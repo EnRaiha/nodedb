@@ -106,7 +106,10 @@ jobs:
             # For pre-release versions, pin internal dep requirements so semver
             # "0.0.0" doesn't fail to match "0.0.0-beta.1"
             if [[ "$VERSION" == *-* ]]; then
-              sed -i -E 's/(nodedb-(codec|bridge|wal|mem|crdt|raft|fts|types|vector|graph|spatial|strict|client|columnar|cluster|query|sql|array|physical) = \{ [^}]*version = )"[^"]*"/\1"='"$VERSION"'"/' Cargo.toml
+              # Pin every internal nodedb* path-dep (bare `nodedb` included) to the
+              # exact prerelease version. A generic match avoids the recurring bug
+              # of forgetting to add a newly-introduced crate to an explicit list.
+              sed -i -E 's/(nodedb[a-z0-9-]* = \{ [^}]*version = )"[^"]*"/\1"='"$VERSION"'"/' Cargo.toml
               echo "Updated internal dep versions to =$VERSION"
             fi
 
@@ -233,7 +236,10 @@ jobs:
             # For pre-release versions, pin internal dep requirements so semver
             # "0" doesn't fail to match "0.0.0-beta.3"
             if [[ "$VERSION" == *-* ]]; then
-              sed -i -E 's/(nodedb-(codec|bridge|wal|mem|crdt|raft|fts|types|vector|graph|spatial|strict|client|columnar|cluster|query|sql|array|physical) = \{ [^}]*version = )"[^"]*"/\1"='"$VERSION"'"/' Cargo.toml
+              # Pin every internal nodedb* path-dep (bare `nodedb` included) to the
+              # exact prerelease version. A generic match avoids the recurring bug
+              # of forgetting to add a newly-introduced crate to an explicit list.
+              sed -i -E 's/(nodedb[a-z0-9-]* = \{ [^}]*version = )"[^"]*"/\1"='"$VERSION"'"/' Cargo.toml
               echo "Updated internal dep versions to =$VERSION"
             fi
 
