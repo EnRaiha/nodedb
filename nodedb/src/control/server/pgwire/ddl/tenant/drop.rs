@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `DROP TENANT [IF EXISTS] <id>` handler. Migrated to
+//! `DROP TENANT [IF EXISTS] <id|name>` handler. Migrated to
 //! `CatalogEntry::DeleteTenant` in phase 1k.6.
+//!
+//! Accepts either a numeric tenant id or a tenant name (single-quoted
+//! optional), parallel to the `CREATE TENANT <name>` and
+//! `SHOW TENANT <name|id>` paths.
 
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
@@ -51,20 +55,34 @@ pub fn drop_tenant(
     if parts.len() < 3 {
         return Err(sqlstate_error(
             "42601",
-            "syntax: DROP TENANT [IF EXISTS] <id>",
+            "syntax: DROP TENANT [IF EXISTS] <id|name>",
         ));
     }
 
-    let tid: u64 = parts[2]
-        .parse()
-        .map_err(|_| sqlstate_error("42601", "TENANT ID must be a numeric value"))?;
-    let tenant_id = TenantId::new(tid);
+    // Accept either a numeric id or a tenant name; mirror the existing
+    // CREATE TENANT name-resolution path.
+    let tenant_id = match super::resolve_tenant_ref(state, parts[2])? {
+        Some(tid) => tid,
+        None => {
+            // Name token did not resolve to any tenant.
+            if if_exists {
+                return Ok(vec![Response::Execution(Tag::new("DROP TENANT"))]);
+            }
+            return Err(sqlstate_error(
+                "42704",
+                &format!("tenant '{}' does not exist", parts[2]),
+            ));
+        }
+    };
+    let tid = tenant_id.as_u64();
 
     if tid == 0 {
         return Err(sqlstate_error("42501", "cannot drop system tenant (0)"));
     }
 
     // `IF EXISTS`: dropping a tenant that does not exist is a no-op success.
+    // (Numeric-id-not-in-catalog path; the name-not-found case was handled
+    // above.)
     if if_exists && !tenant_exists(state, tenant_id)? {
         return Ok(vec![Response::Execution(Tag::new("DROP TENANT"))]);
     }

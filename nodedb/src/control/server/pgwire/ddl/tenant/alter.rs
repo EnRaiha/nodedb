@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `ALTER TENANT <id> SET QUOTA <field> = <value>` handler.
+//! `ALTER TENANT <id|name> SET QUOTA <field> = <value>` handler.
 //!
 //! Tenant quotas live in the in-memory `TenantStore` and are not part
 //! of `StoredTenant`. Quota replication is handled separately from
 //! the tenant identity record.
+//!
+//! The tenant reference accepts either a numeric id or a tenant name
+//! (single-quoted optional), parallel to `CREATE TENANT <name>` and
+//! `SHOW TENANT <name|id>`.
 
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
@@ -12,7 +16,6 @@ use pgwire::error::PgWireResult;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
 
 use super::super::super::types::sqlstate_error;
 
@@ -31,19 +34,22 @@ pub fn alter_tenant(
     if parts.len() < 7 {
         return Err(sqlstate_error(
             "42601",
-            "syntax: ALTER TENANT <id> SET QUOTA <field> = <value>",
+            "syntax: ALTER TENANT <id|name> SET QUOTA <field> = <value>",
         ));
     }
 
-    let tid: u64 = parts[2]
-        .parse()
-        .map_err(|_| sqlstate_error("42601", "TENANT ID must be a numeric value"))?;
-    let tenant_id = TenantId::new(tid);
+    // Accept either a numeric id or a tenant name (mirrors CREATE/SHOW/DROP).
+    let tenant_id = super::resolve_tenant_ref(state, parts[2])?.ok_or_else(|| {
+        sqlstate_error(
+            "42704",
+            &format!("tenant '{}' does not exist", parts[2]),
+        )
+    })?;
 
     if !parts[3].eq_ignore_ascii_case("SET") || !parts[4].eq_ignore_ascii_case("QUOTA") {
         return Err(sqlstate_error(
             "42601",
-            "expected SET QUOTA after tenant ID",
+            "expected SET QUOTA after tenant id or name",
         ));
     }
 
