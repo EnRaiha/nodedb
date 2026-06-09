@@ -141,9 +141,6 @@ zstd = { workspace = true }
 # System calls (eventfd for TPC wake)
 libc = { workspace = true }
 
-# io_uring for Data Plane batched I/O (columnar reads, WAL)
-io-uring = { workspace = true }
-
 # SQL parser (used by function body validation and procedural executor)
 sqlparser = "0.61"
 
@@ -165,6 +162,10 @@ nodedb-array = { workspace = true }
 nodedb-test-support = { workspace = true }
 tower = { workspace = true }
 rcgen = "0.13"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# io_uring for Data Plane batched I/O (columnar reads, WAL)
+io-uring = { workspace = true }
 
 [features]
 default = []

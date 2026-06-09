@@ -21,10 +21,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 crc32c = { workspace = true }
 libc = { workspace = true }
-io-uring = { workspace = true, optional = true }
 aes-gcm = { workspace = true }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = { workspace = true }
@@ -34,8 +36,10 @@ tokio = { workspace = true }
 fluxbench = { workspace = true }
 tracing-subscriber = { workspace = true }
 tempfile = "3"
-io-uring = { workspace = true }
 rand = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+io-uring = { workspace = true }
 
 [[bench]]
 name = "wal_throughput"

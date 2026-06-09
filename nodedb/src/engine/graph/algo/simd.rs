@@ -277,14 +277,17 @@ pub mod neon {
 
     unsafe fn fill_f64_inner(dst: &mut [f64], val: f64) {
         let n = dst.len();
-        let vec_val = vdupq_n_f64(val);
+        // SAFETY: callers enter this helper only on aarch64, where NEON is guaranteed.
+        let vec_val = unsafe { vdupq_n_f64(val) };
         let mut i = 0;
         while i + LANE <= n {
-            vst1q_f64(dst.as_mut_ptr().add(i), vec_val);
+            // SAFETY: `i + LANE <= n`, so the two-lane store is in bounds.
+            unsafe { vst1q_f64(dst.as_mut_ptr().add(i), vec_val) };
             i += LANE;
         }
         while i < n {
-            *dst.get_unchecked_mut(i) = val;
+            // SAFETY: guarded by `i < n`.
+            unsafe { *dst.get_unchecked_mut(i) = val };
             i += 1;
         }
     }
@@ -295,22 +298,30 @@ pub mod neon {
 
     unsafe fn l1_norm_delta_inner(a: &[f64], b: &[f64]) -> f64 {
         let n = a.len().min(b.len());
-        let mut acc = vdupq_n_f64(0.0);
+        // SAFETY: callers enter this helper only on aarch64, where NEON is guaranteed.
+        let mut acc = unsafe { vdupq_n_f64(0.0) };
         let mut i = 0;
 
         while i + LANE <= n {
-            let va = vld1q_f64(a.as_ptr().add(i));
-            let vb = vld1q_f64(b.as_ptr().add(i));
-            let diff = vsubq_f64(va, vb);
-            let abs_diff = vabsq_f64(diff);
-            acc = vaddq_f64(acc, abs_diff);
+            // SAFETY: `i + LANE <= n`, and `n` is the shorter input length.
+            let (va, vb) = unsafe { (vld1q_f64(a.as_ptr().add(i)), vld1q_f64(b.as_ptr().add(i))) };
+            // SAFETY: callers enter this helper only on aarch64, where NEON is guaranteed.
+            let diff = unsafe { vsubq_f64(va, vb) };
+            // SAFETY: callers enter this helper only on aarch64, where NEON is guaranteed.
+            let abs_diff = unsafe { vabsq_f64(diff) };
+            // SAFETY: callers enter this helper only on aarch64, where NEON is guaranteed.
+            acc = unsafe { vaddq_f64(acc, abs_diff) };
             i += LANE;
         }
 
-        let mut sum = vgetq_lane_f64(acc, 0) + vgetq_lane_f64(acc, 1);
+        // SAFETY: callers enter this helper only on aarch64, where NEON is guaranteed.
+        let mut sum = unsafe { vgetq_lane_f64(acc, 0) + vgetq_lane_f64(acc, 1) };
 
         while i < n {
-            sum += (*a.get_unchecked(i) - *b.get_unchecked(i)).abs();
+            // SAFETY: guarded by `i < n`, and `n` is the shorter input length.
+            unsafe {
+                sum += (*a.get_unchecked(i) - *b.get_unchecked(i)).abs();
+            }
             i += 1;
         }
         sum

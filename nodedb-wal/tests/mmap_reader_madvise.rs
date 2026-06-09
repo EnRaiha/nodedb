@@ -24,6 +24,8 @@ use nodedb_wal::record::RecordType;
 use nodedb_wal::segmented::{SegmentedWal, SegmentedWalConfig};
 use tempfile::tempdir;
 
+static OBSERVABILITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn tiny_segment_wal(wal_dir: &std::path::Path) -> SegmentedWal {
     let mut cfg = SegmentedWalConfig::for_testing(wal_dir.to_path_buf());
     // Tiny segments so a handful of appends forces rollover.
@@ -50,6 +52,7 @@ fn write_n_records(wal_dir: &std::path::Path, records: usize) -> Vec<u64> {
 
 #[test]
 fn reader_open_advises_sequential() {
+    let _guard = OBSERVABILITY_LOCK.lock().unwrap();
     let dir = tempdir().unwrap();
     let wal_dir = dir.path();
     write_n_records(wal_dir, 1);
@@ -66,6 +69,7 @@ fn reader_open_advises_sequential() {
 
 #[test]
 fn replay_limit_from_last_segment_opens_only_last_segment() {
+    let _guard = OBSERVABILITY_LOCK.lock().unwrap();
     let dir = tempdir().unwrap();
     let wal_dir = dir.path();
     write_n_records(wal_dir, 5);
@@ -89,6 +93,7 @@ fn replay_limit_from_last_segment_opens_only_last_segment() {
 
 #[test]
 fn replay_skips_segments_entirely_below_from_lsn() {
+    let _guard = OBSERVABILITY_LOCK.lock().unwrap();
     let dir = tempdir().unwrap();
     let wal_dir = dir.path();
     write_n_records(wal_dir, 4);
@@ -111,6 +116,7 @@ fn replay_skips_segments_entirely_below_from_lsn() {
 
 #[test]
 fn replay_limit_returns_only_records_in_range() {
+    let _guard = OBSERVABILITY_LOCK.lock().unwrap();
     // Behaviour spec: even with skipping, the set of returned records
     // must equal the set of records with lsn >= from_lsn, in LSN order.
     let dir = tempdir().unwrap();
@@ -126,7 +132,9 @@ fn replay_limit_returns_only_records_in_range() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn fadvise_dontneed_called_after_segment_iteration() {
+    let _guard = OBSERVABILITY_LOCK.lock().unwrap();
     // Spec: after iterating a segment to end during replay, the fd's pages
     // must be hinted via POSIX_FADV_DONTNEED so replay doesn't retain
     // hot pages from segments that won't be read again.

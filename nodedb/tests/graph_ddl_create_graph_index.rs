@@ -50,7 +50,18 @@ async fn create_graph_index_batches_edge_dispatch() {
 
     // Regression guard: timing. A serial per-doc await loop bursts past
     // this budget; a batched dispatch does not.
-    let budget = Duration::from_secs(1);
+    //
+    // Debug builds run unoptimized (and on non-Linux lack io_uring), so the
+    // *correct* batched path is several times slower — ~2 s vs sub-second in
+    // release. Widen the budget for debug builds so the guard doesn't fire on
+    // a healthy batched build, while keeping it far below the serial-loop
+    // regime (which scales by the same factor into many seconds) so a real
+    // regression still trips it.
+    let budget = if cfg!(debug_assertions) {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(1)
+    };
     assert!(
         elapsed < budget,
         "CREATE GRAPH INDEX on {N} docs must batch edge dispatch; \

@@ -13,9 +13,11 @@
 //! for encrypted on-disk blobs, which is acceptable given the one-time open
 //! cost at partition open time.
 
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 
 /// Module-scoped counters for observing mmap advice + fadvise behaviour.
 pub mod observability {
@@ -102,22 +104,29 @@ impl Drop for ColumnMmap {
         if len == 0 {
             return;
         }
-        let rc = unsafe {
-            libc::posix_fadvise(
-                file.as_raw_fd(),
-                0,
-                len as libc::off_t,
-                libc::POSIX_FADV_DONTNEED,
-            )
-        };
-        if rc == 0 {
-            observability::FADV_DONTNEED_COUNT.fetch_add(1, Ordering::Relaxed);
-        } else {
-            tracing::warn!(
-                path = %self.path.display(),
-                errno = rc,
-                "posix_fadvise(DONTNEED) failed on columnar mmap drop",
-            );
+        #[cfg(target_os = "linux")]
+        {
+            let rc = unsafe {
+                libc::posix_fadvise(
+                    file.as_raw_fd(),
+                    0,
+                    len as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                )
+            };
+            if rc == 0 {
+                observability::FADV_DONTNEED_COUNT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    errno = rc,
+                    "posix_fadvise(DONTNEED) failed on columnar mmap drop",
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (file, &self.path);
         }
     }
 }

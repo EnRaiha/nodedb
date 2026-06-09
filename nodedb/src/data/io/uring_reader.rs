@@ -24,26 +24,36 @@
 //!   → return [Vec<u8>, Vec<u8>, Vec<u8>]
 //! ```
 
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
+
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
+#[cfg(target_os = "linux")]
 use super::aligned_buf::{ALIGNMENT, AlignedBuf};
-use super::io_metrics::{IoMetrics, TIER_CRITICAL, TIER_HIGH, TIER_LOW};
+use super::io_metrics::IoMetrics;
+#[cfg(target_os = "linux")]
+use super::io_metrics::{TIER_CRITICAL, TIER_HIGH, TIER_LOW};
 use crate::bridge::envelope::Priority;
 
 /// Queue depth for the io_uring instance.
+#[cfg(target_os = "linux")]
 const QUEUE_DEPTH: u32 = 64;
 
 /// Maximum number of pre-allocated buffers in the pool.
+#[cfg(target_os = "linux")]
 const POOL_SIZE: usize = 32;
 
 /// Default buffer size (4 MiB — fits most column files).
+#[cfg(target_os = "linux")]
 const DEFAULT_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Per-core batched io_uring reader.
 ///
 /// Not `Send` — owned by a single Data Plane core.
+#[cfg(target_os = "linux")]
 pub struct UringReader {
     ring: io_uring::IoUring,
     /// Pre-allocated aligned buffer pool.
@@ -54,6 +64,10 @@ pub struct UringReader {
     buf_size: usize,
 }
 
+#[cfg(not(target_os = "linux"))]
+pub struct UringReader;
+
+#[cfg(target_os = "linux")]
 impl UringReader {
     /// Create a new io_uring reader with a pre-allocated buffer pool.
     ///
@@ -274,8 +288,41 @@ impl UringReader {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+impl UringReader {
+    /// Create a reader on io_uring-capable Linux hosts.
+    ///
+    /// Non-Linux builds return `None` so callers use their existing
+    /// sequential-read fallback path.
+    pub fn new() -> Option<Self> {
+        None
+    }
+
+    /// Create with custom configuration.
+    pub fn with_config(_queue_depth: u32, _pool_size: usize, _buf_size: usize) -> Option<Self> {
+        None
+    }
+
+    /// Non-Linux builds should not have a concrete reader, but keep this method
+    /// available so generic call sites compile.
+    pub fn read_files(&mut self, paths: &[&Path]) -> Vec<Vec<u8>> {
+        vec![Vec::new(); paths.len()]
+    }
+
+    /// Priority-aware variant of [`read_files`].
+    pub fn read_files_with_priority(
+        &mut self,
+        paths: &[&Path],
+        _priority: Priority,
+        _metrics: &IoMetrics,
+    ) -> Vec<Vec<u8>> {
+        self.read_files(paths)
+    }
+}
+
 /// Tracks which buffer a read uses.
 #[derive(Clone, Copy)]
+#[cfg(target_os = "linux")]
 enum BufSource {
     Pool(usize),
     Oversized(usize),
@@ -283,6 +330,7 @@ enum BufSource {
 }
 
 /// A pending read operation.
+#[cfg(target_os = "linux")]
 struct PendingRead {
     index: usize,
     file: Option<std::fs::File>,
@@ -290,6 +338,7 @@ struct PendingRead {
     buf_source: BufSource,
 }
 
+#[cfg(target_os = "linux")]
 impl PendingRead {
     fn failed(index: usize) -> Self {
         Self {
@@ -303,11 +352,12 @@ impl PendingRead {
 
 /// Round a read size up to ALIGNMENT.
 #[inline]
+#[cfg(target_os = "linux")]
 fn round_up_read(size: usize) -> usize {
     super::aligned_buf::round_up(size, ALIGNMENT)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::io::Write;

@@ -43,6 +43,7 @@ fn mmap_column_advises_sequential() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn column_scan_advises_dontneed_after_release() {
     // Spec: once the mmap'd column is dropped, its pages should be hinted
     // via POSIX_FADV_DONTNEED so cold partition reads don't pin page cache

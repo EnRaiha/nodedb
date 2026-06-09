@@ -16,9 +16,11 @@
 //! This reader is used in tier 2: when the Event Plane enters WAL Catchup
 //! Mode, it mmap's the relevant sealed segments and iterates records.
 
-use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 
 use memmap2::Mmap;
 
@@ -54,22 +56,29 @@ fn fadv_dontneed(fd: &std::fs::File, len: usize, path: &Path) {
     if len == 0 {
         return;
     }
-    let rc = unsafe {
-        libc::posix_fadvise(
-            fd.as_raw_fd(),
-            0,
-            len as libc::off_t,
-            libc::POSIX_FADV_DONTNEED,
-        )
-    };
-    if rc == 0 {
-        observability::FADV_DONTNEED_COUNT.fetch_add(1, Ordering::Relaxed);
-    } else {
-        tracing::warn!(
-            path = %path.display(),
-            errno = rc,
-            "posix_fadvise(DONTNEED) failed on exhausted WAL segment",
-        );
+    #[cfg(target_os = "linux")]
+    {
+        let rc = unsafe {
+            libc::posix_fadvise(
+                fd.as_raw_fd(),
+                0,
+                len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+        if rc == 0 {
+            observability::FADV_DONTNEED_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            tracing::warn!(
+                path = %path.display(),
+                errno = rc,
+                "posix_fadvise(DONTNEED) failed on exhausted WAL segment",
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, path);
     }
 }
 

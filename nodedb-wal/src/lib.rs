@@ -41,7 +41,7 @@ pub mod segment;
 pub mod segmented;
 pub mod temporal_purge;
 pub mod tombstone;
-#[cfg(feature = "io-uring")]
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub mod uring_writer;
 pub mod writer;
 

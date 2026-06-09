@@ -10,7 +10,7 @@
 //! unpadded record length, otherwise subsequent submissions land on an
 //! unaligned offset and the kernel returns `-EINVAL`.
 
-#![cfg(feature = "io-uring")]
+#![cfg(all(feature = "io-uring", target_os = "linux"))]
 
 use std::path::PathBuf;
 

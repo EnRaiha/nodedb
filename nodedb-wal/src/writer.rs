@@ -24,7 +24,7 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt as _;
 
 use crate::align::{AlignedBuf, DEFAULT_ALIGNMENT};
@@ -140,7 +140,7 @@ impl WalWriter {
         let mut opts = OpenOptions::new();
         opts.create(true).write(true).append(false);
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(target_os = "linux")]
         if config.use_direct_io {
             // O_DIRECT: bypass page cache.
             opts.custom_flags(libc::O_DIRECT);
@@ -230,7 +230,7 @@ impl WalWriter {
         let mut opts = OpenOptions::new();
         opts.create(true).write(true).append(false);
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(target_os = "linux")]
         if config.use_direct_io {
             opts.custom_flags(libc::O_DIRECT);
         }

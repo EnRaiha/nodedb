@@ -26,7 +26,12 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 /// Write to signal, read to consume. Multiple signals coalesce into one.
 /// The fd can be registered with any event loop (epoll, io_uring, kqueue fallback).
 pub struct EventFd {
+    #[cfg(target_os = "linux")]
     fd: OwnedFd,
+    #[cfg(not(target_os = "linux"))]
+    read_fd: OwnedFd,
+    #[cfg(not(target_os = "linux"))]
+    write_fd: OwnedFd,
 }
 
 impl EventFd {
@@ -35,14 +40,36 @@ impl EventFd {
     /// `EFD_NONBLOCK` ensures reads/writes never block the calling thread.
     /// `EFD_CLOEXEC` prevents fd leaks across fork/exec.
     pub fn new() -> io::Result<Self> {
-        // SAFETY: eventfd2 is a standard Linux syscall. Flags are valid.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: eventfd2 is a standard Linux syscall. Flags are valid.
+            let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fd is a valid file descriptor returned by eventfd().
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            Ok(Self { fd })
         }
-        // SAFETY: fd is a valid file descriptor returned by eventfd().
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(Self { fd })
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut fds = [0; 2];
+            // SAFETY: `fds` points to two valid c_int slots for pipe to fill.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if let Err(err) = set_pipe_flags(fds[0]).and_then(|()| set_pipe_flags(fds[1])) {
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                }
+                return Err(err);
+            }
+            // SAFETY: fds were returned by pipe() and ownership moves into OwnedFd.
+            let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+            Ok(Self { read_fd, write_fd })
+        }
     }
 
     /// Signal the other side to wake up.
@@ -51,14 +78,12 @@ impl EventFd {
     /// a single read clears all pending signals.
     pub fn notify(&self) -> io::Result<()> {
         let val: u64 = 1;
+        #[cfg(target_os = "linux")]
+        let fd = self.fd.as_raw_fd();
+        #[cfg(not(target_os = "linux"))]
+        let fd = self.write_fd.as_raw_fd();
         // SAFETY: writing 8 bytes to a valid eventfd.
-        let ret = unsafe {
-            libc::write(
-                self.fd.as_raw_fd(),
-                &val as *const u64 as *const libc::c_void,
-                8,
-            )
-        };
+        let ret = unsafe { libc::write(fd, &val as *const u64 as *const libc::c_void, 8) };
         if ret < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -71,24 +96,54 @@ impl EventFd {
     /// Returns `Ok(0)` if no signal was pending (EAGAIN on non-blocking fd).
     /// Returns `Ok(n)` where n is the accumulated signal count.
     pub fn try_read(&self) -> io::Result<u64> {
-        let mut val: u64 = 0;
-        // SAFETY: reading 8 bytes from a valid eventfd.
-        let ret = unsafe {
-            libc::read(
-                self.fd.as_raw_fd(),
-                &mut val as *mut u64 as *mut libc::c_void,
-                8,
-            )
-        };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::WouldBlock {
-                Ok(0)
+        #[cfg(target_os = "linux")]
+        {
+            let mut val: u64 = 0;
+            // SAFETY: reading 8 bytes from a valid eventfd.
+            let ret = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    &mut val as *mut u64 as *mut libc::c_void,
+                    8,
+                )
+            };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    Ok(0)
+                } else {
+                    Err(err)
+                }
             } else {
-                Err(err)
+                Ok(val)
             }
-        } else {
-            Ok(val)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut count = 0u64;
+            loop {
+                let mut val: u64 = 0;
+                // SAFETY: reading 8 bytes from the nonblocking pipe read end.
+                let ret = unsafe {
+                    libc::read(
+                        self.read_fd.as_raw_fd(),
+                        &mut val as *mut u64 as *mut libc::c_void,
+                        8,
+                    )
+                };
+                if ret == 8 {
+                    count = count.saturating_add(val.max(1));
+                    continue;
+                }
+                if ret < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        return Ok(count);
+                    }
+                    return Err(err);
+                }
+                return Ok(count);
+            }
         }
     }
 
@@ -99,8 +154,39 @@ impl EventFd {
     /// - Glommio: `GlommioDma::from_raw_fd()` or similar
     /// - io_uring: `IORING_OP_READ` on the fd
     pub fn as_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        #[cfg(target_os = "linux")]
+        {
+            self.fd.as_raw_fd()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.read_fd.as_raw_fd()
+        }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_pipe_flags(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl is called with a valid fd returned by pipe().
+    let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if status_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl F_SETFL updates status flags for this fd.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, status_flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: fcntl is called with a valid fd returned by pipe().
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if fd_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl F_SETFD updates close-on-exec flags for this fd.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 // SAFETY: eventfd is a kernel object. The fd can be shared across threads.

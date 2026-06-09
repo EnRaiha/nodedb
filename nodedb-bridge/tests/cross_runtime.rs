@@ -12,7 +12,7 @@
 //!
 //! Requires the `tokio` feature: `cargo test -p nodedb-bridge --features tokio`
 
-#![cfg(feature = "tokio")]
+#![cfg(all(feature = "tokio", target_os = "linux"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
