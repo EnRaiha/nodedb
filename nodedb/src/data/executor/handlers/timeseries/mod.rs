@@ -30,9 +30,10 @@ pub(in crate::data::executor) struct TimeseriesScanParams<'a> {
     pub gap_fill: &'a str,
     /// Serialized computed columns for scalar projection expressions.
     pub computed_columns: &'a [u8],
-    /// Bitemporal system-time cutoff: rows whose `_ts_system` exceeds
-    /// this cutoff are hidden. `None` on non-bitemporal collections.
-    pub system_as_of_ms: Option<i64>,
+    /// Bitemporal system-time selection. `AsOf(ms)` hides rows whose
+    /// `_ts_system` exceeds the cutoff; `AllVersions` emits every `_ts_system`
+    /// row ordered ascending (audit log); `Current` is unconstrained.
+    pub system_time: nodedb_types::SystemTimeScope,
     /// Bitemporal valid-time point. `None` skips valid-time filtering.
     pub valid_at_ms: Option<i64>,
 }
@@ -60,9 +61,12 @@ impl CoreLoop {
             aggregates,
             gap_fill,
             computed_columns,
-            system_as_of_ms,
+            system_time,
             valid_at_ms,
         } = params;
+
+        let all_versions = system_time.is_all_versions();
+        let system_as_of_ms = system_time.as_of_ms();
 
         // Lazy-load partition registry from disk if not yet loaded.
         self.ensure_ts_registry(tid, collection);
@@ -167,6 +171,7 @@ impl CoreLoop {
                 filter_predicates: &filter_predicates,
                 has_filters,
                 computed_columns,
+                all_versions,
             })
         }
     }

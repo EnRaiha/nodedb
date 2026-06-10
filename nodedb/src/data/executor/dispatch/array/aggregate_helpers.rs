@@ -202,23 +202,6 @@ pub(super) fn coord_to_group_key(c: &CoordValue) -> i64 {
     }
 }
 
-pub(super) fn encode_partials(
-    core: &CoreLoop,
-    task: &ExecutionTask,
-    partials: &[ArrayAggPartial],
-) -> Response {
-    let owned: Vec<&ArrayAggPartial> = partials.iter().collect();
-    match zerompk::to_msgpack_vec(&owned) {
-        Ok(bytes) => core.response_with_payload(task, bytes),
-        Err(e) => core.response_error(
-            task,
-            ErrorCode::Internal {
-                detail: format!("array aggregate partial encode: {e}"),
-            },
-        ),
-    }
-}
-
 pub(super) fn encode_agg_rows(
     core: &CoreLoop,
     task: &ExecutionTask,

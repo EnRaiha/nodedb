@@ -5,8 +5,10 @@
 use crate::bridge::envelope::Response;
 use nodedb_mem;
 use nodedb_physical::physical_plan::DocumentOp;
+use nodedb_types::SystemTimeScope;
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::document::read::scan_params::VersionedScanParams;
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
@@ -46,20 +48,36 @@ impl CoreLoop {
                 surrogate,
                 pk_bytes: _,
                 rls_filters,
-                system_as_of_ms,
+                system_time,
                 valid_at_ms,
-            } => self.execute_point_get(
-                task,
-                super::super::handlers::point::get::PointGetParams {
-                    tid,
-                    collection,
-                    document_id,
-                    surrogate: *surrogate,
-                    rls_filters,
-                    system_as_of_ms: *system_as_of_ms,
-                    valid_at_ms: *valid_at_ms,
-                },
-            ),
+            } => {
+                let system_as_of_ms = match system_time {
+                    SystemTimeScope::Current => None,
+                    SystemTimeScope::AsOf(ms) => Some(*ms),
+                    SystemTimeScope::AllVersions => {
+                        return self.response_error(
+                            task,
+                            crate::bridge::envelope::ErrorCode::Unsupported {
+                                detail: "AS OF SYSTEM TIME NULL (all-versions) is not \
+                                         supported on point gets; use a table scan"
+                                    .into(),
+                            },
+                        );
+                    }
+                };
+                self.execute_point_get(
+                    task,
+                    super::super::handlers::point::get::PointGetParams {
+                        tid,
+                        collection,
+                        document_id,
+                        surrogate: *surrogate,
+                        rls_filters,
+                        system_as_of_ms,
+                        valid_at_ms: *valid_at_ms,
+                    },
+                )
+            }
 
             DocumentOp::PointPut {
                 collection,
@@ -127,22 +145,30 @@ impl CoreLoop {
                 projection,
                 computed_columns,
                 window_functions,
-                system_as_of_ms,
+                system_time,
                 valid_at_ms,
                 prefilter,
             } => {
-                if system_as_of_ms.is_some() || valid_at_ms.is_some() {
-                    self.execute_document_scan_as_of(
-                        task,
-                        tid,
+                if system_time.is_all_versions() {
+                    let params = VersionedScanParams {
                         collection,
-                        *limit,
-                        *offset,
+                        limit: *limit,
+                        offset: *offset,
                         filters,
                         projection,
-                        *system_as_of_ms,
-                        *valid_at_ms,
-                    )
+                        valid_at_ms: *valid_at_ms,
+                    };
+                    self.execute_document_scan_all_versions(task, tid, params)
+                } else if system_time.is_temporal() || valid_at_ms.is_some() {
+                    let params = VersionedScanParams {
+                        collection,
+                        limit: *limit,
+                        offset: *offset,
+                        filters,
+                        projection,
+                        valid_at_ms: *valid_at_ms,
+                    };
+                    self.execute_document_scan_as_of(task, tid, params, system_time.as_of_ms())
                 } else {
                     self.execute_document_scan(
                         task,

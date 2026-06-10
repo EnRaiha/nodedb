@@ -26,7 +26,7 @@ impl CoreLoop {
                 aggregates,
                 gap_fill,
                 computed_columns,
-                system_as_of_ms,
+                system_time,
                 valid_at_ms,
                 ..
             } => self.execute_timeseries_scan(TimeseriesScanParams {
@@ -41,7 +41,7 @@ impl CoreLoop {
                 aggregates,
                 gap_fill,
                 computed_columns,
-                system_as_of_ms: *system_as_of_ms,
+                system_time: *system_time,
                 valid_at_ms: *valid_at_ms,
             }),
 
