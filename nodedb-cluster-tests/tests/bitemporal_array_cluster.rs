@@ -80,6 +80,106 @@ fn parse_int_attr(row: &str) -> i64 {
         .unwrap_or_else(|| panic!("cannot extract attrs[0] as i64 from: {row}"))
 }
 
+/// Wall-clock milliseconds since the Unix epoch.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_millis() as i64
+}
+
+/// Extract the scalar aggregate value from an `ARRAY_AGG(..., 'sum')` result.
+///
+/// Robust to the exact projection shape: accepts a bare numeric `result`
+/// column (`"10"`) or a JSON object carrying a `result` key (`{"result":10}`),
+/// and skips any trailing `{"truncated_before_horizon": ...}` summary row that
+/// temporal aggregates append (it has no numeric `result`).
+async fn scalar_agg_sum(client: &tokio_postgres::Client, sql: &str) -> f64 {
+    let rows = query_col0(client, sql).await;
+    rows.iter()
+        .find_map(|r| {
+            r.parse::<f64>().ok().or_else(|| {
+                serde_json::from_str::<serde_json::Value>(r)
+                    .ok()
+                    .and_then(|v| v.get("result").and_then(|x| x.as_f64()))
+            })
+        })
+        .unwrap_or_else(|| panic!("no numeric aggregate result in rows: {rows:?}\n  sql: {sql}"))
+}
+
+/// Distributed bitemporal **aggregate** across shards.
+///
+/// Mirrors the slice test but exercises the `ARRAY_AGG ... AS OF SYSTEM TIME`
+/// path end-to-end: pgwire → coordinator `coord_agg` fan-out → shard
+/// `exec_agg` (which decodes the `(partials, truncated_before_horizon)` tuple)
+/// → partial merge → `finalize_agg_partials`. A wire-shape mismatch anywhere
+/// on that path (the class of bug that broke this silently when only mock
+/// executors were tested) surfaces here as a codec error or a wrong sum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_array_agg_as_of_returns_versioned_sum_across_shards() {
+    let cluster = TestCluster::spawn_three()
+        .await
+        .expect("3-node cluster spawn");
+
+    let leader_idx = cluster
+        .exec_ddl_on_any_leader(
+            "CREATE ARRAY bt3 \
+             DIMS (x INT64 [0..15]) \
+             ATTRS (v INT64) \
+             TILE_EXTENTS (16) \
+             CELL_ORDER ROW_MAJOR",
+        )
+        .await
+        .expect("CREATE ARRAY bt3");
+    let client = &cluster.nodes[leader_idx].client;
+
+    // v1 = 10 at x=0.
+    client
+        .simple_query("INSERT INTO ARRAY bt3 COORDS (0) VALUES (10)")
+        .await
+        .expect("insert v1");
+    client
+        .simple_query("SELECT ARRAY_FLUSH('bt3')")
+        .await
+        .expect("flush v1");
+
+    // Capture a cutoff strictly between v1 and v2.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let cutoff_ms = now_ms();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    // v2 = 99 at x=0.
+    client
+        .simple_query("INSERT INTO ARRAY bt3 COORDS (0) VALUES (99)")
+        .await
+        .expect("insert v2");
+    client
+        .simple_query("SELECT ARRAY_FLUSH('bt3')")
+        .await
+        .expect("flush v2");
+
+    // Live aggregate sees the latest version: sum = v2 = 99.
+    let live = scalar_agg_sum(client, "SELECT * FROM ARRAY_AGG('bt3', 'v', 'sum')").await;
+    assert!(
+        (live - 99.0).abs() < 1e-4,
+        "live agg sum must be v2=99, got {live}"
+    );
+
+    // AS OF between versions: the distributed aggregate must resolve the cell
+    // ceiling to v1 on every shard and sum to 10.
+    let as_of = scalar_agg_sum(
+        client,
+        &format!("SELECT * FROM ARRAY_AGG('bt3', 'v', 'sum') AS OF SYSTEM TIME {cutoff_ms}"),
+    )
+    .await;
+    assert!(
+        (as_of - 10.0).abs() < 1e-4,
+        "AS OF SYSTEM TIME {cutoff_ms} agg sum must be v1=10, got {as_of}"
+    );
+
+    cluster.shutdown().await;
+}
+
 /// Bring up a 3-node cluster, write v1 then v2 of a cell at coord `x=0`,
 /// capturing the system-time cutoff between the two writes. Assert that
 /// every node returns v1 when queried `AS OF SYSTEM TIME <cutoff>`.

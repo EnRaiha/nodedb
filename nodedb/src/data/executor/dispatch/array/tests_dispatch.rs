@@ -214,7 +214,11 @@ fn json_to_value(v: serde_json::Value) -> Value {
                 .cloned()
                 .map(json_to_value)
                 .collect();
-            Value::ArrayCell(ArrayCell { coords, attrs })
+            Value::ArrayCell(ArrayCell {
+                coords,
+                attrs,
+                system_time: None,
+            })
         }
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -264,7 +268,7 @@ fn slice_returns_only_cells_in_range() {
         limit: 0,
         cell_filter: None,
         hilbert_range: None,
-        system_as_of: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
     assert_eq!(r.status, Status::Ok, "slice failed: {r:?}");
@@ -281,6 +285,79 @@ fn slice_returns_only_cells_in_range() {
         }
     }
     assert!((sums - 7.0).abs() < 1e-9);
+}
+
+#[test]
+fn slice_all_versions_emits_audit_log_ascending() {
+    let mut h = Harness::new();
+    let s = schema_2d_f64("t6_audit");
+    let aid = ArrayId::new(TenantId::new(1), "t6_audit");
+    h.open(&aid, &s, 0xA7);
+
+    // Three system-time versions of the same cell (0,0), each sealed into
+    // its own segment so they are distinct retained tile-versions.
+    let mk = |v: f64, sys: i64| ArrayPutCell {
+        coord: vec![CoordValue::Int64(0), CoordValue::Int64(0)],
+        attrs: vec![CellValue::Float64(v)],
+        surrogate: Surrogate::ZERO,
+        system_from_ms: sys,
+        valid_from_ms: 0,
+        valid_until_ms: i64::MAX,
+    };
+    h.put(&aid, vec![mk(1.0, 100)], 1);
+    h.flush(&aid);
+    h.put(&aid, vec![mk(2.0, 200)], 2);
+    h.flush(&aid);
+    h.put(&aid, vec![mk(3.0, 300)], 3);
+    h.flush(&aid);
+
+    let slice = ArraySlice::new(vec![None, None]);
+    let slice_bytes = zerompk::to_msgpack_vec(&slice).unwrap();
+    let r = h.send(ArrayOp::Slice {
+        array_id: aid.clone(),
+        slice_msgpack: slice_bytes,
+        attr_projection: vec![],
+        limit: 0,
+        cell_filter: None,
+        hilbert_range: None,
+        system_time: nodedb_types::SystemTimeScope::AllVersions,
+        valid_at_ms: None,
+    });
+    assert_eq!(r.status, Status::Ok, "all-versions slice failed: {r:?}");
+
+    // Read rows as raw JSON: `json_to_value` drops the injected `_ts_system`
+    // column, so inspect the envelope directly.
+    use crate::data::executor::response_codec::ArraySliceResponse;
+    let env: ArraySliceResponse =
+        zerompk::from_msgpack(r.payload.as_ref()).expect("ArraySliceResponse envelope");
+    assert!(
+        !env.truncated_before_horizon,
+        "AllVersions applies no system-time horizon"
+    );
+    let json = nodedb_types::msgpack_to_json_string(&env.rows_msgpack).expect("rows msgpack→json");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("rows json parse");
+
+    let got: Vec<(i64, f64)> = rows
+        .iter()
+        .map(|row| {
+            let ts = row
+                .get("_ts_system")
+                .and_then(|v| v.as_i64())
+                .expect("_ts_system column present on audit-log rows");
+            let v = row
+                .get("attrs")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_f64())
+                .expect("attr value");
+            (ts, v)
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![(100, 1.0), (200, 2.0), (300, 3.0)],
+        "audit log must return every version ascending by system time"
+    );
 }
 
 #[test]
@@ -315,6 +392,127 @@ fn aggregate_sum_scalar_across_multiple_tiles() {
         .and_then(|v| v.as_f64())
         .expect("result f64");
     assert!((f - 10.0).abs() < 1e-9, "sum got {f}");
+}
+
+#[test]
+fn aggregate_return_partial_emits_tuple_wire_shape() {
+    // Distributed shard aggregates set `return_partial = true`. The Data Plane
+    // MUST emit the `(partials, truncated_before_horizon)` tuple — the same
+    // shape the bitemporal path uses — so the cluster `exec_agg` (which always
+    // decodes a tuple) can read non-temporal aggregates too. A bare `Vec` here
+    // (the old `encode_partials` shape) would fail that decode.
+    let mut h = Harness::new();
+    let s = schema_2d_f64("t6_partial");
+    let aid = ArrayId::new(TenantId::new(1), "t6_partial");
+    h.open(&aid, &s, 0xA9);
+    h.put(&aid, vec![cell(0, 0, 1.0), cell(1, 1, 2.0)], 1);
+
+    let r = h.send(ArrayOp::Aggregate {
+        array_id: aid.clone(),
+        attr_idx: 0,
+        reducer: ArrayReducer::Sum,
+        group_by_dim: -1,
+        cell_filter: None,
+        return_partial: true,
+        hilbert_range: None,
+        system_as_of: None,
+        valid_at_ms: None,
+    });
+    assert_eq!(r.status, Status::Ok, "agg failed: {r:?}");
+
+    // Must decode as a 2-tuple (partials, flag), NOT a bare Vec.
+    let (partials, truncated): (
+        Vec<nodedb_cluster::distributed_array::merge::ArrayAggPartial>,
+        bool,
+    ) = zerompk::from_msgpack(r.payload.as_ref())
+        .expect("return_partial payload must be a (Vec<ArrayAggPartial>, bool) tuple");
+    assert_eq!(partials.len(), 1);
+    assert!(
+        (partials[0].sum - 3.0).abs() < 1e-9,
+        "sum got {}",
+        partials[0].sum
+    );
+    assert!(
+        !truncated,
+        "non-temporal current-state read is never below-horizon"
+    );
+}
+
+#[test]
+fn aggregate_temporal_appends_horizon_summary_row() {
+    // Temporal aggregates surface the below-horizon signal as a trailing
+    // {"truncated_before_horizon": bool} summary row — the same shape the
+    // cluster `finalize_agg_partials` produces. Non-temporal aggregates (tested
+    // above) carry no such row, so the two modes stay distinguishable.
+    let mut h = Harness::new();
+    let s = schema_2d_f64("t6_agg_ts");
+    let aid = ArrayId::new(TenantId::new(1), "t6_agg_ts");
+    h.open(&aid, &s, 0xAB);
+    let mk = |x: i64, y: i64, v: f64, sys: i64| ArrayPutCell {
+        coord: vec![CoordValue::Int64(x), CoordValue::Int64(y)],
+        attrs: vec![CellValue::Float64(v)],
+        surrogate: Surrogate::ZERO,
+        system_from_ms: sys,
+        valid_from_ms: 0,
+        valid_until_ms: i64::MAX,
+    };
+    h.put(&aid, vec![mk(0, 0, 10.0, 100), mk(1, 1, 20.0, 100)], 1);
+    h.flush(&aid);
+
+    // AS OF after the writes: both cells visible, not below horizon.
+    let r = h.send(ArrayOp::Aggregate {
+        array_id: aid.clone(),
+        attr_idx: 0,
+        reducer: ArrayReducer::Sum,
+        group_by_dim: -1,
+        cell_filter: None,
+        return_partial: false,
+        hilbert_range: None,
+        system_as_of: Some(150),
+        valid_at_ms: None,
+    });
+    assert_eq!(r.status, Status::Ok, "temporal agg failed: {r:?}");
+    let rows = decode_agg_rows(r.payload.as_ref());
+    assert_eq!(
+        rows.len(),
+        2,
+        "temporal scalar agg = result row + summary row"
+    );
+    let sum = rows[0]
+        .get("result")
+        .and_then(|v| v.as_f64())
+        .expect("result");
+    assert!((sum - 30.0).abs() < 1e-9, "sum got {sum}");
+    assert_eq!(
+        rows[1]
+            .get("truncated_before_horizon")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "cutoff after all data is not below-horizon"
+    );
+
+    // AS OF before the writes: below horizon → trailing flag is true.
+    let r2 = h.send(ArrayOp::Aggregate {
+        array_id: aid.clone(),
+        attr_idx: 0,
+        reducer: ArrayReducer::Sum,
+        group_by_dim: -1,
+        cell_filter: None,
+        return_partial: false,
+        hilbert_range: None,
+        system_as_of: Some(50),
+        valid_at_ms: None,
+    });
+    assert_eq!(r2.status, Status::Ok, "below-horizon agg failed: {r2:?}");
+    let rows2 = decode_agg_rows(r2.payload.as_ref());
+    assert_eq!(
+        rows2
+            .last()
+            .and_then(|row| row.get("truncated_before_horizon"))
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "cutoff before all data must report below-horizon"
+    );
 }
 
 #[test]
@@ -428,7 +626,7 @@ fn slice_cell_filter_excludes_non_member_surrogates() {
         limit: 0,
         cell_filter: Some(bm),
         hilbert_range: None,
-        system_as_of: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
     assert_eq!(r.status, Status::Ok, "slice+filter failed: {r:?}");

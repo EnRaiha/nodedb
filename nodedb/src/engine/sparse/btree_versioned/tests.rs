@@ -153,10 +153,108 @@ fn scan_returns_latest_per_doc_id() {
     put(&e, "c", "a", 100, b"a1");
     put(&e, "c", "a", 200, b"a2");
     put(&e, "c", "b", 150, b"b1");
-    let all = e.versioned_scan_as_of(1, "c", None, None, 100).unwrap();
+    let all = e
+        .versioned_scan_as_of(1, "c", None, None, 100, &|_: &[u8]| true)
+        .unwrap();
     let map: std::collections::HashMap<_, _> = all.into_iter().collect();
     assert_eq!(map.get("a").map(|v| v.as_slice()), Some(b"a2" as &[u8]));
     assert_eq!(map.get("b").map(|v| v.as_slice()), Some(b"b1" as &[u8]));
+}
+
+#[test]
+fn scan_all_returns_every_version_in_system_time_order() {
+    let (e, _d) = open_temp();
+    // One document updated three times under different system times.
+    put(&e, "c", "a", 100, b"a1");
+    put(&e, "c", "a", 200, b"a2");
+    put(&e, "c", "a", 300, b"a3");
+    // A second document interleaved by system time.
+    put(&e, "c", "b", 150, b"b1");
+
+    let all = e
+        .versioned_scan_all(1, "c", None, 100, &|_: &[u8]| true)
+        .unwrap();
+    // Every version is present (no newest-per-id collapse).
+    assert_eq!(all.len(), 4);
+    // Ascending by system time globally.
+    let times: Vec<i64> = all.iter().map(|(_, sf, _)| *sf).collect();
+    assert_eq!(times, vec![100, 150, 200, 300]);
+    // System-time and body line up per version.
+    assert_eq!(all[0], ("a".to_string(), 100, b"a1".to_vec()));
+    assert_eq!(all[1], ("b".to_string(), 150, b"b1".to_vec()));
+    assert_eq!(all[2], ("a".to_string(), 200, b"a2".to_vec()));
+    assert_eq!(all[3], ("a".to_string(), 300, b"a3".to_vec()));
+}
+
+#[test]
+fn scan_all_skips_tombstoned_versions() {
+    let (e, _d) = open_temp();
+    put(&e, "c", "a", 100, b"a1");
+    e.versioned_tombstone(1, "c", "a", 200).unwrap();
+    put(&e, "c", "a", 300, b"a3");
+    let all = e
+        .versioned_scan_all(1, "c", None, 100, &|_: &[u8]| true)
+        .unwrap();
+    // The tombstone version is excluded; the two live versions remain.
+    let times: Vec<i64> = all.iter().map(|(_, sf, _)| *sf).collect();
+    assert_eq!(times, vec![100, 300]);
+}
+
+#[test]
+fn scan_all_pushes_predicate_down_so_limit_counts_matches() {
+    // Regression: the audit-log handler used to fetch a capped window then
+    // filter, so a selective predicate silently under-returned. The predicate
+    // is now applied inside the scan, before `limit` truncation, so `limit`
+    // counts MATCHING versions — not raw scanned rows.
+    let (e, _d) = open_temp();
+    for i in 0..10i64 {
+        put(&e, "c", "a", 100 + i, format!("v{i}").as_bytes());
+    }
+    // Match only odd-suffixed bodies: v1, v3, v5, v7, v9.
+    let odd = |body: &[u8]| body.last().map(|b| (b - b'0') % 2 == 1).unwrap_or(false);
+
+    let rows = e.versioned_scan_all(1, "c", None, 3, &odd).unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "limit must count matching versions, not scanned rows"
+    );
+    let bodies: Vec<Vec<u8>> = rows.into_iter().map(|(_, _, b)| b).collect();
+    // Oldest three matches in ascending system-time order.
+    assert_eq!(bodies, vec![b"v1".to_vec(), b"v3".to_vec(), b"v5".to_vec()]);
+}
+
+#[test]
+fn scan_as_of_pushes_predicate_down_so_limit_counts_matches() {
+    // Same regression for the point-in-time (newest-per-doc) scan: the `limit`
+    // early-stop must count matching documents, so a selective filter cannot
+    // make the scan return fewer rows than exist.
+    let (e, _d) = open_temp();
+    for (i, id) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+        put(&e, "c", id, 100 + i as i64, format!("x{i}").as_bytes());
+    }
+    // Match only even-suffixed bodies: x0 (a), x2 (c), x4 (e).
+    let even = |body: &[u8]| {
+        body.last()
+            .map(|b| (b - b'0').is_multiple_of(2))
+            .unwrap_or(false)
+    };
+
+    let rows = e
+        .versioned_scan_as_of(1, "c", None, None, 2, &even)
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "limit must count matching docs, not scanned rows"
+    );
+    for (_, body) in &rows {
+        assert_eq!(
+            (body.last().unwrap() - b'0') % 2,
+            0,
+            "only even-suffixed docs match"
+        );
+    }
 }
 
 #[test]
@@ -165,11 +263,11 @@ fn scan_as_of_hides_tombstoned_rows() {
     put(&e, "c", "a", 100, b"a1");
     e.versioned_tombstone(1, "c", "a", 200).unwrap();
     let at_150 = e
-        .versioned_scan_as_of(1, "c", Some(150), None, 100)
+        .versioned_scan_as_of(1, "c", Some(150), None, 100, &|_: &[u8]| true)
         .unwrap();
     assert_eq!(at_150.len(), 1);
     let at_250 = e
-        .versioned_scan_as_of(1, "c", Some(250), None, 100)
+        .versioned_scan_as_of(1, "c", Some(250), None, 100, &|_: &[u8]| true)
         .unwrap();
     assert!(at_250.is_empty());
 }

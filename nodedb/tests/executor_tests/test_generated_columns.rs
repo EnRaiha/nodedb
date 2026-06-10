@@ -63,7 +63,7 @@ fn get_doc(
             collection: collection.into(),
             document_id: id.into(),
             rls_filters: Vec::new(),
-            system_as_of_ms: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             surrogate: nodedb_types::Surrogate::ZERO,
             pk_bytes: Vec::new(),

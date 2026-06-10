@@ -204,7 +204,7 @@ fn read_ops_not_replicated() {
         collection: "orders".into(),
         document_id: "doc-1".into(),
         rls_filters: vec![],
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),

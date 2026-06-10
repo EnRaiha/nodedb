@@ -89,7 +89,7 @@ fn non_bitemporal_collection_uses_legacy_storage() {
     // The versioned table must be empty for this collection because
     // writes went to the legacy path.
     let bitemporal_rows = sparse
-        .versioned_scan_as_of(1, "c", None, None, 100)
+        .versioned_scan_as_of(1, "c", None, None, 100, &|_: &[u8]| true)
         .unwrap();
     assert!(
         bitemporal_rows.is_empty(),
