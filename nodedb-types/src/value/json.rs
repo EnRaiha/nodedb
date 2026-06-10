@@ -46,10 +46,16 @@ impl From<Value> for serde_json::Value {
             Value::Vector(v) => {
                 serde_json::Value::Array(v.iter().map(|f| serde_json::json!(*f)).collect())
             }
-            Value::ArrayCell(cell) => serde_json::json!({
-                "coords": cell.coords.into_iter().map(serde_json::Value::from).collect::<Vec<_>>(),
-                "attrs": cell.attrs.into_iter().map(serde_json::Value::from).collect::<Vec<_>>(),
-            }),
+            Value::ArrayCell(cell) => {
+                let mut obj = serde_json::json!({
+                    "coords": cell.coords.into_iter().map(serde_json::Value::from).collect::<Vec<_>>(),
+                    "attrs": cell.attrs.into_iter().map(serde_json::Value::from).collect::<Vec<_>>(),
+                });
+                if let Some(ts) = cell.system_time {
+                    obj["_ts_system"] = serde_json::json!(ts);
+                }
+                obj
+            }
         }
     }
 }
@@ -178,6 +184,7 @@ mod tests {
         let v = Value::ArrayCell(ArrayCell {
             coords: vec![Value::Integer(1), Value::Integer(2)],
             attrs: vec![Value::Float(3.5)],
+            system_time: None,
         });
         let json = serde_json::Value::from(v);
         assert!(

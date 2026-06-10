@@ -252,6 +252,10 @@ impl SparseEngine {
     /// Scan every doc_id in a collection at the requested cutoff.
     /// Returns `(doc_id, body)` pairs for live versions only. O(N)
     /// collection-wide; callers add filter/limit on top.
+    /// `predicate` is evaluated against each surviving version's document body
+    /// before it counts toward `limit`, so a selective filter never causes the
+    /// scan to early-stop with fewer matching rows than exist. Pass `&|_| true`
+    /// for an unfiltered scan.
     pub fn versioned_scan_as_of(
         &self,
         tenant: u64,
@@ -259,6 +263,7 @@ impl SparseEngine {
         sys_cutoff_ms: Option<i64>,
         valid_at_ms: Option<i64>,
         limit: usize,
+        predicate: &dyn Fn(&[u8]) -> bool,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
         let lo = coll_prefix(tenant, coll);
         let hi = coll_prefix_end(tenant, coll);
@@ -297,7 +302,7 @@ impl SparseEngine {
             };
             if current_id.as_deref() != Some(doc_id) {
                 if let Some(prev_id) = current_id.as_ref() {
-                    flush_scan(prev_id, &best_for_current, valid_at_ms, &mut out)?;
+                    flush_scan(prev_id, &best_for_current, valid_at_ms, predicate, &mut out)?;
                     if out.len() >= limit {
                         return Ok(out);
                     }
@@ -313,9 +318,77 @@ impl SparseEngine {
             });
         }
         if let Some(prev_id) = current_id.as_ref() {
-            flush_scan(prev_id, &best_for_current, valid_at_ms, &mut out)?;
+            flush_scan(prev_id, &best_for_current, valid_at_ms, predicate, &mut out)?;
         }
         Ok(out)
+    }
+
+    /// Audit-log scan: every live system-time version of every doc in the
+    /// collection, ordered ascending by `sys_from_ms` (ties broken by
+    /// `doc_id`). Tombstone / GDPR-erased versions are skipped. Unlike
+    /// [`Self::versioned_scan_as_of`] this does **not** collapse to the
+    /// newest-per-id — it yields the full history (`AS OF SYSTEM TIME NULL`).
+    ///
+    /// Returns `(doc_id, sys_from_ms, body)` tuples. The handler projects
+    /// `sys_from_ms` into the output as the system-time column.
+    ///
+    /// `predicate` is evaluated against each version's document body **before**
+    /// the `limit` truncation, so a selective filter never causes the scan to
+    /// return fewer rows than exist (the caller must push its scan filters in
+    /// here rather than filtering the truncated result). Pass `&|_| true` for
+    /// an unfiltered scan.
+    pub fn versioned_scan_all(
+        &self,
+        tenant: u64,
+        coll: &str,
+        valid_at_ms: Option<i64>,
+        limit: usize,
+        predicate: &dyn Fn(&[u8]) -> bool,
+    ) -> crate::Result<Vec<(String, i64, Vec<u8>)>> {
+        let lo = coll_prefix(tenant, coll);
+        let hi = coll_prefix_end(tenant, coll);
+        let txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
+        let t = txn
+            .open_table(DOCUMENTS_VERSIONED)
+            .map_err(|e| redb_err("open table", e))?;
+        let range = t
+            .range(lo.as_str()..hi.as_str())
+            .map_err(|e| redb_err("range", e))?;
+
+        let mut all: Vec<(String, i64, Vec<u8>)> = Vec::new();
+        for r in range {
+            let (k, v) = r.map_err(|e| redb_err("entry", e))?;
+            let key_str = k.value();
+            let Some((id_part, suffix)) = key_str.rsplit_once('\x00') else {
+                continue;
+            };
+            let Some(doc_id) = id_part.strip_prefix(lo.as_str()) else {
+                continue;
+            };
+            let Ok(sf) = suffix.parse::<i64>() else {
+                continue;
+            };
+            let bytes = v.value().to_vec();
+            let decoded = decode_value(&bytes)?;
+            if !decoded.is_live() {
+                continue;
+            }
+            if let Some(vt) = valid_at_ms
+                && (vt < decoded.valid_from_ms || vt >= decoded.valid_until_ms)
+            {
+                continue;
+            }
+            // Push the caller's scan filters down here so the `limit` truncation
+            // below counts only matching versions, never raw scanned rows.
+            if !predicate(decoded.body) {
+                continue;
+            }
+            all.push((doc_id.to_string(), sf, decoded.body.to_vec()));
+        }
+        // Global ascending order by system time; deterministic on ties.
+        all.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        all.truncate(limit);
+        Ok(all)
     }
 }
 
@@ -325,6 +398,7 @@ fn flush_scan(
     id: &str,
     pick: &Option<(i64, Vec<u8>)>,
     valid_at_ms: Option<i64>,
+    predicate: &dyn Fn(&[u8]) -> bool,
     out: &mut Vec<(String, Vec<u8>)>,
 ) -> crate::Result<()> {
     let Some((_sf, v)) = pick else { return Ok(()) };
@@ -335,6 +409,11 @@ fn flush_scan(
     if let Some(vt) = valid_at_ms
         && (vt < decoded.valid_from_ms || vt >= decoded.valid_until_ms)
     {
+        return Ok(());
+    }
+    // Caller's scan filters are pushed down here so they are applied before the
+    // row counts toward the scan's `limit`.
+    if !predicate(decoded.body) {
         return Ok(());
     }
     out.push((id.to_string(), decoded.body.to_vec()));

@@ -82,11 +82,14 @@ fn write_native_value(buf: &mut Vec<u8>, value: &crate::Value) {
                 buf.extend_from_slice(&(*f as f64).to_be_bytes());
             }
         }
-        // ArrayCell is encoded as a 2-key map `{coords:[...], attrs:[...]}`
-        // so the pgwire `msgpack_to_json_string` transcoder produces clean
-        // JSON for clients reading slice/project rows.
+        // ArrayCell is encoded as a `{coords:[...], attrs:[...]}` map so the
+        // pgwire `msgpack_to_json_string` transcoder produces clean JSON for
+        // clients reading slice/project rows. On audit-log (AS OF SYSTEM TIME
+        // NULL) reads each version carries its system-time, surfaced as the
+        // `_ts_system` column (mirrors the document-engine audit-log shape).
         crate::Value::ArrayCell(cell) => {
-            write_native_map_header(buf, 2);
+            let map_len = if cell.system_time.is_some() { 3 } else { 2 };
+            write_native_map_header(buf, map_len);
             write_native_str(buf, "coords");
             write_native_array_header(buf, cell.coords.len());
             for v in &cell.coords {
@@ -96,6 +99,10 @@ fn write_native_value(buf: &mut Vec<u8>, value: &crate::Value) {
             write_native_array_header(buf, cell.attrs.len());
             for v in &cell.attrs {
                 write_native_value(buf, v);
+            }
+            if let Some(ts) = cell.system_time {
+                write_native_str(buf, "_ts_system");
+                write_native_int(buf, ts);
             }
         }
     }

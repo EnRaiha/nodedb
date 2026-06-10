@@ -13,6 +13,7 @@ use std::sync::Arc;
 use nodedb_array::query::ceiling::{CeilingParams, CeilingResult, ceiling_resolve_cell};
 use nodedb_array::schema::ArraySchema;
 use nodedb_array::segment::{MbrQueryPredicate, TilePayload, extract_cell_bytes};
+use nodedb_array::tile::cell_payload::{CellPayload, is_cell_sentinel};
 use nodedb_array::tile::sparse_tile::{SparseTile, SparseTileBuilder};
 use nodedb_array::types::TileId;
 use nodedb_array::types::coord::value::CoordValue;
@@ -31,6 +32,10 @@ use crate::engine::array::memtable::Memtable;
 /// <root>/<segment-id-2>.ndas
 /// ...
 /// ```
+/// One materialized cell version returned by an all-versions scan:
+/// `(hilbert_prefix, coord, system_from_ms, payload)`.
+pub type CellVersion = (u64, Vec<CoordValue>, i64, CellPayload);
+
 pub struct ArrayStore {
     root: PathBuf,
     schema: Arc<ArraySchema>,
@@ -263,16 +268,7 @@ impl ArrayStore {
         };
 
         // Collect all distinct hilbert_prefix values present in any version.
-        let mut all_prefixes: HashSet<u64> = HashSet::new();
-        for h in self.segments.values() {
-            let reader = h.reader();
-            for entry in reader.tiles() {
-                all_prefixes.insert(entry.tile_id.hilbert_prefix);
-            }
-        }
-        for (tile_id, _) in self.memtable.iter() {
-            all_prefixes.insert(tile_id.hilbert_prefix);
-        }
+        let all_prefixes = self.all_hilbert_prefixes();
 
         // Did any version exist at all in the store?
         let any_versions = !all_prefixes.is_empty();
@@ -282,39 +278,7 @@ impl ArrayStore {
 
         for prefix in all_prefixes {
             // Collect all distinct coords across every version for this prefix.
-            let mut coords: Vec<Vec<CoordValue>> = Vec::new();
-
-            // From memtable versions.
-            for (_, buf) in self.memtable.iter_tile_versions(prefix, i64::MAX) {
-                for coord_key in buf.all_coord_keys() {
-                    let coord = Memtable::decode_coord_key(coord_key)?;
-                    if !coords.contains(&coord) {
-                        coords.push(coord);
-                    }
-                }
-            }
-
-            // From segment versions (newest-first per segment, but we only need
-            // coords here so order within a segment doesn't matter).
-            for h in self.segments.values() {
-                let reader = h.reader();
-                for item in reader.iter_tile_versions(prefix, i64::MAX)? {
-                    let (_, tile_payload) = item?;
-                    if let TilePayload::Sparse(sparse) = &tile_payload {
-                        let n = sparse.nnz() as usize;
-                        for row in 0..n {
-                            let coord: Vec<CoordValue> = sparse
-                                .dim_dicts
-                                .iter()
-                                .map(|d| d.values[d.indices[row] as usize].clone())
-                                .collect();
-                            if !coords.contains(&coord) {
-                                coords.push(coord);
-                            }
-                        }
-                    }
-                }
-            }
+            let coords = self.distinct_coords_for_prefix(prefix)?;
 
             let mut builder = SparseTileBuilder::new(&self.schema);
             for coord in &coords {
@@ -363,6 +327,53 @@ impl ArrayStore {
         Ok((out, truncated_before_horizon))
     }
 
+    /// Audit-log scan: return every **live** cell-version across all system times.
+    ///
+    /// Each returned entry is `(hilbert_prefix, coord, system_from_ms, payload)`.
+    /// Tombstoned and erased versions are skipped — mirrors `versioned_scan_all`
+    /// in the document engine.
+    ///
+    /// When `valid_at_ms` is `Some(vt)`, only versions whose
+    /// `valid_from_ms <= vt < valid_until_ms` are included.
+    ///
+    /// The caller is responsible for sorting and applying limits.
+    pub fn scan_tiles_all_versions(
+        &self,
+        valid_at_ms: Option<i64>,
+    ) -> Result<Vec<CellVersion>, nodedb_array::ArrayError> {
+        // Collect all distinct (hilbert_prefix, coord) pairs.
+        let all_prefixes = self.all_hilbert_prefixes();
+
+        let mut out: Vec<CellVersion> = Vec::new();
+
+        for prefix in all_prefixes {
+            // Collect all distinct coords for this prefix (across all versions).
+            let coords = self.distinct_coords_for_prefix(prefix)?;
+
+            for coord in &coords {
+                // All versions for this coord across memtable + segments,
+                // newest-first by system_from_ms.
+                let versions = self.cell_versions_for_coord(prefix, coord, i64::MAX)?;
+                for (tile_id, bytes) in &versions {
+                    // Skip tombstones and erasures — emit only live payloads.
+                    if is_cell_sentinel(bytes) {
+                        continue;
+                    }
+                    let payload = CellPayload::decode(bytes)?;
+                    // Apply valid-time point filter if requested.
+                    if let Some(vt) = valid_at_ms
+                        && !(payload.valid_from_ms <= vt && vt < payload.valid_until_ms)
+                    {
+                        continue;
+                    }
+                    out.push((prefix, coord.clone(), tile_id.system_from_ms, payload));
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Resolve the ceiling for a specific cell coordinate.
     ///
     /// Returns the raw `CeilingResult` so callers can distinguish between
@@ -397,6 +408,66 @@ impl ArrayStore {
             coord,
             &params,
         )
+    }
+
+    /// Collect every distinct `hilbert_prefix` present in any tile version,
+    /// across both the memtable and all open segments.
+    fn all_hilbert_prefixes(&self) -> HashSet<u64> {
+        let mut all_prefixes: HashSet<u64> = HashSet::new();
+        for h in self.segments.values() {
+            for entry in h.reader().tiles() {
+                all_prefixes.insert(entry.tile_id.hilbert_prefix);
+            }
+        }
+        for (tile_id, _) in self.memtable.iter() {
+            all_prefixes.insert(tile_id.hilbert_prefix);
+        }
+        all_prefixes
+    }
+
+    /// Collect every distinct cell coordinate for a given `hilbert_prefix`,
+    /// scanning all versions across the memtable and all segments. Order is
+    /// insertion order (memtable coords first); callers that need a stable
+    /// ordering must sort the result themselves.
+    fn distinct_coords_for_prefix(
+        &self,
+        prefix: u64,
+    ) -> Result<Vec<Vec<CoordValue>>, nodedb_array::ArrayError> {
+        let mut coords: Vec<Vec<CoordValue>> = Vec::new();
+
+        // From memtable versions.
+        for (_, buf) in self.memtable.iter_tile_versions(prefix, i64::MAX) {
+            for coord_key in buf.all_coord_keys() {
+                let coord = Memtable::decode_coord_key(coord_key)?;
+                if !coords.contains(&coord) {
+                    coords.push(coord);
+                }
+            }
+        }
+
+        // From segment versions (newest-first per segment, but we only need
+        // coords here so order within a segment doesn't matter).
+        for h in self.segments.values() {
+            let reader = h.reader();
+            for item in reader.iter_tile_versions(prefix, i64::MAX)? {
+                let (_, tile_payload) = item?;
+                if let TilePayload::Sparse(sparse) = &tile_payload {
+                    let n = sparse.nnz() as usize;
+                    for row in 0..n {
+                        let coord: Vec<CoordValue> = sparse
+                            .dim_dicts
+                            .iter()
+                            .map(|d| d.values[d.indices[row] as usize].clone())
+                            .collect();
+                        if !coords.contains(&coord) {
+                            coords.push(coord);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(coords)
     }
 
     /// Build a `(TileId, raw_bytes)` list for a specific `coord` across all
