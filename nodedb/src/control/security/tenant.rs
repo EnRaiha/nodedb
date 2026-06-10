@@ -102,6 +102,11 @@ pub struct TenantIsolation {
     usage: HashMap<TenantId, TenantUsage>,
     /// Default quota applied to tenants without explicit config.
     default_quota: TenantQuota,
+    /// Monotonic high-water-mark of every tenant id observed, used to
+    /// allocate fresh ids without a catalog (the embedded / unit path).
+    /// The catalog's durable `tenant_id_hwm` is authoritative when one
+    /// is wired up; this mirror only serves the no-catalog fallback.
+    id_hwm: u64,
 }
 
 impl TenantIsolation {
@@ -110,12 +115,27 @@ impl TenantIsolation {
             quotas: HashMap::new(),
             usage: HashMap::new(),
             default_quota,
+            id_hwm: 0,
         }
     }
 
     /// Set quota for a specific tenant.
     pub fn set_quota(&mut self, tenant_id: TenantId, quota: TenantQuota) {
+        self.id_hwm = self.id_hwm.max(tenant_id.as_u64());
         self.quotas.insert(tenant_id, quota);
+    }
+
+    /// Allocate the next tenant id from the in-memory high-water-mark,
+    /// skipping the reserved system (`0`) and bootstrap (`1`) slots.
+    /// Used only when no catalog is wired up; with a catalog,
+    /// `SystemCatalog::allocate_tenant_id` is the durable authority.
+    pub fn allocate_tenant_id(&mut self) -> u64 {
+        let next = self
+            .id_hwm
+            .max(crate::control::security::catalog::tenant_id_hwm::FIRST_USER_TENANT_ID - 1)
+            + 1;
+        self.id_hwm = next;
+        next
     }
 
     /// Whether a tenant already has an explicit quota record.

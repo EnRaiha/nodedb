@@ -50,6 +50,7 @@ pub mod surrogate_pk;
 pub mod synonym_groups;
 pub mod system_catalog;
 pub mod tables;
+pub mod tenant_id_hwm;
 pub mod tenant_quotas;
 pub mod topics;
 pub mod trigger_types;

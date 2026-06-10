@@ -54,6 +54,15 @@ fn parse_tenant_options<'a>(rest: &[&'a str]) -> PgWireResult<TenantOptions<'a>>
     })
 }
 
+/// The default username auto-provisioned as a tenant's `tenant_admin`
+/// when `CREATE TENANT` is run without an explicit `WITH ADMIN <user>`
+/// clause. Defined once here so the `DROP TENANT` cleanup path can
+/// identify and remove this lifecycle-owned account without the
+/// convention drifting between the two sites.
+pub(super) fn default_admin_username(tenant_name: &str) -> String {
+    format!("{tenant_name}_admin")
+}
+
 /// `CREATE TENANT [IF NOT EXISTS] <name> [ID <id>] [WITH ADMIN <user>]`
 ///
 /// Creates a tenant with default quotas. Only superuser can create tenants.
@@ -95,21 +104,27 @@ pub fn create_tenant(
         return Ok(vec![Response::Execution(Tag::new("CREATE TENANT"))]);
     }
 
-    // Pick the tenant id under a short lock scope; do NOT mutate the
-    // store yet — the post_apply side effect on every node seeds the
-    // default quota when `PutTenant` commits.
-    let tenant_id = {
-        let tenants = match state.tenants.lock() {
-            Ok(t) => t,
-            Err(p) => p.into_inner(),
-        };
-        match opts.explicit_id {
-            Some(id) => TenantId::new(id),
+    // Pick the tenant id. An explicit `ID <n>` is honored verbatim;
+    // otherwise allocate a fresh id from the durable, monotonic
+    // high-water-mark so two `CREATE TENANT`s never collide and a
+    // dropped id is never reused. The catalog counter is authoritative
+    // when wired up; the in-memory mirror covers the no-catalog path.
+    let tenant_id = match opts.explicit_id {
+        Some(id) => TenantId::new(id),
+        None => match state.credentials.catalog().as_ref() {
+            Some(catalog) => TenantId::new(
+                catalog
+                    .allocate_tenant_id()
+                    .map_err(|e| sqlstate_error("XX000", &format!("tenant id alloc: {e}")))?,
+            ),
             None => {
-                let count = tenants.tenant_count() as u64;
-                TenantId::new(count + 1)
+                let mut tenants = match state.tenants.lock() {
+                    Ok(t) => t,
+                    Err(p) => p.into_inner(),
+                };
+                TenantId::new(tenants.allocate_tenant_id())
             }
-        }
+        },
     };
 
     let now = std::time::SystemTime::now()
@@ -148,7 +163,7 @@ pub fn create_tenant(
     let admin_name = opts
         .admin_override
         .map(str::to_string)
-        .unwrap_or_else(|| format!("{name}_admin"));
+        .unwrap_or_else(|| default_admin_username(name));
     let admin_password = {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();

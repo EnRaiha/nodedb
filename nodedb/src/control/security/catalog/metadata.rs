@@ -2,6 +2,9 @@
 
 //! Metadata counter and tenant operations for the system catalog.
 
+use redb::ReadableTable;
+
+use super::tenant_id_hwm::{HWM_KEY, TENANT_ID_HWM};
 use super::types::{METADATA, StoredTenant, SystemCatalog, TENANTS, catalog_err};
 
 impl SystemCatalog {
@@ -69,6 +72,24 @@ impl SystemCatalog {
             table
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|e| catalog_err("insert tenant", e))?;
+        }
+        // Advance the durable tenant-id high-water-mark in the same
+        // transaction so the id is never reissued by a later
+        // auto-allocation — covers explicitly-chosen ids and ids
+        // replicated from a leader on follower-side applies alike.
+        {
+            let mut hwm = write_txn
+                .open_table(TENANT_ID_HWM)
+                .map_err(|e| catalog_err("open tenant_id_hwm", e))?;
+            let cur = hwm
+                .get(HWM_KEY)
+                .map_err(|e| catalog_err("get tenant_id_hwm", e))?
+                .map(|v| v.value())
+                .unwrap_or(0);
+            if tenant.tenant_id > cur {
+                hwm.insert(HWM_KEY, tenant.tenant_id)
+                    .map_err(|e| catalog_err("insert tenant_id_hwm", e))?;
+            }
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
