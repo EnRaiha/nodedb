@@ -125,6 +125,140 @@ async fn show_roles_lists_created_role() {
     );
 }
 
+/// After `DROP ROLE`, `SHOW ROLES` must not list the dropped role. A
+/// `DROP` that leaves the entry visible in `SHOW` is a ghost — the
+/// catalog and the introspection view disagree on whether the role
+/// exists.
+#[tokio::test]
+async fn show_roles_omits_dropped_role() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE ROLE ghost_role_to_drop")
+        .await
+        .expect("CREATE ROLE must succeed");
+    server
+        .exec("DROP ROLE ghost_role_to_drop")
+        .await
+        .expect("DROP ROLE must succeed");
+
+    let rows = server
+        .query_named_rows("SHOW ROLES")
+        .await
+        .expect("SHOW ROLES must not error");
+
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.values().any(|v| v == "ghost_role_to_drop")),
+        "SHOW ROLES must not list a role that was dropped: {rows:?}"
+    );
+}
+
+// ── SHOW TENANTS after DROP TENANT ───────────────────────────────────
+
+/// After `DROP TENANT`, `SHOW TENANTS` must not list the dropped tenant
+/// — neither by name nor as a ghost id-slot.
+///
+/// `CREATE TENANT` auto-provisions a `<name>_admin` user in the new
+/// tenant. `SHOW TENANTS` derives its row set from the union of
+/// catalog-registered tenants and every user's `tenant_id`, so an
+/// orphaned admin user resurrects the dropped tenant as a ghost row
+/// whose `name` is empty (the catalog row is gone) but whose
+/// `tenant_id` slot is retained. The regression guard below asserts no
+/// such empty-named ghost survives for the dropped id.
+#[tokio::test]
+async fn show_tenants_omits_dropped_tenant() {
+    let server = TestServer::start().await;
+    // Explicit high id so the new tenant does not collide with the
+    // bootstrap superuser's home tenant; the auto-provisioned
+    // `<name>_admin` is then the only user in it.
+    server
+        .exec("CREATE TENANT ghost_tenant_to_drop ID 4242")
+        .await
+        .expect("CREATE TENANT must succeed");
+
+    let before = server
+        .query_named_rows("SHOW TENANTS")
+        .await
+        .expect("SHOW TENANTS must not error");
+    let tenant_id = before
+        .iter()
+        .find(|r| {
+            r.get("name")
+                .map(|n| n == "ghost_tenant_to_drop")
+                .unwrap_or(false)
+        })
+        .and_then(|r| r.get("tenant_id"))
+        .cloned()
+        .expect("created tenant must be visible in SHOW TENANTS before drop");
+
+    server
+        .exec("DROP TENANT ghost_tenant_to_drop")
+        .await
+        .expect("DROP TENANT must succeed");
+
+    let after = server
+        .query_named_rows("SHOW TENANTS")
+        .await
+        .expect("SHOW TENANTS must not error");
+
+    assert!(
+        !after.iter().any(|r| r
+            .get("name")
+            .map(|n| n == "ghost_tenant_to_drop")
+            .unwrap_or(false)),
+        "SHOW TENANTS must not list a tenant dropped by name: {after:?}"
+    );
+    // Regression guard for the specific silent failure mode: a retained
+    // id-slot with a cleared (empty) name is the ghost signature.
+    assert!(
+        !after.iter().any(|r| r.get("tenant_id") == Some(&tenant_id)),
+        "SHOW TENANTS must not retain the id-slot of a dropped tenant \
+         (ghost row with empty name): {after:?}"
+    );
+}
+
+/// `DROP TENANT` must refuse (`42501`) when an operator-owned user
+/// still belongs to the tenant, rather than orphaning it (which leaves
+/// a `SHOW TENANTS` ghost) or silently hard-deleting it. The user and
+/// the tenant must both survive the refused drop.
+#[tokio::test]
+async fn drop_tenant_refuses_when_real_users_remain() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE TENANT keep_tenant ID 4243")
+        .await
+        .expect("CREATE TENANT must succeed");
+    server
+        .exec("CREATE USER keep_tenant_member WITH PASSWORD 'pw' TENANT 4243")
+        .await
+        .expect("CREATE USER must succeed");
+
+    let err = server
+        .client
+        .simple_query("DROP TENANT keep_tenant")
+        .await
+        .expect_err("DROP TENANT must be refused while a real user remains");
+    let code = err.code().map(|c| c.code().to_string()).unwrap_or_default();
+    assert_eq!(
+        code, "42501",
+        "DROP TENANT with a remaining real user must fail with 42501, got: {err}"
+    );
+
+    // No silent deletion: the real user must still exist.
+    let users = server
+        .query_named_rows("SHOW USERS")
+        .await
+        .expect("SHOW USERS must not error");
+    assert!(
+        users.iter().any(|r| r
+            .get("username")
+            .map(|n| n == "keep_tenant_member")
+            .unwrap_or(false)),
+        "the operator-owned user must survive a refused DROP TENANT: {users:?}"
+    );
+}
+
 // ── SHOW STATS / SHOW SERVER STATS / SHOW METRICS / SHOW MEMORY ──────
 
 /// `SHOW STATS` must reach a real handler. The session-parameter fallback

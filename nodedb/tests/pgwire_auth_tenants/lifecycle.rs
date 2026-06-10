@@ -20,6 +20,70 @@ async fn create_tenant() {
     assert!(events.last().unwrap().detail.contains("acme"));
 }
 
+/// Two `CREATE TENANT`s without an explicit `ID` must receive distinct
+/// ids. The pre-fix allocator derived the id from a lazily-populated
+/// traffic counter, so with no traffic every auto-allocated tenant got
+/// id 1 and the second create silently overwrote the first.
+#[tokio::test]
+async fn create_tenant_without_id_allocates_distinct_ids() {
+    let state = make_state_with_catalog();
+    let su = superuser();
+    ddl_ok(&state, &su, "CREATE TENANT alpha").await;
+    ddl_ok(&state, &su, "CREATE TENANT beta").await;
+
+    let catalog = state.credentials.catalog();
+    let catalog = catalog.as_ref().expect("catalog must be wired");
+    let a = catalog
+        .find_tenant_by_name("alpha")
+        .unwrap()
+        .expect("tenant alpha must exist");
+    let b = catalog
+        .find_tenant_by_name("beta")
+        .unwrap()
+        .expect("tenant beta must survive (not be overwritten by alpha's slot)");
+    assert_ne!(
+        a.tenant_id, b.tenant_id,
+        "two auto-allocated tenants must not share an id"
+    );
+    // Reserved slots 0 (system) and 1 (bootstrap) are never handed out.
+    assert!(a.tenant_id >= 2 && b.tenant_id >= 2, "{a:?} {b:?}");
+}
+
+/// An auto-allocated id is never reused after the tenant is dropped:
+/// the durable high-water-mark only moves forward, so a dropped id
+/// cannot be silently reassigned to a different tenant.
+#[tokio::test]
+async fn dropped_tenant_id_is_not_reused() {
+    let state = make_state_with_catalog();
+    let su = superuser();
+    ddl_ok(&state, &su, "CREATE TENANT gamma").await;
+    let catalog = state.credentials.catalog();
+    let dropped_id = catalog
+        .as_ref()
+        .unwrap()
+        .find_tenant_by_name("gamma")
+        .unwrap()
+        .expect("gamma must exist")
+        .tenant_id;
+
+    ddl_ok(&state, &su, &format!("DROP TENANT {dropped_id}")).await;
+    ddl_ok(&state, &su, "CREATE TENANT delta").await;
+
+    let reused = state
+        .credentials
+        .catalog()
+        .as_ref()
+        .unwrap()
+        .find_tenant_by_name("delta")
+        .unwrap()
+        .expect("delta must exist")
+        .tenant_id;
+    assert_ne!(
+        reused, dropped_id,
+        "a fresh tenant must not reuse a dropped tenant's id"
+    );
+}
+
 #[tokio::test]
 async fn drop_system_tenant_rejected() {
     let state = make_state();
