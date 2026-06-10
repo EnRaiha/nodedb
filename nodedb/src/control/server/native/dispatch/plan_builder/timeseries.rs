@@ -33,7 +33,7 @@ pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result
         gap_fill: String::new(),
         computed_columns: Vec::new(),
         rls_filters: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     }))
 }

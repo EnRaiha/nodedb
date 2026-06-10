@@ -514,7 +514,7 @@ impl Session {
                     surrogate,
                     pk_bytes,
                     rls_filters: Vec::new(),
-                    system_as_of_ms: None,
+                    system_time: nodedb_types::SystemTimeScope::Current,
                     valid_at_ms: None,
                 })
             }

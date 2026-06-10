@@ -21,7 +21,7 @@ pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result
         filters,
         rls_filters: Vec::new(),
         sort_keys: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
         prefilter: None,
         computed_columns: Vec::new(),

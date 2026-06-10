@@ -383,7 +383,7 @@ async fn probe_row_in_target(
         surrogate,
         pk_bytes: document_id.as_bytes().to_vec(),
         rls_filters: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
     let vshard_id = VShardId::from_collection_in_database(db_id, collection_qualified);
@@ -408,7 +408,7 @@ async fn fetch_source_row(
         surrogate,
         pk_bytes: document_id.as_bytes().to_vec(),
         rls_filters: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
     let vshard_id = VShardId::from_collection_in_database(source_db_id, source_coll_qualified);

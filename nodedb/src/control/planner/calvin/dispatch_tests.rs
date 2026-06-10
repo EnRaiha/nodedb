@@ -42,7 +42,7 @@ fn scan_task(vshard: u32) -> PhysicalTask {
             projection: vec![],
             computed_columns: vec![],
             window_functions: vec![],
-            system_as_of_ms: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             prefilter: None,
         }),

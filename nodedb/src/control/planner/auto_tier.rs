@@ -243,7 +243,7 @@ fn build_scan_task(
             gap_fill: agg.gap_fill.clone(),
             computed_columns: Vec::new(),
             rls_filters: Vec::new(),
-            system_as_of_ms: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
         }),
         post_set_op: PostSetOp::None,

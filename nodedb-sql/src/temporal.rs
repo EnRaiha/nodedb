@@ -15,6 +15,8 @@
 //! (no temporal qualifier) — every scan site must construct one even when
 //! the query is not temporal.
 
+use nodedb_types::SystemTimeScope;
+
 /// Valid-time qualifier attached to a scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ValidTime {
@@ -32,9 +34,10 @@ pub enum ValidTime {
 /// Combined bitemporal qualifier for a scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TemporalScope {
-    /// `FOR SYSTEM_TIME AS OF <ms>` cutoff, milliseconds. `None` means
-    /// current (latest) system-time version.
-    pub system_as_of_ms: Option<i64>,
+    /// System-time selection. `Current` = latest committed version;
+    /// `AsOf(ms)` = point-in-time; `AllVersions` = every system-time version
+    /// (`AS OF SYSTEM TIME NULL`, audit-log semantics).
+    pub system_time: SystemTimeScope,
     /// Valid-time qualifier.
     pub valid_time: ValidTime,
 }
@@ -42,6 +45,6 @@ pub struct TemporalScope {
 impl TemporalScope {
     /// True when either temporal axis is qualified.
     pub fn is_temporal(&self) -> bool {
-        self.system_as_of_ms.is_some() || !matches!(self.valid_time, ValidTime::Any)
+        self.system_time.is_temporal() || !matches!(self.valid_time, ValidTime::Any)
     }
 }

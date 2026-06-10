@@ -50,7 +50,7 @@ pub(crate) fn build_point_get(
                 surrogate,
                 pk_bytes,
                 rls_filters: Vec::new(),
-                system_as_of_ms: None,
+                system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
             }))
         }
@@ -254,7 +254,7 @@ pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result
         projection: Vec::new(),
         computed_columns: Vec::new(),
         window_functions: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
         prefilter: None,
     }))

@@ -53,7 +53,7 @@ pub async fn verify_hash_chain(
         projection: Vec::new(),
         computed_columns: Vec::new(),
         window_functions: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
         prefilter: None,
     });

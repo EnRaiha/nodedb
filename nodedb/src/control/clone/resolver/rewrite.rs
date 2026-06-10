@@ -9,6 +9,31 @@ use nodedb_types::DatabaseId;
 
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, KvOp, PhysicalPlan, TimeseriesOp};
+use nodedb_types::SystemTimeScope;
+
+/// Compute the source-side system-time selection for a clone scan rewrite.
+///
+/// Snapshot clones read the source at a fixed point-in-time (`effective_ms`),
+/// so they always collapse to an `AsOf` (or the plan's own selection when the
+/// clone carries no ceiling). `AllVersions` (audit log) does not compose with a
+/// snapshot clone — the request is rejected with a typed error rather than
+/// silently picking an arbitrary snapshot.
+fn rewrite_system_time(
+    effective_ms: Option<i64>,
+    plan_scope: SystemTimeScope,
+) -> crate::Result<SystemTimeScope> {
+    if matches!(plan_scope, SystemTimeScope::AllVersions) {
+        return Err(crate::Error::PlanError {
+            detail: "AS OF SYSTEM TIME NULL (all-versions) cannot be read through a \
+                     snapshot clone; query the source database directly"
+                .into(),
+        });
+    }
+    match effective_ms {
+        Some(ms) => Ok(SystemTimeScope::AsOf(ms)),
+        None => Ok(plan_scope),
+    }
+}
 
 /// Rewrite a `PhysicalPlan` to target the source database and collection at
 /// the effective source LSN.  Returns `None` for plan types that are not
@@ -42,7 +67,9 @@ pub struct RewriteForSourceParams<'a> {
     pub state: &'a Arc<SharedState>,
 }
 
-pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<PhysicalPlan> {
+pub fn rewrite_plan_for_source(
+    params: RewriteForSourceParams<'_>,
+) -> crate::Result<Option<PhysicalPlan>> {
     use crate::control::planner::sql_plan_convert::convert::db_qualified;
 
     let RewriteForSourceParams {
@@ -69,23 +96,26 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
             projection,
             computed_columns,
             window_functions,
-            system_as_of_ms,
+            system_time,
             valid_at_ms,
             prefilter,
-        }) if collection == &target_qualified => Some(PhysicalPlan::Document(DocumentOp::Scan {
-            collection: source_qualified,
-            limit: *limit,
-            offset: *offset,
-            sort_keys: sort_keys.clone(),
-            filters: filters.clone(),
-            distinct: *distinct,
-            projection: projection.clone(),
-            computed_columns: computed_columns.clone(),
-            window_functions: window_functions.clone(),
-            system_as_of_ms: effective_source_ms.or(*system_as_of_ms),
-            valid_at_ms: *valid_at_ms,
-            prefilter: prefilter.clone(),
-        })),
+        }) if collection == &target_qualified => {
+            let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
+            Ok(Some(PhysicalPlan::Document(DocumentOp::Scan {
+                collection: source_qualified,
+                limit: *limit,
+                offset: *offset,
+                sort_keys: sort_keys.clone(),
+                filters: filters.clone(),
+                distinct: *distinct,
+                projection: projection.clone(),
+                computed_columns: computed_columns.clone(),
+                window_functions: window_functions.clone(),
+                system_time,
+                valid_at_ms: *valid_at_ms,
+                prefilter: prefilter.clone(),
+            })))
+        }
 
         PhysicalPlan::Document(DocumentOp::PointGet {
             collection,
@@ -93,7 +123,7 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
             surrogate: _,
             pk_bytes,
             rls_filters,
-            system_as_of_ms,
+            system_time,
             valid_at_ms,
         }) if collection == &target_qualified => {
             // The target surrogate is not valid in the source database — each
@@ -107,20 +137,24 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
             // would force every read to wait on a degraded surrogate-store
             // probe, but they are still observable in the surrogate
             // assigner's own metrics/logs.
-            let source_surrogate = state
+            let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
+            let Some(source_surrogate) = state
                 .surrogate_assigner
                 .lookup(&source_qualified, pk_bytes)
                 .ok()
-                .flatten()?;
-            Some(PhysicalPlan::Document(DocumentOp::PointGet {
+                .flatten()
+            else {
+                return Ok(None);
+            };
+            Ok(Some(PhysicalPlan::Document(DocumentOp::PointGet {
                 collection: source_qualified,
                 document_id: document_id.clone(),
                 surrogate: source_surrogate,
                 pk_bytes: pk_bytes.clone(),
                 rls_filters: rls_filters.clone(),
-                system_as_of_ms: effective_source_ms.or(*system_as_of_ms),
+                system_time,
                 valid_at_ms: *valid_at_ms,
-            }))
+            })))
         }
 
         PhysicalPlan::Document(DocumentOp::IndexedFetch {
@@ -132,7 +166,7 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
             limit,
             offset,
         }) if collection == &target_qualified => {
-            Some(PhysicalPlan::Document(DocumentOp::IndexedFetch {
+            Ok(Some(PhysicalPlan::Document(DocumentOp::IndexedFetch {
                 collection: source_qualified,
                 path: path.clone(),
                 value: value.clone(),
@@ -140,7 +174,7 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
                 projection: projection.clone(),
                 limit: *limit,
                 offset: *offset,
-            }))
+            })))
         }
 
         PhysicalPlan::Kv(KvOp::Scan {
@@ -154,7 +188,7 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
             // (clones-of-clones still funnel through here per-level);
             // the resolver overrides it for source delegation below.
             surrogate_ceiling: _,
-        }) if collection == &target_qualified => Some(PhysicalPlan::Kv(KvOp::Scan {
+        }) if collection == &target_qualified => Ok(Some(PhysicalPlan::Kv(KvOp::Scan {
             collection: source_qualified,
             cursor: cursor.clone(),
             count: *count,
@@ -162,19 +196,19 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
             match_pattern: match_pattern.clone(),
             sort_keys: sort_keys.clone(),
             surrogate_ceiling: kv_surrogate_ceiling,
-        })),
+        }))),
 
         PhysicalPlan::Kv(KvOp::Get {
             collection,
             key,
             rls_filters,
             surrogate_ceiling: _,
-        }) if collection == &target_qualified => Some(PhysicalPlan::Kv(KvOp::Get {
+        }) if collection == &target_qualified => Ok(Some(PhysicalPlan::Kv(KvOp::Get {
             collection: source_qualified,
             key: key.clone(),
             rls_filters: rls_filters.clone(),
             surrogate_ceiling: kv_surrogate_ceiling,
-        })),
+        }))),
 
         PhysicalPlan::Columnar(ColumnarOp::Scan {
             collection,
@@ -183,22 +217,25 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
             filters,
             rls_filters,
             sort_keys,
-            system_as_of_ms,
+            system_time,
             valid_at_ms,
             prefilter,
             computed_columns,
-        }) if collection == &target_qualified => Some(PhysicalPlan::Columnar(ColumnarOp::Scan {
-            collection: source_qualified,
-            projection: projection.clone(),
-            limit: *limit,
-            filters: filters.clone(),
-            rls_filters: rls_filters.clone(),
-            sort_keys: sort_keys.clone(),
-            system_as_of_ms: effective_source_ms.or(*system_as_of_ms),
-            valid_at_ms: *valid_at_ms,
-            prefilter: prefilter.clone(),
-            computed_columns: computed_columns.clone(),
-        })),
+        }) if collection == &target_qualified => {
+            let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
+            Ok(Some(PhysicalPlan::Columnar(ColumnarOp::Scan {
+                collection: source_qualified,
+                projection: projection.clone(),
+                limit: *limit,
+                filters: filters.clone(),
+                rls_filters: rls_filters.clone(),
+                sort_keys: sort_keys.clone(),
+                system_time,
+                valid_at_ms: *valid_at_ms,
+                prefilter: prefilter.clone(),
+                computed_columns: computed_columns.clone(),
+            })))
+        }
 
         PhysicalPlan::Timeseries(TimeseriesOp::Scan {
             collection,
@@ -212,10 +249,11 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
             gap_fill,
             computed_columns,
             rls_filters,
-            system_as_of_ms,
+            system_time,
             valid_at_ms,
         }) if collection == &target_qualified => {
-            Some(PhysicalPlan::Timeseries(TimeseriesOp::Scan {
+            let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
+            Ok(Some(PhysicalPlan::Timeseries(TimeseriesOp::Scan {
                 collection: source_qualified,
                 time_range: *time_range,
                 projection: projection.clone(),
@@ -227,9 +265,9 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
                 gap_fill: gap_fill.clone(),
                 computed_columns: computed_columns.clone(),
                 rls_filters: rls_filters.clone(),
-                system_as_of_ms: effective_source_ms.or(*system_as_of_ms),
+                system_time,
                 valid_at_ms: *valid_at_ms,
-            }))
+            })))
         }
 
         // Write operations, DDL, and all other engine plans are not replicated
@@ -248,7 +286,7 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> Option<Phy
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => None,
+        | PhysicalPlan::ClusterArray(_) => Ok(None),
     }
 }
 

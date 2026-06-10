@@ -194,4 +194,34 @@ mod tests {
             "expected ClusterArray variant"
         );
     }
+
+    #[test]
+    fn all_versions_aggregate_is_rejected() {
+        // AS OF SYSTEM TIME NULL (AllVersions) is meaningless for an aggregate —
+        // summing across every historical version is undefined. The planner must
+        // reject it with a typed PlanError rather than silently degrading to a
+        // live read. This is why `ArrayOp::Aggregate` / `ClusterArrayOp::Agg`
+        // carry `Option<i64>` (Current | AsOf) and not `SystemTimeScope`: the
+        // AllVersions state is made unrepresentable by rejecting it here.
+        // Audit-log reads go through NDARRAY_SLICE instead.
+        let ctx = make_ctx(false);
+        let temporal = TemporalScope {
+            system_time: nodedb_types::SystemTimeScope::AllVersions,
+            ..TemporalScope::default()
+        };
+        let err = convert_agg(
+            "sales",
+            "revenue",
+            ArrayReducerAst::Sum,
+            None,
+            temporal,
+            TenantId::new(1),
+            &ctx,
+        )
+        .expect_err("AllVersions aggregate must be rejected");
+        assert!(
+            matches!(&err, crate::Error::PlanError { detail } if detail.contains("not meaningful")),
+            "expected typed PlanError about AllVersions aggregate, got {err:?}"
+        );
+    }
 }

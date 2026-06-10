@@ -24,7 +24,6 @@ use nodedb_cluster::distributed_array::coordinator::{
     ArrayCoordinator, ArrayWriteCoordParams, coord_delete, coord_put,
 };
 use nodedb_cluster::distributed_array::handler::handle_array_shard_rpc;
-use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
 use nodedb_cluster::distributed_array::rpc::ShardRpcDispatch;
 use nodedb_cluster::distributed_array::wire::{ArrayShardAggReq, ArrayShardSliceReq};
 use nodedb_cluster::error::Result as ClusterResult;
@@ -193,7 +192,7 @@ struct SliceArgs<'a> {
     limit: u32,
     slice_hilbert_ranges: &'a [(u64, u64)],
     prefix_bits: u8,
-    system_as_of: Option<i64>,
+    system_time: nodedb_types::SystemTimeScope,
     valid_at_ms: Option<i64>,
 }
 
@@ -247,7 +246,7 @@ impl ClusterArrayExecutor {
                 limit,
                 slice_hilbert_ranges,
                 prefix_bits,
-                system_as_of,
+                system_time,
                 valid_at_ms,
             } => {
                 self.execute_slice(SliceArgs {
@@ -257,7 +256,7 @@ impl ClusterArrayExecutor {
                     limit: *limit,
                     slice_hilbert_ranges,
                     prefix_bits: *prefix_bits,
-                    system_as_of: *system_as_of,
+                    system_time: *system_time,
                     valid_at_ms: *valid_at_ms,
                 })
                 .await
@@ -318,7 +317,7 @@ impl ClusterArrayExecutor {
             limit,
             slice_hilbert_ranges,
             prefix_bits,
-            system_as_of,
+            system_time,
             valid_at_ms,
         } = args;
         let coordinator = ArrayCoordinator::for_slice(
@@ -346,11 +345,11 @@ impl ClusterArrayExecutor {
             prefix_bits: 0,
             slice_hilbert_ranges: vec![],
             shard_hilbert_range: None,
-            system_as_of,
+            system_time,
             valid_at_ms,
         };
         let result = coordinator
-            .coord_slice(req, limit)
+            .coord_slice(req, limit, system_time)
             .await
             .map_err(cluster_err)?;
 
@@ -418,8 +417,7 @@ impl ClusterArrayExecutor {
             system_as_of,
             valid_at_ms,
         };
-        let partials: Vec<ArrayAggPartial> =
-            coordinator.coord_agg(req).await.map_err(cluster_err)?;
+        let agg = coordinator.coord_agg(req).await.map_err(cluster_err)?;
 
         // Decode the reducer so we know which field to finalize.
         let reducer: nodedb_physical::physical_plan::ArrayReducer =
@@ -429,10 +427,19 @@ impl ClusterArrayExecutor {
             })?;
 
         // Finalize each partial into the same {"group", "result"} / {"result"}
-        // shape the local ArrayOp::Aggregate path produces. This ensures
-        // payload_to_response → decode_payload_to_json emits the same JSON
-        // structure for both single-node and cluster agg queries.
-        let rows = finalize_agg_partials(&partials, &reducer, group_by_dim);
+        // shape the local ArrayOp::Aggregate path produces, plus the trailing
+        // {"truncated_before_horizon": bool} summary row for temporal queries
+        // only. This ensures payload_to_response → decode_payload_to_json emits
+        // the same JSON structure for both single-node and cluster agg queries —
+        // including the below-horizon signal, which must not be silently dropped.
+        let emit_horizon = system_as_of.is_some() || valid_at_ms.is_some();
+        let rows = finalize_agg_partials(
+            &agg.partials,
+            &reducer,
+            group_by_dim,
+            agg.truncated_before_horizon,
+            emit_horizon,
+        );
         zerompk::to_msgpack_vec(&rows).map_err(encode_err)
     }
 

@@ -285,7 +285,7 @@ pub async fn fetch_old_row(
         surrogate,
         pk_bytes,
         rls_filters: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
     let vshard_id = crate::types::VShardId::from_key(document_id.as_bytes());
