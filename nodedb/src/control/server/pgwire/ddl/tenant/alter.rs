@@ -39,12 +39,18 @@ pub fn alter_tenant(
     }
 
     // Accept either a numeric id or a tenant name (mirrors CREATE/SHOW/DROP).
-    let tenant_id = super::resolve_tenant_ref(state, parts[2])?.ok_or_else(|| {
-        sqlstate_error(
+    let tenant_id = super::resolve_tenant_ref(state, parts[2])?
+        .ok_or_else(|| sqlstate_error("42704", &format!("tenant '{}' does not exist", parts[2])))?;
+
+    // Existence gate, uniform across numeric ids and resolved names: altering an
+    // unknown tenant must error rather than silently seed a default quota for a
+    // phantom id.
+    if !super::tenant_exists(state, tenant_id)? {
+        return Err(sqlstate_error(
             "42704",
             &format!("tenant '{}' does not exist", parts[2]),
-        )
-    })?;
+        ));
+    }
 
     if !parts[3].eq_ignore_ascii_case("SET") || !parts[4].eq_ignore_ascii_case("QUOTA") {
         return Err(sqlstate_error(

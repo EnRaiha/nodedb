@@ -44,8 +44,11 @@ use super::super::types::sqlstate_error;
 ///
 /// The numeric form is the legacy fast path and requires no catalog access;
 /// any `u64`-parseable token returns `Ok(Some(TenantId::new(id)))` whether or
-/// not that id currently exists (callers that need existence still rely on
-/// their own `tenant_exists`-style check).
+/// not that id currently exists. Resolving a token to an id does **not** assert
+/// the tenant exists — callers must gate the operation through [`tenant_exists`]
+/// so that an unknown numeric id and an unknown name behave identically (both
+/// `42704`, or an `IF EXISTS` no-op). Skipping that check reintroduces the
+/// id/name asymmetry where a bogus numeric id silently "succeeds".
 ///
 /// A non-numeric token is treated as a tenant name and resolved via
 /// [`find_tenant_by_name`]. Single-quoted names are unwrapped, mirroring the
@@ -91,4 +94,25 @@ pub(super) fn resolve_tenant_ref(
         .find_tenant_by_name(name)
         .map_err(|e| sqlstate_error("XX000", &format!("catalog read: {e}")))?
         .map(|stored| TenantId::new(stored.tenant_id)))
+}
+
+/// Whether `tenant_id` currently exists, consulting the redb catalog when one
+/// is wired up and falling back to the in-memory quota table otherwise.
+///
+/// Shared by `DROP`, `ALTER`, and `PURGE TENANT` so existence is enforced the
+/// same way for numeric ids and resolved names — see [`resolve_tenant_ref`].
+pub(super) fn tenant_exists(state: &SharedState, tenant_id: TenantId) -> PgWireResult<bool> {
+    if let Some(catalog) = state.credentials.catalog() {
+        let present = catalog
+            .load_all_tenants()
+            .map_err(|e| sqlstate_error("XX000", &format!("catalog read: {e}")))?
+            .iter()
+            .any(|t| t.tenant_id == tenant_id.as_u64());
+        return Ok(present);
+    }
+    let tenants = match state.tenants.lock() {
+        Ok(t) => t,
+        Err(p) => p.into_inner(),
+    };
+    Ok(tenants.has_quota(tenant_id))
 }
