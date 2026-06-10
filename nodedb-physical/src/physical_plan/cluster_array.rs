@@ -14,6 +14,7 @@
 //! not the SPSC bridge.
 
 use nodedb_array::types::ArrayId;
+use nodedb_types::SystemTimeScope;
 
 /// Cluster-mode array operations executed by the coordinator on the
 /// Control Plane.
@@ -46,8 +47,14 @@ pub enum ClusterArrayOp {
         slice_hilbert_ranges: Vec<(u64, u64)>,
         /// Routing granularity from the array catalog entry.
         prefix_bits: u8,
-        /// Bitemporal system-time cutoff. `None` = live read.
-        system_as_of: Option<i64>,
+        /// Bitemporal system-time scope for this slice fan-out.
+        ///
+        /// - `Current`: live read.
+        /// - `AsOf(t)`: point-in-time at `t`.
+        /// - `AllVersions`: audit-log fan-out — each shard emits all live
+        ///   cell-versions; the coordinator merge-sorts by
+        ///   `ArrayCell::system_time` ascending before applying the limit.
+        system_time: SystemTimeScope,
         /// Bitemporal valid-time point. `None` = no valid-time filter.
         valid_at_ms: Option<i64>,
     },

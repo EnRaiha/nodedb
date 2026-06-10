@@ -2,14 +2,17 @@
 
 //! Merge functions for distributed array query results.
 //!
-//! Slice merges concatenate row sets from shards in arrival order and
-//! apply the coordinator-side limit. The output preserves each shard's
-//! intra-shard order; cross-shard ordering reflects arrival, since the
-//! wire response (`ArrayShardSliceResp::rows_msgpack`) is a flat opaque
-//! `Vec<Vec<u8>>` with no per-row sort key. A globally Hilbert-ordered
+//! Plain slice merges (`merge_slice_rows`) concatenate row sets from shards
+//! in arrival order and apply the coordinator-side limit, preserving each
+//! shard's intra-shard order. Cross-shard ordering reflects arrival, since
+//! a plain slice row carries no per-row sort key. A globally Hilbert-ordered
 //! merge would require carrying a parallel prefix column on the wire and
-//! a k-way merge here — that is a wire-format change, not a merger
-//! change, and lives outside this module.
+//! a k-way merge here — that is a wire-format change, not a merger change,
+//! and lives outside this module.
+//!
+//! Audit-log slice merges (`merge_slice_rows_sorted`) do carry a sort key:
+//! each native-msgpack row holds a `_ts_system` column, so these are merged
+//! globally by system-time ascending before the limit is applied.
 //!
 //! Aggregate merges combine per-shard partial aggregates using
 //! reducer-specific arithmetic (SUM/COUNT/MIN/MAX — same Welford
@@ -18,6 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::wire::{ArrayShardAggResp, ArrayShardSliceResp};
+use crate::error::{ClusterError, Result};
 
 /// Partial aggregate contributed by a single shard for one group-by bucket.
 ///
@@ -126,6 +130,79 @@ pub fn merge_slice_rows(
         }
     }
     merged
+}
+
+/// Merge row batches from multiple shards for an audit-log (`AllVersions`) fan-out.
+///
+/// Unlike `merge_slice_rows`, which concatenates rows in shard-arrival order,
+/// this function decodes each row's system-time and sorts globally by that
+/// time ascending (ties broken by the raw msgpack byte sequence as a stable
+/// coord proxy) before applying the limit.
+///
+/// Each row is the native (untagged) msgpack map emitted by the array slice
+/// handler — `{"coords": [...], "attrs": [...], "_ts_system": <int>}`. In
+/// audit-log mode every row carries `_ts_system`; a row that fails to decode
+/// or is missing that column is a wire-contract violation (corruption or a
+/// handler bug), so this function returns an error rather than silently
+/// mis-ordering the result — see the "no silent partial success" rule.
+///
+/// Pass `coordinator_limit = 0` to return all rows without truncation.
+pub fn merge_slice_rows_sorted(
+    shard_resps: &[ArrayShardSliceResp],
+    coordinator_limit: u32,
+) -> Result<Vec<Vec<u8>>> {
+    // Collect all raw rows from all shards. Each entry is (system_time_ms, raw_bytes).
+    let mut tagged: Vec<(i64, Vec<u8>)> = Vec::new();
+    for resp in shard_resps {
+        for row in &resp.rows_msgpack {
+            let ts = decode_system_time(row)?;
+            tagged.push((ts, row.clone()));
+        }
+    }
+    // Stable sort: ascending by system_time, then by raw bytes for tie-breaking.
+    tagged.sort_by(|(ts_a, bytes_a), (ts_b, bytes_b)| {
+        ts_a.cmp(ts_b).then_with(|| bytes_a.cmp(bytes_b))
+    });
+    let total = tagged.len();
+    let cap = if coordinator_limit > 0 {
+        total.min(coordinator_limit as usize)
+    } else {
+        total
+    };
+    Ok(tagged.into_iter().take(cap).map(|(_, b)| b).collect())
+}
+
+/// Decode the `_ts_system` system-time column from a native-msgpack audit-log row.
+///
+/// Rows are encoded by the array slice handler via the native (untagged)
+/// `value_to_msgpack` writer, so they decode back to a `Value::Object` map.
+/// In audit-log mode the handler always stamps `_ts_system`; its absence — or
+/// a row that doesn't decode as an object at all — means the wire payload is
+/// corrupt or the handler contract was broken, both of which are hard errors.
+fn decode_system_time(bytes: &[u8]) -> Result<i64> {
+    let value = nodedb_types::value_from_msgpack(bytes).map_err(|e| ClusterError::Codec {
+        detail: format!("audit-log row decode in sorted merge: {e}"),
+    })?;
+    match value {
+        nodedb_types::Value::Object(map) => match map.get("_ts_system") {
+            Some(nodedb_types::Value::Integer(ts)) => Ok(*ts),
+            Some(other) => Err(ClusterError::Codec {
+                detail: format!(
+                    "audit-log row _ts_system is {}, expected integer",
+                    other.type_name()
+                ),
+            }),
+            None => Err(ClusterError::Codec {
+                detail: "audit-log row missing _ts_system column in sorted merge".into(),
+            }),
+        },
+        other => Err(ClusterError::Codec {
+            detail: format!(
+                "audit-log row decoded as {}, expected object map",
+                other.type_name()
+            ),
+        }),
+    }
 }
 
 /// Merge per-shard partial aggregates into one result per group-by key.
@@ -375,6 +452,109 @@ mod tests {
         // Total 4 rows, limit 3 → first 3.
         let rows = merge_slice_rows(&[r0, r1], 3);
         assert_eq!(rows.len(), 3);
+    }
+
+    /// Build a wire row exactly as the array slice handler does: a native
+    /// (untagged) msgpack encoding of `Value::ArrayCell` carrying `_ts_system`.
+    fn audit_row(system_time: i64, coord: i64) -> Vec<u8> {
+        use nodedb_types::Value;
+        use nodedb_types::array_cell::ArrayCell;
+        let cell = Value::ArrayCell(ArrayCell {
+            coords: vec![Value::Integer(coord)],
+            attrs: vec![Value::Float(1.0)],
+            system_time: Some(system_time),
+        });
+        nodedb_types::value_to_msgpack(&cell).expect("encode audit row")
+    }
+
+    #[test]
+    fn merge_slice_rows_sorted_orders_by_system_time_across_shards() {
+        // Shard 0 emits ts=30 then ts=10; shard 1 emits ts=20. The merged
+        // output must be globally ascending by system-time: 10, 20, 30.
+        let r0 = ArrayShardSliceResp {
+            shard_id: 0,
+            rows_msgpack: vec![audit_row(30, 3), audit_row(10, 1)],
+            truncated: false,
+            truncated_before_horizon: false,
+        };
+        let r1 = ArrayShardSliceResp {
+            shard_id: 1,
+            rows_msgpack: vec![audit_row(20, 2)],
+            truncated: false,
+            truncated_before_horizon: false,
+        };
+        let rows = merge_slice_rows_sorted(&[r0, r1], 0).expect("sorted merge");
+        let times: Vec<i64> = rows
+            .iter()
+            .map(|b| decode_system_time(b).unwrap())
+            .collect();
+        assert_eq!(times, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn merge_slice_rows_sorted_applies_limit_after_global_sort() {
+        // Limit must cut the globally-sorted sequence, not per-shard arrival.
+        let r0 = ArrayShardSliceResp {
+            shard_id: 0,
+            rows_msgpack: vec![audit_row(50, 5), audit_row(10, 1)],
+            truncated: false,
+            truncated_before_horizon: false,
+        };
+        let r1 = ArrayShardSliceResp {
+            shard_id: 1,
+            rows_msgpack: vec![audit_row(30, 3), audit_row(20, 2)],
+            truncated: false,
+            truncated_before_horizon: false,
+        };
+        let rows = merge_slice_rows_sorted(&[r0, r1], 2).expect("sorted merge");
+        let times: Vec<i64> = rows
+            .iter()
+            .map(|b| decode_system_time(b).unwrap())
+            .collect();
+        assert_eq!(times, vec![10, 20]);
+    }
+
+    #[test]
+    fn merge_slice_rows_sorted_rejects_corrupt_row() {
+        // A row that doesn't decode as a native object map is a wire-contract
+        // violation and must surface as an error, not sort silently to the end.
+        let resp = ArrayShardSliceResp {
+            shard_id: 0,
+            rows_msgpack: vec![audit_row(10, 1), vec![0xFF, 0xFF, 0xFF]],
+            truncated: false,
+            truncated_before_horizon: false,
+        };
+        assert!(merge_slice_rows_sorted(&[resp], 0).is_err());
+    }
+
+    #[test]
+    fn agg_partial_wire_shape_is_tuple_with_horizon_flag() {
+        // The Data Plane `return_partial` path encodes `(partials, flag)` as a
+        // 2-element msgpack array (see `encode_bitemporal_agg_partial`). The
+        // cluster executor MUST decode that tuple — decoding it as a bare
+        // `Vec<ArrayAggPartial>` is a shape mismatch that fails outright and
+        // also drops the below-horizon signal. This pins the contract so the
+        // producer and consumer can't drift apart again.
+        let partials = vec![
+            ArrayAggPartial::from_single(0, 10.0),
+            ArrayAggPartial::from_single(1, 20.0),
+        ];
+        let bytes = zerompk::to_msgpack_vec(&(&partials, true)).expect("encode tuple");
+
+        // Correct shape round-trips, carrying the flag.
+        let (decoded, flag): (Vec<ArrayAggPartial>, bool) =
+            zerompk::from_msgpack(&bytes).expect("decode tuple");
+        assert_eq!(decoded.len(), 2);
+        assert!(flag);
+
+        // The old (buggy) bare-Vec decode must fail — guards the regression.
+        assert!(zerompk::from_msgpack::<Vec<ArrayAggPartial>>(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_system_time_reads_ts_system_column() {
+        let bytes = audit_row(1_700_000_000_123, 7);
+        assert_eq!(decode_system_time(&bytes).unwrap(), 1_700_000_000_123);
     }
 
     #[test]

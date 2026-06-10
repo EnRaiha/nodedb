@@ -3,7 +3,7 @@
 pub mod read;
 pub mod write;
 
-pub use read::{ArrayCoordParams, ArrayCoordinator, CoordSliceResult};
+pub use read::{ArrayCoordParams, ArrayCoordinator, CoordAggResult, CoordSliceResult};
 pub use write::{ArrayWriteCoordParams, coord_delete, coord_put, coord_put_partitioned};
 
 #[cfg(test)]
@@ -110,13 +110,13 @@ mod tests {
             prefix_bits: 0,
             slice_hilbert_ranges: vec![],
             shard_hilbert_range: None,
-            system_as_of: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
         };
 
         // 3 shards × 2 rows each = 6 merged rows.
         let result = coord
-            .coord_slice(req, 0)
+            .coord_slice(req, 0, nodedb_types::SystemTimeScope::Current)
             .await
             .expect("coord_slice should succeed");
         assert_eq!(result.rows.len(), 6);
@@ -140,12 +140,12 @@ mod tests {
             prefix_bits: 0,
             slice_hilbert_ranges: vec![],
             shard_hilbert_range: None,
-            system_as_of: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
         };
 
         let result = coord
-            .coord_slice(req, 4)
+            .coord_slice(req, 4, nodedb_types::SystemTimeScope::Current)
             .await
             .expect("coord_slice with limit should succeed");
         assert_eq!(result.rows.len(), 4);
@@ -177,9 +177,10 @@ mod tests {
             .await
             .expect("coord_agg should succeed");
 
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].count, 3);
-        assert!((merged[0].sum - 30.0).abs() < f64::EPSILON);
+        assert_eq!(merged.partials.len(), 1);
+        assert_eq!(merged.partials[0].count, 3);
+        assert!((merged.partials[0].sum - 30.0).abs() < f64::EPSILON);
+        assert!(!merged.truncated_before_horizon);
     }
 
     #[tokio::test]
@@ -190,7 +191,7 @@ mod tests {
             .coord_agg(make_agg_req())
             .await
             .expect("coord_agg with empty shards should succeed");
-        assert!(merged.is_empty());
+        assert!(merged.partials.is_empty());
     }
 
     #[tokio::test]
@@ -239,13 +240,65 @@ mod tests {
             .expect("grouped coord_agg should succeed");
 
         // group_key=0: sum=5+15=20, count=2; group_key=1: sum=20, count=1.
-        assert_eq!(merged.len(), 2);
-        let g0 = merged.iter().find(|p| p.group_key == 0).expect("group 0");
-        let g1 = merged.iter().find(|p| p.group_key == 1).expect("group 1");
+        assert_eq!(merged.partials.len(), 2);
+        let g0 = merged
+            .partials
+            .iter()
+            .find(|p| p.group_key == 0)
+            .expect("group 0");
+        let g1 = merged
+            .partials
+            .iter()
+            .find(|p| p.group_key == 1)
+            .expect("group 1");
         assert!((g0.sum - 20.0).abs() < f64::EPSILON);
         assert_eq!(g0.count, 2);
         assert!((g1.sum - 20.0).abs() < f64::EPSILON);
         assert_eq!(g1.count, 1);
+    }
+
+    #[tokio::test]
+    async fn coord_agg_or_reduces_truncated_before_horizon() {
+        // One shard reports below-horizon; the coordinator must OR-reduce the
+        // flag so the upstream caller can surface an incomplete-result signal.
+        // Dropping it here was a silent-partial-success bug.
+        struct HorizonDispatch;
+
+        #[async_trait]
+        impl ShardRpcDispatch for HorizonDispatch {
+            async fn call(&self, req: VShardEnvelope, _timeout_ms: u64) -> Result<VShardEnvelope> {
+                // Shard 1 is below horizon (zero partials); shard 0 has data.
+                let (partials, below) = if req.vshard_id == 0 {
+                    (vec![ArrayAggPartial::from_single(0, 10.0)], false)
+                } else {
+                    (vec![], true)
+                };
+                let resp = ArrayShardAggResp {
+                    shard_id: req.vshard_id,
+                    partials,
+                    truncated_before_horizon: below,
+                };
+                let payload = zerompk::to_msgpack_vec(&resp).unwrap();
+                Ok(VShardEnvelope::new(
+                    VShardMessageType::ArrayShardSliceResp,
+                    req.target_node,
+                    req.source_node,
+                    req.vshard_id,
+                    payload,
+                ))
+            }
+        }
+
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(HorizonDispatch);
+        let coord = make_coordinator(vec![0, 1], dispatch);
+        let merged = coord
+            .coord_agg(make_agg_req())
+            .await
+            .expect("coord_agg should succeed");
+        assert!(
+            merged.truncated_before_horizon,
+            "coordinator must OR-reduce the below-horizon flag across shards"
+        );
     }
 
     #[tokio::test]
@@ -264,13 +317,13 @@ mod tests {
             prefix_bits: 0,
             slice_hilbert_ranges: vec![],
             shard_hilbert_range: None,
-            system_as_of: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
         };
 
         // coordinator_limit = 0 → no cutoff → 20 rows.
         let result = coord
-            .coord_slice(req, 0)
+            .coord_slice(req, 0, nodedb_types::SystemTimeScope::Current)
             .await
             .expect("coord_slice unlimited should succeed");
         assert_eq!(result.rows.len(), 20);

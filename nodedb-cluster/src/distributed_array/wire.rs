@@ -41,9 +41,13 @@ pub struct ArrayShardSliceReq {
     /// duplicate rows in single-node harnesses where all vShards share one
     /// Data Plane.
     pub shard_hilbert_range: Option<(u64, u64)>,
-    /// Bitemporal system-time cutoff forwarded from `ArrayOp::Slice::system_as_of`.
-    /// `None` = live read.
-    pub system_as_of: Option<i64>,
+    /// Bitemporal system-time scope forwarded from `ArrayOp::Slice::system_time`.
+    ///
+    /// - `Current` = live read.
+    /// - `AsOf(t)` = point-in-time at `t`.
+    /// - `AllVersions` = audit-log fan-out — shard emits all live cell-versions,
+    ///   each tagged with `ArrayCell::system_time`.
+    pub system_time: nodedb_types::SystemTimeScope,
     /// Bitemporal valid-time point forwarded from `ArrayOp::Slice::valid_at_ms`.
     /// `None` = no valid-time filter.
     pub valid_at_ms: Option<i64>,

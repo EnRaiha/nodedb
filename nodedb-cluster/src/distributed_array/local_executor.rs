@@ -16,6 +16,26 @@ use crate::distributed_array::merge::ArrayAggPartial;
 use crate::distributed_array::wire::{ArrayShardAggReq, ArrayShardPutReq, ArrayShardSliceReq};
 use crate::error::Result;
 
+/// Result of a local shard slice: the per-row bytes plus the bitemporal
+/// below-horizon signal.
+///
+/// `truncated_before_horizon` is computed by the Data Plane (it is `true`
+/// when the `system_time` cutoff predates every stored tile version, so the
+/// shard produced zero rows for that reason). It MUST be threaded back to the
+/// coordinator so the OR-reduce across shards can surface an incomplete-result
+/// signal to the client — dropping it would silently report complete results.
+pub struct ArraySliceExec {
+    pub rows: Vec<Vec<u8>>,
+    pub truncated_before_horizon: bool,
+}
+
+/// Result of a local shard partial aggregate: the per-group partial states
+/// plus the bitemporal below-horizon signal (see [`ArraySliceExec`]).
+pub struct ArrayAggExec {
+    pub partials: Vec<ArrayAggPartial>,
+    pub truncated_before_horizon: bool,
+}
+
 /// Execute array operations against the local Data Plane.
 ///
 /// The implementor (in `nodedb`) routes the call through the SPSC bridge
@@ -36,9 +56,10 @@ pub trait ArrayLocalExecutor: Send + Sync + 'static {
     ///   duplicate rows in single-node harnesses where all vShards share one
     ///   Data Plane. `None` = no Hilbert filter.
     ///
-    /// Returns `Vec<Vec<u8>>` — one element per matching row, each element
-    /// being the zerompk encoding of that row.
-    async fn exec_slice(&self, req: &ArrayShardSliceReq) -> Result<Vec<Vec<u8>>>;
+    /// Returns the per-row bytes (one element per matching row, each the
+    /// native-msgpack encoding of that row) plus the `truncated_before_horizon`
+    /// signal from the Data Plane.
+    async fn exec_slice(&self, req: &ArrayShardSliceReq) -> Result<ArraySliceExec>;
 
     /// Execute a surrogate-bitmap scan and return the zerompk-encoded
     /// `SurrogateBitmap` bytes for matching cells.
@@ -54,9 +75,10 @@ pub trait ArrayLocalExecutor: Send + Sync + 'static {
     /// Execute a partial aggregate on this shard and return the partial states.
     ///
     /// The Data Plane computes the aggregate with `return_partial = true`, so it
-    /// returns `Vec<ArrayAggPartial>` rather than finalized scalars. The
-    /// coordinator merges partials from all shards before finalizing.
-    async fn exec_agg(&self, req: &ArrayShardAggReq) -> Result<Vec<ArrayAggPartial>>;
+    /// returns partial states (plus the `truncated_before_horizon` signal)
+    /// rather than finalized scalars. The coordinator merges partials from all
+    /// shards before finalizing.
+    async fn exec_agg(&self, req: &ArrayShardAggReq) -> Result<ArrayAggExec>;
 
     /// Apply a cell-batch write to the local array engine.
     ///

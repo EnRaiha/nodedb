@@ -2,7 +2,7 @@
 
 //! Timeseries engine operations dispatched to the Data Plane.
 
-use nodedb_types::Surrogate;
+use nodedb_types::{Surrogate, SystemTimeScope};
 
 /// Timeseries engine physical operations.
 #[derive(
@@ -43,12 +43,13 @@ pub enum TimeseriesOp {
         computed_columns: Vec<u8>,
         /// RLS post-scan filters (applied after time-range pruning).
         rls_filters: Vec<u8>,
-        /// Bitemporal system-time cutoff. When `Some`, block-skip on
-        /// `_ts_system` min/max and a post-fetch filter exclude rows
-        /// written after the given epoch-ms. Only populated for
-        /// timeseries collections created `WITH BITEMPORAL`.
+        /// System-time selection. `Current` = current state; `AsOf(ms)` =
+        /// block-skip + post-filter to rows written ≤ ms; `AllVersions` =
+        /// every `_ts_system` row ordered ascending (audit log), system-time
+        /// column projected. Only meaningful for timeseries collections
+        /// created `WITH BITEMPORAL`.
         #[serde(default)]
-        system_as_of_ms: Option<i64>,
+        system_time: SystemTimeScope,
         /// Bitemporal valid-time point. When `Some`, only rows whose
         /// `[_ts_valid_from, _ts_valid_until)` interval contains this
         /// point are returned.

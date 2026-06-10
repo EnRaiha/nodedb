@@ -12,7 +12,7 @@
 //! type fidelity at the engine boundary.
 
 use nodedb_array::types::ArrayId;
-use nodedb_types::SurrogateBitmap;
+use nodedb_types::{SurrogateBitmap, SystemTimeScope};
 
 /// Reducer for [`ArrayOp::Aggregate`]. Numeric `c_enum` keeps the
 /// wire encoding to a single byte.
@@ -108,6 +108,12 @@ pub enum ArrayOp {
     /// `slice_msgpack` is an zerompk encoding of
     /// `nodedb_array::query::Slice`. Empty `attr_projection` means
     /// "all attributes".
+    ///
+    /// Under `SystemTimeScope::AllVersions` (`AS OF SYSTEM TIME NULL`),
+    /// the Data Plane emits one row per live cell-version, each carrying
+    /// `ArrayCell::system_time = Some(system_from_ms)`. Rows are sorted
+    /// ascending by system time, ties broken by coord lexicographic order.
+    /// `limit` bounds the total number of versions returned (not cells).
     Slice {
         array_id: ArrayId,
         slice_msgpack: Vec<u8>,
@@ -123,10 +129,14 @@ pub enum ArrayOp {
         /// single-node harnesses where all vShards share one Data Plane.
         /// `None` = no Hilbert filter (all cells included).
         hilbert_range: Option<(u64, u64)>,
-        /// Bitemporal system-time cutoff. When `Some(t)`, only tile versions
-        /// with `system_from_ms <= t` are considered. `None` = live read
-        /// (`i64::MAX` effective cutoff — returns current state).
-        system_as_of: Option<i64>,
+        /// Bitemporal system-time scope.
+        ///
+        /// - `Current`: live read (returns the latest committed state).
+        /// - `AsOf(t)`: point-in-time snapshot at system-time `t`.
+        /// - `AllVersions`: audit-log read — every live cell-version,
+        ///   ordered ascending by `system_from_ms`. Each emitted row has
+        ///   `ArrayCell::system_time = Some(system_from_ms)`.
+        system_time: SystemTimeScope,
         /// Bitemporal valid-time point. When `Some(vt)`, a cell is only
         /// returned if `valid_from_ms <= vt < valid_until_ms`. `None` =
         /// no valid-time filter.
@@ -267,6 +277,52 @@ mod tests {
             hilbert_range: None,
             system_as_of: None,
             valid_at_ms: None,
+        };
+        let bytes = zerompk::to_msgpack_vec(&op).unwrap();
+        let back: ArrayOp = zerompk::from_msgpack(&bytes).unwrap();
+        assert_eq!(op, back);
+    }
+
+    #[test]
+    fn slice_all_versions_roundtrips_through_msgpack() {
+        use nodedb_types::SystemTimeScope;
+        let op = ArrayOp::Slice {
+            array_id: aid(),
+            slice_msgpack: vec![],
+            attr_projection: vec![],
+            limit: 0,
+            cell_filter: None,
+            hilbert_range: None,
+            system_time: SystemTimeScope::AllVersions,
+            valid_at_ms: None,
+        };
+        let bytes = zerompk::to_msgpack_vec(&op).unwrap();
+        let back: ArrayOp = zerompk::from_msgpack(&bytes).unwrap();
+        assert_eq!(op, back);
+        assert!(
+            matches!(
+                back,
+                ArrayOp::Slice {
+                    system_time: SystemTimeScope::AllVersions,
+                    ..
+                }
+            ),
+            "round-trip must preserve AllVersions"
+        );
+    }
+
+    #[test]
+    fn slice_as_of_roundtrips_through_msgpack() {
+        use nodedb_types::SystemTimeScope;
+        let op = ArrayOp::Slice {
+            array_id: aid(),
+            slice_msgpack: vec![],
+            attr_projection: vec![],
+            limit: 10,
+            cell_filter: None,
+            hilbert_range: None,
+            system_time: SystemTimeScope::AsOf(1_700_000_000_000),
+            valid_at_ms: Some(1_600_000_000_000),
         };
         let bytes = zerompk::to_msgpack_vec(&op).unwrap();
         let back: ArrayOp = zerompk::from_msgpack(&bytes).unwrap();
