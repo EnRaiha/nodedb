@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `DROP TENANT [IF EXISTS] <id>` handler. Migrated to
+//! `DROP TENANT [IF EXISTS] <id|name>` handler. Migrated to
 //! `CatalogEntry::DeleteTenant` in phase 1k.6.
+//!
+//! Accepts either a numeric tenant id or a tenant name (single-quoted
+//! optional), parallel to the `CREATE TENANT <name>` and
+//! `SHOW TENANT <name|id>` paths.
 
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
@@ -11,28 +15,10 @@ use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
 
 use super::super::super::types::sqlstate_error;
 use super::super::parse_utils::strip_if_exists;
-
-/// Whether a tenant id currently exists, consulting the redb catalog when
-/// one is wired up and falling back to the in-memory quota table otherwise.
-fn tenant_exists(state: &SharedState, tenant_id: TenantId) -> PgWireResult<bool> {
-    if let Some(catalog) = state.credentials.catalog() {
-        let present = catalog
-            .load_all_tenants()
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog read: {e}")))?
-            .iter()
-            .any(|t| t.tenant_id == tenant_id.as_u64());
-        return Ok(present);
-    }
-    let tenants = match state.tenants.lock() {
-        Ok(t) => t,
-        Err(p) => p.into_inner(),
-    };
-    Ok(tenants.has_quota(tenant_id))
-}
+use super::tenant_exists;
 
 pub fn drop_tenant(
     state: &SharedState,
@@ -51,22 +37,44 @@ pub fn drop_tenant(
     if parts.len() < 3 {
         return Err(sqlstate_error(
             "42601",
-            "syntax: DROP TENANT [IF EXISTS] <id>",
+            "syntax: DROP TENANT [IF EXISTS] <id|name>",
         ));
     }
 
-    let tid: u64 = parts[2]
-        .parse()
-        .map_err(|_| sqlstate_error("42601", "TENANT ID must be a numeric value"))?;
-    let tenant_id = TenantId::new(tid);
+    // Accept either a numeric id or a tenant name; mirror the existing
+    // CREATE TENANT name-resolution path. A name that matches no tenant yields
+    // `None` here; an unknown numeric id resolves to a candidate that the
+    // existence gate below rejects, so both forms behave identically.
+    let tenant_id = match super::resolve_tenant_ref(state, parts[2])? {
+        Some(tid) => tid,
+        None => {
+            // Name token did not resolve to any tenant.
+            if if_exists {
+                return Ok(vec![Response::Execution(Tag::new("DROP TENANT"))]);
+            }
+            return Err(sqlstate_error(
+                "42704",
+                &format!("tenant '{}' does not exist", parts[2]),
+            ));
+        }
+    };
+    let tid = tenant_id.as_u64();
 
     if tid == 0 {
         return Err(sqlstate_error("42501", "cannot drop system tenant (0)"));
     }
 
-    // `IF EXISTS`: dropping a tenant that does not exist is a no-op success.
-    if if_exists && !tenant_exists(state, tenant_id)? {
-        return Ok(vec![Response::Execution(Tag::new("DROP TENANT"))]);
+    // Existence gate, uniform across numeric ids and resolved names: an unknown
+    // tenant is a no-op under `IF EXISTS`, otherwise `42704` — never a silent
+    // delete proposal for a tenant that does not exist.
+    if !tenant_exists(state, tenant_id)? {
+        if if_exists {
+            return Ok(vec![Response::Execution(Tag::new("DROP TENANT"))]);
+        }
+        return Err(sqlstate_error(
+            "42704",
+            &format!("tenant '{}' does not exist", parts[2]),
+        ));
     }
 
     let entry = CatalogEntry::DeleteTenant { tenant_id: tid };
