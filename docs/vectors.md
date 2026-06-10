@@ -14,8 +14,8 @@ NodeDB's vector engine is built for production semantic search — not vectors s
 - **Indexes**: HNSW (in-memory hierarchical) + Vamana / DiskANN (SSD-resident flat-beam, billion-scale on one node). The cost-model planner picks based on collection size + workload signals.
 - **Quantization frontier**:
   - **SQ8** — Scalar quantization to 8-bit. ~4× memory reduction, minimal recall loss.
-  - **PQ** / **IVF-PQ** — Classic product quantization. ~4-8× / ~16 bytes/vector for very large indexes.
-  - **OPQ** — PQ + learned random rotation; minor accuracy bump over `pq`.
+  - **PQ** — Classic product quantization codec. ~4-8× / ~16 bytes/vector for very large indexes.
+  - **OPQ** — PQ + learned random rotation; minor accuracy bump over plain PQ.
   - **Binary** — Sign-bit Hamming for ultra-cold tiers (no rerank).
   - **Ternary** — BitNet 1.58 trit-pack `{-1, 0, +1}` with cold/hot pack and AVX-512 popcnt.
   - **RaBitQ** — 1-bit quantization with `O(1/√D)` error bound (SIGMOD 2024). Frontier 1-bit primary path.
@@ -95,6 +95,7 @@ CREATE COLLECTION corpus (
     dim=384,
     metric='cosine',
     quantization='rabitq',
+    storage_dtype='bf16',
     m=32,
     ef_construction=200,
     payload_indexes=['tenant_id', 'created_at']
@@ -102,6 +103,8 @@ CREATE COLLECTION corpus (
 ```
 
 `primary='vector'` is purely an access-path hint — not a different engine. Cross-engine queries, CRDT sync, SQL semantics all keep working. `payload_indexes` are per-field equality / range / boolean indexes over the metadata sidecar for filtered ANN (replaces Pinecone metadata filters).
+
+`storage_dtype` controls the precision of raw HNSW vector storage (independent of quantization). Accepted values: `F32` (default, 4 bytes/dimension), `F16` (2 bytes/dimension, IEEE half), `BF16` (2 bytes/dimension, bfloat16 — same exponent range as F32, better dynamic range for embeddings, preferred). Using `BF16` or `F16` halves resident vector bytes, reducing memory pressure on large indexes with a small accuracy cost. The HNSW graph structure and search quality remain unaffected.
 
 Default `primary='document'` is unchanged: classic `CREATE VECTOR INDEX ON ...` syntax continues to work.
 

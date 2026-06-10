@@ -15,7 +15,7 @@ CREATE ROLE data_engineer;
 | --------------- | --------------------------------- |
 | `readonly`      | SELECT on all collections         |
 | `readwrite`     | SELECT, INSERT, UPDATE, DELETE    |
-| `admin`         | All operations + DDL              |
+| `monitor`       | Read metrics, health, audit logs  |
 | `tenant_admin`  | Admin within a tenant             |
 | `cluster_admin` | Cluster-wide DDL (no data bypass) |
 | `superuser`     | Unrestricted (cross-tenant)       |
@@ -73,10 +73,13 @@ A `GRANT` with an `ON` clause grants object permissions (rather than role
 membership). Permissions may be comma-separated:
 
 ```sql
--- Collection-level
-GRANT SELECT ON orders TO analyst;
-GRANT INSERT, UPDATE ON orders TO data_engineer;
+-- Collection-level (object-type keywords COLLECTION and TABLE are equivalent)
+GRANT SELECT ON COLLECTION orders TO analyst;
+GRANT INSERT, UPDATE ON TABLE orders TO data_engineer;
 GRANT ALL ON orders TO admin;
+
+-- With ADMIN OPTION (grantee can delegate the permission to others)
+GRANT SELECT ON COLLECTION orders TO analyst WITH ADMIN OPTION;
 
 -- Function/procedure execute
 GRANT EXECUTE ON FUNCTION full_name TO analyst;

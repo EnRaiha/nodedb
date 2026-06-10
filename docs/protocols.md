@@ -28,6 +28,8 @@ psql -h localhost -p 6432
 
 **SQL coverage:** Everything in the [query language reference](query-language.md).
 
+**Introspection:** NodeDB exposes PostgreSQL-compatible `pg_catalog` virtual tables (e.g., `pg_class`, `pg_namespace`, `pg_attribute`, `pg_type`) so that standard Postgres clients, ORMs, and business intelligence tools can introspect the database schema without modification. Queries against `pg_catalog.*` tables are transparently rewritten to pull from NodeDB's internal catalog.
+
 ## NDB (Native Protocol)
 
 Binary MessagePack protocol used by the `ndb` CLI, Rust SDK, and FFI bindings. It carries two kinds of messages, serving two different audiences:
@@ -169,7 +171,7 @@ SUBSCRIBE sessions
 PUBLISH sessions "user_logged_in"
 ```
 
-**Supported commands:** `GET`, `SET` (with `EX`/`PX`/`NX`/`XX`), `DEL`, `EXISTS`, `MGET`, `MSET`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `SCAN`, `KEYS`, `HGET`, `HMGET`, `HSET`, `FLUSHDB`, `DBSIZE`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBLISH`, `PING`, `ECHO`, `SELECT`, `INFO`, `QUIT`.
+**Supported commands:** `GET`, `SET` (with `EX`/`PX`/`NX`/`XX`), `GETSET`, `DEL`, `EXISTS`, `MGET`, `MSET`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `SCAN`, `KEYS`, `HGET`, `HMGET`, `HSET`, `ZADD`, `ZREM`, `ZRANK`, `ZRANGE`, `ZCARD`, `ZSCORE`, `FLUSHDB`, `DBSIZE`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBLISH`, `PING`, `ECHO`, `SELECT`, `INFO`, `QUIT`.
 
 All RESP commands dispatch to the same KV engine as SQL queries. Data written via RESP is queryable via SQL and vice versa.
 
@@ -257,29 +259,18 @@ Environment variables override config: `NODEDB_PORT_PGWIRE`, `NODEDB_PORT_NATIVE
 
 ## Native Protocol Opcodes (SDK Reference)
 
-Native opcodes are used internally by the Rust SDK (`nodedb-client`), FFI bindings (`nodedb-lite-ffi`), and WASM bindings (`nodedb-lite-wasm`). Application code does not construct opcodes directly — it calls typed SDK methods that dispatch the appropriate opcode. All opcodes are single-byte identifiers in the MessagePack framing and cover 18 engine-specific operations.
+Native opcodes are used internally by the Rust SDK (`nodedb-client`), FFI bindings (`nodedb-lite-ffi`), and WASM bindings (`nodedb-lite-wasm`). Application code does not construct opcodes directly — it calls typed SDK methods that dispatch the appropriate opcode. All opcodes are single-byte identifiers in the MessagePack framing.
 
-| Opcode               | Hex    | Operation                                        |
-| -------------------- | ------ | ------------------------------------------------ |
-| `TimeseriesScan`     | `0x1A` | Time-range scan with optional bucket aggregation |
-| `TimeseriesIngest`   | `0x1B` | Batch ingest into a timeseries collection        |
-| `SpatialScan`        | `0x19` | R\*-tree lookup with OGC predicate               |
-| `KvScan`             | `0x72` | Full scan over a KV collection                   |
-| `KvGet`              | `0x73` | Point lookup by key                              |
-| `KvSet`              | `0x74` | Set a key-value pair with optional TTL           |
-| `KvDelete`           | `0x75` | Delete by key                                    |
-| `KvExpire`           | `0x76` | Set TTL on an existing key                       |
-| `KvMultiGet`         | `0x77` | Batch point lookups                              |
-| `KvMultiSet`         | `0x78` | Batch set                                        |
-| `KvFieldSet`         | `0x79` | Set individual fields on a KV value              |
-| `DocumentUpdate`     | `0x7A` | Update fields on a document by ID                |
-| `DocumentPatch`      | `0x7B` | JSON-patch a document by ID                      |
-| `DocumentGet`        | `0x7C` | Fetch a document by ID                           |
-| `DocumentBulkInsert` | `0x7D` | Batch insert documents                           |
-| `DocumentBulkDelete` | `0x7E` | Batch delete documents by predicate              |
-| `VectorInsert`       | `0x7F` | Insert a vector with metadata                    |
-| `VectorSearch`       | `0x80` | ANN search (HNSW) with optional pre-filter       |
-| `VectorDelete`       | `0x81` | Delete a vector by ID                            |
+The native protocol defines a distinct opcode per operation across all engines (90+ operations total). Common opcodes include:
+
+- `PointGet` (0x10) — Key-value point lookup
+- `VectorSearch` (0x13) — Vector similarity search
+- `VectorMultiSearch` (0x80) — Batch vector search
+- `TimeseriesScan` (0x1A) — Time-range aggregated scan
+- `SpatialScan` (0x19) — Spatial range query
+- `DocumentGet`, `DocumentUpdate`, `DocumentBulkInsert` — Document operations
+
+The full opcode set is defined by the protocol specification. SDKs expose these via typed methods (`client.get()`, `client.vector_search()`, etc.); direct opcode construction is rarely needed.
 
 ## TLS
 

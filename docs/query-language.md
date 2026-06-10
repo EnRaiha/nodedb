@@ -618,13 +618,17 @@ PURGE TENANT acme CONFIRM;
 -- Secondary index
 CREATE INDEX idx_email ON users(email);
 CREATE UNIQUE INDEX idx_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_email ON users(email);
 DROP INDEX idx_email;
+DROP INDEX IF EXISTS idx_email;
 SHOW INDEXES;
 
 -- Vector index
 CREATE VECTOR INDEX idx_articles_embedding ON articles METRIC cosine DIM 384;
 CREATE VECTOR INDEX idx_articles_embedding ON articles METRIC cosine DIM 384 M 32 EF_CONSTRUCTION 400;
+CREATE VECTOR INDEX IF NOT EXISTS idx_articles_embedding ON articles METRIC cosine DIM 384;
 DROP VECTOR INDEX idx_name;
+DROP VECTOR INDEX IF EXISTS idx_name;
 
 -- Full-text index
 CREATE FULLTEXT INDEX idx_body ON articles(body);
@@ -703,6 +707,9 @@ LIMIT 10;
 -- Full-text match in WHERE
 SELECT * FROM articles WHERE text_match(body, 'distributed database');
 
+-- SEARCH() as an alias for WHERE-clause full-text matching
+SELECT * FROM articles WHERE SEARCH(body, 'distributed database');
+
 -- Hybrid vector + text (RRF fusion)
 SELECT title, rrf_score(
     vector_distance(embedding, [0.1, 0.3, ...]),
@@ -738,11 +745,14 @@ WHERE u.id = 'alice'
 RETURN other.id, other.name;
 
 -- Run algorithms
-GRAPH ALGO PAGERANK ON knows DAMPING 0.85 ITERATIONS 20 TOLERANCE 1e-7;
-GRAPH ALGO wcc ON knows;
+GRAPH ALGO PAGERANK ON 'knows' DAMPING 0.85 ITERATIONS 20 TOLERANCE 1e-7;
+GRAPH ALGO PAGERANK ON 'knows' DAMPING 0.85 PERSONALIZATION {"alice": 1.0, "bob": 0.5};
+GRAPH ALGO wcc ON 'knows';
 ```
 
 Available algorithms: `pagerank`, `wcc`, `label_propagation`, `lcc`, `sssp`, `betweenness`, `closeness`, `harmonic`, `degree`, `louvain`, `triangles`, `diameter`, `kcore`.
+
+**Personalized PageRank** — The `PERSONALIZATION` parameter takes a JSON object mapping node identifiers to seed weights. This biases the random-walk teleport set toward the named seed nodes, enabling importance scoring relative to a reference set (e.g., recommendations or "related to these nodes").
 
 ### Key-Value
 
@@ -984,6 +994,22 @@ SET nodedb.consistency = 'eventual';
 SHOW nodedb.consistency;
 SHOW ALL;
 RESET nodedb.consistency;
+
+-- Roles and permissions
+SHOW ROLES;
+
+-- Server statistics
+SHOW STATS;           -- alias SHOW SERVER STATS
+SHOW METRICS;
+SHOW MEMORY;
+
+-- Tenants
+SHOW TENANTS;
+SHOW TENANTS WITH NAME 'acme';
+
+-- Switch session tenant (superuser only)
+SET TENANT = 'acme';
+SET TENANT = DEFAULT;
 ```
 
 ## Change Tracking
@@ -1004,6 +1030,12 @@ LIVE SELECT * FROM users WHERE role = 'admin';
 -- Users and roles
 CREATE USER alice PASSWORD 'secret';
 CREATE ROLE analyst;
+CREATE ROLE IF NOT EXISTS analyst;
+CREATE USER IF NOT EXISTS alice PASSWORD 'secret';
+DROP ROLE analyst;
+DROP ROLE IF EXISTS analyst;
+DROP USER alice;
+DROP USER IF EXISTS alice;
 GRANT READ ON analytics TO analyst;
 GRANT ROLE analyst TO alice;
 REVOKE READ ON analytics FROM analyst;
