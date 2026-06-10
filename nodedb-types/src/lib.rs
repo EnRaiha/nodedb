@@ -106,7 +106,8 @@ pub use sync::violation::ViolationType;
 pub use sync::wire::{SyncFrame, SyncMessageType};
 pub use temporal::{
     BitemporalFilter, BitemporalInterval, LsnMapError, LsnMsAnchor, LsnMsMap, NANOS_PER_MS,
-    OPEN_UPPER, OrdinalClock, ValidTimePredicate, lsn_to_ms, ms_to_ordinal_upper, ordinal_to_ms,
+    OPEN_UPPER, OrdinalClock, SystemTimeScope, ValidTimePredicate, lsn_to_ms, ms_to_ordinal_upper,
+    ordinal_to_ms,
 };
 pub use text_search::{Bm25Params, QueryMode, TextSearchParams};
 pub use trace::{SpanId, TraceId};
