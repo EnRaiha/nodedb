@@ -38,6 +38,7 @@
 
 use super::lex::keyword_position_outside_literals;
 use crate::temporal::{TemporalScope, ValidTime};
+use nodedb_types::SystemTimeScope;
 
 /// Output of the temporal preprocess stage.
 #[derive(Debug)]
@@ -63,29 +64,29 @@ pub fn extract(sql: &str) -> Result<Option<Extracted>, TemporalParseError> {
     // FOR SYSTEM_TIME AS OF (table-scan style)
     if let Some((rewritten, ms)) = strip_system_time_as_of(&working)? {
         working = rewritten;
-        scope.system_as_of_ms = Some(ms);
+        scope.system_time = SystemTimeScope::AsOf(ms);
         any = true;
     }
     // __system_as_of__(<int>) function escape hatch
     if let Some((rewritten, ms)) = strip_system_as_of_function(&working)? {
-        if scope.system_as_of_ms.is_some() {
+        if scope.system_time.is_temporal() {
             return Err(TemporalParseError(
                 "multiple FOR SYSTEM_TIME / __system_as_of__ clauses".into(),
             ));
         }
         working = rewritten;
-        scope.system_as_of_ms = Some(ms);
+        scope.system_time = SystemTimeScope::AsOf(ms);
         any = true;
     }
     // AS OF SYSTEM TIME <expr> (array read style, CockroachDB-inspired)
-    if let Some((rewritten, ms)) = strip_as_of_system_time(&working)? {
-        if scope.system_as_of_ms.is_some() {
+    if let Some((rewritten, sys_scope)) = strip_as_of_system_time(&working)? {
+        if scope.system_time.is_temporal() {
             return Err(TemporalParseError(
                 "multiple system-time AS OF clauses in one statement".into(),
             ));
         }
         working = rewritten;
-        scope.system_as_of_ms = Some(ms);
+        scope.system_time = sys_scope;
         any = true;
         if strip_as_of_system_time(&working)?.is_some() {
             return Err(TemporalParseError(
@@ -291,18 +292,20 @@ fn parse_temporal_expr(token: &str) -> Result<i64, TemporalParseError> {
 /// Using the same pre-processor approach for both keeps the two clauses
 /// consistent and avoids mixing native sqlparser AS-OF support with custom
 /// preprocessing in the same pipeline.
-fn strip_as_of_system_time(sql: &str) -> Result<Option<(String, i64)>, TemporalParseError> {
+fn strip_as_of_system_time(
+    sql: &str,
+) -> Result<Option<(String, SystemTimeScope)>, TemporalParseError> {
     let keyword = "AS OF SYSTEM TIME";
     let Some(start) = keyword_position_outside_literals(sql, keyword) else {
         return Ok(None);
     };
     let after_kw = start + keyword.len();
-    let (ms, end_abs) = parse_as_of_expr(sql, after_kw)?;
+    let (scope, end_abs) = parse_as_of_expr(sql, after_kw)?;
     let mut out = String::with_capacity(sql.len());
     out.push_str(sql[..start].trim_end());
     out.push(' ');
     out.push_str(sql[end_abs..].trim_start());
-    Ok(Some((out.trim().to_string(), ms)))
+    Ok(Some((out.trim().to_string(), scope)))
 }
 
 /// Match `AS OF VALID TIME <expr>` (case-insensitive) anywhere in `sql` and
@@ -314,7 +317,22 @@ fn strip_as_of_valid_time(sql: &str) -> Result<Option<(String, i64)>, TemporalPa
         return Ok(None);
     };
     let after_kw = start + keyword.len();
-    let (ms, end_abs) = parse_as_of_expr(sql, after_kw)?;
+    let (scope, end_abs) = parse_as_of_expr(sql, after_kw)?;
+    let ms = match scope {
+        SystemTimeScope::AsOf(ms) => ms,
+        SystemTimeScope::AllVersions => {
+            return Err(TemporalParseError(
+                "AS OF VALID TIME NULL is not supported; NULL (all-versions) \
+                 applies only to SYSTEM TIME"
+                    .into(),
+            ));
+        }
+        SystemTimeScope::Current => {
+            return Err(TemporalParseError(
+                "AS OF VALID TIME requires an expression".into(),
+            ));
+        }
+    };
     let mut out = String::with_capacity(sql.len());
     out.push_str(sql[..start].trim_end());
     out.push(' ');
@@ -328,7 +346,10 @@ fn strip_as_of_valid_time(sql: &str) -> Result<Option<(String, i64)>, TemporalPa
 /// The expression is delimited by end-of-string or the next keyword-boundary
 /// token (a subsequent `AS OF`, or certain SQL keywords that cannot appear
 /// inside a temporal expression). Quoted string literals are consumed whole.
-fn parse_as_of_expr(sql: &str, offset: usize) -> Result<(i64, usize), TemporalParseError> {
+fn parse_as_of_expr(
+    sql: &str,
+    offset: usize,
+) -> Result<(SystemTimeScope, usize), TemporalParseError> {
     let rest = &sql[offset..];
     let trimmed = rest.trim_start();
     let leading = rest.len() - trimmed.len();
@@ -350,7 +371,7 @@ fn parse_as_of_expr(sql: &str, offset: usize) -> Result<(i64, usize), TemporalPa
         let end_rel = inner_start + close + 1; // include closing quote
         let token = &trimmed[..end_rel];
         let ms = parse_temporal_expr(token)?;
-        return Ok((ms, abs_start + end_rel));
+        return Ok((SystemTimeScope::AsOf(ms), abs_start + end_rel));
     }
 
     // Otherwise scan to the next whitespace-delimited boundary. We stop at:
@@ -394,10 +415,15 @@ fn parse_as_of_expr(sql: &str, offset: usize) -> Result<(i64, usize), TemporalPa
             "AS OF clause at offset {abs_start} has no expression"
         )));
     }
+    // Bare NULL (case-insensitive) → all-versions (audit-log) mode.
+    if token.eq_ignore_ascii_case("NULL") {
+        let raw_end = abs_start + end_rel;
+        return Ok((SystemTimeScope::AllVersions, raw_end));
+    }
     let ms = parse_temporal_expr(token)?;
     // Advance past the expression (including trailing whitespace that was trimmed).
     let raw_end = abs_start + end_rel;
-    Ok((ms, raw_end))
+    Ok((SystemTimeScope::AsOf(ms), raw_end))
 }
 
 /// Parse an optionally-signed integer starting at `offset` in `sql`, skipping
@@ -433,7 +459,7 @@ mod tests {
         let ex = extract("SELECT * FROM t FOR SYSTEM_TIME AS OF 100 WHERE x = 1")
             .unwrap()
             .unwrap();
-        assert_eq!(ex.temporal.system_as_of_ms, Some(100));
+        assert_eq!(ex.temporal.system_time, SystemTimeScope::AsOf(100));
         assert_eq!(ex.temporal.valid_time, ValidTime::Any);
         assert!(!ex.sql.to_uppercase().contains("FOR SYSTEM_TIME"));
         assert!(ex.sql.contains("WHERE x = 1"));
@@ -464,7 +490,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(ex.temporal.system_as_of_ms, Some(500));
+        assert_eq!(ex.temporal.system_time, SystemTimeScope::AsOf(500));
         assert_eq!(ex.temporal.valid_time, ValidTime::At(250));
     }
 
@@ -473,7 +499,7 @@ mod tests {
         let ex = extract("SELECT __system_as_of__(777), x FROM t")
             .unwrap()
             .unwrap();
-        assert_eq!(ex.temporal.system_as_of_ms, Some(777));
+        assert_eq!(ex.temporal.system_time, SystemTimeScope::AsOf(777));
         assert!(ex.sql.contains("TRUE"));
         assert!(!ex.sql.contains("__system_as_of__"));
     }
@@ -493,7 +519,10 @@ mod tests {
         let ex = extract("SELECT * FROM array_slice('g', '{}') AS OF SYSTEM TIME 1700000000000")
             .unwrap()
             .unwrap();
-        assert_eq!(ex.temporal.system_as_of_ms, Some(1_700_000_000_000));
+        assert_eq!(
+            ex.temporal.system_time,
+            SystemTimeScope::AsOf(1_700_000_000_000)
+        );
         assert!(!ex.sql.to_uppercase().contains("AS OF SYSTEM TIME"));
     }
 
@@ -514,7 +543,10 @@ mod tests {
         .unwrap()
         .unwrap();
         // 2024-01-15T00:00:00Z in ms
-        assert_eq!(ex.temporal.system_as_of_ms, Some(1_705_276_800_000));
+        assert_eq!(
+            ex.temporal.system_time,
+            SystemTimeScope::AsOf(1_705_276_800_000)
+        );
         assert!(!ex.sql.to_uppercase().contains("AS OF SYSTEM TIME"));
     }
 
@@ -525,7 +557,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(ex.temporal.system_as_of_ms, Some(500));
+        assert_eq!(ex.temporal.system_time, SystemTimeScope::AsOf(500));
         assert_eq!(ex.temporal.valid_time, ValidTime::At(250));
     }
 
@@ -542,7 +574,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let ts = ex.temporal.system_as_of_ms.unwrap();
+        let ts = ex
+            .temporal
+            .system_time
+            .as_of_ms()
+            .expect("NOW() resolves to AsOf");
         assert!(
             ts >= before && ts <= after,
             "NOW() ts {ts} not in [{before}, {after}]"
@@ -581,6 +617,32 @@ mod tests {
         let ex = extract("SELECT * FROM t FOR SYSTEM_TIME AS OF 100")
             .unwrap()
             .unwrap();
-        assert_eq!(ex.temporal.system_as_of_ms, Some(100));
+        assert_eq!(ex.temporal.system_time, SystemTimeScope::AsOf(100));
+    }
+
+    #[test]
+    fn as_of_system_time_null_is_all_versions() {
+        let ex = extract("SELECT * FROM t AS OF SYSTEM TIME NULL WHERE x = 1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ex.temporal.system_time, SystemTimeScope::AllVersions);
+        assert!(!ex.sql.to_uppercase().contains("AS OF SYSTEM TIME"));
+        assert!(ex.sql.contains("WHERE x = 1"));
+    }
+
+    #[test]
+    fn as_of_system_time_null_case_insensitive() {
+        let ex = extract("SELECT * FROM t AS OF SYSTEM TIME null")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ex.temporal.system_time, SystemTimeScope::AllVersions);
+    }
+
+    #[test]
+    fn as_of_valid_time_null_rejected() {
+        assert!(
+            extract("SELECT * FROM t AS OF VALID TIME NULL").is_err(),
+            "AS OF VALID TIME NULL must be rejected"
+        );
     }
 }

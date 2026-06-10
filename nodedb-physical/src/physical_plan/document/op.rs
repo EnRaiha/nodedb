@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use nodedb_types::{Surrogate, SurrogateBitmap};
+use nodedb_types::{Surrogate, SurrogateBitmap, SystemTimeScope};
 
 use super::merge_types::MergeClauseOp;
 use super::types::{EnforcementOptions, RegisteredIndex, ReturningSpec, StorageMode, UpdateValue};
@@ -35,10 +35,10 @@ pub enum DocumentOp {
         /// Injected by the Control Plane planner from RLS policies.
         #[allow(clippy::doc_markdown)]
         rls_filters: Vec<u8>,
-        /// `FOR SYSTEM_TIME AS OF <ms>` cutoff. `None` = current state.
-        /// Honored only by bitemporal collections; the planner rejects
-        /// temporal point-gets on non-bitemporal collections.
-        system_as_of_ms: Option<i64>,
+        /// System-time selection. `Current` = current state. Honored only by
+        /// bitemporal collections; the planner rejects temporal point-gets on
+        /// non-bitemporal collections. `AllVersions` is rejected for point-gets.
+        system_time: SystemTimeScope,
         /// `FOR VALID_TIME CONTAINS <ms>` filter.
         valid_at_ms: Option<i64>,
     },
@@ -125,11 +125,12 @@ pub enum DocumentOp {
         computed_columns: Vec<u8>,
         /// Serialized `Vec<WindowFuncSpec>`.
         window_functions: Vec<u8>,
-        /// `FOR SYSTEM_TIME AS OF <ms>` cutoff. `None` = current state.
-        /// Honored only by collections registered with bitemporal storage;
-        /// the planner rejects temporal scans on non-bitemporal collections
-        /// at SQL plan time, so the handler trusts this field.
-        system_as_of_ms: Option<i64>,
+        /// System-time selection. `Current` = current state; `AsOf(ms)` =
+        /// point-in-time; `AllVersions` = every system-time version ordered
+        /// ascending (audit log). Honored only by collections registered with
+        /// bitemporal storage; the planner rejects temporal scans on
+        /// non-bitemporal collections at SQL plan time.
+        system_time: SystemTimeScope,
         /// `FOR VALID_TIME CONTAINS <ms>` filter. `None` = no filter.
         valid_at_ms: Option<i64>,
         /// Optional surrogate prefilter injected by a cross-engine sub-plan.
@@ -371,5 +372,7 @@ pub enum DocumentOp {
         cursor: Vec<u8>,
         count: usize,
         system_as_of_ms: Option<i64>,
+        // NOTE: clone materialization is a point-in-time snapshot; `AllVersions`
+        // does not compose with snapshot clones and is rejected upstream.
     },
 }

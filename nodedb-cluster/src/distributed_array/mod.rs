@@ -12,11 +12,11 @@ pub mod scatter;
 pub mod wire;
 
 pub use coordinator::{
-    ArrayCoordinator, ArrayWriteCoordParams, CoordSliceResult, coord_delete, coord_put,
-    coord_put_partitioned,
+    ArrayCoordinator, ArrayWriteCoordParams, CoordAggResult, CoordSliceResult, coord_delete,
+    coord_put, coord_put_partitioned,
 };
 pub use handler::handle_array_shard_rpc;
-pub use local_executor::ArrayLocalExecutor;
+pub use local_executor::{ArrayAggExec, ArrayLocalExecutor, ArraySliceExec};
 pub use merge::{
     ArrayAggPartial, any_truncated_before_horizon_agg, any_truncated_before_horizon_slice,
     merge_slice_rows, reduce_agg_partials,

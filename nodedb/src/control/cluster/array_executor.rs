@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use nodedb_array::types::ArrayId;
-use nodedb_cluster::distributed_array::ArrayLocalExecutor;
 use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
 use nodedb_cluster::distributed_array::wire::{ArrayShardAggReq, ArrayShardPutReq};
+use nodedb_cluster::distributed_array::{ArrayAggExec, ArrayLocalExecutor, ArraySliceExec};
 use nodedb_cluster::error::{ClusterError, Result};
 use nodedb_query::msgpack_scan;
 use nodedb_types::Surrogate;
@@ -117,7 +117,7 @@ impl ArrayLocalExecutor for DataPlaneArrayExecutor {
     async fn exec_slice(
         &self,
         req: &nodedb_cluster::distributed_array::wire::ArrayShardSliceReq,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<ArraySliceExec> {
         let array_id: ArrayId =
             zerompk::from_msgpack(&req.array_id_msgpack).map_err(|e| ClusterError::Codec {
                 detail: format!("array_id decode in exec_slice: {e}"),
@@ -142,7 +142,7 @@ impl ArrayLocalExecutor for DataPlaneArrayExecutor {
             limit: req.limit,
             cell_filter,
             hilbert_range: req.shard_hilbert_range,
-            system_as_of: req.system_as_of,
+            system_time: req.system_time,
             valid_at_ms: req.valid_at_ms,
         });
 
@@ -161,14 +161,21 @@ impl ArrayLocalExecutor for DataPlaneArrayExecutor {
 
         // Decode the structured `ArraySliceResponse` envelope, then split the
         // inner rows_msgpack into per-row byte slices for the cluster coordinator.
+        // The `truncated_before_horizon` flag must be threaded back so the
+        // coordinator can OR-reduce it across shards — dropping it here would
+        // silently report complete results for below-horizon bitemporal reads.
         let slice_resp: ArraySliceResponse =
             zerompk::from_msgpack(&resp.payload).map_err(|e| ClusterError::Codec {
                 detail: format!("array slice response decode: {e}"),
             })?;
-        split_msgpack_array_rows(&slice_resp.rows_msgpack)
+        let rows = split_msgpack_array_rows(&slice_resp.rows_msgpack)?;
+        Ok(ArraySliceExec {
+            rows,
+            truncated_before_horizon: slice_resp.truncated_before_horizon,
+        })
     }
 
-    async fn exec_agg(&self, req: &ArrayShardAggReq) -> Result<Vec<ArrayAggPartial>> {
+    async fn exec_agg(&self, req: &ArrayShardAggReq) -> Result<ArrayAggExec> {
         let array_id: ArrayId =
             zerompk::from_msgpack(&req.array_id_msgpack).map_err(|e| ClusterError::Codec {
                 detail: format!("array_id decode in exec_agg: {e}"),
@@ -217,13 +224,23 @@ impl ArrayLocalExecutor for DataPlaneArrayExecutor {
         }
 
         if resp.payload.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ArrayAggExec {
+                partials: Vec::new(),
+                truncated_before_horizon: false,
+            });
         }
 
-        zerompk::from_msgpack::<Vec<ArrayAggPartial>>(&resp.payload).map_err(|e| {
-            ClusterError::Codec {
+        // The Data Plane's `return_partial` path encodes a `(partials, flag)`
+        // tuple (see `encode_bitemporal_agg_partial`), so decode the tuple —
+        // decoding it as a bare `Vec<ArrayAggPartial>` is a shape mismatch and
+        // fails outright, and would also drop the below-horizon signal.
+        let (partials, truncated_before_horizon): (Vec<ArrayAggPartial>, bool) =
+            zerompk::from_msgpack(&resp.payload).map_err(|e| ClusterError::Codec {
                 detail: format!("ArrayAggPartial decode in exec_agg: {e}"),
-            }
+            })?;
+        Ok(ArrayAggExec {
+            partials,
+            truncated_before_horizon,
         })
     }
 

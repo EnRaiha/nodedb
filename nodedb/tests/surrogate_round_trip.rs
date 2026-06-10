@@ -623,7 +623,7 @@ fn surrogate_round_trip_all_engines() {
                 limit: 100,
                 cell_filter: None,
                 hilbert_range: None,
-                system_as_of: None,
+                system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
             }),
         );
@@ -645,7 +645,7 @@ fn surrogate_round_trip_all_engines() {
                 limit: 100,
                 cell_filter: Some(intersection.clone()),
                 hilbert_range: None,
-                system_as_of: None,
+                system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
             }),
         );

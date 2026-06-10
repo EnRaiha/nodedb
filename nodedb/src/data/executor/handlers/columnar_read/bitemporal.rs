@@ -2,6 +2,21 @@
 
 //! Bitemporal row-visibility predicate for system-time / valid-time queries.
 
+/// Extract the system-time (`_ts_system`) value of a columnar row for
+/// audit-log ordering. Rows missing the column (non-bitemporal, or the
+/// column index is `None`) sort first via `i64::MIN`.
+pub(super) fn row_system_time(
+    row: &[nodedb_types::value::Value],
+    ts_system_idx: Option<usize>,
+) -> i64 {
+    use nodedb_types::value::Value;
+    match ts_system_idx.and_then(|i| row.get(i)) {
+        Some(Value::Integer(i)) => *i,
+        Some(Value::DateTime(dt)) | Some(Value::NaiveDateTime(dt)) => dt.micros / 1000,
+        _ => i64::MIN,
+    }
+}
+
 /// Bitemporal row-level visibility predicate.
 ///
 /// - `system_as_of_ms`: when `Some`, any row whose `_ts_system` value
@@ -57,4 +72,62 @@ pub(super) fn bitemporal_row_visible(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_types::value::Value;
+
+    fn row(ts_system: i64, value: i64) -> Vec<Value> {
+        // [_ts_system, _ts_valid_from, _ts_valid_until, value]
+        vec![
+            Value::Integer(ts_system),
+            Value::Integer(0),
+            Value::Integer(i64::MAX),
+            Value::Integer(value),
+        ]
+    }
+
+    #[test]
+    fn row_system_time_reads_column() {
+        assert_eq!(row_system_time(&row(123, 9), Some(0)), 123);
+        // No bitemporal column resolved → sorts first.
+        assert_eq!(row_system_time(&row(123, 9), None), i64::MIN);
+    }
+
+    #[test]
+    fn all_versions_sort_orders_ascending_by_system_time() {
+        // A single logical key updated three times: three distinct versions
+        // distinguished by `_ts_system`. Under AS OF SYSTEM TIME NULL every
+        // version is emitted ordered ascending by system time.
+        let mut rows = [row(300, 3), row(100, 1), row(200, 2)];
+        let ts_idx = Some(0);
+        rows.sort_by_key(|r| row_system_time(r, ts_idx));
+        let times: Vec<i64> = rows.iter().map(|r| row_system_time(r, ts_idx)).collect();
+        assert_eq!(times, vec![100, 200, 300]);
+        // The payload column tracks the version it belongs to.
+        let values: Vec<i64> = rows
+            .iter()
+            .map(|r| match r.get(3) {
+                Some(Value::Integer(v)) => *v,
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn all_versions_does_not_apply_system_cutoff() {
+        // With no system-time cutoff (Current/AllVersions both pass None to the
+        // predicate) every row is visible regardless of `_ts_system`.
+        assert!(bitemporal_row_visible(
+            &row(999, 1),
+            Some(0),
+            Some(1),
+            Some(2),
+            None,
+            None
+        ));
+    }
 }

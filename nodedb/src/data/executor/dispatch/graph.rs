@@ -8,6 +8,24 @@ use nodedb_physical::physical_plan::GraphOp;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
+use nodedb_types::SystemTimeScope;
+
+/// Resolve a graph temporal op's system-time selection to a point-in-time
+/// cutoff. `AllVersions` (audit log) is not yet supported on the graph
+/// engine and surfaces a typed `Unsupported` error.
+fn graph_system_as_of(
+    system_time: &SystemTimeScope,
+) -> Result<Option<i64>, crate::bridge::envelope::ErrorCode> {
+    match system_time {
+        SystemTimeScope::Current => Ok(None),
+        SystemTimeScope::AsOf(ms) => Ok(Some(*ms)),
+        SystemTimeScope::AllVersions => Err(crate::bridge::envelope::ErrorCode::Unsupported {
+            detail: "AS OF SYSTEM TIME NULL (all-versions) is not yet supported on the \
+                     graph engine"
+                .into(),
+        }),
+    }
+}
 
 impl CoreLoop {
     pub(super) fn dispatch_graph(&mut self, task: &ExecutionTask, op: &GraphOp) -> Response {
@@ -210,27 +228,39 @@ impl CoreLoop {
                 node_id,
                 edge_label,
                 direction,
-                system_as_of_ms,
+                system_time,
                 valid_at_ms,
                 rls_filters: _,
-            } => self.execute_graph_temporal_neighbors(
-                task,
-                super::super::handlers::graph_temporal::TemporalNeighborsParams {
-                    tid,
-                    collection,
-                    node_id,
-                    edge_label,
-                    direction: *direction,
-                    system_as_of_ms: *system_as_of_ms,
-                    valid_at_ms: *valid_at_ms,
-                },
-            ),
+            } => {
+                let system_as_of_ms = match graph_system_as_of(system_time) {
+                    Ok(v) => v,
+                    Err(resp) => return self.response_error(task, resp),
+                };
+                self.execute_graph_temporal_neighbors(
+                    task,
+                    super::super::handlers::graph_temporal::TemporalNeighborsParams {
+                        tid,
+                        collection,
+                        node_id,
+                        edge_label,
+                        direction: *direction,
+                        system_as_of_ms,
+                        valid_at_ms: *valid_at_ms,
+                    },
+                )
+            }
 
             GraphOp::TemporalAlgorithm {
                 algorithm,
                 params,
-                system_as_of_ms,
-            } => self.execute_graph_temporal_algo(task, tid, algorithm, params, *system_as_of_ms),
+                system_time,
+            } => {
+                let system_as_of_ms = match graph_system_as_of(system_time) {
+                    Ok(v) => v,
+                    Err(resp) => return self.response_error(task, resp),
+                };
+                self.execute_graph_temporal_algo(task, tid, algorithm, params, system_as_of_ms)
+            }
 
             GraphOp::Stats { collection, as_of } => {
                 self.execute_graph_stats(task, tid, collection.as_deref(), *as_of)

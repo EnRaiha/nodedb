@@ -29,18 +29,18 @@ Array schemas are defined by dimensions (axes), attributes (stored values), and 
 ```sql
 CREATE ARRAY spatial_grid
   DIMS (
-    x INT64 DOMAIN [0, 1000),
-    y INT64 DOMAIN [0, 1000),
-    z INT64 DOMAIN [0, 1000)
+    x INT64 [0..1000],
+    y INT64 [0..1000],
+    z INT64 [0..1000]
   )
   ATTRS (
-    temperature FLOAT32,
-    pressure FLOAT32,
-    humidity FLOAT32
+    temperature FLOAT64,
+    pressure FLOAT64,
+    humidity FLOAT64
   )
   TILE_EXTENTS (64, 64, 64)
   WITH (
-    cell_order = 'Z-ORDER',
+    prefix_bits = 8,
     audit_retain_ms = 86400000
   );
 ```
@@ -49,11 +49,14 @@ CREATE ARRAY spatial_grid
 
 | Parameter         | Required | Default     | Description                                                                                                        |
 | ----------------- | -------- | ----------- | ------------------------------------------------------------------------------------------------------------------ |
-| `DIMS`            | Yes      | —           | List of dimensions. Each has a name, type (`INT64`, `INT32`, `FLOAT64`), and domain bounds `[lo, hi)`.             |
-| `ATTRS`           | Yes      | —           | List of attributes (cell values). Each has a name and type (`FLOAT32`, FLOAT64`, `INT32`, `INT64`, `STRING`).      |
+| `DIMS`            | Yes      | —           | List of dimensions. Each has a name, type (`INT64`, `FLOAT64`, `TIMESTAMP_MS`, `STRING`), and optional domain bounds `[lo..hi]`. |
+| `ATTRS`           | Yes      | —           | List of attributes (cell values). Each has a name and type (`INT64`, `FLOAT64`, `STRING`, `BYTES`).               |
 | `TILE_EXTENTS`    | Yes      | —           | Tuple of tile extent per dimension. All > 0. Determines cell locality and compression block granularity.           |
-| `cell_order`      | No       | `'Z-ORDER'` | `'Z-ORDER'` (Hilbert curve) or `'ROW-MAJOR'`. Affects spatial cache locality.                                      |
+| `CELL_ORDER`      | No       | `Z_ORDER`   | `ROW_MAJOR`, `COL_MAJOR`, `Z_ORDER`, or `HILBERT`. Affects spatial cache locality.                                 |
+| `TILE_ORDER`      | No       | —           | `ROW_MAJOR`, `COL_MAJOR`, `Z_ORDER`, or `HILBERT`. Optional tile ordering.                                         |
+| `prefix_bits`     | No       | `8`         | Bits for key prefix compression (1–16). Lower = better compression, higher = faster prefix filtering.              |
 | `audit_retain_ms` | No       | `NULL`      | Milliseconds. Tiles older than now - `audit_retain_ms` (by system time) are eligible for purge. `NULL` = keep all. |
+| `minimum_audit_retain_ms` | No | —        | Minimum retention window enforced for compliance.                                                                  |
 
 ## Examples
 
@@ -63,11 +66,11 @@ CREATE ARRAY spatial_grid
 -- Create a 2D elevation map with tiles of 256x256 cells
 CREATE ARRAY elevation_map
   DIMS (
-    lon FLOAT64 DOMAIN [-180, 180),
-    lat FLOAT64 DOMAIN [-90, 90)
+    lon FLOAT64 [-180..180],
+    lat FLOAT64 [-90..90]
   )
   ATTRS (
-    height FLOAT32
+    height FLOAT64
   )
   TILE_EXTENTS (256, 256);
 
@@ -88,13 +91,13 @@ SELECT ARRAY_FLUSH('elevation_map');
 -- Create a 3D climate model with temporal tracking
 CREATE ARRAY climate_forecast
   DIMS (
-    lon INT32 DOMAIN [-180, 180),
-    lat INT32 DOMAIN [-90, 90),
-    altitude_m INT32 DOMAIN [0, 50000)
+    lon INT64 [-180..180],
+    lat INT64 [-90..90],
+    altitude_m INT64 [0..50000]
   )
   ATTRS (
-    temp_c FLOAT32,
-    humidity FLOAT32
+    temp_c FLOAT64,
+    humidity FLOAT64
   )
   TILE_EXTENTS (32, 32, 20)
   WITH (audit_retain_ms = 7776000000);  -- 90 days

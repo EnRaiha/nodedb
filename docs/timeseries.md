@@ -53,14 +53,12 @@ GROUP BY bucket, host
 ORDER BY bucket DESC;
 
 -- Continuous aggregation (incremental, no full re-scan)
-CREATE MATERIALIZED VIEW cpu_hourly AS
-SELECT time_bucket('1 hour', ts) AS hour,
-       host,
-       AVG(cpu_usage) AS avg_cpu,
-       ts_percentile(cpu_usage, 0.99) AS p99_cpu
-FROM cpu_metrics
-GROUP BY hour, host
-WITH (refresh = 'incremental');
+CREATE CONTINUOUS AGGREGATE cpu_hourly
+ON cpu_metrics
+BUCKET '1 hour'
+AGGREGATE AVG(cpu_usage) AS avg_cpu, ts_percentile(cpu_usage, 0.99) AS p99_cpu
+GROUP BY time_bucket('1 hour', ts) AS hour, host
+WITH (refresh_interval = '1m');
 
 -- Approximate aggregation
 SELECT approx_count_distinct(host) AS unique_hosts,
@@ -115,13 +113,9 @@ Continuous aggregates are incrementally maintained views over a timeseries colle
 -- Create a continuous aggregate
 CREATE CONTINUOUS AGGREGATE cpu_hourly
 ON cpu_metrics
-AS
-    SELECT time_bucket('1 hour', ts) AS hour,
-           host,
-           AVG(cpu_usage) AS avg_cpu,
-           ts_percentile(cpu_usage, 0.99) AS p99_cpu
-    FROM cpu_metrics
-    GROUP BY hour, host
+BUCKET '1 hour'
+AGGREGATE AVG(cpu_usage) AS avg_cpu, ts_percentile(cpu_usage, 0.99) AS p99_cpu
+GROUP BY time_bucket('1 hour', ts) AS hour, host
 WITH (refresh_interval = '1m');
 
 -- Manually trigger a refresh
@@ -195,7 +189,7 @@ Timeseries data can be backdated or corrected using bitemporal queries — disti
 SELECT host, AVG(cpu_usage) FROM cpu_metrics
 WHERE ts > now() - INTERVAL '1 hour'
 GROUP BY host
-AS OF SYSTEM TIME (extract(epoch from now()) * 1000 - 86400000);
+AS OF SYSTEM TIME '2026-06-06T00:00:00Z';
 
 -- Correct historical metric (recorded with wrong timestamp, corrected later)
 INSERT INTO cpu_metrics (ts, host, cpu_usage) VALUES

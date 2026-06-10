@@ -3,6 +3,7 @@
 //! Generic scan converters: row scan, secondary-index lookup, point get.
 
 use nodedb_sql::types::{EngineType, Filter, SqlValue};
+use nodedb_types::SystemTimeScope;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{TenantId, VShardId};
@@ -61,7 +62,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
                 gap_fill: String::new(),
                 computed_columns: computed_bytes,
                 rls_filters: Vec::new(),
-                system_as_of_ms: None,
+                system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
             })
         }
@@ -72,7 +73,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
             filters: filter_bytes,
             rls_filters: Vec::new(),
             sort_keys: sort.clone(),
-            system_as_of_ms: temporal.system_as_of_ms,
+            system_time: temporal.system_time,
             valid_at_ms: valid_at_from_scope(temporal),
             prefilter: None,
             computed_columns: computed_bytes.clone(),
@@ -84,7 +85,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
             filters: filter_bytes,
             rls_filters: Vec::new(),
             sort_keys: sort.clone(),
-            system_as_of_ms: None,
+            system_time: SystemTimeScope::Current,
             valid_at_ms: None,
             prefilter: None,
             computed_columns: computed_bytes.clone(),
@@ -111,7 +112,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
                 projection: proj_names,
                 computed_columns: computed_bytes,
                 window_functions: window_bytes,
-                system_as_of_ms: temporal.system_as_of_ms,
+                system_time: temporal.system_time,
                 valid_at_ms: valid_at_from_scope(temporal),
                 prefilter: None,
             })
@@ -215,7 +216,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_point_get(
                 surrogate,
                 pk_bytes,
                 rls_filters: Vec::new(),
-                system_as_of_ms: None,
+                system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
             })
         }
@@ -245,7 +246,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_point_get(
                 filters: filter_bytes,
                 rls_filters: Vec::new(),
                 sort_keys: Vec::new(),
-                system_as_of_ms: None,
+                system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
                 prefilter: None,
                 computed_columns: Vec::new(),

@@ -70,14 +70,14 @@ async fn handle_slice(
 
     validate_slice_routing(&req, local_vshard_id)?;
 
-    let rows = executor.exec_slice(&req).await?;
+    let exec = executor.exec_slice(&req).await?;
 
-    let truncated = req.limit > 0 && rows.len() >= req.limit as usize;
+    let truncated = req.limit > 0 && exec.rows.len() >= req.limit as usize;
     let resp = ArrayShardSliceResp {
         shard_id: local_vshard_id,
-        rows_msgpack: rows,
+        rows_msgpack: exec.rows,
         truncated,
-        truncated_before_horizon: false,
+        truncated_before_horizon: exec.truncated_before_horizon,
     };
     serialise(resp)
 }
@@ -92,12 +92,12 @@ async fn handle_agg(
             detail: format!("ArrayShardAggReq decode: {e}"),
         })?;
 
-    let partials = executor.exec_agg(&req).await?;
+    let exec = executor.exec_agg(&req).await?;
 
     let resp = ArrayShardAggResp {
         shard_id: local_vshard_id,
-        partials,
-        truncated_before_horizon: false,
+        partials: exec.partials,
+        truncated_before_horizon: exec.truncated_before_horizon,
     };
     serialise(resp)
 }
@@ -250,7 +250,7 @@ mod tests {
     use crate::distributed_array::wire::{ArrayShardAggReq, ArrayShardPutReq};
     use crate::error::Result;
 
-    use super::super::local_executor::ArrayLocalExecutor;
+    use super::super::local_executor::{ArrayAggExec, ArrayLocalExecutor, ArraySliceExec};
     use super::super::opcodes::{
         ARRAY_SHARD_AGG_REQ, ARRAY_SHARD_DELETE_REQ, ARRAY_SHARD_PUT_REQ, ARRAY_SHARD_SLICE_REQ,
         ARRAY_SHARD_SURROGATE_BITMAP_REQ,
@@ -268,6 +268,7 @@ mod tests {
         rows: Vec<Vec<u8>>,
         bitmap: Vec<u8>,
         partials: Vec<ArrayAggPartial>,
+        truncated_before_horizon: bool,
     }
 
     #[async_trait]
@@ -275,8 +276,11 @@ mod tests {
         async fn exec_slice(
             &self,
             _req: &super::super::wire::ArrayShardSliceReq,
-        ) -> Result<Vec<Vec<u8>>> {
-            Ok(self.rows.clone())
+        ) -> Result<ArraySliceExec> {
+            Ok(ArraySliceExec {
+                rows: self.rows.clone(),
+                truncated_before_horizon: self.truncated_before_horizon,
+            })
         }
 
         async fn exec_surrogate_bitmap_scan(
@@ -287,8 +291,11 @@ mod tests {
             Ok(self.bitmap.clone())
         }
 
-        async fn exec_agg(&self, _req: &ArrayShardAggReq) -> Result<Vec<ArrayAggPartial>> {
-            Ok(self.partials.clone())
+        async fn exec_agg(&self, _req: &ArrayShardAggReq) -> Result<ArrayAggExec> {
+            Ok(ArrayAggExec {
+                partials: self.partials.clone(),
+                truncated_before_horizon: self.truncated_before_horizon,
+            })
         }
 
         async fn exec_put(&self, req: &ArrayShardPutReq) -> Result<u64> {
@@ -316,7 +323,7 @@ mod tests {
             prefix_bits: 0,
             slice_hilbert_ranges: vec![],
             shard_hilbert_range: None,
-            system_as_of: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
         };
         zerompk::to_msgpack_vec(&req).unwrap()
@@ -356,6 +363,7 @@ mod tests {
             rows: vec![row.clone(), row.clone()],
             bitmap: vec![],
             partials: vec![],
+            truncated_before_horizon: false,
         });
         let payload = make_slice_req_bytes();
         let resp_bytes = handle_array_shard_rpc(ARRAY_SHARD_SLICE_REQ, 0, &payload, &executor)
@@ -369,12 +377,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_slice_propagates_truncated_before_horizon() {
+        // The Data Plane computes `truncated_before_horizon`; the handler must
+        // forward it from the executor, not hardcode `false` — otherwise the
+        // coordinator's OR-reduce always sees `false` and below-horizon
+        // bitemporal reads silently report complete results.
+        let executor: Arc<dyn ArrayLocalExecutor> = Arc::new(StubExecutor {
+            rows: vec![],
+            bitmap: vec![],
+            partials: vec![],
+            truncated_before_horizon: true,
+        });
+        let payload = make_slice_req_bytes();
+        let resp_bytes = handle_array_shard_rpc(ARRAY_SHARD_SLICE_REQ, 0, &payload, &executor)
+            .await
+            .expect("slice handler should succeed");
+        let resp: ArrayShardSliceResp =
+            zerompk::from_msgpack(&resp_bytes).expect("response should deserialise");
+        assert!(
+            resp.truncated_before_horizon,
+            "handler must forward the executor's below-horizon flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_agg_propagates_truncated_before_horizon() {
+        let executor: Arc<dyn ArrayLocalExecutor> = Arc::new(StubExecutor {
+            rows: vec![],
+            bitmap: vec![],
+            partials: vec![],
+            truncated_before_horizon: true,
+        });
+        let payload = make_agg_req_bytes();
+        let resp_bytes = handle_array_shard_rpc(ARRAY_SHARD_AGG_REQ, 0, &payload, &executor)
+            .await
+            .expect("agg handler should succeed");
+        let resp: ArrayShardAggResp =
+            zerompk::from_msgpack(&resp_bytes).expect("response should deserialise");
+        assert!(
+            resp.truncated_before_horizon,
+            "handler must forward the executor's below-horizon flag"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_surrogate_bitmap_returns_executor_bitmap() {
         let bitmap = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let executor: Arc<dyn ArrayLocalExecutor> = Arc::new(StubExecutor {
             rows: vec![],
             bitmap: bitmap.clone(),
             partials: vec![],
+            truncated_before_horizon: false,
         });
         let payload = make_bitmap_req_bytes();
         let resp_bytes =
@@ -395,6 +448,7 @@ mod tests {
             rows: vec![],
             bitmap: vec![],
             partials: vec![partial.clone()],
+            truncated_before_horizon: false,
         });
         let payload = make_agg_req_bytes();
         let resp_bytes = handle_array_shard_rpc(ARRAY_SHARD_AGG_REQ, 3, &payload, &executor)
@@ -450,6 +504,7 @@ mod tests {
             rows: vec![],
             bitmap: vec![],
             partials: vec![],
+            truncated_before_horizon: false,
         });
         // prefix_bits=0 disables routing validation.
         let payload = make_put_req_bytes(0, 0);
@@ -469,6 +524,7 @@ mod tests {
             rows: vec![],
             bitmap: vec![],
             partials: vec![],
+            truncated_before_horizon: false,
         });
         let payload = make_delete_req_bytes();
         let resp_bytes = handle_array_shard_rpc(ARRAY_SHARD_DELETE_REQ, 2, &payload, &executor)
@@ -487,6 +543,7 @@ mod tests {
             rows: vec![],
             bitmap: vec![],
             partials: vec![],
+            truncated_before_horizon: false,
         });
         // prefix_bits=10, stride=1 → bucket = top 10 bits of hilbert_prefix.
         // hilbert_prefix = 0 → bucket 0 → expected vshard 0.
@@ -526,7 +583,7 @@ mod tests {
             prefix_bits: 10,
             slice_hilbert_ranges: vec![(0x0040_0000_0000_0000, 0x0040_0000_0000_0000)],
             shard_hilbert_range: None,
-            system_as_of: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
         };
         let err = super::validate_slice_routing(&req, 5)
@@ -552,7 +609,7 @@ mod tests {
             prefix_bits: 10,
             slice_hilbert_ranges: vec![(0x0040_0000_0000_0000, 0x0040_0000_0000_0000)],
             shard_hilbert_range: None,
-            system_as_of: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
         };
         super::validate_slice_routing(&req, 1).expect("overlapping range should accept");
@@ -564,6 +621,7 @@ mod tests {
             rows: vec![],
             bitmap: vec![],
             partials: vec![],
+            truncated_before_horizon: false,
         });
         let err = handle_array_shard_rpc(0xFF, 0, &[], &executor)
             .await

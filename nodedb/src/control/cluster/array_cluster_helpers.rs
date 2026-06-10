@@ -17,6 +17,7 @@ use crate::Error;
 pub(super) enum AggValue {
     Float(f64),
     Int(i64),
+    Bool(bool),
     Null,
 }
 
@@ -25,6 +26,7 @@ impl zerompk::ToMessagePack for AggValue {
         match self {
             AggValue::Float(f) => writer.write_f64(*f),
             AggValue::Int(i) => writer.write_i64(*i),
+            AggValue::Bool(b) => writer.write_boolean(*b),
             AggValue::Null => writer.write_nil(),
         }
     }
@@ -35,12 +37,17 @@ impl zerompk::ToMessagePack for AggValue {
 ///
 /// For scalar (no group-by), returns a single `[{"result": f64}]`.
 /// For group-by, returns one `{"group": i64, "result": f64}` per partial.
-/// The map keys and value types match the local `AggCell` encoding so that
-/// `decode_payload_to_json` produces identical JSON on both paths.
+/// When `emit_horizon` is set (temporal queries only), a trailing
+/// `{"truncated_before_horizon": bool}` summary row is appended. This mirrors
+/// the single-node path (`dispatch::array::aggregate`) exactly — including the
+/// rule that the below-horizon signal is surfaced only for temporal reads — so
+/// `decode_payload_to_json` produces byte-identical JSON on both topologies.
 pub(super) fn finalize_agg_partials(
     partials: &[ArrayAggPartial],
     reducer: &nodedb_physical::physical_plan::ArrayReducer,
     group_by_dim: i32,
+    truncated_before_horizon: bool,
+    emit_horizon: bool,
 ) -> Vec<std::collections::BTreeMap<String, AggValue>> {
     use nodedb_physical::physical_plan::ArrayReducer;
 
@@ -60,7 +67,7 @@ pub(super) fn finalize_agg_partials(
 
     let is_grouped = group_by_dim >= 0;
 
-    partials
+    let mut rows: Vec<std::collections::BTreeMap<String, AggValue>> = partials
         .iter()
         .map(|p| {
             let mut row = std::collections::BTreeMap::new();
@@ -70,7 +77,21 @@ pub(super) fn finalize_agg_partials(
             row.insert("result".to_string(), finalize(p));
             row
         })
-        .collect()
+        .collect();
+
+    // Trailing summary row carrying the below-horizon signal — only for
+    // temporal queries, matching the single-node path so both topologies emit
+    // the same row shape (non-temporal aggregates carry no summary row).
+    if emit_horizon {
+        let mut summary = std::collections::BTreeMap::new();
+        summary.insert(
+            "truncated_before_horizon".to_string(),
+            AggValue::Bool(truncated_before_horizon),
+        );
+        rows.push(summary);
+    }
+
+    rows
 }
 
 pub(super) fn cluster_err(e: nodedb_cluster::error::ClusterError) -> Error {

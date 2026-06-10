@@ -401,6 +401,7 @@ mod tests {
         let v = Value::ArrayCell(ArrayCell {
             coords: vec![Value::Integer(1), Value::Integer(2)],
             attrs: vec![Value::Float(3.5), Value::String("label".into())],
+            system_time: None,
         });
         let bytes = zerompk::to_msgpack_vec(&v).expect("encode");
         let decoded: Value = zerompk::from_msgpack(&bytes).expect("decode");

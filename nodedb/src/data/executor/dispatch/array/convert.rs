@@ -164,7 +164,11 @@ pub fn sparse_tile_to_array_cells(schema: &ArraySchema, tile: &SparseTile) -> Ve
         for col in &tile.attr_cols {
             attrs.push(cell_value_to_value(&col[attr_row]));
         }
-        cells.push(ArrayCell { coords, attrs });
+        cells.push(ArrayCell {
+            coords,
+            attrs,
+            system_time: None,
+        });
     }
     cells
 }

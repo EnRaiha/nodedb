@@ -48,8 +48,7 @@ BEGIN
 END;
 
 -- SYNC: fires in the same transaction on the Data Plane (ACID, write latency += trigger time)
-CREATE TRIGGER enforce_balance AFTER UPDATE ON accounts FOR EACH ROW
-WITH (EXECUTION = SYNC)
+CREATE SYNC TRIGGER enforce_balance AFTER UPDATE ON accounts FOR EACH ROW
 BEGIN
     IF NEW.balance < 0 THEN
         RAISE EXCEPTION 'Balance cannot go negative';
@@ -57,8 +56,7 @@ BEGIN
 END;
 
 -- DEFERRED: fires at COMMIT time, batched (ACID, COMMIT is slower)
-CREATE TRIGGER validate_totals AFTER INSERT ON line_items FOR EACH ROW
-WITH (EXECUTION = DEFERRED)
+CREATE DEFERRED TRIGGER validate_totals AFTER INSERT ON line_items FOR EACH ROW
 BEGIN
     -- cross-row validation at statement boundary
 END;
@@ -272,10 +270,15 @@ JSON-RPC over WebSocket for SQL execution, live query delivery, and session mana
 - Session reconnect with event replay
 - Auth token refresh during long-lived connections
 
+## Sync to Embedded Clients
+
+Columnar, Vector, FTS, and Spatial collections participate in **inbound sync** to NodeDB-Lite and NodeDB-WASM over the Sync protocol (WebSocket). DDL schema changes broadcast to connected embedded sessions after the Origin catalog commit, enabling automatic schema discovery. This allows offline-first applications to stay synchronized with production schema evolution.
+
 ## Related
 
 - [Key-Value](kv.md) — KV changes appear in CDC and LIVE SELECT
 - [Documents](documents.md) — Document mutations trigger events
 - [NodeDB-Lite](lite.md) — CRDT sync uses the same CDC infrastructure
+- [Offline Sync Patterns](offline-sync-patterns.md) — Offline-first workflows with sync
 
 [Back to docs](README.md)

@@ -18,20 +18,16 @@ OIDC is a delegated authentication protocol where:
 Create a provider configuration:
 
 ```sql
-CREATE OIDC PROVIDER okta WITH (
-    issuer = 'https://dev-12345.okta.com/',
-    jwks_url = 'https://dev-12345.okta.com/.well-known/jwks.json',
-    audience = 'api://nodedb'
-);
+CREATE OIDC PROVIDER okta ISSUER 'https://dev-12345.okta.com/' JWKS_URI 'https://dev-12345.okta.com/.well-known/jwks.json' AUDIENCE 'api://nodedb';
 ```
 
 **Parameters:**
 
-| Parameter  | Required | Description                                                                                       |
-| ---------- | -------- | ------------------------------------------------------------------------------------------------- |
-| `issuer`   | Yes      | Provider's issuer URL (e.g. `https://accounts.google.com`, `https://your-domain.auth0.com/`)      |
-| `jwks_url` | Yes      | JWKS endpoint for signature validation (e.g. `https://accounts.google.com/.well-known/jwks.json`) |
-| `audience` | Yes      | Expected `aud` claim in the JWT (matches your app's audience with the provider)                   |
+| Parameter   | Required | Description                                                                                       |
+| ----------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `ISSUER`    | Yes      | Provider's issuer URL (e.g. `https://accounts.google.com`, `https://your-domain.auth0.com/`)      |
+| `JWKS_URI`  | Yes      | JWKS endpoint for signature validation (e.g. `https://accounts.google.com/.well-known/jwks.json`) |
+| `AUDIENCE`  | Optional | Expected `aud` claim in the JWT (matches your app's audience with the provider)                   |
 
 **Permissions:** `CREATE OIDC PROVIDER` requires Superuser or ClusterAdmin role.
 
@@ -39,60 +35,45 @@ CREATE OIDC PROVIDER okta WITH (
 
 ## Claim Mapping
 
-Map JWT claims to NodeDB identity attributes. Define rules in the provider configuration:
+Map JWT claims to NodeDB identity attributes. Define rules using the `CLAIM MAPPING WHEN` clause:
 
 ```sql
-CREATE OIDC PROVIDER okta WITH (
-    issuer = 'https://dev-12345.okta.com/',
-    jwks_url = 'https://dev-12345.okta.com/.well-known/jwks.json',
-    audience = 'api://nodedb',
-    claim_mapping = [
-        { claim = 'email', value = 'alice@company.com', effect = { default_database = 'prod', add_databases = ['prod', 'staging'] } },
-        { claim = 'email', value = 'bob@company.com', effect = { default_database = 'staging', add_databases = ['staging'] } },
-        { claim = 'department', value = 'engineering', effect = { add_databases = ['prod', 'staging', 'dev'], add_roles = ['DatabaseEditor', 'ClusterAdmin'] } }
-    ]
-);
+CREATE OIDC PROVIDER okta ISSUER 'https://dev-12345.okta.com/' JWKS_URI 'https://dev-12345.okta.com/.well-known/jwks.json'
+  CLAIM MAPPING WHEN email = 'alice@company.com' SET DEFAULT_DATABASE = 1 ADD DATABASES [1, 2] ADD ROLES ['readwrite']
+  CLAIM MAPPING WHEN email = 'bob@company.com' SET DEFAULT_DATABASE = 2 ADD DATABASES [2]
+  CLAIM MAPPING WHEN department = 'engineering' ADD DATABASES [1, 2, 3] ADD ROLES ['cluster_admin'];
 ```
 
 **Rule structure:**
 
 ```
-{ claim = <claim_name>, value = <claim_value>, effect = {
-    default_database = <DatabaseId | null>,
-    add_databases = [<DatabaseId>, ...],
-    add_roles = [<Role>, ...]
-} }
+CLAIM MAPPING WHEN <claim> = '<value>' [SET DEFAULT_DATABASE = <db_id>] [ADD DATABASES [<id>, ...]] [ADD ROLES ['<role>', ...]]
 ```
 
 **How it works:**
 
-- If JWT contains claim `claim_name` with value matching `value`, apply the `effect`
-- `default_database` sets the user's default database for the session
-- `add_databases` adds the databases to the user's accessible set
-- `add_roles` adds roles to the authenticated identity
-- Multiple rules are OR-combined: if any rule matches, its effect applies
+- If JWT contains `<claim>` with value matching `<value>`, apply the corresponding actions
+- `SET DEFAULT_DATABASE` sets the user's default database for the session (numeric database ID)
+- `ADD DATABASES` adds the databases to the user's accessible set (numeric IDs in brackets)
+- `ADD ROLES` adds roles to the authenticated identity (quoted role names in array)
+- Multiple rules are OR-combined: if any rule matches, its actions apply
 - Claim values support wildcards (`*`) for matching any value of a claim
 
 **Example: wildcard for department**
 
 ```sql
-claim_mapping = [
-    { claim = 'department', value = '*', effect = { add_databases = ['logging'] } }
-]
+CREATE OIDC PROVIDER okta ISSUER '...' JWKS_URI '...'
+  CLAIM MAPPING WHEN department = '*' ADD DATABASES [5];
 ```
 
-All users with a `department` claim get access to the `logging` database.
+All users with a `department` claim get access to the database with ID 5.
 
 ## Updating Provider Configuration
 
-Modify claim mapping or issuer details:
+Modify claim mapping:
 
 ```sql
-ALTER OIDC PROVIDER okta SET (
-    claim_mapping = [
-        { claim = 'email', value = 'alice@company.com', effect = { add_databases = ['analytics'] } }
-    ]
-);
+ALTER OIDC PROVIDER okta SET CLAIM MAPPING WHEN email = 'alice@company.com' ADD DATABASES [4];
 ```
 
 Changes take effect immediately for new authentications. Existing sessions retain their identity until the next request (same as role-change propagation).
@@ -137,12 +118,6 @@ NodeDB caches JWKS locally to avoid repeated network roundtrips:
 - **TTL expiry:** Cache expires after 1 hour; next validation triggers refresh
 - **Circuit breaker:** If the provider is unreachable, use cached JWKS for up to 24 hours
 
-**Explicit reload:**
-
-```sql
-ALTER OIDC PROVIDER okta SET RELOAD_JWKS;
-```
-
 ## JWT Verification Sequence
 
 1. Decode JWT header (check `alg`, `kid`)
@@ -171,11 +146,7 @@ ALTER OIDC PROVIDER okta SET claim_mapping = [...];
 **1. Provider registration (admin)**
 
 ```sql
-CREATE OIDC PROVIDER auth0 WITH (
-    issuer = 'https://your-domain.auth0.com/',
-    jwks_url = 'https://your-domain.auth0.com/.well-known/jwks.json',
-    audience = 'nodedb-api'
-);
+CREATE OIDC PROVIDER auth0 ISSUER 'https://your-domain.auth0.com/' JWKS_URI 'https://your-domain.auth0.com/.well-known/jwks.json' AUDIENCE 'nodedb-api';
 ```
 
 **2. Get token from provider**

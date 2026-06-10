@@ -40,7 +40,10 @@ AS OF SYSTEM TIME 1700000000000
 AS OF VALID TIME 1700000001000;
 ```
 
-Times are milliseconds since Unix epoch. Use `extract(epoch from now()) * 1000` for current time.
+Times can be specified as:
+- Integer milliseconds since Unix epoch (e.g., `1700000000000`)
+- `NOW()` for current time
+- ISO-8601 string literal (e.g., `'2024-01-15T00:00:00Z'`)
 
 ## Examples
 
@@ -50,12 +53,12 @@ Retrieve the state of a collection at a past moment:
 
 ```sql
 -- Document collection with system time tracking
-CREATE COLLECTION user_accounts STRICT (
+CREATE COLLECTION user_accounts (
     id UUID DEFAULT gen_uuid_v7(),
     email VARCHAR,
     balance DECIMAL,
     created_at TIMESTAMP DEFAULT now()
-);
+) WITH (engine='document_strict', bitemporal=true);
 
 INSERT INTO user_accounts (email, balance) VALUES
     ('alice@example.com', 100.00);
@@ -65,7 +68,7 @@ UPDATE user_accounts SET balance = 150.00 WHERE email = 'alice@example.com';
 
 -- Query the database as it existed 10 minutes ago
 SELECT email, balance FROM user_accounts
-AS OF SYSTEM TIME (extract(epoch from now()) * 1000 - 600000);
+AS OF SYSTEM TIME 1700000000000;
 -- Returns: alice@example.com, 100.00 (the original balance)
 
 -- Query current state
@@ -96,7 +99,7 @@ VALUES ('2026-04-01T10:00:00Z', 'warehouse-a', 22.3, '2026-04-02T15:30:00Z');
 -- Query what we knew at April 1st (before correction)
 SELECT location, temperature FROM sensor_readings
 WHERE ts BETWEEN '2026-04-01' AND '2026-04-02'
-AS OF VALID TIME 1711953600000;  -- April 1st
+AS OF VALID TIME '2026-04-01T00:00:00Z';
 
 -- Query what we know now (after correction)
 SELECT location, temperature FROM sensor_readings
@@ -127,7 +130,7 @@ SELECT lon, lat, temp_c FROM ARRAY_SLICE(
     {lon: [-10, 10), lat: [0, 20)},
     ['temp_c']
 )
-AS OF SYSTEM TIME (extract(epoch from now()) * 1000 - 86400000);
+AS OF SYSTEM TIME '2026-06-06T00:00:00Z';
 ```
 
 ### Lineage and Compliance
@@ -153,11 +156,13 @@ UPDATE transactions SET status = 'CONFIRMED' WHERE id = 'txn-1';
 UPDATE transactions SET status = 'SETTLED' WHERE id = 'txn-1';
 
 -- Audit: show full timeline of this transaction
-SELECT status, system_time FROM transactions
+SELECT status, _ts_system FROM transactions
 WHERE id = 'txn-1'
-AS OF SYSTEM TIME NULL  -- special: returns all versions in system time order
-ORDER BY system_time ASC;
+AS OF SYSTEM TIME NULL  -- returns every system-time version, ascending
+ORDER BY _ts_system ASC;
 ```
+
+`AS OF SYSTEM TIME NULL` returns every system-time version of each matching row, ordered ascending, with the `_ts_system` column projected into the result. It is supported on the Document (strict and schemaless), Columnar, and Timeseries engines. It is not supported on the Graph or Array engines, nor when reading through a database clone — those return a typed error rather than collapsing to a single version.
 
 ## Index Engines and Temporal Composition
 
@@ -185,7 +190,7 @@ CREATE VECTOR INDEX idx_product_vec ON product_embeddings METRIC cosine DIM 384;
 SELECT p.product_id, p.description,
        vector_distance(p.embedding, $query_vec) AS score
 FROM product_embeddings p
-AS OF SYSTEM TIME (extract(epoch from now()) * 1000 - 2592000000)
+AS OF SYSTEM TIME '2026-05-08T00:00:00Z'
 WHERE p.id IN (
     SEARCH product_embeddings USING VECTOR(embedding, $query_vec, 20)
 )
@@ -212,7 +217,7 @@ CREATE SEARCH INDEX ON articles FIELDS title, body ANALYZER 'english';
 -- 3. Bitemporal FTS: search the index state as it existed yesterday
 SELECT id, title
 FROM articles
-AS OF SYSTEM TIME (extract(epoch from now()) * 1000 - 86400000)
+AS OF SYSTEM TIME '2026-06-06T00:00:00Z'
 WHERE text_match(body, 'distributed consensus raft')
 ORDER BY bm25_score(body, 'distributed consensus raft') DESC
 LIMIT 20;
@@ -275,7 +280,7 @@ SELECT value FROM config_entries WHERE key = 'feature_x_enabled';
 
 -- Audit: what was the value 7 days ago?
 SELECT value FROM config_entries
-AS OF SYSTEM TIME (extract(epoch from now()) * 1000 - 604800000)
+AS OF SYSTEM TIME '2026-05-31T00:00:00Z'
 WHERE key = 'feature_x_enabled';
 ```
 

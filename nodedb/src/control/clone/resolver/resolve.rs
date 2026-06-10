@@ -163,7 +163,7 @@ pub fn resolve_read(
                     effective_source_ms: cur_effective_ms,
                     kv_surrogate_ceiling: cur_origin.kv_surrogate_ceiling,
                     state,
-                })
+                })?
             {
                 let source_vshard = VShardId::from_collection_in_database(
                     src_db_id,

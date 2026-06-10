@@ -129,7 +129,7 @@ fn document_scan_preserves_kv_rows_when_collection_has_strict_config() {
             projection: Vec::new(),
             computed_columns: Vec::new(),
             window_functions: Vec::new(),
-            system_as_of_ms: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             prefilter: None,
         }),

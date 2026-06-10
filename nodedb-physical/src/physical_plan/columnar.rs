@@ -9,7 +9,7 @@
 //!
 //! All profiles share the same `ColumnarMemtable` → `SegmentWriter` infrastructure.
 
-use nodedb_types::{Surrogate, SurrogateBitmap};
+use nodedb_types::{Surrogate, SurrogateBitmap, SystemTimeScope};
 
 /// Intent carried on `ColumnarOp::Insert` — see enum docs.
 #[derive(
@@ -65,11 +65,12 @@ pub enum ColumnarOp {
         /// against matching rows before the `limit` is enforced. Empty
         /// for scans with no ORDER BY.
         sort_keys: Vec<(String, bool)>,
-        /// Bitemporal system-time cutoff: read rows whose `_ts_system`
-        /// is ≤ this value. `None` = current-state read. Only populated
-        /// for collections created `WITH BITEMPORAL`.
+        /// System-time selection. `Current` = current-state read; `AsOf(ms)` =
+        /// rows whose `_ts_system` is ≤ ms; `AllVersions` = every `_ts_system`
+        /// row ordered ascending (audit log), system-time column projected.
+        /// Only meaningful for collections created `WITH BITEMPORAL`.
         #[serde(default)]
-        system_as_of_ms: Option<i64>,
+        system_time: SystemTimeScope,
         /// Bitemporal valid-time predicate: keep rows whose
         /// `[_ts_valid_from, _ts_valid_until)` interval contains this
         /// point. `None` = no valid-time filter.

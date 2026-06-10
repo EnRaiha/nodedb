@@ -37,27 +37,7 @@ pub async fn algo(
     mode: Option<String>,
     personalization: Option<String>,
 ) -> PgWireResult<Vec<Response>> {
-    let algorithm = match algorithm_name {
-        "PAGERANK" => crate::engine::graph::algo::GraphAlgorithm::PageRank,
-        "WCC" => crate::engine::graph::algo::GraphAlgorithm::Wcc,
-        "COMMUNITY" => crate::engine::graph::algo::GraphAlgorithm::LabelPropagation,
-        "LCC" => crate::engine::graph::algo::GraphAlgorithm::Lcc,
-        "SSSP" => crate::engine::graph::algo::GraphAlgorithm::Sssp,
-        "BETWEENNESS" => crate::engine::graph::algo::GraphAlgorithm::Betweenness,
-        "CLOSENESS" => crate::engine::graph::algo::GraphAlgorithm::Closeness,
-        "HARMONIC" => crate::engine::graph::algo::GraphAlgorithm::Harmonic,
-        "DEGREE" => crate::engine::graph::algo::GraphAlgorithm::Degree,
-        "LOUVAIN" => crate::engine::graph::algo::GraphAlgorithm::Louvain,
-        "TRIANGLES" => crate::engine::graph::algo::GraphAlgorithm::Triangles,
-        "DIAMETER" => crate::engine::graph::algo::GraphAlgorithm::Diameter,
-        "KCORE" => crate::engine::graph::algo::GraphAlgorithm::KCore,
-        other => {
-            return Err(sqlstate_error(
-                "42601",
-                &format!("unknown graph algorithm '{other}'"),
-            ));
-        }
-    };
+    let algorithm = resolve_algorithm(algorithm_name)?;
 
     let max_iterations = clamp_opt(max_iterations, "ITERATIONS", MAX_ITERATIONS_CAP)?;
     let sample_size = clamp_opt(sample_size, "SAMPLE", MAX_SAMPLE_CAP)?;
@@ -84,6 +64,38 @@ pub async fn algo(
         Ok(resp) => algo_payload_to_query_response(&resp.payload, algorithm),
         Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
     }
+}
+
+/// Resolve a `GRAPH ALGO <name>` keyword to its [`GraphAlgorithm`] variant.
+///
+/// `COMMUNITY` and `LABEL_PROPAGATION` are accepted aliases that both map to
+/// label propagation. Unknown names surface a structured `42601` error rather
+/// than a catch-all default.
+fn resolve_algorithm(
+    algorithm_name: &str,
+) -> PgWireResult<crate::engine::graph::algo::GraphAlgorithm> {
+    use crate::engine::graph::algo::GraphAlgorithm;
+    Ok(match algorithm_name {
+        "PAGERANK" => GraphAlgorithm::PageRank,
+        "WCC" => GraphAlgorithm::Wcc,
+        "COMMUNITY" | "LABEL_PROPAGATION" => GraphAlgorithm::LabelPropagation,
+        "LCC" => GraphAlgorithm::Lcc,
+        "SSSP" => GraphAlgorithm::Sssp,
+        "BETWEENNESS" => GraphAlgorithm::Betweenness,
+        "CLOSENESS" => GraphAlgorithm::Closeness,
+        "HARMONIC" => GraphAlgorithm::Harmonic,
+        "DEGREE" => GraphAlgorithm::Degree,
+        "LOUVAIN" => GraphAlgorithm::Louvain,
+        "TRIANGLES" => GraphAlgorithm::Triangles,
+        "DIAMETER" => GraphAlgorithm::Diameter,
+        "KCORE" => GraphAlgorithm::KCore,
+        other => {
+            return Err(sqlstate_error(
+                "42601",
+                &format!("unknown graph algorithm '{other}'"),
+            ));
+        }
+    })
 }
 
 /// Parse the `PERSONALIZATION {…}` JSON object literal into a `node_id → weight`
@@ -167,4 +179,31 @@ fn algo_payload_to_query_response(
         schema,
         stream::iter(pgwire_rows),
     ))])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::graph::algo::GraphAlgorithm;
+
+    #[test]
+    fn community_resolves_to_label_propagation() {
+        assert!(matches!(
+            resolve_algorithm("COMMUNITY").unwrap(),
+            GraphAlgorithm::LabelPropagation
+        ));
+    }
+
+    #[test]
+    fn label_propagation_alias_resolves_to_label_propagation() {
+        assert!(matches!(
+            resolve_algorithm("LABEL_PROPAGATION").unwrap(),
+            GraphAlgorithm::LabelPropagation
+        ));
+    }
+
+    #[test]
+    fn unknown_algorithm_is_rejected() {
+        assert!(resolve_algorithm("NOPE").is_err());
+    }
 }

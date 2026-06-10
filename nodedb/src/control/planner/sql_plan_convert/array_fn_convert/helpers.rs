@@ -102,7 +102,7 @@ pub(super) fn map_binary_op(o: ArrayBinaryOpAst) -> ArrayBinaryOp {
 }
 
 /// Resolve a [`TemporalScope`] into the `(system_as_of, valid_at_ms)` pair
-/// expected by `ArrayOp::Slice` and `ArrayOp::Aggregate`.
+/// expected by `ArrayOp::Aggregate` (and `ClusterArrayOp::Agg`).
 ///
 /// Default semantics when neither clause was given: both `None` — the Data
 /// Plane handler treats this as the live-state fast path (equivalent to
@@ -118,11 +118,26 @@ pub(super) fn map_binary_op(o: ArrayBinaryOpAst) -> ArrayBinaryOp {
 /// `ValidTime::At(v)` (point-in-time) form is supported by the array engine;
 /// a range predicate (`ValidTime::Range`) is rejected here with a typed error
 /// because array cells store a single valid-time point, not an interval.
+///
+/// `AS OF SYSTEM TIME NULL` (AllVersions) is rejected for aggregates because
+/// summing across all historical versions is not meaningful. Use
+/// `NDARRAY_SLICE` for audit-log reads instead.
 pub(super) fn resolve_array_temporal(
     temporal: TemporalScope,
     context: &str,
 ) -> crate::Result<(Option<i64>, Option<i64>)> {
-    let system_as_of = temporal.system_as_of_ms;
+    let system_as_of = match temporal.system_time {
+        nodedb_types::SystemTimeScope::Current => None,
+        nodedb_types::SystemTimeScope::AsOf(ms) => Some(ms),
+        nodedb_types::SystemTimeScope::AllVersions => {
+            return Err(crate::Error::PlanError {
+                detail: format!(
+                    "{context}: AS OF SYSTEM TIME NULL is not meaningful for NDARRAY_AGG; \
+                     use a point-in-time AS OF SYSTEM TIME <ms>, or NDARRAY_SLICE for the audit log"
+                ),
+            });
+        }
+    };
     let valid_at_ms = match temporal.valid_time {
         ValidTime::Any => None,
         ValidTime::At(ms) => Some(ms),
@@ -136,6 +151,36 @@ pub(super) fn resolve_array_temporal(
         }
     };
     Ok((system_as_of, valid_at_ms))
+}
+
+/// Resolve a [`TemporalScope`] into the `(system_time, valid_at_ms)` pair
+/// expected by `ArrayOp::Slice` (and `ClusterArrayOp::Slice`).
+///
+/// Unlike `resolve_array_temporal` (used for AGG), this variant passes
+/// `SystemTimeScope::AllVersions` through unchanged so that
+/// `AS OF SYSTEM TIME NULL` triggers the audit-log scan path in the
+/// Data Plane handler.
+///
+/// `ValidTime::Range` is still rejected — array cells carry a single
+/// valid-time point, not an interval, so range predicates are nonsensical.
+pub(super) fn resolve_array_temporal_scope(
+    temporal: TemporalScope,
+    context: &str,
+) -> crate::Result<(nodedb_types::SystemTimeScope, Option<i64>)> {
+    let system_time = temporal.system_time; // all three variants pass through
+    let valid_at_ms = match temporal.valid_time {
+        ValidTime::Any => None,
+        ValidTime::At(ms) => Some(ms),
+        ValidTime::Range(lo, _hi) => {
+            return Err(crate::Error::PlanError {
+                detail: format!(
+                    "{context}: AS OF VALID TIME range predicates are not supported on array reads; \
+                     use AS OF VALID TIME <ms> (point-in-time). Got FOR VALID_TIME FROM {lo} ..."
+                ),
+            });
+        }
+    };
+    Ok((system_time, valid_at_ms))
 }
 
 const _UNUSED_ATTR_TYPE: Option<EngineAttrType> = None;

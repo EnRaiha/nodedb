@@ -351,7 +351,7 @@ mod tests {
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
                 rls_filters: Vec::new(),
-                system_as_of_ms: None,
+                system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
             }),
             deadline: Instant::now() + Duration::from_secs(5),

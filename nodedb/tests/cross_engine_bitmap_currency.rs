@@ -383,7 +383,7 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
             sort_keys: Vec::new(),
             limit: 100,
             projection: Vec::new(),
-            system_as_of_ms: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             prefilter: Some(doc_bitmap.clone()),
             computed_columns: Vec::new(),
@@ -433,7 +433,7 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
         projection: Vec::new(),
         computed_columns: Vec::new(),
         window_functions: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
         prefilter: None,
     });

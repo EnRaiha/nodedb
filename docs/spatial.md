@@ -67,7 +67,7 @@ WHERE ST_DWithin(location, ST_Point(-73.990, 40.750), 2000)
 LIMIT 10;
 
 -- H3 hexagonal binning
-SELECT h3_to_string(h3_encode(40.748, -73.985, 9)) AS hex;
+SELECT h3_latlngtocell(40.748, -73.985, 9) AS hex;
 
 -- Spatial join
 SELECT r.name, z.zone_name

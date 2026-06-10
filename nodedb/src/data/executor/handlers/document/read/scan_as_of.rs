@@ -7,25 +7,29 @@
 use tracing::debug;
 
 use super::projection::apply_projection_msgpack;
+use super::scan_params::VersionedScanParams;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_document_scan_as_of(
         &mut self,
         task: &ExecutionTask,
         tid: u64,
-        collection: &str,
-        limit: usize,
-        offset: usize,
-        filters: &[u8],
-        projection: &[String],
+        params: VersionedScanParams<'_>,
         system_as_of_ms: Option<i64>,
-        valid_at_ms: Option<i64>,
     ) -> Response {
+        let VersionedScanParams {
+            collection,
+            limit,
+            offset,
+            filters,
+            projection,
+            valid_at_ms,
+        } = params;
+
         debug!(
             core = self.core_id,
             %collection,
@@ -57,13 +61,19 @@ impl CoreLoop {
             }
         };
 
-        let fetch_limit = (limit + offset).saturating_mul(2).max(1000);
+        // Push the scan filters down into the engine so the `limit` early-stop
+        // counts only matching documents. Filtering the truncated result here
+        // (as the old fetch-then-filter heuristic did) silently under-returned
+        // when the filter was selective.
+        let predicate = |body: &[u8]| filter_predicates.iter().all(|f| f.matches_binary(body));
+        let scan_limit = offset.saturating_add(limit);
         let rows = match self.sparse.versioned_scan_as_of(
             tid,
             collection,
             system_as_of_ms,
             valid_at_ms,
-            fetch_limit,
+            scan_limit,
+            &predicate,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -76,16 +86,7 @@ impl CoreLoop {
             }
         };
 
-        let filtered: Vec<(String, Vec<u8>)> = if filter_predicates.is_empty() {
-            rows
-        } else {
-            rows.into_iter()
-                .filter(|(_id, body)| filter_predicates.iter().all(|f| f.matches_binary(body)))
-                .collect()
-        };
-
-        let sliced: Vec<(String, Vec<u8>)> =
-            filtered.into_iter().skip(offset).take(limit).collect();
+        let sliced: Vec<(String, Vec<u8>)> = rows.into_iter().skip(offset).take(limit).collect();
 
         if projection.is_empty() {
             return self.send_document_rows_raw(task, &sliced, 1024);

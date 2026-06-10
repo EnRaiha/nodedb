@@ -11,7 +11,10 @@ use std::sync::Arc;
 use crate::circuit_breaker::CircuitBreaker;
 use crate::error::{ClusterError, Result};
 
-use super::super::merge::{ArrayAggPartial, merge_slice_rows, reduce_agg_partials};
+use super::super::merge::{
+    ArrayAggPartial, any_truncated_before_horizon_agg, merge_slice_rows, merge_slice_rows_sorted,
+    reduce_agg_partials,
+};
 use super::super::rpc::ShardRpcDispatch;
 use super::super::scatter::{FanOutParams, FanOutPartitionedParams, fan_out, fan_out_partitioned};
 use super::super::wire::{
@@ -46,6 +49,19 @@ pub struct ArrayCoordParams {
 #[derive(Debug, Clone, Default)]
 pub struct CoordSliceResult {
     pub rows: Vec<Vec<u8>>,
+    pub truncated_before_horizon: bool,
+}
+
+/// Result of a coordinated aggregate fan-out.
+///
+/// Carries the merged per-group partials together with the OR-reduced
+/// `truncated_before_horizon` flag, mirroring [`CoordSliceResult`]. Dropping
+/// the flag here would let a below-horizon bitemporal aggregate report
+/// complete results — the same silent-partial-success bug the slice path
+/// avoids.
+#[derive(Debug, Clone, Default)]
+pub struct CoordAggResult {
+    pub partials: Vec<ArrayAggPartial>,
     pub truncated_before_horizon: bool,
 }
 
@@ -133,6 +149,12 @@ impl ArrayCoordinator {
     /// Data Plane. The coordinator applies the same `limit` as a final
     /// cut-off on the merged result.
     ///
+    /// When `system_time` is `AllVersions`, the coordinator merge-sorts rows
+    /// from all shards by `ArrayCell::system_time` ascending (k-way merge via
+    /// `merge_slice_rows_sorted`) before applying the limit, to preserve global
+    /// audit ordering. For `Current`/`AsOf`, rows are concatenated in arrival
+    /// order (existing behavior).
+    ///
     /// Returns merged rows plus the OR-reduced `truncated_before_horizon`
     /// flag across all shards. If any shard fails the entire operation
     /// returns `Err` — partial results are not silently dropped.
@@ -140,6 +162,7 @@ impl ArrayCoordinator {
         &self,
         req: ArrayShardSliceReq,
         coordinator_limit: u32,
+        system_time: nodedb_types::SystemTimeScope,
     ) -> Result<CoordSliceResult> {
         let prefix_bits = self.params.prefix_bits;
         let per_shard: Vec<(u32, Vec<u8>)> = self
@@ -181,7 +204,13 @@ impl ArrayCoordinator {
         let resps = decode_resps::<ArrayShardSliceResp>(&raw)?;
         let truncated_before_horizon =
             super::super::merge::any_truncated_before_horizon_slice(&resps);
-        let rows = merge_slice_rows(&resps, coordinator_limit);
+        let rows = if system_time.is_all_versions() {
+            // Audit-log: merge-sort by ArrayCell::system_time ascending across
+            // shards to preserve global ordering, then truncate to limit.
+            merge_slice_rows_sorted(&resps, coordinator_limit)?
+        } else {
+            merge_slice_rows(&resps, coordinator_limit)
+        };
         Ok(CoordSliceResult {
             rows,
             truncated_before_horizon,
@@ -194,7 +223,7 @@ impl ArrayCoordinator {
     /// Hilbert-prefix pre-filter and only count cells in its partition. This
     /// prevents double-counting in configurations where multiple vShards share
     /// a single Data Plane executor (e.g. single-node harnesses).
-    pub async fn coord_agg(&self, req: ArrayShardAggReq) -> Result<Vec<ArrayAggPartial>> {
+    pub async fn coord_agg(&self, req: ArrayShardAggReq) -> Result<CoordAggResult> {
         let prefix_bits = self.params.prefix_bits;
         let per_shard: Vec<(u32, Vec<u8>)> = self
             .params
@@ -231,7 +260,10 @@ impl ArrayCoordinator {
         )
         .await?;
         let resps = decode_resps::<ArrayShardAggResp>(&raw)?;
-        Ok(reduce_agg_partials(&resps))
+        Ok(CoordAggResult {
+            partials: reduce_agg_partials(&resps),
+            truncated_before_horizon: any_truncated_before_horizon_agg(&resps),
+        })
     }
 
     /// Forward a coord-based delete to the shard(s) that own the cells.

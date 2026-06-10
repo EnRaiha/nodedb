@@ -87,11 +87,14 @@ CREATE COLLECTION tax_rates (
 ) WITH (engine='document_strict');
 ```
 
-2. **Sync subset to Lite:** Use CRDT shape subscriptions to sync only relevant jurisdictions:
+2. **Sync subset to Lite:** Use CRDT shape subscriptions to sync only relevant jurisdictions. On the device, establish a shape subscription that filters by jurisdiction:
 
-```
--- On the device:
-SUBSCRIBE SHAPE tax_rates WHERE jurisdiction IN ('US-CA', 'US-NY');
+```rust
+// Wire-level shape subscription (via NodeDB-Lite client)
+// This is a client/sync-level feature, not runnable SQL
+client.shape_subscribe("tax_rates", json!({
+    "jurisdiction": ["US-CA", "US-NY"]
+})).await?;
 ```
 
 3. **Lookup at invoice time:** Use TEMPORAL_LOOKUP (or equivalent local query) to find the rate effective at the invoice date:
@@ -107,6 +110,10 @@ LIMIT 1;
 4. **Reconcile on sync:** If a rate changed between offline creation and sync, Origin can flag invoices for review. The app decides whether to recalculate or accept the offline-computed tax.
 
 **Key principle:** Tax computation logic lives in the application, not the database. NodeDB provides the primitives (temporal lookup, CRDT sync, decimal arithmetic) — the app decides which rate to apply and when to recalculate.
+
+## Sync Scope
+
+Columnar, Vector, FTS, and Spatial collections now participate in **inbound sync** to NodeDB-Lite (alongside the document and CRDT engines). Schema changes (DDL) broadcast to connected Lite and WASM sessions after the Origin catalog commits, so embedded clients automatically pick up new collections and columns without explicit subscription. This enables seamless schema evolution in offline-first applications.
 
 ## NodeDB-Lite Usage
 

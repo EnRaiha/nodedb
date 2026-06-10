@@ -20,7 +20,7 @@ CREATE USER service_bot WITH PASSWORD 'key' ROLE readwrite TENANT 42;
 SHOW USERS;
 ```
 
-**Roles:** `readonly`, `readwrite`, `admin`, `tenant_admin`, `superuser`
+**Roles:** `readonly`, `readwrite`, `tenant_admin`, `superuser`, `cluster_admin`, `monitor`
 
 Connect via psql:
 
@@ -33,21 +33,24 @@ psql -h localhost -p 6432 -U alice
 For service-to-service communication without passwords.
 
 ```sql
--- Create an API key (returns the key once — store it securely)
-CREATE API KEY 'my-service' ROLE readwrite;
+-- Create an API key for a user (returns the key once — store it securely)
+CREATE API KEY FOR alice;
 
 -- Create a key scoped to specific databases
-CREATE API KEY 'analytics-svc' FOR service_account WITH DATABASES (analytics, logs);
+CREATE API KEY FOR service_account WITH DATABASES (analytics, logs);
 
 -- Revoke
-DROP API KEY 'my-service';
+REVOKE API KEY <key_id>;
+
+-- List API keys
+SHOW API KEYS [FOR <user>];
 ```
 
 **Database scoping:**
 
 ```sql
 -- Create a key accessible only to the 'prod' database
-CREATE API KEY 'prod-reader' FOR alice WITH DATABASES (prod);
+CREATE API KEY FOR alice WITH DATABASES (prod);
 
 -- Attempt to use key on a different database is rejected
 -- Error: DATABASE_NOT_AUTHORIZED
@@ -70,7 +73,7 @@ Credentials for daemons, batch jobs, and application backends. Service accounts 
 CREATE SERVICE ACCOUNT 'batch-processor' FOR DATABASE analytics;
 
 -- Create an API key on the service account
-CREATE API KEY 'batch-key' FOR 'batch-processor' WITH DATABASES (analytics);
+CREATE API KEY FOR 'batch-processor' WITH DATABASES (analytics);
 
 -- Adjust accessible databases
 ALTER SERVICE ACCOUNT 'batch-processor' SET DATABASES (analytics, logs);
@@ -98,17 +101,16 @@ CREATE OIDC PROVIDER auth0 WITH (
 
 See [OIDC Single Sign-On](oidc.md) for full setup and claim mapping.
 
-## JWKS (JWT Auto-Discovery) — Legacy
+## JWT Configuration — Legacy
 
 Multi-provider support for Auth0, Clerk, Supabase, Firebase, Keycloak, and Cognito via `nodedb.toml` configuration.
 
 Configure in `nodedb.toml`:
 
 ```toml
-[auth.jwks]
-providers = [
-    { issuer = "https://your-domain.auth0.com/", audience = "your-api" },
-]
+[[auth.jwt.providers]]
+issuer = "https://your-domain.auth0.com/"
+audience = "your-api"
 ```
 
 JWT claims map to `$auth.*` session variables:

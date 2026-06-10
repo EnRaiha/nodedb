@@ -34,6 +34,14 @@ pub struct ArrayCell {
     pub coords: Vec<Value>,
     /// One `Value` per attribute column.
     pub attrs: Vec<Value>,
+    /// System-time of this cell version in milliseconds since Unix epoch.
+    ///
+    /// `Some` only on audit-log reads (`AS OF SYSTEM TIME NULL`), where each
+    /// row represents one system-time version of the cell. `None` on live and
+    /// point-in-time reads — those return the ceiling-resolved state with no
+    /// per-row version column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_time: Option<i64>,
 }
 
 #[cfg(test)]
@@ -44,6 +52,15 @@ mod tests {
         ArrayCell {
             coords: vec![Value::Integer(1), Value::Integer(2)],
             attrs: vec![Value::Float(3.5), Value::String("label".into())],
+            system_time: None,
+        }
+    }
+
+    fn sample_cell_with_system_time(ts: i64) -> ArrayCell {
+        ArrayCell {
+            coords: vec![Value::Integer(1), Value::Integer(2)],
+            attrs: vec![Value::Float(3.5), Value::String("label".into())],
+            system_time: Some(ts),
         }
     }
 
@@ -72,5 +89,32 @@ mod tests {
         let mut c = sample_cell();
         c.coords[0] = Value::Integer(999);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn zerompk_roundtrip_with_system_time() {
+        let cell = sample_cell_with_system_time(1_700_000_000_000);
+        let bytes = zerompk::to_msgpack_vec(&cell).expect("encode");
+        let decoded: ArrayCell = zerompk::from_msgpack(&bytes).expect("decode");
+        assert_eq!(decoded, cell);
+        assert_eq!(decoded.system_time, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn system_time_none_is_absent_in_json() {
+        let cell = sample_cell();
+        let s = sonic_rs::to_string(&cell).expect("json encode");
+        assert!(
+            !s.contains("system_time"),
+            "system_time must be absent when None: {s}"
+        );
+    }
+
+    #[test]
+    fn system_time_some_roundtrips_through_json() {
+        let cell = sample_cell_with_system_time(1_700_000_000_000);
+        let s = sonic_rs::to_string(&cell).expect("json encode");
+        let decoded: ArrayCell = sonic_rs::from_str(&s).expect("json decode");
+        assert_eq!(decoded.system_time, Some(1_700_000_000_000));
     }
 }

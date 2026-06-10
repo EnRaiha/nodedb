@@ -3,7 +3,7 @@
 //! Graph engine operations dispatched to the Data Plane.
 
 use nodedb_graph::{AlgoParams, Direction, GraphAlgorithm, GraphTraversalOptions};
-use nodedb_types::{Surrogate, SurrogateBitmap};
+use nodedb_types::{Surrogate, SurrogateBitmap, SystemTimeScope};
 
 /// One edge in an `EdgePutBatch` / `EdgeDeleteBatch`.
 ///
@@ -211,9 +211,10 @@ pub enum GraphOp {
         node_id: String,
         edge_label: Option<String>,
         direction: Direction,
-        /// System-time cutoff in ms. `None` falls back to current-state
-        /// semantics identical to `Neighbors`.
-        system_as_of_ms: Option<i64>,
+        /// System-time selection. `Current` falls back to current-state
+        /// semantics identical to `Neighbors`; `AsOf(ms)` is point-in-time.
+        /// `AllVersions` returns a typed NotSupported error on graph.
+        system_time: SystemTimeScope,
         /// Optional valid-time point. Skipped when `None`.
         valid_at_ms: Option<i64>,
         rls_filters: Vec<u8>,
@@ -227,9 +228,10 @@ pub enum GraphOp {
     TemporalAlgorithm {
         algorithm: GraphAlgorithm,
         params: AlgoParams,
-        /// System-time cutoff in ms. `None` means current state (equivalent
-        /// to plain `Algo`).
-        system_as_of_ms: Option<i64>,
+        /// System-time selection. `Current` means current state (equivalent to
+        /// plain `Algo`); `AsOf(ms)` builds a snapshot at that cutoff.
+        /// `AllVersions` returns a typed NotSupported error on graph.
+        system_time: SystemTimeScope,
     },
 
     /// Read persistent graph-stats counters from the edge store.

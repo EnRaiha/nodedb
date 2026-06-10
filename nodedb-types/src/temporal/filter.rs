@@ -2,6 +2,7 @@
 
 //! Bitemporal filter predicates used by SQL planner and scan operators.
 
+use crate::temporal::system_time::SystemTimeScope;
 use serde::{Deserialize, Serialize};
 
 /// Valid-time predicate attached to a scan.
@@ -43,8 +44,8 @@ pub enum ValidTimePredicate {
     zerompk::FromMessagePack,
 )]
 pub struct BitemporalFilter {
-    /// System AS OF time (ms since epoch). None = latest committed state.
-    pub system_as_of_ms: Option<i64>,
+    /// System-time selection. `Current` = latest committed state.
+    pub system_time: SystemTimeScope,
     /// Valid-time predicate. None = unconstrained along the valid axis.
     pub valid: Option<ValidTimePredicate>,
 }
@@ -52,19 +53,19 @@ pub struct BitemporalFilter {
 impl BitemporalFilter {
     /// Filter that requests strictly current state on both axes.
     pub const CURRENT: Self = Self {
-        system_as_of_ms: None,
+        system_time: SystemTimeScope::Current,
         valid: None,
     };
 
     /// Whether this filter is the pure current-state filter.
     pub const fn is_current(&self) -> bool {
-        self.system_as_of_ms.is_none() && self.valid.is_none()
+        matches!(self.system_time, SystemTimeScope::Current) && self.valid.is_none()
     }
 
     /// Construct a filter for "as of system time `t`".
     pub const fn system_as_of(t: i64) -> Self {
         Self {
-            system_as_of_ms: Some(t),
+            system_time: SystemTimeScope::AsOf(t),
             valid: None,
         }
     }
@@ -72,7 +73,7 @@ impl BitemporalFilter {
     /// Construct a filter for "valid-time contains `t`".
     pub const fn valid_at(t: i64) -> Self {
         Self {
-            system_as_of_ms: None,
+            system_time: SystemTimeScope::Current,
             valid: Some(ValidTimePredicate::Contains(t)),
         }
     }
@@ -91,10 +92,10 @@ mod tests {
     #[test]
     fn constructors_populate_expected_fields() {
         let f = BitemporalFilter::system_as_of(1_000);
-        assert_eq!(f.system_as_of_ms, Some(1_000));
+        assert_eq!(f.system_time, SystemTimeScope::AsOf(1_000));
         assert!(f.valid.is_none());
         let g = BitemporalFilter::valid_at(2_000);
-        assert!(g.system_as_of_ms.is_none());
+        assert_eq!(g.system_time, SystemTimeScope::Current);
         assert_eq!(g.valid, Some(ValidTimePredicate::Contains(2_000)));
     }
 

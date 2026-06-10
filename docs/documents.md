@@ -167,7 +167,7 @@ Both schemaless and strict documents support bitemporal queries — tracking sys
 ```sql
 -- Query documents as they existed yesterday (system time)
 SELECT * FROM users
-AS OF SYSTEM TIME (extract(epoch from now()) * 1000 - 86400000);
+AS OF SYSTEM TIME '2026-06-06T00:00:00Z';
 
 -- Query documents that were valid at a past date (valid time)
 SELECT * FROM users

@@ -489,9 +489,7 @@ fn extract_system_as_of_ms(
 fn extract_doc_as_of(op: &nodedb_physical::physical_plan::DocumentOp) -> Option<i64> {
     use nodedb_physical::physical_plan::DocumentOp;
     match op {
-        DocumentOp::Scan {
-            system_as_of_ms, ..
-        } => *system_as_of_ms,
+        DocumentOp::Scan { system_time, .. } => system_time.as_of_ms(),
         _ => None,
     }
 }
@@ -499,9 +497,7 @@ fn extract_doc_as_of(op: &nodedb_physical::physical_plan::DocumentOp) -> Option<
 fn extract_columnar_as_of(op: &nodedb_physical::physical_plan::ColumnarOp) -> Option<i64> {
     use nodedb_physical::physical_plan::ColumnarOp;
     match op {
-        ColumnarOp::Scan {
-            system_as_of_ms, ..
-        } => *system_as_of_ms,
+        ColumnarOp::Scan { system_time, .. } => system_time.as_of_ms(),
         _ => None,
     }
 }
@@ -509,9 +505,7 @@ fn extract_columnar_as_of(op: &nodedb_physical::physical_plan::ColumnarOp) -> Op
 fn extract_timeseries_as_of(op: &nodedb_physical::physical_plan::TimeseriesOp) -> Option<i64> {
     use nodedb_physical::physical_plan::TimeseriesOp;
     match op {
-        TimeseriesOp::Scan {
-            system_as_of_ms, ..
-        } => *system_as_of_ms,
+        TimeseriesOp::Scan { system_time, .. } => system_time.as_of_ms(),
         _ => None,
     }
 }

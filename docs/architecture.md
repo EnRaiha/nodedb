@@ -22,7 +22,7 @@ NodeDB splits work across three planes connected by lock-free ring buffers. This
 └────────────────────────┘  └─────────────────────────────────────┘
 ```
 
-**Control Plane** — Runs on Tokio. Handles connections (pgwire, HTTP, WebSocket), parses SQL via DataFusion, builds logical query plans, and dispatches work to the Data Plane. All types here are `Send + Sync`.
+**Control Plane** — Runs on Tokio. Handles connections (pgwire, HTTP, WebSocket), parses SQL via nodedb-sql (sqlparser-rs based), builds logical query plans, and dispatches work to the Data Plane. All types here are `Send + Sync`.
 
 **Data Plane** — One thread per CPU core, each an isolated shard. Reads from NVMe via io_uring, runs SIMD vector math, executes physical query plans. No locks, no atomics, no cross-core sharing. Types are `!Send` by design. Emits `WriteEvent` records (covering inserts, updates, and deletes via `WriteOp`) to the Event Plane via per-core bounded ring buffers after each WAL commit.
 
@@ -44,13 +44,13 @@ NodeDB splits work across three planes connected by lock-free ring buffers. This
 
 There are two ways a query reaches the Data Plane. Both produce the same `PhysicalPlan` and execute identically from that point on.
 
-**SQL path (user-facing)** — All user-visible interfaces use SQL. `psql`, the `ndb` CLI, and the HTTP `/v1/query` endpoint all accept SQL text. The Control Plane runs it through DataFusion (parse → logical plan → optimize → `PhysicalPlan`):
+**SQL path (user-facing)** — All user-visible interfaces use SQL. `psql`, the `ndb` CLI, and the HTTP `/v1/query` endpoint all accept SQL text. The Control Plane runs it through nodedb-sql (parse → logical plan → optimize → `PhysicalPlan`):
 
 ```
 psql / ndb CLI / HTTP /v1/query
          │
          ▼
-   DataFusion parser
+   nodedb-sql parser
          │
          ▼
    Logical plan + optimizer
@@ -59,7 +59,7 @@ psql / ndb CLI / HTTP /v1/query
    PhysicalPlan ──► SPSC Bridge ──► Data Plane
 ```
 
-**Native opcode path (SDK optimization)** — The Rust SDK (`nodedb-client`), FFI bindings (`nodedb-lite-ffi`), and WASM bindings (`nodedb-lite-wasm`) dispatch typed opcode messages over the NDB protocol instead of SQL text. The Control Plane converts them directly to a `PhysicalPlan` via `build_plan()`, skipping SQL parsing and serialization:
+**Native opcode path (SDK optimization)** — The Rust SDK (`nodedb-client`), FFI bindings (`nodedb-lite-ffi`), and WASM bindings (`nodedb-lite-wasm`) dispatch typed opcode messages over the NDB protocol instead of SQL text. The Control Plane converts them directly to a `PhysicalPlan` via engine-specific handlers, skipping SQL parsing and serialization:
 
 ```
 nodedb-client / nodedb-lite-ffi / nodedb-lite-wasm

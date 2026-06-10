@@ -164,7 +164,7 @@ const results = await db.sql(
 
 ## Offline-First with CRDT Sync
 
-WASM supports the same CRDT sync as native NodeDB-Lite. Writes happen locally, deltas sync to Origin when online:
+WASM supports the same CRDT sync as native NodeDB-Lite. Writes happen locally, deltas sync to Origin when online. Schema changes (DDL) broadcast from Origin to connected WASM sessions automatically after catalog commits, enabling embedded clients to discover new collections and columns without explicit subscription.
 
 ```javascript
 import init, { NodeDbLite } from "nodedb-lite-wasm";

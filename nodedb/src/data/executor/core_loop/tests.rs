@@ -83,7 +83,7 @@ fn expired_task_returns_deadline_exceeded() {
                     surrogate: nodedb_types::Surrogate::ZERO,
                     pk_bytes: Vec::new(),
                     rls_filters: Vec::new(),
-                    system_as_of_ms: None,
+                    system_time: nodedb_types::SystemTimeScope::Current,
                     valid_at_ms: None,
                 }))
             },
@@ -108,7 +108,7 @@ fn watermark_in_response() {
                 surrogate: nodedb_types::Surrogate::ZERO,
                 pk_bytes: Vec::new(),
                 rls_filters: Vec::new(),
-                system_as_of_ms: None,
+                system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
             })),
         })
@@ -132,7 +132,7 @@ fn cancel_removes_pending_task() {
                     surrogate: nodedb_types::Surrogate::ZERO,
                     pk_bytes: Vec::new(),
                     rls_filters: Vec::new(),
-                    system_as_of_ms: None,
+                    system_time: nodedb_types::SystemTimeScope::Current,
                     valid_at_ms: None,
                 }))
             },
@@ -243,7 +243,7 @@ fn scan_with_prefilter_returns_only_bitmap_members() {
                 projection: Vec::new(),
                 computed_columns: Vec::new(),
                 window_functions: Vec::new(),
-                system_as_of_ms: None,
+                system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
                 prefilter: Some(prefilter),
             })),

@@ -220,33 +220,34 @@ All algorithms run directly on the CSR index. SIMD-accelerated where applicable 
 ### Running Algorithms
 
 ```sql
-GRAPH ALGO PAGERANK ON social_graph DAMPING 0.85 ITERATIONS 20 TOLERANCE 1e-7;
-GRAPH ALGO WCC ON knowledge_graph;
-GRAPH ALGO SSSP ON routes FROM 'city:chicago';
-GRAPH ALGO COMMUNITY ON products ITERATIONS 10 RESOLUTION 1.0;
-GRAPH ALGO BETWEENNESS ON network SAMPLE 500;
-GRAPH ALGO KCORE ON collaboration;
-GRAPH ALGO TRIANGLES ON social MODE global;
-GRAPH ALGO DIAMETER ON web;
+GRAPH ALGO PAGERANK ON 'social_graph' DAMPING 0.85 ITERATIONS 20 TOLERANCE 1e-7;
+GRAPH ALGO PAGERANK ON 'social_graph' DAMPING 0.85 PERSONALIZATION {"alice": 1.0, "bob": 0.5};
+GRAPH ALGO WCC ON 'knowledge_graph';
+GRAPH ALGO SSSP ON 'routes' FROM 'city:chicago';
+GRAPH ALGO COMMUNITY ON 'products' ITERATIONS 10 RESOLUTION 1.0;
+GRAPH ALGO BETWEENNESS ON 'network' SAMPLE 500;
+GRAPH ALGO KCORE ON 'collaboration';
+GRAPH ALGO TRIANGLES ON 'social' MODE global;
+GRAPH ALGO DIAMETER ON 'web';
 ```
 
 ### Algorithm Reference
 
-| Algorithm             | What it computes                                                 | Key Parameters                                          |
-| --------------------- | ---------------------------------------------------------------- | ------------------------------------------------------- |
-| **PageRank**          | Node importance via incoming link structure                      | `DAMPING` (0.85), `ITERATIONS` (20), `TOLERANCE` (1e-7) |
-| **WCC**               | Weakly connected components (union-find with path compression)   | —                                                       |
-| **Label Propagation** | Community detection via iterative label spreading                | `ITERATIONS` (10)                                       |
-| **LCC**               | Local clustering coefficient — how tightly neighbors connect     | —                                                       |
-| **SSSP**              | Single-source shortest path (Dijkstra, rejects negative weights) | `FROM` (required)                                       |
-| **Betweenness**       | Bridge nodes with high traffic (Brandes' algorithm)              | `SAMPLE` (optional, for approximation)                  |
-| **Closeness**         | How close a node is to all others (inverse distance sum)         | `SAMPLE` (optional)                                     |
-| **Harmonic**          | Like closeness, but handles disconnected graphs                  | `SAMPLE` (optional)                                     |
-| **Degree**            | Connection count per node                                        | `DIRECTION` (in/out/both)                               |
-| **Louvain**           | Community detection via modularity optimization                  | `ITERATIONS` (10), `RESOLUTION` (1.0)                   |
-| **Triangles**         | Triangle count (per-node or global)                              | `MODE` (global/per_node)                                |
-| **Diameter**          | Longest shortest path in the graph                               | —                                                       |
-| **k-Core**            | Coreness decomposition (peeling algorithm)                       | —                                                       |
+| Algorithm             | What it computes                                                             | Key Parameters                                                                             |
+| --------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| **PageRank**          | Node importance via incoming link structure; biased by personalization seeds | `DAMPING` (0.85), `ITERATIONS` (20), `TOLERANCE` (1e-7), `PERSONALIZATION` (optional JSON) |
+| **WCC**               | Weakly connected components (union-find with path compression)               | —                                                                                          |
+| **Label Propagation** | Community detection via iterative label spreading                            | `ITERATIONS` (10)                                                                          |
+| **LCC**               | Local clustering coefficient — how tightly neighbors connect                 | —                                                                                          |
+| **SSSP**              | Single-source shortest path (Dijkstra, rejects negative weights)             | `FROM` (required)                                                                          |
+| **Betweenness**       | Bridge nodes with high traffic (Brandes' algorithm)                          | `SAMPLE` (optional, for approximation)                                                     |
+| **Closeness**         | How close a node is to all others (inverse distance sum)                     | `SAMPLE` (optional)                                                                        |
+| **Harmonic**          | Like closeness, but handles disconnected graphs                              | `SAMPLE` (optional)                                                                        |
+| **Degree**            | Connection count per node                                                    | `DIRECTION` (in/out/both)                                                                  |
+| **Louvain**           | Community detection via modularity optimization                              | `ITERATIONS` (10), `RESOLUTION` (1.0)                                                      |
+| **Triangles**         | Triangle count (per-node or global)                                          | `MODE` (global/per_node)                                                                   |
+| **Diameter**          | Longest shortest path in the graph                                           | —                                                                                          |
+| **k-Core**            | Coreness decomposition (peeling algorithm)                                   | —                                                                                          |
 
 ---
 

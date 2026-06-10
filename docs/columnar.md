@@ -166,7 +166,7 @@ Columnar collections track both system time and valid time, enabling corrections
 SELECT level, COUNT(*) FROM logs
 WHERE ts > now() - INTERVAL '1 hour'
 GROUP BY level
-AS OF SYSTEM TIME (extract(epoch from now()) * 1000 - 3600000);
+AS OF SYSTEM TIME '2026-06-07T12:00:00Z';
 
 -- Query records valid at a specific date (forecast corrections, backdated data)
 SELECT host, cpu_usage FROM metrics

@@ -79,7 +79,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
             gap_fill: gap_fill.to_string(),
             computed_columns: computed_bytes,
             rls_filters: Vec::new(),
-            system_as_of_ms: temporal.system_as_of_ms,
+            system_time: temporal.system_time,
             valid_at_ms: valid_at_from_scope(temporal),
         }),
         post_set_op: PostSetOp::None,

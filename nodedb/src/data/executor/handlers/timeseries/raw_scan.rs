@@ -25,6 +25,9 @@ pub(in crate::data::executor) struct RawScanParams<'a> {
     pub filter_predicates: &'a [crate::bridge::scan_filter::ScanFilter],
     pub has_filters: bool,
     pub computed_columns: &'a [u8],
+    /// `AS OF SYSTEM TIME NULL`: emit every `_ts_system` version ordered
+    /// ascending by system time (audit-log semantics).
+    pub all_versions: bool,
 }
 
 impl CoreLoop {
@@ -42,6 +45,7 @@ impl CoreLoop {
             filter_predicates,
             has_filters,
             computed_columns: computed_columns_bytes,
+            all_versions,
         } = params;
 
         // Scan-quiesce gate.
@@ -156,6 +160,15 @@ impl CoreLoop {
             results
         };
 
+        // Audit-log order: ascending by system time across all versions.
+        let results = if all_versions {
+            let mut sorted = results;
+            sorted.sort_by_key(rmpv_system_time);
+            sorted
+        } else {
+            results
+        };
+
         let array = rmpv::Value::Array(results);
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &array).unwrap_or(());
@@ -166,6 +179,23 @@ impl CoreLoop {
 // ---------------------------------------------------------------------------
 // Parallel partition scan for raw mode
 // ---------------------------------------------------------------------------
+
+/// Extract the `_ts_system` value from an rmpv-encoded row for audit-log
+/// ordering. Rows without the column sort first (treated as `i64::MIN`).
+fn rmpv_system_time(row: &rmpv::Value) -> i64 {
+    let rmpv::Value::Map(entries) = row else {
+        return i64::MIN;
+    };
+    for (k, v) in entries {
+        if let rmpv::Value::String(s) = k
+            && s.as_str() == Some("_ts_system")
+            && let rmpv::Value::Integer(i) = v
+        {
+            return i.as_i64().unwrap_or(i64::MIN);
+        }
+    }
+    i64::MIN
+}
 
 /// Scan disk partitions in parallel, returning rmpv rows sorted by timestamp.
 fn scan_partitions_parallel(

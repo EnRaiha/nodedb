@@ -55,8 +55,8 @@ pub(crate) fn convert_slice(
             detail: format!("array slice encode: {e}"),
         })?;
 
-    let (system_as_of, valid_at_ms) =
-        super::helpers::resolve_array_temporal(temporal, "ARRAY_SLICE")?;
+    let (system_time, valid_at_ms) =
+        super::helpers::resolve_array_temporal_scope(temporal, "ARRAY_SLICE")?;
     let attr_indices = resolve_attr_indices(name, attr_projection, &schema)?;
     let aid = ArrayId::new(tenant_id, name);
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
@@ -79,7 +79,7 @@ pub(crate) fn convert_slice(
             limit,
             slice_hilbert_ranges,
             prefix_bits: entry.prefix_bits,
-            system_as_of,
+            system_time,
             valid_at_ms,
         })
     } else {
@@ -90,7 +90,7 @@ pub(crate) fn convert_slice(
             limit,
             cell_filter: None,
             hilbert_range: None,
-            system_as_of,
+            system_time,
             valid_at_ms,
         })
     };

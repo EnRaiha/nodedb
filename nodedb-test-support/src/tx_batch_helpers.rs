@@ -159,7 +159,7 @@ pub fn doc_get(collection: &str, doc_id: &str) -> PhysicalPlan {
         collection: collection.into(),
         document_id: doc_id.into(),
         rls_filters: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
         surrogate: nodedb_types::Surrogate::ZERO,
         pk_bytes: Vec::new(),
@@ -274,7 +274,7 @@ pub fn timeseries_scan(collection: &str) -> PhysicalPlan {
         aggregates: Vec::new(),
         gap_fill: String::new(),
         rls_filters: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
         computed_columns: Vec::new(),
     })

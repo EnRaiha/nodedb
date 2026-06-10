@@ -174,7 +174,7 @@ async fn execute_aggregate_scan(
         gap_fill: String::new(),
         computed_columns: Vec::new(),
         rls_filters: Vec::new(),
-        system_as_of_ms: None,
+        system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
 

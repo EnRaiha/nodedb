@@ -79,7 +79,7 @@ ports:
 
 | Variable                  | Default    | Description                  |
 | ------------------------- | ---------- | ---------------------------- |
-| `NODEDB_MEMORY_LIMIT`     | 75% of RAM | e.g. `4GiB`                  |
+| `NODEDB_MEMORY_LIMIT`     | 1 GiB      | e.g. `4GiB`                  |
 | `NODEDB_DATA_PLANE_CORES` | CPUs - 1   | number of Data Plane threads |
 | `NODEDB_LOG_FORMAT`       | `text`     | `text` or `json`             |
 
@@ -247,9 +247,9 @@ ilp = false                       # Example: disable TLS for ILP ingest
 | `ports.resp`       | `NODEDB_PORT_RESP`        | disabled                                              |
 | `ports.ilp`        | `NODEDB_PORT_ILP`         | disabled                                              |
 | `data_dir`         | `NODEDB_DATA_DIR`         | `~/.nodedb/data` (binary), `/var/lib/nodedb` (Docker) |
-| `memory_limit`     | `NODEDB_MEMORY_LIMIT`     | `1GiB`                                                |
+| `memory_limit`     | `NODEDB_MEMORY_LIMIT`     | `1 GiB`                                               |
 | `data_plane_cores` | `NODEDB_DATA_PLANE_CORES` | CPUs - 1                                              |
-| `max_connections`  | `NODEDB_MAX_CONNECTIONS`  | `1024`                                                |
+| `max_connections`  | `NODEDB_MAX_CONNECTIONS`  | `4096`                                                |
 | `log_format`       | `NODEDB_LOG_FORMAT`       | `text`                                                |
 
 **Per-protocol TLS** (only applies when `[server.tls]` is configured):
@@ -446,8 +446,7 @@ END;
 $$;
 
 -- Fire synchronously in the same transaction (ACID, adds trigger latency to writes)
-CREATE TRIGGER enforce_balance AFTER UPDATE ON accounts FOR EACH ROW
-WITH (EXECUTION = SYNC) $$
+CREATE SYNC TRIGGER enforce_balance AFTER UPDATE ON accounts FOR EACH ROW $$
 BEGIN
     IF NEW.balance < 0 THEN
         RAISE EXCEPTION 'Balance cannot go negative';
@@ -518,8 +517,8 @@ COPY tenant_restore(acme) FROM STDIN;
 PURGE TENANT acme CONFIRM;
 
 -- Inspect resource usage and limits
-SHOW TENANT USAGE FOR acme;
-SHOW TENANT QUOTA FOR acme;
+SHOW TENANT USAGE FOR acme IN DATABASE prod;
+SHOW TENANT QUOTA FOR acme IN DATABASE prod;
 ```
 
 ## What's Next

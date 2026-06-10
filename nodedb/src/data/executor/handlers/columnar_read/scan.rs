@@ -29,9 +29,11 @@ pub(in crate::data::executor) struct ColumnarScanParams<'a> {
     #[allow(dead_code)]
     pub rls_filters: &'a [u8],
     pub sort_keys: &'a [(String, bool)],
-    /// Bitemporal system-time cutoff: drop rows with `_ts_system > cutoff`.
-    /// `None` is a current-state read (no filter applied).
-    pub system_as_of_ms: Option<i64>,
+    /// Bitemporal system-time selection. `Current` is a current-state read;
+    /// `AsOf(ms)` drops rows with `_ts_system > ms`; `AllVersions` emits every
+    /// `_ts_system` row ordered ascending (audit log), with the system-time
+    /// column projected.
+    pub system_time: nodedb_types::SystemTimeScope,
     /// Bitemporal valid-time point: drop rows whose
     /// `[_ts_valid_from, _ts_valid_until)` interval does not contain this
     /// point. `None` skips valid-time filtering entirely.
@@ -61,11 +63,21 @@ impl CoreLoop {
             filters,
             rls_filters: _,
             sort_keys,
-            system_as_of_ms,
+            system_time,
             valid_at_ms,
             prefilter,
             computed_columns,
         } = params;
+
+        use nodedb_types::SystemTimeScope;
+        let all_versions = system_time.is_all_versions();
+        // AS OF SYSTEM TIME NULL must surface every version: do not apply a
+        // system-time cutoff. `AsOf(ms)` applies the ceiling; `Current` is
+        // unconstrained.
+        let system_as_of_ms = match system_time {
+            SystemTimeScope::Current | SystemTimeScope::AllVersions => None,
+            SystemTimeScope::AsOf(ms) => Some(ms),
+        };
 
         let computed_cols: Vec<ComputedColumn> = if !computed_columns.is_empty() {
             match zerompk::from_msgpack(computed_columns) {
@@ -207,7 +219,11 @@ impl CoreLoop {
                 }
                 let mut obj = serde_json::Map::new();
                 for (i, col_def) in schema.columns.iter().enumerate() {
+                    // Under all-versions (audit log) the system-time column is
+                    // always projected so callers can order/inspect history.
+                    let force_system_col = all_versions && col_def.name == "_ts_system";
                     if !projection.is_empty()
+                        && !force_system_col
                         && !projection.iter().any(|p| p == &col_def.name)
                         && !computed_cols.iter().any(|cc| cc.alias == col_def.name)
                     {
@@ -235,6 +251,7 @@ impl CoreLoop {
                         obj.retain(|k, _| {
                             projection.iter().any(|p| p == k)
                                 || computed_cols.iter().any(|cc| &cc.alias == k)
+                                || (all_versions && k == "_ts_system")
                         });
                     }
                 }
@@ -247,6 +264,13 @@ impl CoreLoop {
 
         if !sort_keys.is_empty() {
             matched.sort_by(|(a, _), (b, _)| sort_rows_by_keys(a, b, schema, sort_keys));
+        } else if all_versions {
+            // Audit-log order: ascending by system time. The hidden
+            // `_ts_system` column index was resolved above.
+            matched.sort_by(|(a, _), (b, _)| {
+                super::bitemporal::row_system_time(a, ts_system_idx)
+                    .cmp(&super::bitemporal::row_system_time(b, ts_system_idx))
+            });
         }
 
         let results: Vec<serde_json::Value> =

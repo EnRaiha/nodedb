@@ -39,10 +39,17 @@ CREATE SEARCH INDEX ON articles FIELDS title, body
     ANALYZER 'english'
     FUZZY true;
 
--- Basic search
+-- Basic search with text_match
 SELECT title, bm25_score(body, 'distributed database rust') AS score
 FROM articles
 WHERE text_match(body, 'distributed database rust')
+ORDER BY score DESC
+LIMIT 20;
+
+-- Using SEARCH() as an alias (equivalent to text_match)
+SELECT title, bm25_score(body, 'distributed database rust') AS score
+FROM articles
+WHERE SEARCH(body, 'distributed database rust')
 ORDER BY score DESC
 LIMIT 20;
 
