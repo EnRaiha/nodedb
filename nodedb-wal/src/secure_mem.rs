@@ -13,10 +13,17 @@
 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 use tracing::warn;
+use zeroize::Zeroize;
 
 /// A 32-byte key held in memory, mlocked against swap.
 ///
-/// On `Drop`, the memory is explicitly zeroed and then munlocked.
+/// On `Drop`, the memory is zeroed (via `zeroize`, which is guaranteed not to
+/// be elided by the optimizer) and then munlocked.
+///
+/// `Clone`, `Copy`, and `Debug` are intentionally NOT derived: key material
+/// must not be duplicated or written to logs. A redacting `Debug` impl is
+/// provided so the type can still appear in `#[derive(Debug)]` structs without
+/// leaking the bytes.
 pub struct SecureKey {
     bytes: Box<[u8; 32]>,
 }
@@ -26,9 +33,13 @@ impl SecureKey {
     ///
     /// If mlock fails, logs a warning and continues — startup is not aborted.
     pub fn new(bytes: [u8; 32]) -> Self {
+        #[cfg_attr(not(all(unix, not(target_arch = "wasm32"))), allow(unused_mut))]
         let mut boxed = Box::new(bytes);
         #[cfg(all(unix, not(target_arch = "wasm32")))]
-        mlock_best_effort(boxed.as_mut_ptr() as *mut libc::c_void, 32);
+        mlock_best_effort(
+            boxed.as_mut_ptr() as *mut libc::c_void,
+            std::mem::size_of_val(boxed.as_ref()),
+        );
         Self { bytes: boxed }
     }
 
@@ -38,27 +49,36 @@ impl SecureKey {
     }
 }
 
-impl Drop for SecureKey {
-    fn drop(&mut self) {
-        // Zero the key before releasing.
-        // Use volatile writes so the compiler cannot optimize them away.
-        for byte in self.bytes.iter_mut() {
-            unsafe { std::ptr::write_volatile(byte, 0u8) };
-        }
-        #[cfg(all(unix, not(target_arch = "wasm32")))]
-        munlock_best_effort(self.bytes.as_mut_ptr() as *mut libc::c_void, 32);
+impl std::fmt::Debug for SecureKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecureKey")
+            .field("bytes", &"[REDACTED]")
+            .finish()
     }
 }
 
-/// Public convenience wrapper for mlocking raw key bytes from `crypto.rs`.
+impl Drop for SecureKey {
+    fn drop(&mut self) {
+        // Zero the key before releasing. `zeroize` guarantees the writes are
+        // not optimized away and inserts a compiler fence afterwards.
+        self.bytes.as_mut().zeroize();
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        munlock_best_effort(
+            self.bytes.as_mut_ptr() as *mut libc::c_void,
+            std::mem::size_of_val(self.bytes.as_ref()),
+        );
+    }
+}
+
+/// Public convenience wrapper for mlocking key bytes from `crypto.rs`.
 ///
-/// Locks `len` bytes starting at `ptr`. Best-effort: logs a warning on failure.
+/// Locks the whole slice. Best-effort: logs a warning on failure.
 /// No-op on non-Unix targets.
-pub fn mlock_key_bytes(ptr: *mut u8, len: usize) {
+pub fn mlock_key_bytes(bytes: &mut [u8]) {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
-    mlock_best_effort(ptr as *mut libc::c_void, len);
+    mlock_best_effort(bytes.as_mut_ptr() as *mut libc::c_void, bytes.len());
     #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
-    let _ = (ptr, len);
+    let _ = bytes;
 }
 
 /// Attempt to mlock `len` bytes starting at `ptr`.
@@ -103,6 +123,24 @@ mod tests {
         let key = SecureKey::new([0xABu8; 32]);
         drop(key);
         // If we get here without panic or memory error, mlock/munlock worked.
+    }
+
+    #[test]
+    fn secure_key_debug_redacts_bytes() {
+        let key = SecureKey::new([0xCDu8; 32]);
+        let rendered = format!("{key:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        // The raw key byte (0xCD = 205) must not appear in any form.
+        assert!(!rendered.contains("205"));
+        assert!(!rendered.to_lowercase().contains("cd"));
+    }
+
+    #[test]
+    fn mlock_key_bytes_accepts_slice() {
+        // Best-effort mlock over a slice must not panic regardless of
+        // RLIMIT_MEMLOCK, and is a no-op on non-Unix targets.
+        let mut buf = [0u8; 32];
+        mlock_key_bytes(&mut buf);
     }
 
     #[test]

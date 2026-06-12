@@ -16,12 +16,14 @@
 //! ```
 //! `payload_len` includes the 16-byte auth tag.
 
+use std::sync::Arc;
+
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit};
 
 use crate::error::{Result, WalError};
 use crate::record::HEADER_SIZE;
-use crate::secure_mem;
+use crate::secure_mem::SecureKey;
 
 /// Security gate for WAL key files: enforces no-symlink, regular-file,
 /// Unix mode bits (no group/world), and owner-UID checks.
@@ -96,8 +98,12 @@ fn check_key_file_wal(path: &std::path::Path) -> Result<()> {
 #[derive(Clone)]
 pub struct WalEncryptionKey {
     cipher: Aes256Gcm,
-    /// Raw key bytes (kept for producing new instances with a fresh epoch).
-    key_bytes: [u8; 32],
+    /// Key material held in a zeroized, mlocked allocation (kept for producing
+    /// new instances with a fresh epoch). Shared via `Arc` so cloning a key —
+    /// or rolling to a fresh epoch — does not duplicate the secret or its
+    /// `mlock`; the single allocation is zeroized and munlocked when the last
+    /// reference drops.
+    key: Arc<SecureKey>,
     /// Random 4-byte epoch: occupies the high 4 bytes of the 12-byte nonce.
     /// Disambiguates nonces across WAL lifetimes with the same key.
     epoch: [u8; 4],
@@ -110,20 +116,14 @@ impl WalEncryptionKey {
     /// a fresh epoch we cannot guarantee nonce uniqueness across WAL
     /// lifetimes, so panicking would silently risk nonce reuse on RNG
     /// failure — better to surface it.
+    ///
+    /// The key material is moved into a [`SecureKey`], which mlocks it against
+    /// swap and zeroizes it on drop.
     pub fn from_bytes(key: &[u8; 32]) -> Result<Self> {
-        let mut epoch = [0u8; 4];
-        getrandom::fill(&mut epoch).map_err(|e| WalError::EncryptionError {
-            detail: format!("getrandom failed while generating epoch: {e}"),
-        })?;
-        // mlock key_bytes so they are not swapped to disk. Best-effort: if the
-        // OS refuses (e.g. RLIMIT_MEMLOCK exceeded in a container) we log and
-        // continue rather than aborting startup.
-        let mut key_bytes = *key;
-        secure_mem::mlock_key_bytes(key_bytes.as_mut_ptr(), 32);
         Ok(Self {
             cipher: Aes256Gcm::new(key.into()),
-            key_bytes,
-            epoch,
+            key: Arc::new(SecureKey::new(*key)),
+            epoch: random_epoch()?,
         })
     }
 
@@ -135,7 +135,7 @@ impl WalEncryptionKey {
     pub fn with_epoch(key: &[u8; 32], epoch: [u8; 4]) -> Self {
         Self {
             cipher: Aes256Gcm::new(key.into()),
-            key_bytes: *key,
+            key: Arc::new(SecureKey::new(*key)),
             epoch,
         }
     }
@@ -143,8 +143,15 @@ impl WalEncryptionKey {
     /// Produce a new key instance with the same key material but a fresh
     /// random epoch. Used when rolling to a new WAL segment — each segment
     /// gets its own epoch so the per-segment nonce space is independent.
+    ///
+    /// The mlocked key allocation is shared with `self` via `Arc`; only the
+    /// epoch differs, so no additional secret copy is made.
     pub fn with_fresh_epoch(&self) -> Result<Self> {
-        Self::from_bytes(&self.key_bytes)
+        Ok(Self {
+            cipher: self.cipher.clone(),
+            key: Arc::clone(&self.key),
+            epoch: random_epoch()?,
+        })
     }
 
     /// Load key from a file (must contain exactly 32 bytes).
@@ -439,6 +446,19 @@ pub fn decrypt_segment_envelope(
     epoch.copy_from_slice(&preamble[8..12]);
     let ciphertext = &blob[SEGMENT_ENVELOPE_PREAMBLE_SIZE..];
     key.decrypt_aad(&epoch, SEGMENT_ENVELOPE_NONCE_LSN, &preamble, ciphertext)
+}
+
+/// Generate a fresh random 4-byte epoch.
+///
+/// Returns an error if the OS RNG (`getrandom`) is unavailable — a fresh epoch
+/// is what guarantees nonce uniqueness across WAL lifetimes, so RNG failure
+/// must surface rather than silently risk nonce reuse.
+fn random_epoch() -> Result<[u8; 4]> {
+    let mut epoch = [0u8; 4];
+    getrandom::fill(&mut epoch).map_err(|e| WalError::EncryptionError {
+        detail: format!("getrandom failed while generating epoch: {e}"),
+    })?;
+    Ok(epoch)
 }
 
 /// Derive a 12-byte nonce from an epoch and LSN.
