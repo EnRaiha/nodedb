@@ -143,6 +143,7 @@ pub(in super::super) fn convert_insert_array(
             array_id: aid,
             cells_msgpack,
             wal_lsn,
+            provenance: None,
         }),
         post_set_op: PostSetOp::None,
     }])
@@ -245,6 +246,7 @@ pub(in super::super) fn convert_delete_array(
             array_id: aid,
             coords_msgpack,
             wal_lsn,
+            provenance: None,
         }),
         post_set_op: PostSetOp::None,
     }])

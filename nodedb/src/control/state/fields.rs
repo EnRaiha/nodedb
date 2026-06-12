@@ -289,8 +289,10 @@ pub struct SharedState {
     /// on all cores draw from the same per-database window. Populated with
     /// caps from `ALTER DATABASE … SET QUOTA (maintenance_cpu_pct = N)`.
     pub maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
-    /// Fork detection: tracks `lite_id → last_seen_epoch`.
-    pub epoch_tracker: Mutex<std::collections::HashMap<String, u64>>,
+    /// Durable producer registry for Lite client fencing.  `None` when the
+    /// system catalog is unavailable (in-memory / test configurations).
+    pub producer_registry:
+        Option<Arc<crate::control::sync_producer::registry::SyncProducerRegistry>>,
     /// Timeseries partition registries.
     pub ts_partition_registries: Option<
         Mutex<

@@ -14,7 +14,13 @@ use crate::engine::array::wal::{
 use crate::types::{DatabaseId, TenantId, VShardId};
 use crate::wal::manager::WalManager;
 use nodedb_physical::physical_plan::{
-    ArrayOp, CrdtOp, DocumentOp, GraphOp, KvOp, TimeseriesOp, VectorOp,
+    ArrayOp, CrdtOp, DocumentOp, GraphOp, TimeseriesOp, VectorOp,
+};
+
+use super::wal_dispatch_kv;
+
+pub use super::wal_dispatch_fts_spatial::{
+    wal_append_fts_delete, wal_append_fts_index, wal_append_spatial_delete, wal_append_spatial_put,
 };
 
 /// Append a write operation to the WAL for single-node durability.
@@ -48,8 +54,9 @@ pub fn wal_append_if_write_with_creds(
             surrogate: _,
             pk_bytes: _,
         }) => {
+            let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
             let entry =
-                zerompk::to_msgpack_vec(&(collection, document_id, value)).map_err(|e| {
+                zerompk::to_msgpack_vec(&(collection, document_id, value, prov)).map_err(|e| {
                     crate::Error::Serialization {
                         format: "msgpack".into(),
                         detail: format!("wal point put: {e}"),
@@ -64,8 +71,9 @@ pub fn wal_append_if_write_with_creds(
             if_absent: _,
             surrogate: _,
         }) => {
+            let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
             let entry =
-                zerompk::to_msgpack_vec(&(collection, document_id, value)).map_err(|e| {
+                zerompk::to_msgpack_vec(&(collection, document_id, value, prov)).map_err(|e| {
                     crate::Error::Serialization {
                         format: "msgpack".into(),
                         detail: format!("wal point insert: {e}"),
@@ -78,7 +86,8 @@ pub fn wal_append_if_write_with_creds(
             document_id,
             ..
         }) => {
-            let entry = zerompk::to_msgpack_vec(&(collection, document_id)).map_err(|e| {
+            let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
+            let entry = zerompk::to_msgpack_vec(&(collection, document_id, prov)).map_err(|e| {
                 crate::Error::Serialization {
                     format: "msgpack".into(),
                     detail: format!("wal point delete: {e}"),
@@ -92,12 +101,14 @@ pub fn wal_append_if_write_with_creds(
             dim,
             field_name,
             surrogate,
+            provenance,
         }) => {
             // The local-WAL record carries the surrogate as a u32 so
             // recovery can rebind without consulting the catalog. The
             // `Option<String>` slot remains for follower decoders that
             // pre-date surrogate identity (compatibility shape only —
-            // always None on this path).
+            // always None on this path). Provenance is appended last so
+            // older 6-element decoders can still parse the leading fields.
             let doc_id_compat: Option<String> = None;
             let entry = zerompk::to_msgpack_vec(&(
                 collection,
@@ -106,6 +117,7 @@ pub fn wal_append_if_write_with_creds(
                 field_name,
                 doc_id_compat,
                 surrogate.as_u32(),
+                provenance,
             ))
             .map_err(|e| crate::Error::Serialization {
                 format: "msgpack".into(),
@@ -131,7 +143,11 @@ pub fn wal_append_if_write_with_creds(
             collection,
             vector_id,
         }) => {
-            let entry = zerompk::to_msgpack_vec(&(collection, vector_id)).map_err(|e| {
+            // Provenance is always None for local delete-by-node-id; appended
+            // as trailing element so older 2-element decoders fall back
+            // gracefully via the legacy arity arm.
+            let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
+            let entry = zerompk::to_msgpack_vec(&(collection, vector_id, prov)).map_err(|e| {
                 crate::Error::Serialization {
                     format: "msgpack".into(),
                     detail: format!("wal vector delete: {e}"),
@@ -139,8 +155,20 @@ pub fn wal_append_if_write_with_creds(
             })?;
             wal.append_vector_delete(tenant_id, vshard_id, database_id, &entry)?;
         }
-        PhysicalPlan::Crdt(CrdtOp::Apply { delta, .. }) => {
-            wal.append_crdt_delta(tenant_id, vshard_id, database_id, delta)?;
+        PhysicalPlan::Crdt(CrdtOp::Apply {
+            delta, provenance, ..
+        }) => {
+            // Wrap delta bytes with provenance so the replay decoder can
+            // reconstruct idempotency context. Older decoders that treated
+            // the payload as raw bytes will fail to msgpack-decode and fall
+            // back to the legacy raw-bytes path.
+            let crdt_payload = zerompk::to_msgpack_vec(&(delta, provenance)).map_err(|e| {
+                crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: format!("wal crdt delta: {e}"),
+                }
+            })?;
+            wal.append_crdt_delta(tenant_id, vshard_id, database_id, &crdt_payload)?;
         }
         PhysicalPlan::Graph(GraphOp::EdgePut {
             collection,
@@ -211,20 +239,25 @@ pub fn wal_append_if_write_with_creds(
             on_conflict_updates: _,
             surrogates: _,
             schema_bytes: _,
+            provenance,
+            wal_lsn: _,
         }) => {
-            let wal_payload =
-                zerompk::to_msgpack_vec(&("columnar", collection, payload)).map_err(|e| {
-                    crate::Error::Serialization {
-                        format: "msgpack".into(),
-                        detail: format!("wal columnar batch: {e}"),
-                    }
-                })?;
+            // Provenance is appended last; older 3-element decoders ignore
+            // the trailing field via their arity-fallback paths.
+            let wal_payload = zerompk::to_msgpack_vec(&(
+                "columnar", collection, payload, provenance,
+            ))
+            .map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal columnar batch: {e}"),
+            })?;
             wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?;
         }
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
             collection,
             payload,
             format: _,
+            provenance,
             ..
         }) => {
             // WAL bypass: skip WAL if collection has wal=false in timeseries_config.
@@ -239,241 +272,26 @@ pub fn wal_append_if_write_with_creds(
                 return Ok(());
             }
 
-            let wal_payload = zerompk::to_msgpack_vec(&("timeseries", collection, payload))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal timeseries batch: {e}"),
-                })?;
+            // Provenance is appended last; older 3-element decoders ignore
+            // the trailing field via their arity-fallback paths.
+            let wal_payload =
+                zerompk::to_msgpack_vec(&("timeseries", collection, payload, provenance)).map_err(
+                    |e| crate::Error::Serialization {
+                        format: "msgpack".into(),
+                        detail: format!("wal timeseries batch: {e}"),
+                    },
+                )?;
             wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?;
         }
-        // KV write operations.
-        PhysicalPlan::Kv(KvOp::Put {
-            collection,
-            key,
-            value,
-            ttl_ms,
-            surrogate: _,
-        }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_put", collection, key, value, ttl_ms))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv put: {e}"),
-                })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::Insert {
-            collection,
-            key,
-            value,
-            ttl_ms,
-            surrogate: _,
-        })
-        | PhysicalPlan::Kv(KvOp::InsertIfAbsent {
-            collection,
-            key,
-            value,
-            ttl_ms,
-            surrogate: _,
-        })
-        | PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
-            collection,
-            key,
-            value,
-            ttl_ms,
-            updates: _,
-            surrogate: _,
-        }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_put", collection, key, value, ttl_ms))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv insert-like put: {e}"),
-                })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::Delete { collection, keys }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_delete", collection, keys)).map_err(|e| {
-                crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv delete: {e}"),
-                }
-            })?;
-            wal.append_delete(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::BatchPut {
-            collection,
-            entries,
-            ttl_ms,
-        }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_batch_put", collection, entries, ttl_ms))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv batch put: {e}"),
-                })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::Expire {
-            collection,
-            key,
-            ttl_ms,
-        }) => {
-            let entry =
-                zerompk::to_msgpack_vec(&("kv_expire", collection, key, ttl_ms)).map_err(|e| {
-                    crate::Error::Serialization {
-                        format: "msgpack".into(),
-                        detail: format!("wal kv expire: {e}"),
-                    }
-                })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::Persist { collection, key }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_persist", collection, key)).map_err(|e| {
-                crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv persist: {e}"),
-                }
-            })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::RegisterIndex {
-            collection,
-            field,
-            field_position,
-            backfill: _,
-        }) => {
-            let entry =
-                zerompk::to_msgpack_vec(&("kv_register_index", collection, field, field_position))
-                    .map_err(|e| crate::Error::Serialization {
-                        format: "msgpack".into(),
-                        detail: format!("wal kv register index: {e}"),
-                    })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::DropIndex { collection, field }) => {
-            let entry =
-                zerompk::to_msgpack_vec(&("kv_drop_index", collection, field)).map_err(|e| {
-                    crate::Error::Serialization {
-                        format: "msgpack".into(),
-                        detail: format!("wal kv drop index: {e}"),
-                    }
-                })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::FieldSet {
-            collection,
-            key,
-            updates,
-        }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_field_set", collection, key, updates))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv field set: {e}"),
-                })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        // Atomic KV operations.
-        PhysicalPlan::Kv(KvOp::Incr {
-            collection,
-            key,
-            delta,
-            ttl_ms,
-        }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_incr", collection, key, delta, ttl_ms))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv incr: {e}"),
-                })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::IncrFloat {
-            collection,
-            key,
-            delta,
-        }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_incr_float", collection, key, delta))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv incr_float: {e}"),
-                })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::Cas {
-            collection,
-            key,
-            expected,
-            new_value,
-        }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_cas", collection, key, expected, new_value))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv cas: {e}"),
-                })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::GetSet {
-            collection,
-            key,
-            new_value,
-        }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_getset", collection, key, new_value))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv getset: {e}"),
-                })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        // Sorted index DDL — persisted so indexes are rebuilt on recovery.
-        PhysicalPlan::Kv(KvOp::RegisterSortedIndex {
-            collection,
-            index_name,
-            sort_columns,
-            key_column,
-            window_type,
-            window_timestamp_column,
-            window_start_ms,
-            window_end_ms,
-        }) => {
-            let entry = zerompk::to_msgpack_vec(&(
-                "kv_register_sorted_index",
-                collection,
-                index_name,
-                sort_columns,
-                key_column,
-                window_type,
-                window_timestamp_column,
-                window_start_ms,
-                window_end_ms,
-            ))
-            .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal kv register sorted index: {e}"),
-            })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        PhysicalPlan::Kv(KvOp::DropSortedIndex { index_name }) => {
-            let entry =
-                zerompk::to_msgpack_vec(&("kv_drop_sorted_index", index_name)).map_err(|e| {
-                    crate::Error::Serialization {
-                        format: "msgpack".into(),
-                        detail: format!("wal kv drop sorted index: {e}"),
-                    }
-                })?;
-            wal.append_delete(tenant_id, vshard_id, database_id, &entry)?;
-        }
-        // Truncate uses append_delete to mark the collection as cleared in the WAL.
-        // On recovery, replaying this entry drops all hash table state for the collection.
-        PhysicalPlan::Kv(KvOp::Truncate { collection }) => {
-            let entry = zerompk::to_msgpack_vec(&("kv_truncate", collection)).map_err(|e| {
-                crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv truncate: {e}"),
-                }
-            })?;
-            wal.append_delete(tenant_id, vshard_id, database_id, &entry)?;
+        // KV write operations — delegated to wal_dispatch_kv.
+        PhysicalPlan::Kv(kv_op) => {
+            wal_dispatch_kv::wal_append_kv_op(wal, tenant_id, vshard_id, database_id, kv_op)?;
         }
         PhysicalPlan::Array(ArrayOp::Put {
             array_id,
             cells_msgpack,
             wal_lsn: _,
+            provenance,
         }) => {
             let cells = zerompk::from_msgpack::<Vec<crate::engine::array::wal::ArrayPutCell>>(
                 cells_msgpack,
@@ -485,6 +303,7 @@ pub fn wal_append_if_write_with_creds(
             let payload = ArrayPutPayload {
                 array_id: array_id.clone(),
                 cells,
+                provenance: provenance.clone(),
             };
             let bytes =
                 encode_put_with_version(&payload).map_err(|e| crate::Error::Serialization {
@@ -497,6 +316,7 @@ pub fn wal_append_if_write_with_creds(
             array_id,
             coords_msgpack,
             wal_lsn: _,
+            provenance,
         }) => {
             let cells =
                 zerompk::from_msgpack::<Vec<ArrayDeleteCell>>(coords_msgpack).map_err(|e| {
@@ -508,6 +328,7 @@ pub fn wal_append_if_write_with_creds(
             let payload = ArrayDeletePayload {
                 array_id: array_id.clone(),
                 cells,
+                provenance: provenance.clone(),
             };
             let bytes =
                 encode_delete_with_version(&payload).map_err(|e| crate::Error::Serialization {
@@ -524,18 +345,22 @@ pub fn wal_append_if_write_with_creds(
 
 /// Append a timeseries batch to WAL and return the assigned LSN.
 ///
-/// Used by the ILP listener to propagate the WAL LSN to the Data Plane
-/// for proper dedup tracking and `flush_wal_lsn` in partition metadata.
-/// Returns `None` if WAL is bypassed for this collection.
+/// Used by the ILP listener and the sync timeseries handler to propagate the
+/// WAL LSN to the Data Plane for proper dedup tracking and `flush_wal_lsn` in
+/// partition metadata. Returns `None` if WAL is bypassed for this collection.
+///
+/// `provenance` is `None` for the ILP direct-ingest path; the sync path passes
+/// the frame's `SyncProvenance` so the WAL record carries full idempotency context.
 pub fn wal_append_timeseries(
     wal: &WalManager,
     tenant_id: TenantId,
     vshard_id: VShardId,
-    database_id: DatabaseId,
     collection: &str,
     payload: &[u8],
+    provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
     credentials: Option<&CredentialStore>,
 ) -> crate::Result<Option<nodedb_types::Lsn>> {
+    let database_id = DatabaseId::DEFAULT;
     // WAL bypass check.
     if let Some(creds) = credentials
         && let Some(catalog) = creds.catalog()
@@ -547,13 +372,126 @@ pub fn wal_append_timeseries(
     }
 
     let payload_vec = payload.to_vec();
-    let wal_payload =
-        zerompk::to_msgpack_vec(&("timeseries", collection, payload_vec)).map_err(|e| {
-            crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal timeseries batch: {e}"),
-            }
+    let wal_payload = zerompk::to_msgpack_vec(&("timeseries", collection, payload_vec, provenance))
+        .map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal timeseries batch: {e}"),
         })?;
     let lsn = wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?;
     Ok(Some(lsn))
+}
+
+/// Append a columnar batch to WAL and return the assigned LSN.
+///
+/// Mirrors `wal_append_timeseries` but encodes with kind `"columnar"` so the
+/// WAL replay decoder routes to `replay_columnar_payload`.
+/// Returns `None` if WAL is bypassed (columnar collections do not currently
+/// support `wal=false`, so this always returns `Some`).
+pub fn wal_append_columnar(
+    wal: &WalManager,
+    tenant_id: TenantId,
+    vshard_id: VShardId,
+    database_id: DatabaseId,
+    collection: &str,
+    payload: &[u8],
+    provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
+) -> crate::Result<Option<nodedb_types::Lsn>> {
+    let payload_vec = payload.to_vec();
+    let wal_payload = zerompk::to_msgpack_vec(&("columnar", collection, payload_vec, provenance))
+        .map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal columnar batch: {e}"),
+    })?;
+    let lsn = wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?;
+    Ok(Some(lsn))
+}
+
+/// Operation fields for a vector put WAL record.
+///
+/// Groups the vector-identity and provenance fields that together describe a
+/// single vector insert, reducing the call-site argument count.
+pub struct VectorPutWalArgs<'a> {
+    pub collection: &'a str,
+    pub vector: &'a [f32],
+    pub dim: usize,
+    pub field_name: &'a str,
+    pub surrogate: nodedb_types::Surrogate,
+    pub provenance: Option<&'a nodedb_types::sync::wire::SyncProvenance>,
+}
+
+/// Operation fields for a vector delete-by-surrogate WAL record.
+///
+/// Groups the collection, surrogate, field, and provenance fields that
+/// together identify a single vector deletion.
+pub struct VectorDeleteWalArgs<'a> {
+    pub collection: &'a str,
+    pub surrogate: nodedb_types::Surrogate,
+    pub field_name: &'a str,
+    pub provenance: Option<&'a nodedb_types::sync::wire::SyncProvenance>,
+}
+
+/// Append a vector put (insert) to the WAL and return the assigned LSN.
+///
+/// Encodes `(collection, vector, dim, field_name, doc_id_compat, surrogate_u32, provenance)`
+/// exactly as the non-sync `VectorOp::Insert` arm in `wal_append_if_write_with_creds` does,
+/// so replay decodes both paths with the same 7-element shape.
+pub fn wal_append_vector_put(
+    wal: &WalManager,
+    tenant_id: TenantId,
+    vshard_id: VShardId,
+    database_id: DatabaseId,
+    args: VectorPutWalArgs<'_>,
+) -> crate::Result<nodedb_types::Lsn> {
+    let VectorPutWalArgs {
+        collection,
+        vector,
+        dim,
+        field_name,
+        surrogate,
+        provenance,
+    } = args;
+    let doc_id_compat: Option<String> = None;
+    let entry = zerompk::to_msgpack_vec(&(
+        collection,
+        vector,
+        dim,
+        field_name,
+        doc_id_compat,
+        surrogate.as_u32(),
+        provenance,
+    ))
+    .map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal vector put (sync): {e}"),
+    })?;
+    let lsn = wal.append_vector_put(tenant_id, vshard_id, database_id, &entry)?;
+    Ok(lsn)
+}
+
+/// Append a vector delete-by-surrogate to the WAL and return the assigned LSN.
+///
+/// Encodes `(collection, surrogate_u32, field_name, provenance)` as a `VectorDelete`
+/// record. The replay decoder uses a surrogate-aware arm (4-element shape) that maps
+/// back to `execute_vector_delete_by_surrogate`; the legacy 2-element and 3-element
+/// delete arms fall through to direct node-id deletion and remain backward-compatible.
+pub fn wal_append_vector_delete_by_surrogate(
+    wal: &WalManager,
+    tenant_id: TenantId,
+    vshard_id: VShardId,
+    database_id: DatabaseId,
+    args: VectorDeleteWalArgs<'_>,
+) -> crate::Result<nodedb_types::Lsn> {
+    let VectorDeleteWalArgs {
+        collection,
+        surrogate,
+        field_name,
+        provenance,
+    } = args;
+    let entry = zerompk::to_msgpack_vec(&(collection, surrogate.as_u32(), field_name, provenance))
+        .map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal vector delete by surrogate (sync): {e}"),
+        })?;
+    let lsn = wal.append_vector_delete(tenant_id, vshard_id, database_id, &entry)?;
+    Ok(lsn)
 }

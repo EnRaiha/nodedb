@@ -129,12 +129,13 @@ impl OriginArrayInbound {
     pub(super) async fn apply_op_direct(
         &self,
         op: ArrayOp,
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
-        let data_plane_op = self.op_to_data_plane_plan(&op)?;
+        let data_plane_op = self.op_to_data_plane_plan(&op, provenance)?;
         let vshard = self.vshard_for_op(&op);
 
-        let dispatch_result =
-            crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
+        let response =
+            match crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
                 self.shared(),
                 self.tenant_id(),
                 vshard,
@@ -142,19 +143,32 @@ impl OriginArrayInbound {
                 TraceId::ZERO,
                 crate::event::EventSource::CrdtSync,
             )
-            .await;
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        array = %op.header.array,
+                        error = %e,
+                        "array_inbound: Data Plane dispatch failed"
+                    );
+                    return Err(Some(build_reject(
+                        &op.header.array,
+                        op.header.hlc,
+                        ArrayRejectReason::EngineRejected,
+                        format!("dispatch error: {e}"),
+                    )));
+                }
+            };
 
-        if let Err(e) = dispatch_result {
-            warn!(
-                array = %op.header.array,
-                error = %e,
-                "array_inbound: Data Plane dispatch failed"
-            );
+        // Surface fenced / error responses as rejects so the caller sends
+        // ArrayRejectMsg rather than a silent success.
+        if response.status == crate::bridge::envelope::Status::Error {
             return Err(Some(build_reject(
                 &op.header.array,
                 op.header.hlc,
                 ArrayRejectReason::EngineRejected,
-                format!("dispatch error: {e}"),
+                "Data Plane rejected (fenced or error)".to_string(),
             )));
         }
 
@@ -210,9 +224,15 @@ impl OriginArrayInbound {
     }
 
     /// Convert a decoded `ArrayOp` (from sync) into a `PhysicalPlan::Array` variant.
+    ///
+    /// `provenance` is `Some` on the single-node sync path; `None` for snapshot
+    /// replay and any non-sync caller. The value is threaded into
+    /// `DataArrayOp::Put/Delete.provenance` so the Data Plane can run epoch
+    /// fencing and advance the HWM.
     pub(super) fn op_to_data_plane_plan(
         &self,
         op: &ArrayOp,
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     ) -> Result<crate::bridge::envelope::PhysicalPlan, Option<ArrayRejectMsg>> {
         use nodedb_array::sync::op::ArrayOpKind;
         use nodedb_physical::physical_plan::ArrayOp as DataArrayOp;
@@ -241,6 +261,7 @@ impl OriginArrayInbound {
                     array_id,
                     cells_msgpack,
                     wal_lsn: 0,
+                    provenance,
                 }
             }
             ArrayOpKind::Delete | ArrayOpKind::Erase => {
@@ -257,6 +278,7 @@ impl OriginArrayInbound {
                     array_id,
                     coords_msgpack,
                     wal_lsn: 0,
+                    provenance,
                 }
             }
         };

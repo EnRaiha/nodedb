@@ -217,6 +217,8 @@ pub(in super::super) fn convert_insert(
                 on_conflict_updates: Vec::new(),
                 surrogates,
                 schema_bytes,
+                provenance: None,
+                wal_lsn: None,
             }),
             post_set_op: PostSetOp::None,
         });
@@ -303,6 +305,8 @@ pub(in super::super) fn convert_upsert(
                 on_conflict_updates: on_conflict_values,
                 surrogates,
                 schema_bytes,
+                provenance: None,
+                wal_lsn: None,
             }),
             post_set_op: PostSetOp::None,
         });

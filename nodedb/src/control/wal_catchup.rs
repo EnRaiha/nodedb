@@ -120,10 +120,23 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
             continue;
         }
 
-        // Deserialize WAL payload: (collection, raw_ilp_bytes).
-        let Ok((collection, payload)): Result<(String, Vec<u8>), _> =
-            zerompk::from_msgpack(&record.payload)
-        else {
+        // Deserialize WAL payload. Try the new 4-element shape (with kind
+        // discriminator, collection, payload, and trailing provenance) first,
+        // then fall back to the legacy 2-element (collection, payload) shape
+        // written by pre-3a records. Provenance is decoded and discarded here.
+        let (collection, payload) = if let Ok((disc, coll, p, _provenance)) =
+            zerompk::from_msgpack::<(
+                String,
+                String,
+                Vec<u8>,
+                Option<nodedb_types::sync::wire::SyncProvenance>,
+            )>(&record.payload)
+        {
+            let _ = disc;
+            (coll, p)
+        } else if let Ok((coll, p)) = zerompk::from_msgpack::<(String, Vec<u8>)>(&record.payload) {
+            (coll, p)
+        } else {
             max_lsn = max_lsn.max(record.header.lsn);
             continue;
         };
@@ -139,6 +152,7 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
             // Re-derived on the engine side during apply (record carries
             // raw ILP — row identities are reconstructed from the wire).
             surrogates: Vec::new(),
+            provenance: None,
         });
 
         // Dispatch to Data Plane — do NOT re-append to WAL (already there).

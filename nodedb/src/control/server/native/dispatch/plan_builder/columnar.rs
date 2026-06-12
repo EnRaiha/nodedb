@@ -57,6 +57,8 @@ pub(crate) fn build_insert(
         on_conflict_updates: Vec::new(),
         surrogates,
         schema_bytes: Vec::new(),
+        provenance: None,
+        wal_lsn: None,
     }))
 }
 

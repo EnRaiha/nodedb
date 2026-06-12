@@ -600,6 +600,7 @@ impl Session {
                     peer_id,
                     mutation_id: 0,
                     surrogate,
+                    provenance: None,
                 })
             }
             "graph_rag_fusion" => {

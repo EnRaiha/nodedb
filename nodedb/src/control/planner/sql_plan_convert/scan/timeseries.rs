@@ -131,6 +131,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(
             format: "msgpack".into(),
             wal_lsn: None,
             surrogates,
+            provenance: None,
         }),
         post_set_op: PostSetOp::None,
     }])

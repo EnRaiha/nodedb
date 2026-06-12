@@ -128,9 +128,9 @@ async fn flush_ilp_batch_inner(
             &state.wal,
             tenant_id,
             vshard_id,
-            crate::types::DatabaseId::DEFAULT,
             &collection,
             &payload_bytes,
+            None,
             Some(&state.credentials),
         )?
         .map(|lsn| lsn.as_u64());
@@ -141,6 +141,7 @@ async fn flush_ilp_batch_inner(
             format: "ilp".to_string(),
             wal_lsn,
             surrogates: Vec::new(),
+            provenance: None,
         });
 
         let response = match state.gateway.as_ref() {

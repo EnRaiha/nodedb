@@ -13,6 +13,19 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::bridge::envelope::{Priority, Request, Response, Status};
+
+/// Identifies a committed Raft entry within the apply loop.
+///
+/// Groups the three fields that always travel together: the Raft group, the
+/// log index within that group, and the idempotency key extracted from the
+/// `ReplicatedEntry` header. All three are forwarded together to
+/// `ProposeTracker::complete` after each apply.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AppliedPosition {
+    pub group_id: u64,
+    pub log_index: u64,
+    pub applied_key: u64,
+}
 use crate::control::array_sync::OriginApplyEngine;
 use crate::control::distributed_applier::{ProposeResult, ProposeTracker};
 use crate::control::state::SharedState;
@@ -26,16 +39,41 @@ use crate::types::{DatabaseId, ReadConsistency, TraceId};
 pub(crate) async fn apply_array_op(
     state: &Arc<SharedState>,
     tracker: &Arc<ProposeTracker>,
-    group_id: u64,
-    log_index: u64,
-    applied_key: u64,
+    pos: AppliedPosition,
     array: &str,
     op_bytes: &[u8],
+    provenance_bytes: Option<&[u8]>,
 ) {
+    let AppliedPosition {
+        group_id,
+        log_index,
+        applied_key,
+    } = pos;
     use crate::types::{TenantId, VShardId};
     use nodedb_array::sync::op_codec;
     use nodedb_array::types::coord::value::CoordValue;
     use nodedb_cluster::array_routing::{array_vshard_for_name, vshard_for_array_coord};
+
+    // Decode the replicated provenance so the epoch fence runs on this replica
+    // exactly as it did on the node that first received the op. Absent
+    // provenance (`None`) is normal for non-sync array ops. Provenance bytes
+    // that are present but fail to decode signal version skew or corrupt
+    // replicated state: the epoch fence cannot run, but the engine's HLC
+    // `already_seen` dedup is still authoritative for idempotency, so we apply
+    // without a fence rather than poison the entry — and surface it loudly.
+    let provenance: Option<nodedb_types::sync::wire::SyncProvenance> = match provenance_bytes {
+        None => None,
+        Some(b) => match zerompk::from_msgpack::<nodedb_types::sync::wire::SyncProvenance>(b) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(
+                    group_id, index = log_index, array = %array, error = %e,
+                    "apply_array_op: provenance decode failed; applying without epoch fence (version skew or corruption)"
+                );
+                None
+            }
+        },
+    };
 
     let op = match op_codec::decode_op(op_bytes) {
         Ok(op) => op,
@@ -136,6 +174,7 @@ pub(crate) async fn apply_array_op(
                 array_id,
                 cells_msgpack,
                 wal_lsn: 0,
+                provenance: provenance.clone(),
             }
         }
         ArrayOpKind::Delete | ArrayOpKind::Erase => {
@@ -159,6 +198,7 @@ pub(crate) async fn apply_array_op(
                 array_id,
                 coords_msgpack,
                 wal_lsn: 0,
+                provenance,
             }
         }
     };
@@ -320,11 +360,14 @@ pub(crate) struct ArraySchemaPayload<'a> {
 pub(crate) fn apply_array_schema(
     state: &Arc<SharedState>,
     tracker: &Arc<ProposeTracker>,
-    group_id: u64,
-    log_index: u64,
-    applied_key: u64,
+    pos: AppliedPosition,
     payload: ArraySchemaPayload<'_>,
 ) {
+    let AppliedPosition {
+        group_id,
+        log_index,
+        applied_key,
+    } = pos;
     use nodedb_array::sync::hlc::Hlc;
     use nodedb_array::types::ArrayId;
     use nodedb_types::TenantId as NdTenantId;

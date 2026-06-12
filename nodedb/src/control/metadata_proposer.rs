@@ -255,6 +255,94 @@ pub fn propose_surrogate_hwm(shared: &SharedState, hwm: u32) -> Result<u64, Erro
     Ok(log_index)
 }
 
+/// Propose a Lite client registration through the metadata Raft group and
+/// wait for it to be applied locally.
+///
+/// In single-node / no-cluster mode (no `metadata_raft` installed),
+/// returns `Ok(0)` immediately — the local registry write already persisted
+/// the state. In cluster mode every follower applies the entry via
+/// `SyncProducerRegistry::apply_register` so the `(producer_id, epoch)` pair
+/// agrees on all nodes and survives leader failover.
+pub fn propose_sync_producer_register(
+    shared: &SharedState,
+    lite_id: &str,
+    producer_id: u64,
+    tenant_id: u64,
+    epoch: u64,
+    created_ms: i64,
+) -> Result<u64, Error> {
+    let Some(handle) = shared.metadata_raft.get() else {
+        return Ok(0);
+    };
+
+    let entry = MetadataEntry::SyncProducerRegister {
+        lite_id: lite_id.to_owned(),
+        producer_id,
+        tenant_id,
+        epoch,
+        created_ms,
+    };
+    let raw = encode_entry(&entry).map_err(|e| Error::Config {
+        detail: format!("sync_producer_register encode: {e}"),
+    })?;
+
+    let log_index = handle.propose(raw)?;
+
+    let watcher = shared.applied_index_watcher(METADATA_GROUP_ID);
+    let outcome =
+        tokio::task::block_in_place(|| watcher.wait_for(log_index, DEFAULT_PROPOSE_TIMEOUT));
+    if !outcome.is_reached() {
+        return Err(Error::Config {
+            detail: format!(
+                "sync_producer_register propose timed out waiting for log index {log_index}"
+            ),
+        });
+    }
+
+    Ok(log_index)
+}
+
+/// Propose a Lite client epoch fence through the metadata Raft group and
+/// wait for it to be applied locally.
+///
+/// In single-node / no-cluster mode (no `metadata_raft` installed),
+/// returns `Ok(0)` immediately — the local registry write already persisted
+/// the state. In cluster mode every follower applies the entry via
+/// `SyncProducerRegistry::apply_fence` (max-wins) so the epoch advance
+/// survives leader failover.
+pub fn propose_sync_producer_fence(
+    shared: &SharedState,
+    lite_id: &str,
+    new_epoch: u64,
+) -> Result<u64, Error> {
+    let Some(handle) = shared.metadata_raft.get() else {
+        return Ok(0);
+    };
+
+    let entry = MetadataEntry::SyncProducerFence {
+        lite_id: lite_id.to_owned(),
+        new_epoch,
+    };
+    let raw = encode_entry(&entry).map_err(|e| Error::Config {
+        detail: format!("sync_producer_fence encode: {e}"),
+    })?;
+
+    let log_index = handle.propose(raw)?;
+
+    let watcher = shared.applied_index_watcher(METADATA_GROUP_ID);
+    let outcome =
+        tokio::task::block_in_place(|| watcher.wait_for(log_index, DEFAULT_PROPOSE_TIMEOUT));
+    if !outcome.is_reached() {
+        return Err(Error::Config {
+            detail: format!(
+                "sync_producer_fence propose timed out waiting for log index {log_index}"
+            ),
+        });
+    }
+
+    Ok(log_index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

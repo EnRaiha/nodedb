@@ -34,6 +34,28 @@ impl SharedState {
         array_catalog: crate::control::array_catalog::ArrayCatalogHandle,
     ) -> crate::Result<Arc<Self>> {
         let mut credentials = CredentialStore::open(catalog_path)?;
+
+        // Share the credential store's already-open catalog (one redb file
+        // handle). Opening a second `SystemCatalog` on the same path is rejected
+        // by redb, which would silently disable durable fencing.
+        let producer_registry = {
+            use crate::control::sync_producer::registry::SyncProducerRegistry;
+            match credentials.catalog() {
+                Some(catalog) => match SyncProducerRegistry::open(Arc::new(catalog.clone())) {
+                    Ok(reg) => Some(Arc::new(reg)),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "SharedState::open: SyncProducerRegistry::open failed; \
+                             sync handshake will use in-memory fork detection only"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            }
+        };
+
         credentials.set_lockout_policy_with_grace(
             auth_config.max_failed_logins,
             auth_config.lockout_duration_secs,
@@ -414,7 +436,7 @@ impl SharedState {
             maintenance_budget: Arc::new(
                 crate::control::maintenance::MaintenanceBudgetTracker::new(),
             ),
-            epoch_tracker: Mutex::new(std::collections::HashMap::new()),
+            producer_registry,
             ts_partition_registries: Some(Mutex::new(std::collections::HashMap::new())),
             cold_storage: None,
             snapshot_storage: Arc::new(object_store::memory::InMemory::new()),

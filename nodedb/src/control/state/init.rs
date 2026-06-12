@@ -319,7 +319,7 @@ impl SharedState {
             maintenance_budget: Arc::new(
                 crate::control::maintenance::MaintenanceBudgetTracker::new(),
             ),
-            epoch_tracker: Mutex::new(std::collections::HashMap::new()),
+            producer_registry: None,
             ts_partition_registries: Some(Mutex::new(std::collections::HashMap::new())),
             cold_storage: None,
             snapshot_storage: Arc::new(object_store::memory::InMemory::new()),

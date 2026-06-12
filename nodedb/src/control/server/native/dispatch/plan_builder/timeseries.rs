@@ -59,5 +59,6 @@ pub(crate) fn build_ingest(fields: &TextFields, collection: &str) -> crate::Resu
         // without a decode pass, so the engine integration owns
         // per-row identity binding.
         surrogates: Vec::new(),
+        provenance: None,
     }))
 }

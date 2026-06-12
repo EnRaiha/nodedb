@@ -53,6 +53,7 @@ pub(crate) fn build_apply(
         peer_id,
         mutation_id,
         surrogate,
+        provenance: None,
     }))
 }
 

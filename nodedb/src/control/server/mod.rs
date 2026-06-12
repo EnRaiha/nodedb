@@ -18,3 +18,5 @@ pub mod session_auth;
 pub mod sync;
 pub mod tls_reload;
 pub mod wal_dispatch;
+pub(super) mod wal_dispatch_fts_spatial;
+pub(super) mod wal_dispatch_kv;

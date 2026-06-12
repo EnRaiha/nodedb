@@ -207,6 +207,15 @@ impl MultiShardMerger {
         let msg = ArrayDeltaMsg {
             array: op.header.array.clone(),
             op_payload,
+            // Merged ops are Origin's authoritative state being fanned out to
+            // Lite, not client-originated writes, so they carry no producer
+            // identity. The wire message keeps these fields for protocol
+            // uniformity; the receiver derives producer_id/epoch from its
+            // session identity, never from an inbound delta, so zeroing here is
+            // both safe and the correct "no attributed producer" value.
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         };
 
         let frame = match nodedb_types::sync::wire::SyncFrame::try_encode(

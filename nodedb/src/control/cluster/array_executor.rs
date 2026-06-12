@@ -276,6 +276,7 @@ impl ArrayLocalExecutor for DataPlaneArrayExecutor {
             array_id,
             cells_msgpack,
             wal_lsn: req.wal_lsn,
+            provenance: None,
         });
 
         let resp = self.dispatch_and_await(plan).await?;
@@ -309,6 +310,7 @@ impl ArrayLocalExecutor for DataPlaneArrayExecutor {
             array_id,
             coords_msgpack: coords_msgpack.to_vec(),
             wal_lsn,
+            provenance: None,
         });
 
         let resp = self.dispatch_and_await(plan).await?;

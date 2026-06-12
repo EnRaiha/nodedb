@@ -377,6 +377,7 @@ async fn ingest_ilp(
         format: "ilp".into(),
         wal_lsn: None,
         surrogates: Vec::new(),
+        provenance: None,
     });
     dispatch_to_data_plane(
         shared,

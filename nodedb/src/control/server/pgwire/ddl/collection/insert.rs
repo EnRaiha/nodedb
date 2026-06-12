@@ -246,6 +246,7 @@ pub async fn insert_document(
             dim,
             field_name: field_name.clone(),
             surrogate,
+            provenance: None,
         });
 
         if let Some(err) = dispatch_plan(state, tenant_id, vec_vshard, vec_plan).await {

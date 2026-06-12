@@ -80,6 +80,7 @@ pub async fn crdt_merge(
         peer_id: identity.user_id,
         mutation_id: 0,
         surrogate: target_surrogate,
+        provenance: None,
     });
 
     crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(

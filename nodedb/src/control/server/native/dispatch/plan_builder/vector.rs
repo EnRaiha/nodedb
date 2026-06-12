@@ -108,6 +108,7 @@ pub(crate) fn build_insert(
         dim,
         field_name,
         surrogate,
+        provenance: None,
     }))
 }
 

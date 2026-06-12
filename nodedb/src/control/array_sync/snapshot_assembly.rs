@@ -169,7 +169,7 @@ impl OriginArrayInbound {
                     continue;
                 }
             };
-            match self.apply_op(op.clone(), &raw).await {
+            match self.apply_op(op.clone(), &raw, None).await {
                 Ok(InboundOutcome::Applied) => ops_applied += 1,
                 Ok(_) => {}
                 Err(Some(reject)) => {

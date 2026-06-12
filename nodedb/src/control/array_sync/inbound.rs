@@ -43,6 +43,7 @@ use nodedb_array::sync::apply::ApplyRejection;
 use nodedb_array::sync::hlc::Hlc;
 use nodedb_array::sync::op::ArrayOp;
 use nodedb_array::sync::op_codec;
+use nodedb_types::sync::wire::SyncProvenance;
 use nodedb_types::sync::wire::array::{
     ArrayAckMsg, ArrayCatchupRequestMsg, ArrayDeltaBatchMsg, ArrayDeltaMsg, ArrayRejectMsg,
     ArrayRejectReason, ArraySchemaSyncMsg,
@@ -102,6 +103,13 @@ pub struct OriginArrayInbound {
     apply_observer: Option<Arc<dyn ArrayApplyObserver>>,
     /// In-flight snapshot chunk buffers keyed by `(array, snapshot_hlc_bytes)`.
     snapshots: Mutex<HashMap<(String, [u8; 18]), SnapshotAssembly>>,
+    /// Server-authoritative producer identity for this session, assigned at
+    /// handshake and set via [`Self::set_session_identity`]. Inbound provenance
+    /// is stamped from these — never from the wire message — so a client cannot
+    /// spoof another producer's id or replay a fenced epoch. `0` = unidentified
+    /// (legacy / non-fenced) producer, which the gate treats as a no-op.
+    session_producer_id: std::sync::atomic::AtomicU64,
+    session_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl OriginArrayInbound {
@@ -147,6 +155,8 @@ impl OriginArrayInbound {
             tenant_id,
             apply_observer: None,
             snapshots: Mutex::new(HashMap::new()),
+            session_producer_id: std::sync::atomic::AtomicU64::new(0),
+            session_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -154,6 +164,36 @@ impl OriginArrayInbound {
     pub fn with_observer(mut self, observer: Arc<dyn ArrayApplyObserver>) -> Self {
         self.apply_observer = Some(observer);
         self
+    }
+
+    /// Bind this session's handshake-assigned producer identity. The session
+    /// handler calls this before dispatching each array frame so inbound
+    /// provenance is stamped server-authoritatively. `0` leaves the session
+    /// unfenced (legacy / unidentified producer).
+    pub fn set_session_identity(&self, producer_id: u64, epoch: u64) {
+        use std::sync::atomic::Ordering;
+        self.session_producer_id
+            .store(producer_id, Ordering::Relaxed);
+        self.session_epoch.store(epoch, Ordering::Relaxed);
+    }
+
+    /// Build server-authoritative provenance for an op in `array` carrying the
+    /// client-supplied `seq`. `producer_id`/`epoch` come from the session's
+    /// handshake identity, NOT the wire message. Returns `None` for an
+    /// unidentified producer (`session_producer_id == 0`) — the gate no-ops.
+    fn session_provenance(&self, array: &str, seq: u64) -> Option<SyncProvenance> {
+        use std::sync::atomic::Ordering;
+        let producer_id = self.session_producer_id.load(Ordering::Relaxed);
+        if producer_id == 0 {
+            return None;
+        }
+        use nodedb_types::sync::wire::stream_id::{EngineKind, stream_id_for};
+        Some(SyncProvenance {
+            producer_id,
+            epoch: self.session_epoch.load(Ordering::Relaxed),
+            stream_id: stream_id_for(EngineKind::Array, array),
+            seq,
+        })
     }
 
     // ─── Delta ───────────────────────────────────────────────────────────────
@@ -176,7 +216,8 @@ impl OriginArrayInbound {
             }
         };
 
-        self.apply_op(op, &msg.op_payload).await
+        let provenance = self.session_provenance(&msg.array, msg.seq);
+        self.apply_op(op, &msg.op_payload, provenance).await
     }
 
     /// Handle a batch of delta messages from a Lite peer.
@@ -190,7 +231,12 @@ impl OriginArrayInbound {
         let mut outcomes = Vec::with_capacity(msg.op_payloads.len());
         for payload in &msg.op_payloads {
             let outcome = match op_codec::decode_op(payload) {
-                Ok(op) => self.apply_op(op, payload).await,
+                Ok(op) => {
+                    // Batch carries no per-op seq; array dedups by HLC, so seq
+                    // is informational here. The epoch fence still applies.
+                    let provenance = self.session_provenance(&msg.array, 0);
+                    self.apply_op(op, payload, provenance).await
+                }
                 Err(e) => {
                     warn!(array = %msg.array, error = %e, "array_inbound: batch decode failed");
                     Err(Some(build_reject(
@@ -322,6 +368,7 @@ impl OriginArrayInbound {
         &self,
         op: ArrayOp,
         raw_op_bytes: &[u8],
+        provenance: Option<SyncProvenance>,
     ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
         // 1. Shape validation.
         if let Err(e) = op.validate_shape() {
@@ -367,7 +414,7 @@ impl OriginArrayInbound {
         //    exercised when the cluster stack has not been started (development,
         //    single-node Origin, unit tests without a raft setup).
         if self.shared.raft_proposer.get().is_none() {
-            return self.apply_op_direct(op).await;
+            return self.apply_op_direct(op, provenance).await;
         }
 
         // 5. Multi-node path: propose through Raft.
@@ -376,6 +423,9 @@ impl OriginArrayInbound {
             array: op.header.array.clone(),
             op_bytes: raw_op_bytes.to_vec(),
             schema_hlc_bytes: hlc_bytes,
+            provenance: provenance
+                .as_ref()
+                .and_then(|p| zerompk::to_msgpack_vec(p).ok()),
         };
         let vshard = self.vshard_for_op(&op);
         let entry = ReplicatedEntry::new(self.tenant_id.as_u64(), vshard.as_u32(), write);

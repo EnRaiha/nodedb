@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
-use crate::control::array_sync::raft_apply::{apply_array_op, apply_array_schema};
+use crate::control::array_sync::raft_apply::{AppliedPosition, apply_array_op, apply_array_schema};
 use crate::control::cluster::calvin::ReadResultEvent;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{ReplicatedEntry, ReplicatedWrite, from_replicated_entry};
@@ -120,16 +120,20 @@ pub async fn run_apply_loop(
                     ReplicatedWrite::ArrayOp {
                         ref array,
                         ref op_bytes,
+                        ref provenance,
                         ..
                     } => {
                         apply_array_op(
                             &state,
                             &tracker,
-                            batch.group_id,
-                            entry.index,
-                            applied_key,
+                            AppliedPosition {
+                                group_id: batch.group_id,
+                                log_index: entry.index,
+                                applied_key,
+                            },
                             array,
                             op_bytes,
+                            provenance.as_deref(),
                         )
                         .await;
                         continue;
@@ -142,9 +146,11 @@ pub async fn run_apply_loop(
                         apply_array_schema(
                             &state,
                             &tracker,
-                            batch.group_id,
-                            entry.index,
-                            applied_key,
+                            AppliedPosition {
+                                group_id: batch.group_id,
+                                log_index: entry.index,
+                                applied_key,
+                            },
                             crate::control::array_sync::raft_apply::ArraySchemaPayload {
                                 array,
                                 snapshot_payload,

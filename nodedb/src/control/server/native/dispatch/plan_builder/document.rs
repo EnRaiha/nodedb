@@ -85,6 +85,7 @@ pub(crate) fn build_point_put(
                 format: "ilp".to_string(),
                 wal_lsn: None,
                 surrogates: Vec::new(),
+                provenance: None,
             }))
         }
         Some(CollectionType::Columnar(_)) => Err(crate::Error::BadRequest {

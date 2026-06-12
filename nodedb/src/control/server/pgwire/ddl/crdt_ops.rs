@@ -136,6 +136,7 @@ pub async fn crdt_apply(
         peer_id: identity.user_id,
         mutation_id: 0,
         surrogate,
+        provenance: None,
     });
 
     super::sync_dispatch::dispatch_async(

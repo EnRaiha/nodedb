@@ -86,16 +86,30 @@ impl MetadataCommitApplier {
     /// - Non-DDL variants (topology, routing, lease, version) have
     ///   no host-side redb effects in this crate — the cluster crate
     ///   already tracks them in the `MetadataCache`.
-    fn apply_host_side_effects(&self, entry: &MetadataEntry, raft_index: u64) {
+    ///
+    /// `Ok(())` means the entry is fully applied (or its only failure was a
+    /// best-effort durability shortcut whose source of truth is the replicated
+    /// log). `Err` means a durable, replicated-state write failed — the caller
+    /// MUST NOT advance the apply watermark past this entry, so Raft re-delivers
+    /// it and the apply is retried. This is the canonical "never advance the
+    /// state machine past an entry you couldn't apply" rule: a transient I/O
+    /// failure clears on retry; a persistent one leaves the watermark loudly
+    /// stuck (proposer waiters time out) rather than silently diverging from the
+    /// quorum with a false-success ACK.
+    fn apply_host_side_effects(
+        &self,
+        entry: &MetadataEntry,
+        raft_index: u64,
+    ) -> Result<(), crate::Error> {
         // Atomic batches unpack one level: the sub-entries are
         // applied individually so each gets its own audit record
         // stamped with the same raft_index (they committed at the
         // same log position).
         if let MetadataEntry::Batch { entries } = entry {
             for sub in entries {
-                self.apply_host_side_effects(sub, raft_index);
+                self.apply_host_side_effects(sub, raft_index)?;
             }
-            return;
+            return Ok(());
         }
 
         // Handle non-CatalogDdl variants that still have host-side
@@ -122,7 +136,7 @@ impl MetadataCommitApplier {
                         "drain_start applied to host tracker"
                     );
                 }
-                return;
+                return Ok(());
             }
             MetadataEntry::DescriptorDrainEnd { descriptor_id } => {
                 if let Some(weak) = self.shared.get()
@@ -134,7 +148,7 @@ impl MetadataCommitApplier {
                         "drain_end applied to host tracker"
                     );
                 }
-                return;
+                return Ok(());
             }
             MetadataEntry::CaTrustChange {
                 add_ca_cert,
@@ -150,7 +164,7 @@ impl MetadataCommitApplier {
                         raft_index,
                     );
                 }
-                return;
+                return Ok(());
             }
             MetadataEntry::SurrogateAlloc { hwm } => {
                 // Advance the in-memory surrogate high-watermark on every
@@ -168,32 +182,100 @@ impl MetadataCommitApplier {
                         .registry_handle()
                         .read()
                         .unwrap_or_else(|p| p.into_inner());
-                    if let Err(e) = reg.restore_hwm(*hwm) {
-                        warn!(hwm, error = %e, "surrogate_alloc apply: restore_hwm failed");
-                    }
+                    let restored = reg.restore_hwm(*hwm);
                     drop(reg);
+                    // The in-memory HWM advance is correctness-critical: if it
+                    // fails this replica could re-issue a surrogate the cluster
+                    // already allocated. Do not advance past this entry — retry.
+                    if let Err(e) = restored {
+                        warn!(hwm, error = %e, "surrogate_alloc apply: restore_hwm failed — halting watermark for retry");
+                        return Err(crate::Error::Internal {
+                            detail: format!("surrogate_alloc apply: restore_hwm failed: {e}"),
+                        });
+                    }
                     // Best-effort catalog persist: a failure means the
-                    // next restart will re-derive the HWM from the log,
-                    // which is correct — just slightly slower. We must
-                    // not block the apply loop on catalog I/O.
+                    // next restart will re-derive the HWM from the log
+                    // (the log is the source of truth), which is correct —
+                    // just slightly slower. Tolerate and continue.
                     if let Some(catalog) = self.credentials.catalog()
                         && let Err(e) = catalog.put_surrogate_hwm(*hwm)
                     {
                         warn!(
                             hwm,
                             error = %e,
-                            "surrogate_alloc apply: failed to persist hwm to catalog"
+                            "surrogate_alloc apply: failed to persist hwm to catalog (tolerable; log is authoritative)"
                         );
                     }
                     debug!(hwm, raft_index, "surrogate hwm advanced via raft");
                 }
-                return;
+                return Ok(());
+            }
+            MetadataEntry::SyncProducerRegister {
+                lite_id,
+                producer_id,
+                tenant_id,
+                epoch,
+                created_ms,
+            } => {
+                if let Some(weak) = self.shared.get()
+                    && let Some(shared) = weak.upgrade()
+                {
+                    let Some(registry) = shared.producer_registry.as_deref() else {
+                        return Ok(());
+                    };
+                    // The registration row is durable replicated state. A write
+                    // failure must not advance the watermark — Raft re-delivers
+                    // and `apply_register` is idempotent, so the retry is safe.
+                    if let Err(e) = registry.apply_register(
+                        lite_id,
+                        *producer_id,
+                        *tenant_id,
+                        *epoch,
+                        *created_ms,
+                    ) {
+                        warn!(
+                            lite_id = %lite_id,
+                            producer_id,
+                            error = %e,
+                            "sync_producer_register apply failed — halting watermark for retry"
+                        );
+                        return Err(crate::Error::Internal {
+                            detail: format!("sync_producer_register apply failed: {e}"),
+                        });
+                    }
+                    debug!(lite_id = %lite_id, producer_id, raft_index, "sync producer registered via raft");
+                }
+                return Ok(());
+            }
+            MetadataEntry::SyncProducerFence { lite_id, new_epoch } => {
+                if let Some(weak) = self.shared.get()
+                    && let Some(shared) = weak.upgrade()
+                {
+                    let Some(registry) = shared.producer_registry.as_deref() else {
+                        return Ok(());
+                    };
+                    // Durable epoch advance; `apply_fence` is idempotent
+                    // (max-wins) so re-delivery on failure is safe.
+                    if let Err(e) = registry.apply_fence(lite_id, *new_epoch) {
+                        warn!(
+                            lite_id = %lite_id,
+                            new_epoch,
+                            error = %e,
+                            "sync_producer_fence apply failed — halting watermark for retry"
+                        );
+                        return Err(crate::Error::Internal {
+                            detail: format!("sync_producer_fence apply failed: {e}"),
+                        });
+                    }
+                    debug!(lite_id = %lite_id, new_epoch, raft_index, "sync producer fenced via raft");
+                }
+                return Ok(());
             }
             _ => {}
         }
 
         let Some(catalog) = self.credentials.catalog() else {
-            return;
+            return Ok(());
         };
         let (payload, audit) = match entry {
             MetadataEntry::CatalogDdl { payload } => (payload, None),
@@ -210,13 +292,17 @@ impl MetadataCommitApplier {
                     sql_text.clone(),
                 )),
             ),
-            _ => return,
+            _ => return Ok(()),
         };
         let catalog_entry = match catalog_entry::decode(payload) {
             Ok(e) => e,
             Err(e) => {
+                // Deterministic poison: a corrupt payload will not decode on
+                // retry either, so skip it (advance) rather than wedge the
+                // group. Loud because a committed-but-undecodable entry is a
+                // serious version-skew / corruption signal.
                 warn!(error = %e, "metadata applier: failed to decode CatalogEntry payload");
-                return;
+                return Ok(());
             }
         };
 
@@ -290,21 +376,30 @@ impl MetadataCommitApplier {
                 stamped, shared, raft_index,
             );
         }
+        Ok(())
     }
 }
 
 impl MetadataApplier for MetadataCommitApplier {
     fn apply(&self, entries: &[(u64, Vec<u8>)]) -> u64 {
+        // `last` is the highest index whose state is GUARANTEED visible. We
+        // only advance it past an entry that fully applied — a durable apply
+        // failure stops the batch here so Raft re-delivers the entry and the
+        // apply is retried (never a silent divergence with a false-success ACK).
         let mut last = 0u64;
         for (index, data) in entries {
-            last = *index;
             if data.is_empty() {
+                // Raft no-op: nothing to apply, safe to advance.
+                last = *index;
                 continue;
             }
             let entry = match decode_entry(data) {
                 Ok(e) => e,
                 Err(e) => {
+                    // Undecodable committed entry: deterministic poison, won't
+                    // decode on retry — skip (advance) rather than wedge.
                     warn!(index = *index, error = %e, "metadata decode failed");
+                    last = *index;
                     continue;
                 }
             };
@@ -314,8 +409,19 @@ impl MetadataApplier for MetadataCommitApplier {
                 let mut guard = self.cache.write().unwrap_or_else(|p| p.into_inner());
                 guard.apply(*index, &entry);
             }
-            // 2. Host side effects (redb writeback + async post-apply).
-            self.apply_host_side_effects(&entry, *index);
+            // 2. Host side effects (redb writeback + async post-apply). A
+            //    durable failure halts the watermark at the last good index.
+            if let Err(e) = self.apply_host_side_effects(&entry, *index) {
+                warn!(
+                    index = *index,
+                    last_applied = last,
+                    error = %e,
+                    "metadata apply: durable host-side effect failed; not advancing \
+                     watermark — Raft will re-deliver and retry"
+                );
+                break;
+            }
+            last = *index;
         }
         if last > 0 {
             // The Raft tick loop bumps the per-group apply watcher
