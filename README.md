@@ -238,7 +238,30 @@ Pre-1.0 versions may change internals between releases — those changes are cri
 
 ## License
 
-NodeDB uses a dual-license model:
+NodeDB is **source-available** under a mixed-license model. The short version:
+**you can use NodeDB for anything — internal apps, your own SaaS or AI-agent
+platform, commercial products, at any scale. The one thing you may not do is
+offer NodeDB itself to third parties as a hosted database service (DBaaS).**
 
-- **Shared engine crates** (`nodedb-types`, `nodedb-vector`, `nodedb-graph`, `nodedb-fts`, `nodedb-spatial`, `nodedb-codec`, `nodedb-columnar`, `nodedb-array`, `nodedb-sql`, `nodedb-client`, `nodedb-query`, `nodedb-strict`) — [Apache 2.0](LICENSE.APACHE-2.0). Use them freely in your own projects, SDKs, and tools.
-- **Server crates** (`nodedb`, `nodedb-wal`, `nodedb-raft`, `nodedb-cluster`, `nodedb-bridge`, `nodedb-mem`, `nodedb-crdt`) — [Business Source License 1.1](LICENSE). Free for any use except offering NodeDB as a hosted database service (DBaaS). Converts to Apache 2.0 on 2030-05-01.
+- **Everything except the server — [Apache 2.0](LICENSE.APACHE-2.0), no strings.**
+  The shared kernel that both Origin and [NodeDB-Lite](https://github.com/NodeDB-Lab/nodedb-lite)
+  build on: the engines (`nodedb-vector`, `nodedb-vector-gpu`, `nodedb-graph`,
+  `nodedb-fts`, `nodedb-spatial`, `nodedb-columnar`, `nodedb-array`), the
+  foundations (`nodedb-mem`, `nodedb-wal`, `nodedb-crdt`), and the supporting
+  crates (`nodedb-types`, `nodedb-codec`, `nodedb-strict`, `nodedb-sql`,
+  `nodedb-query`, `nodedb-physical`, `nodedb-client`). Use them freely in your own
+  projects, SDKs, and tools.
+- **The server — [Business Source License 1.1](LICENSE).** Only four crates:
+  `nodedb` (the server binary), `nodedb-bridge`, `nodedb-raft`, `nodedb-cluster` —
+  the three-plane runtime and distribution layer. Free for any use _except_
+  operating it as a managed/hosted database service on others' behalf. Converts
+  to Apache 2.0 on 2030-05-01.
+
+Cloud providers and marketplaces may offer one-click or self-deploy NodeDB images
+freely — that's explicitly permitted; the line is operational, not promotional.
+Only running the database _as a managed service on someone's behalf_ needs a
+commercial license.
+
+> **NodeDB-Lite** (the embedded build — WASM/OPFS, mobile, desktop) is **entirely
+> Apache 2.0** and pulls in only the Apache crates above. There is no BSL anywhere
+> in a Lite dependency tree — embed it wherever you like.

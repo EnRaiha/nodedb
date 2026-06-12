@@ -8,22 +8,37 @@ Licensed Work:        NodeDB
 Change Date:          2030-05-01
 Change License:       Apache License, Version 2.0
 
-Additional Use Grant: You may make use of the Licensed Work, provided that
-                      you may not use the Licensed Work to provide a
-                      Database Service.
+Additional Use Grant: You may make use of the Licensed Work in production,
+                      provided that you do not provide a Database Service.
 
-                      A "Database Service" means any commercial product,
-                      service, or platform in which the Licensed Work is
-                      offered to third parties primarily to provide database
-                      functionality, managed database hosting (DBaaS), or
-                      direct Database Administration/GUI tools.
+                      A "Database Service" means operating the Licensed Work on
+                      behalf of third parties as a commercial offering in which
+                      the database functionality it provides is itself the
+                      product. This includes managed or hosted database hosting
+                      (DBaaS) and a hosted database administration or GUI
+                      service built on the Licensed Work.
 
-                      For the avoidance of doubt: using the Licensed Work as
-                      the backend data store to power an internal application,
-                      a Software-as-a-Service (SaaS) product, or an AI Agent
-                      platform where the database functionality is abstracted
-                      away and is not the primary product exposed to the
-                      end-user, is explicitly permitted at any scale.
+                      For the avoidance of doubt, the following are explicitly
+                      permitted at any scale:
+
+                      (a) Use as the engine inside something else — using the
+                      Licensed Work as the backend data store for an internal
+                      application, a Software-as-a-Service (SaaS) product, or an
+                      AI-agent platform, where the database is abstracted away
+                      and is not the primary product exposed to the end-user.
+
+                      (b) Self-managed distribution — distributing, listing, or
+                      pre-installing the Licensed Work as software that the
+                      end-user deploys and operates themselves: a virtual-machine
+                      or container image, a one-click application, or a listing
+                      in a third-party cloud provider's or hosting marketplace's
+                      catalog, including where that provider charges for the
+                      underlying compute or infrastructure on which the end-user
+                      runs it. The boundary is operational, not promotional: a
+                      provider may freely offer and advertise such a deployable
+                      image; only operating the database on the end-user's
+                      behalf as a managed or hosted offering is a Database
+                      Service.
 
 -----------------------------------------------------------------------------
 
