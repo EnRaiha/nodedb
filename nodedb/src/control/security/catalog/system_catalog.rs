@@ -6,14 +6,20 @@
 //! and provides raw WASM module storage methods.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use redb::Database;
 use tracing::info;
 
 use super::types::*;
 
+/// Cloneable handle to the redb-backed system catalog. Clones share one
+/// underlying `redb::Database` (one file open), so the catalog can be shared
+/// between the credential store and the sync producer registry without a
+/// second `Database::create` on the same path (which redb rejects).
+#[derive(Clone)]
 pub struct SystemCatalog {
-    pub(super) db: Database,
+    pub(super) db: Arc<Database>,
 }
 
 impl SystemCatalog {
@@ -60,7 +66,7 @@ impl SystemCatalog {
             info!(path = %path.display(), "system catalog opened");
         }
 
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
     /// Execute a write transaction on the WASM_MODULES table.

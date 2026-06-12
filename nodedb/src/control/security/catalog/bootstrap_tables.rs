@@ -81,6 +81,9 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "surrogate_pk" => SURROGATE_PK,
     "surrogate_pk_rev" => SURROGATE_PK_REV,
     "surrogate_hwm" => super::surrogate_hwm::SURROGATE_HWM,
+    // ── Sync producer registry ──
+    "sync_producer_hwm" => super::sync_producer::SYNC_PRODUCER_HWM,
+    "sync_producers" => super::sync_producer::SYNC_PRODUCERS,
     // ── DDL objects ──
     "materialized_views" => MATERIALIZED_VIEWS,
     "continuous_aggregates" => CONTINUOUS_AGGREGATES,

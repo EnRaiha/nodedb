@@ -47,6 +47,7 @@ pub mod sequences;
 pub mod streaming_mvs;
 pub mod surrogate_hwm;
 pub mod surrogate_pk;
+pub mod sync_producer;
 pub mod synonym_groups;
 pub mod system_catalog;
 pub mod tables;
