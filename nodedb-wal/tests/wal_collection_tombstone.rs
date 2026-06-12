@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end tombstone pipeline: write records, write tombstone,
 //! replay, assert shadowed writes are filtered.

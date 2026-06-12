@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
 //! WAL recovery: scan an existing WAL file to determine the last committed LSN
 //! and file offset, enabling safe reopening for continued writes.

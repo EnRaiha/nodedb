@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
 //! FK chain across agents: child arrives before parent, defer-and-retry resolves.
 

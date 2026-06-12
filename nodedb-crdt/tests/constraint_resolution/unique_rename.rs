@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
 //! Multi-agent UNIQUE auto-rename: 3 agents offline simultaneously all claim
 //! the same email; under `RenameSuffix` the suffix counter advances

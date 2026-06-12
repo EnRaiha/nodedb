@@ -4,7 +4,7 @@ description = "Deterministic O_DIRECT write-ahead log with io_uring group commit
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 readme = "README.md"
 repository.workspace = true
 homepage.workspace = true
@@ -17,6 +17,7 @@ default = []
 io-uring = ["dep:io-uring"]
 
 [dependencies]
+nodedb-types = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crc32c = { workspace = true }

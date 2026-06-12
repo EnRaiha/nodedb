@@ -13,4 +13,4 @@ for per-version changes.
 
 ## License
 
-Licensed under the Business Source License 1.1 ([`LICENSE`](../LICENSE)).
+Licensed under the Apache License, Version 2.0 ([`LICENSE-APACHE`](../LICENSE.APACHE-2.0)).

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
 //! Spec: mmap WAL readers must advise MADV_SEQUENTIAL, and replay
 //! helpers must filter segments by SegmentMeta.first_lsn before opening.

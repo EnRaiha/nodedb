@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
 //! Segment preamble: 16-byte plaintext header written at offset 0 of every
 //! WAL segment file and every storage segment file.
