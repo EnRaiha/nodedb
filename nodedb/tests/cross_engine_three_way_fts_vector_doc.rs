@@ -228,6 +228,7 @@ fn three_way_fts_vector_doc_bitmap() {
                 dim: 3,
                 field_name: String::new(),
                 surrogate: Surrogate::new(s),
+                provenance: None,
             })),
         })
         .unwrap();

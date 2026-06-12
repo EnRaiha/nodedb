@@ -176,6 +176,7 @@ fn calvin_static_apply_failure_rolls_back_cleanly() {
             dim: 3,
             field_name: String::new(),
             surrogate: nodedb_types::Surrogate::ZERO,
+            provenance: None,
         }),
     );
 
@@ -189,6 +190,7 @@ fn calvin_static_apply_failure_rolls_back_cleanly() {
             dim: 3,
             field_name: String::new(),
             surrogate: nodedb_types::Surrogate::new(99),
+            provenance: None,
         }),
     ];
 

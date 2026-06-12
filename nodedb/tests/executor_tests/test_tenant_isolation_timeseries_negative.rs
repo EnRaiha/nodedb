@@ -31,6 +31,7 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
             format: "ilp".into(),
             wal_lsn: None,
             surrogates: Vec::new(),
+            provenance: None,
         }),
     );
 
@@ -87,6 +88,7 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
             format: "ilp".into(),
             wal_lsn: None,
             surrogates: Vec::new(),
+            provenance: None,
         }),
     );
 

@@ -196,6 +196,7 @@ fn vector_insert_byte_identical() {
             dim: 3,
             field_name: String::new(),
             surrogate: nodedb_types::Surrogate::new(i),
+            provenance: None,
         }));
     }
     assert_deterministic(ops);
@@ -219,6 +220,8 @@ fn columnar_insert_byte_identical() {
                 on_conflict_updates: Vec::new(),
                 surrogates: Vec::new(),
                 schema_bytes: Vec::new(),
+                provenance: None,
+                wal_lsn: None,
             })
         })
         .collect();
@@ -245,6 +248,7 @@ fn crdt_apply_byte_identical() {
                 peer_id: 1,
                 mutation_id: i as u64,
                 surrogate: nodedb_types::Surrogate::ZERO,
+                provenance: None,
             })
         })
         .collect();
@@ -371,6 +375,7 @@ fn timeseries_bitemporal_byte_identical() {
                 format: "ilp".into(),
                 wal_lsn: None,
                 surrogates: Vec::new(),
+                provenance: None,
             })
         })
         .collect();

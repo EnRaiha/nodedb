@@ -50,6 +50,7 @@ fn ingest_ilp(
             format: "ilp".to_string(),
             wal_lsn: None,
             surrogates: Vec::new(),
+            provenance: None,
         }),
     );
     let json_str = nodedb::data::executor::response_codec::decode_payload_to_json(&raw);
@@ -413,6 +414,7 @@ fn dedup_only_skips_flushed_partitions() {
             format: "ilp".to_string(),
             wal_lsn: Some(100),
             surrogates: Vec::new(),
+            provenance: None,
         }),
     );
     let v1: serde_json::Value = serde_json::from_str(
@@ -434,6 +436,7 @@ fn dedup_only_skips_flushed_partitions() {
             format: "ilp".to_string(),
             wal_lsn: Some(100),
             surrogates: Vec::new(),
+            provenance: None,
         }),
     );
     let v2: serde_json::Value = serde_json::from_str(
@@ -456,6 +459,7 @@ fn dedup_only_skips_flushed_partitions() {
             format: "ilp".to_string(),
             wal_lsn: None,
             surrogates: Vec::new(),
+            provenance: None,
         }),
     );
     let v3: serde_json::Value = serde_json::from_str(
@@ -498,6 +502,7 @@ fn catchup_replays_gaps_in_lsn_coverage() {
                 format: "ilp".to_string(),
                 wal_lsn: Some(lsn as u64),
                 surrogates: Vec::new(),
+                provenance: None,
             }),
         );
     }
@@ -528,6 +533,7 @@ fn catchup_replays_gaps_in_lsn_coverage() {
                 format: "ilp".to_string(),
                 wal_lsn: Some(lsn as u64),
                 surrogates: Vec::new(),
+                provenance: None,
             }),
         );
         let v: serde_json::Value = serde_json::from_str(

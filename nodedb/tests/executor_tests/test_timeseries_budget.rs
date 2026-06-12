@@ -90,6 +90,7 @@ fn ingest_ilp(ctx: &mut TestCtx, collection: &str, payload: &str) -> serde_json:
             format: "ilp".to_string(),
             wal_lsn: None,
             surrogates: Vec::new(),
+            provenance: None,
         }),
     );
     let json = nodedb::data::executor::response_codec::decode_payload_to_json(&raw);

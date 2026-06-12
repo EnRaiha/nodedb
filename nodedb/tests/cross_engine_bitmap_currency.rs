@@ -188,6 +188,7 @@ fn fts_derived_bitmap_filters_vector_search() {
                 dim: 3,
                 field_name: String::new(),
                 surrogate: *surrogate,
+                provenance: None,
             })),
         })
         .unwrap();
@@ -350,6 +351,8 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
             on_conflict_updates: Vec::new(),
             surrogates: all_surrogates.clone(),
             schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
         }),
     );
 

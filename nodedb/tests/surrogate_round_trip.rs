@@ -223,6 +223,7 @@ fn surrogate_round_trip_all_engines() {
                 dim: 3,
                 field_name: String::new(),
                 surrogate: Surrogate::new(s),
+                provenance: None,
             })
         })
         .collect();
@@ -306,6 +307,8 @@ fn surrogate_round_trip_all_engines() {
                 on_conflict_updates: Vec::new(),
                 surrogates: COL_SURS.iter().copied().map(Surrogate::new).collect(),
                 schema_bytes: Vec::new(),
+                provenance: None,
+                wal_lsn: None,
             }),
         );
     }
@@ -351,6 +354,7 @@ fn surrogate_round_trip_all_engines() {
                 array_id: aid.clone(),
                 cells_msgpack: cells_mp,
                 wal_lsn: 1,
+                provenance: None,
             }),
         );
     }

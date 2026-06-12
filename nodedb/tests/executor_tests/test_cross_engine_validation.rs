@@ -54,6 +54,7 @@ fn cross_model_query_vector_graph_relational() {
                     dim: 3,
                     field_name: String::new(),
                     surrogate: nodedb_types::Surrogate::ZERO,
+                    provenance: None,
                 }),
             ),
         })
@@ -236,6 +237,7 @@ fn rrf_fusion_mathematically_correct() {
                     dim: 3,
                     field_name: String::new(),
                     surrogate: nodedb_types::Surrogate::ZERO,
+                    provenance: None,
                 }),
             ),
         })

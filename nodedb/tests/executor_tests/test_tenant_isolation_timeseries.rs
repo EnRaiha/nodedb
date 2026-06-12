@@ -28,6 +28,7 @@ fn timeseries_scan_isolated() {
             format: "ilp".into(),
             wal_lsn: None,
             surrogates: Vec::new(),
+            provenance: None,
         }),
     );
 

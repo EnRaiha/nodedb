@@ -57,6 +57,9 @@ fn put_delta(
     ArrayDeltaMsg {
         array: array.to_string(),
         op_payload: payload,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
     }
 }
 

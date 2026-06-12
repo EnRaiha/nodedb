@@ -79,6 +79,7 @@ fn purge_removes_all_tenant_data() {
             format: "ilp".into(),
             wal_lsn: None,
             surrogates: Vec::new(),
+            provenance: None,
         }),
     );
 

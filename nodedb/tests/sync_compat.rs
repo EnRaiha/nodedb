@@ -51,6 +51,9 @@ fn lite_delta_push_frame_roundtrips() {
         mutation_id: 7,
         checksum: 0,
         device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
     };
 
     let frame = SyncFrame::new_msgpack(SyncMessageType::DeltaPush, &msg).unwrap();

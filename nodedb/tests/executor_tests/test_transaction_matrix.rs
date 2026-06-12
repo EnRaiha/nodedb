@@ -49,6 +49,7 @@ fn vector_seed(collection: &str) -> PhysicalPlan {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        provenance: None,
     })
 }
 
@@ -60,6 +61,7 @@ fn vector_fail(collection: &str) -> PhysicalPlan {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        provenance: None,
     })
 }
 
@@ -187,6 +189,7 @@ fn rollback_matrix_vector_then_doc_fail() {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        provenance: None,
     });
     let resp = send_raw(
         &mut core,
@@ -361,6 +364,7 @@ fn rollback_matrix_crdt_buffered_then_vector_fail() {
                     peer_id: 1,
                     mutation_id: 42,
                     surrogate: nodedb_types::Surrogate::ZERO,
+                    provenance: None,
                 }),
                 doc_put("docs", b"modified"),
                 vector_fail("vec"),

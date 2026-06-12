@@ -202,6 +202,7 @@ fn graph_rag_fusion_pipeline() {
                     dim: 3,
                     field_name: String::new(),
                     surrogate: nodedb_types::Surrogate::ZERO,
+                    provenance: None,
                 }),
             ),
         })

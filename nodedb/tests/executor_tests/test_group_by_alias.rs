@@ -95,6 +95,7 @@ fn ingest_ilp(ctx: &mut TestCtx, collection: &str, payload: &str) {
             format: "ilp".to_string(),
             wal_lsn: None,
             surrogates: Vec::new(),
+            provenance: None,
         }),
     );
 }

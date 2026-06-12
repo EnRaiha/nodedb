@@ -29,6 +29,8 @@ fn aggregate_count_reads_plain_columnar_engine_rows() {
             on_conflict_updates: Vec::new(),
             surrogates: Vec::new(),
             schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
         }),
     );
 
@@ -94,6 +96,8 @@ fn columnar_having_uses_canonical_key_but_output_keeps_user_alias() {
             on_conflict_updates: Vec::new(),
             surrogates: Vec::new(),
             schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
         }),
     );
 
@@ -173,6 +177,8 @@ fn columnar_insert_triggers_memtable_flush() {
             on_conflict_updates: Vec::new(),
             surrogates: Vec::new(),
             schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
         }),
     );
 
@@ -220,6 +226,8 @@ fn aggregate_group_by_does_not_require_full_materialization() {
             on_conflict_updates: Vec::new(),
             surrogates: Vec::new(),
             schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
         }),
     );
 

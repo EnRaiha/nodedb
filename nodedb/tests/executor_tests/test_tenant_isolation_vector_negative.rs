@@ -30,6 +30,7 @@ fn vector_cross_tenant_insert_does_not_contaminate_search() {
                 dim: 3,
                 field_name: String::new(),
                 surrogate: nodedb_types::Surrogate::ZERO,
+                provenance: None,
             }),
         );
     }
@@ -76,6 +77,7 @@ fn vector_cross_tenant_insert_does_not_contaminate_search() {
                 dim: 3,
                 field_name: String::new(),
                 surrogate: nodedb_types::Surrogate::ZERO,
+                provenance: None,
             }),
         );
     }
