@@ -5,7 +5,25 @@
 use super::types::{ReplicatedEntry, ReplicatedWrite};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{TenantId, VShardId};
-use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, GraphOp, KvOp, VectorOp};
+use nodedb_physical::physical_plan::{
+    ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, SpatialOp, TextOp, TimeseriesOp, VectorOp,
+};
+
+/// Serialize optional sync provenance into the cross-node wire shape.
+///
+/// `SyncProvenance` is a plain POD struct (producer_id / epoch / stream_id /
+/// seq); its msgpack encoding is infallible — the same contract the
+/// `geometry_bytes` encoding below relies on. We `.expect()` rather than
+/// silently dropping provenance with `.ok()`: losing provenance on a follower
+/// would defeat the idempotency gate and risk double-apply, so a (theoretical)
+/// encode failure must fail loud, not replicate `None`.
+fn encode_provenance(
+    provenance: &Option<nodedb_types::sync::wire::SyncProvenance>,
+) -> Option<Vec<u8>> {
+    provenance
+        .as_ref()
+        .map(|p| zerompk::to_msgpack_vec(p).expect("SyncProvenance serialization is infallible"))
+}
 
 pub fn to_replicated_entry(
     tenant_id: TenantId,
@@ -60,6 +78,7 @@ pub fn to_replicated_entry(
             dim,
             field_name,
             surrogate: _,
+            provenance,
         }) => ReplicatedWrite::VectorInsert {
             collection: collection.clone(),
             vector: vector.clone(),
@@ -70,6 +89,7 @@ pub fn to_replicated_entry(
             // the originating user PK at this hop, headless followers
             // call `assign_anonymous`.
             pk_bytes: None,
+            provenance: encode_provenance(provenance),
         },
         PhysicalPlan::Vector(VectorOp::BatchInsert {
             collection,
@@ -116,11 +136,13 @@ pub fn to_replicated_entry(
             peer_id,
             mutation_id: _,
             surrogate: _,
+            provenance,
         }) => ReplicatedWrite::CrdtApply {
             collection: collection.clone(),
             document_id: document_id.clone(),
             delta: delta.clone(),
             peer_id: *peer_id,
+            provenance: encode_provenance(provenance),
         },
         PhysicalPlan::Graph(GraphOp::EdgePut {
             collection,
@@ -250,6 +272,85 @@ pub fn to_replicated_entry(
                 index_name: index_name.clone(),
             }
         }
+        PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection,
+            payload,
+            surrogates,
+            schema_bytes,
+            provenance,
+            // wal_lsn is omitted from the wire envelope; followers allocate
+            // their own LSN at apply time. intent and on_conflict_updates are
+            // always Insert/empty on the sync path and are hardcoded on decode.
+            ..
+        }) => ReplicatedWrite::ColumnarIngest {
+            collection: collection.clone(),
+            payload: payload.clone(),
+            schema_bytes: schema_bytes.clone(),
+            surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
+            provenance: encode_provenance(provenance),
+        },
+        PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection,
+            payload,
+            format,
+            surrogates,
+            provenance,
+            ..
+        }) => ReplicatedWrite::TimeseriesIngest {
+            collection: collection.clone(),
+            payload: payload.clone(),
+            format: format.clone(),
+            surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
+            provenance: encode_provenance(provenance),
+        },
+        PhysicalPlan::Text(TextOp::FtsIndexDoc {
+            collection,
+            surrogate,
+            text,
+            provenance,
+        }) => ReplicatedWrite::FtsIndex {
+            collection: collection.clone(),
+            surrogate: surrogate.as_u32(),
+            text: text.clone(),
+            provenance: encode_provenance(provenance),
+        },
+        PhysicalPlan::Text(TextOp::FtsDeleteDoc {
+            collection,
+            surrogate,
+            provenance,
+        }) => ReplicatedWrite::FtsDelete {
+            collection: collection.clone(),
+            surrogate: surrogate.as_u32(),
+            provenance: encode_provenance(provenance),
+        },
+        PhysicalPlan::Spatial(SpatialOp::Insert {
+            collection,
+            field,
+            surrogate,
+            geometry,
+            provenance,
+        }) => ReplicatedWrite::SpatialInsert {
+            collection: collection.clone(),
+            field: field.clone(),
+            surrogate: surrogate.as_u32(),
+            // Geometry is plain serializable data — encoding is infallible
+            // (same contract as `ReplicatedEntry::to_bytes`). Fail loud rather
+            // than replicate empty bytes that would error on follower decode.
+            geometry_bytes: zerompk::to_msgpack_vec(geometry)
+                .expect("Geometry serialization is infallible"),
+            provenance: encode_provenance(provenance),
+        },
+        PhysicalPlan::Spatial(SpatialOp::Delete {
+            collection,
+            field,
+            surrogate,
+            provenance,
+        }) => ReplicatedWrite::SpatialDelete {
+            collection: collection.clone(),
+            field: field.clone(),
+            surrogate: surrogate.as_u32(),
+            provenance: encode_provenance(provenance),
+        },
         // Not a write — reads, system ops, etc.
         _ => return None,
     };

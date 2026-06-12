@@ -8,6 +8,7 @@
 //! - [`decode`]: `from_replicated_entry` (bytes → PhysicalPlan) + internal conversions.
 
 pub mod decode;
+mod decode_sync_engines;
 pub mod encode;
 pub mod types;
 

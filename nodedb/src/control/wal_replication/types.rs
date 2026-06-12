@@ -94,6 +94,12 @@ pub enum ReplicatedWrite {
         /// `assign_anonymous(collection)` when `None`).
         #[serde(default)]
         pk_bytes: Option<Vec<u8>>,
+        /// Sync provenance encoded as zerompk bytes. `None` for non-sync
+        /// inserts. Followers decode this back to `SyncProvenance` so the
+        /// idempotency gate runs identically on every replica, advancing
+        /// the same high-water mark as the leader.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
     },
     VectorBatchInsert {
         collection: String,
@@ -125,6 +131,94 @@ pub enum ReplicatedWrite {
         document_id: String,
         delta: Vec<u8>,
         peer_id: u64,
+        /// Sync provenance encoded as zerompk bytes. `None` for non-sync
+        /// applies. Followers decode this back to `SyncProvenance` so the
+        /// idempotency gate runs identically on every replica, advancing
+        /// the same high-water mark as the leader.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
+    },
+    /// A columnar batch insert from a Lite peer, to be applied on all replicas.
+    ///
+    /// `surrogates` are the leader-assigned global identities (in row order),
+    /// carried verbatim so followers use exactly the same values. `wal_lsn` is
+    /// omitted — followers allocate their own WAL LSN at apply time. `provenance`
+    /// is zerompk-encoded `SyncProvenance` so the idempotency gate runs
+    /// identically on every replica.
+    ColumnarIngest {
+        collection: String,
+        /// Row data in MessagePack format.
+        payload: Vec<u8>,
+        /// MessagePack-serialized `ColumnarSchema` from the DDL catalog.
+        schema_bytes: Vec<u8>,
+        /// Leader-assigned global surrogates, parallel to the rows in `payload`.
+        surrogates: Vec<u32>,
+        /// Sync provenance encoded as zerompk bytes.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
+    },
+    /// A timeseries ingest from a Lite peer, to be applied on all replicas.
+    ///
+    /// `surrogates` are the leader-assigned global identities. `wal_lsn` is
+    /// omitted — followers allocate their own WAL LSN at apply time.
+    TimeseriesIngest {
+        collection: String,
+        payload: Vec<u8>,
+        /// "ilp" or "samples".
+        format: String,
+        /// Leader-assigned global surrogates, parallel to the rows in `payload`.
+        surrogates: Vec<u32>,
+        /// Sync provenance encoded as zerompk bytes.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
+    },
+    /// Index a document into the FTS inverted index, from a Lite peer.
+    ///
+    /// `surrogate` is the leader-assigned global identity, carried verbatim
+    /// so followers insert the same row identity into the local FTS index.
+    FtsIndex {
+        collection: String,
+        /// Leader-assigned global surrogate for the document.
+        surrogate: u32,
+        /// Concatenated text to index.
+        text: String,
+        /// Sync provenance encoded as zerompk bytes.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
+    },
+    /// Remove a document from the FTS inverted index, from a Lite peer.
+    FtsDelete {
+        collection: String,
+        /// Leader-assigned global surrogate for the document.
+        surrogate: u32,
+        /// Sync provenance encoded as zerompk bytes.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
+    },
+    /// Insert a geometry into the spatial R-tree index, from a Lite peer.
+    ///
+    /// `surrogate` is the leader-assigned global identity. `geometry` is
+    /// zerompk-encoded `Geometry` to avoid a typed dependency in this crate.
+    SpatialInsert {
+        collection: String,
+        field: String,
+        /// Leader-assigned global surrogate for the row.
+        surrogate: u32,
+        /// zerompk-encoded `nodedb_types::geometry::Geometry`.
+        geometry_bytes: Vec<u8>,
+        /// Sync provenance encoded as zerompk bytes.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
+    },
+    /// Remove a geometry from the spatial R-tree index, from a Lite peer.
+    SpatialDelete {
+        collection: String,
+        field: String,
+        /// Leader-assigned global surrogate for the row.
+        surrogate: u32,
+        /// Sync provenance encoded as zerompk bytes.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
     },
     EdgePut {
         collection: String,
@@ -209,6 +303,13 @@ pub enum ReplicatedWrite {
         array: String,
         op_bytes: Vec<u8>,
         schema_hlc_bytes: [u8; 18],
+        /// Sync provenance (zerompk-encoded `SyncProvenance`), `None` for
+        /// legacy / unidentified producers. Carried so the epoch fence runs
+        /// identically on every replica's apply path — a stale-epoch array
+        /// producer is fenced cluster-wide and across leader failover, not
+        /// just on the node that first received the op.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
     },
     /// An array schema CRDT snapshot from a Lite peer.
     ///

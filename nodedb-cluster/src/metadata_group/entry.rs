@@ -140,6 +140,38 @@ pub enum MetadataEntry {
         remove_ca_fingerprint: Option<[u8; 32]>,
     },
 
+    // ── Sync producer identity ────────────────────────────────────────
+    /// Replicate a new Lite client registration to every node.
+    ///
+    /// On apply every node writes the same registration row verbatim and
+    /// advances its producer-id allocator HWM to at least `producer_id`, so
+    /// a future leader never reissues the same id after a failover. The
+    /// `producer_id` and initial `epoch` are assigned by the leader before
+    /// proposing, so all replicas store identical state.
+    ///
+    /// Applied host-side only; the cluster cache tracks the applied index.
+    SyncProducerRegister {
+        lite_id: String,
+        producer_id: u64,
+        tenant_id: u64,
+        epoch: u64,
+        created_ms: i64,
+    },
+
+    /// Replicate a fencing epoch advance to every node.
+    ///
+    /// Applied with max-wins semantics: each node sets
+    /// `current_epoch = max(stored_epoch, new_epoch)` so out-of-order
+    /// or duplicate delivery cannot roll the epoch backwards. A fence
+    /// entry with no prior register row is a no-op on that node
+    /// (tolerated for reordering/missing idempotency).
+    ///
+    /// Applied host-side only; the cluster cache tracks the applied index.
+    SyncProducerFence {
+        lite_id: String,
+        new_epoch: u64,
+    },
+
     // ── Surrogate identity ────────────────────────────────────────────
     /// Advance the cluster-wide surrogate high-watermark to `hwm`.
     ///

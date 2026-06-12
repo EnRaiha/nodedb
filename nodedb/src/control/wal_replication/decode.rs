@@ -2,6 +2,7 @@
 
 //! Convert committed ReplicatedWrite entries back to PhysicalPlan for Data Plane execution.
 
+use super::decode_sync_engines;
 use super::types::{ReplicatedEntry, ReplicatedWrite};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::surrogate::SurrogateAssigner;
@@ -139,6 +140,7 @@ fn to_physical_plan(
             dim,
             field_name,
             pk_bytes,
+            provenance: prov_bytes,
         } => {
             // Followers re-derive surrogate identity locally. With a
             // PK we share the leader's binding; without one (headless
@@ -149,12 +151,14 @@ fn to_physical_plan(
                 (Some(a), None) => a.assign_anonymous(collection)?,
                 (None, _) => nodedb_types::Surrogate::ZERO,
             };
+            let provenance = decode_sync_engines::decode_provenance(prov_bytes)?;
             PhysicalPlan::Vector(VectorOp::Insert {
                 collection: collection.clone(),
                 vector: vector.clone(),
                 dim: *dim,
                 field_name: field_name.clone(),
                 surrogate,
+                provenance,
             })
         }
         ReplicatedWrite::VectorBatchInsert {
@@ -212,8 +216,10 @@ fn to_physical_plan(
             document_id,
             delta,
             peer_id,
+            provenance: prov_bytes,
         } => {
             let surrogate = assign_or_zero(assigner, collection, document_id.as_bytes())?;
+            let provenance = decode_sync_engines::decode_provenance(prov_bytes)?;
             PhysicalPlan::Crdt(CrdtOp::Apply {
                 collection: collection.clone(),
                 document_id: document_id.clone(),
@@ -221,6 +227,7 @@ fn to_physical_plan(
                 peer_id: *peer_id,
                 mutation_id: 0,
                 surrogate,
+                provenance,
             })
         }
         ReplicatedWrite::EdgePut {
@@ -358,6 +365,58 @@ fn to_physical_plan(
                 index_name: index_name.clone(),
             })
         }
+        ReplicatedWrite::ColumnarIngest {
+            collection,
+            payload,
+            schema_bytes,
+            surrogates,
+            provenance,
+        } => decode_sync_engines::columnar_ingest(
+            collection,
+            payload,
+            schema_bytes,
+            surrogates,
+            provenance,
+        )?,
+        ReplicatedWrite::TimeseriesIngest {
+            collection,
+            payload,
+            format,
+            surrogates,
+            provenance,
+        } => decode_sync_engines::timeseries_ingest(
+            collection, payload, format, surrogates, provenance,
+        )?,
+        ReplicatedWrite::FtsIndex {
+            collection,
+            surrogate,
+            text,
+            provenance,
+        } => decode_sync_engines::fts_index(collection, *surrogate, text, provenance)?,
+        ReplicatedWrite::FtsDelete {
+            collection,
+            surrogate,
+            provenance,
+        } => decode_sync_engines::fts_delete(collection, *surrogate, provenance)?,
+        ReplicatedWrite::SpatialInsert {
+            collection,
+            field,
+            surrogate,
+            geometry_bytes,
+            provenance,
+        } => decode_sync_engines::spatial_insert(
+            collection,
+            field,
+            *surrogate,
+            geometry_bytes,
+            provenance,
+        )?,
+        ReplicatedWrite::SpatialDelete {
+            collection,
+            field,
+            surrogate,
+            provenance,
+        } => decode_sync_engines::spatial_delete(collection, field, *surrogate, provenance)?,
         // The following variants are intercepted upstream (Array CRDT ops by
         // `from_replicated_entry`, CalvinReadResult by the apply loop) and never
         // dispatched through the generic Data Plane path. These arms exist only

@@ -122,6 +122,14 @@ impl MetadataCache {
                 // `tls/ca.d/<fp>.crt` and rebuilds the rustls config.
                 // Cluster cache has nothing to track.
             }
+            MetadataEntry::SyncProducerRegister { .. } => {
+                // host-side only: the production applier calls
+                // `SyncProducerRegistry::apply_register` on every node.
+            }
+            MetadataEntry::SyncProducerFence { .. } => {
+                // host-side only: the production applier calls
+                // `SyncProducerRegistry::apply_fence` on every node.
+            }
             MetadataEntry::SurrogateAlloc { .. } => {
                 // Surrogate HWM advance is host-side only: the production
                 // applier calls `SurrogateRegistry::restore_hwm`. The
