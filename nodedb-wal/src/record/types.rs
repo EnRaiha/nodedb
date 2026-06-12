@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
 //! Record type discriminants.
 //!
@@ -130,6 +130,43 @@ pub enum RecordType {
     /// believing the transaction was not applied and re-dispatch it after
     /// restart, causing double-application.
     CalvinApplied = 110 | 0x8000,
+
+    /// Sync idempotency watermark — advances the durable per-stream
+    /// high-watermark for a given producer so the receiver can safely
+    /// deduplicate re-delivered ingest frames on reconnect.
+    ///
+    /// Payload: fixed 32-byte little-endian `SyncSeqAdvancePayload`
+    /// (`producer_id: u64, epoch: u64, stream_id: u64, seq: u64`).
+    ///
+    /// Required: a replay that skipped this record would leave the HWM
+    /// behind the tail, causing the receiver to re-apply already-committed
+    /// frames as duplicates after a restart.
+    SyncSeqAdvance = 53 | 0x8000,
+
+    /// FTS engine: index a document into the inverted BM25 index.
+    /// Payload: length-prefixed `FtsIndexPayload` (see `fts_spatial.rs`).
+    ///
+    /// Required: skipping this record on replay would leave the FTS index
+    /// behind the storage engine, breaking full-text queries.
+    FtsIndex = 54 | 0x8000,
+
+    /// FTS engine: remove a document from the inverted BM25 index.
+    /// Payload: length-prefixed `FtsDeletePayload` (see `fts_spatial.rs`).
+    ///
+    /// Required: skipping on replay would leave stale postings in the index.
+    FtsDelete = 55 | 0x8000,
+
+    /// Spatial engine: insert or update a geometry entry in the R-tree.
+    /// Payload: length-prefixed `SpatialPutPayload` (see `fts_spatial.rs`).
+    ///
+    /// Required: skipping on replay would leave the R-tree missing entries.
+    SpatialPut = 56 | 0x8000,
+
+    /// Spatial engine: remove a geometry entry from the R-tree.
+    /// Payload: length-prefixed `SpatialDeletePayload` (see `fts_spatial.rs`).
+    ///
+    /// Required: skipping on replay would leave stale entries in the R-tree.
+    SpatialDelete = 57 | 0x8000,
 }
 
 impl RecordType {
@@ -161,6 +198,11 @@ impl RecordType {
             102 => Some(Self::LsnMsAnchor),
             x if x == 103 | 0x8000 => Some(Self::TemporalPurge),
             x if x == 110 | 0x8000 => Some(Self::CalvinApplied),
+            x if x == 53 | 0x8000 => Some(Self::SyncSeqAdvance),
+            x if x == 54 | 0x8000 => Some(Self::FtsIndex),
+            x if x == 55 | 0x8000 => Some(Self::FtsDelete),
+            x if x == 56 | 0x8000 => Some(Self::SpatialPut),
+            x if x == 57 | 0x8000 => Some(Self::SpatialDelete),
             _ => None,
         }
     }
@@ -180,6 +222,11 @@ mod tests {
         assert!(!RecordType::is_required(RecordType::LogBatch as u32));
         assert!(!RecordType::is_required(RecordType::LsnMsAnchor as u32));
         assert!(RecordType::is_required(RecordType::TemporalPurge as u32));
+        assert!(RecordType::is_required(RecordType::SyncSeqAdvance as u32));
+        assert!(RecordType::is_required(RecordType::FtsIndex as u32));
+        assert!(RecordType::is_required(RecordType::FtsDelete as u32));
+        assert!(RecordType::is_required(RecordType::SpatialPut as u32));
+        assert!(RecordType::is_required(RecordType::SpatialDelete as u32));
     }
 
     #[test]
@@ -205,6 +252,11 @@ mod tests {
             RecordType::LsnMsAnchor,
             RecordType::TemporalPurge,
             RecordType::CalvinApplied,
+            RecordType::SyncSeqAdvance,
+            RecordType::FtsIndex,
+            RecordType::FtsDelete,
+            RecordType::SpatialPut,
+            RecordType::SpatialDelete,
         ] {
             assert_eq!(RecordType::from_raw(ty as u32), Some(ty));
         }
