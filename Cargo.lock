@@ -4643,6 +4643,7 @@ dependencies = [
  "io-uring",
  "libc",
  "memmap2",
+ "nodedb-types",
  "rand 0.9.4",
  "tempfile",
  "thiserror 2.0.18",
