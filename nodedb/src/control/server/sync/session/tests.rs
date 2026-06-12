@@ -73,6 +73,9 @@ fn delta_push_rejected_before_auth() {
         mutation_id: 100,
         checksum: 0,
         device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
     };
 
     let response = session.handle_delta_push(&msg, None, None, None);
@@ -95,6 +98,9 @@ fn delta_push_accepted_when_authenticated() {
         mutation_id: 42,
         checksum: 0,
         device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
     };
 
     let response = session.handle_delta_push(&msg, None, None, None);
@@ -148,6 +154,9 @@ fn delta_push_rls_silent_rejection() {
         mutation_id: 42,
         checksum: 0,
         device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
     };
 
     let response =
@@ -192,6 +201,9 @@ fn delta_push_rate_limited_silent_drop() {
         mutation_id: 1,
         checksum: 0,
         device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
     };
 
     let r1 = session.handle_delta_push(&msg, None, None, None);
@@ -209,6 +221,9 @@ fn delta_push_rate_limited_silent_drop() {
         mutation_id: 2,
         checksum: 0,
         device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
     };
     let r2 = session.handle_delta_push(&msg2, None, Some(&mut audit_log), Some(&mut dlq));
     assert!(r2.is_none());
@@ -249,60 +264,46 @@ fn vector_clock_sync() {
     assert_eq!(*sync.clocks.get("orders").unwrap(), 42);
 }
 
+/// The Control Plane no longer keeps an in-memory replay-dedup map: every
+/// `handle_delta_push` is processed. Idempotency is enforced durably at the
+/// Data-Plane gate (`sync_admit`, keyed on producer-assigned seq — see the
+/// `sync_gate` tests); for unfenced clients (producer_id == 0, as here) Loro
+/// merge is idempotent, so re-applying converges to the same state. This test
+/// pins the new contract: no CP-side short-circuit on a repeated mutation_id.
 #[test]
-fn replay_dedup_skips_already_processed() {
+fn delta_push_has_no_cp_side_dedup() {
     let mut session = make_authenticated_session();
 
     let data = serde_json::json!({"key": "value"});
     let delta = nodedb_types::json_to_msgpack(&data).unwrap();
 
-    let msg = DeltaPushMsg {
+    let make = |mutation_id: u64, doc: &str| DeltaPushMsg {
         collection: "docs".into(),
-        document_id: "d1".into(),
+        document_id: doc.into(),
         delta: delta.clone(),
         peer_id: 42,
-        mutation_id: 5,
+        mutation_id,
         checksum: 0,
         device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
     };
 
-    let r1 = session.handle_delta_push(&msg, None, None, None);
-    assert!(r1.is_some());
-    assert_eq!(r1.unwrap().msg_type, SyncMessageType::DeltaAck);
-    assert_eq!(session.mutations_processed, 1);
-
-    let r2 = session.handle_delta_push(&msg, None, None, None);
-    assert!(r2.is_some());
-    assert_eq!(r2.unwrap().msg_type, SyncMessageType::DeltaAck);
-    assert_eq!(session.mutations_processed, 1);
-
-    let msg_old = DeltaPushMsg {
-        collection: "docs".into(),
-        document_id: "d0".into(),
-        delta: delta.clone(),
-        peer_id: 42,
-        mutation_id: 3,
-        checksum: 0,
-        device_valid_time_ms: None,
-    };
-    let r3 = session.handle_delta_push(&msg_old, None, None, None);
-    assert!(r3.is_some());
-    assert_eq!(r3.unwrap().msg_type, SyncMessageType::DeltaAck);
-    assert_eq!(session.mutations_processed, 1);
-
-    let msg_new = DeltaPushMsg {
-        collection: "docs".into(),
-        document_id: "d2".into(),
-        delta,
-        peer_id: 42,
-        mutation_id: 6,
-        checksum: 0,
-        device_valid_time_ms: None,
-    };
-    let r4 = session.handle_delta_push(&msg_new, None, None, None);
-    assert!(r4.is_some());
-    assert_eq!(r4.unwrap().msg_type, SyncMessageType::DeltaAck);
-    assert_eq!(session.mutations_processed, 2);
+    // Same mutation_id twice, then an older id, then a newer id — every one is
+    // processed by the CP now (dedup is the gate's job, not the session's).
+    for (mid, doc) in [(5u64, "d1"), (5, "d1"), (3, "d0"), (6, "d2")] {
+        let r = session.handle_delta_push(&make(mid, doc), None, None, None);
+        assert_eq!(
+            r.expect("delta ack").msg_type,
+            SyncMessageType::DeltaAck,
+            "every delta push is acked"
+        );
+    }
+    assert_eq!(
+        session.mutations_processed, 4,
+        "CP processes every delta — no in-memory replay-dedup short-circuit"
+    );
 }
 
 #[test]
@@ -321,6 +322,9 @@ fn crc32c_mismatch_rejects_delta() {
         mutation_id: 1,
         checksum: valid_checksum,
         device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
     };
     let r1 = session.handle_delta_push(&msg_ok, None, None, None);
     assert!(r1.is_some());
@@ -334,6 +338,9 @@ fn crc32c_mismatch_rejects_delta() {
         mutation_id: 2,
         checksum: valid_checksum ^ 0xDEAD,
         device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
     };
     let r2 = session.handle_delta_push(&msg_bad, None, None, None);
     assert!(r2.is_some());

@@ -3,13 +3,14 @@
 //! Frame dispatch: `process_frame` routes incoming frames to the
 //! per-kind handler methods.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
 
 use crate::control::security::audit::AuditLog;
 use crate::control::security::jwt::JwtValidator;
 use crate::control::security::rls::RlsPolicyStore;
+use crate::control::state::SharedState;
 
 use super::super::dlq::SyncDlq;
 use super::super::wire::*;
@@ -23,17 +24,21 @@ impl SyncSession {
     /// and DLQ persistence are active. `None` puts the session in
     /// permissive mode (testing / internal replication channels).
     ///
+    /// `shared` is forwarded to `handle_handshake` so the durable
+    /// `SyncProducerRegistry` can be consulted during the Lite client
+    /// fencing decision.
+    ///
     /// # Timeseries push
     ///
     /// In production, the listener intercepts `TimeseriesPush` before
     /// calling `process_frame` and routes it through
-    /// [`SharedStateDispatcher`] for Data Plane ingest. If a frame of
+    /// [`SharedStateTimeseriesDispatcher`] for Data Plane ingest. If a frame of
     /// this type ever reaches `process_frame`, it means the listener
     /// interception is broken and `SharedState` is not available here;
     /// we emit a loud rejection ACK and an `error!` log so the failure
     /// is audible rather than silently dropping data after ACKing.
     ///
-    /// [`SharedStateDispatcher`]: super::super::timeseries_handler::SharedStateDispatcher
+    /// [`SharedStateTimeseriesDispatcher`]: super::super::timeseries_handler::SharedStateTimeseriesDispatcher
     pub fn process_frame(
         &mut self,
         frame: &SyncFrame,
@@ -41,17 +46,12 @@ impl SyncSession {
         rls_store: Option<&RlsPolicyStore>,
         audit_log: Option<&mut AuditLog>,
         dlq: Option<&mut SyncDlq>,
-        epoch_tracker: Option<&std::sync::Mutex<HashMap<String, u64>>>,
+        shared: Option<&Arc<SharedState>>,
     ) -> Option<SyncFrame> {
         match frame.msg_type {
             SyncMessageType::Handshake => {
                 let msg: HandshakeMsg = frame.decode_body()?;
-                self.handle_handshake(
-                    &msg,
-                    jwt_validator,
-                    self.server_clock.clone(),
-                    epoch_tracker,
-                )
+                self.handle_handshake(&msg, jwt_validator, self.server_clock.clone(), shared)
             }
             SyncMessageType::DeltaPush => {
                 let msg: DeltaPushMsg = frame.decode_body()?;
@@ -63,7 +63,6 @@ impl SyncSession {
             }
             SyncMessageType::ShapeSubscribe => {
                 let msg: super::super::shape::handler::ShapeSubscribeMsg = frame.decode_body()?;
-                let registry = super::super::shape::registry::ShapeRegistry::new();
                 let tenant_id = self.tenant_id.map(|t| t.as_u64()).unwrap_or(0);
                 let current_lsn = self.server_clock.values().copied().max().unwrap_or(0);
                 // Record the subscription so CollectionPurged broadcast
@@ -73,19 +72,45 @@ impl SyncSession {
                 if let Some(coll) = msg.shape.collection() {
                     self.track_collection(tenant_id, coll);
                 }
-                super::super::shape::handler::handle_subscribe(
-                    &self.session_id,
-                    tenant_id,
-                    &msg,
-                    &registry,
-                    current_lsn,
-                    |_shape, _lsn| super::super::shape::handler::ShapeSnapshotData::empty(),
-                )
+                // Route to the persistent registry when SharedState is present;
+                // fall back to a throwaway registry for the permissive/test path.
+                if let Some(s) = shared {
+                    super::super::shape::handler::handle_subscribe(
+                        &self.session_id,
+                        tenant_id,
+                        &msg,
+                        &s.shape_registry,
+                        current_lsn,
+                        |_shape, _lsn| super::super::shape::handler::ShapeSnapshotData::empty(),
+                    )
+                } else {
+                    let registry = super::super::shape::registry::ShapeRegistry::new();
+                    super::super::shape::handler::handle_subscribe(
+                        &self.session_id,
+                        tenant_id,
+                        &msg,
+                        &registry,
+                        current_lsn,
+                        |_shape, _lsn| super::super::shape::handler::ShapeSnapshotData::empty(),
+                    )
+                }
             }
             SyncMessageType::ShapeUnsubscribe => {
                 let msg: super::super::shape::handler::ShapeUnsubscribeMsg = frame.decode_body()?;
-                let registry = super::super::shape::registry::ShapeRegistry::new();
-                super::super::shape::handler::handle_unsubscribe(&self.session_id, &msg, &registry);
+                if let Some(s) = shared {
+                    super::super::shape::handler::handle_unsubscribe(
+                        &self.session_id,
+                        &msg,
+                        &s.shape_registry,
+                    );
+                } else {
+                    let registry = super::super::shape::registry::ShapeRegistry::new();
+                    super::super::shape::handler::handle_unsubscribe(
+                        &self.session_id,
+                        &msg,
+                        &registry,
+                    );
+                }
                 None
             }
             SyncMessageType::TimeseriesPush => {
@@ -109,6 +134,8 @@ impl SyncSession {
                     accepted: 0,
                     rejected: msg.sample_count,
                     lsn: 0,
+                    applied_seq: 0,
+                    status: AckStatus::Applied,
                 };
                 SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack)
             }
@@ -139,13 +166,18 @@ impl SyncSession {
             | SyncMessageType::SpatialInsertAck
             | SyncMessageType::SpatialDeleteAck => None,
             SyncMessageType::ResyncRequest => {
+                // In the production path (shared = Some), session_handler.rs
+                // intercepts ResyncRequest before process_frame and dispatches
+                // handle_resync_request_async. This arm is reached only when
+                // shared is None (permissive/test path) — log and drop.
                 if let Some(msg) = frame.decode_body::<ResyncRequestMsg>() {
                     warn!(
                         session = %self.session_id,
                         reason = ?msg.reason,
                         from_mutation_id = msg.from_mutation_id,
                         collection = %msg.collection,
-                        "client requested re-sync"
+                        shape_id = %msg.shape_id,
+                        "client requested re-sync (no SharedState; dropping)"
                     );
                 }
                 None

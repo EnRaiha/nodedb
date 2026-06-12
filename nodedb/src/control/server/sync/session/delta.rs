@@ -77,25 +77,12 @@ impl SyncSession {
             self.device_metadata.peer_id = msg.peer_id;
         }
 
-        // Replay deduplication.
-        if let Some(&last_seen) = self.last_seen_mutation.get(&msg.peer_id)
-            && msg.mutation_id <= last_seen
-        {
-            debug!(
-                session = %self.session_id,
-                peer_id = msg.peer_id,
-                mutation_id = msg.mutation_id,
-                last_seen,
-                "replay dedup: skipping already-processed delta"
-            );
-            let ack = DeltaAckMsg {
-                mutation_id: msg.mutation_id,
-                lsn: 0,
-                clock_skew_warning_ms: None,
-            };
-            return SyncFrame::try_encode(SyncMessageType::DeltaAck, &ack);
-        }
-
+        // Replay deduplication is handled durably by the Data-Plane idempotent
+        // gate (`sync_admit`) keyed on the producer-assigned (producer_id,
+        // stream_id, seq). For unfenced clients (producer_id == 0) Loro merge is
+        // idempotent, so a re-applied delta converges to the same state. No
+        // in-memory per-session dedup map is needed (it could not survive a
+        // reconnect anyway).
         let identity = match &self.identity {
             Some(id) => id.clone(),
             None => {
@@ -169,10 +156,6 @@ impl SyncSession {
         }
 
         self.mutations_processed += 1;
-        self.last_seen_mutation
-            .entry(msg.peer_id)
-            .and_modify(|v| *v = (*v).max(msg.mutation_id))
-            .or_insert(msg.mutation_id);
 
         // Record subscription so the Origin `CollectionPurged`
         // broadcast notifies this session on hard-delete of the
@@ -203,6 +186,8 @@ impl SyncSession {
             mutation_id: msg.mutation_id,
             lsn: 0,
             clock_skew_warning_ms,
+            applied_seq: 0,
+            status: nodedb_types::sync::wire::AckStatus::Applied,
         };
         SyncFrame::try_encode(SyncMessageType::DeltaAck, &ack)
     }

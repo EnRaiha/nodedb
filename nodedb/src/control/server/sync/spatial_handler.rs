@@ -4,43 +4,53 @@
 //!
 //! Decodes `SpatialInsertMsg` / `SpatialDeleteMsg` from a Lite client,
 //! deserialises the geometry, allocates a surrogate for the document ID,
-//! dispatches `SpatialOp::Insert` / `SpatialOp::Delete` to the Data Plane,
-//! and returns an ACK frame.
+//! appends a WAL record on the Control Plane, dispatches
+//! `SpatialOp::Insert` / `SpatialOp::Delete` to the Data Plane through
+//! the idempotency gate, and returns an ACK frame.
 //!
-//! Structural pattern mirrors `fts_handler.rs`.
+//! Handler methods live in `spatial_session.rs` to keep both files under
+//! the 500-line limit.
+//!
+//! Structural pattern mirrors `vector_handler.rs`.
 
 use async_trait::async_trait;
-use tracing::{debug, error};
 
 use nodedb_types::Surrogate;
 use nodedb_types::geometry::Geometry;
 
-use super::session::SyncSession;
-use super::wire::*;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, VShardId};
 
 // ── Dispatcher trait ─────────────────────────────────────────────────────────
 
+/// Parameters bundling the spatial-index target for a single insert dispatch.
+///
+/// Groups the four fields that together identify the geometry being written:
+/// which collection, which field index, the stable surrogate ID, and the
+/// geometry value itself.
+#[derive(Debug)]
+pub struct SpatialInsertTarget {
+    pub collection: String,
+    pub field: String,
+    pub surrogate: Surrogate,
+    pub geometry: Geometry,
+}
+
 /// Encapsulates async Data Plane dispatch for spatial insert/delete.
+///
+/// Returns the raw `Response.payload` bytes so the handler can decode the
+/// [`SyncAckResult`] for gate status propagation to the Lite client.
 #[async_trait]
 pub trait SpatialDispatcher: Send + Sync {
     /// Insert a geometry into the R-tree on the Data Plane.
-    ///
-    /// `surrogate` is the stable global identity for the row; both the R-tree
-    /// entry and the sparse document body are keyed by its hex encoding so
-    /// cross-engine prefilter bitmaps intersect without translation.
     async fn dispatch_insert(
         &self,
         tenant_id: TenantId,
         vshard: VShardId,
-        collection: String,
-        field: String,
-        surrogate: Surrogate,
-        geometry: Geometry,
-    ) -> crate::Result<()>;
+        target: SpatialInsertTarget,
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>>;
 
-    /// Remove a document's geometry from the R-tree on the Data Plane,
-    /// keyed by the same surrogate used at insert time.
+    /// Remove a document's geometry from the R-tree on the Data Plane.
     async fn dispatch_delete(
         &self,
         tenant_id: TenantId,
@@ -48,7 +58,8 @@ pub trait SpatialDispatcher: Send + Sync {
         collection: String,
         field: String,
         surrogate: Surrogate,
-    ) -> crate::Result<()>;
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>>;
 
     /// Assign a stable surrogate for `(collection, doc_id)`.
     fn assign_surrogate(&self, collection: &str, doc_id: &str) -> crate::Result<Surrogate>;
@@ -67,33 +78,54 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
         &self,
         tenant_id: TenantId,
         vshard: VShardId,
-        collection: String,
-        field: String,
-        surrogate: Surrogate,
-        geometry: Geometry,
-    ) -> crate::Result<()> {
+        target: SpatialInsertTarget,
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source;
-        use crate::event::EventSource;
+        use crate::control::server::wal_dispatch::wal_append_spatial_put;
         use nodedb_physical::physical_plan::SpatialOp;
+
+        let prov = provenance;
+        let SpatialInsertTarget {
+            collection,
+            field,
+            surrogate,
+            geometry,
+        } = target;
+
+        // Encode geometry to msgpack bytes for WAL storage (same format as
+        // `SpatialInsertMsg.geometry_bytes`).
+        let geometry_bytes =
+            zerompk::to_msgpack_vec(&geometry).map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("spatial put: encode geometry for WAL: {e}"),
+            })?;
+
+        let surrogate_hex = crate::engine::document::store::surrogate_to_doc_id(surrogate);
+        let spatial_put_payload = nodedb_wal::record::SpatialPutPayload::new(
+            prov.clone(),
+            &collection,
+            &field,
+            &surrogate_hex,
+            geometry_bytes,
+        );
+        wal_append_spatial_put(
+            &self.shared.wal,
+            tenant_id,
+            vshard,
+            DatabaseId::DEFAULT,
+            &spatial_put_payload,
+        )?;
 
         let plan = PhysicalPlan::Spatial(SpatialOp::Insert {
             collection,
             field,
             surrogate,
             geometry,
+            provenance: Some(prov),
         });
 
-        dispatch_to_data_plane_with_source(
-            self.shared,
-            tenant_id,
-            vshard,
-            plan,
-            TraceId::ZERO,
-            EventSource::CrdtSync,
-        )
-        .await
-        .map(|_| ())
+        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
     }
 
     async fn dispatch_delete(
@@ -103,28 +135,37 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
         collection: String,
         field: String,
         surrogate: Surrogate,
-    ) -> crate::Result<()> {
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source;
-        use crate::event::EventSource;
+        use crate::control::server::wal_dispatch::wal_append_spatial_delete;
         use nodedb_physical::physical_plan::SpatialOp;
+
+        let prov = provenance;
+
+        let surrogate_hex = crate::engine::document::store::surrogate_to_doc_id(surrogate);
+        let spatial_delete_payload = nodedb_wal::record::SpatialDeletePayload::new(
+            prov.clone(),
+            &collection,
+            &field,
+            &surrogate_hex,
+        );
+        wal_append_spatial_delete(
+            &self.shared.wal,
+            tenant_id,
+            vshard,
+            DatabaseId::DEFAULT,
+            &spatial_delete_payload,
+        )?;
 
         let plan = PhysicalPlan::Spatial(SpatialOp::Delete {
             collection,
             field,
             surrogate,
+            provenance: Some(prov),
         });
 
-        dispatch_to_data_plane_with_source(
-            self.shared,
-            tenant_id,
-            vshard,
-            plan,
-            TraceId::ZERO,
-            EventSource::CrdtSync,
-        )
-        .await
-        .map(|_| ())
+        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
     }
 
     fn assign_surrogate(&self, collection: &str, doc_id: &str) -> crate::Result<Surrogate> {
@@ -145,16 +186,10 @@ impl SpatialDispatcher for NoOpSpatialDispatcher {
         &self,
         _tenant_id: TenantId,
         _vshard: VShardId,
-        _collection: String,
-        _field: String,
-        _surrogate: Surrogate,
-        _geometry: Geometry,
-    ) -> crate::Result<()> {
-        Err(crate::Error::Internal {
-            detail: "spatial insert routed through path lacking SharedState; \
-                     check listener wiring — insert was ACKed but NOT applied"
-                .to_string(),
-        })
+        _target: SpatialInsertTarget,
+        _provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
+        Err(super::raft_dispatch::noop_dispatch_error("spatial insert"))
     }
 
     async fn dispatch_delete(
@@ -164,250 +199,13 @@ impl SpatialDispatcher for NoOpSpatialDispatcher {
         _collection: String,
         _field: String,
         _surrogate: Surrogate,
-    ) -> crate::Result<()> {
-        Err(crate::Error::Internal {
-            detail: "spatial delete routed through path lacking SharedState; \
-                     check listener wiring — delete was ACKed but NOT applied"
-                .to_string(),
-        })
+        _provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
+        Err(super::raft_dispatch::noop_dispatch_error("spatial delete"))
     }
 
     fn assign_surrogate(&self, _collection: &str, _doc_id: &str) -> crate::Result<Surrogate> {
         Ok(Surrogate::ZERO)
-    }
-}
-
-// ── Handler ──────────────────────────────────────────────────────────────────
-
-impl SyncSession {
-    /// Process a `SpatialInsertMsg`: deserialise geometry, allocate surrogate,
-    /// dispatch to Data Plane R-tree, return an ACK frame.
-    pub async fn handle_spatial_insert<D: SpatialDispatcher>(
-        &mut self,
-        msg: &SpatialInsertMsg,
-        dispatcher: &D,
-    ) -> Option<SyncFrame> {
-        self.last_activity = std::time::Instant::now();
-
-        if !self.authenticated {
-            let ack = SpatialInsertAckMsg {
-                collection: msg.collection.clone(),
-                field: msg.field.clone(),
-                doc_id: msg.doc_id.clone(),
-                batch_id: msg.batch_id,
-                accepted: false,
-                reject_reason: Some("unauthenticated".to_string()),
-            };
-            return SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack);
-        }
-
-        // Deserialise the geometry from MessagePack bytes.
-        let geometry: Geometry = match zerompk::from_msgpack(&msg.geometry_bytes) {
-            Ok(g) => g,
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    field = %msg.field,
-                    doc_id = %msg.doc_id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "spatial sync: geometry deserialisation failed"
-                );
-                let ack = SpatialInsertAckMsg {
-                    collection: msg.collection.clone(),
-                    field: msg.field.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(format!("geometry deserialise failed: {e}")),
-                };
-                return SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack);
-            }
-        };
-
-        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.doc_id) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    doc_id = %msg.doc_id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "spatial sync: surrogate assignment failed"
-                );
-                let ack = SpatialInsertAckMsg {
-                    collection: msg.collection.clone(),
-                    field: msg.field.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(format!("surrogate assignment failed: {e}")),
-                };
-                return SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack);
-            }
-        };
-
-        let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
-
-        debug!(
-            session = %self.session_id,
-            collection = %msg.collection,
-            field = %msg.field,
-            doc_id = %msg.doc_id,
-            batch_id = msg.batch_id,
-            lite_id = %msg.lite_id,
-            "spatial insert: dispatching to Data Plane"
-        );
-
-        match dispatcher
-            .dispatch_insert(
-                tenant_id,
-                vshard,
-                msg.collection.clone(),
-                msg.field.clone(),
-                surrogate,
-                geometry,
-            )
-            .await
-        {
-            Ok(()) => {
-                self.mutations_processed += 1;
-                let ack = SpatialInsertAckMsg {
-                    collection: msg.collection.clone(),
-                    field: msg.field.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: true,
-                    reject_reason: None,
-                };
-                SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack)
-            }
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    field = %msg.field,
-                    doc_id = %msg.doc_id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "spatial insert dispatch failed"
-                );
-                let ack = SpatialInsertAckMsg {
-                    collection: msg.collection.clone(),
-                    field: msg.field.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(e.to_string()),
-                };
-                SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack)
-            }
-        }
-    }
-
-    /// Process a `SpatialDeleteMsg`: dispatch removal to the Data Plane R-tree,
-    /// return an ACK frame.
-    pub async fn handle_spatial_delete<D: SpatialDispatcher>(
-        &mut self,
-        msg: &SpatialDeleteMsg,
-        dispatcher: &D,
-    ) -> Option<SyncFrame> {
-        self.last_activity = std::time::Instant::now();
-
-        if !self.authenticated {
-            let ack = SpatialDeleteAckMsg {
-                collection: msg.collection.clone(),
-                field: msg.field.clone(),
-                doc_id: msg.doc_id.clone(),
-                batch_id: msg.batch_id,
-                accepted: false,
-                reject_reason: Some("unauthenticated".to_string()),
-            };
-            return SyncFrame::try_encode(SyncMessageType::SpatialDeleteAck, &ack);
-        }
-
-        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.doc_id) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    doc_id = %msg.doc_id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "spatial sync: surrogate lookup failed for delete"
-                );
-                let ack = SpatialDeleteAckMsg {
-                    collection: msg.collection.clone(),
-                    field: msg.field.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(format!("surrogate lookup failed: {e}")),
-                };
-                return SyncFrame::try_encode(SyncMessageType::SpatialDeleteAck, &ack);
-            }
-        };
-
-        let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
-
-        debug!(
-            session = %self.session_id,
-            collection = %msg.collection,
-            field = %msg.field,
-            doc_id = %msg.doc_id,
-            batch_id = msg.batch_id,
-            lite_id = %msg.lite_id,
-            "spatial delete: dispatching to Data Plane"
-        );
-
-        match dispatcher
-            .dispatch_delete(
-                tenant_id,
-                vshard,
-                msg.collection.clone(),
-                msg.field.clone(),
-                surrogate,
-            )
-            .await
-        {
-            Ok(()) => {
-                self.mutations_processed += 1;
-                let ack = SpatialDeleteAckMsg {
-                    collection: msg.collection.clone(),
-                    field: msg.field.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: true,
-                    reject_reason: None,
-                };
-                SyncFrame::try_encode(SyncMessageType::SpatialDeleteAck, &ack)
-            }
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    field = %msg.field,
-                    doc_id = %msg.doc_id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "spatial delete dispatch failed"
-                );
-                let ack = SpatialDeleteAckMsg {
-                    collection: msg.collection.clone(),
-                    field: msg.field.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(e.to_string()),
-                };
-                SyncFrame::try_encode(SyncMessageType::SpatialDeleteAck, &ack)
-            }
-        }
     }
 }
 
@@ -417,6 +215,8 @@ impl SyncSession {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use super::super::session::SyncSession;
+    use super::super::wire::*;
     use super::*;
 
     type MockCallLog = Arc<Mutex<Vec<(TenantId, String, String)>>>;
@@ -459,21 +259,15 @@ mod tests {
             &self,
             tenant_id: TenantId,
             _vshard: VShardId,
-            collection: String,
-            field: String,
-            _surrogate: Surrogate,
-            _geometry: Geometry,
-        ) -> crate::Result<()> {
+            target: SpatialInsertTarget,
+            provenance: nodedb_types::sync::wire::SyncProvenance,
+        ) -> crate::Result<Vec<u8>> {
+            let seq = provenance.seq;
             self.insert_calls
                 .lock()
                 .unwrap()
-                .push((tenant_id, collection, field));
-            match &self.result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(crate::Error::Internal {
-                    detail: e.to_string(),
-                }),
-            }
+                .push((tenant_id, target.collection, target.field));
+            super::super::test_support::mock_applied_ack(&self.result, seq)
         }
 
         async fn dispatch_delete(
@@ -483,17 +277,14 @@ mod tests {
             collection: String,
             field: String,
             _surrogate: Surrogate,
-        ) -> crate::Result<()> {
+            provenance: nodedb_types::sync::wire::SyncProvenance,
+        ) -> crate::Result<Vec<u8>> {
+            let seq = provenance.seq;
             self.delete_calls
                 .lock()
                 .unwrap()
                 .push((tenant_id, collection, field));
-            match &self.result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(crate::Error::Internal {
-                    detail: e.to_string(),
-                }),
-            }
+            super::super::test_support::mock_applied_ack(&self.result, seq)
         }
 
         fn assign_surrogate(&self, _collection: &str, _doc_id: &str) -> crate::Result<Surrogate> {
@@ -518,6 +309,9 @@ mod tests {
             doc_id: doc_id.to_string(),
             geometry_bytes: make_point_geometry_bytes(),
             batch_id: 1,
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         }
     }
 
@@ -528,6 +322,9 @@ mod tests {
             field: field.to_string(),
             doc_id: doc_id.to_string(),
             batch_id: 2,
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         }
     }
 
@@ -612,6 +409,9 @@ mod tests {
             doc_id: "d1".to_string(),
             geometry_bytes: vec![0xFF, 0xFF, 0xFF], // invalid msgpack
             batch_id: 1,
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         };
 
         let frame = session.handle_spatial_insert(&msg, &mock).await;

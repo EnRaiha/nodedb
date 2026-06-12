@@ -18,11 +18,14 @@ use nodedb_types::value::Value;
 
 use super::session::SyncSession;
 use super::wire::*;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, VShardId};
 
 // ── Dispatcher trait ─────────────────────────────────────────────────────────
 
 /// Encapsulates async Data Plane dispatch for a decoded columnar insert.
+///
+/// Returns the raw `Response.payload` bytes from the Data Plane so that the
+/// handler can decode the [`SyncAckResult`] for gate status propagation.
 #[async_trait]
 pub trait ColumnarDispatcher: Send + Sync {
     /// Dispatch a batch of rows to the Data Plane for columnar ingest.
@@ -37,7 +40,8 @@ pub trait ColumnarDispatcher: Send + Sync {
         collection: String,
         rows: Vec<Vec<Value>>,
         schema_bytes: Vec<u8>,
-    ) -> crate::Result<u64>;
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>>;
 }
 
 // ── SharedState adapter ──────────────────────────────────────────────────────
@@ -58,14 +62,15 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
         collection: String,
         rows: Vec<Vec<Value>>,
         schema_bytes: Vec<u8>,
-    ) -> crate::Result<u64> {
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source;
-        use crate::event::EventSource;
+        use crate::control::server::wal_dispatch::wal_append_columnar;
         use nodedb_physical::physical_plan::columnar::{ColumnarInsertIntent, ColumnarOp};
         use nodedb_types::columnar::ColumnarSchema;
-        use nodedb_types::value::Value;
         use std::collections::HashMap;
+
+        let prov = provenance;
 
         // Decode column names from schema_bytes so we can build object rows.
         // The Data Plane columnar insert handler expects rows as
@@ -77,8 +82,6 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
                 .map(|s| s.columns.into_iter().map(|c| c.name).collect())
                 .unwrap_or_default()
         };
-
-        let row_count = rows.len() as u64;
 
         // Convert each row from positional Vec<Value> to named Value::Object.
         // If column_names is empty (no schema_bytes), fall back to positional
@@ -106,26 +109,32 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
                 detail: format!("columnar sync: msgpack serialize rows: {e}"),
             })?;
 
+        // Allocate a WAL LSN on the Control Plane before dispatching to the
+        // Data Plane. This is the canonical LSN for dedup tracking.
+        let wal_lsn = wal_append_columnar(
+            &self.shared.wal,
+            tenant_id,
+            vshard,
+            DatabaseId::DEFAULT,
+            &collection,
+            &payload,
+            Some(&prov),
+        )?
+        .map(|lsn| lsn.as_u64());
+
         let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
-            collection,
+            collection: collection.clone(),
             payload,
             format: "msgpack".to_string(),
             intent: ColumnarInsertIntent::Insert,
             on_conflict_updates: Vec::new(),
             surrogates: Vec::new(),
             schema_bytes,
+            provenance: Some(prov),
+            wal_lsn,
         });
 
-        dispatch_to_data_plane_with_source(
-            self.shared,
-            tenant_id,
-            vshard,
-            plan,
-            TraceId::ZERO,
-            EventSource::CrdtSync,
-        )
-        .await
-        .map(|_| row_count)
+        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
     }
 }
 
@@ -145,12 +154,9 @@ impl ColumnarDispatcher for NoOpColumnarDispatcher {
         _collection: String,
         _rows: Vec<Vec<Value>>,
         _schema_bytes: Vec<u8>,
-    ) -> crate::Result<u64> {
-        Err(crate::Error::Internal {
-            detail: "columnar insert routed through path lacking SharedState; \
-                     check listener wiring — insert was ACKed but NOT applied"
-                .to_string(),
-        })
+        _provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
+        Err(super::raft_dispatch::noop_dispatch_error("columnar insert"))
     }
 }
 
@@ -177,6 +183,8 @@ impl SyncSession {
                 accepted: 0,
                 rejected: msg.rows.len() as u64,
                 reject_reason: Some("unauthenticated".to_string()),
+                applied_seq: 0,
+                status: AckStatus::Applied,
             };
             return SyncFrame::try_encode(SyncMessageType::ColumnarInsertAck, &ack);
         }
@@ -207,6 +215,8 @@ impl SyncSession {
                         accepted: 0,
                         rejected: total,
                         reject_reason: Some(format!("row {i} msgpack decode failed: {e}")),
+                        applied_seq: 0,
+                        status: AckStatus::Applied,
                     };
                     return SyncFrame::try_encode(SyncMessageType::ColumnarInsertAck, &ack);
                 }
@@ -234,17 +244,39 @@ impl SyncSession {
                 msg.collection.clone(),
                 decoded_rows,
                 msg.schema_bytes.clone(),
+                nodedb_types::sync::wire::SyncProvenance {
+                    producer_id: self.producer_id,
+                    epoch: self.accepted_epoch,
+                    stream_id: nodedb_types::sync::wire::stream_id_for(
+                        nodedb_types::sync::wire::EngineKind::Columnar,
+                        &msg.collection,
+                    ),
+                    seq: msg.seq,
+                },
             )
             .await
         {
-            Ok(accepted) => {
-                self.mutations_processed += accepted;
+            Ok(payload_bytes) => {
+                // Decode SyncAckResult from the Data Plane response payload.
+                // On decode failure fall back to Applied so the client is
+                // still ACKed (the insert succeeded).
+                let gate_result = super::ack_decode::decode_sync_ack(
+                    &payload_bytes,
+                    "columnar",
+                    &self.session_id,
+                    &msg.collection,
+                    msg.seq,
+                );
+
+                self.mutations_processed += decoded;
                 let ack = ColumnarInsertAckMsg {
                     collection: msg.collection.clone(),
                     batch_id: msg.batch_id,
-                    accepted,
-                    rejected: total.saturating_sub(accepted),
+                    accepted: decoded,
+                    rejected: total.saturating_sub(decoded),
                     reject_reason: None,
+                    applied_seq: gate_result.applied_seq,
+                    status: gate_result.status,
                 };
                 SyncFrame::try_encode(SyncMessageType::ColumnarInsertAck, &ack)
             }
@@ -262,6 +294,8 @@ impl SyncSession {
                     accepted: 0,
                     rejected: total,
                     reject_reason: Some(e.to_string()),
+                    applied_seq: 0,
+                    status: AckStatus::Applied,
                 };
                 SyncFrame::try_encode(SyncMessageType::ColumnarInsertAck, &ack)
             }
@@ -281,16 +315,22 @@ mod tests {
 
     struct MockDispatcher {
         calls: MockCallLog,
-        result: crate::Result<u64>,
+        result: crate::Result<Vec<u8>>,
     }
 
     impl MockDispatcher {
         fn ok(n: u64) -> (Self, MockCallLog) {
             let calls = Arc::new(Mutex::new(Vec::new()));
+            // Encode a SyncAckResult so the handler can decode it.
+            let ack_result = nodedb_types::sync::wire::SyncAckResult {
+                status: AckStatus::Applied,
+                applied_seq: n,
+            };
+            let payload = zerompk::to_msgpack_vec(&ack_result).expect("encode SyncAckResult");
             (
                 Self {
                     calls: calls.clone(),
-                    result: Ok(n),
+                    result: Ok(payload),
                 },
                 calls,
             )
@@ -315,13 +355,14 @@ mod tests {
             collection: String,
             rows: Vec<Vec<Value>>,
             _schema_bytes: Vec<u8>,
-        ) -> crate::Result<u64> {
+            _provenance: nodedb_types::sync::wire::SyncProvenance,
+        ) -> crate::Result<Vec<u8>> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((tenant_id, collection, rows));
             match &self.result {
-                Ok(n) => Ok(*n),
+                Ok(b) => Ok(b.clone()),
                 Err(e) => Err(crate::Error::Internal {
                     detail: e.to_string(),
                 }),
@@ -344,6 +385,9 @@ mod tests {
             rows: rows.iter().map(|r| encode_row(r.clone())).collect(),
             batch_id: 1,
             schema_bytes: Vec::new(),
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         }
     }
 

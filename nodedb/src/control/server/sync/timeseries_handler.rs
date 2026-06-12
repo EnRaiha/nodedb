@@ -15,7 +15,7 @@ use tracing::{debug, error};
 
 use super::session::SyncSession;
 use super::wire::*;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, VShardId};
 
 // ── Dispatcher trait ─────────────────────────────────────────────────────────
 
@@ -24,6 +24,9 @@ use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 /// Callers supply a concrete implementation so that the handler can complete
 /// ingest atomically with ACK generation. This makes it structurally
 /// impossible to ACK a push without attempting dispatch.
+///
+/// Returns the raw `Response.payload` bytes from the Data Plane so that the
+/// handler can decode the [`SyncAckResult`] for gate status propagation.
 #[async_trait]
 pub trait TimeseriesDispatcher: Send + Sync {
     async fn dispatch_ingest(
@@ -32,7 +35,8 @@ pub trait TimeseriesDispatcher: Send + Sync {
         vshard: VShardId,
         collection: String,
         ilp_payload: String,
-    ) -> crate::Result<()>;
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>>;
 }
 
 // ── SharedState adapter ──────────────────────────────────────────────────────
@@ -40,42 +44,51 @@ pub trait TimeseriesDispatcher: Send + Sync {
 /// Production dispatcher: routes the ingest to the Data Plane via the SPSC
 /// bridge using `EventSource::CrdtSync` so that AFTER triggers are not
 /// re-fired on synced data.
-pub struct SharedStateDispatcher<'a> {
+pub struct SharedStateTimeseriesDispatcher<'a> {
     pub shared: &'a crate::control::state::SharedState,
 }
 
 #[async_trait]
-impl<'a> TimeseriesDispatcher for SharedStateDispatcher<'a> {
+impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
     async fn dispatch_ingest(
         &self,
         tenant_id: TenantId,
         vshard: VShardId,
         collection: String,
         ilp_payload: String,
-    ) -> crate::Result<()> {
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source;
-        use crate::event::EventSource;
+        use crate::control::server::wal_dispatch::wal_append_timeseries;
         use nodedb_physical::physical_plan::TimeseriesOp;
 
-        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection,
-            payload: ilp_payload.into_bytes(),
-            format: "ilp".to_string(),
-            wal_lsn: None,
-            surrogates: Vec::new(),
-        });
+        let prov = provenance;
 
-        dispatch_to_data_plane_with_source(
-            self.shared,
+        let payload_bytes = ilp_payload.into_bytes();
+
+        // Allocate a WAL LSN on the Control Plane before dispatching to the
+        // Data Plane. This is the canonical LSN for dedup tracking.
+        let wal_lsn = wal_append_timeseries(
+            &self.shared.wal,
             tenant_id,
             vshard,
-            plan,
-            TraceId::ZERO,
-            EventSource::CrdtSync,
-        )
-        .await
-        .map(|_| ())
+            &collection,
+            &payload_bytes,
+            Some(&prov),
+            Some(&self.shared.credentials),
+        )?
+        .map(|lsn| lsn.as_u64());
+
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: collection.clone(),
+            payload: payload_bytes,
+            format: "ilp".to_string(),
+            wal_lsn,
+            surrogates: Vec::new(),
+            provenance: Some(prov),
+        });
+
+        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
     }
 }
 
@@ -86,22 +99,19 @@ impl<'a> TimeseriesDispatcher for SharedStateDispatcher<'a> {
 /// Returns a loud `Internal` error — this is intentionally NOT a silent
 /// no-op. If this path is reached it means the listener wiring is wrong
 /// and the push would otherwise be silently dropped after being ACKed.
-pub struct NoOpDispatcher;
+pub struct NoOpTimeseriesDispatcher;
 
 #[async_trait]
-impl TimeseriesDispatcher for NoOpDispatcher {
+impl TimeseriesDispatcher for NoOpTimeseriesDispatcher {
     async fn dispatch_ingest(
         &self,
         _tenant_id: TenantId,
         _vshard: VShardId,
         _collection: String,
         _ilp_payload: String,
-    ) -> crate::Result<()> {
-        Err(crate::Error::Internal {
-            detail: "timeseries push routed through path lacking SharedState; \
-                     check listener wiring — push was ACKed but NOT ingested"
-                .to_string(),
-        })
+        _provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
+        Err(super::raft_dispatch::noop_dispatch_error("timeseries push"))
     }
 }
 
@@ -127,6 +137,8 @@ impl SyncSession {
                 accepted: 0,
                 rejected: msg.sample_count,
                 lsn: 0,
+                applied_seq: 0,
+                status: AckStatus::Applied,
             };
             return SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack);
         }
@@ -142,11 +154,11 @@ impl SyncSession {
                 accepted: 0,
                 rejected: msg.sample_count,
                 lsn: 0,
+                applied_seq: 0,
+                status: AckStatus::Applied,
             };
             return SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack);
         }
-
-        self.mutations_processed += decoded_count as u64;
 
         // Build ILP-format payload for Data Plane ingest.
         let mut ilp_lines = String::with_capacity(decoded_count * 80);
@@ -177,15 +189,46 @@ impl SyncSession {
         let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
 
         match dispatcher
-            .dispatch_ingest(tenant_id, vshard, msg.collection.clone(), ilp_lines)
+            .dispatch_ingest(
+                tenant_id,
+                vshard,
+                msg.collection.clone(),
+                ilp_lines,
+                nodedb_types::sync::wire::SyncProvenance {
+                    producer_id: self.producer_id,
+                    epoch: self.accepted_epoch,
+                    stream_id: nodedb_types::sync::wire::stream_id_for(
+                        nodedb_types::sync::wire::EngineKind::Timeseries,
+                        &msg.collection,
+                    ),
+                    seq: msg.seq,
+                },
+            )
             .await
         {
-            Ok(()) => {
+            Ok(payload_bytes) => {
+                // Decode SyncAckResult from the Data Plane response payload.
+                // On decode failure fall back to Applied so the client is
+                // still ACKed (the ingest succeeded).
+                let gate_result = super::ack_decode::decode_sync_ack(
+                    &payload_bytes,
+                    "timeseries",
+                    &self.session_id,
+                    &msg.collection,
+                    msg.seq,
+                );
+
                 let ack = TimeseriesAckMsg {
                     collection: msg.collection.clone(),
                     accepted: decoded_count as u64,
                     rejected: msg.sample_count.saturating_sub(decoded_count as u64),
-                    lsn: self.mutations_processed,
+                    // WAL LSN is not surfaced by the dispatch helper (returns
+                    // payload bytes only); `applied_seq` is the real producer
+                    // frontier. Don't conflate the two — leave `lsn` 0 rather
+                    // than report a sequence number as a WAL LSN.
+                    lsn: 0,
+                    applied_seq: gate_result.applied_seq,
+                    status: gate_result.status,
                 };
                 SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack)
             }
@@ -200,7 +243,9 @@ impl SyncSession {
                     collection: msg.collection.clone(),
                     accepted: 0,
                     rejected: msg.sample_count,
-                    lsn: self.mutations_processed,
+                    lsn: 0,
+                    applied_seq: 0,
+                    status: AckStatus::Applied,
                 };
                 SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack)
             }
@@ -223,16 +268,17 @@ mod tests {
 
     struct MockDispatcher {
         calls: MockCallLog,
-        result: crate::Result<()>,
+        result: crate::Result<Vec<u8>>,
     }
 
     impl MockDispatcher {
         fn ok() -> (Self, MockCallLog) {
             let calls = Arc::new(Mutex::new(Vec::new()));
+            // Return an empty payload — handler falls back to Applied.
             (
                 Self {
                     calls: calls.clone(),
-                    result: Ok(()),
+                    result: Ok(Vec::new()),
                 },
                 calls,
             )
@@ -256,14 +302,14 @@ mod tests {
             _vshard: VShardId,
             collection: String,
             ilp_payload: String,
-        ) -> crate::Result<()> {
+            _provenance: nodedb_types::sync::wire::SyncProvenance,
+        ) -> crate::Result<Vec<u8>> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((tenant_id, collection, ilp_payload));
-            // Clone the result by matching on it.
             match &self.result {
-                Ok(()) => Ok(()),
+                Ok(b) => Ok(b.clone()),
                 Err(e) => Err(crate::Error::Internal {
                     detail: e.to_string(),
                 }),
@@ -298,6 +344,9 @@ mod tests {
             min_ts: 1_000,
             max_ts: 1_000,
             watermarks: std::collections::HashMap::new(),
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         }
     }
 

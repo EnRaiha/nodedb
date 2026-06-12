@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Session-level spatial insert/delete handlers.
+//!
+//! Contains `SyncSession::handle_spatial_insert` and
+//! `SyncSession::handle_spatial_delete`, extracted from `spatial_handler.rs`
+//! to keep both files under the 500-line limit.
+
+use tracing::{debug, error};
+
+use nodedb_types::geometry::Geometry;
+use nodedb_types::sync::wire::AckStatus;
+
+use super::session::SyncSession;
+use super::spatial_handler::{SpatialDispatcher, SpatialInsertTarget};
+use super::wire::*;
+use crate::types::{DatabaseId, TenantId, VShardId};
+
+impl SyncSession {
+    /// Process a `SpatialInsertMsg`: deserialise geometry, allocate surrogate,
+    /// WAL-append on CP, dispatch to Data Plane through the idempotency gate,
+    /// return an ACK frame.
+    pub async fn handle_spatial_insert<D: SpatialDispatcher>(
+        &mut self,
+        msg: &SpatialInsertMsg,
+        dispatcher: &D,
+    ) -> Option<SyncFrame> {
+        self.last_activity = std::time::Instant::now();
+
+        if !self.authenticated {
+            let ack = SpatialInsertAckMsg {
+                collection: msg.collection.clone(),
+                field: msg.field.clone(),
+                doc_id: msg.doc_id.clone(),
+                batch_id: msg.batch_id,
+                accepted: false,
+                reject_reason: Some("unauthenticated".to_string()),
+                applied_seq: 0,
+                status: AckStatus::Applied,
+            };
+            return SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack);
+        }
+
+        // Deserialise the geometry from MessagePack bytes.
+        let geometry: Geometry = match zerompk::from_msgpack(&msg.geometry_bytes) {
+            Ok(g) => g,
+            Err(e) => {
+                error!(
+                    session = %self.session_id,
+                    collection = %msg.collection,
+                    field = %msg.field,
+                    doc_id = %msg.doc_id,
+                    batch_id = msg.batch_id,
+                    error = %e,
+                    "spatial sync: geometry deserialisation failed"
+                );
+                let ack = SpatialInsertAckMsg {
+                    collection: msg.collection.clone(),
+                    field: msg.field.clone(),
+                    doc_id: msg.doc_id.clone(),
+                    batch_id: msg.batch_id,
+                    accepted: false,
+                    reject_reason: Some(format!("geometry deserialise failed: {e}")),
+                    applied_seq: 0,
+                    status: AckStatus::Applied,
+                };
+                return SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack);
+            }
+        };
+
+        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.doc_id) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    session = %self.session_id,
+                    collection = %msg.collection,
+                    doc_id = %msg.doc_id,
+                    batch_id = msg.batch_id,
+                    error = %e,
+                    "spatial sync: surrogate assignment failed"
+                );
+                let ack = SpatialInsertAckMsg {
+                    collection: msg.collection.clone(),
+                    field: msg.field.clone(),
+                    doc_id: msg.doc_id.clone(),
+                    batch_id: msg.batch_id,
+                    accepted: false,
+                    reject_reason: Some(format!("surrogate assignment failed: {e}")),
+                    applied_seq: 0,
+                    status: AckStatus::Applied,
+                };
+                return SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack);
+            }
+        };
+
+        let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
+        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
+
+        debug!(
+            session = %self.session_id,
+            collection = %msg.collection,
+            field = %msg.field,
+            doc_id = %msg.doc_id,
+            batch_id = msg.batch_id,
+            lite_id = %msg.lite_id,
+            "spatial insert: dispatching to Data Plane"
+        );
+
+        match dispatcher
+            .dispatch_insert(
+                tenant_id,
+                vshard,
+                SpatialInsertTarget {
+                    collection: msg.collection.clone(),
+                    field: msg.field.clone(),
+                    surrogate,
+                    geometry,
+                },
+                nodedb_types::sync::wire::SyncProvenance {
+                    producer_id: self.producer_id,
+                    epoch: self.accepted_epoch,
+                    stream_id: nodedb_types::sync::wire::stream_id_for(
+                        nodedb_types::sync::wire::EngineKind::Spatial,
+                        &msg.collection,
+                    ),
+                    seq: msg.seq,
+                },
+            )
+            .await
+        {
+            Ok(payload_bytes) => {
+                self.mutations_processed += 1;
+                let gate_result = super::ack_decode::decode_sync_ack(
+                    &payload_bytes,
+                    "spatial insert",
+                    &self.session_id,
+                    &msg.collection,
+                    msg.seq,
+                );
+                let ack = SpatialInsertAckMsg {
+                    collection: msg.collection.clone(),
+                    field: msg.field.clone(),
+                    doc_id: msg.doc_id.clone(),
+                    batch_id: msg.batch_id,
+                    accepted: true,
+                    reject_reason: None,
+                    applied_seq: gate_result.applied_seq,
+                    status: gate_result.status,
+                };
+                SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack)
+            }
+            Err(e) => {
+                error!(
+                    session = %self.session_id,
+                    collection = %msg.collection,
+                    field = %msg.field,
+                    doc_id = %msg.doc_id,
+                    batch_id = msg.batch_id,
+                    error = %e,
+                    "spatial insert dispatch failed"
+                );
+                let ack = SpatialInsertAckMsg {
+                    collection: msg.collection.clone(),
+                    field: msg.field.clone(),
+                    doc_id: msg.doc_id.clone(),
+                    batch_id: msg.batch_id,
+                    accepted: false,
+                    reject_reason: Some(e.to_string()),
+                    applied_seq: 0,
+                    status: AckStatus::Applied,
+                };
+                SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack)
+            }
+        }
+    }
+
+    /// Process a `SpatialDeleteMsg`: allocate/lookup surrogate, WAL-append on
+    /// CP, dispatch removal through the idempotency gate, return an ACK frame.
+    pub async fn handle_spatial_delete<D: SpatialDispatcher>(
+        &mut self,
+        msg: &SpatialDeleteMsg,
+        dispatcher: &D,
+    ) -> Option<SyncFrame> {
+        self.last_activity = std::time::Instant::now();
+
+        if !self.authenticated {
+            let ack = SpatialDeleteAckMsg {
+                collection: msg.collection.clone(),
+                field: msg.field.clone(),
+                doc_id: msg.doc_id.clone(),
+                batch_id: msg.batch_id,
+                accepted: false,
+                reject_reason: Some("unauthenticated".to_string()),
+                applied_seq: 0,
+                status: AckStatus::Applied,
+            };
+            return SyncFrame::try_encode(SyncMessageType::SpatialDeleteAck, &ack);
+        }
+
+        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.doc_id) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    session = %self.session_id,
+                    collection = %msg.collection,
+                    doc_id = %msg.doc_id,
+                    batch_id = msg.batch_id,
+                    error = %e,
+                    "spatial sync: surrogate lookup failed for delete"
+                );
+                let ack = SpatialDeleteAckMsg {
+                    collection: msg.collection.clone(),
+                    field: msg.field.clone(),
+                    doc_id: msg.doc_id.clone(),
+                    batch_id: msg.batch_id,
+                    accepted: false,
+                    reject_reason: Some(format!("surrogate lookup failed: {e}")),
+                    applied_seq: 0,
+                    status: AckStatus::Applied,
+                };
+                return SyncFrame::try_encode(SyncMessageType::SpatialDeleteAck, &ack);
+            }
+        };
+
+        let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
+        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
+
+        debug!(
+            session = %self.session_id,
+            collection = %msg.collection,
+            field = %msg.field,
+            doc_id = %msg.doc_id,
+            batch_id = msg.batch_id,
+            lite_id = %msg.lite_id,
+            "spatial delete: dispatching to Data Plane"
+        );
+
+        match dispatcher
+            .dispatch_delete(
+                tenant_id,
+                vshard,
+                msg.collection.clone(),
+                msg.field.clone(),
+                surrogate,
+                nodedb_types::sync::wire::SyncProvenance {
+                    producer_id: self.producer_id,
+                    epoch: self.accepted_epoch,
+                    stream_id: nodedb_types::sync::wire::stream_id_for(
+                        nodedb_types::sync::wire::EngineKind::Spatial,
+                        &msg.collection,
+                    ),
+                    seq: msg.seq,
+                },
+            )
+            .await
+        {
+            Ok(payload_bytes) => {
+                self.mutations_processed += 1;
+                let gate_result = super::ack_decode::decode_sync_ack(
+                    &payload_bytes,
+                    "spatial delete",
+                    &self.session_id,
+                    &msg.collection,
+                    msg.seq,
+                );
+                let ack = SpatialDeleteAckMsg {
+                    collection: msg.collection.clone(),
+                    field: msg.field.clone(),
+                    doc_id: msg.doc_id.clone(),
+                    batch_id: msg.batch_id,
+                    accepted: true,
+                    reject_reason: None,
+                    applied_seq: gate_result.applied_seq,
+                    status: gate_result.status,
+                };
+                SyncFrame::try_encode(SyncMessageType::SpatialDeleteAck, &ack)
+            }
+            Err(e) => {
+                error!(
+                    session = %self.session_id,
+                    collection = %msg.collection,
+                    field = %msg.field,
+                    doc_id = %msg.doc_id,
+                    batch_id = msg.batch_id,
+                    error = %e,
+                    "spatial delete dispatch failed"
+                );
+                let ack = SpatialDeleteAckMsg {
+                    collection: msg.collection.clone(),
+                    field: msg.field.clone(),
+                    doc_id: msg.doc_id.clone(),
+                    batch_id: msg.batch_id,
+                    accepted: false,
+                    reject_reason: Some(e.to_string()),
+                    applied_seq: 0,
+                    status: AckStatus::Applied,
+                };
+                SyncFrame::try_encode(SyncMessageType::SpatialDeleteAck, &ack)
+            }
+        }
+    }
+}

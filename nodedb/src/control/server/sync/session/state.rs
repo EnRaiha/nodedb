@@ -43,10 +43,6 @@ pub struct SyncSession {
     pub rate_limiter: SyncRateLimiter,
     /// Device metadata from handshake (for DLQ entries).
     pub device_metadata: DeviceMetadata,
-    /// Per-peer replay deduplication: highest mutation_id successfully processed.
-    /// Key = peer_id, Value = highest mutation_id seen from that peer.
-    /// Deltas with mutation_id <= this value are idempotently skipped.
-    pub last_seen_mutation: HashMap<u64, u64>,
     /// Set of `(tenant_id, collection_name)` pairs the client has
     /// ever sent a delta or shape subscription for — used by the
     /// Origin `CollectionPurged` broadcast to decide which sessions
@@ -57,6 +53,13 @@ pub struct SyncSession {
     /// `CollectionPurged` events that committed while the client
     /// was disconnected.
     pub last_seen_lsn: u64,
+    /// Durable producer id assigned by `SyncProducerRegistry` at handshake.
+    /// `0` means the session is not a Lite client or the registry was
+    /// unavailable — legacy / non-Lite connections remain at 0.
+    pub producer_id: u64,
+    /// The fencing epoch accepted by `SyncProducerRegistry` at handshake.
+    /// `0` for non-Lite sessions.
+    pub accepted_epoch: u64,
 }
 
 impl SyncSession {
@@ -82,9 +85,10 @@ impl SyncSession {
             created_at: now,
             rate_limiter: SyncRateLimiter::new(rate_config),
             device_metadata: DeviceMetadata::default(),
-            last_seen_mutation: HashMap::new(),
             tracked_collections: std::collections::HashSet::new(),
             last_seen_lsn: 0,
+            producer_id: 0,
+            accepted_epoch: 0,
         }
     }
 

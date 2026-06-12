@@ -4,23 +4,27 @@
 //!
 //! Decodes `FtsIndexMsg` / `FtsDeleteMsg` from a Lite client,
 //! allocates a surrogate for the document ID via `SurrogateAssigner`,
-//! dispatches `TextOp::FtsIndexDoc` / `TextOp::FtsDeleteDoc` to the
-//! Data Plane, and returns an ACK frame.
+//! appends a WAL record on the Control Plane, dispatches
+//! `TextOp::FtsIndexDoc` / `TextOp::FtsDeleteDoc` to the Data Plane,
+//! and returns an ACK frame carrying the `SyncAckResult` from the gate.
+//!
+//! Handler methods (`handle_fts_index` / `handle_fts_delete`) live in the
+//! sibling `fts_session.rs` to keep both files under 500 lines.
 //!
 //! Structural pattern mirrors `vector_handler.rs`.
 
 use async_trait::async_trait;
-use tracing::{debug, error};
 
 use nodedb_types::Surrogate;
 
-use super::session::SyncSession;
-use super::wire::*;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, VShardId};
 
 // ── Dispatcher trait ─────────────────────────────────────────────────────────
 
 /// Encapsulates async Data Plane dispatch for FTS index/delete.
+///
+/// Returns the raw `Response.payload` bytes so the handler can decode the
+/// [`SyncAckResult`] for gate status propagation to the Lite client.
 #[async_trait]
 pub trait FtsDispatcher: Send + Sync {
     /// Index a document's text on the Data Plane.
@@ -31,7 +35,8 @@ pub trait FtsDispatcher: Send + Sync {
         collection: String,
         surrogate: Surrogate,
         text: String,
-    ) -> crate::Result<()>;
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>>;
 
     /// Remove a document from the FTS index on the Data Plane.
     async fn dispatch_delete(
@@ -40,7 +45,8 @@ pub trait FtsDispatcher: Send + Sync {
         vshard: VShardId,
         collection: String,
         surrogate: Surrogate,
-    ) -> crate::Result<()>;
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>>;
 
     /// Assign a stable surrogate for `(collection, doc_id)`.
     fn assign_surrogate(&self, collection: &str, doc_id: &str) -> crate::Result<Surrogate>;
@@ -62,28 +68,42 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
         collection: String,
         surrogate: Surrogate,
         text: String,
-    ) -> crate::Result<()> {
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source;
-        use crate::event::EventSource;
+        use crate::control::server::wal_dispatch::wal_append_fts_index;
         use nodedb_physical::physical_plan::TextOp;
+
+        let prov = provenance;
+
+        // Allocate WAL LSN on the Control Plane before dispatching to the
+        // Data Plane. The doc_id for WAL purposes is the surrogate hex string
+        // (same as what the DP uses for storage). We encode the original
+        // doc_id (the Lite-side external key) into the WAL payload so replay
+        // can re-derive the surrogate via the same assigner.
+        let surrogate_hex = crate::engine::document::store::surrogate_to_doc_id(surrogate);
+        let fts_index_payload = nodedb_wal::record::FtsIndexPayload::new(
+            prov.clone(),
+            &collection,
+            &surrogate_hex,
+            &text,
+        );
+        wal_append_fts_index(
+            &self.shared.wal,
+            tenant_id,
+            vshard,
+            DatabaseId::DEFAULT,
+            &fts_index_payload,
+        )?;
 
         let plan = PhysicalPlan::Text(TextOp::FtsIndexDoc {
             collection,
             surrogate,
             text,
+            provenance: Some(prov),
         });
 
-        dispatch_to_data_plane_with_source(
-            self.shared,
-            tenant_id,
-            vshard,
-            plan,
-            TraceId::ZERO,
-            EventSource::CrdtSync,
-        )
-        .await
-        .map(|_| ())
+        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
     }
 
     async fn dispatch_delete(
@@ -92,27 +112,32 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
         vshard: VShardId,
         collection: String,
         surrogate: Surrogate,
-    ) -> crate::Result<()> {
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source;
-        use crate::event::EventSource;
+        use crate::control::server::wal_dispatch::wal_append_fts_delete;
         use nodedb_physical::physical_plan::TextOp;
+
+        let prov = provenance;
+
+        let surrogate_hex = crate::engine::document::store::surrogate_to_doc_id(surrogate);
+        let fts_delete_payload =
+            nodedb_wal::record::FtsDeletePayload::new(prov.clone(), &collection, &surrogate_hex);
+        wal_append_fts_delete(
+            &self.shared.wal,
+            tenant_id,
+            vshard,
+            DatabaseId::DEFAULT,
+            &fts_delete_payload,
+        )?;
 
         let plan = PhysicalPlan::Text(TextOp::FtsDeleteDoc {
             collection,
             surrogate,
+            provenance: Some(prov),
         });
 
-        dispatch_to_data_plane_with_source(
-            self.shared,
-            tenant_id,
-            vshard,
-            plan,
-            TraceId::ZERO,
-            EventSource::CrdtSync,
-        )
-        .await
-        .map(|_| ())
+        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
     }
 
     fn assign_surrogate(&self, collection: &str, doc_id: &str) -> crate::Result<Surrogate> {
@@ -136,12 +161,9 @@ impl FtsDispatcher for NoOpFtsDispatcher {
         _collection: String,
         _surrogate: Surrogate,
         _text: String,
-    ) -> crate::Result<()> {
-        Err(crate::Error::Internal {
-            detail: "FTS index routed through path lacking SharedState; \
-                     check listener wiring — index was ACKed but NOT applied"
-                .to_string(),
-        })
+        _provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
+        Err(super::raft_dispatch::noop_dispatch_error("FTS index"))
     }
 
     async fn dispatch_delete(
@@ -150,218 +172,13 @@ impl FtsDispatcher for NoOpFtsDispatcher {
         _vshard: VShardId,
         _collection: String,
         _surrogate: Surrogate,
-    ) -> crate::Result<()> {
-        Err(crate::Error::Internal {
-            detail: "FTS delete routed through path lacking SharedState; \
-                     check listener wiring — delete was ACKed but NOT applied"
-                .to_string(),
-        })
+        _provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
+        Err(super::raft_dispatch::noop_dispatch_error("FTS delete"))
     }
 
     fn assign_surrogate(&self, _collection: &str, _doc_id: &str) -> crate::Result<Surrogate> {
         Ok(Surrogate::ZERO)
-    }
-}
-
-// ── Handler ──────────────────────────────────────────────────────────────────
-
-impl SyncSession {
-    /// Process a `FtsIndexMsg`: allocate surrogate, dispatch to Data Plane,
-    /// return an ACK frame.
-    pub async fn handle_fts_index<D: FtsDispatcher>(
-        &mut self,
-        msg: &FtsIndexMsg,
-        dispatcher: &D,
-    ) -> Option<SyncFrame> {
-        self.last_activity = std::time::Instant::now();
-
-        if !self.authenticated {
-            let ack = FtsIndexAckMsg {
-                collection: msg.collection.clone(),
-                doc_id: msg.doc_id.clone(),
-                batch_id: msg.batch_id,
-                accepted: false,
-                reject_reason: Some("unauthenticated".to_string()),
-            };
-            return SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack);
-        }
-
-        if msg.text.is_empty() {
-            // Empty text — nothing to index; ACK immediately.
-            let ack = FtsIndexAckMsg {
-                collection: msg.collection.clone(),
-                doc_id: msg.doc_id.clone(),
-                batch_id: msg.batch_id,
-                accepted: true,
-                reject_reason: None,
-            };
-            return SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack);
-        }
-
-        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.doc_id) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    doc_id = %msg.doc_id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "fts sync: surrogate assignment failed"
-                );
-                let ack = FtsIndexAckMsg {
-                    collection: msg.collection.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(format!("surrogate assignment failed: {e}")),
-                };
-                return SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack);
-            }
-        };
-
-        let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
-
-        debug!(
-            session = %self.session_id,
-            collection = %msg.collection,
-            doc_id = %msg.doc_id,
-            batch_id = msg.batch_id,
-            lite_id = %msg.lite_id,
-            "fts index: dispatching to Data Plane"
-        );
-
-        match dispatcher
-            .dispatch_index(
-                tenant_id,
-                vshard,
-                msg.collection.clone(),
-                surrogate,
-                msg.text.clone(),
-            )
-            .await
-        {
-            Ok(()) => {
-                self.mutations_processed += 1;
-                let ack = FtsIndexAckMsg {
-                    collection: msg.collection.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: true,
-                    reject_reason: None,
-                };
-                SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack)
-            }
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    doc_id = %msg.doc_id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "fts index dispatch failed"
-                );
-                let ack = FtsIndexAckMsg {
-                    collection: msg.collection.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(e.to_string()),
-                };
-                SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack)
-            }
-        }
-    }
-
-    /// Process a `FtsDeleteMsg`: look up surrogate, dispatch tombstone to
-    /// Data Plane, return an ACK frame.
-    pub async fn handle_fts_delete<D: FtsDispatcher>(
-        &mut self,
-        msg: &FtsDeleteMsg,
-        dispatcher: &D,
-    ) -> Option<SyncFrame> {
-        self.last_activity = std::time::Instant::now();
-
-        if !self.authenticated {
-            let ack = FtsDeleteAckMsg {
-                collection: msg.collection.clone(),
-                doc_id: msg.doc_id.clone(),
-                batch_id: msg.batch_id,
-                accepted: false,
-                reject_reason: Some("unauthenticated".to_string()),
-            };
-            return SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack);
-        }
-
-        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.doc_id) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    doc_id = %msg.doc_id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "fts sync: surrogate lookup failed for delete"
-                );
-                let ack = FtsDeleteAckMsg {
-                    collection: msg.collection.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(format!("surrogate lookup failed: {e}")),
-                };
-                return SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack);
-            }
-        };
-
-        let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
-
-        debug!(
-            session = %self.session_id,
-            collection = %msg.collection,
-            doc_id = %msg.doc_id,
-            batch_id = msg.batch_id,
-            lite_id = %msg.lite_id,
-            "fts delete: dispatching to Data Plane"
-        );
-
-        match dispatcher
-            .dispatch_delete(tenant_id, vshard, msg.collection.clone(), surrogate)
-            .await
-        {
-            Ok(()) => {
-                self.mutations_processed += 1;
-                let ack = FtsDeleteAckMsg {
-                    collection: msg.collection.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: true,
-                    reject_reason: None,
-                };
-                SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack)
-            }
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    doc_id = %msg.doc_id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "fts delete dispatch failed"
-                );
-                let ack = FtsDeleteAckMsg {
-                    collection: msg.collection.clone(),
-                    doc_id: msg.doc_id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(e.to_string()),
-                };
-                SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack)
-            }
-        }
     }
 }
 
@@ -371,6 +188,8 @@ impl SyncSession {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use super::super::session::SyncSession;
+    use super::super::wire::*;
     use super::*;
 
     type MockCallLog = Arc<Mutex<Vec<(TenantId, String, String)>>>;
@@ -416,17 +235,14 @@ mod tests {
             collection: String,
             _surrogate: Surrogate,
             _text: String,
-        ) -> crate::Result<()> {
+            provenance: nodedb_types::sync::wire::SyncProvenance,
+        ) -> crate::Result<Vec<u8>> {
+            let seq = provenance.seq;
             self.index_calls
                 .lock()
                 .unwrap()
                 .push((tenant_id, collection, String::new()));
-            match &self.result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(crate::Error::Internal {
-                    detail: e.to_string(),
-                }),
-            }
+            super::super::test_support::mock_applied_ack(&self.result, seq)
         }
 
         async fn dispatch_delete(
@@ -435,17 +251,14 @@ mod tests {
             _vshard: VShardId,
             collection: String,
             _surrogate: Surrogate,
-        ) -> crate::Result<()> {
+            provenance: nodedb_types::sync::wire::SyncProvenance,
+        ) -> crate::Result<Vec<u8>> {
+            let seq = provenance.seq;
             self.delete_calls
                 .lock()
                 .unwrap()
                 .push((tenant_id, collection, String::new()));
-            match &self.result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(crate::Error::Internal {
-                    detail: e.to_string(),
-                }),
-            }
+            super::super::test_support::mock_applied_ack(&self.result, seq)
         }
 
         fn assign_surrogate(&self, _collection: &str, _doc_id: &str) -> crate::Result<Surrogate> {
@@ -464,6 +277,9 @@ mod tests {
             doc_id: doc_id.to_string(),
             text: text.to_string(),
             batch_id: 1,
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         }
     }
 
@@ -473,6 +289,9 @@ mod tests {
             collection: collection.to_string(),
             doc_id: doc_id.to_string(),
             batch_id: 2,
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         }
     }
 

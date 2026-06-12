@@ -12,13 +12,10 @@
 //! returned without at least attempting dispatch.
 
 use async_trait::async_trait;
-use tracing::{debug, error, warn};
 
 use nodedb_types::Surrogate;
 
-use super::session::SyncSession;
-use super::wire::*;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, VShardId};
 
 // ── Dispatcher trait ─────────────────────────────────────────────────────────
 
@@ -32,6 +29,9 @@ pub struct VectorInsertParams {
 }
 
 /// Encapsulates async Data Plane dispatch for vector insert/delete.
+///
+/// Returns the raw `Response.payload` bytes from the Data Plane so that the
+/// handler can decode the [`SyncAckResult`] for gate status propagation.
 #[async_trait]
 pub trait VectorDispatcher: Send + Sync {
     /// Insert a vector into the HNSW index on the Data Plane.
@@ -40,7 +40,8 @@ pub trait VectorDispatcher: Send + Sync {
         tenant_id: TenantId,
         vshard: VShardId,
         params: VectorInsertParams,
-    ) -> crate::Result<()>;
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>>;
 
     /// Delete a vector by surrogate from the HNSW index on the Data Plane.
     async fn dispatch_delete(
@@ -50,7 +51,8 @@ pub trait VectorDispatcher: Send + Sync {
         collection: String,
         surrogate: Surrogate,
         field_name: String,
-    ) -> crate::Result<()>;
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>>;
 
     /// Assign a stable surrogate for `(collection, doc_id)`.
     fn assign_surrogate(&self, collection: &str, doc_id: &str) -> crate::Result<Surrogate>;
@@ -72,11 +74,31 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
         tenant_id: TenantId,
         vshard: VShardId,
         params: VectorInsertParams,
-    ) -> crate::Result<()> {
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source;
-        use crate::event::EventSource;
+        use crate::control::server::wal_dispatch::{VectorPutWalArgs, wal_append_vector_put};
         use nodedb_physical::physical_plan::VectorOp;
+
+        let prov = provenance;
+
+        // Allocate WAL LSN on the Control Plane before dispatching to the
+        // Data Plane. Sync path MUST write to WAL; non-sync path already does
+        // this via `wal_append_if_write_with_creds` in the main dispatch.
+        wal_append_vector_put(
+            &self.shared.wal,
+            tenant_id,
+            vshard,
+            DatabaseId::DEFAULT,
+            VectorPutWalArgs {
+                collection: &params.collection,
+                vector: &params.vector,
+                dim: params.dim,
+                field_name: &params.field_name,
+                surrogate: params.surrogate,
+                provenance: Some(&prov),
+            },
+        )?;
 
         let plan = PhysicalPlan::Vector(VectorOp::Insert {
             collection: params.collection,
@@ -84,18 +106,10 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
             dim: params.dim,
             field_name: params.field_name,
             surrogate: params.surrogate,
+            provenance: Some(prov),
         });
 
-        dispatch_to_data_plane_with_source(
-            self.shared,
-            tenant_id,
-            vshard,
-            plan,
-            TraceId::ZERO,
-            EventSource::CrdtSync,
-        )
-        .await
-        .map(|_| ())
+        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
     }
 
     async fn dispatch_delete(
@@ -105,28 +119,39 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
         collection: String,
         surrogate: Surrogate,
         field_name: String,
-    ) -> crate::Result<()> {
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source;
-        use crate::event::EventSource;
+        use crate::control::server::wal_dispatch::{
+            VectorDeleteWalArgs, wal_append_vector_delete_by_surrogate,
+        };
         use nodedb_physical::physical_plan::VectorOp;
+
+        let prov = provenance;
+
+        // Allocate WAL LSN on the Control Plane before dispatching to the
+        // Data Plane.
+        wal_append_vector_delete_by_surrogate(
+            &self.shared.wal,
+            tenant_id,
+            vshard,
+            DatabaseId::DEFAULT,
+            VectorDeleteWalArgs {
+                collection: &collection,
+                surrogate,
+                field_name: &field_name,
+                provenance: Some(&prov),
+            },
+        )?;
 
         let plan = PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
             collection,
             surrogate,
             field_name,
+            provenance: Some(prov),
         });
 
-        dispatch_to_data_plane_with_source(
-            self.shared,
-            tenant_id,
-            vshard,
-            plan,
-            TraceId::ZERO,
-            EventSource::CrdtSync,
-        )
-        .await
-        .map(|_| ())
+        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
     }
 
     fn assign_surrogate(&self, collection: &str, doc_id: &str) -> crate::Result<Surrogate> {
@@ -148,12 +173,9 @@ impl VectorDispatcher for NoOpVectorDispatcher {
         _tenant_id: TenantId,
         _vshard: VShardId,
         _params: VectorInsertParams,
-    ) -> crate::Result<()> {
-        Err(crate::Error::Internal {
-            detail: "vector insert routed through path lacking SharedState; \
-                     check listener wiring — insert was ACKed but NOT applied"
-                .to_string(),
-        })
+        _provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
+        Err(super::raft_dispatch::noop_dispatch_error("vector insert"))
     }
 
     async fn dispatch_delete(
@@ -163,12 +185,9 @@ impl VectorDispatcher for NoOpVectorDispatcher {
         _collection: String,
         _surrogate: Surrogate,
         _field_name: String,
-    ) -> crate::Result<()> {
-        Err(crate::Error::Internal {
-            detail: "vector delete routed through path lacking SharedState; \
-                     check listener wiring — delete was ACKed but NOT applied"
-                .to_string(),
-        })
+        _provenance: nodedb_types::sync::wire::SyncProvenance,
+    ) -> crate::Result<Vec<u8>> {
+        Err(super::raft_dispatch::noop_dispatch_error("vector delete"))
     }
 
     fn assign_surrogate(&self, _collection: &str, _doc_id: &str) -> crate::Result<Surrogate> {
@@ -176,241 +195,17 @@ impl VectorDispatcher for NoOpVectorDispatcher {
     }
 }
 
-// ── Handler ──────────────────────────────────────────────────────────────────
-
-impl SyncSession {
-    /// Process a `VectorInsertMsg`: allocate surrogate, dispatch to Data Plane,
-    /// return an ACK frame.
-    ///
-    /// Unauthenticated sessions receive a rejection ACK without dispatch.
-    pub async fn handle_vector_insert<D: VectorDispatcher>(
-        &mut self,
-        msg: &VectorInsertMsg,
-        dispatcher: &D,
-    ) -> Option<SyncFrame> {
-        self.last_activity = std::time::Instant::now();
-
-        if !self.authenticated {
-            let ack = VectorInsertAckMsg {
-                collection: msg.collection.clone(),
-                id: msg.id.clone(),
-                batch_id: msg.batch_id,
-                accepted: false,
-                reject_reason: Some("unauthenticated".to_string()),
-            };
-            return SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack);
-        }
-
-        if msg.vector.len() != msg.dim || msg.dim == 0 {
-            warn!(
-                session = %self.session_id,
-                collection = %msg.collection,
-                id = %msg.id,
-                batch_id = msg.batch_id,
-                stated_dim = msg.dim,
-                actual_len = msg.vector.len(),
-                "vector sync: dimension mismatch; rejecting"
-            );
-            let ack = VectorInsertAckMsg {
-                collection: msg.collection.clone(),
-                id: msg.id.clone(),
-                batch_id: msg.batch_id,
-                accepted: false,
-                reject_reason: Some(format!(
-                    "dimension mismatch: stated {}, actual {}",
-                    msg.dim,
-                    msg.vector.len()
-                )),
-            };
-            return SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack);
-        }
-
-        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.id) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    id = %msg.id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "vector sync: surrogate assignment failed"
-                );
-                let ack = VectorInsertAckMsg {
-                    collection: msg.collection.clone(),
-                    id: msg.id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(format!("surrogate assignment failed: {e}")),
-                };
-                return SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack);
-            }
-        };
-
-        let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
-
-        debug!(
-            session = %self.session_id,
-            collection = %msg.collection,
-            id = %msg.id,
-            batch_id = msg.batch_id,
-            dim = msg.dim,
-            lite_id = %msg.lite_id,
-            "vector insert: dispatching to Data Plane"
-        );
-
-        match dispatcher
-            .dispatch_insert(
-                tenant_id,
-                vshard,
-                VectorInsertParams {
-                    collection: msg.collection.clone(),
-                    vector: msg.vector.clone(),
-                    dim: msg.dim,
-                    field_name: msg.field_name.clone(),
-                    surrogate,
-                },
-            )
-            .await
-        {
-            Ok(()) => {
-                self.mutations_processed += 1;
-                let ack = VectorInsertAckMsg {
-                    collection: msg.collection.clone(),
-                    id: msg.id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: true,
-                    reject_reason: None,
-                };
-                SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack)
-            }
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    id = %msg.id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "vector insert dispatch failed"
-                );
-                let ack = VectorInsertAckMsg {
-                    collection: msg.collection.clone(),
-                    id: msg.id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(e.to_string()),
-                };
-                SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack)
-            }
-        }
-    }
-
-    /// Process a `VectorDeleteMsg`: look up surrogate, dispatch tombstone to
-    /// Data Plane, return an ACK frame.
-    pub async fn handle_vector_delete<D: VectorDispatcher>(
-        &mut self,
-        msg: &VectorDeleteMsg,
-        dispatcher: &D,
-    ) -> Option<SyncFrame> {
-        self.last_activity = std::time::Instant::now();
-
-        if !self.authenticated {
-            let ack = VectorDeleteAckMsg {
-                collection: msg.collection.clone(),
-                id: msg.id.clone(),
-                batch_id: msg.batch_id,
-                accepted: false,
-                reject_reason: Some("unauthenticated".to_string()),
-            };
-            return SyncFrame::try_encode(SyncMessageType::VectorDeleteAck, &ack);
-        }
-
-        // Resolve surrogate — idempotent: if the surrogate was never assigned,
-        // the delete is a no-op.
-        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.id) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    id = %msg.id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "vector sync: surrogate lookup failed for delete"
-                );
-                let ack = VectorDeleteAckMsg {
-                    collection: msg.collection.clone(),
-                    id: msg.id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(format!("surrogate lookup failed: {e}")),
-                };
-                return SyncFrame::try_encode(SyncMessageType::VectorDeleteAck, &ack);
-            }
-        };
-
-        let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
-
-        debug!(
-            session = %self.session_id,
-            collection = %msg.collection,
-            id = %msg.id,
-            batch_id = msg.batch_id,
-            lite_id = %msg.lite_id,
-            "vector delete: dispatching to Data Plane"
-        );
-
-        match dispatcher
-            .dispatch_delete(
-                tenant_id,
-                vshard,
-                msg.collection.clone(),
-                surrogate,
-                msg.field_name.clone(),
-            )
-            .await
-        {
-            Ok(()) => {
-                self.mutations_processed += 1;
-                let ack = VectorDeleteAckMsg {
-                    collection: msg.collection.clone(),
-                    id: msg.id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: true,
-                    reject_reason: None,
-                };
-                SyncFrame::try_encode(SyncMessageType::VectorDeleteAck, &ack)
-            }
-            Err(e) => {
-                error!(
-                    session = %self.session_id,
-                    collection = %msg.collection,
-                    id = %msg.id,
-                    batch_id = msg.batch_id,
-                    error = %e,
-                    "vector delete dispatch failed"
-                );
-                let ack = VectorDeleteAckMsg {
-                    collection: msg.collection.clone(),
-                    id: msg.id.clone(),
-                    batch_id: msg.batch_id,
-                    accepted: false,
-                    reject_reason: Some(e.to_string()),
-                };
-                SyncFrame::try_encode(SyncMessageType::VectorDeleteAck, &ack)
-            }
-        }
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
+//
+// Session handler methods (`handle_vector_insert` / `handle_vector_delete`) live
+// in `vector_session.rs`; tests below drive them via the trait + session API.
 
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use super::super::session::SyncSession;
+    use super::super::wire::*;
     use super::*;
 
     type MockCallLog = Arc<Mutex<Vec<(TenantId, String, String)>>>;
@@ -454,17 +249,14 @@ mod tests {
             tenant_id: TenantId,
             _vshard: VShardId,
             params: VectorInsertParams,
-        ) -> crate::Result<()> {
+            provenance: nodedb_types::sync::wire::SyncProvenance,
+        ) -> crate::Result<Vec<u8>> {
+            let seq = provenance.seq;
             self.insert_calls
                 .lock()
                 .unwrap()
                 .push((tenant_id, params.collection, String::new()));
-            match &self.result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(crate::Error::Internal {
-                    detail: e.to_string(),
-                }),
-            }
+            super::super::test_support::mock_applied_ack(&self.result, seq)
         }
 
         async fn dispatch_delete(
@@ -474,17 +266,14 @@ mod tests {
             collection: String,
             _surrogate: Surrogate,
             _field_name: String,
-        ) -> crate::Result<()> {
+            provenance: nodedb_types::sync::wire::SyncProvenance,
+        ) -> crate::Result<Vec<u8>> {
+            let seq = provenance.seq;
             self.delete_calls
                 .lock()
                 .unwrap()
                 .push((tenant_id, collection, String::new()));
-            match &self.result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(crate::Error::Internal {
-                    detail: e.to_string(),
-                }),
-            }
+            super::super::test_support::mock_applied_ack(&self.result, seq)
         }
 
         fn assign_surrogate(&self, _collection: &str, _doc_id: &str) -> crate::Result<Surrogate> {
@@ -506,6 +295,9 @@ mod tests {
             dim,
             field_name: String::new(),
             batch_id: 1,
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         }
     }
 
@@ -516,6 +308,9 @@ mod tests {
             id: id.to_string(),
             field_name: String::new(),
             batch_id: 2,
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         }
     }
 
