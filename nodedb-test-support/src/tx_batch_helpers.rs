@@ -120,6 +120,7 @@ pub fn vector_seed(collection: &str) -> PhysicalPlan {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        provenance: None,
     })
 }
 
@@ -130,6 +131,7 @@ pub fn vector_insert_ok(collection: &str) -> PhysicalPlan {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::new(101),
+        provenance: None,
     })
 }
 
@@ -141,6 +143,7 @@ pub fn vector_fail(collection: &str) -> PhysicalPlan {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        provenance: None,
     })
 }
 
@@ -228,6 +231,8 @@ pub fn columnar_insert(collection: &str, id: &str, val: i64) -> PhysicalPlan {
         on_conflict_updates: Vec::new(),
         surrogates: Vec::new(),
         schema_bytes: Vec::new(),
+        provenance: None,
+        wal_lsn: None,
     })
 }
 
@@ -259,6 +264,7 @@ pub fn timeseries_ingest(collection: &str, ilp: &str) -> PhysicalPlan {
         format: "ilp".into(),
         wal_lsn: None,
         surrogates: Vec::new(),
+        provenance: None,
     })
 }
 
@@ -288,6 +294,7 @@ pub fn crdt_apply(collection: &str, doc_id: &str) -> PhysicalPlan {
         peer_id: 1,
         mutation_id: 42,
         surrogate: nodedb_types::Surrogate::ZERO,
+        provenance: None,
     })
 }
 

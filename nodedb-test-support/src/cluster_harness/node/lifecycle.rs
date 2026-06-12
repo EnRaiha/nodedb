@@ -151,6 +151,23 @@ impl TestClusterNode {
             state.group_watchers = Arc::clone(&handle.group_watchers);
             // Fixed test KEK so backup tests produce encrypted envelopes.
             state.backup_kek = Some(Arc::new([0x42u8; 32]));
+            // Durable producer registry, sharing the credential store's
+            // already-open catalog (mirrors production `SharedState::open`).
+            // Required for sync handshake fencing to replicate via the
+            // metadata Raft group on cluster nodes.
+            if let Some(catalog) = state.credentials.catalog() {
+                match nodedb::control::sync_producer::registry::SyncProducerRegistry::open(
+                    Arc::new(catalog.clone()),
+                ) {
+                    Ok(reg) => state.producer_registry = Some(Arc::new(reg)),
+                    Err(e) => {
+                        return Err(format!(
+                            "SyncProducerRegistry::open failed in test harness: {e}"
+                        )
+                        .into());
+                    }
+                }
+            }
         } else {
             return Err("SharedState already cloned before cluster wire-up".into());
         }

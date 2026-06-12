@@ -32,6 +32,7 @@ use nodedb_array::types::cell_value::value::CellValue;
 use nodedb_array::types::coord::value::CoordValue;
 use nodedb_array::types::{ArrayId, TileId};
 use nodedb_types::Surrogate;
+use nodedb_types::sync::wire::SyncProvenance;
 use serde::{Deserialize, Serialize};
 
 /// Current on-disk format version for array WAL payloads.
@@ -85,6 +86,11 @@ pub struct ArrayPutCell {
 pub struct ArrayPutPayload {
     pub array_id: ArrayId,
     pub cells: Vec<ArrayPutCell>,
+    /// Sync provenance for idempotency — `None` for locally-originated writes.
+    /// Carried here so the WAL record is self-contained for deduplication
+    /// on replay; the field is ignored until the sync ingest path populates it.
+    #[serde(default)]
+    pub provenance: Option<SyncProvenance>,
 }
 
 #[derive(
@@ -121,6 +127,9 @@ pub struct ArrayDeleteCell {
 pub struct ArrayDeletePayload {
     pub array_id: ArrayId,
     pub cells: Vec<ArrayDeleteCell>,
+    /// Sync provenance for idempotency — `None` for locally-originated writes.
+    #[serde(default)]
+    pub provenance: Option<SyncProvenance>,
 }
 
 #[derive(
@@ -140,6 +149,9 @@ pub struct ArrayFlushPayload {
     /// Tile ids that landed in the segment — lets compaction and
     /// debugging cross-check the manifest without re-decoding the file.
     pub tile_ids: Vec<TileId>,
+    /// Sync provenance for idempotency — `None` for locally-originated flushes.
+    #[serde(default)]
+    pub provenance: Option<SyncProvenance>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -217,6 +229,7 @@ mod tests {
                 valid_from_ms: 1_000,
                 valid_until_ms: i64::MAX,
             }],
+            provenance: None,
         }
     }
 
@@ -234,6 +247,7 @@ mod tests {
             array_id: ArrayId::new(nodedb_types::TenantId::new(1), "g"),
             segment_id: "00000001.ndas".into(),
             tile_ids: vec![TileId::snapshot(7)],
+            provenance: None,
         };
         let bytes = zerompk::to_msgpack_vec(&p).unwrap();
         let back: ArrayFlushPayload = zerompk::from_msgpack(&bytes).unwrap();
@@ -274,6 +288,7 @@ mod tests {
                 system_from_ms: 9_000,
                 erasure: true,
             }],
+            provenance: None,
         };
         let encoded = encode_delete_with_version(&payload).unwrap();
         assert_eq!(encoded[0], ARRAY_WAL_FORMAT_VERSION);

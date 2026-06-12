@@ -240,6 +240,15 @@ pub enum Error {
     #[error("internal error: {detail}")]
     Internal { detail: String },
 
+    /// A deterministic typed error code returned by the Data Plane across the
+    /// SPSC bridge. Preserves the [`crate::bridge::envelope::ErrorCode`] instead
+    /// of flattening it to an opaque string, so Control-Plane callers (e.g. the
+    /// CRDT sync delta path) can classify the failure by type rather than by
+    /// substring-matching a human message. Upholds the crate contract that
+    /// cross-plane errors surface deterministic codes, never opaque strings.
+    #[error("data plane error: {0:?}")]
+    DataPlane(crate::bridge::envelope::ErrorCode),
+
     #[error("promql error: {0}")]
     Promql(#[from] crate::control::promql::PromqlError),
 

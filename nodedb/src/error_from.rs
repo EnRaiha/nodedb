@@ -287,6 +287,21 @@ impl From<Error> for NodeDbError {
             Error::OidcNoDefaultDatabase { sub } => NodeDbError::bad_request(format!(
                 "OIDC: no default database resolved for sub '{sub}'"
             )),
+            // A Data-Plane error code that propagated to the public boundary.
+            // Faithfully surface the typed code's meaning; fall back to internal
+            // for codes without a dedicated public constructor.
+            Error::DataPlane(code) => {
+                use crate::bridge::envelope::ErrorCode as Ec;
+                match code {
+                    Ec::RejectedConstraint { constraint, detail } => {
+                        NodeDbError::constraint_violation(constraint, detail)
+                    }
+                    Ec::RejectedAuthz => NodeDbError::authorization_denied(""),
+                    Ec::DeadlineExceeded => NodeDbError::deadline_exceeded(),
+                    Ec::ConflictRetry => NodeDbError::write_conflict("", ""),
+                    other => NodeDbError::internal(format!("{other:?}")),
+                }
+            }
         }
     }
 }

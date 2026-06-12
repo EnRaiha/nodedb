@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use nodedb_types::sync::wire::SyncProvenance;
 use nodedb_wal::WalRecord;
 use nodedb_wal::record::RecordType;
 use tracing::{trace, warn};
@@ -148,6 +149,14 @@ fn record_to_event(record: &WalRecord, sequence: &mut u64) -> Option<WriteEvent>
         | RecordType::LsnMsAnchor
         | RecordType::TemporalPurge
         | RecordType::CalvinApplied
+        // SyncSeqAdvance: emitted by the sync layer; replay HWM reconstruction
+        // is wired in the idempotency replay pass, not the Event Plane.
+        | RecordType::SyncSeqAdvance
+        // FtsIndex, FtsDelete, SpatialPut, SpatialDelete: emission wired in 3d.
+        | RecordType::FtsIndex
+        | RecordType::FtsDelete
+        | RecordType::SpatialPut
+        | RecordType::SpatialDelete
         | RecordType::Noop => None,
     }
 }
@@ -218,7 +227,32 @@ fn parse_put_record(
         });
     }
 
-    // Try document put: (collection, document_id, value)
+    // Try document put with provenance (new arity): (collection, document_id, value, provenance)
+    if let Ok((collection, document_id, value, _prov)) =
+        zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>)>(payload)
+    {
+        *sequence += 1;
+        let (system_time_ms, valid_time_ms) =
+            crate::event::bitemporal_extract::extract_stamps(Some(&value));
+        return Some(WriteEvent {
+            sequence: *sequence,
+            collection: Arc::from(collection.as_str()),
+            op: WriteOp::Insert,
+            row_id: RowId::new(document_id.as_str()),
+            lsn,
+            tenant_id,
+            vshard_id,
+            source: EventSource::User,
+            new_value: Some(Arc::from(value.as_slice())),
+            old_value: None,
+            system_time_ms,
+            valid_time_ms,
+            user_id: None,
+            statement_digest: None,
+        });
+    }
+
+    // Try document put (legacy arity): (collection, document_id, value)
     if let Ok((collection, document_id, value)) =
         zerompk::from_msgpack::<(String, String, Vec<u8>)>(payload)
     {
@@ -289,7 +323,30 @@ fn parse_delete_record(
         });
     }
 
-    // Try document delete: (collection, document_id)
+    // Try document delete with provenance (new arity): (collection, document_id, provenance)
+    if let Ok((collection, document_id, _prov)) =
+        zerompk::from_msgpack::<(String, String, Option<SyncProvenance>)>(payload)
+    {
+        *sequence += 1;
+        return Some(WriteEvent {
+            sequence: *sequence,
+            collection: Arc::from(collection.as_str()),
+            op: WriteOp::Delete,
+            row_id: RowId::new(document_id.as_str()),
+            lsn,
+            tenant_id,
+            vshard_id,
+            source: EventSource::User,
+            new_value: None,
+            old_value: None,
+            system_time_ms: None,
+            valid_time_ms: None,
+            user_id: None,
+            statement_digest: None,
+        });
+    }
+
+    // Try document delete (legacy arity): (collection, document_id)
     if let Ok((collection, document_id)) = zerompk::from_msgpack::<(String, String)>(payload) {
         *sequence += 1;
         return Some(WriteEvent {
@@ -380,6 +437,34 @@ mod tests {
         let record = make_record(RecordType::Checkpoint, &[], 1, 0, 105);
         let mut seq = 0u64;
         assert!(record_to_event(&record, &mut seq).is_none());
+    }
+
+    #[test]
+    fn parse_document_put_with_provenance() {
+        // New 4-element arity: (collection, document_id, value, Option<SyncProvenance>).
+        let provenance: Option<SyncProvenance> = None;
+        let payload =
+            zerompk::to_msgpack_vec(&("orders", "order-2", b"value2", provenance)).unwrap();
+        let record = make_record(RecordType::Put, &payload, 1, 0, 200);
+        let mut seq = 0u64;
+        let event = record_to_event(&record, &mut seq).unwrap();
+        assert_eq!(event.collection.as_ref(), "orders");
+        assert_eq!(event.row_id.as_str(), "order-2");
+        assert_eq!(event.op, WriteOp::Insert);
+        assert_eq!(seq, 1);
+    }
+
+    #[test]
+    fn parse_document_delete_with_provenance() {
+        // New 3-element arity: (collection, document_id, Option<SyncProvenance>).
+        let provenance: Option<SyncProvenance> = None;
+        let payload = zerompk::to_msgpack_vec(&("orders", "order-2", provenance)).unwrap();
+        let record = make_record(RecordType::Delete, &payload, 1, 0, 201);
+        let mut seq = 0u64;
+        let event = record_to_event(&record, &mut seq).unwrap();
+        assert_eq!(event.op, WriteOp::Delete);
+        assert_eq!(event.row_id.as_str(), "order-2");
+        assert_eq!(seq, 1);
     }
 
     fn make_record(

@@ -261,6 +261,33 @@ pub fn spawn_core(
                 core.replay_kv_wal(&wal_records, num_cores, &tombstones);
                 core.replay_timeseries_wal(&wal_records, num_cores, &tombstones);
                 core.replay_array_wal(&wal_records, num_cores, &tombstones);
+                core.replay_fts_wal(&wal_records, num_cores, &tombstones);
+                core.replay_spatial_wal(&wal_records, num_cores, &tombstones);
+
+                // Reconstruct sync HWM maps from SyncSeqAdvance records so
+                // post-restart deduplication is correct. Fatal on error —
+                // a partially-recovered HWM is not safe to operate with.
+                match crate::wal::replay::replay_sync_hwm_records(&wal_records) {
+                    Ok((maps, stats)) => {
+                        if stats.records > 0 {
+                            info!(
+                                core_id,
+                                records = stats.records,
+                                "sync HWM WAL replay complete"
+                            );
+                        }
+                        core.install_sync_hwm_maps(maps);
+                    }
+                    Err(e) => {
+                        error!(
+                            core_id,
+                            error = %e,
+                            "StartupError: sync HWM WAL replay failed — \
+                             refusing to start with a partially-recovered idempotency gate"
+                        );
+                        std::process::exit(1);
+                    }
+                }
             }
 
             info!(core_id, "data plane core started (eventfd-driven)");
