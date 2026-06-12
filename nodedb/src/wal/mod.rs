@@ -8,4 +8,7 @@ pub mod replay;
 
 pub use audit_segment::AuditWalSegment;
 pub use manager::WalManager;
+pub use replay::SyncHwmReplayMaps;
+pub use replay::SyncHwmReplayStats;
 pub use replay::replay_surrogate_records;
+pub use replay::replay_sync_hwm_records;

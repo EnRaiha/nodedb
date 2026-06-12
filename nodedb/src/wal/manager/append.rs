@@ -260,6 +260,79 @@ impl WalManager {
         )
     }
 
+    /// Append a `SyncSeqAdvance` watermark record. Emitted by the Data Plane sync
+    /// handler after durably applying an ingest message, to make the per-stream
+    /// high-watermark crash-recoverable.
+    ///
+    /// `vshard_id` is `0` — the sync HWM is a node-global idempotency state,
+    /// not sharded user data.
+    pub fn append_sync_seq_advance(
+        &self,
+        producer_id: u64,
+        epoch: u64,
+        stream_id: u64,
+        seq: u64,
+    ) -> crate::Result<Lsn> {
+        let payload =
+            nodedb_wal::record::SyncSeqAdvancePayload::new(producer_id, epoch, stream_id, seq)
+                .to_bytes();
+        self.append_record(
+            RecordType::SyncSeqAdvance,
+            TenantId::new(0),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &payload,
+        )
+    }
+
+    /// Append an `FtsIndex` record. Payload is a length-prefixed `FtsIndexPayload`
+    /// produced by `nodedb_wal::record::FtsIndexPayload::to_bytes()`.
+    pub fn append_fts_index(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        p: &[u8],
+    ) -> crate::Result<Lsn> {
+        self.append_record(RecordType::FtsIndex, tid, vs, db, p)
+    }
+
+    /// Append an `FtsDelete` record. Payload is a length-prefixed `FtsDeletePayload`
+    /// produced by `nodedb_wal::record::FtsDeletePayload::to_bytes()`.
+    pub fn append_fts_delete(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        p: &[u8],
+    ) -> crate::Result<Lsn> {
+        self.append_record(RecordType::FtsDelete, tid, vs, db, p)
+    }
+
+    /// Append a `SpatialPut` record. Payload is a length-prefixed `SpatialPutPayload`
+    /// produced by `nodedb_wal::record::SpatialPutPayload::to_bytes()`.
+    pub fn append_spatial_put(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        p: &[u8],
+    ) -> crate::Result<Lsn> {
+        self.append_record(RecordType::SpatialPut, tid, vs, db, p)
+    }
+
+    /// Append a `SpatialDelete` record. Payload is a length-prefixed `SpatialDeletePayload`
+    /// produced by `nodedb_wal::record::SpatialDeletePayload::to_bytes()`.
+    pub fn append_spatial_delete(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        p: &[u8],
+    ) -> crate::Result<Lsn> {
+        self.append_record(RecordType::SpatialDelete, tid, vs, db, p)
+    }
+
     pub fn append_collection_tombstone(
         &self,
         tid: TenantId,

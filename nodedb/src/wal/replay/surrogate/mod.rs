@@ -57,7 +57,14 @@ pub fn replay_surrogate_records(
             | RecordType::CollectionTombstoned
             | RecordType::LsnMsAnchor
             | RecordType::TemporalPurge
-            | RecordType::CalvinApplied => {}
+            | RecordType::CalvinApplied
+            // SyncSeqAdvance: not relevant to surrogate replay; the sync
+            // idempotency replay pass handles HWM reconstruction.
+            | RecordType::SyncSeqAdvance
+            | RecordType::FtsIndex
+            | RecordType::FtsDelete
+            | RecordType::SpatialPut
+            | RecordType::SpatialDelete => {}
         }
     }
     Ok(stats)
