@@ -47,7 +47,9 @@ use std::os::unix::fs::OpenOptionsExt as _;
 
 use crate::align::{AlignedBuf, DEFAULT_ALIGNMENT, is_aligned};
 use crate::error::{Result, WalError};
-use crate::record::{HEADER_SIZE, RecordHeader, WAL_MAGIC, WalRecord};
+use crate::record::{HEADER_SIZE, WalRecord};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::record::{RecordHeader, WAL_MAGIC};
 
 /// Maximum number of records kept in the double-write buffer.
 /// Only the most recent records matter — torn writes affect the tail.

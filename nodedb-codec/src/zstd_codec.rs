@@ -132,7 +132,7 @@ fn decompress_native(frame: &[u8], expected_size: usize) -> Result<Vec<u8>, Code
 // we fall back to LZ4 encoding on WASM and only support Zstd decoding.
 
 #[cfg(target_arch = "wasm32")]
-fn compress_native(data: &[u8], _level: i32) -> Result<Vec<u8>, CodecError> {
+fn compress_native(_data: &[u8], _level: i32) -> Result<Vec<u8>, CodecError> {
     // ruzstd is decode-only. On WASM, we encode using a minimal Zstd frame.
     // For production WASM builds that need Zstd encoding, compile the C zstd
     // library to WASM. For now, return an error directing callers to use LZ4.

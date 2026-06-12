@@ -16,7 +16,9 @@
 //! On wasm32 the standard allocator is used; per-thread arena pinning and NUMA
 //! binding are no-ops that return `Ok(())` or zero.
 
-use crate::error::{MemError, Result};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::error::MemError;
+use crate::error::Result;
 
 /// Bind the calling thread's memory allocation policy to its local NUMA node.
 ///

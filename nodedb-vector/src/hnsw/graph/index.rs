@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cell::RefCell;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
 use crate::distance::dispatch::distance_typed;
