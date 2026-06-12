@@ -50,6 +50,12 @@ pub struct HandshakeAckMsg {
     /// Server's wire format version (for client-side compatibility check).
     #[serde(default)]
     pub server_wire_version: u16,
+    /// Server-assigned producer ID for this session. 0 if not yet assigned.
+    #[serde(default)]
+    pub producer_id: u64,
+    /// Server's current accepted epoch for this producer. 0 if not yet tracked.
+    #[serde(default)]
+    pub accepted_epoch: u64,
 }
 
 /// Token refresh request (client → server, 0x60).

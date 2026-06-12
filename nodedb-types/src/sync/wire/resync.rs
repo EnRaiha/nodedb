@@ -24,6 +24,10 @@ pub struct ResyncRequestMsg {
     pub from_mutation_id: u64,
     /// Collection scope (empty = all collections).
     pub collection: String,
+    /// Shape the gap was detected on; Origin re-snapshots this shape.
+    /// Empty string if the caller does not know the shape (e.g. legacy path).
+    #[serde(default)]
+    pub shape_id: String,
 }
 
 /// Reason for a re-sync request.

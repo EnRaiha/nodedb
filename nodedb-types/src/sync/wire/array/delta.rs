@@ -22,6 +22,15 @@ pub struct ArrayDeltaMsg {
     pub array: String,
     /// A single zerompk-encoded `ArrayOp`. Decoded by `nodedb-array::sync::op_codec`.
     pub op_payload: Vec<u8>,
+    /// Stable identity of the originating producer. 0 for legacy clients.
+    #[serde(default)]
+    pub producer_id: u64,
+    /// Monotonic epoch counter incremented on every producer restart.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Per-stream monotonic sequence number within the epoch.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 #[cfg(test)]
@@ -33,6 +42,9 @@ mod tests {
         let msg = ArrayDeltaMsg {
             array: "my_array".to_string(),
             op_payload: vec![0x01, 0x02, 0x03],
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
         };
         let encoded = zerompk::to_msgpack_vec(&msg).expect("encode");
         let decoded: ArrayDeltaMsg = zerompk::from_msgpack(&encoded).expect("decode");

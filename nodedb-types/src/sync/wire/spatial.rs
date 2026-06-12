@@ -14,6 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::sync::wire::ack_status::AckStatus;
+
 /// Spatial insert request (Lite → Origin, 0xAA).
 ///
 /// Requests that Origin index the geometry for `(collection, field, doc_id)` in
@@ -39,6 +41,15 @@ pub struct SpatialInsertMsg {
     pub geometry_bytes: Vec<u8>,
     /// Monotonic batch ID (Lite-assigned, per-operation). Used for ACK correlation.
     pub batch_id: u64,
+    /// Stable identity of the originating producer. 0 for legacy clients.
+    #[serde(default)]
+    pub producer_id: u64,
+    /// Monotonic epoch counter incremented on every producer restart.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Per-stream monotonic sequence number within the epoch.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// Spatial insert acknowledgment (Origin → Lite, 0xAB).
@@ -59,6 +70,12 @@ pub struct SpatialInsertAckMsg {
     /// Rejection detail when `accepted == false`.
     #[serde(default)]
     pub reject_reason: Option<String>,
+    /// Highest sequence number from this producer that has been durably applied.
+    #[serde(default)]
+    pub applied_seq: u64,
+    /// Idempotency outcome of the acknowledged message.
+    #[serde(default)]
+    pub status: AckStatus,
 }
 
 /// Spatial delete request (Lite → Origin, 0xAC).
@@ -79,6 +96,15 @@ pub struct SpatialDeleteMsg {
     pub doc_id: String,
     /// Monotonic batch ID for ACK correlation.
     pub batch_id: u64,
+    /// Stable identity of the originating producer. 0 for legacy clients.
+    #[serde(default)]
+    pub producer_id: u64,
+    /// Monotonic epoch counter incremented on every producer restart.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Per-stream monotonic sequence number within the epoch.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// Spatial delete acknowledgment (Origin → Lite, 0xAD).
@@ -99,4 +125,10 @@ pub struct SpatialDeleteAckMsg {
     /// Rejection detail when `accepted == false`.
     #[serde(default)]
     pub reject_reason: Option<String>,
+    /// Highest sequence number from this producer that has been durably applied.
+    #[serde(default)]
+    pub applied_seq: u64,
+    /// Idempotency outcome of the acknowledged message.
+    #[serde(default)]
+    pub status: AckStatus,
 }

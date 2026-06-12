@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::sync::wire::ack_status::AckStatus;
+
 /// Array ack message (client → server, 0x95).
 ///
 /// Sent periodically by Lite peers to advance Origin's GC frontier.
@@ -25,6 +27,12 @@ pub struct ArrayAckMsg {
     pub replica_id: u64,
     /// Highest durably applied HLC on this replica (18-byte layout).
     pub ack_hlc_bytes: [u8; 18],
+    /// Highest sequence number from this producer that has been durably applied.
+    #[serde(default)]
+    pub applied_seq: u64,
+    /// Idempotency outcome of the acknowledged message.
+    #[serde(default)]
+    pub status: AckStatus,
 }
 
 #[cfg(test)]
@@ -37,6 +45,8 @@ mod tests {
             array: "test_array".into(),
             replica_id: 99,
             ack_hlc_bytes: [0xABu8; 18],
+            applied_seq: 0,
+            status: AckStatus::Applied,
         };
         let encoded = zerompk::to_msgpack_vec(&msg).expect("encode");
         let decoded: ArrayAckMsg = zerompk::from_msgpack(&encoded).expect("decode");

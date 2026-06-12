@@ -39,7 +39,8 @@ fn handshake_serialization() {
     let frame = SyncFrame::new_msgpack(SyncMessageType::Handshake, &msg).unwrap();
     let bytes = frame.to_bytes();
     assert!(bytes.len() > SyncFrame::HEADER_SIZE);
-    assert_eq!(bytes[0], 0x01);
+    assert_eq!(bytes[0], SyncFrame::FORMAT_VERSION);
+    assert_eq!(bytes[1], 0x01);
 }
 
 #[test]
@@ -106,7 +107,8 @@ fn presence_update_roundtrip() {
     };
     let frame = SyncFrame::new_msgpack(SyncMessageType::PresenceUpdate, &msg).unwrap();
     let bytes = frame.to_bytes();
-    assert_eq!(bytes[0], 0x80);
+    assert_eq!(bytes[0], SyncFrame::FORMAT_VERSION);
+    assert_eq!(bytes[1], 0x80);
     let decoded: PresenceUpdateMsg = SyncFrame::from_bytes(&bytes)
         .unwrap()
         .decode_body()
@@ -151,7 +153,8 @@ fn presence_leave_roundtrip() {
     };
     let frame = SyncFrame::new_msgpack(SyncMessageType::PresenceLeave, &msg).unwrap();
     let bytes = frame.to_bytes();
-    assert_eq!(bytes[0], 0x82);
+    assert_eq!(bytes[0], SyncFrame::FORMAT_VERSION);
+    assert_eq!(bytes[1], 0x82);
     let decoded: PresenceLeaveMsg = SyncFrame::from_bytes(&bytes)
         .unwrap()
         .decode_body()
@@ -169,7 +172,8 @@ fn collection_purged_roundtrip() {
     };
     let frame = SyncFrame::new_msgpack(SyncMessageType::CollectionPurged, &msg).unwrap();
     let bytes = frame.to_bytes();
-    assert_eq!(bytes[0], 0x14);
+    assert_eq!(bytes[0], SyncFrame::FORMAT_VERSION);
+    assert_eq!(bytes[1], 0x14);
     let decoded: CollectionPurgedMsg = SyncFrame::from_bytes(&bytes)
         .unwrap()
         .decode_body()

@@ -82,6 +82,38 @@ pub enum Namespace {
     /// `versioned_get_current` can resolve the current version with one index
     /// lookup + one history fetch instead of a full prefix scan.
     LatestVersion = 16,
+    /// Durable FIFO queue of outbound columnar row batches waiting for
+    /// transport to Origin. Keys are big-endian monotonic u64 IDs; values are
+    /// zerompk-encoded `PendingColumnarBatch` payloads.
+    ColumnarPending = 17,
+    /// Durable FIFO queue of outbound timeseries row batches waiting for
+    /// transport to Origin. Keys are big-endian monotonic u64 IDs; values are
+    /// zerompk-encoded `PendingTimeseriesBatch` payloads.
+    TimeseriesPending = 18,
+    /// Durable FIFO queue of outbound vector insert operations waiting for
+    /// transport to Origin. Keys are big-endian monotonic u64 IDs; values are
+    /// zerompk-encoded `PendingVectorInsert` payloads.
+    VectorInsertPending = 19,
+    /// Durable FIFO queue of outbound vector delete operations waiting for
+    /// transport to Origin. Keys are big-endian monotonic u64 IDs; values are
+    /// zerompk-encoded `PendingVectorDelete` payloads.
+    VectorDeletePending = 20,
+    /// Durable FIFO queue of outbound FTS index operations waiting for
+    /// transport to Origin. Keys are big-endian monotonic u64 IDs; values are
+    /// zerompk-encoded `PendingFtsIndex` payloads.
+    FtsIndexPending = 21,
+    /// Durable FIFO queue of outbound FTS delete operations waiting for
+    /// transport to Origin. Keys are big-endian monotonic u64 IDs; values are
+    /// zerompk-encoded `PendingFtsDelete` payloads.
+    FtsDeletePending = 22,
+    /// Durable FIFO queue of outbound spatial insert operations waiting for
+    /// transport to Origin. Keys are big-endian monotonic u64 IDs; values are
+    /// zerompk-encoded `PendingSpatialInsert` payloads.
+    SpatialInsertPending = 23,
+    /// Durable FIFO queue of outbound spatial delete operations waiting for
+    /// transport to Origin. Keys are big-endian monotonic u64 IDs; values are
+    /// zerompk-encoded `PendingSpatialDelete` payloads.
+    SpatialDeletePending = 24,
 }
 
 impl Namespace {
@@ -105,6 +137,14 @@ impl Namespace {
             14 => Some(Self::GraphHistory),
             15 => Some(Self::DocumentHistory),
             16 => Some(Self::LatestVersion),
+            17 => Some(Self::ColumnarPending),
+            18 => Some(Self::TimeseriesPending),
+            19 => Some(Self::VectorInsertPending),
+            20 => Some(Self::VectorDeletePending),
+            21 => Some(Self::FtsIndexPending),
+            22 => Some(Self::FtsDeletePending),
+            23 => Some(Self::SpatialInsertPending),
+            24 => Some(Self::SpatialDeletePending),
             _ => None,
         }
     }
@@ -116,10 +156,10 @@ mod tests {
 
     #[test]
     fn namespace_roundtrip() {
-        for v in 0u8..=16 {
+        for v in 0u8..=24 {
             let ns = Namespace::from_u8(v).unwrap();
             assert_eq!(ns as u8, v);
         }
-        assert!(Namespace::from_u8(17).is_none());
+        assert!(Namespace::from_u8(25).is_none());
     }
 }

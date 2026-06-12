@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::sync::compensation::CompensationHint;
+use crate::sync::wire::ack_status::AckStatus;
 
 /// Delta push message (client → server, 0x10).
 #[derive(
@@ -34,6 +35,18 @@ pub struct DeltaPushMsg {
     /// default valid-from.
     #[serde(default)]
     pub device_valid_time_ms: Option<i64>,
+    /// Stable identity of the originating producer (Lite peer ID or Origin node ID).
+    /// 0 for legacy / pre-idempotency clients.
+    #[serde(default)]
+    pub producer_id: u64,
+    /// Monotonic epoch counter incremented on every producer restart.
+    /// 0 for legacy / pre-idempotency clients.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Per-stream monotonic sequence number within the epoch.
+    /// 0 for legacy / pre-idempotency clients.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// Delta acknowledgment (server → client, 0x11).
@@ -51,6 +64,13 @@ pub struct DeltaAckMsg {
     /// (≤ 24h). Populated so clients can surface a warning UX.
     #[serde(default)]
     pub clock_skew_warning_ms: Option<i64>,
+    /// Highest sequence number from this producer that has been durably applied.
+    /// 0 when the server has not yet recorded a sequence for this producer.
+    #[serde(default)]
+    pub applied_seq: u64,
+    /// Idempotency outcome of the acknowledged message.
+    #[serde(default)]
+    pub status: AckStatus,
 }
 
 /// Delta rejection (server → client, 0x12).

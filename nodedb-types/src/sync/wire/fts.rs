@@ -14,6 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::sync::wire::ack_status::AckStatus;
+
 /// FTS index request (Lite → Origin, 0xA6).
 ///
 /// Requests that Origin index the concatenated text of a document into its
@@ -33,6 +35,15 @@ pub struct FtsIndexMsg {
     pub text: String,
     /// Monotonic batch ID (Lite-assigned, per-document). Used for ACK correlation.
     pub batch_id: u64,
+    /// Stable identity of the originating producer. 0 for legacy clients.
+    #[serde(default)]
+    pub producer_id: u64,
+    /// Monotonic epoch counter incremented on every producer restart.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Per-stream monotonic sequence number within the epoch.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// FTS index acknowledgment (Origin → Lite, 0xA7).
@@ -51,6 +62,12 @@ pub struct FtsIndexAckMsg {
     /// Rejection detail when `accepted == false`.
     #[serde(default)]
     pub reject_reason: Option<String>,
+    /// Highest sequence number from this producer that has been durably applied.
+    #[serde(default)]
+    pub applied_seq: u64,
+    /// Idempotency outcome of the acknowledged message.
+    #[serde(default)]
+    pub status: AckStatus,
 }
 
 /// FTS delete request (Lite → Origin, 0xA8).
@@ -68,6 +85,15 @@ pub struct FtsDeleteMsg {
     pub doc_id: String,
     /// Monotonic batch ID for ACK correlation.
     pub batch_id: u64,
+    /// Stable identity of the originating producer. 0 for legacy clients.
+    #[serde(default)]
+    pub producer_id: u64,
+    /// Monotonic epoch counter incremented on every producer restart.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Per-stream monotonic sequence number within the epoch.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// FTS delete acknowledgment (Origin → Lite, 0xA9).
@@ -86,4 +112,10 @@ pub struct FtsDeleteAckMsg {
     /// Rejection detail when `accepted == false`.
     #[serde(default)]
     pub reject_reason: Option<String>,
+    /// Highest sequence number from this producer that has been durably applied.
+    #[serde(default)]
+    pub applied_seq: u64,
+    /// Idempotency outcome of the acknowledged message.
+    #[serde(default)]
+    pub status: AckStatus,
 }

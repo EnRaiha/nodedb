@@ -34,6 +34,9 @@ pub struct TimeseriesWalBatch {
     pub collection: String,
     /// Batch of metric samples: (series_id, timestamp_ms, value).
     pub samples: Vec<(SeriesId, i64, f64)>,
+    /// Sync provenance for idempotent WAL replay across replicas.
+    #[serde(default)]
+    pub provenance: Option<crate::sync::wire::SyncProvenance>,
 }
 
 /// WAL record payload for a timeseries log batch.

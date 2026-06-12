@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::sync::wire::ack_status::AckStatus;
+
 /// Columnar batch insert (client → server, 0xA0).
 ///
 /// Carries one or more rows for a columnar collection. Each entry in
@@ -37,6 +39,15 @@ pub struct ColumnarInsertMsg {
     /// that were already synced via definition-sync.
     #[serde(default)]
     pub schema_bytes: Vec<u8>,
+    /// Stable identity of the originating producer. 0 for legacy clients.
+    #[serde(default)]
+    pub producer_id: u64,
+    /// Monotonic epoch counter incremented on every producer restart.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Per-stream monotonic sequence number within the epoch.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// Columnar insert acknowledgment (server → client, 0xA1).
@@ -55,4 +66,10 @@ pub struct ColumnarInsertAckMsg {
     /// Optional rejection detail for the first rejected row.
     #[serde(default)]
     pub reject_reason: Option<String>,
+    /// Highest sequence number from this producer that has been durably applied.
+    #[serde(default)]
+    pub applied_seq: u64,
+    /// Idempotency outcome of the acknowledged message.
+    #[serde(default)]
+    pub status: AckStatus,
 }

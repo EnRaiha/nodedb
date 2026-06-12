@@ -50,22 +50,28 @@
 //! - `0xAD` SpatialDeleteAck (server → client)
 //! - `0xFF` Ping/Pong (bidirectional)
 
+pub mod ack_result;
+pub mod ack_status;
 pub mod array;
 pub mod columnar;
 pub mod delta;
 pub mod frame;
 pub mod fts;
 pub mod presence;
+pub mod provenance;
 pub mod resync;
 pub mod session;
 pub mod shape;
 pub mod spatial;
+pub mod stream_id;
 pub mod timeseries;
 pub mod vector;
 
 #[cfg(test)]
 mod tests;
 
+pub use ack_result::SyncAckResult;
+pub use ack_status::AckStatus;
 pub use array::{
     ArrayAckMsg, ArrayCatchupRequestMsg, ArrayDeltaBatchMsg, ArrayDeltaMsg, ArrayRejectMsg,
     ArrayRejectReason, ArraySchemaSyncMsg, ArraySnapshotChunkMsg, ArraySnapshotMsg,
@@ -75,6 +81,7 @@ pub use delta::{CollectionPurgedMsg, DeltaAckMsg, DeltaPushMsg, DeltaRejectMsg};
 pub use frame::{SyncFrame, SyncMessageType};
 pub use fts::{FtsDeleteAckMsg, FtsDeleteMsg, FtsIndexAckMsg, FtsIndexMsg};
 pub use presence::{PeerPresence, PresenceBroadcastMsg, PresenceLeaveMsg, PresenceUpdateMsg};
+pub use provenance::SyncProvenance;
 pub use resync::{ResyncReason, ResyncRequestMsg, ThrottleMsg};
 pub use session::{
     HandshakeAckMsg, HandshakeMsg, PingPongMsg, TokenRefreshAckMsg, TokenRefreshMsg,
@@ -83,5 +90,6 @@ pub use shape::{
     ShapeDeltaMsg, ShapeSnapshotMsg, ShapeSubscribeMsg, ShapeUnsubscribeMsg, VectorClockSyncMsg,
 };
 pub use spatial::{SpatialDeleteAckMsg, SpatialDeleteMsg, SpatialInsertAckMsg, SpatialInsertMsg};
+pub use stream_id::{EngineKind, stream_id_for};
 pub use timeseries::{DefinitionSyncMsg, TimeseriesAckMsg, TimeseriesPushMsg};
 pub use vector::{VectorDeleteAckMsg, VectorDeleteMsg, VectorInsertAckMsg, VectorInsertMsg};

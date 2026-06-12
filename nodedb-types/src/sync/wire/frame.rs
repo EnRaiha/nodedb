@@ -159,10 +159,16 @@ impl SyncMessageType {
     }
 }
 
-/// Wire frame: wraps a message type + serialized body.
+/// Wire frame: wraps a message type + serialized body with format versioning
+/// and CRC32C integrity protection.
 ///
-/// Layout: `[msg_type: 1B][length: 4B LE][body: N bytes]`
-/// Total header: 5 bytes.
+/// Layout: `[version: 1B][msg_type: 1B][length: 4B LE][crc32c: 4B LE][body: N bytes]`
+/// Total header: 10 bytes.
+///
+/// Mirrors the WAL record header model: every frame carries a format version
+/// byte (enabling hard rejection of future incompatible formats) and a CRC32C
+/// checksum over the body for silent-corruption detection. There is no
+/// checksum-skip sentinel — CRC32C is always computed and always verified.
 ///
 /// `#[non_exhaustive]` — additional header fields (e.g. compression flag,
 /// session token) may be added without breaking downstream consumers.
@@ -174,31 +180,62 @@ pub struct SyncFrame {
 }
 
 impl SyncFrame {
-    pub const HEADER_SIZE: usize = 5;
+    /// Current wire format version embedded in every frame header.
+    pub const FORMAT_VERSION: u8 = 1;
+
+    /// Total size of the frame header in bytes.
+    ///
+    /// Layout: `[version:1][msg_type:1][len:4 LE][crc32c:4 LE]` = 10 bytes.
+    pub const HEADER_SIZE: usize = 10;
 
     /// Serialize a frame to bytes.
+    ///
+    /// Produces `[FORMAT_VERSION][msg_type][body_len as u32 LE][crc32c(body) as u32 LE][body]`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let len = self.body.len() as u32;
+        let crc = crc32c::crc32c(&self.body);
         let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.body.len());
+        buf.push(Self::FORMAT_VERSION);
         buf.push(self.msg_type as u8);
         buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&crc.to_le_bytes());
         buf.extend_from_slice(&self.body);
         buf
     }
 
     /// Deserialize a frame from bytes.
     ///
-    /// Returns `None` if the data is too short or the message type is unknown.
+    /// Returns `None` if:
+    /// - the buffer is shorter than `HEADER_SIZE`,
+    /// - the version byte does not match `FORMAT_VERSION` (unknown future version),
+    /// - the message type discriminant is unrecognised,
+    /// - the buffer is too short to contain the declared body length, or
+    /// - the CRC32C of the body does not match the header checksum (corrupt frame).
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < Self::HEADER_SIZE {
             return None;
         }
-        let msg_type = SyncMessageType::from_u8(data[0])?;
-        let len = u32::from_le_bytes(data[1..5].try_into().ok()?) as usize;
+        let version = data[0];
+        if version != Self::FORMAT_VERSION {
+            return None;
+        }
+        let msg_type = SyncMessageType::from_u8(data[1])?;
+        let len = u32::from_le_bytes(data[2..6].try_into().ok()?) as usize;
+        let expected_crc = u32::from_le_bytes(data[6..10].try_into().ok()?);
         if data.len() < Self::HEADER_SIZE + len {
             return None;
         }
         let body = data[Self::HEADER_SIZE..Self::HEADER_SIZE + len].to_vec();
+        let actual_crc = crc32c::crc32c(&body);
+        if actual_crc != expected_crc {
+            tracing::warn!(
+                msg_type = data[1],
+                expected_crc,
+                actual_crc,
+                "sync frame CRC32C mismatch; dropping corrupt frame"
+            );
+            return None;
+        }
         Some(Self { msg_type, body })
     }
 
@@ -236,5 +273,76 @@ impl SyncFrame {
     /// Deserialize the body from MessagePack.
     pub fn decode_body<T: zerompk::FromMessagePackOwned>(&self) -> Option<T> {
         zerompk::from_msgpack(&self.body).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_frame(msg_type: SyncMessageType, body: Vec<u8>) -> SyncFrame {
+        SyncFrame { msg_type, body }
+    }
+
+    #[test]
+    fn roundtrip_preserves_msg_type_and_body() {
+        let body = b"hello sync world".to_vec();
+        let frame = make_frame(SyncMessageType::PingPong, body.clone());
+        let bytes = frame.to_bytes();
+        let decoded = SyncFrame::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.msg_type, SyncMessageType::PingPong);
+        assert_eq!(decoded.body, body);
+    }
+
+    #[test]
+    fn flipped_body_byte_returns_none() {
+        let body = b"integrity check".to_vec();
+        let frame = make_frame(SyncMessageType::DeltaPush, body);
+        let mut bytes = frame.to_bytes();
+        // Flip a bit in the first body byte (located at HEADER_SIZE).
+        bytes[SyncFrame::HEADER_SIZE] ^= 0xFF;
+        assert!(SyncFrame::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn truncated_buffer_returns_none() {
+        // Buffer shorter than HEADER_SIZE.
+        assert!(SyncFrame::from_bytes(&[]).is_none());
+        assert!(SyncFrame::from_bytes(&[1u8; SyncFrame::HEADER_SIZE - 1]).is_none());
+
+        // Header intact but body truncated by one byte.
+        let frame = make_frame(SyncMessageType::PingPong, b"abcdef".to_vec());
+        let bytes = frame.to_bytes();
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(SyncFrame::from_bytes(truncated).is_none());
+    }
+
+    #[test]
+    fn wrong_version_returns_none() {
+        let frame = make_frame(SyncMessageType::PingPong, b"version test".to_vec());
+        let mut bytes = frame.to_bytes();
+        // Overwrite the version byte with something other than FORMAT_VERSION.
+        bytes[0] = SyncFrame::FORMAT_VERSION.wrapping_add(1);
+        assert!(SyncFrame::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn header_size_is_ten_and_total_length_is_correct() {
+        assert_eq!(SyncFrame::HEADER_SIZE, 10);
+        let body = b"nodedb".to_vec();
+        let frame = make_frame(SyncMessageType::PingPong, body.clone());
+        let bytes = frame.to_bytes();
+        assert_eq!(bytes.len(), SyncFrame::HEADER_SIZE + body.len());
+    }
+
+    #[test]
+    fn crc32c_field_matches_crate_output() {
+        let body = b"crc check".to_vec();
+        let frame = make_frame(SyncMessageType::Handshake, body.clone());
+        let bytes = frame.to_bytes();
+        // CRC32C is stored at bytes[6..10] LE.
+        let stored = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
+        let expected = crc32c::crc32c(&body);
+        assert_eq!(stored, expected);
     }
 }

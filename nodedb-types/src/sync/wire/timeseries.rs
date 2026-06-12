@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::sync::wire::ack_status::AckStatus;
+
 /// Timeseries metric batch push (client → server, 0x40).
 #[derive(
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
@@ -30,6 +32,15 @@ pub struct TimeseriesPushMsg {
     /// Per-series sync watermark: highest LSN already synced for each series.
     /// Only samples after these watermarks are included.
     pub watermarks: HashMap<u64, u64>,
+    /// Stable identity of the originating producer. 0 for legacy clients.
+    #[serde(default)]
+    pub producer_id: u64,
+    /// Monotonic epoch counter incremented on every producer restart.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Per-stream monotonic sequence number within the epoch.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// Timeseries push acknowledgment (server → client, 0x41).
@@ -45,6 +56,12 @@ pub struct TimeseriesAckMsg {
     pub rejected: u64,
     /// Server-assigned LSN for this batch (used as sync watermark).
     pub lsn: u64,
+    /// Highest sequence number from this producer that has been durably applied.
+    #[serde(default)]
+    pub applied_seq: u64,
+    /// Idempotency outcome of the acknowledged message.
+    #[serde(default)]
+    pub status: AckStatus,
 }
 
 /// Definition sync message (server → client, 0x70).
