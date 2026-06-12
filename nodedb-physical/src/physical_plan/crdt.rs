@@ -36,6 +36,9 @@ pub enum CrdtOp {
         mutation_id: u64,
         /// Stable cross-engine identity for the document this delta targets.
         surrogate: Surrogate,
+        /// Sync provenance: identifies the originating peer and sequence for idempotency.
+        #[serde(default)]
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     },
 
     /// Set conflict resolution policy for a CRDT collection (DDL).

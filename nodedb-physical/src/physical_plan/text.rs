@@ -94,6 +94,9 @@ pub enum TextOp {
         surrogate: nodedb_types::Surrogate,
         /// Concatenated text to index.
         text: String,
+        /// Sync provenance: identifies the originating peer and sequence for idempotency.
+        #[serde(default)]
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     },
 
     /// Remove a document from the inverted FTS index.
@@ -103,6 +106,9 @@ pub enum TextOp {
         collection: String,
         /// Pre-assigned global surrogate for `(collection, doc_id)`.
         surrogate: nodedb_types::Surrogate,
+        /// Sync provenance: identifies the originating peer and sequence for idempotency.
+        #[serde(default)]
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     },
 
     /// Three-source hybrid search: vector + BM25 text + graph BFS, fused via weighted RRF.

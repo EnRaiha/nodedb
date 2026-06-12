@@ -52,6 +52,9 @@ pub enum SpatialOp {
         surrogate: Surrogate,
         /// Typed geometry, deserialised on the Control Plane from wire bytes.
         geometry: Geometry,
+        /// Sync provenance: identifies the originating peer and sequence for idempotency.
+        #[serde(default)]
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     },
     /// Remove a document's geometry from the R-tree index.
     ///
@@ -62,6 +65,9 @@ pub enum SpatialOp {
         field: String,
         /// Stable global surrogate for the row.
         surrogate: Surrogate,
+        /// Sync provenance: identifies the originating peer and sequence for idempotency.
+        #[serde(default)]
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     },
     /// R-tree index scan with spatial predicate and exact refinement.
     Scan {

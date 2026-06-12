@@ -66,6 +66,7 @@ pub enum TimeseriesOp {
         /// WAL record LSN for deduplication. Set by the WAL catch-up task
         /// so the Data Plane can skip records that have already been ingested
         /// or flushed to disk. `None` for live ingest (always accepted).
+        #[serde(default)]
         wal_lsn: Option<u64>,
         /// Per-row stable cross-engine identities, parallel to the rows
         /// in `payload`. CP-side assigner populates this in row order
@@ -78,5 +79,8 @@ pub enum TimeseriesOp {
         /// engine integration.
         #[serde(default)]
         surrogates: Vec<Surrogate>,
+        /// Sync provenance: identifies the originating peer and sequence for idempotency.
+        #[serde(default)]
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     },
 }

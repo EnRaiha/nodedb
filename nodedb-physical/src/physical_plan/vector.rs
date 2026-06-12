@@ -72,6 +72,9 @@ pub enum VectorOp {
         /// Control Plane via `SurrogateAssigner` before dispatch; the
         /// engine binds the HNSW node id to this surrogate.
         surrogate: Surrogate,
+        /// Sync provenance: identifies the originating peer and sequence for idempotency.
+        #[serde(default)]
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     },
 
     /// Batch insert vectors into the HNSW index.
@@ -108,6 +111,9 @@ pub enum VectorOp {
         surrogate: nodedb_types::Surrogate,
         /// Named vector field; empty = default field.
         field_name: String,
+        /// Sync provenance: identifies the originating peer and sequence for idempotency.
+        #[serde(default)]
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     },
 
     /// Set vector index parameters for a collection.

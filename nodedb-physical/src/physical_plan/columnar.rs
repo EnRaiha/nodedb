@@ -129,6 +129,14 @@ pub enum ColumnarOp {
         /// Empty `vec![]` only in legacy test fixtures that do not carry schema.
         #[serde(default)]
         schema_bytes: Vec<u8>,
+        /// Sync provenance: identifies the originating peer and sequence for idempotency.
+        #[serde(default)]
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
+        /// WAL record LSN for deduplication. Set by the WAL catch-up task so the
+        /// Data Plane can skip records that have already been ingested or flushed
+        /// to disk. `None` for live ingest (always accepted).
+        #[serde(default)]
+        wal_lsn: Option<u64>,
     },
 
     /// Update rows matching filter predicates.

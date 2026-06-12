@@ -12,6 +12,7 @@
 //! type fidelity at the engine boundary.
 
 use nodedb_array::types::ArrayId;
+use nodedb_types::sync::wire::SyncProvenance;
 use nodedb_types::{SurrogateBitmap, SystemTimeScope};
 
 /// Reducer for [`ArrayOp::Aggregate`]. Numeric `c_enum` keeps the
@@ -90,18 +91,32 @@ pub enum ArrayOp {
     /// to its `coord` tuple — cross-engine bitmap joins read the
     /// surrogate column on read paths instead of translating coords
     /// back to user-visible PKs.
+    ///
+    /// `provenance` is `Some` only on the inbound sync path (Lite → Origin).
+    /// The Data Plane uses it for epoch fencing and HWM tracking.
+    /// Non-sync callers (SQL DML, Raft apply) set this to `None`.
     Put {
         array_id: ArrayId,
         cells_msgpack: Vec<u8>,
         wal_lsn: u64,
+        /// Sync provenance for epoch fencing and HWM tracking.
+        /// `None` for locally-originated or Raft-replicated writes.
+        #[serde(default)]
+        provenance: Option<SyncProvenance>,
     },
 
     /// Delete by exact coordinates. `coords_msgpack` is an zerompk
     /// encoding of `Vec<Vec<CoordValue>>`.
+    ///
+    /// `provenance` is `Some` only on the inbound sync path (Lite → Origin).
     Delete {
         array_id: ArrayId,
         coords_msgpack: Vec<u8>,
         wal_lsn: u64,
+        /// Sync provenance for epoch fencing and HWM tracking.
+        /// `None` for locally-originated or Raft-replicated writes.
+        #[serde(default)]
+        provenance: Option<SyncProvenance>,
     },
 
     /// Coord-range slice with optional attribute projection.
