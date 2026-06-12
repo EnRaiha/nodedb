@@ -5,9 +5,22 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::types::TenantId;
 
+use crate::wal::replay::SyncHwmReplayMaps;
+
 use super::CoreLoop;
 
 impl CoreLoop {
+    /// Install reconstructed sync HWM state from WAL replay.
+    ///
+    /// Called once by `spawn_core` (in `data/runtime.rs`) immediately after
+    /// WAL replay and before the core enters its event loop. Overwrites both
+    /// `sync_hwm` and `producer_epoch_floor` with the maps built by
+    /// [`crate::wal::replay::replay_sync_hwm_records`].
+    pub fn install_sync_hwm_maps(&mut self, maps: SyncHwmReplayMaps) {
+        self.sync_hwm = maps.sync_hwm;
+        self.producer_epoch_floor = maps.producer_epoch_floor;
+    }
+
     /// Install the shared scan-quiesce registry. Called once by the
     /// server bootstrap in `main.rs` after `SharedState::open`.
     pub fn set_quiesce(

@@ -6,7 +6,7 @@ use crate::bridge::envelope::Response;
 use nodedb_physical::physical_plan::TimeseriesOp;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::timeseries::TimeseriesScanParams;
+use crate::data::executor::handlers::timeseries::{TimeseriesIngestExec, TimeseriesScanParams};
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
@@ -51,14 +51,16 @@ impl CoreLoop {
                 format,
                 wal_lsn,
                 surrogates: _,
-            } => self.execute_timeseries_ingest(
+                provenance,
+            } => self.execute_timeseries_ingest(TimeseriesIngestExec {
                 task,
-                task.request.tenant_id,
+                tid: task.request.tenant_id,
                 collection,
                 payload,
                 format,
-                *wal_lsn,
-            ),
+                wal_lsn: *wal_lsn,
+                provenance: provenance.as_ref(),
+            }),
         }
     }
 }

@@ -101,6 +101,8 @@ impl CoreLoop {
             deleted_nodes: HashMap::new(),
             idempotency_cache: HashMap::new(),
             idempotency_order: std::collections::VecDeque::new(),
+            sync_hwm: HashMap::new(),
+            producer_epoch_floor: HashMap::new(),
             stats_store,
             aggregate_cache: HashMap::new(),
             last_maintenance: None,

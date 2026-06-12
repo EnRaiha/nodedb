@@ -10,6 +10,8 @@ pub mod ingest_formats;
 mod msgpack_decode;
 pub mod raw_scan;
 
+pub(in crate::data::executor) use ingest::TimeseriesIngestExec;
+
 use crate::bridge::envelope::{Payload, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;

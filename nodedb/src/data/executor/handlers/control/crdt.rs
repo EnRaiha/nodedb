@@ -5,7 +5,10 @@
 
 use tracing::{debug, warn};
 
+use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
+
 use crate::bridge::envelope::{ErrorCode, Response};
+use crate::data::executor::sync_gate::SyncAdmit;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
@@ -346,34 +349,103 @@ impl CoreLoop {
         &mut self,
         task: &ExecutionTask,
         delta: &[u8],
+        provenance: Option<&SyncProvenance>,
     ) -> Response {
         let tenant_id = task.request.tenant_id;
-        let engine = match self.get_crdt_engine(tenant_id) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
+
+        let Some(prov) = provenance else {
+            // Non-sync path (SQL / native client): apply unconditionally, no gate.
+            let engine = match self.get_crdt_engine(tenant_id) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    );
+                }
+            };
+            return match engine.apply_committed_delta(delta) {
+                Ok(()) => {
+                    self.checkpoint_coordinator.mark_dirty("crdt", 1);
+                    self.response_ok(task)
+                }
+                Err(e) => {
+                    warn!(core = self.core_id, error = %e, "crdt apply failed");
+                    self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    )
+                }
+            };
         };
-        match engine.apply_committed_delta(delta) {
-            Ok(()) => {
-                self.checkpoint_coordinator.mark_dirty("crdt", 1);
-                self.response_ok(task)
+
+        // Sync path: run the idempotency gate before touching the engine.
+        // Call sync_admit first (exclusive &mut self borrow, no engine borrow).
+        let admit = self.sync_admit(prov);
+
+        // Snapshot the current HWM for Duplicate / Fenced / Gap responses
+        // before any engine borrow.
+        let current_hwm = self.sync_hwm_value(prov.producer_id, prov.stream_id);
+
+        let (status, applied_seq) = match admit {
+            SyncAdmit::Apply => {
+                // Borrow the engine in a nested block so the &mut borrow is
+                // dropped before sync_commit takes &mut self for sync_hwm.
+                let apply_result = {
+                    let engine = match self.get_crdt_engine(tenant_id) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
+                            return self.response_error(
+                                task,
+                                ErrorCode::Internal {
+                                    detail: e.to_string(),
+                                },
+                            );
+                        }
+                    };
+                    engine.apply_committed_delta(delta)
+                };
+                match apply_result {
+                    Ok(()) => {
+                        self.checkpoint_coordinator.mark_dirty("crdt", 1);
+                    }
+                    Err(e) => {
+                        warn!(core = self.core_id, error = %e, "crdt apply failed");
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: e.to_string(),
+                            },
+                        );
+                    }
+                }
+                // Advance the HWM only after the engine apply succeeds.
+                // engine borrow is already dropped at this point.
+                self.sync_commit(prov);
+                (AckStatus::Applied, prov.seq)
             }
-            Err(e) => {
-                warn!(core = self.core_id, error = %e, "crdt apply failed");
-                self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                )
-            }
-        }
+            SyncAdmit::Duplicate => (AckStatus::Duplicate, current_hwm),
+            SyncAdmit::Fenced => (AckStatus::Fenced, current_hwm),
+            SyncAdmit::Gap { expected } => (AckStatus::Gap { expected }, current_hwm),
+        };
+
+        self.sync_ack_response(task, status, applied_seq)
+    }
+
+    /// Read the current HWM for a `(producer_id, stream_id)` pair without
+    /// advancing it. Returns `0` when no frame from this producer has been
+    /// committed on this stream yet.
+    pub(in crate::data::executor) fn sync_hwm_value(
+        &self,
+        producer_id: u64,
+        stream_id: u64,
+    ) -> u64 {
+        *self.sync_hwm.get(&(producer_id, stream_id)).unwrap_or(&0)
     }
 }

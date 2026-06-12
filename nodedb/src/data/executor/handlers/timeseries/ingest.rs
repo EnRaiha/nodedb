@@ -7,9 +7,12 @@
 
 use std::collections::HashMap;
 
+use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
+
 use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
+use crate::data::executor::sync_gate::{SyncAdmit, ack_status_from_admit};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::timeseries::columnar_memtable::{
     ColumnType, ColumnarMemtable, ColumnarMemtableConfig,
@@ -17,25 +20,75 @@ use crate::engine::timeseries::columnar_memtable::{
 use crate::engine::timeseries::ilp;
 use crate::engine::timeseries::ilp_ingest;
 
+/// Parameters for a timeseries ingest operation on the Data Plane.
+///
+/// Bundles the non-`self` arguments to `execute_timeseries_ingest` so the
+/// method stays within the argument-count limit.
+pub(in crate::data::executor) struct TimeseriesIngestExec<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: crate::types::TenantId,
+    pub collection: &'a str,
+    pub payload: &'a [u8],
+    pub format: &'a str,
+    pub wal_lsn: Option<u64>,
+    pub provenance: Option<&'a SyncProvenance>,
+}
+
 impl CoreLoop {
     /// Execute a timeseries ingest.
     ///
-    /// `wal_lsn` is set by the WAL catch-up task to enable deduplication:
-    /// if the record has already been ingested (LSN <= max ingested) or
-    /// flushed to disk (LSN <= max flushed), the ingest is skipped.
+    /// When `provenance` is `Some`, the sync idempotency gate runs first:
+    /// - Duplicate / Fenced / Gap → return `SyncAckResult` via `response_with_payload`
+    ///   without re-applying engine state.
+    /// - Apply → continue; after the memtable write call `sync_commit` to
+    ///   advance the HWM, then return `SyncAckResult{Applied}` via payload.
+    ///
+    /// When `provenance` is `None` (SQL / ILP paths), behave exactly as
+    /// before: no gate, no `SyncAckResult` in the payload.
+    ///
+    /// `wal_lsn` deduplication (last-flushed skip) is preserved on the Apply
+    /// branch: if the record is already on disk the memtable write is skipped,
+    /// but `sync_commit` still advances the HWM because the record WAS
+    /// applied (durably flushed to a segment).
     pub(in crate::data::executor) fn execute_timeseries_ingest(
         &mut self,
-        task: &ExecutionTask,
-        tid: crate::types::TenantId,
-        collection: &str,
-        payload: &[u8],
-        format: &str,
-        wal_lsn: Option<u64>,
+        args: TimeseriesIngestExec<'_>,
     ) -> Response {
+        let TimeseriesIngestExec {
+            task,
+            tid,
+            collection,
+            payload,
+            format,
+            wal_lsn,
+            provenance,
+        } = args;
+        // ── Sync idempotency gate (Data-Plane side) ──────────────────────────
+        if let Some(prov) = provenance {
+            let admit = self.sync_admit(prov);
+            match admit {
+                SyncAdmit::Apply => {
+                    // Fall through to the ingest path below.
+                    // sync_commit is called AFTER the memtable write.
+                }
+                non_apply => {
+                    let current_hwm = self.sync_hwm_value(prov.producer_id, prov.stream_id);
+                    return self.sync_ack_response(
+                        task,
+                        ack_status_from_admit(&non_apply),
+                        current_hwm,
+                    );
+                }
+            }
+        }
+
         let key = (tid, collection.to_string());
-        // LSN-based deduplication: only skip records that are provably
-        // already flushed to sealed disk partitions.
-        if let Some(lsn) = wal_lsn
+
+        // ── LSN-based deduplication (last-flushed skip) ──────────────────────
+        // Skip memtable re-apply if the record was already flushed to disk.
+        // On the sync path we still advance the HWM after this check because
+        // the record IS durably applied (on the flushed segment).
+        let already_flushed = if let Some(lsn) = wal_lsn
             && let Some(registry) = self.ts_registries.get(&key)
         {
             let max_flushed = registry
@@ -43,34 +96,47 @@ impl CoreLoop {
                 .map(|(_, e)| e.meta.last_flushed_wal_lsn)
                 .max()
                 .unwrap_or(0);
-            if max_flushed > 0 && lsn <= max_flushed {
-                let result = serde_json::json!({
-                    "accepted": 0,
-                    "rejected": 0,
-                    "collection": collection,
-                    "dedup_skipped": true,
-                });
-                let json = match response_codec::encode_json(&result) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: e.to_string(),
-                            },
-                        );
-                    }
-                };
-                return Response {
-                    request_id: task.request.request_id,
-                    status: Status::Ok,
-                    attempt: 1,
-                    partial: false,
-                    payload: Payload::from_vec(json),
-                    watermark_lsn: self.watermark,
-                    error_code: None,
-                };
+            max_flushed > 0 && lsn <= max_flushed
+        } else {
+            false
+        };
+
+        if already_flushed {
+            // Advance the HWM even though the memtable write is skipped — the
+            // record is durable on disk, so the seq counts as applied.
+            if let Some(prov) = provenance {
+                self.sync_commit(prov);
+                let applied_seq = self.sync_hwm_value(prov.producer_id, prov.stream_id);
+                return self.sync_ack_response(task, AckStatus::Applied, applied_seq);
             }
+
+            // Non-sync path: return original dedup_skipped JSON shape.
+            let result = serde_json::json!({
+                "accepted": 0,
+                "rejected": 0,
+                "collection": collection,
+                "dedup_skipped": true,
+            });
+            let json = match response_codec::encode_json(&result) {
+                Ok(b) => b,
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    );
+                }
+            };
+            return Response {
+                request_id: task.request.request_id,
+                status: Status::Ok,
+                attempt: 1,
+                partial: false,
+                payload: Payload::from_vec(json),
+                watermark_lsn: self.watermark,
+                error_code: None,
+            };
         }
 
         // Use the epoch's deterministic timestamp when executing inside a Calvin
@@ -83,19 +149,35 @@ impl CoreLoop {
                 .unwrap_or(0)
         });
 
-        match format {
+        let ingest_response = match format {
             "ilp" => self.execute_ilp_ingest(task, tid, collection, payload, wal_lsn, now_ms),
             "json" => self.execute_json_ingest(task, tid, collection, payload, wal_lsn, now_ms),
             "msgpack" => {
                 self.execute_msgpack_ingest(task, tid, collection, payload, wal_lsn, now_ms)
             }
-            _ => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("unknown ingest format: {format}"),
-                },
-            ),
+            _ => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("unknown ingest format: {format}"),
+                    },
+                );
+            }
+        };
+
+        // On the sync path, advance the HWM after a successful ingest and
+        // return a SyncAckResult payload instead of the normal JSON body.
+        if let Some(prov) = provenance
+            && ingest_response.status == Status::Ok
+        {
+            self.sync_commit(prov);
+            let applied_seq = self.sync_hwm_value(prov.producer_id, prov.stream_id);
+            return self.sync_ack_response(task, AckStatus::Applied, applied_seq);
         }
+
+        // Either no provenance, or ingest failed on the Apply path — surface
+        // the response as-is; the HWM is NOT advanced (record not applied).
+        ingest_response
     }
 
     pub(super) fn execute_ilp_ingest(

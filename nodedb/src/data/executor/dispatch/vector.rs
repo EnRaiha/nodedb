@@ -32,6 +32,7 @@ impl CoreLoop {
                 dim,
                 field_name,
                 surrogate,
+                provenance,
             } => self.execute_vector_insert(super::super::handlers::vector::VectorInsertParams {
                 task,
                 tid,
@@ -40,6 +41,7 @@ impl CoreLoop {
                 dim: *dim,
                 field_name,
                 surrogate: *surrogate,
+                provenance: provenance.as_ref(),
             }),
 
             VectorOp::BatchInsert {
@@ -259,8 +261,15 @@ impl CoreLoop {
                 collection,
                 surrogate,
                 field_name,
-            } => self
-                .execute_vector_delete_by_surrogate(task, tid, collection, *surrogate, field_name),
+                provenance,
+            } => self.execute_vector_delete_by_surrogate(
+                task,
+                tid,
+                collection,
+                *surrogate,
+                field_name,
+                provenance.as_ref(),
+            ),
         }
     }
 }

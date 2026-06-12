@@ -76,51 +76,22 @@ impl CoreLoop {
                 collection,
                 surrogate,
                 text,
-            } => {
-                use nodedb_types::TenantId;
-
-                let tenant_id = TenantId::new(tid);
-                match self
-                    .inverted
-                    .index_document(tenant_id, collection, *surrogate, text)
-                {
-                    Ok(()) => self.response_ok(task),
-                    Err(e) => {
-                        tracing::warn!(
-                            core = self.core_id,
-                            %collection,
-                            surrogate = surrogate.as_u32(),
-                            error = %e,
-                            "FtsIndexDoc: inverted index write failed"
-                        );
-                        self.response_error(task, e)
-                    }
-                }
-            }
+                provenance,
+            } => self.execute_fts_index_doc(
+                task,
+                tid,
+                collection,
+                *surrogate,
+                text,
+                provenance.as_ref(),
+            ),
 
             TextOp::FtsDeleteDoc {
                 collection,
                 surrogate,
+                provenance,
             } => {
-                use nodedb_types::TenantId;
-
-                let tenant_id = TenantId::new(tid);
-                match self
-                    .inverted
-                    .remove_document(tenant_id, collection, *surrogate)
-                {
-                    Ok(()) => self.response_ok(task),
-                    Err(e) => {
-                        tracing::warn!(
-                            core = self.core_id,
-                            %collection,
-                            surrogate = surrogate.as_u32(),
-                            error = %e,
-                            "FtsDeleteDoc: inverted index removal failed"
-                        );
-                        self.response_error(task, e)
-                    }
-                }
+                self.execute_fts_delete_doc(task, tid, collection, *surrogate, provenance.as_ref())
             }
 
             TextOp::HybridSearchTriple {

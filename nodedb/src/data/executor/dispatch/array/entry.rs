@@ -38,12 +38,22 @@ impl CoreLoop {
                 array_id,
                 cells_msgpack,
                 wal_lsn,
-            } => self.handle_array_put(task, array_id, cells_msgpack, *wal_lsn),
+                provenance,
+            } => {
+                self.handle_array_put(task, array_id, cells_msgpack, *wal_lsn, provenance.as_ref())
+            }
             ArrayOp::Delete {
                 array_id,
                 coords_msgpack,
                 wal_lsn,
-            } => self.handle_array_delete(task, array_id, coords_msgpack, *wal_lsn),
+                provenance,
+            } => self.handle_array_delete(
+                task,
+                array_id,
+                coords_msgpack,
+                *wal_lsn,
+                provenance.as_ref(),
+            ),
             ArrayOp::Flush { array_id, wal_lsn } => {
                 self.handle_array_flush(task, array_id, *wal_lsn)
             }

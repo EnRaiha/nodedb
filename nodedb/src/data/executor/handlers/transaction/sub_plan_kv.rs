@@ -11,6 +11,7 @@ use nodedb_columnar::pk_index::RowLocation;
 
 use crate::bridge::envelope::{ErrorCode, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::timeseries::TimeseriesIngestExec;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::ColumnarInsertIntent;
@@ -62,6 +63,7 @@ impl CoreLoop {
             on_conflict_updates,
             surrogates,
             schema_bytes,
+            None,
         );
         if resp.status == Status::Error {
             return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
@@ -167,7 +169,15 @@ impl CoreLoop {
             .map(|mt| mt.row_count())
             .unwrap_or(0);
 
-        let resp = self.execute_timeseries_ingest(task, tid, collection, payload, format, wal_lsn);
+        let resp = self.execute_timeseries_ingest(TimeseriesIngestExec {
+            task,
+            tid,
+            collection,
+            payload,
+            format,
+            wal_lsn,
+            provenance: None,
+        });
         if resp.status == Status::Error {
             return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                 detail: "timeseries ingest failed".into(),

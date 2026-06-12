@@ -129,6 +129,7 @@ impl CoreLoop {
                 dim,
                 field_name,
                 surrogate,
+                provenance: _,
             }) => {
                 let index_key = Self::vector_index_key(tid, collection, field_name);
                 let params = self
@@ -283,6 +284,8 @@ impl CoreLoop {
                 on_conflict_updates,
                 surrogates,
                 schema_bytes,
+                provenance: _,
+                wal_lsn: _,
             }) => self.execute_tx_columnar_insert(
                 &dummy_task,
                 collection,

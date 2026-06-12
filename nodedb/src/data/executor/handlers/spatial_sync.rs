@@ -29,6 +29,7 @@ use tracing::{debug, error};
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::sync_gate::{SyncAdmit, ack_status_from_admit};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
 use crate::engine::spatial::RTreeEntry;
@@ -37,6 +38,21 @@ use crate::util::fnv1a_hash;
 use nodedb_types::Surrogate;
 use nodedb_types::bbox::geometry_bbox;
 use nodedb_types::geometry::Geometry;
+use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
+
+/// Parameters for a spatial geometry insert on the Data Plane.
+///
+/// Bundles the non-`self` arguments to `execute_spatial_insert` so the
+/// method stays within the argument-count limit.
+pub(in crate::data::executor) struct SpatialInsertExec<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub field: &'a str,
+    pub surrogate: Surrogate,
+    pub geometry: &'a Geometry,
+    pub provenance: Option<&'a SyncProvenance>,
+}
 
 impl CoreLoop {
     /// Insert a geometry into the per-field R-tree and the sparse document store
@@ -53,13 +69,17 @@ impl CoreLoop {
     /// replaced (upsert semantics).
     pub(in crate::data::executor) fn execute_spatial_insert(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        field: &str,
-        surrogate: Surrogate,
-        geometry: &Geometry,
+        args: SpatialInsertExec<'_>,
     ) -> Response {
+        let SpatialInsertExec {
+            task,
+            tid,
+            collection,
+            field,
+            surrogate,
+            geometry,
+            provenance,
+        } = args;
         let doc_id = surrogate_to_doc_id(surrogate);
 
         debug!(
@@ -70,6 +90,23 @@ impl CoreLoop {
             surrogate = surrogate.as_u32(),
             "spatial sync: insert geometry"
         );
+
+        // ── Idempotency gate ────────────────────────────────────────────────
+        if let Some(prov) = provenance {
+            match self.sync_admit(prov) {
+                SyncAdmit::Apply => {
+                    // Fall through to engine write below; commit after.
+                }
+                admit @ (SyncAdmit::Duplicate | SyncAdmit::Fenced | SyncAdmit::Gap { .. }) => {
+                    let applied_seq = self.sync_hwm_value(prov.producer_id, prov.stream_id);
+                    return self.sync_ack_response(
+                        task,
+                        ack_status_from_admit(&admit),
+                        applied_seq,
+                    );
+                }
+            }
+        }
 
         // ── 1. Serialise + write minimal geometry document to sparse store ──
         let geom_value = geometry_to_value(geometry);
@@ -138,6 +175,12 @@ impl CoreLoop {
         rtree.insert(RTreeEntry { id: entry_id, bbox });
         self.spatial_doc_map.insert(doc_map_key, doc_id);
 
+        // Advance HWM and return gate result payload when provenance is present.
+        if let Some(prov) = provenance {
+            self.sync_commit(prov);
+            return self.sync_ack_response(task, AckStatus::Applied, prov.seq);
+        }
+
         self.response_ok(task)
     }
 
@@ -156,6 +199,7 @@ impl CoreLoop {
         collection: &str,
         field: &str,
         surrogate: Surrogate,
+        provenance: Option<&SyncProvenance>,
     ) -> Response {
         let doc_id = surrogate_to_doc_id(surrogate);
 
@@ -167,6 +211,21 @@ impl CoreLoop {
             surrogate = surrogate.as_u32(),
             "spatial sync: delete geometry"
         );
+
+        // ── Idempotency gate ────────────────────────────────────────────────
+        if let Some(prov) = provenance {
+            match self.sync_admit(prov) {
+                SyncAdmit::Apply => {}
+                admit @ (SyncAdmit::Duplicate | SyncAdmit::Fenced | SyncAdmit::Gap { .. }) => {
+                    let applied_seq = self.sync_hwm_value(prov.producer_id, prov.stream_id);
+                    return self.sync_ack_response(
+                        task,
+                        ack_status_from_admit(&admit),
+                        applied_seq,
+                    );
+                }
+            }
+        }
 
         if let Err(e) = self.sparse.delete(tid, collection, &doc_id) {
             error!(
@@ -193,6 +252,11 @@ impl CoreLoop {
             rtree.delete(entry_id);
         }
         self.spatial_doc_map.remove(&doc_map_key);
+
+        if let Some(prov) = provenance {
+            self.sync_commit(prov);
+            return self.sync_ack_response(task, AckStatus::Applied, prov.seq);
+        }
 
         self.response_ok(task)
     }

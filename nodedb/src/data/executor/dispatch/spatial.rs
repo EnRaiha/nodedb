@@ -6,6 +6,7 @@ use crate::bridge::envelope::Response;
 use nodedb_physical::physical_plan::SpatialOp;
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::spatial_sync::SpatialInsertExec;
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
@@ -21,13 +22,30 @@ impl CoreLoop {
                 field,
                 surrogate,
                 geometry,
-            } => self.execute_spatial_insert(task, tid, collection, field, *surrogate, geometry),
+                provenance,
+            } => self.execute_spatial_insert(SpatialInsertExec {
+                task,
+                tid,
+                collection,
+                field,
+                surrogate: *surrogate,
+                geometry,
+                provenance: provenance.as_ref(),
+            }),
 
             SpatialOp::Delete {
                 collection,
                 field,
                 surrogate,
-            } => self.execute_spatial_delete(task, tid, collection, field, *surrogate),
+                provenance,
+            } => self.execute_spatial_delete(
+                task,
+                tid,
+                collection,
+                field,
+                *surrogate,
+                provenance.as_ref(),
+            ),
 
             SpatialOp::Scan {
                 collection,

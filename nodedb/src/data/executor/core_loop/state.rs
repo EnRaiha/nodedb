@@ -143,6 +143,20 @@ pub struct CoreLoop {
     /// FIFO order of idempotency keys for correct eviction (oldest first).
     pub(in crate::data::executor) idempotency_order: std::collections::VecDeque<u64>,
 
+    /// Per-stream sync high-watermark: the last `seq` durably applied for each
+    /// `(producer_id, stream_id)` pair. Populated from WAL replay on startup;
+    /// advanced by `sync_commit` after WAL durability. Never shared — this map
+    /// lives exclusively on the owning core.
+    pub(in crate::data::executor) sync_hwm:
+        HashMap<(u64 /* producer_id */, u64 /* stream_id */), u64 /* last applied seq */>,
+
+    /// Per-producer epoch floor: the highest epoch seen for each `producer_id`.
+    /// When a newer epoch arrives the floor is advanced immediately (monotonic
+    /// and also persisted in the registry/WAL). Frames carrying an older epoch
+    /// are fenced without state change.
+    pub(in crate::data::executor) producer_epoch_floor:
+        HashMap<u64 /* producer_id */, u64 /* highest epoch seen */>,
+
     /// Column statistics store for CBO. Shares redb with sparse engine.
     /// Updated incrementally on PointPut. Read by DataFusion optimizer.
     pub(in crate::data::executor) stats_store: crate::engine::sparse::stats::StatsStore,

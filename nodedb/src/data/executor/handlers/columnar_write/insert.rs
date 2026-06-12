@@ -6,12 +6,14 @@
 use nodedb_columnar::MutationEngine;
 use nodedb_types::columnar::{ColumnType, ColumnarSchema};
 use nodedb_types::surrogate::Surrogate;
+use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
 use nodedb_types::value::Value;
 
 use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::upsert::apply_on_conflict_updates;
 use crate::data::executor::response_codec;
+use crate::data::executor::sync_gate::{SyncAdmit, ack_status_from_admit};
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::ColumnarInsertIntent;
 use nodedb_physical::physical_plan::document::UpdateValue;
@@ -26,6 +28,14 @@ impl CoreLoop {
     /// PK (upsert-overwrite for `Insert` and `Put`, silent skip for
     /// `InsertIfAbsent`, merge-via-`apply_on_conflict_updates` for `Put`
     /// with non-empty `on_conflict_updates`).
+    ///
+    /// When `provenance` is `Some`, the sync idempotency gate runs first.
+    /// Duplicate / Fenced / Gap arms return `SyncAckResult` via
+    /// `response_with_payload` without touching engine state.
+    /// Apply → proceed with insert → call `sync_commit` → return
+    /// `SyncAckResult{Applied}`.
+    ///
+    /// When `provenance` is `None` (SQL path), behave as before.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_columnar_insert(
         &mut self,
@@ -37,7 +47,25 @@ impl CoreLoop {
         on_conflict_updates: &[(String, UpdateValue)],
         surrogates: &[Surrogate],
         schema_bytes: &[u8],
+        provenance: Option<&SyncProvenance>,
     ) -> Response {
+        // ── Sync idempotency gate (Data-Plane side) ──────────────────────────
+        if let Some(prov) = provenance {
+            let admit = self.sync_admit(prov);
+            match admit {
+                SyncAdmit::Apply => {
+                    // Fall through to the insert path below.
+                }
+                non_apply => {
+                    let current_hwm = self.sync_hwm_value(prov.producer_id, prov.stream_id);
+                    return self.sync_ack_response(
+                        task,
+                        ack_status_from_admit(&non_apply),
+                        current_hwm,
+                    );
+                }
+            }
+        }
         // Parse payload: msgpack-encoded nodedb_types::Value (array or object).
         let ndb_rows: Vec<nodedb_types::Value> = match nodedb_types::value_from_msgpack(payload) {
             Ok(nodedb_types::Value::Array(arr)) => arr,
@@ -301,11 +329,29 @@ impl CoreLoop {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        // The memtable was already drained above, so these rows
+                        // are no longer in memory and were NOT encoded to a
+                        // segment. We must not continue and report success: on
+                        // the sync path that would call `sync_commit` + return
+                        // `AckStatus::Applied`, telling the client durably-lost
+                        // data was applied and advancing the HWM so the retry is
+                        // never re-admitted. Fail hard instead — the HWM stays
+                        // put and the client (or SQL caller) retries.
+                        tracing::error!(
                             core = self.core_id,
                             %collection,
+                            new_segment_id,
+                            row_count,
                             error = %e,
-                            "columnar segment encode failed; flushed rows may be lost"
+                            "columnar segment encode failed; drained rows not durable, failing the write"
+                        );
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!(
+                                    "columnar segment encode failed, {row_count} rows not durable: {e}"
+                                ),
+                            },
                         );
                     }
                 }
@@ -394,6 +440,13 @@ impl CoreLoop {
 
         self.checkpoint_coordinator
             .mark_dirty("columnar", accepted as usize);
+
+        // On the sync path, advance the HWM and return SyncAckResult payload.
+        if let Some(prov) = provenance {
+            self.sync_commit(prov);
+            let applied_seq = self.sync_hwm_value(prov.producer_id, prov.stream_id);
+            return self.sync_ack_response(task, AckStatus::Applied, applied_seq);
+        }
 
         let result = serde_json::json!({
             "accepted": accepted,

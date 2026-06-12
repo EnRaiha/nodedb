@@ -133,6 +133,7 @@ impl Harness {
             array_id: aid.clone(),
             cells_msgpack: bytes,
             wal_lsn: lsn,
+            provenance: None,
         });
         assert_eq!(r.status, Status::Ok, "put failed: {r:?}");
     }
@@ -785,6 +786,7 @@ fn vector_search_with_array_surrogate_prefilter() {
             dim: 3,
             field_name: String::new(),
             surrogate: Surrogate(i + 1),
+            provenance: None,
         }));
         assert_eq!(r.status, Status::Ok, "vector insert {i} failed: {r:?}");
     }

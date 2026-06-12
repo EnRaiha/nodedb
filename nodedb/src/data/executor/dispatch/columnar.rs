@@ -47,6 +47,8 @@ impl CoreLoop {
                 on_conflict_updates,
                 surrogates,
                 schema_bytes,
+                provenance,
+                wal_lsn: _,
             } => {
                 if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
                     return r;
@@ -60,6 +62,7 @@ impl CoreLoop {
                     on_conflict_updates,
                     surrogates,
                     schema_bytes,
+                    provenance.as_ref(),
                 )
             }
 

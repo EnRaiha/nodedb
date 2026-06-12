@@ -23,7 +23,8 @@ impl CoreLoop {
                 peer_id: _,
                 mutation_id: _,
                 surrogate: _,
-            } => self.execute_crdt_apply(task, delta),
+                provenance,
+            } => self.execute_crdt_apply(task, delta, provenance.as_ref()),
 
             CrdtOp::SetPolicy {
                 collection,

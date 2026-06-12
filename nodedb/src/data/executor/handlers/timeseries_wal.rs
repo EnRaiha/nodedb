@@ -8,6 +8,7 @@
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::timeseries::TimeseriesIngestExec;
 use crate::data::executor::task::{ExecutionTask, TaskState};
 use crate::engine::timeseries::columnar_memtable::{
     ColumnarMemtable, ColumnarMemtableConfig, ColumnarSchema,
@@ -72,6 +73,7 @@ impl CoreLoop {
         collection: &str,
         payload: &[u8],
         record_lsn: u64,
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     ) -> usize {
         if let Ok(batch) =
             zerompk::from_msgpack::<nodedb_types::timeseries::TimeseriesWalBatch>(payload)
@@ -115,16 +117,18 @@ impl CoreLoop {
                 format: format.to_string(),
                 wal_lsn: Some(record_lsn),
                 surrogates: Vec::new(),
+                provenance: provenance.clone(),
             }),
         );
-        let response = self.execute_timeseries_ingest(
-            &task,
+        let response = self.execute_timeseries_ingest(TimeseriesIngestExec {
+            task: &task,
             tid,
             collection,
             payload,
             format,
-            Some(record_lsn),
-        );
+            wal_lsn: Some(record_lsn),
+            provenance: provenance.as_ref(),
+        });
         if response.status != crate::bridge::envelope::Status::Ok {
             tracing::warn!(
                 "timeseries WAL replay failed for collection={collection} lsn={record_lsn}: {:?}",
@@ -145,6 +149,8 @@ impl CoreLoop {
         db_id: DatabaseId,
         collection: &str,
         payload: &[u8],
+        record_lsn: u64,
+        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     ) -> usize {
         let task = Self::replay_task(
             tid,
@@ -158,6 +164,8 @@ impl CoreLoop {
                 on_conflict_updates: Vec::new(),
                 surrogates: Vec::new(),
                 schema_bytes: Vec::new(),
+                provenance: provenance.clone(),
+                wal_lsn: Some(record_lsn),
             }),
         );
         let response = self.execute_columnar_insert(
@@ -169,10 +177,11 @@ impl CoreLoop {
             &[],
             &[],
             &[],
+            provenance.as_ref(),
         );
         if response.status != crate::bridge::envelope::Status::Ok {
             tracing::warn!(
-                "columnar WAL replay failed for collection={collection}: {:?}",
+                "columnar WAL replay failed for collection={collection} lsn={record_lsn}: {:?}",
                 response.error_code
             );
             return 0;
@@ -221,13 +230,26 @@ impl CoreLoop {
                 continue;
             }
 
-            let decoded = zerompk::from_msgpack::<(String, String, Vec<u8>)>(&record.payload)
-                .map(|(kind, collection, payload)| (Some(kind), collection, payload))
-                .or_else(|_| {
-                    zerompk::from_msgpack::<(String, Vec<u8>)>(&record.payload)
-                        .map(|(collection, payload)| (None, collection, payload))
-                });
-            let Ok((kind, raw_collection, payload)) = decoded else {
+            // Decode 4-tuple (with provenance), falling back to 3-tuple then
+            // 2-tuple for backwards compatibility with older WAL records.
+            // Records iterate in LSN order (guaranteed by the WAL segment layout),
+            // so provenance-aware replay naturally processes seq in order.
+            let decoded = zerompk::from_msgpack::<(
+                String,
+                String,
+                Vec<u8>,
+                Option<nodedb_types::sync::wire::SyncProvenance>,
+            )>(&record.payload)
+            .map(|(kind, collection, payload, prov)| (Some(kind), collection, payload, prov))
+            .or_else(|_| {
+                zerompk::from_msgpack::<(String, String, Vec<u8>)>(&record.payload)
+                    .map(|(kind, collection, payload)| (Some(kind), collection, payload, None))
+            })
+            .or_else(|_| {
+                zerompk::from_msgpack::<(String, Vec<u8>)>(&record.payload)
+                    .map(|(collection, payload)| (None, collection, payload, None))
+            });
+            let Ok((kind, raw_collection, payload, record_provenance)) = decoded else {
                 tracing::warn!(
                     core = self.core_id,
                     lsn = record.header.lsn,
@@ -273,12 +295,22 @@ impl CoreLoop {
             }
 
             let accepted = match kind.as_deref() {
-                Some("columnar") => {
-                    self.replay_columnar_payload(tid_id, db_id, collection, &payload)
-                }
-                Some("timeseries") | None => {
-                    self.replay_timeseries_payload(tid_id, db_id, collection, &payload, record_lsn)
-                }
+                Some("columnar") => self.replay_columnar_payload(
+                    tid_id,
+                    db_id,
+                    collection,
+                    &payload,
+                    record_lsn,
+                    record_provenance,
+                ),
+                Some("timeseries") | None => self.replay_timeseries_payload(
+                    tid_id,
+                    db_id,
+                    collection,
+                    &payload,
+                    record_lsn,
+                    record_provenance,
+                ),
                 Some(other) => {
                     tracing::warn!(
                         core = self.core_id,

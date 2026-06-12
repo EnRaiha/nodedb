@@ -3,6 +3,7 @@
 //! `ArrayOp::Put` / `Delete` / `Flush` / `Compact` handlers.
 
 use nodedb_array::types::ArrayId;
+use nodedb_types::sync::wire::SyncProvenance;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -16,7 +17,23 @@ impl CoreLoop {
         array_id: &ArrayId,
         cells_msgpack: &[u8],
         wal_lsn: u64,
+        provenance: Option<&SyncProvenance>,
     ) -> Response {
+        // Epoch fence — reject stale/zombie producers. Array's HLC dedup
+        // handles cell-level idempotency; this is additive epoch protection.
+        if let Some(prov) = provenance
+            && !self.sync_fence(prov)
+        {
+            return self.response_error(
+                task,
+                ErrorCode::RejectedPrevalidation {
+                    reason: format!(
+                        "array put fenced: producer_id={} epoch={}",
+                        prov.producer_id, prov.epoch
+                    ),
+                },
+            );
+        }
         let cells: Vec<ArrayPutCell> = match zerompk::from_msgpack(cells_msgpack) {
             Ok(c) => c,
             Err(e) => {
@@ -37,6 +54,11 @@ impl CoreLoop {
                 },
             );
         }
+        // Advance HWM after durable write so the producer's array stream
+        // frontier is tracked and reconstructable on replay.
+        if let Some(prov) = provenance {
+            self.sync_commit(prov);
+        }
         encode_count_response(self, task, "inserted", n)
     }
 
@@ -46,7 +68,22 @@ impl CoreLoop {
         array_id: &ArrayId,
         coords_msgpack: &[u8],
         wal_lsn: u64,
+        provenance: Option<&SyncProvenance>,
     ) -> Response {
+        // Epoch fence — additive to HLC dedup.
+        if let Some(prov) = provenance
+            && !self.sync_fence(prov)
+        {
+            return self.response_error(
+                task,
+                ErrorCode::RejectedPrevalidation {
+                    reason: format!(
+                        "array delete fenced: producer_id={} epoch={}",
+                        prov.producer_id, prov.epoch
+                    ),
+                },
+            );
+        }
         let cells: Vec<ArrayDeleteCell> = match zerompk::from_msgpack(coords_msgpack) {
             Ok(c) => c,
             Err(e) => {
@@ -66,6 +103,9 @@ impl CoreLoop {
                     detail: format!("array delete: {e}"),
                 },
             );
+        }
+        if let Some(prov) = provenance {
+            self.sync_commit(prov);
         }
         encode_count_response(self, task, "deleted", n)
     }
@@ -269,6 +309,7 @@ mod tests {
                         array_id: aid.clone(),
                         cells_msgpack: cells_bytes,
                         wal_lsn: 42,
+                        provenance: None,
                     }),
                     2,
                 ),
@@ -377,6 +418,7 @@ mod tests {
                         array_id: aid.clone(),
                         cells_msgpack: cells_bytes,
                         wal_lsn: 7,
+                        provenance: None,
                     }),
                     2,
                 ),
