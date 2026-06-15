@@ -195,7 +195,10 @@ async fn at_arrow_contains_projection() {
         .await
         .expect("query should succeed");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], "true", "@> should return true for exact match");
+    assert_eq!(
+        rows[0][0], "t",
+        "@> should return true (PG bool 't') for exact match"
+    );
 }
 
 // ── `<@` contained-by ─────────────────────────────────────────────────────
@@ -215,8 +218,8 @@ async fn arrow_at_contained_by_projection() {
         .expect("query should succeed");
     assert_eq!(rows.len(), 1);
     assert_eq!(
-        rows[0][0], "true",
-        "<@ should return true when left is contained by right"
+        rows[0][0], "t",
+        "<@ should return true (PG bool 't') when left is contained by right"
     );
 }
 
@@ -236,8 +239,14 @@ async fn question_key_exists_projection() {
         .await
         .expect("query should succeed");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], "true", "? should return true for present key");
-    assert_eq!(rows[0][1], "false", "? should return false for absent key");
+    assert_eq!(
+        rows[0][0], "t",
+        "? should return true (PG bool 't') for present key"
+    );
+    assert_eq!(
+        rows[0][1], "f",
+        "? should return false (PG bool 'f') for absent key"
+    );
 }
 
 #[tokio::test]

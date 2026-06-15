@@ -201,6 +201,7 @@ fn array_agg_aggregate() {
         &mut rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "products".into(),
+            input: None,
             group_by: vec!["brand".into()],
             aggregates: vec![AggregateSpec {
                 function: "array_agg".into(),

@@ -74,10 +74,10 @@ fn single_core_cross_type_hash_join() {
             post_aggregates: Vec::new(),
             projection: Vec::new(),
             post_filters: Vec::new(),
-            inline_left: None,
-            inline_right: None,
-            inline_left_bitmap: None,
-            inline_right_bitmap: None,
+            left_input: None,
+            right_input: None,
+            left_bitmap: None,
+            right_bitmap: None,
         }),
     );
 
@@ -163,10 +163,10 @@ fn single_core_left_join_with_nulls() {
             post_aggregates: Vec::new(),
             projection: Vec::new(),
             post_filters: Vec::new(),
-            inline_left: None,
-            inline_right: None,
-            inline_left_bitmap: None,
-            inline_right_bitmap: None,
+            left_input: None,
+            right_input: None,
+            left_bitmap: None,
+            right_bitmap: None,
         }),
     );
 
@@ -249,10 +249,10 @@ fn single_core_self_join_respects_aliases_in_filter_and_projection() {
                 },
             ],
             post_filters,
-            inline_left: None,
-            inline_right: None,
-            inline_left_bitmap: None,
-            inline_right_bitmap: None,
+            left_input: None,
+            right_input: None,
+            left_bitmap: None,
+            right_bitmap: None,
         }),
     );
 
@@ -309,10 +309,10 @@ fn single_core_self_join_star_keeps_both_sides() {
             post_aggregates: Vec::new(),
             projection: Vec::new(),
             post_filters: Vec::new(),
-            inline_left: None,
-            inline_right: None,
-            inline_left_bitmap: None,
-            inline_right_bitmap: None,
+            left_input: None,
+            right_input: None,
+            left_bitmap: None,
+            right_bitmap: None,
         }),
     );
 
@@ -413,10 +413,10 @@ fn schemaless_self_join_matches_on_canonicalized_object_fields() {
                 },
             ],
             post_filters,
-            inline_left: None,
-            inline_right: None,
-            inline_left_bitmap: None,
-            inline_right_bitmap: None,
+            left_input: None,
+            right_input: None,
+            left_bitmap: None,
+            right_bitmap: None,
         }),
     );
 

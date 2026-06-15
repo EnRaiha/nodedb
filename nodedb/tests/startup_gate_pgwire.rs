@@ -24,7 +24,7 @@ use nodedb::control::server::pgwire::listener::PgListener;
 use nodedb::control::startup::{StartupPhase, StartupSequencer};
 use nodedb::control::state::SharedState;
 use nodedb::types::Lsn;
-use nodedb_physical::physical_plan::{MetaOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
 
 mod common;
 
@@ -56,9 +56,9 @@ fn make_gated_state() -> (
     (shared, seq, gw_gate, data_sides, dir)
 }
 
-/// Spawn a minimal fake Data Plane that echoes `MetaOp::RawResponse` payloads
+/// Spawn a minimal fake Data Plane that echoes `QueryOp::ProviderScan` rows
 /// back to the Control Plane. This is required so that `SELECT 1` (which the
-/// planner converts to `MetaOp::RawResponse`) can complete.
+/// planner converts to `QueryOp::ProviderScan`) can complete.
 ///
 /// The fake reactor runs in a Tokio task (safe here because it only moves the
 /// `CoreChannelDataSide` channels — no io_uring or TPC involvement).
@@ -72,8 +72,8 @@ fn spawn_fake_data_plane(mut data_side: CoreChannelDataSide) {
                 let request_id = req.inner.request_id;
 
                 let payload = match &req.inner.plan {
-                    PhysicalPlan::Meta(MetaOp::RawResponse { payload }) => {
-                        Payload::from_vec(payload.clone())
+                    PhysicalPlan::Query(QueryOp::ProviderScan { rows, .. }) => {
+                        Payload::from_vec(rows.clone())
                     }
                     _ => Payload::empty(),
                 };

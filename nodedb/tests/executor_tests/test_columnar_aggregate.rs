@@ -47,6 +47,7 @@ fn aggregate_count_reads_plain_columnar_engine_rows() {
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "weather".into(),
+            input: None,
             group_by: Vec::new(),
             aggregates: vec![AggregateSpec {
                 function: "count".into(),
@@ -116,6 +117,7 @@ fn columnar_having_uses_canonical_key_but_output_keeps_user_alias() {
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "weather".into(),
+            input: None,
             group_by: vec!["city".into()],
             aggregates: vec![AggregateSpec {
                 function: "count".into(),
@@ -237,6 +239,7 @@ fn aggregate_group_by_does_not_require_full_materialization() {
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "grouped".into(),
+            input: None,
             group_by: vec!["g".into()],
             aggregates: vec![
                 AggregateSpec {

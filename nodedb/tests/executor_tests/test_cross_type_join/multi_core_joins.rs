@@ -83,17 +83,18 @@ fn multi_core_broadcast_inner_join() {
         "Phase 1 scan returned empty payload"
     );
 
-    // Phase 2: Send BroadcastJoin to core 0 with phase1 data.
+    // Phase 2: Send a HashJoin to core 0 with the small side embedded as a
+    // ProviderScan (the post-resolution shape the coordinator now produces:
+    // large side scanned locally per core, small side broadcast inline).
     let join_payload = send_ok(
         &mut core0.core,
         &mut core0.tx,
         &mut core0.rx,
-        PhysicalPlan::Query(QueryOp::BroadcastJoin {
-            large_collection: "docs".into(),
-            small_collection: "prefs".into(),
-            large_alias: None,
-            small_alias: None,
-            broadcast_data: phase1_payload,
+        PhysicalPlan::Query(QueryOp::HashJoin {
+            left_collection: "docs".into(),
+            right_collection: "prefs".into(),
+            left_alias: None,
+            right_alias: None,
             on: vec![("id".into(), "key".into())],
             join_type: "inner".into(),
             limit: 100,
@@ -101,6 +102,19 @@ fn multi_core_broadcast_inner_join() {
             post_aggregates: Vec::new(),
             projection: Vec::new(),
             post_filters: Vec::new(),
+            left_input: None,
+            right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::ProviderScan {
+                provider: None,
+                rows: response_codec::flatten_to_relational_rows(&phase1_payload),
+                filters: Vec::new(),
+                projection: Vec::new(),
+                sort_keys: Vec::new(),
+                limit: None,
+                offset: 0,
+                distinct: false,
+            }))),
+            left_bitmap: None,
+            right_bitmap: None,
         }),
     );
 
@@ -192,17 +206,16 @@ fn multi_core_broadcast_left_join() {
         }),
     );
 
-    // Phase 2: broadcast join.
+    // Phase 2: broadcast join (small side embedded as ProviderScan).
     let join_payload = send_ok(
         &mut core0.core,
         &mut core0.tx,
         &mut core0.rx,
-        PhysicalPlan::Query(QueryOp::BroadcastJoin {
-            large_collection: "docs".into(),
-            small_collection: "prefs".into(),
-            large_alias: None,
-            small_alias: None,
-            broadcast_data: phase1_payload,
+        PhysicalPlan::Query(QueryOp::HashJoin {
+            left_collection: "docs".into(),
+            right_collection: "prefs".into(),
+            left_alias: None,
+            right_alias: None,
             on: vec![("id".into(), "key".into())],
             join_type: "left".into(),
             limit: 100,
@@ -210,6 +223,19 @@ fn multi_core_broadcast_left_join() {
             post_aggregates: Vec::new(),
             projection: Vec::new(),
             post_filters: Vec::new(),
+            left_input: None,
+            right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::ProviderScan {
+                provider: None,
+                rows: response_codec::flatten_to_relational_rows(&phase1_payload),
+                filters: Vec::new(),
+                projection: Vec::new(),
+                sort_keys: Vec::new(),
+                limit: None,
+                offset: 0,
+                distinct: false,
+            }))),
+            left_bitmap: None,
+            right_bitmap: None,
         }),
     );
 
@@ -332,14 +358,14 @@ fn multi_core_broadcast_merge_simulation() {
         payload1.len()
     );
 
-    // Phase 2: BroadcastJoin on each core, then merge results.
+    // Phase 2: HashJoin on each core with the small side embedded as a
+    // ProviderScan, then merge results.
     let join_plan = |data: Vec<u8>| {
-        PhysicalPlan::Query(QueryOp::BroadcastJoin {
-            large_collection: "docs".into(),
-            small_collection: "prefs".into(),
-            large_alias: None,
-            small_alias: None,
-            broadcast_data: data,
+        PhysicalPlan::Query(QueryOp::HashJoin {
+            left_collection: "docs".into(),
+            right_collection: "prefs".into(),
+            left_alias: None,
+            right_alias: None,
             on: vec![("id".into(), "key".into())],
             join_type: "inner".into(),
             limit: 100,
@@ -347,6 +373,19 @@ fn multi_core_broadcast_merge_simulation() {
             post_aggregates: Vec::new(),
             projection: Vec::new(),
             post_filters: Vec::new(),
+            left_input: None,
+            right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::ProviderScan {
+                provider: None,
+                rows: response_codec::flatten_to_relational_rows(&data),
+                filters: Vec::new(),
+                projection: Vec::new(),
+                sort_keys: Vec::new(),
+                limit: None,
+                offset: 0,
+                distinct: false,
+            }))),
+            left_bitmap: None,
+            right_bitmap: None,
         })
     };
 

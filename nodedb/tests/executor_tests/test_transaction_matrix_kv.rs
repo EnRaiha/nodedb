@@ -410,6 +410,7 @@ fn rollback_matrix_columnar_count_after_rollback() {
         &mut rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "metrics2".into(),
+            input: None,
             group_by: Vec::new(),
             aggregates: vec![AggregateSpec {
                 function: "count".into(),

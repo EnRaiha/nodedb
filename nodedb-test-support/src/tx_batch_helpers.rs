@@ -239,6 +239,7 @@ pub fn columnar_insert(collection: &str, id: &str, val: i64) -> PhysicalPlan {
 pub fn columnar_count(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Query(QueryOp::Aggregate {
         collection: collection.into(),
+        input: None,
         group_by: Vec::new(),
         aggregates: vec![AggregateSpec {
             function: "count".into(),

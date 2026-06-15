@@ -69,9 +69,10 @@ fn cross_join_uses_inline_right_scalar_aggregate_for_post_filter() {
                 output: "name".into(),
             }],
             post_filters,
-            inline_left: None,
-            inline_right: Some(Box::new(PhysicalPlan::Query(QueryOp::Aggregate {
+            left_input: None,
+            right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::Aggregate {
                 collection: "users".into(),
+                input: None,
                 group_by: Vec::new(),
                 aggregates: vec![AggregateSpec {
                     function: "avg".into(),
@@ -88,8 +89,8 @@ fn cross_join_uses_inline_right_scalar_aggregate_for_post_filter() {
                 grouping_sets: Vec::new(),
                 sort_keys: Vec::new(),
             }))),
-            inline_left_bitmap: None,
-            inline_right_bitmap: None,
+            left_bitmap: None,
+            right_bitmap: None,
         }),
     );
 
@@ -166,9 +167,10 @@ fn cross_join_uses_unaliased_scalar_aggregate_key_for_post_filter() {
                 output: "id".into(),
             }],
             post_filters,
-            inline_left: None,
-            inline_right: Some(Box::new(PhysicalPlan::Query(QueryOp::Aggregate {
+            left_input: None,
+            right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::Aggregate {
                 collection: "orders".into(),
+                input: None,
                 group_by: Vec::new(),
                 aggregates: vec![AggregateSpec {
                     function: "avg".into(),
@@ -185,8 +187,8 @@ fn cross_join_uses_unaliased_scalar_aggregate_key_for_post_filter() {
                 grouping_sets: Vec::new(),
                 sort_keys: Vec::new(),
             }))),
-            inline_left_bitmap: None,
-            inline_right_bitmap: None,
+            left_bitmap: None,
+            right_bitmap: None,
         }),
     );
 
@@ -283,8 +285,8 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
             post_aggregates: Vec::new(),
             projection: Vec::new(),
             post_filters: Vec::new(),
-            inline_left: None,
-            inline_right: Some(Box::new(PhysicalPlan::Query(QueryOp::HashJoin {
+            left_input: None,
+            right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::HashJoin {
                 left_collection: "orders".into(),
                 right_collection: "orders".into(),
                 left_alias: None,
@@ -299,9 +301,10 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
                     output: "user_id".into(),
                 }],
                 post_filters: inner_post_filters,
-                inline_left: None,
-                inline_right: Some(Box::new(PhysicalPlan::Query(QueryOp::Aggregate {
+                left_input: None,
+                right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::Aggregate {
                     collection: "orders".into(),
+                    input: None,
                     group_by: Vec::new(),
                     aggregates: vec![AggregateSpec {
                         function: "avg".into(),
@@ -318,11 +321,11 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
                     grouping_sets: Vec::new(),
                     sort_keys: Vec::new(),
                 }))),
-                inline_left_bitmap: None,
-                inline_right_bitmap: None,
+                left_bitmap: None,
+                right_bitmap: None,
             }))),
-            inline_left_bitmap: None,
-            inline_right_bitmap: None,
+            left_bitmap: None,
+            right_bitmap: None,
         }),
     );
 

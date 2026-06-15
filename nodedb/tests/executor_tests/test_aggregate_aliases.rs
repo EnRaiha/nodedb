@@ -53,6 +53,7 @@ fn aggregate_output_uses_user_alias_but_having_reads_canonical_key() {
         &mut ctx.rx,
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "users".into(),
+            input: None,
             group_by: vec!["department".into()],
             aggregates: vec![
                 AggregateSpec {

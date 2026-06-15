@@ -422,7 +422,7 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
     );
 
     // Also verify the bitmap-injected hash join works:
-    // Use a `DocumentOp::Scan` with prefilter as the inline_left_bitmap sub-plan
+    // Use a `DocumentOp::Scan` with prefilter as the left_bitmap sub-plan
     // in a HashJoin between "catalog" (documents) and "metrics" (columnar).
     // The executor runs the sub-plan, collects surrogates 1+2, and injects
     // the bitmap into the left side scan before probing.
@@ -457,10 +457,10 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
             post_aggregates: Vec::new(),
             projection: Vec::new(),
             post_filters: Vec::new(),
-            inline_left: None,
-            inline_right: None,
-            inline_left_bitmap: Some(Box::new(bm_subplan)),
-            inline_right_bitmap: None,
+            left_input: None,
+            right_input: None,
+            left_bitmap: Some(Box::new(bm_subplan)),
+            right_bitmap: None,
         }),
     );
     // The join result has prefixed keys: "catalog.id", "metrics.id", etc.
