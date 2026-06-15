@@ -7,16 +7,13 @@
 //! cross the SPSC bridge, so the full planner / Data Plane path is the wrong
 //! model for them. Instead, this module:
 //!
-//! 1. Materializes the virtual table as a typed [`VTable`] (`value`, `table`).
-//! 2. Parses the client SELECT into a [`VSelect`] (`select`).
+//! 1. Materializes each referenced virtual table as a typed [`VTable`]
+//!    (`value`, `table`) and joins them into a single combined relation.
+//! 2. Parses the client SELECT into a [`VSelect`] (`select`), including its
+//!    FROM/JOIN tree, casts, catalog functions, and `ANY`/`ALL` predicates.
 //! 3. Evaluates WHERE / projection / aggregate / ORDER BY / LIMIT against the
-//!    row set (`expr`, `exec`).
+//!    combined row set (`expr`, `exec`).
 //! 4. Encodes the result back to pgwire (`encode`).
-//!
-//! The previous interceptor returned raw rows with ad-hoc regex pushdown of
-//! `SEQ` / `LIMIT`, silently dropping every other SQL clause. This module
-//! honors full SQL semantics for the surface that ships through
-//! `try_pg_catalog`.
 
 pub mod encode;
 pub mod exec;
@@ -25,6 +22,7 @@ pub mod select;
 pub mod table;
 pub mod value;
 
-pub use exec::execute;
-pub use select::parse_select;
+pub use exec::{ExecError, ResultSet, execute};
+pub use expr::{CatalogResolver, EvalCtx};
+pub use select::{parse_select, parse_select_with_params};
 pub use table::VTable;

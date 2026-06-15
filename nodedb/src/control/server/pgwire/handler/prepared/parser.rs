@@ -158,7 +158,7 @@ impl QueryParser for NodeDbQueryParser {
             // drivers that probe with malformed-but-permissive queries still
             // get a usable Describe.
             let result_fields =
-                crate::control::server::pgwire::pg_catalog::pg_catalog_projected_schema(sql, table)
+                crate::control::server::pgwire::pg_catalog::pg_catalog_projected_schema(sql)
                     .or_else(|| {
                         crate::control::server::pgwire::pg_catalog::pg_catalog_schema(table)
                     })

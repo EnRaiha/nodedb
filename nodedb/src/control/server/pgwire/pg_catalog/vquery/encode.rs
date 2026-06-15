@@ -54,5 +54,9 @@ fn encode_value(encoder: &mut DataRowEncoder, val: &VValue, ty: VType) -> PgWire
         (VValue::Int8(i), VType::Int4) => encoder.encode_field(&(*i as i32)),
         (VValue::Int8(i), _) => encoder.encode_field(i),
         (VValue::Text(s), _) => encoder.encode_field(&s.as_str()),
+        // Arrays are projected as their PostgreSQL text form (`{a,b}`).
+        (arr @ VValue::Array(_), _) => {
+            encoder.encode_field(&arr.to_pg_text().unwrap_or_default().as_str())
+        }
     }
 }
