@@ -12,10 +12,13 @@
 //! 2. Look up the Raft group leader for that vShard in the routing table.
 //! 3. If the leader is this node (`local_node_id`) → `RouteDecision::Local`.
 //! 4. If the leader is another node → `RouteDecision::Remote`.
-//! 5. For plans wrapped in `QueryOp::Exchange{Gather{..}}` →
-//!    `RouteDecision::Broadcast` listing every vShard in the routing table.
-//!    The Exchange node itself is resolved by the coordinator; the child plan
-//!    is routed to all vShards.
+//! 5. For plans wrapped in `QueryOp::Exchange{Gather{..}}` the Exchange wrapper
+//!    is stripped and the child is routed by its data distribution: a genuinely
+//!    cluster-partitioned child (graph traversal by node-id, array by tile) is
+//!    broadcast to every vShard; a single-vShard-homed child (document / kv /
+//!    columnar / timeseries / spatial / vector / text, and joins/aggregates over
+//!    them) is routed to its ONE owning vShard — broadcasting it would duplicate
+//!    rows, since the data-plane scan is not vshard-scoped.
 //!
 //! In single-node mode (routing table = `None`), all plans route locally.
 
@@ -56,12 +59,41 @@ pub fn route_plan(
     // `fuse_payloads` in the gateway core). Shipping the Exchange wrapper itself
     // would let it reach a Data-Plane core, which rejects unresolved Exchange
     // nodes ("Exchange must be resolved by the coordinator before dispatch").
-    use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, QueryOp};
+    use nodedb_physical::physical_plan::{
+        ExchangeMode, ExchangeOp, QueryOp, plan_contains_cluster_partitioned_leaf,
+    };
     match plan {
         PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
             child,
             mode: ExchangeMode::Gather { .. },
-        })) => route_broadcast(*child, local_node_id, routing),
+        })) => {
+            // Strip the Exchange wrapper and route the child. How depends on the
+            // child's data distribution — mirroring `gather_all_vshards`:
+            //
+            // - A genuinely cluster-partitioned source (graph traversal by
+            //   node-id, array by tile) has rows spread across ALL vShards →
+            //   broadcast the child to every vShard and fuse the per-vShard
+            //   payloads.
+            // - A single-vShard-homed source (document/kv/columnar/timeseries/
+            //   spatial/vector/text, and joins/aggregates over them) lives on
+            //   exactly ONE vShard. Broadcasting it to all 1024 vShards would
+            //   return the full result from the owning node once per route that
+            //   lands there (the data-plane scan is NOT vshard-scoped) → N-fold
+            //   duplication. Route it to its single owning vShard instead. Any
+            //   nested build-side data movement is resolved at the dispatch site
+            //   (see `dispatch_remote` / `dispatch_to_data_plane`).
+            if plan_contains_cluster_partitioned_leaf(&child) {
+                route_broadcast(*child, local_node_id, routing)
+            } else {
+                let vshard_id = primary_vshard(&child, database_id);
+                let decision = resolve_decision(vshard_id, local_node_id, Some(routing), None);
+                vec![TaskRoute {
+                    plan: *child,
+                    decision,
+                    vshard_id,
+                }]
+            }
+        }
         other => {
             let vshard_id = primary_vshard(&other, database_id);
             let decision = resolve_decision(vshard_id, local_node_id, Some(routing), None);
@@ -235,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_scan_produces_multiple_routes() {
+    fn single_homed_gather_routes_to_one_vshard() {
         let table = two_node_table();
         let scan = PhysicalPlan::Document(DocumentOp::Scan {
             collection: "events".into(),
@@ -251,8 +283,13 @@ mod tests {
             valid_at_ms: None,
             prefilter: None,
         });
-        // A sharded read reaches the router wrapped in Exchange{Gather} (the
-        // shape `convert()` produces); routing fans it to every vShard.
+        // A single-vShard-homed read reaches the router wrapped in
+        // Exchange{Gather} (the shape `convert()` produces). The router must
+        // strip the Exchange and route the child to its ONE owning vShard — NOT
+        // broadcast to every vShard. Broadcasting a single-homed source would
+        // return the full collection from the owning node once per route that
+        // lands there (the data-plane scan is not vshard-scoped) → N-fold
+        // duplication.
         let plan = PhysicalPlan::Query(nodedb_physical::physical_plan::QueryOp::Exchange(
             nodedb_physical::physical_plan::ExchangeOp {
                 child: Box::new(scan),
@@ -262,18 +299,28 @@ mod tests {
             },
         ));
         let routes = route_plan(plan, 1, Some(&table), DatabaseId::DEFAULT);
-        // Broadcast should produce VSHARD_COUNT routes.
-        assert_eq!(routes.len(), nodedb_cluster::routing::VSHARD_COUNT as usize);
-        // Each route must carry the UNWRAPPED child plan, not the Exchange
-        // wrapper. A wrapper shipped to a vShard reaches a Data-Plane core,
-        // which rejects unresolved Exchange nodes.
-        for route in &routes {
-            assert!(
-                matches!(route.plan, PhysicalPlan::Document(DocumentOp::Scan { .. })),
-                "broadcast route must carry the unwrapped scan child, got {:?}",
-                route.plan
-            );
-        }
+        // Exactly ONE route — to the collection's owning vShard.
+        assert_eq!(
+            routes.len(),
+            1,
+            "single-homed Exchange{{Gather}} must route to one vShard, not broadcast"
+        );
+        // The route carries the UNWRAPPED child plan, not the Exchange wrapper
+        // (a wrapper shipped to a Data-Plane core is rejected as unresolved).
+        assert!(
+            matches!(
+                routes[0].plan,
+                PhysicalPlan::Document(DocumentOp::Scan { .. })
+            ),
+            "route must carry the unwrapped scan child, got {:?}",
+            routes[0].plan
+        );
+        // It routes to the same single vShard a bare scan of the same collection
+        // would (the collection's owner).
+        assert_eq!(
+            routes[0].vshard_id,
+            vshard_for_collection(DatabaseId::DEFAULT, "events")
+        );
     }
 
     /// Find a collection name that hashes to the given vShard.
