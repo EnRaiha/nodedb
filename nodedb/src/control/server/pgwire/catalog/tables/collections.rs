@@ -1,14 +1,27 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Shared helpers for catalog table materializers: collection loading and
-//! field-type → OID mapping.
+//! Shared helpers for catalog row producers: collection loading, field-type →
+//! OID mapping, and msgpack row encoding.
+
+use std::collections::HashMap;
 
 use nodedb_types::DatabaseId;
+use nodedb_types::Value;
 use nodedb_types::columnar::ColumnType;
 
 use crate::control::security::catalog::types::StoredCollection;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+
+/// Encode one catalog row (column-name → value) as msgpack `Value::Object`
+/// bytes. The map keys must be the relation's schema column names, matching
+/// the order declared in `super::super::schema::catalog_columns`.
+pub fn encode_row(row: HashMap<String, Value>) -> crate::Result<Vec<u8>> {
+    nodedb_types::value_to_msgpack(&Value::Object(row)).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".to_string(),
+        detail: e.to_string(),
+    })
+}
 
 /// Load the collections visible to `identity` (all active collections for a
 /// superuser, tenant-scoped otherwise).

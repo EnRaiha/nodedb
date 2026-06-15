@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `pg_type` materializer and the canonical built-in type table.
+//! `pg_type` row producer and the canonical built-in type table.
 
 use std::collections::HashMap;
 
-use pgwire::error::PgWireResult;
+use nodedb_types::Value;
 
-use crate::control::server::pgwire::pg_catalog::vquery::VTable;
-use crate::control::server::pgwire::pg_catalog::vquery::value::{VColumn, VType, VValue};
+use super::collections::encode_row;
 
 /// One built-in PostgreSQL type row.
 struct PgTypeRow {
@@ -97,46 +96,27 @@ const fn row(
     }
 }
 
-pub fn columns() -> Vec<VColumn> {
-    vec![
-        VColumn::new("oid", VType::Int8),
-        VColumn::new("typname", VType::Text),
-        VColumn::new("typnamespace", VType::Int8),
-        VColumn::new("typlen", VType::Int4),
-        VColumn::new("typbyval", VType::Bool),
-        VColumn::new("typtype", VType::Text),
-        VColumn::new("typcategory", VType::Text),
-        VColumn::new("typispreferred", VType::Bool),
-        VColumn::new("typisdefined", VType::Bool),
-        VColumn::new("typdelim", VType::Text),
-        VColumn::new("typrelid", VType::Int8),
-        VColumn::new("typelem", VType::Int8),
-        VColumn::new("typarray", VType::Int8),
-        VColumn::new("typnotnull", VType::Bool),
-    ]
-}
-
-pub fn pg_type() -> PgWireResult<VTable> {
-    let mut t = VTable::new(columns());
+pub fn pg_type() -> crate::Result<Vec<Vec<u8>>> {
+    let mut rows = Vec::with_capacity(TYPES.len());
     for r in TYPES {
-        t.push(vec![
-            VValue::Int8(r.oid),
-            VValue::Text(r.name.into()),
-            VValue::Int8(11),
-            VValue::Int4(r.len),
-            VValue::Bool(r.byval),
-            VValue::Text(r.typtype.into()),
-            VValue::Text(r.category.into()),
-            VValue::Bool(false),
-            VValue::Bool(true),
-            VValue::Text(",".into()),
-            VValue::Int8(0),
-            VValue::Int8(r.elem),
-            VValue::Int8(r.array),
-            VValue::Bool(false),
-        ]);
+        let mut m: HashMap<String, Value> = HashMap::with_capacity(14);
+        m.insert("oid".into(), Value::Integer(r.oid));
+        m.insert("typname".into(), Value::String(r.name.into()));
+        m.insert("typnamespace".into(), Value::Integer(11));
+        m.insert("typlen".into(), Value::Integer(r.len as i64));
+        m.insert("typbyval".into(), Value::Bool(r.byval));
+        m.insert("typtype".into(), Value::String(r.typtype.into()));
+        m.insert("typcategory".into(), Value::String(r.category.into()));
+        m.insert("typispreferred".into(), Value::Bool(false));
+        m.insert("typisdefined".into(), Value::Bool(true));
+        m.insert("typdelim".into(), Value::String(",".into()));
+        m.insert("typrelid".into(), Value::Integer(0));
+        m.insert("typelem".into(), Value::Integer(r.elem));
+        m.insert("typarray".into(), Value::Integer(r.array));
+        m.insert("typnotnull".into(), Value::Bool(false));
+        rows.push(encode_row(m)?);
     }
-    Ok(t)
+    Ok(rows)
 }
 
 /// Name → OID map for `::regtype` resolution, including common aliases.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Stable, deterministic OID helpers for pg_catalog virtual tables.
+//! Stable, deterministic OID helpers for catalog relations.
 //!
 //! OIDs must be stable across server restarts, collection drop+recreate, and
 //! across different nodes in a cluster. They are derived from a FNV-1a hash of
@@ -12,6 +12,19 @@
 //! range (0–16383) used by built-in Postgres system objects.
 
 use crate::util::fnv1a_hash;
+
+/// Well-known PostgreSQL OIDs for the catalog relations themselves, so
+/// `'pg_class'::regclass` resolves the way clients expect.
+pub const SYSTEM_REL_OIDS: &[(&str, i64)] = &[
+    ("pg_class", 1259),
+    ("pg_type", 1247),
+    ("pg_attribute", 1249),
+    ("pg_namespace", 2615),
+    ("pg_index", 2610),
+    ("pg_authid", 1260),
+    ("pg_database", 1262),
+    ("pg_proc", 1255),
+];
 
 /// Stable OID for a collection, for use in `pg_class` and `pg_attribute`.
 ///

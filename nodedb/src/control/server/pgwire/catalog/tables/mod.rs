@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Virtual-table materializers for each pg_catalog relation.
+//! Per-relation row producers for each catalog table.
 
 pub mod catalog_misc;
 pub mod collections;

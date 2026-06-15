@@ -1,36 +1,31 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `_system.dropped_collections` virtual view — materializer.
+//! `_system.dropped_collections` row producer.
 
-use pgwire::error::PgWireResult;
+use std::collections::HashMap;
+
+use nodedb_types::Value;
 
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
-use crate::control::server::pgwire::pg_catalog::vquery::VTable;
-use crate::control::server::pgwire::pg_catalog::vquery::value::{VColumn, VType, VValue};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId};
+use crate::types::DatabaseId;
+
+use super::tables::collections::encode_row;
 
 pub async fn dropped_collections(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-) -> PgWireResult<VTable> {
-    let mut table = VTable::new(vec![
-        VColumn::new("tenant_id", VType::Int8),
-        VColumn::new("name", VType::Text),
-        VColumn::new("owner", VType::Text),
-        VColumn::new("engine_type", VType::Text),
-        VColumn::new("deactivated_at_ns", VType::Int8),
-        VColumn::new("retention_expires_at_ns", VType::Int8),
-        VColumn::new("size_bytes_estimate", VType::Int8),
-    ]);
-
+) -> crate::Result<Vec<Vec<u8>>> {
     let Some(catalog) = state.credentials.catalog() else {
-        return Ok(table);
+        return Ok(Vec::new());
     };
 
     let dropped = catalog
         .load_dropped_collections(DatabaseId::DEFAULT)
-        .map_err(|e| pgwire::error::PgWireError::ApiError(Box::new(e)))?;
+        .map_err(|e| crate::Error::Storage {
+            engine: "catalog".to_string(),
+            detail: e.to_string(),
+        })?;
 
     let retention = state
         .retention_settings
@@ -42,6 +37,7 @@ pub async fn dropped_collections(
     let is_admin = identity.is_superuser || identity.has_role(&Role::TenantAdmin);
     let caller_tenant = identity.tenant_id.as_u64();
 
+    let mut rows = Vec::new();
     for coll in &dropped {
         if !is_admin && coll.tenant_id != caller_tenant {
             continue;
@@ -58,17 +54,26 @@ pub async fn dropped_collections(
                 .unwrap_or(0)
         };
 
-        table.push(vec![
-            VValue::Int8(coll.tenant_id as i64),
-            VValue::Text(coll.name.clone()),
-            VValue::Text(coll.owner.clone()),
-            VValue::Text(engine_type),
-            VValue::Int8(deactivated_ns as i64),
-            VValue::Int8(expires_ns as i64),
-            VValue::Int8(size_estimate as i64),
-        ]);
+        let mut r: HashMap<String, Value> = HashMap::with_capacity(7);
+        r.insert("tenant_id".into(), Value::Integer(coll.tenant_id as i64));
+        r.insert("name".into(), Value::String(coll.name.clone()));
+        r.insert("owner".into(), Value::String(coll.owner.clone()));
+        r.insert("engine_type".into(), Value::String(engine_type));
+        r.insert(
+            "deactivated_at_ns".into(),
+            Value::Integer(deactivated_ns as i64),
+        );
+        r.insert(
+            "retention_expires_at_ns".into(),
+            Value::Integer(expires_ns as i64),
+        );
+        r.insert(
+            "size_bytes_estimate".into(),
+            Value::Integer(size_estimate as i64),
+        );
+        rows.push(encode_row(r)?);
     }
-    Ok(table)
+    Ok(rows)
 }
 
 async fn query_collection_size(
@@ -77,7 +82,7 @@ async fn query_collection_size(
     collection: &str,
 ) -> Option<u64> {
     use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
-    use crate::types::{DatabaseId, ReadConsistency, TenantId, VShardId};
+    use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
     use nodedb_physical::physical_plan::MetaOp;
 
     let request_id = state.next_request_id();
