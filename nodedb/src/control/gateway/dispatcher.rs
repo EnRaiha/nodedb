@@ -126,6 +126,32 @@ async fn dispatch_remote(args: RemoteDispatchArgs<'_>) -> Result<Vec<Vec<u8>>, E
         detail: "gateway: cluster transport not available for remote dispatch".into(),
     })?;
 
+    // Resolve any Exchange data-movement nodes BEFORE shipping to the remote
+    // node. A Data-Plane core rejects any plan still containing an Exchange, so
+    // the coordinator must gather/embed cross-node data here — symmetric with
+    // the local path (`dispatch_local` → `dispatch_to_data_plane_with_source`,
+    // which already resolves). A self-contained plan (no Exchange) is a no-op.
+    // `resolve_exchange_in_plan` is identity-free; catalog materialization is
+    // already done upstream on the pgwire/native paths that own the identity.
+    // (`Box::pin` breaks the async-recursion cycle: resolving a Broadcast build
+    // side calls `gather_all_vshards` → `gateway.execute` → routing → here.)
+    let plan = match Box::pin(crate::control::server::exchange::resolve_exchange_in_plan(
+        shared,
+        database_id,
+        tenant_id,
+        plan,
+        trace_id,
+    ))
+    .await?
+    {
+        // A root-level Gather resolved entirely at the coordinator — its merged
+        // response is ready; return it instead of shipping anything.
+        crate::control::server::exchange::Resolved::Gathered(resp) => {
+            return Ok(vec![resp.payload.to_vec()]);
+        }
+        crate::control::server::exchange::Resolved::Plan(p) => p,
+    };
+
     // Encode the plan.
     let plan_bytes = plan_wire::encode(&plan).map_err(|e| Error::Internal {
         detail: format!("gateway: plan encode failed: {e}"),
