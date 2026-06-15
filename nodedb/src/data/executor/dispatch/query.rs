@@ -7,7 +7,7 @@ use nodedb_physical::physical_plan::QueryOp;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::join::{
-    BroadcastJoinParams, HashJoinParams, InlineHashJoinParams, JoinParams,
+    HashJoinParams, JoinParams,
     lateral::{LateralLoopParams, LateralTopKParams},
 };
 use crate::data::executor::task::ExecutionTask;
@@ -22,6 +22,7 @@ impl CoreLoop {
         match op {
             QueryOp::Aggregate {
                 collection,
+                input,
                 group_by,
                 aggregates,
                 filters,
@@ -35,6 +36,7 @@ impl CoreLoop {
                 task,
                 tid,
                 collection,
+                input.as_deref(),
                 group_by,
                 aggregates,
                 filters,
@@ -44,6 +46,27 @@ impl CoreLoop {
                 sub_aggregates,
                 grouping_sets,
                 sort_keys,
+            ),
+
+            QueryOp::Exchange(_) => self.response_error(
+                task,
+                crate::bridge::envelope::ErrorCode::Internal {
+                    detail: "Exchange must be resolved by the coordinator before dispatch"
+                        .to_string(),
+                },
+            ),
+
+            QueryOp::ProviderScan {
+                rows,
+                filters,
+                projection,
+                sort_keys,
+                limit,
+                offset,
+                distinct,
+                ..
+            } => self.execute_provider_scan(
+                task, rows, filters, projection, sort_keys, *limit, *offset, *distinct,
             ),
 
             QueryOp::HashJoin {
@@ -56,10 +79,10 @@ impl CoreLoop {
                 limit,
                 projection,
                 post_filters,
-                inline_left,
-                inline_right,
-                inline_left_bitmap,
-                inline_right_bitmap,
+                left_input,
+                right_input,
+                left_bitmap,
+                right_bitmap,
                 ..
             } => self.execute_hash_join(HashJoinParams {
                 join: JoinParams {
@@ -75,33 +98,10 @@ impl CoreLoop {
                 right_collection,
                 left_alias: left_alias.as_deref(),
                 right_alias: right_alias.as_deref(),
-                inline_left: inline_left.as_deref(),
-                inline_right: inline_right.as_deref(),
-                inline_left_bitmap: inline_left_bitmap.as_deref(),
-                inline_right_bitmap: inline_right_bitmap.as_deref(),
-            }),
-
-            QueryOp::InlineHashJoin {
-                left_data,
-                right_data,
-                right_alias,
-                on,
-                join_type,
-                limit,
-                projection,
-                post_filters,
-            } => self.execute_inline_hash_join(InlineHashJoinParams {
-                join: JoinParams {
-                    task,
-                    on,
-                    join_type,
-                    limit: *limit,
-                    projection,
-                    post_filter_bytes: post_filters,
-                },
-                left_data,
-                right_data,
-                right_alias: right_alias.as_deref(),
+                left_input: left_input.as_deref(),
+                right_input: right_input.as_deref(),
+                left_bitmap: left_bitmap.as_deref(),
+                right_bitmap: right_bitmap.as_deref(),
             }),
 
             QueryOp::NestedLoopJoin {
@@ -195,6 +195,7 @@ impl CoreLoop {
                 task,
                 tid,
                 collection,
+                None,
                 group_by,
                 aggregates,
                 filters,
@@ -254,62 +255,6 @@ impl CoreLoop {
                 projection,
                 left_join: *left_join,
                 outer_row_cap: *outer_row_cap,
-            }),
-
-            QueryOp::BroadcastJoin {
-                large_collection,
-                small_collection,
-                large_alias,
-                small_alias,
-                broadcast_data,
-                on,
-                join_type,
-                limit,
-                projection,
-                post_filters,
-                ..
-            } => self.execute_broadcast_join(BroadcastJoinParams {
-                join: JoinParams {
-                    task,
-                    on,
-                    join_type,
-                    limit: *limit,
-                    projection,
-                    post_filter_bytes: post_filters,
-                },
-                tid,
-                large_collection,
-                small_collection,
-                large_alias: large_alias.as_deref(),
-                small_alias: small_alias.as_deref(),
-                broadcast_data,
-            }),
-
-            QueryOp::ShuffleJoin {
-                left_collection,
-                right_collection,
-                on,
-                join_type,
-                limit,
-                ..
-            } => self.execute_hash_join(HashJoinParams {
-                join: JoinParams {
-                    task,
-                    on,
-                    join_type,
-                    limit: *limit,
-                    projection: &[],
-                    post_filter_bytes: &[],
-                },
-                tid,
-                left_collection,
-                right_collection,
-                left_alias: None,
-                right_alias: None,
-                inline_left: None,
-                inline_right: None,
-                inline_left_bitmap: None,
-                inline_right_bitmap: None,
             }),
         }
     }

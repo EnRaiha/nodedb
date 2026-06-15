@@ -28,9 +28,7 @@ mod raw;
 mod tests;
 
 pub use arrow::encode_as_arrow_ipc;
-pub(in crate::data::executor) use decode::{
-    decode_response_to_docs, decode_response_to_docs_from_bytes,
-};
+pub(in crate::data::executor) use decode::decode_response_to_docs;
 pub use encode::decode_payload_to_json;
 pub(in crate::data::executor) use encode::{
     encode, encode_count, encode_json, encode_json_vec, encode_serde, encode_value_vec,
@@ -42,5 +40,5 @@ pub(in crate::data::executor) use hits::{
     DocumentRow, GraphRagMetadata, GraphRagResponse, GraphRagResult, HybridSearchHit,
     NeighborEntry, NeighborMultiEntry, SubgraphEdge, VectorSearchHit,
 };
-pub use raw::encode_binary_rows;
 pub(crate) use raw::{decode_raw_scan_to_docs, encode_raw_document_rows};
+pub use raw::{encode_binary_rows, flatten_to_relational_rows};

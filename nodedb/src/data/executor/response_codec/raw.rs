@@ -114,6 +114,27 @@ pub(crate) fn decode_raw_scan_to_docs(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
     results
 }
 
+/// Storage→relational boundary: flatten gathered storage rows into a single
+/// flat relational row array.
+///
+/// Gathered output is heterogeneous by producer — document/columnar scans emit
+/// the storage wire format (`{id, data:<value>}` wrappers, carrying the
+/// surrogate), while computed producers (aggregates, joins) already emit flat
+/// column maps. This extracts the inner `data` value for storage rows and passes
+/// flat rows through unchanged, returning one msgpack array of flat rows.
+///
+/// This is the ONE place storage rows become relational rows. The
+/// relational-operator layer (hash-join probe, `ProviderScan`) consumes only
+/// this flat shape and never sees — or sniffs for — a `{id, data}` wrapper. The
+/// `{id, data}` format stays confined to the storage / transport / sync layer.
+pub fn flatten_to_relational_rows(bytes: &[u8]) -> Vec<u8> {
+    let flat: Vec<Vec<u8>> = decode_raw_scan_to_docs(bytes)
+        .into_iter()
+        .map(|(_id, data)| data)
+        .collect();
+    encode_binary_rows(&flat)
+}
+
 /// Encode a list of pre-built binary msgpack rows into a single msgpack array.
 ///
 /// Each row is already a valid msgpack value (typically a map). This just

@@ -9,7 +9,7 @@ pub mod nested_loop;
 pub mod params;
 pub mod sort_merge;
 
-pub(crate) use params::{BroadcastJoinParams, HashJoinParams, InlineHashJoinParams, JoinParams};
+pub(crate) use params::{HashJoinParams, JoinParams};
 
 use nodedb_query::msgpack_scan;
 
@@ -85,7 +85,13 @@ fn write_prefixed_entries(buf: &mut Vec<u8>, bytes: &[u8], prefix: &str) {
 
         // Write prefixed key.
         if let Some(k) = key {
-            if prefix.is_empty() {
+            // A merged join row's keys are alias-qualified exactly once. When
+            // the source is itself a join result (multi-way join), its keys are
+            // already qualified (`c.relname`, `a.attname`); re-prefixing would
+            // produce `c.c.relname`, which no projection or filter can resolve.
+            // SQL column identifiers never contain '.', so a '.' in the key
+            // reliably means "already qualified" — pass it through verbatim.
+            if prefix.is_empty() || k.contains('.') {
                 write_str(buf, k);
             } else {
                 // Avoid allocation: write prefix.key directly.

@@ -7,7 +7,7 @@ use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::JoinProjection;
 
-/// Common join configuration shared across hash, inline-hash, and broadcast joins.
+/// Common join configuration shared across join variants.
 pub(crate) struct JoinParams<'a> {
     pub task: &'a ExecutionTask,
     pub on: &'a [(String, String)],
@@ -17,7 +17,16 @@ pub(crate) struct JoinParams<'a> {
     pub post_filter_bytes: &'a [u8],
 }
 
-/// Hash join: scans both sides from storage (or executes inline sub-plans).
+/// Hash join: scans both sides from storage or executes resolved child sub-plans.
+///
+/// When `left_input` or `right_input` is `Some`, the executor runs that sub-plan
+/// (e.g. a `ProviderScan` after coordinator resolution) and uses the resulting
+/// rows as the corresponding join side. When `None`, the side is scanned locally
+/// by `left_collection` / `right_collection`.
+///
+/// `left_bitmap` / `right_bitmap`, when `Some`, are executed first to build a
+/// surrogate prefilter that is injected into the local scan for the corresponding
+/// side, pushing the filter into the document engine before any msgpack decode.
 pub(crate) struct HashJoinParams<'a> {
     pub join: JoinParams<'a>,
     pub tid: u64,
@@ -25,40 +34,24 @@ pub(crate) struct HashJoinParams<'a> {
     pub right_collection: &'a str,
     pub left_alias: Option<&'a str>,
     pub right_alias: Option<&'a str>,
-    pub inline_left: Option<&'a PhysicalPlan>,
-    pub inline_right: Option<&'a PhysicalPlan>,
+    /// Resolved child plan for the left side (e.g. `ProviderScan`). `None` =
+    /// scan locally by `left_collection`.
+    pub left_input: Option<&'a PhysicalPlan>,
+    /// Resolved child plan for the right side. Same semantics as `left_input`.
+    pub right_input: Option<&'a PhysicalPlan>,
     /// Bitmap-producer sub-plan for the left side. When `Some`, the executor
     /// runs this sub-plan first, collects surrogates, and injects the bitmap
-    /// into the right (probe) side's scan prefilter.
-    pub inline_left_bitmap: Option<&'a PhysicalPlan>,
+    /// into the left side's scan prefilter.
+    pub left_bitmap: Option<&'a PhysicalPlan>,
     /// Bitmap-producer sub-plan for the right side. Same semantics as
-    /// `inline_left_bitmap` but applied to the right collection.
-    pub inline_right_bitmap: Option<&'a PhysicalPlan>,
-}
-
-/// Inline hash join: both sides are pre-gathered as msgpack byte arrays.
-pub(crate) struct InlineHashJoinParams<'a> {
-    pub join: JoinParams<'a>,
-    pub left_data: &'a [u8],
-    pub right_data: &'a [u8],
-    pub right_alias: Option<&'a str>,
-}
-
-/// Broadcast join: small side is pre-serialized, large side scanned locally.
-pub(crate) struct BroadcastJoinParams<'a> {
-    pub join: JoinParams<'a>,
-    pub tid: u64,
-    pub large_collection: &'a str,
-    pub small_collection: &'a str,
-    pub large_alias: Option<&'a str>,
-    pub small_alias: Option<&'a str>,
-    pub broadcast_data: &'a [u8],
+    /// `left_bitmap` but applied to the right collection.
+    pub right_bitmap: Option<&'a PhysicalPlan>,
 }
 
 impl JoinParams<'_> {
     /// Apply post-join WHERE filters and projection to result rows.
     ///
-    /// Shared tail logic for hash, inline-hash, and broadcast joins:
+    /// Shared tail logic for hash joins and lateral joins:
     /// deserializes post-filter predicates, retains matching rows, then
     /// applies column projection — all on raw msgpack bytes.
     pub fn filter_and_project(&self, results: &mut Vec<Vec<u8>>) {

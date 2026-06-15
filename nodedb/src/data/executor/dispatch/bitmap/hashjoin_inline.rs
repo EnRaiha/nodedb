@@ -2,8 +2,8 @@
 
 //! HashJoin bitmap-prefilter injection.
 //!
-//! When `QueryOp::HashJoin` carries an `inline_left_bitmap` or
-//! `inline_right_bitmap` sub-plan, the executor calls `run_bitmap_subplan`
+//! When `QueryOp::HashJoin` carries a `left_bitmap` or
+//! `right_bitmap` sub-plan, the executor calls `run_bitmap_subplan`
 //! to execute that sub-plan and collect the resulting surrogates into a
 //! `SurrogateBitmap`. The bitmap is then used to build a prefiltered
 //! `DocumentOp::Scan` for the probe side, replacing the generic

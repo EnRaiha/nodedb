@@ -170,8 +170,6 @@ impl CoreLoop {
                 injected_reads,
             ),
 
-            MetaOp::RawResponse { payload } => self.response_with_payload(task, payload.clone()),
-
             MetaOp::RebuildIndex {
                 collection,
                 index_name,

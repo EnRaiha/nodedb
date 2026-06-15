@@ -30,6 +30,7 @@ pub mod kv;
 pub mod merge;
 pub(super) mod merge_helpers;
 pub mod point;
+pub(super) mod provider_scan;
 pub mod purge;
 pub mod query_collection_size;
 pub mod reclaim;

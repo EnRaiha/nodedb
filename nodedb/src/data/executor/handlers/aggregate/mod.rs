@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Aggregate handler: GROUP BY, HAVING, and aggregate function execution.
+//!
+//! The generic (non-columnar) path uses **streaming accumulators** — see
+//! `accum.rs`.  Raw document bytes are never stored; only the extracted
+//! scalar / approximate values needed by each aggregate function are kept.
+//! Memory is O(num_groups × num_aggregates) instead of
+//! O(total_matching_docs × avg_doc_size).
+//!
+//! Split by concern so each file stays under the project's hard size limit:
+//! `exec` (dispatch + fast paths), `streaming` (the spill-backed group-by
+//! accumulation), `cache_key` (result-cache key derivation), and `rows`
+//! (post-aggregate alias renaming and ORDER BY sorting).
+
+mod cache_key;
+mod exec;
+mod rows;
+mod streaming;
