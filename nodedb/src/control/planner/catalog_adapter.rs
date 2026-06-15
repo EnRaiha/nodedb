@@ -166,6 +166,23 @@ impl OriginCatalog {
 }
 
 impl SqlCatalog for OriginCatalog {
+    /// Resolve any relation name to planner metadata. Catalog tables
+    /// (pg_class, information_schema.*, _system.*, etc.) are returned
+    /// directly from the static schema registry without a catalog round-trip.
+    /// All other names fall through to `get_collection`.
+    fn resolve_relation(
+        &self,
+        _database_id: nodedb_types::DatabaseId,
+        name: &str,
+    ) -> std::result::Result<Option<CollectionInfo>, SqlCatalogError> {
+        if let Some(info) =
+            crate::control::server::pgwire::catalog::schema::catalog_collection_info(name)
+        {
+            return Ok(Some(info));
+        }
+        self.get_collection(_database_id, name)
+    }
+
     fn get_collection(
         &self,
         _database_id: nodedb_types::DatabaseId,
@@ -295,6 +312,35 @@ impl SqlCatalog for OriginCatalog {
             primary: stored.primary,
             vector_primary: stored.vector_primary,
         }))
+    }
+
+    fn resolve_regclass(
+        &self,
+        _database_id: nodedb_types::DatabaseId,
+        _tenant_id: u64,
+        name: &str,
+    ) -> Option<i64> {
+        // Check system/catalog relation OIDs first.
+        if let Some(&oid) = crate::control::server::pgwire::catalog::oid::SYSTEM_REL_OIDS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, o)| o)
+        {
+            return Some(oid);
+        }
+        // Fall back to the stable hash-derived OID for user collections.
+        Some(
+            crate::control::server::pgwire::catalog::oid::stable_collection_oid(
+                self.tenant_id,
+                name,
+            ),
+        )
+    }
+
+    fn resolve_regtype(&self, name: &str) -> Option<i64> {
+        crate::control::server::pgwire::catalog::tables::pg_type::type_oid_map()
+            .get(name)
+            .copied()
     }
 
     fn lookup_array(&self, name: &str) -> Option<ArrayCatalogView> {

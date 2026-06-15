@@ -13,7 +13,8 @@ use crate::control::security::auth_context::AuthContext;
 use crate::control::security::rls::RlsPolicyStore;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::{
-    ColumnarOp, DocumentOp, GraphOp, KvOp, QueryOp, SpatialOp, TextOp, TimeseriesOp, VectorOp,
+    ColumnarOp, DocumentOp, ExchangeOp, GraphOp, KvOp, QueryOp, SpatialOp, TextOp, TimeseriesOp,
+    VectorOp,
 };
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -72,15 +73,30 @@ fn inject_rls_for_plan(
             collection,
             filters,
             ..
-        })
-        | PhysicalPlan::Query(QueryOp::Aggregate {
-            collection,
-            filters,
-            ..
         }) => {
             let rls = get_rls(rls_store, tenant_id, collection, auth)?;
             if !rls.is_empty() {
                 merge_filters(filters, &rls)?;
+            }
+        }
+
+        // Aggregate: a catalog aggregate (`input: Some`) sources rows from the
+        // embedded sub-plan, so RLS must be injected into that input rather
+        // than the aggregate's own (empty) filters. A legacy aggregate
+        // (`input: None`) merges RLS into its `filters` as before.
+        PhysicalPlan::Query(QueryOp::Aggregate {
+            collection,
+            input,
+            filters,
+            ..
+        }) => {
+            if let Some(child) = input {
+                inject_rls_for_plan(tenant_id, child, rls_store, auth)?;
+            } else {
+                let rls = get_rls(rls_store, tenant_id, collection, auth)?;
+                if !rls.is_empty() {
+                    merge_filters(filters, &rls)?;
+                }
             }
         }
 
@@ -166,6 +182,69 @@ fn inject_rls_for_plan(
             // Graph traversal RLS is applied per-node by the Data Plane handler.
             // Graph nodes accessed as documents get filtered via DocumentOp::PointGet RLS.
             let _ = rls_filters;
+        }
+
+        // ── Exchange: coordinator wrapper — recurse into the child plan ──
+        //
+        // The converter wraps any sharded real-collection scan in an Exchange
+        // before RLS injection runs. Without this arm the catch-all silently
+        // swallows the Exchange and the inner scan never receives its RLS filter.
+        PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp { child, .. })) => {
+            inject_rls_for_plan(tenant_id, child, rls_store, auth)?;
+        }
+
+        // ── LateralTopK / LateralLoop: recurse into outer_plan; also inject
+        //    RLS into the inner_filters that the executor applies per outer row ──
+        //
+        // The outer_plan is a fully-formed PhysicalPlan (possibly Exchange-wrapped)
+        // that produces the driving rows — it must receive RLS.  The inner_collection
+        // is scanned directly by the Data Plane per-outer-row using inner_filters;
+        // those filters must also have RLS merged in.
+        PhysicalPlan::Query(QueryOp::LateralTopK {
+            outer_plan,
+            inner_collection,
+            inner_filters,
+            ..
+        }) => {
+            inject_rls_for_plan(tenant_id, outer_plan, rls_store, auth)?;
+            let rls = get_rls(rls_store, tenant_id, inner_collection, auth)?;
+            if !rls.is_empty() {
+                merge_filters(inner_filters, &rls)?;
+            }
+        }
+
+        PhysicalPlan::Query(QueryOp::LateralLoop {
+            outer_plan,
+            inner_collection,
+            inner_filters,
+            ..
+        }) => {
+            inject_rls_for_plan(tenant_id, outer_plan, rls_store, auth)?;
+            let rls = get_rls(rls_store, tenant_id, inner_collection, auth)?;
+            if !rls.is_empty() {
+                merge_filters(inner_filters, &rls)?;
+            }
+        }
+
+        // ── HashJoin: recurse into resolved child inputs when present ──
+        //
+        // left_input / right_input hold a resolved sub-plan (e.g. an
+        // Exchange-wrapped scan or a ProviderScan) supplied by the coordinator.
+        // When Some, the child is the actual source of rows and must receive RLS.
+        // When None, the executor scans left_collection / right_collection directly
+        // without a filter slot on HashJoin; that gap is a pre-existing limitation
+        // tracked separately — it does not regress here.
+        PhysicalPlan::Query(QueryOp::HashJoin {
+            left_input,
+            right_input,
+            ..
+        }) => {
+            if let Some(child) = left_input {
+                inject_rls_for_plan(tenant_id, child, rls_store, auth)?;
+            }
+            if let Some(child) = right_input {
+                inject_rls_for_plan(tenant_id, child, rls_store, auth)?;
+            }
         }
 
         // Write operations, DDL, meta — no read RLS needed.

@@ -38,6 +38,37 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
         temporal,
         database_id,
     } = p;
+
+    // Catalog tables (pg_class, information_schema.*, _system.*, etc.) are
+    // surfaced as `ProviderScan{Some(name)}` so the coordinator materializes
+    // their rows per-request from the identity-scoped catalog producer.
+    // `rows` is left empty here; the coordinator fills it post-cache via
+    // `materialize_providers`. Using an empty-coordinator vshard (empty
+    // collection string) keeps the task coordinator-local.
+    if crate::control::server::pgwire::catalog::schema::catalog_collection_info(collection)
+        .is_some()
+    {
+        let filter_bytes = serialize_filters(filters)?;
+        let proj_names = extract_projection_names(projection, window_functions);
+        let sort = convert_sort_keys(sort_keys);
+        return Ok(vec![PhysicalTask {
+            tenant_id,
+            vshard_id: VShardId::from_collection_in_database(database_id, ""),
+            database_id,
+            plan: PhysicalPlan::Query(QueryOp::ProviderScan {
+                provider: Some(collection.to_string()),
+                rows: Vec::new(),
+                filters: filter_bytes,
+                projection: proj_names,
+                sort_keys: sort,
+                limit: *limit,
+                offset: *offset,
+                distinct: *distinct,
+            }),
+            post_set_op: PostSetOp::None,
+        }]);
+    }
+
     let coll_qualified = super::super::convert::db_qualified(database_id, collection);
     let collection = coll_qualified.as_str();
     let filter_bytes = serialize_filters(filters)?;

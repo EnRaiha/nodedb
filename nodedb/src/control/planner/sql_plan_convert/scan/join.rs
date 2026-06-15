@@ -10,9 +10,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{DatabaseId, VShardId};
 use nodedb_physical::physical_plan::*;
 
-use super::super::aggregate::{
-    extract_collection_name, extract_join_projection_specs, extract_scan_alias,
-};
+use super::super::aggregate::{extract_join_projection_specs, extract_scan_alias};
 use super::super::convert::convert_one;
 use super::super::filter::{expr_filter_qualified, serialize_filters};
 use super::super::scan_params::JoinPlanParams;
@@ -89,9 +87,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
         ctx,
     } = p;
     let mut left_collection =
-        super::super::convert::db_qualified(p.ctx.database_id, &extract_collection_name(left));
+        super::super::aggregate::join_side_collection(left, p.ctx.database_id);
     let mut right_collection =
-        super::super::convert::db_qualified(p.ctx.database_id, &extract_collection_name(right));
+        super::super::aggregate::join_side_collection(right, p.ctx.database_id);
     let mut left_alias = extract_scan_alias(left);
     let mut right_alias = extract_scan_alias(right);
     let join_projection = extract_join_projection_specs(projection);
@@ -99,23 +97,38 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
 
     // Check if the left side is a nested join (multi-way join).
     // If so, convert the inner join to a physical plan and pass it
-    // as `inline_left` so the executor runs it first.
-    let inline_left = if matches!(left, SqlPlan::Join { .. }) {
+    // as `left_input` so the executor runs it first. Sharded nested
+    // joins are wrapped in Exchange{Broadcast} so the coordinator
+    // gathers the nested join result and embeds it.
+    let left_input = if matches!(left, SqlPlan::Join { .. }) {
         let inner_tasks = convert_one(left, tenant_id, ctx)?;
-        inner_tasks.into_iter().next().map(|t| Box::new(t.plan))
+        inner_tasks.into_iter().next().map(|t| {
+            let plan = t.plan;
+            if plan.is_sharded_source() {
+                Box::new(PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+                    child: Box::new(plan),
+                    mode: ExchangeMode::Broadcast,
+                })))
+            } else {
+                Box::new(plan)
+            }
+        })
     } else {
-        None
+        // Catalog left scans lower to an embedded `ProviderScan` (returns
+        // `Some`); plain user-collection scans stay `None` and are scanned by
+        // name via `left_collection`.
+        super::super::aggregate::inline_join_side(left, tenant_id, ctx)?
     };
-    let inline_right = super::super::aggregate::inline_join_side(right, tenant_id, ctx)?;
+    let right_input = super::super::aggregate::inline_join_side(right, tenant_id, ctx)?;
 
     // RIGHT JOIN → swap sides and convert to LEFT JOIN.
     let mut on_keys = on.to_vec();
-    let mut inline_left = inline_left;
-    let mut inline_right = inline_right;
+    let mut left_input = left_input;
+    let mut right_input = right_input;
     let effective_join_type = if join_type.as_str() == "right" {
         std::mem::swap(&mut left_collection, &mut right_collection);
         std::mem::swap(&mut left_alias, &mut right_alias);
-        std::mem::swap(&mut inline_left, &mut inline_right);
+        std::mem::swap(&mut left_input, &mut right_input);
         on_keys = on_keys.into_iter().map(|(l, r)| (r, l)).collect();
         "left".to_string()
     } else {
@@ -131,8 +144,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
         std::mem::swap(&mut raw_left_bm, &mut raw_right_bm);
     }
     let db_id = p.ctx.database_id;
-    let inline_left_bitmap = raw_left_bm.and_then(|h| bitmap_hint_to_plan(&h, db_id));
-    let inline_right_bitmap = raw_right_bm.and_then(|h| bitmap_hint_to_plan(&h, db_id));
+    let left_bitmap = raw_left_bm.and_then(|h| bitmap_hint_to_plan(&h, db_id));
+    let right_bitmap = raw_right_bm.and_then(|h| bitmap_hint_to_plan(&h, db_id));
 
     let vshard = VShardId::from_collection_in_database(p.ctx.database_id, &left_collection);
 
@@ -152,10 +165,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
             post_aggregates: Vec::new(),
             projection: join_projection,
             post_filters: filter_bytes,
-            inline_left,
-            inline_right,
-            inline_left_bitmap,
-            inline_right_bitmap,
+            left_input,
+            right_input,
+            left_bitmap,
+            right_bitmap,
         }),
         post_set_op: PostSetOp::None,
     }])

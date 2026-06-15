@@ -36,7 +36,16 @@ pub(super) fn convert_constant_result(
         tenant_id,
         vshard_id: VShardId::from_collection_in_database(ctx.database_id, ""),
         database_id: ctx.database_id,
-        plan: PhysicalPlan::Meta(MetaOp::RawResponse { payload }),
+        plan: PhysicalPlan::Query(QueryOp::ProviderScan {
+            provider: None,
+            rows: payload,
+            filters: Vec::new(),
+            projection: Vec::new(),
+            sort_keys: Vec::new(),
+            limit: None,
+            offset: 0,
+            distinct: false,
+        }),
         post_set_op: PostSetOp::None,
     }])
 }

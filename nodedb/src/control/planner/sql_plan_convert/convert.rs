@@ -9,6 +9,9 @@ use nodedb_sql::types::SqlPlan;
 
 use std::sync::Arc;
 
+use crate::bridge::envelope::PhysicalPlan;
+use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, QueryOp};
+
 use crate::control::array_catalog::ArrayCatalogHandle;
 use crate::control::security::credential::CredentialStore;
 use crate::control::surrogate::SurrogateAssigner;
@@ -87,6 +90,12 @@ impl ConvertContext {
 }
 
 /// Convert a list of SqlPlans to PhysicalTasks.
+///
+/// After each task is produced, any top-level read plan that is a sharded
+/// source is wrapped in `Exchange{Gather}` so the coordinator knows to fan
+/// it to all Data Plane cores and merge the results. Non-sharded plans
+/// (point gets, writes, constant `ProviderScan`s, coordinator-local joins)
+/// are left unwrapped.
 pub fn convert(
     plans: &[SqlPlan],
     tenant_id: TenantId,
@@ -94,7 +103,33 @@ pub fn convert(
 ) -> crate::Result<Vec<PhysicalTask>> {
     let mut tasks = Vec::new();
     for plan in plans {
-        tasks.extend(convert_one(plan, tenant_id, ctx)?);
+        let mut one = convert_one(plan, tenant_id, ctx)?;
+        for task in &mut one {
+            if task.plan.is_sharded_source() {
+                let as_aggregate = matches!(
+                    &task.plan,
+                    PhysicalPlan::Query(QueryOp::Aggregate { .. })
+                        | PhysicalPlan::Query(QueryOp::PartialAggregate { .. })
+                );
+                // Move the plan out, wrap it in Exchange{Gather}, put it back.
+                let sentinel = PhysicalPlan::Query(QueryOp::ProviderScan {
+                    provider: None,
+                    rows: Vec::new(),
+                    filters: Vec::new(),
+                    projection: Vec::new(),
+                    sort_keys: Vec::new(),
+                    limit: None,
+                    offset: 0,
+                    distinct: false,
+                });
+                let inner = std::mem::replace(&mut task.plan, sentinel);
+                task.plan = PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+                    child: Box::new(inner),
+                    mode: ExchangeMode::Gather { as_aggregate },
+                }));
+            }
+        }
+        tasks.extend(one);
     }
     Ok(tasks)
 }

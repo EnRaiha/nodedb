@@ -289,6 +289,20 @@ impl QueryContext {
                 detail: format!("{other}"),
             },
         })?;
+        // Fold catalog-dependent cast expressions (::regclass, ::regtype) to
+        // constant OID literals at plan time, before crossing the bridge.
+        // The data-plane evaluator is pure and has no catalog access.
+        let plans: Vec<_> = plans
+            .into_iter()
+            .map(|p| {
+                nodedb_sql::planner::catalog_fold::fold_catalog_exprs_in_plan(
+                    p,
+                    &catalog,
+                    database_id,
+                    tenant_id.as_u64(),
+                )
+            })
+            .collect();
         let version_set = catalog.take_recorded_versions();
         let ctx = super::sql_plan_convert::ConvertContext {
             retention_registry: self.retention_registry.clone(),
@@ -397,11 +411,22 @@ impl QueryContext {
         // adapter fresh keeps the adapter's state per-plan and
         // allows future extension.
         let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
-        let plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog).map_err(|e| {
+        let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog).map_err(|e| {
             crate::Error::PlanError {
                 detail: format!("{e}"),
             }
         })?;
+        let plans: Vec<_> = raw_plans
+            .into_iter()
+            .map(|p| {
+                nodedb_sql::planner::catalog_fold::fold_catalog_exprs_in_plan(
+                    p,
+                    &catalog,
+                    database_id,
+                    tenant_id.as_u64(),
+                )
+            })
+            .collect();
         let ctx = super::sql_plan_convert::ConvertContext {
             retention_registry: self.retention_registry.clone(),
             array_catalog: self.array_catalog.clone(),
