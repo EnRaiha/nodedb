@@ -1,109 +1,60 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Expression AST and evaluator for virtual-table queries.
+//! Row-level evaluation of expressions against a (possibly joined) table.
 
-use super::table::VTable;
-use super::value::VValue;
-
-#[derive(Debug, Clone)]
-pub enum Expr {
-    Literal(VValue),
-    Column(String),
-    Star, // sentinel for COUNT(*)
-    BinaryOp(Box<Expr>, BinOp, Box<Expr>),
-    UnaryNot(Box<Expr>),
-    UnaryNeg(Box<Expr>),
-    IsNull(Box<Expr>, bool /*negated*/),
-    InList(Box<Expr>, Vec<Expr>, bool /*negated*/),
-    Between(Box<Expr>, Box<Expr>, Box<Expr>, bool /*negated*/),
-    Like(Box<Expr>, String, bool /*negated*/),
-    Aggregate(AggFn, Box<Expr>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinOp {
-    Eq,
-    NotEq,
-    Lt,
-    LtEq,
-    Gt,
-    GtEq,
-    And,
-    Or,
-    Add,
-    Sub,
-    Mul,
-    Div,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AggFn {
-    Count,
-    Sum,
-    Min,
-    Max,
-    Avg,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum EvalError {
-    #[error("unknown column: {0}")]
-    UnknownColumn(String),
-    #[error("type mismatch in expression: {0}")]
-    TypeMismatch(String),
-    #[error("unsupported expression in virtual-table query: {0}")]
-    Unsupported(String),
-    #[error("invalid LIKE pattern: {0}")]
-    InvalidLike(String),
-}
+use super::super::table::{ResolveError, VTable};
+use super::super::value::VValue;
+use super::cast::{EvalCtx, eval_cast, eval_scalar_fn, like_match};
+use super::types::{BinOp, EvalError, Expr};
 
 /// Evaluate an expression in the context of a single row.
-pub fn eval(expr: &Expr, row: &[VValue], table: &VTable) -> Result<VValue, EvalError> {
+pub fn eval(
+    expr: &Expr,
+    row: &[VValue],
+    table: &VTable,
+    ctx: &EvalCtx,
+) -> Result<VValue, EvalError> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Star => Ok(VValue::Null),
-        Expr::Column(name) => {
+        Expr::Column { qualifier, name } => {
             let idx = table
-                .column_index(name)
-                .ok_or_else(|| EvalError::UnknownColumn(name.clone()))?;
+                .resolve_column(qualifier.as_deref(), name)
+                .map_err(|e| match e {
+                    ResolveError::Unknown(s) => EvalError::UnknownColumn(s),
+                    ResolveError::Ambiguous(s) => EvalError::AmbiguousColumn(s),
+                })?;
             Ok(row[idx].clone())
         }
-        Expr::UnaryNot(e) => {
-            let v = eval(e, row, table)?;
-            match v {
-                VValue::Null => Ok(VValue::Null),
-                VValue::Bool(b) => Ok(VValue::Bool(!b)),
-                _ => Err(EvalError::TypeMismatch("NOT requires boolean".into())),
-            }
-        }
-        Expr::UnaryNeg(e) => {
-            let v = eval(e, row, table)?;
-            match v {
-                VValue::Null => Ok(VValue::Null),
-                VValue::Int4(i) => Ok(VValue::Int4(-i)),
-                VValue::Int8(i) => Ok(VValue::Int8(-i)),
-                _ => Err(EvalError::TypeMismatch("unary - on non-integer".into())),
-            }
-        }
+        Expr::UnaryNot(e) => match eval(e, row, table, ctx)? {
+            VValue::Null => Ok(VValue::Null),
+            VValue::Bool(b) => Ok(VValue::Bool(!b)),
+            _ => Err(EvalError::TypeMismatch("NOT requires boolean".into())),
+        },
+        Expr::UnaryNeg(e) => match eval(e, row, table, ctx)? {
+            VValue::Null => Ok(VValue::Null),
+            VValue::Int4(i) => Ok(VValue::Int4(-i)),
+            VValue::Int8(i) => Ok(VValue::Int8(-i)),
+            _ => Err(EvalError::TypeMismatch("unary - on non-integer".into())),
+        },
         Expr::IsNull(e, negated) => {
-            let v = eval(e, row, table)?;
-            let is_null = v.is_null();
+            let is_null = eval(e, row, table, ctx)?.is_null();
             Ok(VValue::Bool(if *negated { !is_null } else { is_null }))
         }
         Expr::BinaryOp(l, op, r) => {
-            let lv = eval(l, row, table)?;
-            let rv = eval(r, row, table)?;
+            let lv = eval(l, row, table, ctx)?;
+            let rv = eval(r, row, table, ctx)?;
             apply_binary(op, &lv, &rv)
         }
         Expr::InList(e, items, negated) => {
-            let v = eval(e, row, table)?;
+            let v = eval(e, row, table, ctx)?;
             if v.is_null() {
                 return Ok(VValue::Null);
             }
             let mut found = false;
             let mut any_null = false;
             for item in items {
-                let iv = eval(item, row, table)?;
+                let iv = eval(item, row, table, ctx)?;
                 if iv.is_null() {
                     any_null = true;
                     continue;
@@ -123,9 +74,9 @@ pub fn eval(expr: &Expr, row: &[VValue], table: &VTable) -> Result<VValue, EvalE
             Ok(VValue::Bool(if *negated { !result } else { result }))
         }
         Expr::Between(e, lo, hi, negated) => {
-            let v = eval(e, row, table)?;
-            let lov = eval(lo, row, table)?;
-            let hiv = eval(hi, row, table)?;
+            let v = eval(e, row, table, ctx)?;
+            let lov = eval(lo, row, table, ctx)?;
+            let hiv = eval(hi, row, table, ctx)?;
             if v.is_null() || lov.is_null() || hiv.is_null() {
                 return Ok(VValue::Null);
             }
@@ -139,7 +90,7 @@ pub fn eval(expr: &Expr, row: &[VValue], table: &VTable) -> Result<VValue, EvalE
             Ok(VValue::Bool(if *negated { !in_range } else { in_range }))
         }
         Expr::Like(e, pattern, negated) => {
-            let v = eval(e, row, table)?;
+            let v = eval(e, row, table, ctx)?;
             let Some(s) = v.as_text() else {
                 if v.is_null() {
                     return Ok(VValue::Null);
@@ -149,14 +100,79 @@ pub fn eval(expr: &Expr, row: &[VValue], table: &VTable) -> Result<VValue, EvalE
             let m = like_match(s, pattern);
             Ok(VValue::Bool(if *negated { !m } else { m }))
         }
-        Expr::Aggregate(_, _) => Err(EvalError::Unsupported(
-            "aggregate functions only allowed in projection".into(),
-        )),
+        Expr::Cast(inner, target) => {
+            let v = eval(inner, row, table, ctx)?;
+            eval_cast(v, *target, ctx)
+        }
+        Expr::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(eval(item, row, table, ctx)?);
+            }
+            Ok(VValue::Array(out))
+        }
+        Expr::ScalarFn(func, args) => {
+            let mut argv = Vec::with_capacity(args.len());
+            for a in args {
+                argv.push(eval(a, row, table, ctx)?);
+            }
+            eval_scalar_fn(*func, &argv, ctx)
+        }
+        Expr::AnyAll {
+            left,
+            op,
+            array,
+            any,
+        } => {
+            let lv = eval(left, row, table, ctx)?;
+            let arr = eval(array, row, table, ctx)?;
+            eval_any_all(&lv, *op, &arr, *any)
+        }
+        Expr::Aggregate(_, _) => Err(EvalError::AggregateInPredicate),
     }
 }
 
-fn apply_binary(op: &BinOp, l: &VValue, r: &VValue) -> Result<VValue, EvalError> {
-    // Logical short-circuit semantics for AND / OR with NULL.
+/// `left <op> ANY(array)` / `left <op> ALL(array)` with SQL NULL semantics.
+fn eval_any_all(left: &VValue, op: BinOp, array: &VValue, any: bool) -> Result<VValue, EvalError> {
+    if left.is_null() || array.is_null() {
+        return Ok(VValue::Null);
+    }
+    let Some(items) = array.as_array() else {
+        return Err(EvalError::TypeMismatch(
+            "ANY/ALL requires an array right-hand side".into(),
+        ));
+    };
+    let mut saw_null = false;
+    for item in items {
+        match apply_binary(&op, left, item)? {
+            VValue::Bool(true) => {
+                if any {
+                    return Ok(VValue::Bool(true));
+                }
+            }
+            VValue::Bool(false) => {
+                if !any {
+                    return Ok(VValue::Bool(false));
+                }
+            }
+            VValue::Null => saw_null = true,
+            other => {
+                return Err(EvalError::TypeMismatch(format!(
+                    "non-boolean comparison in ANY/ALL: {other:?}"
+                )));
+            }
+        }
+    }
+    // ANY: no match found — NULL if any comparison was unknown, else false.
+    // ALL: no false found — NULL if any comparison was unknown, else true.
+    if saw_null {
+        Ok(VValue::Null)
+    } else {
+        Ok(VValue::Bool(!any))
+    }
+}
+
+pub fn apply_binary(op: &BinOp, l: &VValue, r: &VValue) -> Result<VValue, EvalError> {
     match op {
         BinOp::And => {
             return Ok(match (l.as_bool(), r.as_bool()) {
@@ -219,38 +235,7 @@ fn apply_binary(op: &BinOp, l: &VValue, r: &VValue) -> Result<VValue, EvalError>
     }
 }
 
-/// Treat the predicate value as a SQL truth: NULL → false, true → true,
-/// false → false.
+/// SQL truth value of a predicate result: only `true` is truthy.
 pub fn truthy(v: &VValue) -> bool {
     matches!(v, VValue::Bool(true))
-}
-
-/// SQL `LIKE` with `%` (any string) and `_` (any single char). No escape
-/// handling — virtual-table data does not embed literal `%` or `_`.
-fn like_match(s: &str, pattern: &str) -> bool {
-    let s_chars: Vec<char> = s.chars().collect();
-    let p_chars: Vec<char> = pattern.chars().collect();
-    like_match_recursive(&s_chars, &p_chars)
-}
-
-fn like_match_recursive(s: &[char], p: &[char]) -> bool {
-    if p.is_empty() {
-        return s.is_empty();
-    }
-    match p[0] {
-        '%' => {
-            // Skip consecutive '%' to bound recursion.
-            let mut i = 1;
-            while i < p.len() && p[i] == '%' {
-                i += 1;
-            }
-            let rest = &p[i..];
-            if rest.is_empty() {
-                return true;
-            }
-            (0..=s.len()).any(|k| like_match_recursive(&s[k..], rest))
-        }
-        '_' => !s.is_empty() && like_match_recursive(&s[1..], &p[1..]),
-        c => !s.is_empty() && s[0] == c && like_match_recursive(&s[1..], &p[1..]),
-    }
 }
