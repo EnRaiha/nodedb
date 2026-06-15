@@ -22,6 +22,7 @@ use nodedb_query::msgpack_scan;
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status};
 use crate::control::arrow_convert;
+use crate::control::gateway::core::QueryContext;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
 
@@ -163,6 +164,107 @@ pub async fn gather_all_cores(
         raw,
         merged_array,
         watermark_lsn: max_lsn,
+    })
+}
+
+/// Cluster-wide gather with routing awareness.
+///
+/// # Single-node mode
+///
+/// If `state.gateway` is `None` this degenerates to [`gather_all_cores`] with
+/// unchanged behaviour.
+///
+/// # Cluster mode — single-vShard-homed sources (document, kv, columnar,
+/// timeseries, spatial, vector, text)
+///
+/// Standard collections are *single-vShard-homed*: all rows for a collection
+/// live on exactly one vShard determined by `vshard_for_collection(database_id,
+/// &name)`.  The data-plane scan is **not** vshard-scoped, so broadcasting the
+/// plan to every vShard via `Exchange{Gather}` causes the owning node to return
+/// the full collection once per route that lands on it — 1 024× duplication.
+///
+/// For these sources the bare plan is routed through the gateway's normal
+/// `route_plan` `other` arm, which sends it directly to the single owning
+/// vShard (local or remote) and returns exactly the right rows.
+///
+/// # Cluster mode — cluster-partitioned sources (graph traversal, array)
+///
+/// Graph traversal ops and Array ops distribute data across vShards by node-id
+/// or tile-id.  Cross-node gather for these sources requires a dedicated
+/// scatter-gather path that does not yet exist.  To avoid producing wrong
+/// results we fall back to the local `gather_all_cores` path.
+///
+/// TRACKED DEBT: cross-node gather for genuinely vShard-partitioned sources
+/// (graph traversal / array) needs its own broadcast + vshard-scoped path.
+/// The Exchange{Gather} broadcast approach is NOT correct for single-vShard-
+/// homed collections and must not be reinstated for them.
+pub async fn gather_all_vshards(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+) -> crate::Result<GatherOutcome> {
+    let Some(gateway) = state.gateway.as_ref() else {
+        // Single-node: delegate to the local fan-out path unchanged.
+        return gather_all_cores(state, tenant_id, database_id, plan, trace_id).await;
+    };
+
+    if nodedb_physical::physical_plan::plan_contains_cluster_partitioned_leaf(&plan) {
+        // Graph node-id / array tile partitioning: cross-node gather via this
+        // primitive is NOT yet correct (these engines have dedicated scatter-
+        // gather paths). Fall back to the prior local fan to avoid introducing
+        // wrong results.
+        // TRACKED DEBT: cross-node gather for genuinely vShard-partitioned
+        // sources (graph traversal / array) needs its own broadcast +
+        // vshard-scoped path. Do not replace this fallback with Exchange{Gather}
+        // broadcasting — that path is only correct for single-vShard-homed
+        // collections.
+        return gather_all_cores(state, tenant_id, database_id, plan, trace_id).await;
+    }
+
+    // Single-vShard-homed source (document/kv/columnar/ts/spatial/vector/text):
+    // the whole collection lives on ONE vShard. Route the BARE plan through the
+    // gateway so route_plan's `other` arm sends it to that single owning vShard
+    // (local or remote). Do NOT wrap in Exchange{Gather} — broadcasting would
+    // duplicate rows because the data-plane scan is not vshard-scoped.
+    let ctx = QueryContext {
+        tenant_id,
+        trace_id,
+        database_id,
+    };
+
+    // `Box::pin` breaks an async-fn recursion cycle: the gateway dispatches the
+    // plan through `dispatch_to_data_plane`, which re-enters
+    // `resolve_exchange_in_plan` → `resolve_exchange` → here. The cycle
+    // terminates at runtime (the plan is Exchange-free, so the re-entrant
+    // resolve is a no-op), but the future must be heap-indirected so its size
+    // is finite.
+    let payloads: Vec<Vec<u8>> =
+        Box::pin(gateway.execute(&ctx, plan))
+            .await
+            .map_err(|e| crate::Error::Dispatch {
+                detail: format!("cross-node gather via gateway: {e}"),
+            })?;
+
+    let mut all_elements: Vec<Vec<u8>> = Vec::new();
+    let mut raw = Vec::new();
+    for payload in &payloads {
+        raw.extend_from_slice(payload);
+        all_elements.extend(extract_msgpack_elements(payload));
+    }
+
+    let merged_array = encode_msgpack_array(&all_elements);
+
+    Ok(GatherOutcome {
+        raw,
+        merged_array,
+        // KNOWN LIMITATION: cross-node gather does not yet thread per-shard
+        // watermark LSNs back through the gateway response, so Strong-consistency
+        // LSN fencing degrades to pass-through on this path.  This is consistent
+        // with existing gateway behavior (gateway.execute returns no LSN metadata).
+        // Tracked as a follow-up: propagate watermark_lsn through GatewayResponse.
+        watermark_lsn: Lsn::ZERO,
     })
 }
 

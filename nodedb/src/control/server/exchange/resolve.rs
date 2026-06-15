@@ -31,7 +31,9 @@ use crate::control::state::SharedState;
 use crate::data::executor::response_codec::{encode_binary_rows, flatten_to_relational_rows};
 use crate::types::{DatabaseId, TenantId, TraceId};
 
-use super::gather::{GatherOutcome, finalize_aggregate, gather_all_cores, outcome_to_response};
+use super::gather::{
+    GatherOutcome, finalize_aggregate, gather_all_cores, gather_all_vshards, outcome_to_response,
+};
 
 /// Result of `resolve_and_materialize`.
 pub enum Resolved {
@@ -314,7 +316,7 @@ async fn resolve_exchange(
                 Resolved::Gathered(resp) => return Ok(Resolved::Gathered(resp)),
             };
             let outcome: GatherOutcome =
-                gather_all_cores(state, tenant_id, database_id, child, trace_id).await?;
+                gather_all_vshards(state, tenant_id, database_id, child, trace_id).await?;
             let payload = if as_aggregate {
                 finalize_aggregate(&outcome.merged_array)
             } else {
@@ -331,7 +333,8 @@ async fn resolve_exchange(
             child,
             mode: ExchangeMode::Broadcast,
         })) => {
-            let outcome = gather_all_cores(state, tenant_id, database_id, *child, trace_id).await?;
+            let outcome =
+                gather_all_vshards(state, tenant_id, database_id, *child, trace_id).await?;
             Ok(Resolved::Gathered(outcome_to_response(
                 outcome.merged_array,
                 outcome.watermark_lsn,

@@ -17,5 +17,7 @@ mod auth_objects;
 mod cluster_boot;
 #[path = "sql_cluster_cross_node_dml_tests/ddl_objects.rs"]
 mod ddl_objects;
+#[path = "sql_cluster_cross_node_dml_tests/gather_cross_node.rs"]
+mod gather_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/schema_objects.rs"]
 mod schema_objects;
