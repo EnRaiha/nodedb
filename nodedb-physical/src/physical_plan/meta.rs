@@ -103,10 +103,6 @@ pub enum MetaOp {
     /// `snapshot` is a MessagePack-serialized `TenantDataSnapshot`.
     RestoreTenantSnapshot { tenant_id: u64, snapshot: Vec<u8> },
 
-    /// Pre-computed response payload. The Data Plane echoes it back without
-    /// touching any engine. Used for constant queries (SELECT 1 AS value).
-    RawResponse { payload: Vec<u8> },
-
     /// Purge ALL data for a tenant across every engine and cache.
     ///
     /// Deletes documents, indexes, vectors, graph edges, timeseries,

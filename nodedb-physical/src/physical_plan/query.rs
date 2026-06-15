@@ -49,9 +49,61 @@ pub struct JoinProjection {
     zerompk::FromMessagePack,
 )]
 pub enum QueryOp {
+    /// Coordinator-resolved data-movement wrapper. Defensive error if it reaches a core.
+    Exchange(crate::physical_plan::ExchangeOp),
+
+    /// Pre-materialized rows. `provider: Some(name)` => filled per-request
+    /// (identity-scoped catalog table); `None` => `rows` is final (constant
+    /// SELECT or gathered broadcast child). `rows` is a canonical msgpack array
+    /// of map values (the `encode_binary_rows` shape).
+    ///
+    /// The executor applies predicate, offset, sort, distinct, projection, and
+    /// limit in that order over the rows before emitting the response. Empty
+    /// `filters`/`projection` and `None` limit are no-ops (all rows emitted
+    /// unchanged through those stages).
+    ProviderScan {
+        /// Catalog provider name for deferred materialization by the coordinator.
+        /// `Some(name)` is replaced with `None` after `materialize_providers`
+        /// fills `rows`. Data-Plane cores must never see `Some`.
+        provider: Option<String>,
+        /// Msgpack array of plain map rows. Filled by the coordinator from the
+        /// catalog producer or from a gathered broadcast child.
+        rows: Vec<u8>,
+        /// Serialized `Vec<ScanFilter>` (MessagePack). Empty = no predicate.
+        #[serde(default)]
+        filters: Vec<u8>,
+        /// Output column names to keep. Empty = emit all columns.
+        #[serde(default)]
+        projection: Vec<String>,
+        /// Sort keys: `(column_name, ascending)`. Empty = unordered.
+        #[serde(default)]
+        sort_keys: Vec<(String, bool)>,
+        /// Maximum rows to emit after offset/sort/distinct/projection.
+        /// `None` = unlimited.
+        #[serde(default)]
+        limit: Option<usize>,
+        /// Number of rows to skip before applying limit.
+        #[serde(default)]
+        offset: usize,
+        /// SQL DISTINCT: deduplicate on the projected row.
+        #[serde(default)]
+        distinct: bool,
+    },
+
     /// Aggregate: GROUP BY + aggregate functions.
     Aggregate {
         collection: String,
+        /// Optional sub-plan whose decoded rows are aggregated instead of
+        /// scanning `collection` per-shard. `Some` currently means EXACTLY a
+        /// catalog source (a `ProviderScan` lowered by the converter): the
+        /// aggregate runs over the coordinator-materialized catalog rows and is
+        /// therefore coordinator-local (never broadcast — see
+        /// `is_sharded_source`). `None` = legacy path: scan the named
+        /// `collection` on every shard. `collection` stays populated in both
+        /// cases so downstream RLS / permission / classification continue to
+        /// read it; the executor simply prefers `input` when present.
+        #[serde(default)]
+        input: Option<Box<crate::physical_plan::PhysicalPlan>>,
         group_by: Vec<String>,
         aggregates: Vec<AggregateSpec>,
         filters: Vec<u8>,
@@ -82,6 +134,10 @@ pub enum QueryOp {
     },
 
     /// Hash join: build hash map on right, probe with left.
+    ///
+    /// `left_input`/`right_input` carry a resolved child plan (an Exchange
+    /// child during planning, or an embedded `ProviderScan` after coordinator
+    /// resolution). When `None` the side is scanned locally by collection name.
     HashJoin {
         left_collection: String,
         right_collection: String,
@@ -98,67 +154,21 @@ pub enum QueryOp {
         projection: Vec<JoinProjection>,
         /// Post-join WHERE filter predicates (MessagePack).
         post_filters: Vec<u8>,
-        /// Inline left sub-plan for multi-way joins. When set, the executor
-        /// runs this sub-plan first and uses its result as the left side
-        /// instead of scanning `left_collection`.
-        inline_left: Option<Box<crate::physical_plan::PhysicalPlan>>,
-        /// Inline right sub-plan for scalar subqueries or other materialized
-        /// small-side inputs. The Control Plane executes this plan first,
-        /// merges it if needed, then embeds the result into `BroadcastJoin`.
-        inline_right: Option<Box<crate::physical_plan::PhysicalPlan>>,
+        /// Resolved child plan for the left side. An Exchange child during
+        /// planning; a `ProviderScan` after coordinator resolution. `None`
+        /// means the left side is scanned locally by `left_collection`.
+        left_input: Option<Box<crate::physical_plan::PhysicalPlan>>,
+        /// Resolved child plan for the right side. Same semantics as
+        /// `left_input` but applied to `right_collection`.
+        right_input: Option<Box<crate::physical_plan::PhysicalPlan>>,
         /// Bitmap-producer sub-plan for the left side. When set, the executor
         /// executes this plan first, collects surrogates from all returned rows,
         /// and injects the resulting bitmap into the probe-side prefilter before
         /// scanning. `None` = no bitmap pushdown for the left side.
-        inline_left_bitmap: Option<Box<crate::physical_plan::PhysicalPlan>>,
+        left_bitmap: Option<Box<crate::physical_plan::PhysicalPlan>>,
         /// Bitmap-producer sub-plan for the right side. Same semantics as
-        /// `inline_left_bitmap` but applied to the right (probe) collection.
-        inline_right_bitmap: Option<Box<crate::physical_plan::PhysicalPlan>>,
-    },
-
-    /// Inline hash join: both sides are pre-gathered msgpack data.
-    /// Used for multi-way joins where the left side is the result of another join.
-    InlineHashJoin {
-        /// Left side: msgpack array of maps (from inner join result).
-        left_data: Vec<u8>,
-        /// Right side: raw broadcast scan data.
-        right_data: Vec<u8>,
-        right_alias: Option<String>,
-        on: Vec<(String, String)>,
-        join_type: String,
-        limit: usize,
-        projection: Vec<JoinProjection>,
-        post_filters: Vec<u8>,
-    },
-
-    /// Broadcast join: small side serialized in the plan.
-    BroadcastJoin {
-        large_collection: String,
-        small_collection: String,
-        large_alias: Option<String>,
-        small_alias: Option<String>,
-        broadcast_data: Vec<u8>,
-        on: Vec<(String, String)>,
-        join_type: String,
-        limit: usize,
-        /// Post-join GROUP BY columns (empty = no aggregation).
-        post_group_by: Vec<String>,
-        /// Post-join aggregates: (op, field) pairs (empty = no aggregation).
-        post_aggregates: Vec<(String, String)>,
-        /// Post-join projection: column names to keep (empty = all).
-        projection: Vec<JoinProjection>,
-        /// Post-join WHERE filter predicates (MessagePack).
-        post_filters: Vec<u8>,
-    },
-
-    /// Shuffle join: repartition by join key via SPSC.
-    ShuffleJoin {
-        left_collection: String,
-        right_collection: String,
-        on: Vec<(String, String)>,
-        join_type: String,
-        limit: usize,
-        target_core: usize,
+        /// `left_bitmap` but applied to the right (probe) collection.
+        right_bitmap: Option<Box<crate::physical_plan::PhysicalPlan>>,
     },
 
     /// Nested loop join: fallback for non-equi joins.
