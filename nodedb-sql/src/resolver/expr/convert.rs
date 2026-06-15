@@ -367,6 +367,38 @@ fn convert_expr_inner(expr: &Expr, depth: &mut usize) -> Result<SqlExpr> {
 
             Ok(SqlExpr::Literal(SqlValue::Int(micros)))
         }
+        // `left = ANY(right)` — desugar into InList over array elements.
+        // When `right` resolves to an ArrayLiteral (or a function call that
+        // the bridge/evaluator will fold to an array), emit InList so the
+        // downstream scan filter path handles it natively.
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => {
+            // Only support `=` comparison for now; reject other operators
+            // with a clear, non-AST-leaking message.
+            use ast::BinaryOperator;
+            if !matches!(compare_op, BinaryOperator::Eq) {
+                return Err(SqlError::Unsupported {
+                    detail: "ANY operator with non-equality comparison is not supported".into(),
+                });
+            }
+            let left_expr = convert_expr_depth(left, depth)?;
+            let right_expr = convert_expr_depth(right, depth)?;
+            // Expand the right-hand side into a list if it is an array literal;
+            // otherwise wrap as a single-element list so InList still evaluates.
+            let list = match right_expr {
+                SqlExpr::ArrayLiteral(elems) => elems,
+                other => vec![other],
+            };
+            Ok(SqlExpr::InList {
+                expr: Box::new(left_expr),
+                list,
+                negated: false,
+            })
+        }
         _ => Err(SqlError::Unsupported {
             detail: format!("expression: {expr}"),
         }),

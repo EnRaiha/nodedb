@@ -6,6 +6,7 @@ pub mod array_dml;
 pub mod array_fn;
 pub mod ast_helpers;
 pub mod bitmap_emit;
+pub mod catalog_fold;
 pub mod const_fold;
 pub mod cte;
 pub mod dml;

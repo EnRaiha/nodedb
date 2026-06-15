@@ -5,12 +5,12 @@
 //! Given the two children of a `SqlPlan::Join`, this module determines which
 //! side(s) qualify for bitmap-producer pushdown and returns a `BitmapJoinHints`
 //! struct. The converter layer (`nodedb`'s `sql_plan_convert::scan`) uses these
-//! hints to populate `QueryOp::HashJoin::inline_left_bitmap` and
-//! `inline_right_bitmap` with the appropriate `PhysicalPlan` sub-plans.
+//! hints to populate `QueryOp::HashJoin::left_bitmap` and
+//! `right_bitmap` with the appropriate `PhysicalPlan` sub-plans.
 //!
 //! Selection policy (no cost model; no statistics required):
-//! - Left child qualifies → emit `inline_left_bitmap` hint.
-//! - Right child qualifies → emit `inline_right_bitmap` hint.
+//! - Left child qualifies → emit `left_bitmap` hint.
+//! - Right child qualifies → emit `right_bitmap` hint.
 //! - Both qualify → emit the side that is already a `DocumentIndexLookup`
 //!   (already indexed), preferring left if both are the same shape.
 //! - Neither qualifies → both hints are `None`.
@@ -23,7 +23,7 @@ use super::predicate::{self, BitmapHint};
 #[derive(Debug, Default)]
 pub struct BitmapJoinHints {
     /// Hint for the left join child. When `Some`, the converter should build an
-    /// `IndexedFetch` (or `Scan`) sub-plan and place it in `inline_left_bitmap`.
+    /// `IndexedFetch` (or `Scan`) sub-plan and place it in `left_bitmap`.
     pub left: Option<BitmapHint>,
     /// Hint for the right join child. Same semantics as `left`.
     pub right: Option<BitmapHint>,

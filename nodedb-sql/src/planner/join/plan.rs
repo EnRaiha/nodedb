@@ -72,7 +72,15 @@ pub fn plan_join_from_select(
             scan_for_relation(&join_item.relation, scope)?
         };
 
-        let (join_type, on_keys, condition) = extract_join_spec(&join_item.join_operator)?;
+        let (join_type, mut on_keys, condition) = extract_join_spec(&join_item.join_operator)?;
+
+        // Orient equi-keys to FROM order: `on.0` must reference the left input
+        // and `on.1` the right input. The ON clause may write the operands in
+        // either order (`ON right.k = left.k`); the physical join builds the
+        // hash index on the right key, so a reversed pair would index the wrong
+        // side and match zero rows.
+        let right_ids = right_side_identifiers(&join_item.relation);
+        super::constraint::orient_keys_to_sides(&mut on_keys, &right_ids);
 
         current_plan = SqlPlan::Join {
             left: Box::new(current_plan),
@@ -148,6 +156,20 @@ pub fn plan_join_from_select(
         *filt = filters;
     }
     Ok(Some(current_plan))
+}
+
+/// Collect the normalized identifiers (alias and/or table name) by which a
+/// right-side join relation can be referenced in an ON clause. Used to orient
+/// equi-keys so the right-side operand is always `on.1`.
+fn right_side_identifiers(factor: &ast::TableFactor) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Ok(Some((name, alias))) = crate::parser::normalize::table_name_from_factor(factor) {
+        if let Some(a) = alias {
+            ids.push(a);
+        }
+        ids.push(name);
+    }
+    ids
 }
 
 /// Extract an alias (or table name) from a named-table `TableFactor`.

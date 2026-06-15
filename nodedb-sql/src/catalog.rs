@@ -46,6 +46,15 @@ pub enum SqlCatalogError {
     },
 }
 
+/// A relation that resolves to planner metadata without a stored collection.
+/// Catalog tables (pg_class, _system.*) and array TVFs both fit this shape.
+pub trait TableProvider {
+    fn schema(&self) -> CollectionInfo;
+    fn rel_oid(&self) -> Option<i64> {
+        None
+    }
+}
+
 /// Trait for looking up collection metadata during planning.
 ///
 /// Both Origin (via CredentialStore) and Lite (via the embedded
@@ -72,6 +81,17 @@ pub trait SqlCatalog {
         name: &str,
     ) -> Result<Option<CollectionInfo>, SqlCatalogError>;
 
+    /// Resolve ANY relation name to planner metadata. Catalog tables override
+    /// this to surface synthetic relations by name; the default resolves only
+    /// stored collections, identical to `get_collection`.
+    fn resolve_relation(
+        &self,
+        database_id: DatabaseId,
+        name: &str,
+    ) -> Result<Option<CollectionInfo>, SqlCatalogError> {
+        self.get_collection(database_id, name)
+    }
+
     /// Look up an array by name. Returns `None` if no array with that
     /// name is registered. The default implementation returns `None` so
     /// that catalog adapters predating array support compile without
@@ -84,6 +104,25 @@ pub trait SqlCatalog {
     /// Cheap existence check; the default delegates to `lookup_array`.
     fn array_exists(&self, name: &str) -> bool {
         self.lookup_array(name).is_some()
+    }
+
+    /// Resolve a relation name to its catalog OID for `'name'::regclass`.
+    /// Returns `None` when the name is not found. The default returns `None`
+    /// so existing impls compile without change.
+    fn resolve_regclass(
+        &self,
+        _database_id: nodedb_types::DatabaseId,
+        _tenant_id: u64,
+        _name: &str,
+    ) -> Option<i64> {
+        None
+    }
+
+    /// Resolve a type name to its catalog OID for `'name'::regtype`.
+    /// Returns `None` when the name is not found. The default returns `None`
+    /// so existing impls compile without change.
+    fn resolve_regtype(&self, _name: &str) -> Option<i64> {
+        None
     }
 }
 

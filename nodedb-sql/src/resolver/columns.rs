@@ -206,7 +206,7 @@ impl TableScope {
         }
         if let Some((name, alias)) = table_name_from_factor(factor)? {
             let info = catalog
-                .get_collection(DatabaseId::DEFAULT, &name)?
+                .resolve_relation(DatabaseId::DEFAULT, &name)?
                 .ok_or_else(|| SqlError::UnknownTable { name: name.clone() })?;
             self.add(ResolvedTable { name, alias, info })?;
         }

@@ -47,6 +47,15 @@ pub(super) fn convert_function_depth(func: &ast::Function, depth: &mut usize) ->
         .collect::<Vec<_>>()
         .join(".");
 
+    // `current_schemas(bool)` — PostgreSQL catalog function returning TEXT[].
+    // Fold to a literal array at parse time so `= ANY(current_schemas(...))` works
+    // without threading session context into the data-plane evaluator.
+    if (name == "current_schemas" || name == "current_schema")
+        && let Some(expr) = intercept_catalog_function(&name, func, depth)?
+    {
+        return Ok(expr);
+    }
+
     let args = match &func.args {
         ast::FunctionArguments::None => Vec::new(),
         ast::FunctionArguments::Subquery(_) => {
@@ -126,6 +135,39 @@ fn intercept_fts_function(
             args,
             distinct: false,
         })),
+        _ => Ok(None),
+    }
+}
+
+/// Intercept PostgreSQL catalog functions and fold them to literal arrays.
+///
+/// `current_schemas(true)` → `ARRAY['pg_catalog', 'public']`
+/// `current_schemas(false)` → `ARRAY['public']`
+/// `current_schema()` → `'public'`
+///
+/// Returns `Ok(Some(expr))` when the function is folded, `Ok(None)` otherwise.
+fn intercept_catalog_function(
+    name: &str,
+    func: &ast::Function,
+    depth: &mut usize,
+) -> Result<Option<SqlExpr>> {
+    let args = collect_function_args(func, depth)?;
+    match name {
+        "current_schemas" => {
+            // Determine whether to include implicit schemas (pg_catalog).
+            let include_implicit = match args.first() {
+                Some(SqlExpr::Literal(SqlValue::Bool(b))) => *b,
+                // Default to false when arg is missing or non-literal.
+                _ => false,
+            };
+            let mut schemas: Vec<SqlExpr> = Vec::new();
+            if include_implicit {
+                schemas.push(SqlExpr::Literal(SqlValue::String("pg_catalog".into())));
+            }
+            schemas.push(SqlExpr::Literal(SqlValue::String("public".into())));
+            Ok(Some(SqlExpr::ArrayLiteral(schemas)))
+        }
+        "current_schema" => Ok(Some(SqlExpr::Literal(SqlValue::String("public".into())))),
         _ => Ok(None),
     }
 }

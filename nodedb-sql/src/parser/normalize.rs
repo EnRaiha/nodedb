@@ -49,15 +49,43 @@ pub fn normalize_object_name_checked(name: &sqlparser::ast::ObjectName) -> Resul
         .unwrap_or_default())
 }
 
+/// Normalize a table name, accepting the two system-schema qualifiers that name
+/// catalog relations (NodeDB has no user schemas, so any other qualifier is
+/// rejected by [`normalize_object_name_checked`]):
+///
+/// - `pg_catalog.pg_class` → `pg_class` (the `pg_catalog` schema is implicit).
+/// - `_system.audit_log` → `_system.audit_log` (the `_system.` prefix is part of
+///   the catalog relation's name).
+///
+/// These are resolved like any other relation through `SqlCatalog::resolve_relation`.
+fn normalize_table_name(name: &sqlparser::ast::ObjectName) -> Result<String> {
+    if name.0.len() == 2 {
+        let parts: Vec<String> = name
+            .0
+            .iter()
+            .map(|p| match p {
+                sqlparser::ast::ObjectNamePart::Identifier(ident) => normalize_ident(ident),
+                _ => String::new(),
+            })
+            .collect();
+        match parts[0].as_str() {
+            "pg_catalog" => return Ok(parts[1].clone()),
+            "_system" => return Ok(format!("_system.{}", parts[1])),
+            _ => {}
+        }
+    }
+    normalize_object_name_checked(name)
+}
+
 /// Extract table name and optional alias from a table factor.
 ///
-/// Returns `Err` if the table name is schema-qualified.
+/// Returns `Err` if the table name is schema-qualified with a non-system schema.
 pub fn table_name_from_factor(
     factor: &sqlparser::ast::TableFactor,
 ) -> Result<Option<(String, Option<String>)>> {
     match factor {
         sqlparser::ast::TableFactor::Table { name, alias, .. } => {
-            let table = normalize_object_name_checked(name)?;
+            let table = normalize_table_name(name)?;
             let alias_name = alias.as_ref().map(|a| normalize_ident(&a.name));
             Ok(Some((table, alias_name)))
         }
