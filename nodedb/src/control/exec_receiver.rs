@@ -23,6 +23,7 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use crate::types::ReadConsistency;
 use nodedb_physical::physical_plan::wire as plan_wire;
+use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
 
 /// Numeric code for `TypedClusterError::Internal` when plan bytes fail to decode.
 const PLAN_DECODE_FAILED: u32 = nodedb_cluster::rpc_codec::PLAN_DECODE_FAILED;
@@ -133,6 +134,22 @@ impl LocalPlanExecutor {
             }
         };
 
+        // ── 3b. Reject unresolved Exchange nodes ──────────────────────────────
+        //
+        // Exchange is data-movement and is always resolved by the coordinator on
+        // the requesting node before a plan is shipped here. A local core cannot
+        // perform cross-core/cross-node movement, so a plan that still contains an
+        // Exchange node anywhere in its tree is a coordinator bug — reject it
+        // deterministically instead of dispatching an unexecutable plan.
+        if plan_contains_exchange(&plan) {
+            return ExecuteResponse::err(TypedClusterError::Internal {
+                code: PLAN_DECODE_FAILED,
+                message: "received plan with unresolved Exchange node; coordinator must resolve \
+                          data movement before cross-node dispatch"
+                    .into(),
+            });
+        }
+
         // ── 4. Dispatch through local SPSC bridge ─────────────────────────────
         //
         // Build a Request, register a oneshot tracker, dispatch, and await the response.
@@ -199,5 +216,63 @@ impl LocalPlanExecutor {
                 elapsed_ms: deadline.as_millis() as u64,
             }),
         }
+    }
+}
+
+/// Returns `true` if `plan` or any nested child plan still carries a
+/// `QueryOp::Exchange` node.
+///
+/// Exchange is coordinator-resolved before cross-node dispatch, so a remote
+/// executor must never receive one. This walks the realistic nesting points —
+/// the `Exchange.child` box, the four `HashJoin` child/bitmap boxes, and the
+/// `LateralTopK` / `LateralLoop` `outer_plan` box — and treats every other
+/// variant as an Exchange-free leaf. Carriers are matched explicitly (no
+/// catch-all) so a future plan variant that boxes a child plan fails to compile
+/// here rather than silently bypassing the guard.
+fn plan_contains_exchange(plan: &PhysicalPlan) -> bool {
+    match plan {
+        // Query operations may embed child plans that themselves carry Exchange.
+        PhysicalPlan::Query(query_op) => match query_op {
+            QueryOp::Exchange(op) => plan_contains_exchange(&op.child),
+            QueryOp::HashJoin {
+                left_input,
+                right_input,
+                left_bitmap,
+                right_bitmap,
+                ..
+            } => [left_input, right_input, left_bitmap, right_bitmap]
+                .into_iter()
+                .flatten()
+                .any(|child| plan_contains_exchange(child)),
+            QueryOp::LateralTopK { outer_plan, .. } => plan_contains_exchange(outer_plan),
+            QueryOp::LateralLoop { outer_plan, .. } => plan_contains_exchange(outer_plan),
+            // Aggregate may carry a sub-plan input (catalog `ProviderScan`),
+            // which could in principle nest an Exchange — recurse when present.
+            QueryOp::Aggregate { input, .. } => {
+                input.as_deref().is_some_and(plan_contains_exchange)
+            }
+            // Remaining query ops carry no nested PhysicalPlan child.
+            QueryOp::ProviderScan { .. }
+            | QueryOp::PartialAggregate { .. }
+            | QueryOp::NestedLoopJoin { .. }
+            | QueryOp::SortMergeJoin { .. }
+            | QueryOp::FacetCounts { .. }
+            | QueryOp::RecursiveScan { .. }
+            | QueryOp::RecursiveValue { .. } => false,
+        },
+
+        // Leaf engine operations carry no nested PhysicalPlan child.
+        PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Document(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_) => false,
     }
 }

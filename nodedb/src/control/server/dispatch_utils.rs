@@ -110,6 +110,25 @@ pub async fn dispatch_to_data_plane_with_source(
     trace_id: TraceId,
     event_source: crate::event::EventSource,
 ) -> crate::Result<Response> {
+    // Resolve any Exchange data-movement nodes before dispatch: a root-level
+    // Gather fans the child to all cores and returns the merged response here;
+    // a Broadcast join child is gathered and embedded so the plan reaching a
+    // core is self-contained. Safe no-op for the many non-Exchange callers
+    // (writes, metrics, triggers). Catalog materialization is identity-scoped
+    // and already done upstream on the pgwire/native paths.
+    let plan = match crate::control::server::exchange::resolve_exchange_in_plan(
+        shared,
+        DatabaseId::DEFAULT,
+        tenant_id,
+        plan,
+        trace_id,
+    )
+    .await?
+    {
+        crate::control::server::exchange::Resolved::Gathered(resp) => return Ok(resp),
+        crate::control::server::exchange::Resolved::Plan(p) => p,
+    };
+
     // Extract write metadata before the plan is moved into the request.
     let is_columnar_collection = matches!(
         &plan,

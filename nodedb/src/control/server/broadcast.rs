@@ -1,23 +1,27 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Broadcast dispatch: fan a plan to all Data Plane cores and merge results.
+//! Write-fan-out broadcast helpers.
+//!
+//! These functions broadcast write-like or admin plans to every Data-Plane
+//! core and merge a count or await acknowledgement from each.  They are the
+//! write-replication path, not the read data-movement path — read data
+//! movement is handled by `exchange::gather::gather_all_cores`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use nodedb_query::msgpack_scan;
 use sonic_rs;
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response};
-use crate::control::arrow_convert;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
-use nodedb_physical::physical_plan::QueryOp;
 
-/// Total number of `broadcast_to_all_cores` / `broadcast_count_to_all_cores`
-/// invocations since process start. Exposed so callers (including test
-/// harnesses) can assert O(hops) call-count budgets on batched BFS
-/// paths.
+/// Total number of broadcast invocations (read + write) since process start.
+///
+/// Exposed so callers (including test harnesses) can assert O(hops)
+/// call-count budgets on batched BFS paths.  `gather_all_cores` in
+/// `exchange::gather` increments this counter via
+/// `broadcast_call_count_increment`.
 static BROADCAST_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the total broadcast call count for observability / tests.
@@ -25,131 +29,43 @@ pub fn broadcast_call_count() -> u64 {
     BROADCAST_CALLS.load(Ordering::Relaxed)
 }
 
-/// Broadcast a physical plan to ALL Data Plane cores and merge responses.
+/// Increment the broadcast call counter.
 ///
-/// Used for scans (DocumentScan, Aggregate, etc.) where data is distributed
-/// across cores. Each core scans its local storage, and all results are
-/// concatenated into one msgpack array.
+/// Called by `exchange::gather::gather_all_cores` so all fan-out paths share
+/// the same counter regardless of which helper is used.
+pub(crate) fn broadcast_call_count_increment() {
+    BROADCAST_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Fan a read plan to every Data-Plane core and return the merged response.
+///
+/// Thin wrapper over the single gather primitive
+/// [`crate::control::server::exchange::gather_all_cores`] for callers (e.g.
+/// graph dispatch) that fan a plan to all cores and want the concatenated row
+/// array. Join/catalog read data movement instead flows through
+/// `exchange::resolve_and_materialize`; this entry stays for direct
+/// all-core scans that are not expressed as an `Exchange` plan node.
 pub async fn broadcast_to_all_cores(
     shared: &SharedState,
     tenant_id: TenantId,
     plan: PhysicalPlan,
     trace_id: TraceId,
 ) -> crate::Result<Response> {
-    BROADCAST_CALLS.fetch_add(1, Ordering::Relaxed);
-    let num_cores = shared
-        .dispatcher
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .num_cores();
-
-    let mut receivers = Vec::with_capacity(num_cores);
-    for core_id in 0..num_cores {
-        let request_id = shared.next_request_id();
-        let vshard_id = VShardId::new(core_id as u32);
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id: DatabaseId::DEFAULT,
-            vshard_id,
-            plan: plan.clone(),
-            deadline: Instant::now()
-                + Duration::from_secs(shared.tuning.network.default_deadline_secs),
-            priority: Priority::Normal,
-            trace_id,
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-        };
-
-        let rx = shared.tracker.register(request_id);
-        shared
-            .dispatcher
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .dispatch_to_core(core_id, request)?;
-        receivers.push(rx);
-    }
-
-    // Await all responses and merge raw msgpack rows. Internal transport stays
-    // msgpack; JSON conversion only happens at API boundaries.
-    let mut all_elements: Vec<Vec<u8>> = Vec::new();
-    let mut max_lsn = Lsn::ZERO;
-    let mut had_error = false;
-    let mut error_msg = String::new();
-
-    for mut rx in receivers {
-        let resp = tokio::time::timeout(
-            Duration::from_secs(shared.tuning.network.default_deadline_secs),
-            async { rx.recv().await.ok_or(()) },
-        )
-        .await
-        .map_err(|_| crate::Error::Dispatch {
-            detail: "broadcast timeout".into(),
-        })?
-        .map_err(|_| crate::Error::Dispatch {
-            detail: "broadcast channel closed".into(),
-        })?;
-
-        if resp.status == crate::bridge::envelope::Status::Error {
-            if let Some(ref ec) = resp.error_code {
-                match ec {
-                    crate::bridge::envelope::ErrorCode::NotFound => continue,
-                    _ => {
-                        had_error = true;
-                        error_msg = format!("{ec:?}");
-                    }
-                }
-            }
-            continue;
-        }
-
-        if resp.watermark_lsn > max_lsn {
-            max_lsn = resp.watermark_lsn;
-        }
-
-        if resp.payload.is_empty() {
-            continue;
-        }
-
-        all_elements.extend(extract_msgpack_elements(&resp.payload));
-    }
-
-    let merged_payload = encode_msgpack_array(&all_elements);
-
-    if had_error && all_elements.is_empty() {
-        return Err(crate::Error::Dispatch { detail: error_msg });
-    }
-
-    // For aggregate plans, run Arrow SIMD final-aggregation post-processing on
-    // the merged msgpack rows. This converts the merged rows into a columnar
-    // RecordBatch and verifies that the Arrow kernels can operate on the
-    // result (e.g. SUM/AVG/MIN/MAX over partial results from all cores).
-    // The merged_payload itself is returned unchanged — the batch is used for
-    // any Control-Plane-side window functions or secondary aggregations added
-    // by the planner. Currently this validates the merge and logs schema info.
-    if is_aggregate_plan(&plan)
-        && let Some(batch) = arrow_convert::msgpack_rows_to_record_batch(&merged_payload)
-    {
-        tracing::trace!(
-            rows = batch.num_rows(),
-            columns = batch.num_columns(),
-            "arrow aggregate post-processing: merged {} rows from {} cores",
-            batch.num_rows(),
-            num_cores,
-        );
-    }
-
+    let outcome = crate::control::server::exchange::gather_all_cores(
+        shared,
+        tenant_id,
+        DatabaseId::DEFAULT,
+        plan,
+        trace_id,
+    )
+    .await?;
     Ok(Response {
         request_id: RequestId::new(0),
         status: crate::bridge::envelope::Status::Ok,
         attempt: 1,
         partial: false,
-        payload: crate::bridge::envelope::Payload::from_vec(merged_payload),
-        watermark_lsn: max_lsn,
+        payload: crate::bridge::envelope::Payload::from_vec(outcome.merged_array),
+        watermark_lsn: outcome.watermark_lsn,
         error_code: None,
     })
 }
@@ -255,159 +171,6 @@ pub async fn broadcast_count_to_all_cores(
     })
 }
 
-/// Broadcast a plan to all cores and return raw binary payloads concatenated.
-///
-/// Unlike `broadcast_to_all_cores` (which merges as JSON), this returns the
-/// raw response bytes. Each core's payload is appended as-is. Used by the
-/// two-phase join: phase 1 scans the right collection across all cores and
-/// collects raw msgpack, phase 2 passes it as `broadcast_data` to the join.
-pub async fn broadcast_raw(
-    shared: &SharedState,
-    tenant_id: TenantId,
-    plan: PhysicalPlan,
-    trace_id: TraceId,
-) -> crate::Result<Vec<u8>> {
-    BROADCAST_CALLS.fetch_add(1, Ordering::Relaxed);
-    let num_cores = shared
-        .dispatcher
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .num_cores();
-
-    let mut receivers = Vec::with_capacity(num_cores);
-    for core_id in 0..num_cores {
-        let request_id = shared.next_request_id();
-        let vshard_id = VShardId::new(core_id as u32);
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id: DatabaseId::DEFAULT,
-            vshard_id,
-            plan: plan.clone(),
-            deadline: std::time::Instant::now()
-                + std::time::Duration::from_secs(shared.tuning.network.default_deadline_secs),
-            priority: crate::bridge::envelope::Priority::Normal,
-            trace_id,
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-        };
-
-        let rx = shared.tracker.register(request_id);
-        shared
-            .dispatcher
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .dispatch_to_core(core_id, request)?;
-        receivers.push(rx);
-    }
-
-    let mut merged = Vec::new();
-    for mut rx in receivers {
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(shared.tuning.network.default_deadline_secs),
-            async { rx.recv().await.ok_or(()) },
-        )
-        .await
-        .map_err(|_| crate::Error::Dispatch {
-            detail: "broadcast_raw timeout".into(),
-        })?
-        .map_err(|_| crate::Error::Dispatch {
-            detail: "broadcast_raw channel closed".into(),
-        })?;
-
-        if resp.status == crate::bridge::envelope::Status::Error {
-            continue;
-        }
-        if !resp.payload.is_empty() {
-            merged.extend_from_slice(resp.payload.as_ref());
-        }
-    }
-    Ok(merged)
-}
-
-/// Returns `true` if the plan is an aggregate kind that benefits from Arrow
-/// SIMD post-processing on the Control Plane after multi-core merge.
-fn is_aggregate_plan(plan: &PhysicalPlan) -> bool {
-    matches!(
-        plan,
-        PhysicalPlan::Query(QueryOp::Aggregate { .. })
-            | PhysicalPlan::Query(QueryOp::PartialAggregate { .. })
-    )
-}
-
-fn extract_msgpack_elements(payload: &[u8]) -> Vec<Vec<u8>> {
-    if payload.is_empty() {
-        return Vec::new();
-    }
-
-    let Some((count, mut pos)) = msgpack_scan::array_header(payload, 0) else {
-        tracing::warn!(
-            payload_len = payload.len(),
-            "broadcast_to_all_cores: payload is not a msgpack array; treating as single row"
-        );
-        return vec![payload.to_vec()];
-    };
-
-    let mut rows = Vec::with_capacity(count);
-    for _ in 0..count {
-        if pos >= payload.len() {
-            break;
-        }
-        let start = pos;
-        match msgpack_scan::skip_value(payload, pos) {
-            Some(next) => {
-                rows.push(payload[start..next].to_vec());
-                pos = next;
-            }
-            None => {
-                tracing::warn!(
-                    pos,
-                    payload_len = payload.len(),
-                    "broadcast_to_all_cores: could not skip msgpack element; stopping early"
-                );
-                break;
-            }
-        }
-    }
-    rows
-}
-
-fn decode_count_field(payload: &[u8], key: &str) -> Option<usize> {
-    if payload.is_empty() {
-        return Some(0);
-    }
-
-    let json = nodedb_types::json_from_msgpack(payload)
-        .ok()
-        .or_else(|| sonic_rs::from_slice::<serde_json::Value>(payload).ok())?;
-    json.get(key).and_then(|v| v.as_u64()).map(|v| v as usize)
-}
-
-fn encode_msgpack_array(rows: &[Vec<u8>]) -> Vec<u8> {
-    let total_data: usize = rows.iter().map(|row| row.len()).sum();
-    let mut out = Vec::with_capacity(total_data + 5);
-
-    let row_count = rows.len();
-    if row_count < 16 {
-        out.push(0x90 | row_count as u8);
-    } else if row_count <= u16::MAX as usize {
-        out.push(0xdc);
-        out.extend_from_slice(&(row_count as u16).to_be_bytes());
-    } else {
-        out.push(0xdd);
-        out.extend_from_slice(&(row_count as u32).to_be_bytes());
-    }
-
-    for row in rows {
-        out.extend_from_slice(row);
-    }
-    out
-}
-
 /// Broadcast a `DocumentOp::Register` plan to **every** Data Plane core
 /// and await an acknowledgement from each core before returning.
 ///
@@ -496,40 +259,24 @@ pub async fn broadcast_register_to_all_cores(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{encode_msgpack_array, extract_msgpack_elements};
-
-    #[test]
-    fn extracts_raw_msgpack_rows_from_array_payload() {
-        let payload =
-            nodedb_types::json_to_msgpack(&serde_json::json!([{"id":"u1"},{"id":"u2"}])).unwrap();
-
-        let rows = extract_msgpack_elements(&payload);
-
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            crate::data::executor::response_codec::decode_payload_to_json(&rows[0]),
-            r#"{"id":"u1"}"#
-        );
-        assert_eq!(
-            crate::data::executor::response_codec::decode_payload_to_json(&rows[1]),
-            r#"{"id":"u2"}"#
-        );
+fn decode_count_field(payload: &[u8], key: &str) -> Option<usize> {
+    if payload.is_empty() {
+        return Some(0);
     }
 
+    let json = nodedb_types::json_from_msgpack(payload)
+        .ok()
+        .or_else(|| sonic_rs::from_slice::<serde_json::Value>(payload).ok())?;
+    json.get(key).and_then(|v| v.as_u64()).map(|v| v as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::broadcast_call_count;
+
     #[test]
-    fn reencodes_merged_rows_as_msgpack_array() {
-        let payload_a = nodedb_types::json_to_msgpack(&serde_json::json!([{"id":"u1"}])).unwrap();
-        let payload_b = nodedb_types::json_to_msgpack(&serde_json::json!([{"id":"u2"}])).unwrap();
-
-        let mut rows = extract_msgpack_elements(&payload_a);
-        rows.extend(extract_msgpack_elements(&payload_b));
-        let merged = encode_msgpack_array(&rows);
-
-        assert_eq!(
-            crate::data::executor::response_codec::decode_payload_to_json(&merged),
-            r#"[{"id":"u1"},{"id":"u2"}]"#
-        );
+    fn call_count_readable() {
+        let before = broadcast_call_count();
+        assert!(before < u64::MAX);
     }
 }

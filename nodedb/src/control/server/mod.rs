@@ -4,6 +4,7 @@ pub mod admission;
 pub mod broadcast;
 pub mod conn_stream;
 pub mod dispatch_utils;
+pub mod exchange;
 pub mod graph_dispatch;
 pub mod http;
 pub mod ilp_listener;
