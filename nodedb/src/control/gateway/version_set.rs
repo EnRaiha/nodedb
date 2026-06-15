@@ -327,11 +327,6 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                     right_collection,
                     ..
                 }
-                | ShuffleJoin {
-                    left_collection,
-                    right_collection,
-                    ..
-                }
                 | NestedLoopJoin {
                     left_collection,
                     right_collection,
@@ -346,15 +341,6 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                     out.push(right_collection.clone());
                 }
 
-                BroadcastJoin {
-                    large_collection,
-                    small_collection,
-                    ..
-                } => {
-                    out.push(large_collection.clone());
-                    out.push(small_collection.clone());
-                }
-
                 LateralTopK {
                     inner_collection, ..
                 } => {
@@ -367,8 +353,17 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                     out.push(inner_collection.clone());
                 }
 
+                // Exchange: recurse into the child plan for collection extraction.
+                Exchange(op) => {
+                    let child_collections = touched_collections(&op.child);
+                    out.extend(child_collections);
+                }
+
+                // ProviderScan is a catalog/constant source — no user collection.
+                ProviderScan { .. } => {}
+
                 // No user-collection field.
-                InlineHashJoin { .. } | RecursiveValue { .. } => {}
+                RecursiveValue { .. } => {}
             }
         }
 

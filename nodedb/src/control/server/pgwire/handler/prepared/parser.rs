@@ -138,41 +138,6 @@ impl QueryParser for NodeDbQueryParser {
                 param_types: Vec::new(),
                 result_fields: Vec::new(),
                 is_dsl: false,
-                pg_catalog_table: None,
-            });
-        }
-
-        // pg_catalog virtual tables: bypass the planner entirely — they
-        // aren't real collections. Populate result_fields from the static
-        // catalog schema so Describe can report column types before Bind.
-        let upper = sql.to_uppercase();
-        if let Some(table) =
-            crate::control::server::pgwire::pg_catalog::extract_pg_catalog_table(&upper)
-        {
-            // Parse the SELECT now so Describe can report the *projected*
-            // column schema rather than the full table schema. The
-            // evaluator-produced result must match what Describe announces
-            // — drivers (tokio-postgres, JDBC) decode the wire response
-            // against the Describe shape and will panic on column-count
-            // mismatch. Fall back to the full schema if parsing fails so
-            // drivers that probe with malformed-but-permissive queries still
-            // get a usable Describe.
-            let result_fields =
-                crate::control::server::pgwire::pg_catalog::pg_catalog_projected_schema(sql)
-                    .or_else(|| {
-                        crate::control::server::pgwire::pg_catalog::pg_catalog_schema(table)
-                    })
-                    .unwrap_or_default();
-            let count = count_placeholders(sql).max(types.len());
-            let param_types: Vec<Option<Type>> = (0..count)
-                .map(|i| types.get(i).and_then(|t| t.clone()))
-                .collect();
-            return Ok(ParsedStatement {
-                sql: sql.to_owned(),
-                param_types,
-                result_fields,
-                is_dsl: false,
-                pg_catalog_table: Some(table),
             });
         }
 
@@ -210,7 +175,6 @@ impl QueryParser for NodeDbQueryParser {
             param_types,
             result_fields,
             is_dsl,
-            pg_catalog_table: None,
         })
     }
 

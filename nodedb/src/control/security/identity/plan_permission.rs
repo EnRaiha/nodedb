@@ -61,18 +61,20 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         PhysicalPlan::Query(
             QueryOp::Aggregate { .. }
             | QueryOp::HashJoin { .. }
-            | QueryOp::InlineHashJoin { .. }
             | QueryOp::PartialAggregate { .. }
-            | QueryOp::BroadcastJoin { .. }
-            | QueryOp::ShuffleJoin { .. }
             | QueryOp::NestedLoopJoin { .. }
             | QueryOp::SortMergeJoin { .. }
             | QueryOp::RecursiveScan { .. }
             | QueryOp::RecursiveValue { .. }
             | QueryOp::FacetCounts { .. }
             | QueryOp::LateralTopK { .. }
-            | QueryOp::LateralLoop { .. },
+            | QueryOp::LateralLoop { .. }
+            | QueryOp::ProviderScan { .. },
         ) => Permission::Read,
+
+        // An Exchange node's required permission is its child's permission;
+        // it only redistributes rows produced by the wrapped plan.
+        PhysicalPlan::Query(QueryOp::Exchange(op)) => required_permission(&op.child),
 
         PhysicalPlan::Text(
             TextOp::Search { .. }
@@ -179,9 +181,6 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | VectorOp::CompactIndex { .. }
             | VectorOp::Rebuild { .. },
         ) => Permission::Alter,
-
-        // Pre-computed responses (constant queries like SELECT 1).
-        PhysicalPlan::Meta(MetaOp::RawResponse { .. }) => Permission::Read,
 
         // Control operations.
         PhysicalPlan::Meta(MetaOp::Cancel { .. }) => Permission::Admin,

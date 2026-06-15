@@ -15,7 +15,8 @@ use super::pgwire_bridge::pgwire_result_to_native;
 use super::sql_gateway::dispatch_task_via_gateway;
 use super::transaction::{handle_begin, handle_commit, handle_rollback};
 use super::{DispatchCtx, error_to_native};
-use crate::control::server::broadcast::{broadcast_count_to_all_cores, broadcast_to_all_cores};
+use crate::control::server::broadcast::broadcast_count_to_all_cores;
+use crate::control::server::exchange::resolve::{Resolved, resolve_and_materialize};
 
 /// Handle a SQL statement: transaction control, SET/SHOW, DDL, or DataFusion.
 ///
@@ -253,7 +254,7 @@ async fn execute_planned(
 /// Broadcast plans (scans, InsertSelect) are handled locally; all other tasks
 /// flow through `dispatch_task_via_gateway` which routes via the gateway when
 /// available, or falls back to the local SPSC path on single-node boot.
-async fn dispatch_task(ctx: &DispatchCtx<'_>, task: PhysicalTask) -> crate::Result<Response> {
+async fn dispatch_task(ctx: &DispatchCtx<'_>, mut task: PhysicalTask) -> crate::Result<Response> {
     if matches!(
         task.plan,
         crate::bridge::envelope::PhysicalPlan::Document(
@@ -287,9 +288,22 @@ async fn dispatch_task(ctx: &DispatchCtx<'_>, task: PhysicalTask) -> crate::Resu
         .await;
     }
 
-    // Broadcast scans must fan-out to all cores regardless of gateway state.
-    if task.plan.is_broadcast_scan() {
-        return broadcast_to_all_cores(ctx.state, task.tenant_id, task.plan, TraceId::ZERO).await;
+    // Exchange resolution: materialize catalog providers and resolve any
+    // Exchange nodes (Gather/Broadcast) before dispatch.
+    match resolve_and_materialize(
+        ctx.state,
+        ctx.identity,
+        task.database_id,
+        task.tenant_id,
+        task.plan,
+        TraceId::ZERO,
+    )
+    .await?
+    {
+        Resolved::Gathered(resp) => return Ok(resp),
+        Resolved::Plan(resolved_plan) => {
+            task.plan = resolved_plan;
+        }
     }
 
     // All other tasks — point ops, writes, Raft-replicated writes — route
@@ -515,7 +529,7 @@ mod tests {
     use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp};
 
     #[test]
-    fn columnar_scan_is_broadcast() {
+    fn columnar_scan_is_sharded_source() {
         let plan = PhysicalPlan::Columnar(ColumnarOp::Scan {
             collection: "metrics".into(),
             projection: Vec::new(),
@@ -528,11 +542,11 @@ mod tests {
             prefilter: None,
             computed_columns: Vec::new(),
         });
-        assert!(plan.is_broadcast_scan());
+        assert!(plan.is_sharded_source());
     }
 
     #[test]
-    fn document_scan_is_still_broadcast() {
+    fn document_scan_is_still_sharded_source() {
         let plan = PhysicalPlan::Document(DocumentOp::Scan {
             collection: "docs".into(),
             filters: Vec::new(),
@@ -547,6 +561,6 @@ mod tests {
             valid_at_ms: None,
             prefilter: None,
         });
-        assert!(plan.is_broadcast_scan());
+        assert!(plan.is_sharded_source());
     }
 }

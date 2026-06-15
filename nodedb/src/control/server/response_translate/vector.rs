@@ -155,6 +155,12 @@ pub fn translate_vector_search_payload(
 /// vector hits, apply surrogate→PK translation. Otherwise return the
 /// payload untouched.
 pub fn translate_if_vector(payload: &[u8], plan: &PhysicalPlan, state: &SharedState) -> Vec<u8> {
+    // The coordinator wraps sharded reads (including vector search) in an
+    // `Exchange{Gather}` node; unwrap it so the underlying vector op is visible
+    // and surrogate→PK hit translation still runs on the gathered payload.
+    if let PhysicalPlan::Query(nodedb_physical::physical_plan::QueryOp::Exchange(op)) = plan {
+        return translate_if_vector(payload, &op.child, state);
+    }
     let (collection, rls_filters, top_k): (&str, &[u8], usize) = match plan {
         PhysicalPlan::Vector(VectorOp::Search {
             collection,

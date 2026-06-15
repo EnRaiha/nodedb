@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::bridge::envelope::{Priority, Request, Response};
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::exchange::resolve::{Resolved, resolve_and_materialize};
 use crate::types::{DatabaseId, Lsn, ReadConsistency, TraceId};
 use nodedb_physical::physical_task::PhysicalTask;
-use sonic_rs;
 
 use super::core::NodeDbPgHandler;
 
@@ -20,13 +21,18 @@ impl NodeDbPgHandler {
     ///
     /// `user_id` is forwarded to the `Request` for DML audit attribution.
     /// Pass `None` for system-generated tasks (triggers, maintenance, etc.).
+    ///
+    /// `identity` is forwarded to the Exchange resolver for per-request catalog
+    /// materialization (identity-scoped catalog rows). Pass `None` for internal
+    /// sub-tasks where Exchange has already been resolved by an outer call.
     pub(super) async fn dispatch_task(
         &self,
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
+        identity: Option<&AuthenticatedIdentity>,
     ) -> crate::Result<Response> {
         let tenant_id = task.tenant_id;
-        let result = self.dispatch_task_inner(task, user_id).await;
+        let result = self.dispatch_task_inner(task, user_id, identity).await;
         // Advance per-tenant observed write-HLC high-water on any
         // successful dispatch (local, raft-replicated, or broadcast).
         // Used by RESTORE's staleness gate. Backup captures envelope
@@ -42,8 +48,9 @@ impl NodeDbPgHandler {
 
     async fn dispatch_task_inner(
         &self,
-        task: PhysicalTask,
+        mut task: PhysicalTask,
         user_id: Option<Arc<str>>,
+        identity: Option<&AuthenticatedIdentity>,
     ) -> crate::Result<Response> {
         // Reject user writes against a source database that is currently
         // frozen by a clone materializer sweep.  Reads and DDL pass through
@@ -136,199 +143,27 @@ impl NodeDbPgHandler {
             .await;
         }
 
-        // Broadcast scans to all cores — data is distributed across cores.
-        if task.plan.is_broadcast_scan() {
-            return crate::control::server::broadcast::broadcast_to_all_cores(
+        // Exchange resolution: materialize catalog providers and resolve any
+        // Exchange nodes (Gather/Broadcast) in the plan.  When identity is
+        // available (user-facing SQL paths), per-request catalog materialization
+        // runs first; on internal sub-task paths (identity = None) the plan has
+        // no Exchange nodes left to resolve.
+        if let Some(ident) = identity {
+            match resolve_and_materialize(
                 &self.state,
+                ident,
+                task.database_id,
                 task.tenant_id,
                 task.plan,
                 TraceId::ZERO,
             )
-            .await;
-        }
-
-        // Cross-shard HashJoin: two-phase execution.
-        if let crate::bridge::envelope::PhysicalPlan::Query(
-            nodedb_physical::physical_plan::QueryOp::HashJoin {
-                ref left_collection,
-                ref right_collection,
-                ref left_alias,
-                ref right_alias,
-                ref on,
-                ref join_type,
-                limit,
-                ref post_group_by,
-                ref post_aggregates,
-                ref projection,
-                ref post_filters,
-                ref inline_left,
-                ref inline_right,
-                inline_left_bitmap: _,
-                inline_right_bitmap: _,
-            },
-        ) = task.plan
-        {
-            // Multi-way join: execute inner join first, gather right side,
-            // then send both as a BroadcastJoin to a single core.
-            if let Some(inner_plan) = inline_left {
-                // Step 1: Execute the inner join via recursive dispatch.
-                let inner_task = nodedb_physical::physical_task::PhysicalTask {
-                    tenant_id: task.tenant_id,
-                    vshard_id: task.vshard_id,
-                    database_id: task.database_id,
-                    plan: inner_plan.as_ref().clone(),
-                    post_set_op: nodedb_physical::physical_task::PostSetOp::None,
-                };
-                let inner_resp = Box::pin(self.dispatch_task(inner_task, None)).await?;
-                let left_data: Vec<u8> = inner_resp.payload.as_ref().to_vec();
-
-                // Step 2: Broadcast-scan the right collection.
-                let right_scan = crate::bridge::envelope::PhysicalPlan::Document(
-                    nodedb_physical::physical_plan::DocumentOp::Scan {
-                        collection: right_collection.clone(),
-                        filters: Vec::new(),
-                        limit: (limit * 10).min(50000),
-                        offset: 0,
-                        sort_keys: Vec::new(),
-                        distinct: false,
-                        projection: Vec::new(),
-                        computed_columns: Vec::new(),
-                        window_functions: Vec::new(),
-                        system_time: nodedb_types::SystemTimeScope::Current,
-                        valid_at_ms: None,
-                        prefilter: None,
-                    },
-                );
-                let right_data = crate::control::server::broadcast::broadcast_raw(
-                    &self.state,
-                    task.tenant_id,
-                    right_scan,
-                    TraceId::ZERO,
-                )
-                .await?;
-
-                // Step 3: Dispatch a HashJoin to core 0 with both sides embedded
-                // as inline data (no collection scanning needed).
-                let on_keys: Vec<(String, String)> =
-                    on.iter().map(|(l, r)| (l.clone(), r.clone())).collect();
-                let join_plan = crate::bridge::envelope::PhysicalPlan::Query(
-                    nodedb_physical::physical_plan::QueryOp::InlineHashJoin {
-                        left_data,
-                        right_data,
-                        right_alias: right_alias.clone(),
-                        on: on_keys,
-                        join_type: join_type.clone(),
-                        limit,
-                        projection: projection.clone(),
-                        post_filters: post_filters.clone(),
-                    },
-                );
-                let join_task = nodedb_physical::physical_task::PhysicalTask {
-                    tenant_id: task.tenant_id,
-                    vshard_id: task.vshard_id,
-                    database_id: task.database_id,
-                    plan: join_plan,
-                    post_set_op: nodedb_physical::physical_task::PostSetOp::None,
-                };
-                let mut resp = self.dispatch_local(join_task, None).await?;
-
-                let has_post_agg = !post_group_by.is_empty() || !post_aggregates.is_empty();
-                if has_post_agg {
-                    resp = crate::control::server::post_aggregate::apply_post_aggregation(
-                        resp,
-                        post_group_by,
-                        post_aggregates,
-                    )?;
+            .await?
+            {
+                Resolved::Gathered(resp) => return Ok(resp),
+                Resolved::Plan(resolved_plan) => {
+                    task.plan = resolved_plan;
                 }
-                return Ok(resp);
             }
-            // Phase 1: broadcast scan the right collection across all cores.
-            // Uses broadcast_raw to get raw binary payloads (no JSON wrapping).
-            let broadcast_data = if let Some(right_plan) = inline_right {
-                self.materialize_inline_join_side(
-                    task.tenant_id,
-                    task.vshard_id,
-                    task.database_id,
-                    right_plan,
-                )
-                .await?
-            } else {
-                let right_scan = crate::bridge::envelope::PhysicalPlan::Document(
-                    nodedb_physical::physical_plan::DocumentOp::Scan {
-                        collection: right_collection.clone(),
-                        filters: Vec::new(),
-                        limit: (limit * 10).min(50000),
-                        offset: 0,
-                        sort_keys: Vec::new(),
-                        distinct: false,
-                        projection: Vec::new(),
-                        computed_columns: Vec::new(),
-                        window_functions: Vec::new(),
-                        system_time: nodedb_types::SystemTimeScope::Current,
-                        valid_at_ms: None,
-                        prefilter: None,
-                    },
-                );
-                crate::control::server::broadcast::broadcast_raw(
-                    &self.state,
-                    task.tenant_id,
-                    right_scan,
-                    TraceId::ZERO,
-                )
-                .await?
-            };
-
-            tracing::warn!(
-                broadcast_bytes = broadcast_data.len(),
-                right = %right_collection,
-                left = %left_collection,
-                "two-phase join: phase 1 complete"
-            );
-
-            // Phase 2: dispatch BroadcastJoin to all cores (each core has a
-            // shard of the left collection; the right side is fully embedded).
-            let on_keys: Vec<(String, String)> =
-                on.iter().map(|(l, r)| (l.clone(), r.clone())).collect();
-
-            let has_post_agg = !post_group_by.is_empty() || !post_aggregates.is_empty();
-            let post_group_by = post_group_by.clone();
-            let post_aggregates = post_aggregates.clone();
-
-            let broadcast_plan = crate::bridge::envelope::PhysicalPlan::Query(
-                nodedb_physical::physical_plan::QueryOp::BroadcastJoin {
-                    large_collection: left_collection.clone(),
-                    small_collection: right_collection.clone(),
-                    large_alias: left_alias.clone(),
-                    small_alias: right_alias.clone(),
-                    broadcast_data,
-                    on: on_keys,
-                    join_type: join_type.clone(),
-                    limit,
-                    post_group_by: Vec::new(),
-                    post_aggregates: Vec::new(),
-                    projection: projection.clone(),
-                    post_filters: post_filters.clone(),
-                },
-            );
-            let mut resp = crate::control::server::broadcast::broadcast_to_all_cores(
-                &self.state,
-                task.tenant_id,
-                broadcast_plan,
-                TraceId::ZERO,
-            )
-            .await?;
-
-            // Post-join aggregation: if the original query had GROUP BY on join
-            // results, aggregate them now in the Control Plane.
-            if has_post_agg {
-                resp = crate::control::server::post_aggregate::apply_post_aggregation(
-                    resp,
-                    &post_group_by,
-                    &post_aggregates,
-                )?;
-            }
-
-            return Ok(resp);
         }
 
         if let Some(async_proposer) = self.state.async_raft_proposer.get()
@@ -526,69 +361,14 @@ impl NodeDbPgHandler {
             detail: "response channel closed".into(),
         })
     }
-
-    async fn materialize_inline_join_side(
-        &self,
-        tenant_id: crate::types::TenantId,
-        fallback_vshard_id: crate::types::VShardId,
-        database_id: DatabaseId,
-        plan: &crate::bridge::envelope::PhysicalPlan,
-    ) -> crate::Result<Vec<u8>> {
-        let vshard_id = super::plan::extract_collection(plan)
-            .map(|c| crate::types::VShardId::from_collection_in_database(database_id, c))
-            .unwrap_or(fallback_vshard_id);
-        let task = nodedb_physical::physical_task::PhysicalTask {
-            tenant_id,
-            vshard_id,
-            database_id,
-            plan: plan.clone(),
-            post_set_op: nodedb_physical::physical_task::PostSetOp::None,
-        };
-        let resp = Box::pin(self.dispatch_task(task, None)).await?;
-        normalize_join_broadcast_payload(resp.payload.as_ref())
-    }
-}
-
-fn normalize_join_broadcast_payload(payload: &[u8]) -> crate::Result<Vec<u8>> {
-    if payload.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    match payload[0] {
-        b'[' | b'{' => {
-            let json: serde_json::Value =
-                sonic_rs::from_slice(payload).map_err(|e| crate::Error::Codec {
-                    detail: format!("join broadcast JSON decode: {e}"),
-                })?;
-            nodedb_types::json_to_msgpack(&json).map_err(|e| crate::Error::Codec {
-                detail: format!("join broadcast msgpack encode: {e}"),
-            })
-        }
-        _ => Ok(payload.to_vec()),
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_join_broadcast_payload;
-
     #[test]
-    fn normalize_join_broadcast_payload_converts_json_arrays_to_msgpack() {
-        let payload = br#"[{"avg_amount":43.598}]"#;
-
-        let normalized = normalize_join_broadcast_payload(payload).unwrap();
-        let decoded = nodedb_types::json_from_msgpack(&normalized).unwrap();
-
-        assert_eq!(decoded, serde_json::json!([{ "avg_amount": 43.598 }]));
-    }
-
-    #[test]
-    fn normalize_join_broadcast_payload_keeps_msgpack_payloads() {
-        let payload =
-            nodedb_types::json_to_msgpack(&serde_json::json!([{ "avg_amount": 43.598 }])).unwrap();
-
-        let normalized = normalize_join_broadcast_payload(&payload).unwrap();
-
-        assert_eq!(normalized, payload);
+    fn dispatch_task_compile_check() {
+        // Confirm the dispatch module compiles without the old two-phase join
+        // and broadcast_scan helpers.
+        let _: () = ();
     }
 }

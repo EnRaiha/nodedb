@@ -385,14 +385,17 @@ impl NodeDbPgHandler {
             // --- Normal dispatch ---
             let user_id: Option<std::sync::Arc<str>> =
                 Some(std::sync::Arc::from(identity.username.as_str()));
-            let resp = self.dispatch_task(task, user_id).await.map_err(|e| {
-                let (severity, code, message) = error_to_sqlstate(&e);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?;
+            let resp = self
+                .dispatch_task(task, user_id, Some(identity))
+                .await
+                .map_err(|e| {
+                    let (severity, code, message) = error_to_sqlstate(&e);
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        severity.to_owned(),
+                        code.to_owned(),
+                        message,
+                    )))
+                })?;
 
             if let Some((severity, code, message)) =
                 response_status_to_sqlstate(resp.status, &resp.error_code)

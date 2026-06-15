@@ -12,8 +12,10 @@
 //! 2. Look up the Raft group leader for that vShard in the routing table.
 //! 3. If the leader is this node (`local_node_id`) → `RouteDecision::Local`.
 //! 4. If the leader is another node → `RouteDecision::Remote`.
-//! 5. For broadcast-scan plans ([`PhysicalPlan::is_broadcast_scan`]) →
+//! 5. For plans wrapped in `QueryOp::Exchange{Gather{..}}` →
 //!    `RouteDecision::Broadcast` listing every vShard in the routing table.
+//!    The Exchange node itself is resolved by the coordinator; the child plan
+//!    is routed to all vShards.
 //!
 //! In single-node mode (routing table = `None`), all plans route locally.
 
@@ -48,18 +50,28 @@ pub fn route_plan(
         }];
     };
 
-    if plan.is_broadcast_scan() {
-        return route_broadcast(plan, local_node_id, routing);
+    // A sharded read/aggregate reaches the router wrapped in `Exchange{Gather}`.
+    // The coordinator strips the Exchange here: its child is the plan that runs
+    // on each vShard, and the per-vShard payloads are fused on return (see
+    // `fuse_payloads` in the gateway core). Shipping the Exchange wrapper itself
+    // would let it reach a Data-Plane core, which rejects unresolved Exchange
+    // nodes ("Exchange must be resolved by the coordinator before dispatch").
+    use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, QueryOp};
+    match plan {
+        PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+            child,
+            mode: ExchangeMode::Gather { .. },
+        })) => route_broadcast(*child, local_node_id, routing),
+        other => {
+            let vshard_id = primary_vshard(&other, database_id);
+            let decision = resolve_decision(vshard_id, local_node_id, Some(routing), None);
+            vec![TaskRoute {
+                plan: other,
+                decision,
+                vshard_id,
+            }]
+        }
     }
-
-    let vshard_id = primary_vshard(&plan, database_id);
-    let decision = resolve_decision(vshard_id, local_node_id, Some(routing), None);
-
-    vec![TaskRoute {
-        plan,
-        decision,
-        vshard_id,
-    }]
 }
 
 /// Resolve the `RouteDecision` for a single vShard.
@@ -225,7 +237,7 @@ mod tests {
     #[test]
     fn broadcast_scan_produces_multiple_routes() {
         let table = two_node_table();
-        let plan = PhysicalPlan::Document(DocumentOp::Scan {
+        let scan = PhysicalPlan::Document(DocumentOp::Scan {
             collection: "events".into(),
             limit: 100,
             offset: 0,
@@ -239,9 +251,29 @@ mod tests {
             valid_at_ms: None,
             prefilter: None,
         });
+        // A sharded read reaches the router wrapped in Exchange{Gather} (the
+        // shape `convert()` produces); routing fans it to every vShard.
+        let plan = PhysicalPlan::Query(nodedb_physical::physical_plan::QueryOp::Exchange(
+            nodedb_physical::physical_plan::ExchangeOp {
+                child: Box::new(scan),
+                mode: nodedb_physical::physical_plan::ExchangeMode::Gather {
+                    as_aggregate: false,
+                },
+            },
+        ));
         let routes = route_plan(plan, 1, Some(&table), DatabaseId::DEFAULT);
         // Broadcast should produce VSHARD_COUNT routes.
         assert_eq!(routes.len(), nodedb_cluster::routing::VSHARD_COUNT as usize);
+        // Each route must carry the UNWRAPPED child plan, not the Exchange
+        // wrapper. A wrapper shipped to a vShard reaches a Data-Plane core,
+        // which rejects unresolved Exchange nodes.
+        for route in &routes {
+            assert!(
+                matches!(route.plan, PhysicalPlan::Document(DocumentOp::Scan { .. })),
+                "broadcast route must carry the unwrapped scan child, got {:?}",
+                route.plan
+            );
+        }
     }
 
     /// Find a collection name that hashes to the given vShard.

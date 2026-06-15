@@ -75,14 +75,6 @@ pub(super) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Text(TextOp::FtsDeleteDoc { collection, .. })
         | PhysicalPlan::Query(QueryOp::PartialAggregate { collection, .. })
         | PhysicalPlan::Query(QueryOp::FacetCounts { collection, .. })
-        | PhysicalPlan::Query(QueryOp::BroadcastJoin {
-            large_collection: collection,
-            ..
-        })
-        | PhysicalPlan::Query(QueryOp::ShuffleJoin {
-            left_collection: collection,
-            ..
-        })
         | PhysicalPlan::Document(DocumentOp::BulkUpdate { collection, .. })
         | PhysicalPlan::Document(DocumentOp::BulkDelete { collection, .. })
         | PhysicalPlan::Document(DocumentOp::Upsert { collection, .. })
@@ -117,6 +109,10 @@ pub(super) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Meta(MetaOp::Checkpoint)
         | PhysicalPlan::Graph(GraphOp::Algo { .. })
         | PhysicalPlan::Graph(GraphOp::Match { .. }) => None,
+        // Exchange: recurse into the child plan to extract the collection.
+        PhysicalPlan::Query(QueryOp::Exchange(op)) => extract_collection(&op.child),
+        // ProviderScan is a catalog/constant source — no user collection.
+        PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
         _ => None,
     }
 }
@@ -144,7 +140,6 @@ pub(super) fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Query(QueryOp::Aggregate { .. })
         | PhysicalPlan::Query(QueryOp::FacetCounts { .. })
         | PhysicalPlan::Query(QueryOp::HashJoin { .. })
-        | PhysicalPlan::Query(QueryOp::InlineHashJoin { .. })
         | PhysicalPlan::Query(QueryOp::RecursiveScan { .. })
         | PhysicalPlan::Query(QueryOp::RecursiveValue { .. })
         | PhysicalPlan::Query(QueryOp::LateralTopK { .. })
@@ -163,10 +158,14 @@ pub(super) fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
             PlanKind::SingleDocument
         }
 
-        // Constant-result expressions (SELECT 1, SELECT 'hello', ST_GeoHash(...), etc.)
-        // are compiled to RawResponse with a msgpack-encoded JSON array of row objects.
-        // Route through MultiRow so each array element streams as its own pgwire row.
-        PhysicalPlan::Meta(MetaOp::RawResponse { .. }) => PlanKind::MultiRow,
+        // Constant-result or catalog-scan expressions (SELECT 1, SELECT 'hello',
+        // catalog scans, etc.) are compiled to ProviderScan. Route through MultiRow
+        // so each array element streams as its own pgwire row.
+        PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => PlanKind::MultiRow,
+
+        // Exchange nodes at this point mean the plan was not yet resolved.
+        // Recurse into the child to determine the plan kind.
+        PhysicalPlan::Query(QueryOp::Exchange(op)) => describe_plan(&op.child),
 
         // DML operations that return affected row count.
         PhysicalPlan::Document(DocumentOp::PointPut { .. })

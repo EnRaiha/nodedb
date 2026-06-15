@@ -75,7 +75,7 @@ pub fn define_field(
                 coll.field_defs.retain(|f| f.name != field_name);
 
                 // `fields` is the canonical schema-structure source read by
-                // `pg_catalog/tables.rs`, `maintenance/analyze.rs`,
+                // `catalog/schema.rs`, `maintenance/analyze.rs`,
                 // `collection/describe.rs`, `collection/insert.rs`,
                 // `create/register.rs`, and `ilp_listener.rs`. `field_defs`
                 // carries field behavior (defaults, asserts, generated). Both

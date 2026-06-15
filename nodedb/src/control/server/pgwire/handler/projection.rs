@@ -238,6 +238,8 @@ pub(super) async fn reproject_response(
                 Some(v) => {
                     let text = match v {
                         serde_json::Value::String(s) => s.clone(),
+                        // PostgreSQL text format for boolean is `t`/`f`.
+                        serde_json::Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
                         other => other.to_string(),
                     };
                     let _ = encoder.encode_field(&text);
@@ -364,6 +366,8 @@ pub(super) async fn reproject_star_response(response: Response) -> PgWireResult<
                     Some(v) => {
                         let text = match v {
                             serde_json::Value::String(s) => s.clone(),
+                            // PostgreSQL text format for boolean is `t`/`f`.
+                            serde_json::Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
                             other => other.to_string(),
                         };
                         let _ = encoder.encode_field(&text);

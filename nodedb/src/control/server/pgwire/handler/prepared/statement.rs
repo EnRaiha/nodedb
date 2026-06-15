@@ -27,9 +27,4 @@ pub struct ParsedStatement {
     /// etc.) that `plan_sql` cannot parse. The Execute handler routes these
     /// through the full DSL dispatcher instead of `execute_planned_sql_with_params`.
     pub is_dsl: bool,
-    /// Name of the targeted pg_catalog virtual table, if any. When set, the
-    /// Execute handler bypasses the planner and dispatches to `try_pg_catalog`.
-    /// Describe-time `result_fields` are populated from the catalog's static
-    /// schema so drivers can introspect types before Bind.
-    pub pg_catalog_table: Option<&'static str>,
 }
