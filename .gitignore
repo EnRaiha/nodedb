@@ -102,3 +102,4 @@ dmypy.json
 .gradle/
 
 .cargo/
+.claude/prep/
