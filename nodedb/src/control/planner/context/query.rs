@@ -1,32 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Query planning context for the Control Plane.
-//!
-//! Uses nodedb-sql for SQL parsing and planning. The DataFusion session
-//! is retained only for the function body validator (CREATE FUNCTION)
-//! and procedural executor (PL/pgSQL expression evaluation).
-
 use std::sync::Arc;
 
 use crate::control::security::credential::CredentialStore;
-use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::security::permission::PermissionStore;
-use crate::control::security::role::RoleStore;
 
-/// Security context for query planning — bundles identity + permission stores.
-///
-/// Used by `plan_sql_with_rls` to check EXECUTE permissions on user UDFs
-/// and inject RLS predicates.
-pub struct PlanSecurityContext<'a> {
-    pub identity: &'a AuthenticatedIdentity,
-    pub auth: &'a crate::control::security::auth_context::AuthContext,
-    pub rls_store: &'a crate::control::security::rls::RlsPolicyStore,
-    pub permissions: &'a PermissionStore,
-    pub roles: &'a RoleStore,
-    /// Permission tree cache for hierarchical ACL injection.
-    /// `None` = skip permission tree filtering (e.g., internal queries).
-    pub permission_cache: Option<&'a crate::control::security::permission_tree::PermissionCache>,
-}
+use super::catalog_inputs::CatalogInputs;
+use super::security::PlanSecurityContext;
 
 /// Query context for the Control Plane.
 ///
@@ -74,46 +53,6 @@ pub struct QueryContext {
     /// `VectorPrimaryInsert` conversion can reject oversized vectors without
     /// an extra `TenantIsolation` lock inside the planner hot path.
     max_vector_dim: std::sync::atomic::AtomicU32,
-}
-
-/// Inputs needed to construct an `OriginCatalog` per plan call.
-///
-/// Tenant is intentionally **not** stored here: every plan call passes the
-/// effective tenant to `build_adapter`, so a single `QueryContext` shared
-/// across a pgwire handler can serve queries from connections belonging to
-/// different tenants without cross-tenant catalog resolution.
-#[derive(Clone)]
-struct CatalogInputs {
-    credentials: Arc<CredentialStore>,
-    shared: Option<std::sync::Weak<crate::control::state::SharedState>>,
-    retention_policy_registry:
-        Option<Arc<crate::engine::timeseries::retention_policy::RetentionPolicyRegistry>>,
-}
-
-impl CatalogInputs {
-    fn build_adapter(
-        &self,
-        tenant_id: u64,
-        database_id: crate::types::DatabaseId,
-    ) -> super::catalog_adapter::OriginCatalog {
-        if let Some(weak) = &self.shared
-            && let Some(shared) = weak.upgrade()
-        {
-            super::catalog_adapter::OriginCatalog::new_with_lease(
-                &shared,
-                tenant_id,
-                database_id,
-                self.retention_policy_registry.clone(),
-            )
-        } else {
-            super::catalog_adapter::OriginCatalog::new(
-                Arc::clone(&self.credentials),
-                tenant_id,
-                database_id,
-                self.retention_policy_registry.clone(),
-            )
-        }
-    }
 }
 
 impl QueryContext {
@@ -245,7 +184,7 @@ impl QueryContext {
     /// Core planning via nodedb-sql: parse → plan → optimize → convert.
     ///
     /// Returns the compiled physical tasks and the
-    /// [`super::descriptor_set::DescriptorVersionSet`] recording
+    /// [`super::super::descriptor_set::DescriptorVersionSet`] recording
     /// every descriptor the planner touched. The version set is
     /// used as the plan-cache key AND as the input to
     /// `SharedState::acquire_plan_lease_scope` so cache hits
@@ -257,7 +196,7 @@ impl QueryContext {
         database_id: crate::types::DatabaseId,
     ) -> crate::Result<(
         Vec<nodedb_physical::physical_task::PhysicalTask>,
-        super::descriptor_set::DescriptorVersionSet,
+        super::super::descriptor_set::DescriptorVersionSet,
     )> {
         let inputs = match &self.catalog_inputs {
             Some(i) => i,
@@ -304,7 +243,7 @@ impl QueryContext {
             })
             .collect();
         let version_set = catalog.take_recorded_versions();
-        let ctx = super::sql_plan_convert::ConvertContext {
+        let ctx = super::super::sql_plan_convert::ConvertContext {
             retention_registry: self.retention_registry.clone(),
             array_catalog: self.array_catalog.clone(),
             credentials: self
@@ -320,7 +259,7 @@ impl QueryContext {
                 .load(std::sync::atomic::Ordering::Relaxed),
             database_id,
         };
-        let tasks = super::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
+        let tasks = super::super::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
         Ok((tasks, version_set))
     }
 
@@ -368,16 +307,16 @@ impl QueryContext {
         _returning: bool,
     ) -> crate::Result<(
         Vec<nodedb_physical::physical_task::PhysicalTask>,
-        super::descriptor_set::DescriptorVersionSet,
+        super::super::descriptor_set::DescriptorVersionSet,
     )> {
         let (mut tasks, version_set) = self.plan_with_nodedb_sql(sql, tenant_id, database_id)?;
 
         // Inject RLS predicates.
-        super::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
+        super::super::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
 
         // Inject permission tree filters (hierarchical ACL).
         if let Some(cache) = sec.permission_cache {
-            super::rls_injection::inject_permission_tree(&mut tasks, cache, sec.auth)?;
+            super::super::rls_injection::inject_permission_tree(&mut tasks, cache, sec.auth)?;
         }
 
         Ok((tasks, version_set))
@@ -427,7 +366,7 @@ impl QueryContext {
                 )
             })
             .collect();
-        let ctx = super::sql_plan_convert::ConvertContext {
+        let ctx = super::super::sql_plan_convert::ConvertContext {
             retention_registry: self.retention_registry.clone(),
             array_catalog: self.array_catalog.clone(),
             credentials: self
@@ -443,13 +382,13 @@ impl QueryContext {
                 .load(std::sync::atomic::Ordering::Relaxed),
             database_id,
         };
-        let mut tasks = super::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
+        let mut tasks = super::super::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
 
         // Inject RLS predicates.
-        super::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
+        super::super::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
 
         if let Some(cache) = sec.permission_cache {
-            super::rls_injection::inject_permission_tree(&mut tasks, cache, sec.auth)?;
+            super::super::rls_injection::inject_permission_tree(&mut tasks, cache, sec.auth)?;
         }
 
         Ok(tasks)
