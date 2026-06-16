@@ -79,6 +79,17 @@ pub struct QueryTuning {
     /// Default: 1_000_000.
     #[serde(default = "default_groupby_max_groups_in_mem")]
     pub groupby_max_groups_in_mem: usize,
+    /// Maximum total bytes a single unbounded (no-LIMIT) document scan may
+    /// materialize on a Data Plane core before the handler aborts with a
+    /// deterministic `ResourcesExhausted` error.  A `SELECT * FROM <coll>`
+    /// without a LIMIT is no longer silently truncated; instead it returns
+    /// every row that fits this budget and surfaces a typed error (suggesting
+    /// the client add a LIMIT) if the result would exceed it.  This is a
+    /// per-core, per-query bound that sits below the Control-Plane aggregate
+    /// `network.max_query_result_bytes` ceiling.
+    /// Default: 512 MiB.
+    #[serde(default = "default_max_scan_result_bytes")]
+    pub max_scan_result_bytes: usize,
 }
 
 impl Default for QueryTuning {
@@ -96,6 +107,7 @@ impl Default for QueryTuning {
             columnar_flush_threshold: default_columnar_flush_threshold(),
             compaction_target_bytes: default_compaction_target_bytes(),
             groupby_max_groups_in_mem: default_groupby_max_groups_in_mem(),
+            max_scan_result_bytes: default_max_scan_result_bytes(),
         }
     }
 }
@@ -135,4 +147,7 @@ fn default_compaction_target_bytes() -> usize {
 }
 fn default_groupby_max_groups_in_mem() -> usize {
     1_000_000
+}
+fn default_max_scan_result_bytes() -> usize {
+    512 * 1024 * 1024
 }

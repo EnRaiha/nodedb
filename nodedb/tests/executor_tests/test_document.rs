@@ -3,9 +3,72 @@
 //! Integration tests for document operations (PointGet/Put/Delete, RangeScan, CRDT).
 
 use nodedb::bridge::envelope::{ErrorCode, Status};
+use nodedb_bridge::buffer::{Consumer, Producer};
 use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, PhysicalPlan};
 
+use nodedb::bridge::dispatch::{BridgeRequest, BridgeResponse};
+use nodedb::data::executor::core_loop::CoreLoop;
+
 use crate::helpers::*;
+
+/// Build a `DocumentOp::Scan` over `collection` with an optional row limit.
+/// `limit == usize::MAX` models a no-LIMIT `SELECT * FROM collection`.
+fn doc_scan_plan(collection: &str, limit: usize) -> PhysicalPlan {
+    PhysicalPlan::Document(DocumentOp::Scan {
+        collection: collection.into(),
+        limit,
+        offset: 0,
+        sort_keys: Vec::new(),
+        filters: Vec::new(),
+        distinct: false,
+        projection: Vec::new(),
+        computed_columns: Vec::new(),
+        window_functions: Vec::new(),
+        system_time: nodedb_types::SystemTimeScope::Current,
+        valid_at_ms: None,
+        prefilter: None,
+    })
+}
+
+/// Push one scan request, tick once, then drain every chunk response,
+/// returning `(total_row_count, terminal_status, terminal_error_code)`.
+///
+/// A document scan whose result exceeds `stream_chunk_size` streams as
+/// multiple `Partial` responses followed by a terminal `Ok` (or a terminal
+/// `Error` when a budget is exceeded mid-flight). The terminal frame is the
+/// one whose `status` is not `Partial`.
+fn run_scan_and_count(
+    core: &mut CoreLoop,
+    tx: &mut Producer<BridgeRequest>,
+    rx: &mut Consumer<BridgeResponse>,
+    plan: PhysicalPlan,
+) -> (usize, Status, Option<ErrorCode>) {
+    tx.try_push(BridgeRequest {
+        inner: make_request(plan),
+    })
+    .unwrap();
+    core.tick();
+
+    let mut total = 0usize;
+    let mut terminal_status = Status::Ok;
+    let mut terminal_error = None;
+    while let Ok(resp) = rx.try_pop() {
+        let r = resp.inner;
+        if !r.payload.is_empty() {
+            let json = payload_json(&r.payload);
+            if let Ok(serde_json::Value::Array(rows)) =
+                serde_json::from_str::<serde_json::Value>(&json)
+            {
+                total += rows.len();
+            }
+        }
+        if r.status != Status::Partial {
+            terminal_status = r.status;
+            terminal_error = r.error_code;
+        }
+    }
+    (total, terminal_status, terminal_error)
+}
 
 #[test]
 fn point_get_not_found() {
@@ -183,4 +246,114 @@ fn range_scan_returns_results() {
     let json = payload_json(&payload);
     assert!(json.contains("alice"), "payload: {json}");
     assert!(json.contains("bob"), "payload: {json}");
+}
+
+/// Insert `count` small documents into `collection` in a single batch.
+fn batch_insert_docs(
+    core: &mut CoreLoop,
+    tx: &mut Producer<BridgeRequest>,
+    rx: &mut Consumer<BridgeResponse>,
+    collection: &str,
+    count: usize,
+) {
+    let documents: Vec<(String, Vec<u8>)> = (0..count)
+        .map(|i| {
+            let id = format!("d{i}");
+            let value = format!("{{\"i\":{i}}}").into_bytes();
+            (id, value)
+        })
+        .collect();
+    let surrogates: Vec<nodedb_types::Surrogate> = (0..count)
+        .map(|i| nodedb_types::Surrogate::new((i as u32) + 1))
+        .collect();
+
+    send_ok(
+        core,
+        tx,
+        rx,
+        PhysicalPlan::Document(DocumentOp::BatchInsert {
+            collection: collection.into(),
+            documents,
+            surrogates,
+        }),
+    );
+}
+
+/// A no-LIMIT scan over a collection with more than the historical 10k
+/// truncation point returns EVERY row (not silently capped at 10 000) when the
+/// result fits the scan memory budget.
+#[test]
+fn unbounded_scan_returns_all_rows_when_within_budget() {
+    let (mut core, mut tx, mut rx, _dir) = make_core();
+
+    let count = 12_000;
+    batch_insert_docs(&mut core, &mut tx, &mut rx, "wide", count);
+
+    // usize::MAX models a no-LIMIT `SELECT * FROM wide`.
+    let (rows, status, err) = run_scan_and_count(
+        &mut core,
+        &mut tx,
+        &mut rx,
+        doc_scan_plan("wide", usize::MAX),
+    );
+
+    assert_eq!(status, Status::Ok, "unexpected error: {err:?}");
+    assert_eq!(
+        rows, count,
+        "no-LIMIT scan must return all {count} rows, not the old 10k cap"
+    );
+    assert!(
+        rows > 10_000,
+        "regression: result was truncated at/under the old 10k default"
+    );
+}
+
+/// A no-LIMIT scan whose materialized result exceeds the scan memory budget
+/// surfaces a deterministic `ResourcesExhausted` error — it never silently
+/// returns a partial result.
+#[test]
+fn unbounded_scan_over_budget_surfaces_error() {
+    let (mut core, mut tx, mut rx, _dir) = make_core();
+
+    // Tiny per-query scan budget so a modest collection trips it.
+    let tuning = nodedb_types::config::tuning::QueryTuning {
+        max_scan_result_bytes: 256, // bytes
+        ..nodedb_types::config::tuning::QueryTuning::default()
+    };
+    core.set_query_tuning(tuning);
+
+    batch_insert_docs(&mut core, &mut tx, &mut rx, "big", 5_000);
+
+    let (rows, status, err) = run_scan_and_count(
+        &mut core,
+        &mut tx,
+        &mut rx,
+        doc_scan_plan("big", usize::MAX),
+    );
+
+    assert_eq!(
+        status,
+        Status::Error,
+        "over-budget scan must surface an error, got {rows} rows"
+    );
+    assert_eq!(
+        err,
+        Some(ErrorCode::ResourcesExhausted),
+        "must surface the deterministic resource-exhausted error"
+    );
+}
+
+/// An explicit `LIMIT n` still returns exactly `n` rows — the budget bound only
+/// applies to unbounded scans and must not change explicit-limit behaviour.
+#[test]
+fn explicit_limit_returns_exactly_n() {
+    let (mut core, mut tx, mut rx, _dir) = make_core();
+
+    batch_insert_docs(&mut core, &mut tx, &mut rx, "limited", 12_000);
+
+    let (rows, status, err) =
+        run_scan_and_count(&mut core, &mut tx, &mut rx, doc_scan_plan("limited", 250));
+
+    assert_eq!(status, Status::Ok, "unexpected error: {err:?}");
+    assert_eq!(rows, 250, "explicit LIMIT 250 must return exactly 250 rows");
 }

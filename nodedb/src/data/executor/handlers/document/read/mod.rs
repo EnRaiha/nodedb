@@ -9,4 +9,5 @@ pub mod projection;
 pub mod scan;
 pub mod scan_all_versions;
 pub mod scan_as_of;
+pub mod scan_budget;
 pub mod scan_params;

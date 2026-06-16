@@ -60,7 +60,12 @@ impl CoreLoop {
                 zerompk::from_msgpack(computed_columns_bytes).unwrap_or_default()
             };
 
-        let fetch_limit = (limit + offset).saturating_mul(2).max(1000);
+        // For an explicit LIMIT this preserves the over-fetch heuristic; for a
+        // no-LIMIT scan (`limit == usize::MAX`) it bounds the storage fetch to
+        // a row ceiling derived from the byte budget (+1 row to detect "more
+        // exist") so the data-plane Vec cannot grow to the whole collection.
+        let scan_budget_bytes = self.query_tuning.max_scan_result_bytes;
+        let fetch_limit = super::scan_budget::fetch_limit_for(limit, offset, scan_budget_bytes);
 
         let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
             Vec::new()
@@ -152,6 +157,17 @@ impl CoreLoop {
                     m.record_document_read();
                 }
 
+                // Bound an unbounded (no-LIMIT) scan by the memory budget. If
+                // the materialized result exceeds `max_scan_result_bytes`,
+                // surface a deterministic error instead of silently dropping
+                // rows. Only enforced for unbounded scans — an explicit
+                // `LIMIT n` is already row-bounded by the planner.
+                if limit == usize::MAX
+                    && super::scan_budget::scan_bytes_exceeded(&filtered, scan_budget_bytes)
+                {
+                    return self.response_error(task, ErrorCode::ResourcesExhausted);
+                }
+
                 if let Some(pf) = prefilter {
                     filtered.retain(|(doc_id, _)| {
                         if let Ok(n) = u32::from_str_radix(doc_id, 16) {
@@ -189,7 +205,7 @@ impl CoreLoop {
                     sort::sort_rows(&mut v, sort_keys);
                     v
                 } else {
-                    match self.external_sort(filtered, sort_keys, limit + offset) {
+                    match self.external_sort(filtered, sort_keys, limit.saturating_add(offset)) {
                         Ok(merged) => merged,
                         Err(e) => {
                             warn!(core = self.core_id, error = %e, "external sort failed");

@@ -86,6 +86,18 @@ impl CoreLoop {
             }
         };
 
+        // A no-LIMIT bitemporal scan shares the `usize::MAX` limit; bound its
+        // materialized result by the scan memory budget and surface a
+        // deterministic error rather than silently truncating.
+        if limit == usize::MAX
+            && super::scan_budget::scan_bytes_exceeded(
+                &rows,
+                self.query_tuning.max_scan_result_bytes,
+            )
+        {
+            return self.response_error(task, ErrorCode::ResourcesExhausted);
+        }
+
         let sliced: Vec<(String, Vec<u8>)> = rows.into_iter().skip(offset).take(limit).collect();
 
         if projection.is_empty() {

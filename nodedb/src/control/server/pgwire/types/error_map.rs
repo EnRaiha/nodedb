@@ -123,7 +123,10 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
         ErrorCode::ResourcesExhausted => (
             "ERROR",
             sqlstate::OUT_OF_MEMORY,
-            "resources exhausted".into(),
+            "query result exceeded the scan memory budget; add a LIMIT clause \
+             or a more selective filter, or raise \
+             [tuning.query] max_scan_result_bytes"
+                .into(),
         ),
         ErrorCode::RejectedDanglingEdge { missing_node } => (
             "ERROR",

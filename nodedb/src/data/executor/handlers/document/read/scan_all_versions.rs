@@ -90,6 +90,18 @@ impl CoreLoop {
             }
         };
 
+        // A no-LIMIT audit-log scan shares the `usize::MAX` limit; bound its
+        // materialized result by the scan memory budget and surface a
+        // deterministic error rather than silently truncating.
+        if limit == usize::MAX
+            && super::scan_budget::version_bytes_exceeded(
+                &rows,
+                self.query_tuning.max_scan_result_bytes,
+            )
+        {
+            return self.response_error(task, ErrorCode::ResourcesExhausted);
+        }
+
         let sliced = rows.into_iter().skip(offset).take(limit);
 
         let mut out: Vec<(String, Vec<u8>)> = Vec::new();

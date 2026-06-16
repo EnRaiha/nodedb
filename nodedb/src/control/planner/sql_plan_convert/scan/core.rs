@@ -135,7 +135,12 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
         EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
             PhysicalPlan::Document(DocumentOp::Scan {
                 collection: collection.into(),
-                limit: limit.unwrap_or(10000),
+                // A no-LIMIT document scan is unbounded by row count; the Data
+                // Plane bounds it by a memory budget (`max_scan_result_bytes`)
+                // and surfaces a deterministic error rather than silently
+                // truncating. KV/columnar/timeseries keep their 10k default
+                // (bounded in follow-on units).
+                limit: limit.unwrap_or(usize::MAX),
                 offset: *offset,
                 sort_keys: sort,
                 filters: filter_bytes,
