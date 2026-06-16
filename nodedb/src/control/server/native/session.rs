@@ -32,6 +32,9 @@ use session_chunk::chunk_large_response;
 #[path = "session_chunk.rs"]
 mod session_chunk;
 
+#[path = "session_stream.rs"]
+mod session_stream;
+
 /// A client session on the native binary protocol.
 ///
 /// Auto-detects JSON vs MessagePack on the first frame. Supports all
@@ -216,48 +219,68 @@ impl NativeSession {
             };
 
             // Decode and handle.
-            let response = match codec::decode_request(&payload, format) {
+            let outcome = match codec::decode_request(&payload, format) {
                 Ok(req) => self.handle_request(req).await,
-                Err(e) => NativeResponse::error(0, "42601", format!("{e}")),
+                Err(e) => dispatch::SqlOutcome::Response(Box::new(NativeResponse::error(
+                    0,
+                    "42601",
+                    format!("{e}"),
+                ))),
             };
 
-            // Encode and write response — chunk if it exceeds frame limit.
-            let resp_bytes = codec::encode_response(&response, format)?;
-            if resp_bytes.len() <= MAX_FRAME_SIZE as usize {
-                codec::write_frame(&mut self.stream, &resp_bytes).await?;
-            } else {
-                // Response too large for a single frame — split rows.
-                let frames = chunk_large_response(response, format)?;
-                for frame in &frames {
-                    codec::write_frame(&mut self.stream, frame).await?;
+            match outcome {
+                dispatch::SqlOutcome::Response(response) => {
+                    // Encode and write response — chunk if it exceeds frame limit.
+                    let resp_bytes = codec::encode_response(&response, format)?;
+                    if resp_bytes.len() <= MAX_FRAME_SIZE as usize {
+                        codec::write_frame(&mut self.stream, &resp_bytes).await?;
+                    } else {
+                        // Response too large for a single frame — split rows.
+                        let frames = chunk_large_response(*response, format)?;
+                        for frame in &frames {
+                            codec::write_frame(&mut self.stream, frame).await?;
+                        }
+                    }
+                }
+                dispatch::SqlOutcome::Stream(sql_stream) => {
+                    session_stream::emit_sql_stream(&mut self.stream, sql_stream, format).await?;
                 }
             }
         }
     }
 
     /// Route a decoded request to the appropriate handler.
+    ///
+    /// Returns a [`SqlOutcome`]: every op produces a materialized
+    /// `SqlOutcome::Response` except an eligible streamable SELECT on the
+    /// `Sql`/`Ddl` path, which yields `SqlOutcome::Stream` for the run loop to
+    /// emit as multiple frames.
     async fn handle_request(
         &mut self,
         req: nodedb_types::protocol::NativeRequest,
-    ) -> NativeResponse {
+    ) -> dispatch::SqlOutcome {
+        use dispatch::SqlOutcome;
         let seq = req.seq;
         let op = req.op;
 
         // Auth handling.
         if op == OpCode::Auth {
-            return self.handle_auth(seq, &req.fields).await;
+            return SqlOutcome::Response(Box::new(self.handle_auth(seq, &req.fields).await));
         }
 
         // Ping requires no auth.
         if op == OpCode::Ping {
-            return dispatch::handle_ping(seq);
+            return SqlOutcome::Response(Box::new(dispatch::handle_ping(seq)));
         }
 
         // Status requires no auth — returns current startup phase.
         if op == OpCode::Status {
             let health = crate::control::startup::health::observe(&self.state.startup);
             let native_status = crate::control::startup::health::to_native_status(&health);
-            return NativeResponse::status_row(seq, native_status.to_string());
+            return SqlOutcome::Response(Box::new(NativeResponse::status_row(
+                seq,
+                native_status.to_string(),
+            )));
         }
 
         // All other ops require authentication.
@@ -267,18 +290,22 @@ impl NativeSession {
                 self.auth_context = Some(super::super::session_auth::build_auth_context(&trust_id));
                 self.identity = Some(trust_id);
             } else {
-                return NativeResponse::error(
+                return SqlOutcome::Response(Box::new(NativeResponse::error(
                     seq,
                     "28000",
                     "not authenticated. Send Auth request first.",
-                );
+                )));
             }
         }
 
         let identity = match self.identity.as_ref() {
             Some(id) => id,
             None => {
-                return NativeResponse::error(seq, "28000", "not authenticated");
+                return SqlOutcome::Response(Box::new(NativeResponse::error(
+                    seq,
+                    "28000",
+                    "not authenticated",
+                )));
             }
         };
 
@@ -304,23 +331,34 @@ impl NativeSession {
         let fields = match &req.fields {
             RequestFields::Text(f) => f,
             _ => {
-                return NativeResponse::error(
+                return SqlOutcome::Response(Box::new(NativeResponse::error(
                     seq,
                     "0A000",
                     "unsupported request field format for this server version",
-                );
+                )));
             }
         };
 
-        match op {
-            // SQL: full DataFusion pipeline.
-            OpCode::Sql | OpCode::Ddl => {
-                let sql = match &fields.sql {
-                    Some(s) => s.as_str(),
-                    None => return NativeResponse::error(seq, "42601", "missing 'sql' field"),
-                };
-                dispatch::handle_sql(&ctx, seq, sql, fields.sql_params.as_deref()).await
-            }
+        // SQL / DDL is the only path that can stream — handle it before the
+        // materialized `match op` below so its `SqlOutcome` flows up unchanged.
+        if matches!(op, OpCode::Sql | OpCode::Ddl) {
+            let sql = match &fields.sql {
+                Some(s) => s.as_str(),
+                None => {
+                    return SqlOutcome::Response(Box::new(NativeResponse::error(
+                        seq,
+                        "42601",
+                        "missing 'sql' field",
+                    )));
+                }
+            };
+            return dispatch::handle_sql_streaming(&ctx, seq, sql, fields.sql_params.as_deref())
+                .await;
+        }
+
+        let response = match op {
+            // SQL handled above (streaming-capable).
+            OpCode::Sql | OpCode::Ddl => unreachable!("SQL/DDL handled before this match"),
 
             // Session parameters.
             OpCode::Set => {
@@ -329,9 +367,15 @@ impl NativeSession {
                     None => {
                         // Also support SET via sql field: "SET key = value"
                         if let Some(sql) = &fields.sql {
-                            return dispatch::handle_sql(&ctx, seq, sql, None).await;
+                            return SqlOutcome::Response(Box::new(
+                                dispatch::handle_sql(&ctx, seq, sql, None).await,
+                            ));
                         }
-                        return NativeResponse::error(seq, "42601", "missing 'key' field");
+                        return SqlOutcome::Response(Box::new(NativeResponse::error(
+                            seq,
+                            "42601",
+                            "missing 'key' field",
+                        )));
                     }
                 };
                 let value = fields.value.as_deref().unwrap_or("");
@@ -342,9 +386,15 @@ impl NativeSession {
                     Some(k) => k.as_str(),
                     None => {
                         if let Some(sql) = &fields.sql {
-                            return dispatch::handle_sql(&ctx, seq, sql, None).await;
+                            return SqlOutcome::Response(Box::new(
+                                dispatch::handle_sql(&ctx, seq, sql, None).await,
+                            ));
                         }
-                        return NativeResponse::error(seq, "42601", "missing 'key' field");
+                        return SqlOutcome::Response(Box::new(NativeResponse::error(
+                            seq,
+                            "42601",
+                            "missing 'key' field",
+                        )));
                     }
                 };
                 dispatch::handle_show(&ctx, seq, key)
@@ -352,7 +402,13 @@ impl NativeSession {
             OpCode::Reset => {
                 let key = match &fields.key {
                     Some(k) => k.as_str(),
-                    None => return NativeResponse::error(seq, "42601", "missing 'key' field"),
+                    None => {
+                        return SqlOutcome::Response(Box::new(NativeResponse::error(
+                            seq,
+                            "42601",
+                            "missing 'key' field",
+                        )));
+                    }
                 };
                 dispatch::handle_reset(&ctx, seq, key)
             }
@@ -366,7 +422,13 @@ impl NativeSession {
             OpCode::Explain => {
                 let sql = match &fields.sql {
                     Some(s) => s.as_str(),
-                    None => return NativeResponse::error(seq, "42601", "missing 'sql' field"),
+                    None => {
+                        return SqlOutcome::Response(Box::new(NativeResponse::error(
+                            seq,
+                            "42601",
+                            "missing 'sql' field",
+                        )));
+                    }
                 };
                 dispatch::handle_sql(&ctx, seq, &format!("EXPLAIN {sql}"), None).await
             }
@@ -443,7 +505,13 @@ impl NativeSession {
             OpCode::CopyFrom => {
                 let sql = match &fields.sql {
                     Some(s) => s.as_str(),
-                    None => return NativeResponse::error(seq, "42601", "missing 'sql' field"),
+                    None => {
+                        return SqlOutcome::Response(Box::new(NativeResponse::error(
+                            seq,
+                            "42601",
+                            "missing 'sql' field",
+                        )));
+                    }
                 };
                 dispatch::handle_sql(&ctx, seq, sql, None).await
             }
@@ -453,7 +521,9 @@ impl NativeSession {
             // OpCode is #[non_exhaustive]; future opcodes that reach this
             // handler before session.rs is updated return a typed error.
             _ => NativeResponse::error(seq, "0A000", "opcode not supported by this server version"),
-        }
+        };
+
+        SqlOutcome::Response(Box::new(response))
     }
 
     /// Handle authentication request.

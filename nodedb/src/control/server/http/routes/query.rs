@@ -379,9 +379,39 @@ pub async fn query_ndjson(
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
+    let trace_id = crate::control::trace_context::generate_trace_id();
+
+    // Lazy fast path: an eligible single-task, unordered, multi-row SELECT
+    // streams its rows straight off a `ResultStream` as NDJSON lines instead
+    // of materializing the whole result first. HTTP is stateless, so there is
+    // no autocommit / transaction-block gate (cf. native + pgwire). The
+    // streaming body outlives this handler, so request-accounting is not
+    // bracketed around it — admission was already gated by `check_tenant_quota`
+    // above, matching the pgwire lazy path which also does not request-account
+    // the streamed `QueryResponse`.
+    match super::query_stream::try_open_stream(&state, &tasks, database_id, trace_id).await {
+        Ok(Some((stream, limit))) => {
+            let body = axum::body::Body::from_stream(super::query_stream::ndjson_body_stream(
+                stream, limit,
+            ));
+            return Response::builder()
+                .header("Content-Type", "application/x-ndjson")
+                .body(body)
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "encoding error").into_response()
+                });
+        }
+        Ok(None) => {
+            // Not streamable — fall through to the materialized path below.
+        }
+        Err(e) => {
+            let (_status, msg) = GatewayErrorMap::to_http(&e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+        }
+    }
+
     state.shared.tenant_request_start(tenant_id);
 
-    let trace_id = crate::control::trace_context::generate_trace_id();
     let mut ndjson = String::new();
     for task in tasks {
         let dispatch_result: crate::Result<Vec<Vec<u8>>> = match state.shared.gateway.as_ref() {
@@ -413,12 +443,15 @@ pub async fn query_ndjson(
                     if !payload.is_empty() {
                         let json_str =
                             crate::data::executor::response_codec::decode_payload_to_json(payload);
-                        // Try to parse as array and emit each element as a line.
-                        if let Ok(serde_json::Value::Array(items)) =
-                            sonic_rs::from_str::<serde_json::Value>(&json_str)
-                        {
-                            for item in &items {
-                                ndjson.push_str(&item.to_string());
+                        // Emit each array element as its own NDJSON line.
+                        // `to_array_iter` yields raw JSON slices without
+                        // deserializing into a Value tree — no per-item heap
+                        // alloc and no re-serialization. Non-array payloads
+                        // (DDL acks, error text, etc.) fall back to emitting
+                        // the whole payload as one line.
+                        if json_str.trim_start().starts_with('[') {
+                            for lv in sonic_rs::to_array_iter(json_str.as_str()).flatten() {
+                                ndjson.push_str(lv.as_raw_str());
                                 ndjson.push('\n');
                             }
                         } else {

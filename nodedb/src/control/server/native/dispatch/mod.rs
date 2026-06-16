@@ -11,13 +11,15 @@ mod plan_builder;
 mod session_ops;
 mod sql;
 mod sql_gateway;
+mod streaming;
 mod transaction;
 
 pub(crate) use auth::{handle_auth, handle_ping};
 pub(crate) use conversion::{error_to_native, parse_json_to_columns_rows};
 pub(crate) use direct_ops::handle_direct_op;
 pub(crate) use session_ops::{handle_reset, handle_set, handle_show};
-pub(crate) use sql::handle_sql;
+pub(crate) use sql::{handle_sql, handle_sql_streaming};
+pub(crate) use streaming::{SqlOutcome, SqlStream};
 pub(crate) use transaction::{handle_begin, handle_commit, handle_rollback};
 
 use crate::control::planner::context::QueryContext;

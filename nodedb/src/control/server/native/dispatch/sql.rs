@@ -13,6 +13,7 @@ use nodedb_physical::physical_task::PhysicalTask;
 
 use super::pgwire_bridge::pgwire_result_to_native;
 use super::sql_gateway::dispatch_task_via_gateway;
+use super::streaming::{SqlOutcome, try_open_sql_stream};
 use super::transaction::{handle_begin, handle_commit, handle_rollback};
 use super::{DispatchCtx, error_to_native};
 use crate::control::server::broadcast::broadcast_count_to_all_cores;
@@ -33,6 +34,35 @@ pub(crate) async fn handle_sql(
     sql: &str,
     sql_params: Option<&[Value]>,
 ) -> NativeResponse {
+    // Non-streaming entry: SET-via-sql, SHOW-via-sql, EXPLAIN, COPY FROM. These
+    // never reach the streamable SELECT fast path, so `allow_stream = false`
+    // guarantees a `Response` outcome.
+    handle_sql_inner(ctx, seq, sql, sql_params, false)
+        .await
+        .into_response()
+}
+
+/// Streaming-capable entry for `OpCode::Sql | OpCode::Ddl`.
+///
+/// Identical to [`handle_sql`] except an eligible autocommit, single-task,
+/// unordered multi-row SELECT yields [`SqlOutcome::Stream`] for the session
+/// loop to emit as multiple frames instead of one materialized response.
+pub(crate) async fn handle_sql_streaming(
+    ctx: &DispatchCtx<'_>,
+    seq: u64,
+    sql: &str,
+    sql_params: Option<&[Value]>,
+) -> SqlOutcome {
+    handle_sql_inner(ctx, seq, sql, sql_params, true).await
+}
+
+async fn handle_sql_inner(
+    ctx: &DispatchCtx<'_>,
+    seq: u64,
+    sql: &str,
+    sql_params: Option<&[Value]>,
+    allow_stream: bool,
+) -> SqlOutcome {
     // Inline bound parameters before any dispatch — keeps the
     // substitution invariant in one place so the DDL router, planner,
     // and transaction buffer all see the same SQL shape regardless of
@@ -40,7 +70,7 @@ pub(crate) async fn handle_sql(
     let substituted: Option<String> = match sql_params {
         Some(params) if !params.is_empty() => match inline_params(sql, params) {
             Ok(s) => Some(s),
-            Err(msg) => return NativeResponse::error(seq, "42P02", msg),
+            Err(msg) => return resp(NativeResponse::error(seq, "42P02", msg)),
         },
         _ => None,
     };
@@ -51,59 +81,59 @@ pub(crate) async fn handle_sql(
     ctx.sessions.ensure_session(*ctx.peer_addr);
 
     if sql_trimmed.is_empty() || sql_trimmed == ";" {
-        return NativeResponse::ok(seq);
+        return resp(NativeResponse::ok(seq));
     }
 
     // Transaction control.
     if upper == "BEGIN" || upper == "BEGIN TRANSACTION" || upper == "START TRANSACTION" {
-        return handle_begin(ctx, seq);
+        return resp(handle_begin(ctx, seq));
     }
     if upper == "COMMIT" || upper == "END" || upper == "END TRANSACTION" {
-        return handle_commit(ctx, seq).await;
+        return resp(handle_commit(ctx, seq).await);
     }
     if upper == "ROLLBACK" || upper == "ABORT" {
-        return handle_rollback(ctx, seq);
+        return resp(handle_rollback(ctx, seq));
     }
     if upper.starts_with("SAVEPOINT ") {
-        return NativeResponse::status_row(seq, "SAVEPOINT");
+        return resp(NativeResponse::status_row(seq, "SAVEPOINT"));
     }
     if upper.starts_with("RELEASE SAVEPOINT ") || upper.starts_with("RELEASE ") {
-        return NativeResponse::status_row(seq, "RELEASE");
+        return resp(NativeResponse::status_row(seq, "RELEASE"));
     }
     if upper.starts_with("ROLLBACK TO ") {
-        return NativeResponse::status_row(seq, "ROLLBACK");
+        return resp(NativeResponse::status_row(seq, "ROLLBACK"));
     }
 
     if ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::Failed {
-        return NativeResponse::error(
+        return resp(NativeResponse::error(
             seq,
             "25P02",
             "current transaction is aborted, commands ignored until end of transaction block",
-        );
+        ));
     }
 
     // SET / SHOW / RESET.
     if upper.starts_with("SET ") {
-        return handle_set_sql(ctx, seq, sql_trimmed);
+        return resp(handle_set_sql(ctx, seq, sql_trimmed));
     }
     if upper.starts_with("SHOW ") && is_session_show(&upper) {
-        return handle_show_sql(ctx, seq, sql_trimmed);
+        return resp(handle_show_sql(ctx, seq, sql_trimmed));
     }
     if upper.starts_with("RESET ") {
         let param = sql_trimmed[6..].trim().to_lowercase();
         ctx.sessions
             .set_parameter(ctx.peer_addr, param, String::new());
-        return NativeResponse::status_row(seq, "RESET");
+        return resp(NativeResponse::status_row(seq, "RESET"));
     }
     if upper == "DISCARD ALL" {
         ctx.sessions.remove(ctx.peer_addr);
         ctx.sessions.ensure_session(*ctx.peer_addr);
-        return NativeResponse::status_row(seq, "DISCARD ALL");
+        return resp(NativeResponse::status_row(seq, "DISCARD ALL"));
     }
 
     // EXPLAIN.
     if upper.starts_with("EXPLAIN ") {
-        return handle_explain(ctx, seq, sql_trimmed).await;
+        return resp(handle_explain(ctx, seq, sql_trimmed).await);
     }
 
     // DDL: try DDL router first.
@@ -119,33 +149,50 @@ pub(crate) async fn handle_sql(
     )
     .await
     {
-        return pgwire_result_to_native(seq, result).await;
+        return resp(pgwire_result_to_native(seq, result).await);
     }
 
     // Quota check.
     if let Err(e) = ctx.state.check_tenant_quota(ctx.tenant_id()) {
-        return error_to_native(seq, &e);
+        return resp(error_to_native(seq, &e));
     }
 
-    // DataFusion planning.
+    // DataFusion planning + dispatch. The streaming fast path (when
+    // `allow_stream`) may return a `SqlStream`; otherwise this collapses to a
+    // single materialized `NativeResponse`.
     ctx.state.tenant_request_start(ctx.tenant_id());
-    let result = execute_planned(ctx, seq, sql_trimmed, database_id).await;
+    let outcome = execute_planned(ctx, seq, sql_trimmed, database_id, allow_stream).await;
     ctx.state.tenant_request_end(ctx.tenant_id());
 
-    if result.status == nodedb_types::protocol::ResponseStatus::Error {
+    if let SqlOutcome::Response(ref r) = outcome
+        && r.status == nodedb_types::protocol::ResponseStatus::Error
+    {
         ctx.sessions.fail_transaction(ctx.peer_addr);
     }
 
-    result
+    outcome
+}
+
+/// Wrap a materialized response as a non-streaming [`SqlOutcome`].
+#[inline]
+fn resp(r: NativeResponse) -> SqlOutcome {
+    SqlOutcome::Response(Box::new(r))
 }
 
 /// Plan SQL via DataFusion and dispatch tasks to the Data Plane.
+///
+/// When `allow_stream` is set and the planned statement is an eligible
+/// autocommit, single-task, unordered multi-row SELECT, returns
+/// [`SqlOutcome::Stream`] for lazy frame emission. Every other case — writes,
+/// in-block buffering, multi-task, set-ops, errors — collapses to a single
+/// [`SqlOutcome::Response`].
 async fn execute_planned(
     ctx: &DispatchCtx<'_>,
     seq: u64,
     sql: &str,
     database_id: crate::types::DatabaseId,
-) -> NativeResponse {
+    allow_stream: bool,
+) -> SqlOutcome {
     // Extract per-query ON DENY override (e.g., SELECT ... ON DENY ERROR 'CODE' MESSAGE '...').
     let mut auth_ctx = ctx.auth_context.clone();
     let clean_sql =
@@ -166,11 +213,24 @@ async fn execute_planned(
         .await
     {
         Ok(t) => t,
-        Err(e) => return error_to_native(seq, &e),
+        Err(e) => return resp(error_to_native(seq, &e)),
     };
 
     if tasks.is_empty() {
-        return NativeResponse::status_row(seq, "OK");
+        return resp(NativeResponse::status_row(seq, "OK"));
+    }
+
+    // Streaming fast path: an eligible autocommit, single-task, unordered
+    // multi-row SELECT streams its rows as multiple frames. The permission /
+    // tenant gate below is preserved for the materialized path; the streamable
+    // scan child is a plain user-collection read, and `plan_sql_with_rls`
+    // already applied RLS + permission planning, so it is safe to stream.
+    if allow_stream {
+        match try_open_sql_stream(ctx, seq, &tasks, database_id).await {
+            Ok(Some(stream)) => return SqlOutcome::Stream(stream),
+            Ok(None) => {}
+            Err(e) => return resp(error_to_native(seq, &e)),
+        }
     }
 
     let mut all_columns: Option<Vec<String>> = None;
@@ -180,7 +240,11 @@ async fn execute_planned(
 
     for task in tasks {
         if task.tenant_id != ctx.tenant_id() {
-            return NativeResponse::error(seq, "42501", "tenant isolation violation");
+            return resp(NativeResponse::error(
+                seq,
+                "42501",
+                "tenant isolation violation",
+            ));
         }
 
         // In transaction: buffer writes.
@@ -198,29 +262,30 @@ async fn execute_planned(
             }
         }
 
-        let resp = match dispatch_task(ctx, task).await {
+        let task_resp = match dispatch_task(ctx, task).await {
             Ok(r) => r,
-            Err(e) => return error_to_native(seq, &e),
+            Err(e) => return resp(error_to_native(seq, &e)),
         };
 
-        if resp.status == Status::Error {
-            let msg = if resp.payload.is_empty() {
-                resp.error_code
+        if task_resp.status == Status::Error {
+            let msg = if task_resp.payload.is_empty() {
+                task_resp
+                    .error_code
                     .as_ref()
                     .map(|c| format!("{c:?}"))
                     .unwrap_or_else(|| "unknown error".into())
             } else {
-                String::from_utf8_lossy(&resp.payload).into_owned()
+                String::from_utf8_lossy(&task_resp.payload).into_owned()
             };
-            return NativeResponse::error(seq, "XX000", msg);
+            return resp(NativeResponse::error(seq, "XX000", msg));
         }
 
-        last_lsn = resp.watermark_lsn.as_u64();
+        last_lsn = task_resp.watermark_lsn.as_u64();
 
-        if resp.payload.is_empty() {
+        if task_resp.payload.is_empty() {
             total_affected += 1;
         } else {
-            let json_text = response_codec::decode_payload_to_json(&resp.payload);
+            let json_text = response_codec::decode_payload_to_json(&task_resp.payload);
             let (cols, rows) = super::parse_json_to_columns_rows(&json_text);
             if !cols.is_empty() && all_columns.is_none() {
                 all_columns = Some(cols);
@@ -233,9 +298,9 @@ async fn execute_planned(
         let mut r = NativeResponse::ok(seq);
         r.rows_affected = Some(total_affected);
         r.watermark_lsn = last_lsn;
-        r
+        resp(r)
     } else {
-        NativeResponse {
+        resp(NativeResponse {
             seq,
             status: nodedb_types::protocol::ResponseStatus::Ok,
             columns: all_columns,
@@ -245,7 +310,7 @@ async fn execute_planned(
             error: None,
             auth: None,
             warnings: Vec::new(),
-        }
+        })
     }
 }
 

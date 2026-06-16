@@ -11,6 +11,7 @@ pub mod health;
 pub mod metrics;
 pub mod promql;
 pub mod query;
+pub mod query_stream;
 pub mod status;
 pub mod stream_poll;
 pub mod stream_sse;
