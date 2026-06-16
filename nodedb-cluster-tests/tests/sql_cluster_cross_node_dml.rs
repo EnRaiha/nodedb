@@ -25,3 +25,5 @@ mod graph_traverse_cross_node;
 mod join_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/schema_objects.rs"]
 mod schema_objects;
+#[path = "sql_cluster_cross_node_dml_tests/select_streaming_cross_node.rs"]
+mod select_streaming_cross_node;

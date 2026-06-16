@@ -192,7 +192,21 @@ impl LocalPlanExecutor {
         }
 
         // ── 5. Collect response payloads ──────────────────────────────────────
-        match tokio::time::timeout(deadline, async { rx.recv().await.ok_or(()) }).await {
+        //
+        // A remote scan can stream as several `Partial` chunks before its
+        // terminal frame — the Data Plane chunks any result wider than
+        // `stream_chunk_size`. Consuming only the first frame would silently
+        // truncate the remote shard's result to one chunk and orphan the
+        // request's tracker entry. Drain and concatenate every frame via the
+        // same bounded collector the local dispatch path uses, so the combined
+        // payload is held to the Control-Plane `max_query_result_bytes` ceiling.
+        use crate::control::server::dispatch_utils::{
+            DispatchCollectError, collect_bounded_response,
+        };
+        let max_result_bytes = self.state.tuning.network.max_query_result_bytes as usize;
+        match tokio::time::timeout(deadline, collect_bounded_response(&mut rx, max_result_bytes))
+            .await
+        {
             Ok(Ok(resp)) => {
                 if resp.status == crate::bridge::envelope::Status::Error {
                     let msg = resp
@@ -208,10 +222,22 @@ impl LocalPlanExecutor {
                     ExecuteResponse::ok(vec![resp.payload.to_vec()])
                 }
             }
-            Ok(Err(_)) => ExecuteResponse::err(TypedClusterError::Internal {
-                code: PLAN_DECODE_FAILED,
-                message: "response channel closed".into(),
-            }),
+            Ok(Err(DispatchCollectError::OverBudget { bytes })) => {
+                self.state.tracker.cancel(&request_id);
+                ExecuteResponse::err(TypedClusterError::Internal {
+                    code: 0,
+                    message: format!(
+                        "remote query result exceeded max_query_result_bytes \
+                         ({bytes} > {max_result_bytes} bytes)"
+                    ),
+                })
+            }
+            Ok(Err(DispatchCollectError::ChannelClosed)) => {
+                ExecuteResponse::err(TypedClusterError::Internal {
+                    code: PLAN_DECODE_FAILED,
+                    message: "response channel closed".into(),
+                })
+            }
             Err(_) => ExecuteResponse::err(TypedClusterError::DeadlineExceeded {
                 elapsed_ms: deadline.as_millis() as u64,
             }),

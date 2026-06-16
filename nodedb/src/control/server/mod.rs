@@ -10,6 +10,7 @@ pub mod http;
 pub mod ilp_listener;
 pub mod listener;
 pub mod native;
+pub mod payload_merge;
 pub mod pgwire;
 pub mod post_aggregate;
 pub mod resp;

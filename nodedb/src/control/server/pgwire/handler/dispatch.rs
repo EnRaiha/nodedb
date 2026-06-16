@@ -351,15 +351,37 @@ impl NodeDbPgHandler {
             Err(poisoned) => poisoned.into_inner().dispatch(request)?,
         };
 
-        tokio::time::timeout(
+        // A scan result wider than `stream_chunk_size` is emitted as several
+        // `Partial` frames followed by a terminal frame. Drain and concatenate
+        // every frame (bounded by `max_query_result_bytes`) rather than taking
+        // only the first chunk — consuming one frame would silently truncate the
+        // result to `stream_chunk_size` rows and orphan the request's tracker
+        // entry. Mirrors `dispatch_to_data_plane_with_source`.
+        use crate::control::server::dispatch_utils::{
+            DispatchCollectError, collect_bounded_response,
+        };
+        let max_result_bytes = self.state.tuning.network.max_query_result_bytes as usize;
+        match tokio::time::timeout(
             std::time::Duration::from_secs(self.state.tuning.network.default_deadline_secs),
-            async { rx.recv().await.ok_or(()) },
+            collect_bounded_response(&mut rx, max_result_bytes),
         )
         .await
         .map_err(|_| crate::Error::DeadlineExceeded { request_id })?
-        .map_err(|_| crate::Error::Dispatch {
-            detail: "response channel closed".into(),
-        })
+        {
+            Ok(resp) => Ok(resp),
+            Err(DispatchCollectError::OverBudget { bytes }) => {
+                self.state.tracker.cancel(&request_id);
+                Err(crate::Error::ExecutionLimitExceeded {
+                    detail: format!(
+                        "query result exceeded max_query_result_bytes \
+                         ({bytes} > {max_result_bytes} bytes)"
+                    ),
+                })
+            }
+            Err(DispatchCollectError::ChannelClosed) => Err(crate::Error::Dispatch {
+                detail: "response channel closed".into(),
+            }),
+        }
     }
 }
 

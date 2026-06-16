@@ -18,9 +18,8 @@
 use futures::future::join_all;
 use std::time::{Duration, Instant};
 
-use nodedb_query::msgpack_scan;
-
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status};
+use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::arrow_convert;
 use crate::control::gateway::core::QueryContext;
 use crate::control::state::SharedState;
@@ -97,17 +96,40 @@ pub async fn gather_all_cores(
         receivers.push((core_id, rx));
     }
 
-    // Await all responses in parallel using join_all.
+    // Await all responses in parallel using join_all. Each core's scan result
+    // may stream as several `Partial` frames before its terminal frame, so drain
+    // and concatenate the full bounded response per core — taking only the first
+    // frame would silently truncate that core's contribution to `stream_chunk_size`
+    // rows.
     let deadline = Duration::from_secs(deadline_secs);
+    let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
     let response_futures = receivers.into_iter().map(|(core_id, mut rx)| async move {
-        tokio::time::timeout(deadline, async move { rx.recv().await.ok_or(()) })
-            .await
-            .map_err(|_| crate::Error::Dispatch {
-                detail: format!("gather timeout on core {core_id}"),
-            })?
-            .map_err(|_| crate::Error::Dispatch {
-                detail: format!("gather channel closed on core {core_id}"),
-            })
+        match tokio::time::timeout(
+            deadline,
+            crate::control::server::dispatch_utils::collect_bounded_response(
+                &mut rx,
+                max_result_bytes,
+            ),
+        )
+        .await
+        .map_err(|_| crate::Error::Dispatch {
+            detail: format!("gather timeout on core {core_id}"),
+        })? {
+            Ok(resp) => Ok(resp),
+            Err(crate::control::server::dispatch_utils::DispatchCollectError::OverBudget {
+                bytes,
+            }) => Err(crate::Error::ExecutionLimitExceeded {
+                detail: format!(
+                    "gather on core {core_id} exceeded max_query_result_bytes \
+                     ({bytes} > {max_result_bytes} bytes)"
+                ),
+            }),
+            Err(crate::control::server::dispatch_utils::DispatchCollectError::ChannelClosed) => {
+                Err(crate::Error::Dispatch {
+                    detail: format!("gather channel closed on core {core_id}"),
+                })
+            }
+        }
     });
 
     let results: Vec<crate::Result<Response>> = join_all(response_futures).await;
@@ -297,67 +319,4 @@ pub(super) fn outcome_to_response(merged_array: Vec<u8>, watermark_lsn: Lsn) -> 
         watermark_lsn,
         error_code: None,
     }
-}
-
-/// Extract individual msgpack elements from a msgpack array payload.
-///
-/// If the payload is not a valid msgpack array, it is returned as a single
-/// element with a warning logged.
-fn extract_msgpack_elements(payload: &[u8]) -> Vec<Vec<u8>> {
-    if payload.is_empty() {
-        return Vec::new();
-    }
-
-    let Some((count, mut pos)) = msgpack_scan::array_header(payload, 0) else {
-        tracing::warn!(
-            payload_len = payload.len(),
-            "gather: payload is not a msgpack array; treating as single element"
-        );
-        return vec![payload.to_vec()];
-    };
-
-    let mut rows = Vec::with_capacity(count);
-    for _ in 0..count {
-        if pos >= payload.len() {
-            break;
-        }
-        let start = pos;
-        match msgpack_scan::skip_value(payload, pos) {
-            Some(next) => {
-                rows.push(payload[start..next].to_vec());
-                pos = next;
-            }
-            None => {
-                tracing::warn!(
-                    pos,
-                    payload_len = payload.len(),
-                    "gather: could not skip msgpack element; stopping early"
-                );
-                break;
-            }
-        }
-    }
-    rows
-}
-
-/// Encode a list of pre-extracted msgpack elements into a single msgpack array.
-fn encode_msgpack_array(rows: &[Vec<u8>]) -> Vec<u8> {
-    let total_data: usize = rows.iter().map(|r| r.len()).sum();
-    let mut out = Vec::with_capacity(total_data + 5);
-
-    let n = rows.len();
-    if n < 16 {
-        out.push(0x90 | n as u8);
-    } else if n <= u16::MAX as usize {
-        out.push(0xdc);
-        out.extend_from_slice(&(n as u16).to_be_bytes());
-    } else {
-        out.push(0xdd);
-        out.extend_from_slice(&(n as u32).to_be_bytes());
-    }
-
-    for row in rows {
-        out.extend_from_slice(row);
-    }
-    out
 }
