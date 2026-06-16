@@ -8,6 +8,7 @@ pub mod lateral;
 pub mod nested_loop;
 pub mod params;
 pub mod sort_merge;
+mod spill;
 
 pub(crate) use params::{HashJoinParams, JoinParams};
 
