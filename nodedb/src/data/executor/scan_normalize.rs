@@ -48,6 +48,59 @@ impl CoreLoop {
         self.scan_sparse(tid, collection, limit)
     }
 
+    /// Row-at-a-time scan: invokes `f(id, raw_msgpack_bytes)` for every row
+    /// in `collection` without an upper-row cap.
+    ///
+    /// Routing follows the same priority order as [`scan_collection`]:
+    /// KV → Columnar → Sparse/document. All rows are normalized to standard
+    /// msgpack maps before being passed to `f`.
+    ///
+    /// The callback receives shared references to the data; it must copy any
+    /// bytes it wants to retain beyond the call. If `f` returns `Err`, iteration
+    /// stops immediately and the error is propagated. Scan errors from the
+    /// underlying engine are also propagated via `crate::Result`.
+    ///
+    /// There is intentionally no `limit` parameter — bounding is the caller's
+    /// responsibility (e.g. the grace-hash join pipeline).
+    // Consumed by the streamed grace-hash join build/probe pipeline (wired in a
+    // subsequent unit); defined here first as the standalone, tested primitive.
+    #[allow(dead_code)]
+    pub(in crate::data::executor) fn scan_collection_for_each<F>(
+        &self,
+        tid: u64,
+        collection: &str,
+        mut f: F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(&str, &[u8]) -> crate::Result<()>,
+    {
+        // 1. KV engine — materializes internally; iterate the batch per-row.
+        let kv_docs = self.scan_kv(tid, collection, usize::MAX);
+        if !kv_docs.is_empty() {
+            for (id, bytes) in &kv_docs {
+                f(id, bytes)?;
+            }
+            return Ok(());
+        }
+
+        // 2. Columnar — materializes internally; iterate the batch per-row.
+        let col_docs = self.scan_columnar(tid, collection, usize::MAX);
+        if !col_docs.is_empty() {
+            for (id, bytes) in &col_docs {
+                f(id, bytes)?;
+            }
+            return Ok(());
+        }
+
+        // 3. Sparse/document engine (schemaless + strict) — materializes
+        //    internally via btree scan; iterate the batch per-row.
+        let sparse_docs = self.scan_sparse(tid, collection, usize::MAX)?;
+        for (id, bytes) in &sparse_docs {
+            f(id, bytes)?;
+        }
+        Ok(())
+    }
+
     /// Scan KV engine entries → standard msgpack.
     /// Injects the `key` field directly into the msgpack map — no JSON roundtrip.
     fn scan_kv(&self, tid: u64, collection: &str, limit: usize) -> Vec<(String, Vec<u8>)> {
@@ -338,5 +391,84 @@ pub(in crate::data::executor) fn decoded_col_to_value(
             }
         }
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that `scan_collection_for_each` visits exactly the same
+    /// `(id, bytes)` set as `scan_collection` for a sparse/document collection.
+    ///
+    /// Constructing a populated `CoreLoop` is feasible here via the shared
+    /// `make_core_with_dir` helper used throughout the executor test suite.
+    /// We insert a handful of documents via `core.sparse.put`, then compare
+    /// both scan outputs.
+    #[test]
+    fn for_each_matches_scan_collection_on_sparse_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _req_tx, _resp_rx) =
+            crate::data::executor::core_loop::tests::make_core_with_dir(dir.path());
+
+        let tid: u64 = 1;
+        let coll = "scan_test";
+
+        // Insert three schemaless documents via the sparse engine.
+        // `sparse.put` writes raw bytes (here a minimal JSON blob that
+        // `json_to_msgpack` will normalise to msgpack in both paths).
+        let raw_a = b"{\"x\":1}";
+        let raw_b = b"{\"x\":2}";
+        let raw_c = b"{\"x\":3}";
+        core.sparse.put(tid, coll, "a", raw_a).unwrap();
+        core.sparse.put(tid, coll, "b", raw_b).unwrap();
+        core.sparse.put(tid, coll, "c", raw_c).unwrap();
+
+        // Collect via `scan_collection` (the reference output).
+        let mut expected = core.scan_collection(tid, coll, usize::MAX).unwrap();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Collect via `scan_collection_for_each`.
+        let mut actual: Vec<(String, Vec<u8>)> = Vec::new();
+        core.scan_collection_for_each(tid, coll, |id, bytes| {
+            actual.push((id.to_owned(), bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        actual.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "row counts must match: expected {}, got {}",
+            expected.len(),
+            actual.len()
+        );
+        assert_eq!(expected, actual, "id+bytes pairs must be identical");
+    }
+
+    /// Verify that a callback error from `scan_collection_for_each` is
+    /// propagated immediately and stops iteration.
+    #[test]
+    fn for_each_propagates_callback_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _req_tx, _resp_rx) =
+            crate::data::executor::core_loop::tests::make_core_with_dir(dir.path());
+
+        let tid: u64 = 1;
+        let coll = "err_test";
+        core.sparse.put(tid, coll, "a", b"{\"v\":1}").unwrap();
+        core.sparse.put(tid, coll, "b", b"{\"v\":2}").unwrap();
+
+        let mut calls = 0usize;
+        let result = core.scan_collection_for_each(tid, coll, |_id, _bytes| {
+            calls += 1;
+            Err(crate::Error::Internal {
+                detail: "deliberate test error".into(),
+            })
+        });
+
+        assert!(result.is_err(), "error from callback must be propagated");
+        assert_eq!(calls, 1, "iteration must stop after the first error");
     }
 }
