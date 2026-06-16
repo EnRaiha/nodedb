@@ -38,7 +38,11 @@ use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::error::{ClusterError, Result};
-use crate::rpc_codec::{self, MAX_RPC_PAYLOAD_SIZE, RaftRpc, auth_envelope};
+use crate::forward::ChunkSink;
+use crate::rpc_codec::{
+    self, ExecuteRequest, ExecuteStreamChunk, ExecuteStreamEnd, MAX_RPC_PAYLOAD_SIZE, RaftRpc,
+    TypedClusterError, auth_envelope,
+};
 use crate::topology::NodeInfo;
 use crate::transport::auth_context::AuthContext;
 use crate::transport::peer_identity_verifier::{
@@ -111,6 +115,54 @@ impl PeerIdentityStore for NoopIdentityStore {
 pub trait RaftRpcHandler: Send + Sync + 'static {
     fn handle_rpc(&self, rpc: RaftRpc)
     -> impl std::future::Future<Output = Result<RaftRpc>> + Send;
+
+    /// Handle a streaming `ExecuteStreamRequest`: execute the plan and push
+    /// each result frame to `sink`. Returns `None` on a clean EOF or
+    /// `Some(err)` on a terminal failure. The transport writes one
+    /// `RPC_EXECUTE_STREAM_END` envelope carrying this outcome after the call
+    /// returns. See [`crate::forward::PlanExecutor::execute_plan_streaming`].
+    fn handle_rpc_streaming(
+        &self,
+        req: ExecuteRequest,
+        sink: impl ChunkSink,
+    ) -> impl std::future::Future<Output = Option<TypedClusterError>> + Send;
+}
+
+/// Transport-local [`ChunkSink`] that writes one `RPC_EXECUTE_STREAM_CHUNK`
+/// envelope per chunk to a QUIC send stream.
+///
+/// Each chunk gets a fresh outbound `seq` (mirroring the one-shot response
+/// path in [`handle_stream`]). The `write_all` is awaited inline so QUIC flow
+/// control throttles the producer — the chunk MUST NOT be detached into a
+/// spawned task.
+struct QuicChunkSink<'a> {
+    send: &'a mut quinn::SendStream,
+    auth: &'a AuthContext,
+}
+
+impl ChunkSink for QuicChunkSink<'_> {
+    async fn send_chunk(&mut self, payload: Vec<u8>, watermark_lsn: u64) -> Result<()> {
+        let rpc = RaftRpc::ExecuteStreamChunk(ExecuteStreamChunk {
+            payload,
+            watermark_lsn,
+        });
+        let inner = rpc_codec::encode(&rpc)?;
+        let seq = self.auth.peer_seq_out.next();
+        let mut envelope = Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + inner.len());
+        auth_envelope::write_envelope(
+            self.auth.local_node_id,
+            seq,
+            &inner,
+            &self.auth.mac_key,
+            &mut envelope,
+        )?;
+        self.send
+            .write_all(&envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write stream chunk: {e}"),
+            })
+    }
 }
 
 /// Extract the peer's leaf certificate DER bytes from a QUIC connection.
@@ -319,6 +371,44 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
 
         // 4. Decode inner RPC and hand to handler.
         let request = rpc_codec::decode(inner_frame)?;
+
+        // 4b. Streaming path: an `ExecuteStreamRequest` produces a multi-frame
+        //     response — N `RPC_EXECUTE_STREAM_CHUNK` envelopes (each written
+        //     inline so QUIC flow control throttles the producer) followed by
+        //     exactly one `RPC_EXECUTE_STREAM_END` envelope, then `finish()`.
+        //     The non-streaming path below is unchanged: one response envelope.
+        if let RaftRpc::ExecuteStreamRequest(req) = request {
+            let terminal = {
+                let sink = QuicChunkSink {
+                    send: &mut send,
+                    auth: &auth,
+                };
+                handler.handle_rpc_streaming(req, sink).await
+            };
+
+            let end_rpc = RaftRpc::ExecuteStreamEnd(ExecuteStreamEnd { error: terminal });
+            let end_inner = rpc_codec::encode(&end_rpc)?;
+            let end_seq = auth.peer_seq_out.next();
+            let mut end_envelope =
+                Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + end_inner.len());
+            auth_envelope::write_envelope(
+                auth.local_node_id,
+                end_seq,
+                &end_inner,
+                &auth.mac_key,
+                &mut end_envelope,
+            )?;
+            send.write_all(&end_envelope)
+                .await
+                .map_err(|e| ClusterError::Transport {
+                    detail: format!("write stream end: {e}"),
+                })?;
+            send.finish().map_err(|e| ClusterError::Transport {
+                detail: format!("finish stream response: {e}"),
+            })?;
+            return Ok::<(), ClusterError>(());
+        }
+
         let response = handler.handle_rpc(request).await?;
 
         // 5. Wrap the response in its own envelope. `from = local_node_id`,

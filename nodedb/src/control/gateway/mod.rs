@@ -10,6 +10,7 @@ pub mod plan_cache;
 pub mod retry;
 pub mod route;
 pub mod router;
+pub mod stream;
 pub mod version_set;
 
 pub use core::Gateway;

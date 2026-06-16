@@ -102,7 +102,7 @@ pub use error::{
     CalvinError, ClusterError, MigrationCheckpointError, MigrationRecoveryError, Result,
 };
 pub use follower_read::{FollowerReadGate, ReadLevel};
-pub use forward::{NoopPlanExecutor, PlanExecutor};
+pub use forward::{ChunkSink, NoopPlanExecutor, PlanExecutor};
 pub use ghost::{GhostStub, GhostTable};
 pub use health::{HealthConfig, HealthMonitor};
 pub use lifecycle_state::{ClusterLifecycleState, ClusterLifecycleTracker};

@@ -18,13 +18,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use nodedb_cluster::rpc_codec::{ExecuteRequest, RaftRpc, TypedClusterError};
 use tracing::debug;
 
 use crate::Error;
 use crate::control::server::dispatch_utils::dispatch_to_data_plane;
+use crate::control::server::result_stream::{ResultStream, RowBatch};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::wire as plan_wire;
 
 use super::route::{RouteDecision, TaskRoute};
@@ -80,6 +82,61 @@ pub async fn dispatch_route(
                 leader_addr: String::new(),
             })
         }
+    }
+}
+
+/// Streaming sibling of [`dispatch_route`]: dispatch a single route and return
+/// a [`ResultStream`] of row batches.
+///
+/// - `Local` → [`gather_all_cores_stream`] over the route's plan (the route is
+///   a single-vShard-homed scan answered on this node; fanning to all local
+///   cores mirrors the local degenerate of `gather_all_vshards`).
+/// - `Remote` → [`dispatch_remote_stream`] (eager first frame + retry split).
+/// - `Broadcast` → unreachable (router splits broadcasts before dispatch).
+/// - `LeaderUnknown` → `NotLeader` so the gateway retry loop re-resolves.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_route_stream(
+    route: TaskRoute,
+    shared: &Arc<SharedState>,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    trace_id: TraceId,
+    deadline_ms: u64,
+    version_set: &GatewayVersionSet,
+) -> Result<ResultStream, Error> {
+    match route.decision {
+        RouteDecision::Local => {
+            crate::control::server::exchange::gather::gather_all_cores_stream(
+                shared,
+                tenant_id,
+                database_id,
+                route.plan,
+                trace_id,
+            )
+        }
+        RouteDecision::Remote { node_id, vshard_id } => {
+            dispatch_remote_stream(RemoteDispatchArgs {
+                plan: route.plan,
+                shared,
+                node_id,
+                vshard_id,
+                tenant_id,
+                database_id,
+                trace_id,
+                deadline_ms,
+                version_set,
+            })
+            .await
+        }
+        RouteDecision::Broadcast { .. } => Err(Error::Internal {
+            detail: "dispatcher: Broadcast route reached stream dispatch — should have been split"
+                .into(),
+        }),
+        RouteDecision::LeaderUnknown { vshard_id } => Err(Error::NotLeader {
+            vshard_id: VShardId::new(vshard_id as u32),
+            leader_node: 0,
+            leader_addr: String::new(),
+        }),
     }
 }
 
@@ -217,6 +274,160 @@ async fn dispatch_remote(args: RemoteDispatchArgs<'_>) -> Result<Vec<Vec<u8>>, E
         other => Err(Error::Internal {
             detail: format!("gateway: unexpected RPC response variant: {other:?}"),
         }),
+    }
+}
+
+/// Remote streaming dispatch via the multi-frame `ExecuteStreamRequest` RPC.
+///
+/// Returns a [`ResultStream`] that yields the remote shard's row batches as
+/// they arrive over QUIC, interleaved by the caller's `select_all` with any
+/// local routes.
+///
+/// ## Retry-vs-stream split (critical)
+///
+/// Leader resolution and the FIRST frame are obtained EAGERLY here: the bidi
+/// stream is opened and the first stream item is pulled inside this function.
+/// A terminal error that arrives BEFORE any row (`NotLeader`,
+/// `DescriptorMismatch`, transport failure on open) is mapped via
+/// [`map_typed_cluster_error`] to a retryable [`Error`] and propagated to the
+/// gateway's existing not-leader retry loop. Once at least one chunk has been
+/// observed, any subsequent error is TERMINAL — it is surfaced as a stream
+/// `Err` and never retried (re-running the plan would duplicate the rows
+/// already streamed to the client).
+///
+/// The returned stream re-emits the buffered first batch followed by the rest.
+async fn dispatch_remote_stream(args: RemoteDispatchArgs<'_>) -> Result<ResultStream, Error> {
+    let RemoteDispatchArgs {
+        plan,
+        shared,
+        node_id,
+        vshard_id,
+        tenant_id,
+        database_id,
+        trace_id,
+        deadline_ms,
+        version_set,
+    } = args;
+    let transport = shared.cluster_transport.as_ref().ok_or(Error::Internal {
+        detail: "gateway: cluster transport not available for remote stream dispatch".into(),
+    })?;
+
+    // Resolve Exchange nodes before shipping (symmetric with `dispatch_remote`).
+    let plan = match Box::pin(crate::control::server::exchange::resolve_exchange_in_plan(
+        shared,
+        database_id,
+        tenant_id,
+        plan,
+        trace_id,
+    ))
+    .await?
+    {
+        crate::control::server::exchange::Resolved::Plan(p) => p,
+        // A streamable child whose Exchange resolved at the coordinator into a
+        // ready response/stream — re-emit it as a single-batch / forwarded
+        // stream. These do not occur for the streamable-scan plans routed here,
+        // but handle exhaustively and behaviour-preservingly.
+        crate::control::server::exchange::Resolved::Gathered(resp) => {
+            let batch = RowBatch {
+                payload: resp.payload.to_vec(),
+                watermark_lsn: resp.watermark_lsn,
+            };
+            return Ok(Box::pin(futures::stream::once(async move { Ok(batch) })));
+        }
+        crate::control::server::exchange::Resolved::Stream(s) => return Ok(s),
+    };
+
+    let plan_bytes = plan_wire::encode(&plan).map_err(|e| Error::Internal {
+        detail: format!("gateway: plan encode failed: {e}"),
+    })?;
+
+    let descriptor_versions: Vec<nodedb_cluster::rpc_codec::DescriptorVersionEntry> = version_set
+        .iter()
+        .map(
+            |(name, version)| nodedb_cluster::rpc_codec::DescriptorVersionEntry {
+                collection: name.clone(),
+                version: *version,
+            },
+        )
+        .collect();
+
+    let req = RaftRpc::ExecuteStreamRequest(ExecuteRequest {
+        plan_bytes,
+        tenant_id: tenant_id.as_u64(),
+        database_id: database_id.as_u64(),
+        deadline_remaining_ms: deadline_ms,
+        trace_id: trace_id.0,
+        descriptor_versions,
+    });
+
+    debug!(
+        node_id,
+        vshard_id,
+        tenant_id = tenant_id.as_u64(),
+        "gateway: dispatching ExecuteStreamRequest to remote node"
+    );
+
+    // Open the stream eagerly. A failure to even open / send the request is a
+    // pre-row condition: map it like a transport failure in `dispatch_remote`
+    // so the retry loop routes elsewhere on the next attempt.
+    let stream = transport.send_rpc_stream(node_id, req).await.map_err(|e| {
+        Error::NotLeader {
+            vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
+            leader_node: 0,
+            leader_addr: format!("node-{node_id} (stream open error: {e})"),
+        }
+    })?;
+    // The `async_stream` body is `!Unpin`; pin it on the heap so we can pull
+    // the eager first frame and then keep the tail around for `.chain`.
+    let mut stream = Box::pin(stream);
+
+    // Eagerly pull the FIRST frame so a pre-row terminal error is catchable and
+    // retryable. Any error here is a pre-row error.
+    let first = match stream.next().await {
+        Some(Ok((payload, lsn))) => RowBatch {
+            payload,
+            watermark_lsn: Lsn::new(lsn),
+        },
+        Some(Err(e)) => return Err(map_stream_cluster_error(e, vshard_id)),
+        // Clean EOF with zero rows: a valid empty result. Return an empty stream.
+        None => return Ok(Box::pin(futures::stream::empty())),
+    };
+
+    // Build the result stream: re-emit the buffered first batch, then forward
+    // the rest. Errors past the first frame are TERMINAL — surfaced as stream
+    // `Err`, never retried.
+    let rest = stream.map(move |item| match item {
+        Ok((payload, lsn)) => Ok(RowBatch {
+            payload,
+            watermark_lsn: Lsn::new(lsn),
+        }),
+        Err(e) => Err(Error::Dispatch {
+            detail: format!("remote stream terminal error: {e}"),
+        }),
+    });
+
+    let head = futures::stream::once(async move { Ok(first) });
+    Ok(Box::pin(head.chain(rest)))
+}
+
+/// Map a pre-row [`nodedb_cluster::ClusterError`] from a streaming dispatch to a
+/// retryable internal [`Error`].
+///
+/// A `StreamTerminal` carrying a typed `NotLeader` / `DescriptorMismatch` maps
+/// through the same [`map_typed_cluster_error`] used by the one-shot path so the
+/// gateway retry loop handles it identically. Any other cluster error becomes a
+/// transport-style `NotLeader` (leader_node = 0) so the next attempt re-resolves
+/// routing rather than re-entrenching an unreachable node.
+fn map_stream_cluster_error(err: nodedb_cluster::ClusterError, vshard_id: u64) -> Error {
+    match err {
+        nodedb_cluster::ClusterError::StreamTerminal { error, .. } => {
+            map_typed_cluster_error(error, vshard_id)
+        }
+        other => Error::NotLeader {
+            vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
+            leader_node: 0,
+            leader_addr: format!("stream dispatch error: {other}"),
+        },
     }
 }
 

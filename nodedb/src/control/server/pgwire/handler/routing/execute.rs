@@ -279,8 +279,9 @@ impl NodeDbPgHandler {
             // autocommit unordered SELECT streams its rows straight to the
             // client (see `maybe_stream_select`); everything else falls through
             // to the normal dispatch path below.
-            if let Some(stream_response) =
-                self.maybe_stream_select(&task, plan_kind, resp_post_set_op, addr)?
+            if let Some(stream_response) = self
+                .maybe_stream_select(&task, plan_kind, resp_post_set_op, addr)
+                .await?
             {
                 responses.push(stream_response);
                 continue;

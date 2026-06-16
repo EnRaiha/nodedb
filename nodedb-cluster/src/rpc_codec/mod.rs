@@ -30,7 +30,8 @@ pub use cluster_mgmt::{
 };
 pub use data_propose::{DataProposeRequest, DataProposeResponse};
 pub use execute::{
-    DescriptorVersionEntry, ExecuteRequest, ExecuteResponse, PLAN_DECODE_FAILED, TypedClusterError,
+    DescriptorVersionEntry, ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, ExecuteStreamEnd,
+    PLAN_DECODE_FAILED, TypedClusterError,
 };
 pub use header::{HEADER_SIZE, MAX_RPC_PAYLOAD_SIZE};
 pub use mac::{MAC_LEN, MacKey};

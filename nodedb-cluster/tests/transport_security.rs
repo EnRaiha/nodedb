@@ -75,6 +75,17 @@ impl RaftRpcHandler for EchoHandler {
             }),
         }
     }
+
+    async fn handle_rpc_streaming(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ExecuteRequest,
+        _sink: impl nodedb_cluster::ChunkSink,
+    ) -> Option<nodedb_cluster::rpc_codec::TypedClusterError> {
+        Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
+            code: 0,
+            message: "streaming not supported by test EchoHandler".into(),
+        })
+    }
 }
 
 fn sample_append(term: u64) -> AppendEntriesRequest {

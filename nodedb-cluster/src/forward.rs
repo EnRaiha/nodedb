@@ -5,9 +5,27 @@
 //! [`PlanExecutor`]: the physical-plan execution path introduced in C-β.
 //! The legacy [`RequestForwarder`] SQL-string path was deleted in C-δ.6.
 
-use crate::rpc_codec::{ExecuteRequest, ExecuteResponse};
+use crate::rpc_codec::{ExecuteRequest, ExecuteResponse, TypedClusterError};
 
 // ── Physical-plan execution (C-β) ────────────────────────────────────────────
+
+/// Sink for streamed result chunks driven by [`PlanExecutor::execute_plan_streaming`].
+///
+/// The transport server provides a `ChunkSink` whose `send_chunk` writes one
+/// `RPC_EXECUTE_STREAM_CHUNK` envelope to the QUIC stream and awaits the write
+/// inline, so QUIC flow control back-pressures the producer (the local stream
+/// pull) when the coordinator falls behind.
+///
+/// `send_chunk` returning `Err` means the client / coordinator is gone (the
+/// stream was reset or finished early): the producer MUST stop pulling and
+/// return without writing a terminal frame.
+pub trait ChunkSink: Send {
+    fn send_chunk(
+        &mut self,
+        payload: Vec<u8>,
+        watermark_lsn: u64,
+    ) -> impl std::future::Future<Output = crate::error::Result<()>> + Send;
+}
 
 /// Trait for executing a pre-planned `PhysicalPlan` on the local Data Plane.
 ///
@@ -26,6 +44,20 @@ pub trait PlanExecutor: Send + Sync + 'static {
         &self,
         req: ExecuteRequest,
     ) -> impl std::future::Future<Output = ExecuteResponse> + Send;
+
+    /// Streaming sibling of [`execute_plan`](Self::execute_plan).
+    ///
+    /// Executes the plan and pushes each result frame to `sink` as it arrives.
+    /// Returns `None` on a clean EOF (all chunks delivered), or `Some(err)` on a
+    /// terminal failure — validation rejection, decode failure, deadline, or an
+    /// error pulled from the underlying result stream. A `send_chunk` error
+    /// (coordinator gone) is NOT a terminal error: the producer stops and
+    /// returns `None`, since there is no live peer to receive a terminal frame.
+    fn execute_plan_streaming(
+        &self,
+        req: ExecuteRequest,
+        sink: impl ChunkSink,
+    ) -> impl std::future::Future<Output = Option<TypedClusterError>> + Send;
 }
 
 /// No-op executor for single-node mode or testing.
@@ -33,10 +65,20 @@ pub struct NoopPlanExecutor;
 
 impl PlanExecutor for NoopPlanExecutor {
     async fn execute_plan(&self, _req: ExecuteRequest) -> ExecuteResponse {
-        use crate::rpc_codec::TypedClusterError;
         ExecuteResponse::err(TypedClusterError::Internal {
             code: 0,
             message: "plan execution not available (single-node mode)".into(),
+        })
+    }
+
+    async fn execute_plan_streaming(
+        &self,
+        _req: ExecuteRequest,
+        _sink: impl ChunkSink,
+    ) -> Option<TypedClusterError> {
+        Some(TypedClusterError::Internal {
+            code: 0,
+            message: "streaming plan execution not available (single-node mode)".into(),
         })
     }
 }

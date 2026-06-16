@@ -12,7 +12,7 @@ use super::cluster_mgmt::{
 };
 use super::data_propose::{DataProposeRequest, DataProposeResponse};
 use super::discriminants::*;
-use super::execute::{ExecuteRequest, ExecuteResponse};
+use super::execute::{ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, ExecuteStreamEnd};
 use super::header::HEADER_SIZE;
 use super::metadata::{MetadataProposeRequest, MetadataProposeResponse};
 use super::{cluster_mgmt, data_propose, execute, metadata, raft_msgs, vshard};
@@ -47,6 +47,12 @@ pub enum RaftRpc {
     // Physical-plan execution (Batch C-β onwards)
     ExecuteRequest(ExecuteRequest),
     ExecuteResponse(ExecuteResponse),
+    // Streaming physical-plan execution (L4). The request reuses the
+    // `ExecuteRequest` body; the chunk/end frames form the multi-frame
+    // response sequence on the same QUIC stream.
+    ExecuteStreamRequest(ExecuteRequest),
+    ExecuteStreamChunk(ExecuteStreamChunk),
+    ExecuteStreamEnd(ExecuteStreamEnd),
     // Data-group proposal forwarding (groups 1+)
     DataProposeRequest(DataProposeRequest),
     DataProposeResponse(DataProposeResponse),
@@ -73,6 +79,9 @@ pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
         RaftRpc::MetadataProposeResponse(m) => metadata::encode_metadata_propose_resp(m, &mut out),
         RaftRpc::ExecuteRequest(m) => execute::encode_execute_req(m, &mut out),
         RaftRpc::ExecuteResponse(m) => execute::encode_execute_resp(m, &mut out),
+        RaftRpc::ExecuteStreamRequest(m) => execute::encode_execute_stream_req(m, &mut out),
+        RaftRpc::ExecuteStreamChunk(m) => execute::encode_execute_stream_chunk(m, &mut out),
+        RaftRpc::ExecuteStreamEnd(m) => execute::encode_execute_stream_end(m, &mut out),
         RaftRpc::DataProposeRequest(m) => data_propose::encode_data_propose_req(m, &mut out),
         RaftRpc::DataProposeResponse(m) => data_propose::encode_data_propose_resp(m, &mut out),
     }?;
@@ -135,6 +144,9 @@ pub fn decode(data: &[u8]) -> Result<RaftRpc> {
         RPC_METADATA_PROPOSE_RESP => metadata::decode_metadata_propose_resp(payload),
         RPC_EXECUTE_REQ => execute::decode_execute_req(payload),
         RPC_EXECUTE_RESP => execute::decode_execute_resp(payload),
+        RPC_EXECUTE_STREAM_REQ => execute::decode_execute_stream_req(payload),
+        RPC_EXECUTE_STREAM_CHUNK => execute::decode_execute_stream_chunk(payload),
+        RPC_EXECUTE_STREAM_END => execute::decode_execute_stream_end(payload),
         RPC_DATA_PROPOSE_REQ => data_propose::decode_data_propose_req(payload),
         RPC_DATA_PROPOSE_RESP => data_propose::decode_data_propose_resp(payload),
         _ => Err(ClusterError::Codec {

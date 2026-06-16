@@ -4299,6 +4299,7 @@ dependencies = [
 name = "nodedb-cluster"
 version = "0.3.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "crc32c",
  "futures",

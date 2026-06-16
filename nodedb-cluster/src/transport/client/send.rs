@@ -11,11 +11,12 @@
 
 use std::net::SocketAddr;
 
+use futures::Stream;
 use tracing::debug;
 
 use crate::circuit_breaker::RetryPolicy;
 use crate::error::{ClusterError, Result};
-use crate::rpc_codec::{self, RaftRpc, auth_envelope};
+use crate::rpc_codec::{self, RaftRpc, TypedClusterError, auth_envelope};
 use crate::transport::config::SNI_HOSTNAME;
 use crate::transport::server;
 use crate::wire_version::handshake_io::perform_version_handshake_client;
@@ -123,6 +124,89 @@ impl NexarTransport {
         }))
     }
 
+    /// Open a streaming RPC to `target` and return a stream of result chunks.
+    ///
+    /// Sibling of [`try_send_once`](Self::try_send_once) for multi-frame
+    /// responses: opens a bidi stream on the pooled connection, writes the
+    /// request envelope (typically a `RaftRpc::ExecuteStreamRequest`), finishes
+    /// the send side, and returns a [`Stream`] that loops
+    /// [`server::read_envelope`] until the terminal `RPC_EXECUTE_STREAM_END`
+    /// frame:
+    ///
+    /// - `RPC_EXECUTE_STREAM_CHUNK` → yields `Ok((payload, watermark_lsn))`.
+    /// - `RPC_EXECUTE_STREAM_END{error: None}` → ends the stream cleanly.
+    /// - `RPC_EXECUTE_STREAM_END{error: Some(e)}` → yields `Err` then ends.
+    /// - a transport / decode error before the END frame → yields `Err` then
+    ///   ends (the connection dropped mid-stream).
+    ///
+    /// There is NO retry wrapper on the stream body — retry only applies to the
+    /// eager pre-first-frame phase, which the caller (coordinator) owns. Once
+    /// the first frame has been observed, any error is terminal.
+    pub async fn send_rpc_stream(
+        &self,
+        target: u64,
+        rpc: RaftRpc,
+    ) -> Result<impl Stream<Item = Result<(Vec<u8>, u64)>> + Send + use<>> {
+        let envelope = self.wrap_outbound(&rpc)?;
+        let conn = self.get_or_connect(target).await?;
+
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
+            detail: format!("open_bi (stream) to node {target}: {e}"),
+        })?;
+
+        send.write_all(&envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write stream request to node {target}: {e}"),
+            })?;
+        send.finish().map_err(|e| ClusterError::Transport {
+            detail: format!("finish stream request to node {target}: {e}"),
+        })?;
+
+        // Clone the shared auth so the returned stream owns its envelope-parsing
+        // state and borrows neither `self` nor `conn` beyond the held `recv`.
+        let auth = self.auth.clone();
+        let local_node_id = self.auth.local_node_id;
+
+        Ok(async_stream::try_stream! {
+            // Keep the send half alive for the duration of the stream so the
+            // server-side `accept_bi` stream is not reset early.
+            let _send = send;
+            loop {
+                let envelope = server::read_envelope(&mut recv).await?;
+                let (fields, inner_frame) =
+                    auth_envelope::parse_envelope(&envelope, &auth.mac_key)?;
+                // Replay-window check, skipping self-addressed frames (same
+                // reasoning as `parse_inbound`).
+                if fields.from_node_id != local_node_id {
+                    auth.peer_seq_in.accept(fields.from_node_id, fields.seq)?;
+                }
+                match rpc_codec::decode(inner_frame)? {
+                    RaftRpc::ExecuteStreamChunk(chunk) => {
+                        yield (chunk.payload, chunk.watermark_lsn);
+                    }
+                    RaftRpc::ExecuteStreamEnd(end) => {
+                        match end.error {
+                            None => return,
+                            Some(e) => {
+                                Err(stream_terminal_error(e))?;
+                                return;
+                            }
+                        }
+                    }
+                    other => {
+                        Err(ClusterError::Transport {
+                            detail: format!(
+                                "unexpected frame in streaming response: {other:?}"
+                            ),
+                        })?;
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
     /// Single-attempt RPC send (no retry, no circuit breaker).
     async fn try_send_once(
         &self,
@@ -200,4 +284,15 @@ impl NexarTransport {
         }
         rpc_codec::decode(inner_frame)
     }
+}
+
+/// Map a terminal [`TypedClusterError`] carried by `ExecuteStreamEnd` into a
+/// [`ClusterError`] for the stream's `Err` item.
+///
+/// A terminal error is reached only AFTER at least the stream was established,
+/// so by the coordinator's retry-vs-stream contract it is never retried — it is
+/// surfaced as-is. The original typed shape is preserved in the detail string.
+fn stream_terminal_error(err: TypedClusterError) -> ClusterError {
+    let detail = format!("{err:?}");
+    ClusterError::StreamTerminal { error: err, detail }
 }

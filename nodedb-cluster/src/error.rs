@@ -80,6 +80,18 @@ pub enum ClusterError {
     #[error("transport error: {detail}")]
     Transport { detail: String },
 
+    /// Terminal error carried by a streaming `ExecuteStreamEnd` frame.
+    ///
+    /// Preserves the typed shape end-to-end so the coordinator can map a
+    /// pre-row `NotLeader` / `DescriptorMismatch` back to a retryable error
+    /// (retry only applies before the first row — see the coordinator's
+    /// `dispatch_remote_stream`). `detail` is the `Debug` rendering for logs.
+    #[error("streaming execution terminal error: {detail}")]
+    StreamTerminal {
+        error: crate::rpc_codec::TypedClusterError,
+        detail: String,
+    },
+
     #[error("storage error: {detail}")]
     Storage { detail: String },
 

@@ -73,6 +73,29 @@ pub enum TypedClusterError {
     },
 }
 
+/// One streamed chunk of an `ExecuteStreamRequest` result.
+///
+/// Mirrors a `RowBatch` on the coordinator side: `payload` is a standalone
+/// msgpack array of row elements (the exact bytes the Data Plane produced for a
+/// single scan frame); `watermark_lsn` is that frame's read watermark. A
+/// streaming response is a sequence of these followed by exactly one
+/// [`ExecuteStreamEnd`].
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ExecuteStreamChunk {
+    pub payload: Vec<u8>,
+    pub watermark_lsn: u64,
+}
+
+/// Terminal frame of an `ExecuteStreamRequest` result.
+///
+/// `error: None` is a clean EOF (all chunks delivered). `error: Some(e)` is a
+/// terminal failure — any chunks already delivered are valid, but the result is
+/// incomplete and the consumer must surface the error.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ExecuteStreamEnd {
+    pub error: Option<TypedClusterError>,
+}
+
 impl ExecuteResponse {
     pub fn ok(payloads: Vec<Vec<u8>>) -> Self {
         Self {
@@ -131,6 +154,41 @@ pub(super) fn decode_execute_resp(payload: &[u8]) -> Result<RaftRpc> {
         payload,
         ExecuteResponse,
         "ExecuteResponse"
+    )?))
+}
+
+pub(super) fn encode_execute_stream_req(msg: &ExecuteRequest, out: &mut Vec<u8>) -> Result<()> {
+    write_frame(RPC_EXECUTE_STREAM_REQ, &to_bytes!(msg)?, out)
+}
+pub(super) fn encode_execute_stream_chunk(
+    msg: &ExecuteStreamChunk,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    write_frame(RPC_EXECUTE_STREAM_CHUNK, &to_bytes!(msg)?, out)
+}
+pub(super) fn encode_execute_stream_end(msg: &ExecuteStreamEnd, out: &mut Vec<u8>) -> Result<()> {
+    write_frame(RPC_EXECUTE_STREAM_END, &to_bytes!(msg)?, out)
+}
+
+pub(super) fn decode_execute_stream_req(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::ExecuteStreamRequest(from_bytes!(
+        payload,
+        ExecuteRequest,
+        "ExecuteStreamRequest"
+    )?))
+}
+pub(super) fn decode_execute_stream_chunk(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::ExecuteStreamChunk(from_bytes!(
+        payload,
+        ExecuteStreamChunk,
+        "ExecuteStreamChunk"
+    )?))
+}
+pub(super) fn decode_execute_stream_end(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::ExecuteStreamEnd(from_bytes!(
+        payload,
+        ExecuteStreamEnd,
+        "ExecuteStreamEnd"
     )?))
 }
 
@@ -289,6 +347,88 @@ mod tests {
             Some(TypedClusterError::Internal { code, message }) => {
                 assert_eq!(code, PLAN_DECODE_FAILED);
                 assert!(message.contains("plan"));
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    fn roundtrip_stream_chunk(chunk: ExecuteStreamChunk) -> ExecuteStreamChunk {
+        let rpc = RaftRpc::ExecuteStreamChunk(chunk);
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::ExecuteStreamChunk(c) => c,
+            other => panic!("expected ExecuteStreamChunk, got {other:?}"),
+        }
+    }
+
+    fn roundtrip_stream_end(end: ExecuteStreamEnd) -> ExecuteStreamEnd {
+        let rpc = RaftRpc::ExecuteStreamEnd(end);
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::ExecuteStreamEnd(e) => e,
+            other => panic!("expected ExecuteStreamEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_execute_stream_request_reuses_execute_request_body() {
+        let req = ExecuteRequest {
+            plan_bytes: b"streaming-plan".to_vec(),
+            tenant_id: 11,
+            database_id: 2,
+            deadline_remaining_ms: 4242,
+            trace_id: [9u8; 16],
+            descriptor_versions: vec![DescriptorVersionEntry {
+                collection: "wide".into(),
+                version: 3,
+            }],
+        };
+        let rpc = RaftRpc::ExecuteStreamRequest(req.clone());
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::ExecuteStreamRequest(r) => {
+                assert_eq!(r.plan_bytes, req.plan_bytes);
+                assert_eq!(r.tenant_id, 11);
+                assert_eq!(r.database_id, 2);
+                assert_eq!(r.deadline_remaining_ms, 4242);
+                assert_eq!(r.trace_id, req.trace_id);
+                assert_eq!(r.descriptor_versions.len(), 1);
+                assert_eq!(r.descriptor_versions[0].collection, "wide");
+                assert_eq!(r.descriptor_versions[0].version, 3);
+            }
+            other => panic!("expected ExecuteStreamRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_execute_stream_chunk_payload_and_lsn() {
+        let chunk = ExecuteStreamChunk {
+            payload: vec![0x91, 0x01, 0x02, 0x03],
+            watermark_lsn: 0xDEAD_BEEF,
+        };
+        let decoded = roundtrip_stream_chunk(chunk.clone());
+        assert_eq!(decoded.payload, chunk.payload);
+        assert_eq!(decoded.watermark_lsn, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn roundtrip_execute_stream_end_clean_eof() {
+        let decoded = roundtrip_stream_end(ExecuteStreamEnd { error: None });
+        assert!(decoded.error.is_none());
+    }
+
+    #[test]
+    fn roundtrip_execute_stream_end_terminal_error() {
+        let decoded = roundtrip_stream_end(ExecuteStreamEnd {
+            error: Some(TypedClusterError::Internal {
+                code: PLAN_DECODE_FAILED,
+                message: "stream failed mid-flight".into(),
+            }),
+        });
+        match decoded.error {
+            Some(TypedClusterError::Internal { code, message }) => {
+                assert_eq!(code, PLAN_DECODE_FAILED);
+                assert!(message.contains("stream failed"));
             }
             other => panic!("expected Internal, got {other:?}"),
         }

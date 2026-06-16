@@ -518,6 +518,17 @@ mod tests {
                     }),
                 }
             }
+
+            async fn handle_rpc_streaming(
+                &self,
+                _req: crate::rpc_codec::ExecuteRequest,
+                _sink: impl crate::forward::ChunkSink,
+            ) -> Option<crate::rpc_codec::TypedClusterError> {
+                Some(crate::rpc_codec::TypedClusterError::Internal {
+                    code: 0,
+                    message: "streaming not supported by JoinHandler".into(),
+                })
+            }
         }
 
         let handler = Arc::new(JoinHandler {

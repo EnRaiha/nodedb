@@ -50,6 +50,22 @@ impl RaftRpcHandler for EchoHandler {
             }),
         }
     }
+
+    async fn handle_rpc_streaming(
+        &self,
+        _req: crate::rpc_codec::ExecuteRequest,
+        mut sink: impl crate::forward::ChunkSink,
+    ) -> Option<crate::rpc_codec::TypedClusterError> {
+        // Emit three deterministic chunks then clean EOF. Exercises the
+        // multi-frame chunk/end envelope path end-to-end over loopback QUIC.
+        for i in 0u64..3 {
+            if let Err(_e) = sink.send_chunk(vec![i as u8; 4], i + 100).await {
+                // Coordinator gone — stop producing, no terminal frame.
+                return None;
+            }
+        }
+        None
+    }
 }
 
 fn make_transport(node_id: u64) -> NexarTransport {
@@ -103,6 +119,53 @@ async fn append_entries_roundtrip() {
     assert_eq!(resp.term, 5);
     assert!(resp.success);
     assert_eq!(resp.last_log_index, 12);
+
+    shutdown_tx.send(true).unwrap();
+    serve_task.abort();
+}
+
+#[tokio::test]
+async fn execute_stream_roundtrip() {
+    use futures::StreamExt;
+
+    let server = Arc::new(make_transport(1));
+    let client = Arc::new(make_transport(2));
+
+    client.register_peer(1, server.local_addr());
+
+    let handler: Arc<EchoHandler> = Arc::new(EchoHandler);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let srv = server.clone();
+    let serve_task = tokio::spawn(async move {
+        srv.serve(handler, shutdown_rx).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let req = RaftRpc::ExecuteStreamRequest(crate::rpc_codec::ExecuteRequest {
+        plan_bytes: b"plan".to_vec(),
+        tenant_id: 1,
+        database_id: 0,
+        deadline_remaining_ms: 5000,
+        trace_id: [0u8; 16],
+        descriptor_versions: vec![],
+    });
+
+    let stream = client.send_rpc_stream(1, req).await.unwrap();
+    futures::pin_mut!(stream);
+
+    let mut chunks: Vec<(Vec<u8>, u64)> = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.unwrap());
+    }
+
+    // EchoHandler emits three chunks then a clean EOF.
+    assert_eq!(chunks.len(), 3, "expected three streamed chunks");
+    for (i, (payload, lsn)) in chunks.iter().enumerate() {
+        assert_eq!(payload, &vec![i as u8; 4]);
+        assert_eq!(*lsn, i as u64 + 100);
+    }
 
     shutdown_tx.send(true).unwrap();
     serve_task.abort();

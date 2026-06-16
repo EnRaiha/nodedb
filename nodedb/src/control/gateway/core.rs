@@ -54,8 +54,9 @@ pub struct Gateway {
     pub plan_cache: Arc<PlanCache>,
     /// Number of times `retry_not_leader` retried due to a `NotLeader` response.
     /// Each retry attempt after the initial attempt increments this counter.
-    /// Observable via [`Gateway::not_leader_retry_count`].
-    not_leader_retry_count: Arc<AtomicU64>,
+    /// Observable via [`Gateway::not_leader_retry_count`]. `pub(super)` so the
+    /// streaming entry point in `stream.rs` can increment it identically.
+    pub(super) not_leader_retry_count: Arc<AtomicU64>,
 }
 
 impl Gateway {
@@ -344,7 +345,7 @@ impl Gateway {
     ///
     /// `database_id` scopes the catalog lookup to the session's current database
     /// so that a plan from one database cannot be served under another.
-    fn collect_version_set(
+    pub(super) fn collect_version_set(
         &self,
         plan: &PhysicalPlan,
         tenant_id: u64,

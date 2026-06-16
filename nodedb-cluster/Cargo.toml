@@ -27,6 +27,7 @@ tokio = { workspace = true }
 rand = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+async-stream = { workspace = true }
 
 # Serialization (compact binary for RPCs — matches nexar wire format)
 rkyv = { workspace = true }

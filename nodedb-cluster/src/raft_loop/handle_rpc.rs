@@ -8,9 +8,9 @@
 //! orchestration in [`super::join`].
 
 use crate::error::{ClusterError, Result};
-use crate::forward::PlanExecutor;
+use crate::forward::{ChunkSink, PlanExecutor};
 use crate::health;
-use crate::rpc_codec::RaftRpc;
+use crate::rpc_codec::{ExecuteRequest, RaftRpc, TypedClusterError};
 use crate::transport::RaftRpcHandler;
 
 use super::loop_core::{CommitApplier, RaftLoop};
@@ -354,6 +354,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                 detail: format!("unexpected request type in RPC handler: {other:?}"),
             }),
         }
+    }
+
+    // Streaming physical-plan execution (L4) — delegate to the PlanExecutor's
+    // streaming path. The transport drives the multi-frame chunk/end envelope
+    // writes; this just runs the plan and feeds `sink`.
+    async fn handle_rpc_streaming(
+        &self,
+        req: ExecuteRequest,
+        sink: impl ChunkSink,
+    ) -> Option<TypedClusterError> {
+        self.plan_executor.execute_plan_streaming(req, sink).await
     }
 }
 

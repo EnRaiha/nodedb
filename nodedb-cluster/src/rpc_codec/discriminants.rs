@@ -34,6 +34,13 @@ pub const RPC_EXECUTE_RESP: u8 = 19;
 /// Data-group (non-metadata) proposal forwarding — vshard_id + payload.
 pub const RPC_DATA_PROPOSE_REQ: u8 = 20;
 pub const RPC_DATA_PROPOSE_RESP: u8 = 21;
+/// Streaming physical-plan execution (L4). The request reuses the existing
+/// [`ExecuteRequest`](super::execute::ExecuteRequest) body; the response is a
+/// multi-frame sequence of `RPC_EXECUTE_STREAM_CHUNK` envelopes terminated by
+/// exactly one `RPC_EXECUTE_STREAM_END` envelope on the same QUIC stream.
+pub const RPC_EXECUTE_STREAM_REQ: u8 = 22;
+pub const RPC_EXECUTE_STREAM_CHUNK: u8 = 23;
+pub const RPC_EXECUTE_STREAM_END: u8 = 24;
 
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared

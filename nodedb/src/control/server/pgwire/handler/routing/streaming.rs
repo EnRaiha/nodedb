@@ -24,7 +24,6 @@ impl NodeDbPgHandler {
     /// normal dispatch path).
     ///
     /// Eligibility (all required):
-    ///   - single-node (no gateway — cluster fan-out streams in its own effort),
     ///   - no post-set-op (UNION/INTERSECT/EXCEPT need the full sets),
     ///   - `PlanKind::MultiRow` (the streamed shape is one TEXT column),
     ///   - autocommit (not inside a BEGIN..COMMIT block — in-block reads
@@ -34,15 +33,14 @@ impl NodeDbPgHandler {
     ///
     /// The returned stream is `Send + 'static`: it owns a cloned `Arc<SharedState>`
     /// and the scan plan, borrowing neither `self` nor `task`.
-    pub(super) fn maybe_stream_select(
+    pub(super) async fn maybe_stream_select(
         &self,
         task: &PhysicalTask,
         plan_kind: PlanKind,
         post_set_op: PostSetOp,
         addr: &std::net::SocketAddr,
     ) -> PgWireResult<Option<Response>> {
-        if self.state.gateway.is_some()
-            || post_set_op != PostSetOp::None
+        if post_set_op != PostSetOp::None
             || !matches!(plan_kind, PlanKind::MultiRow)
             || self.sessions.transaction_state(addr)
                 == crate::control::server::pgwire::session::TransactionState::InBlock
@@ -70,13 +68,26 @@ impl NodeDbPgHandler {
         // and does not borrow `self` or `task`.
         let child_plan = (**child).clone();
         let state = std::sync::Arc::clone(&self.state);
-        let stream = crate::control::server::exchange::gather::gather_all_cores_stream(
-            &state,
-            task.tenant_id,
-            task.database_id,
-            child_plan,
-            crate::types::TraceId::ZERO,
-        )
+
+        // Single-node fans to local cores directly; cluster routes the scan to
+        // its owning vShard (local or remote over the L4 QUIC streaming
+        // transport) via the gateway and merges per-route streams.
+        let stream = if let Some(gw) = state.gateway.as_ref() {
+            let ctx = crate::control::gateway::core::QueryContext {
+                tenant_id: task.tenant_id,
+                trace_id: crate::types::TraceId::ZERO,
+                database_id: task.database_id,
+            };
+            gw.execute_stream(&ctx, child_plan).await
+        } else {
+            crate::control::server::exchange::gather::gather_all_cores_stream(
+                &state,
+                task.tenant_id,
+                task.database_id,
+                child_plan,
+                crate::types::TraceId::ZERO,
+            )
+        }
         .map_err(|e| {
             let (severity, code, message) = error_to_sqlstate(&e);
             PgWireError::UserError(Box::new(ErrorInfo::new(

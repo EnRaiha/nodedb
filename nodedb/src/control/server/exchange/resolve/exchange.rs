@@ -126,16 +126,28 @@ async fn resolve_exchange(
                 Resolved::Stream(s) => return Ok(Resolved::Stream(s)),
             };
 
-            // Single-node streaming fast path: a non-aggregate, unordered scan
-            // fanned to local cores can stream straight to the client without
-            // coordinator-side materialization. Cluster mode and aggregate
-            // gathers keep the existing materialize-then-merge behaviour.
-            if state.gateway.is_none()
-                && !as_aggregate
-                && child.is_streamable_unordered_scan()
-            {
-                let stream =
-                    gather_all_cores_stream(state, tenant_id, database_id, child, trace_id)?;
+            // Streaming fast path: a non-aggregate, unordered scan can stream
+            // straight to the client without coordinator-side materialization.
+            //
+            // - Single-node (`gateway.is_none()`): fan to all local cores via
+            //   `gather_all_cores_stream`.
+            // - Cluster (`gateway.is_some()`): `gateway.execute_stream` routes
+            //   the scan to its owning vShard — local cores when this node owns
+            //   it, or the remote owner over QUIC (L4 streaming transport) —
+            //   and merges the per-route streams with the same `select_all`.
+            //
+            // Aggregate gathers keep the materialize-then-merge behaviour.
+            if !as_aggregate && child.is_streamable_unordered_scan() {
+                let stream = if let Some(gw) = state.gateway.as_ref() {
+                    let ctx = crate::control::gateway::core::QueryContext {
+                        tenant_id,
+                        trace_id,
+                        database_id,
+                    };
+                    gw.execute_stream(&ctx, child).await?
+                } else {
+                    gather_all_cores_stream(state, tenant_id, database_id, child, trace_id)?
+                };
                 return Ok(Resolved::Stream(stream));
             }
 
