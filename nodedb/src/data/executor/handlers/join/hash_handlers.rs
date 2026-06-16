@@ -39,7 +39,16 @@ impl CoreLoop {
             "hash join"
         );
 
-        let scan_limit = (join.limit * 10).min(50000);
+        // Derive a finite fetch-ceiling from the per-query byte budget so
+        // the underlying KV scan never calls Vec::with_capacity(usize::MAX).
+        // For an unbounded join (no SQL LIMIT) this evaluates to
+        // budget_bytes / 16 + 1 (floored at 1000), which is tight enough to
+        // prevent OOM but large enough not to silently truncate any real
+        // workload. The post-materialisation byte-budget guards below are the
+        // authoritative overflow check; this ceiling is only a pre-fetch hint.
+        let budget = self.query_tuning.max_scan_result_bytes;
+        let scan_limit =
+            crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
 
         // Evaluate bitmap sub-plans first. These prefilter the local scan for
         // each side, pushing surrogate exclusion into the document engine before
@@ -151,6 +160,17 @@ impl CoreLoop {
             (docs, keys)
         };
 
+        // Memory-budget guard on the hash-join probe side (left).
+        //
+        // Symmetric with the build-side guard below. The probe side is fully
+        // materialised before the right side is scanned. We check it first so
+        // that an over-budget left input surfaces the error immediately rather
+        // than after also materialising the right side. A budget of 0 disables
+        // the check (treated as unlimited), matching the scan-budget convention.
+        if let Some(err) = self.join_side_over_budget(join.task, &left_docs, budget) {
+            return err;
+        }
+
         // Resolve the right side.
         let right_docs = if let Some(sub_plan) = right_input {
             let sub_response = self.execute_plan(join.task, sub_plan);
@@ -201,7 +221,7 @@ impl CoreLoop {
         let left_keys: Vec<&str> = left_key_strs.iter().map(|s| s.as_str()).collect();
         let right_keys: Vec<&str> = join.on.iter().map(|(_, r)| r.as_str()).collect();
 
-        // Memory-budget guard on the hash-join build side.
+        // Memory-budget guard on the hash-join build side (right).
         //
         // The build side is fully materialised into `right_docs` before the
         // `HashIndex` is constructed. For a large build side this allocation
@@ -213,12 +233,8 @@ impl CoreLoop {
         // This is NOT a spill path — we do not drop or truncate rows.  We
         // surface a deterministic `ResourcesExhausted` error so the caller can
         // retry with a narrower predicate or explicit LIMIT.
-        let build_budget_bytes = self.query_tuning.max_scan_result_bytes;
-        if crate::data::executor::handlers::scan_budget::scan_bytes_exceeded(
-            &right_docs,
-            build_budget_bytes,
-        ) {
-            return self.response_error(join.task, ErrorCode::ResourcesExhausted);
+        if let Some(err) = self.join_side_over_budget(join.task, &right_docs, budget) {
+            return err;
         }
 
         let right_index = HashIndex::build(&right_docs, &right_keys);

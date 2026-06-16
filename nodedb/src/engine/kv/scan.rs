@@ -63,8 +63,13 @@ impl KvHashTable {
         now_ms: u64,
         match_pattern: Option<&str>,
     ) -> ScanBatchWithSurrogate<'_> {
-        let mut results = Vec::with_capacity(count);
+        // Compute the real slot ceiling first so the capacity hint never
+        // exceeds the number of rows that actually exist in the table.
+        // `count` may be a large budget-derived ceiling (e.g. ~33 M for a
+        // 512 MiB budget); blindly passing it to `with_capacity` would
+        // eagerly allocate hundreds of MB even for a tiny collection.
         let total_slots = self.capacity() + self.rehash_source_len();
+        let mut results = Vec::with_capacity(count.min(total_slots));
 
         let mut idx = cursor_idx;
         while results.len() < count && idx < total_slots {

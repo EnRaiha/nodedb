@@ -59,7 +59,14 @@ impl CoreLoop {
             "sort-merge join"
         );
 
-        let scan_limit = (limit * 10).min(50000);
+        // Derive a finite fetch-ceiling from the per-query byte budget so
+        // the underlying KV scan never calls Vec::with_capacity(usize::MAX).
+        // For an unbounded join this evaluates to budget_bytes / 16 + 1
+        // (floored at 1000). The post-materialisation byte-budget guards below
+        // are the authoritative overflow check; this ceiling is a pre-fetch hint.
+        let budget = self.query_tuning.max_scan_result_bytes;
+        let scan_limit =
+            crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
 
         let left_docs = match self.scan_collection(tid, left_collection, scan_limit) {
             Ok(d) => d,
@@ -72,6 +79,15 @@ impl CoreLoop {
                 );
             }
         };
+
+        // Memory-budget guard on the left side. Checked immediately after
+        // materialisation so an over-budget left input surfaces the error before
+        // the right side is scanned. A budget of 0 disables the check (treated
+        // as unlimited), matching the scan-budget convention.
+        if let Some(err) = self.join_side_over_budget(task, &left_docs, budget) {
+            return err;
+        }
+
         let right_docs = match self.scan_collection(tid, right_collection, scan_limit) {
             Ok(d) => d,
             Err(e) => {
@@ -83,6 +99,12 @@ impl CoreLoop {
                 );
             }
         };
+
+        // Memory-budget guard on the right side. Same convention as the
+        // left-side guard above. A budget of 0 disables the check.
+        if let Some(err) = self.join_side_over_budget(task, &right_docs, budget) {
+            return err;
+        }
 
         let left_keys: Vec<&str> = on.iter().map(|(l, _)| l.as_str()).collect();
         let right_keys: Vec<&str> = on.iter().map(|(_, r)| r.as_str()).collect();
