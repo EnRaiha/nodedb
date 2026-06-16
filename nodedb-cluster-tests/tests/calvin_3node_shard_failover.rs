@@ -38,7 +38,7 @@
 //! beyond the scope of this sub-batch. The catch-up property is fully
 //! covered here via the follower log-replay path.
 
-mod common;
+mod cluster_common;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -53,7 +53,7 @@ use nodedb_types::{
 };
 use tokio::sync::mpsc;
 
-use common::{spawn_with_sequencer, wait_for_sequencer_leader};
+use cluster_common::{spawn_with_sequencer, wait_for_sequencer_leader};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -160,7 +160,7 @@ async fn scheduler_catchup_via_raft_log_replay() {
     }
 
     // All 3 nodes must converge on at least one applied epoch.
-    common::wait_for(
+    cluster_common::wait_for(
         "all 3 nodes apply pre-batch epochs",
         Duration::from_secs(10),
         Duration::from_millis(20),
@@ -209,7 +209,7 @@ async fn scheduler_catchup_via_raft_log_replay() {
 
     // Wait for all 3 nodes to advance beyond the pre-batch epoch.
     let expected_min_epoch = pre_epoch_leader + 1;
-    common::wait_for(
+    cluster_common::wait_for(
         "all 3 nodes apply post-batch epochs",
         Duration::from_secs(10),
         Duration::from_millis(20),

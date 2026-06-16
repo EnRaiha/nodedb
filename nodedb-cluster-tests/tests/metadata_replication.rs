@@ -10,13 +10,13 @@
 //! visibility (applier decoding + redb writeback + pgwire visibility)
 //! is covered by `nodedb/tests/sql_cluster_cross_node_dml.rs`.
 
-mod common;
+mod cluster_common;
 
 use std::time::Duration;
 
 use nodedb_cluster::MetadataEntry;
 
-use common::{TestNode, wait_for};
+use cluster_common::{TestNode, wait_for};
 
 fn opaque_catalog_entry(data: &[u8]) -> MetadataEntry {
     MetadataEntry::CatalogDdl {

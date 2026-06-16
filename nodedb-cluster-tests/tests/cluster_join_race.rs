@@ -10,7 +10,7 @@
 //! Exercises `probe::designated_bootstrapper` + the retry loop in
 //! `bootstrap::join::join`.
 
-mod common;
+mod cluster_common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use nodedb_cluster::NexarTransport;
 
-use common::{TestNode, wait_for};
+use cluster_common::{TestNode, wait_for};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn five_nodes_race_on_full_seed_list_form_one_cluster() {
@@ -30,7 +30,7 @@ async fn five_nodes_race_on_full_seed_list_form_one_cluster() {
     let mut transports: Vec<Arc<NexarTransport>> = Vec::with_capacity(NODE_COUNT as usize);
     for id in 1..=NODE_COUNT {
         transports.push(Arc::new(
-            common::test_transport(id).expect("bind transport"),
+            cluster_common::test_transport(id).expect("bind transport"),
         ));
     }
     let seeds: Vec<SocketAddr> = transports.iter().map(|t| t.local_addr()).collect();

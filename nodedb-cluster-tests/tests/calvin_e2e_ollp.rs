@@ -32,7 +32,7 @@
 //! The executor-level verification (step 4) is tested in
 //! `nodedb/tests/executor_tests/test_ollp_verification.rs`.
 
-mod common;
+mod cluster_common;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -47,7 +47,7 @@ use nodedb_types::{
 };
 use tokio::sync::mpsc;
 
-use common::{spawn_with_sequencer, wait_for_sequencer_leader};
+use cluster_common::{spawn_with_sequencer, wait_for_sequencer_leader};
 
 /// Find two collection names that hash to distinct vshards.
 ///
@@ -161,7 +161,7 @@ async fn ollp_bulk_update_txclass_admitted_and_fanned_out() {
     inbox.submit(tx_class).expect("inbox.submit succeeded");
 
     // Wait for all 3 replicas to apply the epoch.
-    common::wait_for(
+    cluster_common::wait_for(
         "all 3 replicas apply epoch 0 (initial OLLP BulkUpdate)",
         Duration::from_secs(10),
         Duration::from_millis(20),
@@ -209,7 +209,7 @@ async fn ollp_bulk_update_txclass_admitted_and_fanned_out() {
         .expect("inbox.submit for retry succeeded");
 
     // Wait for the retry epoch.
-    common::wait_for(
+    cluster_common::wait_for(
         "all 3 replicas apply epoch 1 (retry OLLP BulkUpdate)",
         Duration::from_secs(10),
         Duration::from_millis(20),

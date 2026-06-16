@@ -130,7 +130,7 @@ async fn graph_traverse_returns_complete_distinct_set_from_any_node() {
                             "GRAPH TRAVERSE FROM 'root' DEPTH 1 LABEL 'l' DIRECTION out",
                         )
                         .await;
-                        traversed_node_ids(&v).len() >= NEIGHBORS + 1
+                        traversed_node_ids(&v).len() > NEIGHBORS
                     })
                 })
             },

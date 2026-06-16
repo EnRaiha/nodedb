@@ -31,7 +31,7 @@ use nodedb_cluster::{
     new_shared,
 };
 
-mod common;
+mod cluster_common;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

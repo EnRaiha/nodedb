@@ -7,13 +7,13 @@
 //! serving the transport. Asserts that all three nodes converge on a
 //! 3-member topology within 10 seconds.
 
-mod common;
+mod cluster_common;
 
 use std::time::Duration;
 
 use nodedb_cluster::ClusterLifecycleState;
 
-use common::{TestNode, wait_for};
+use cluster_common::{TestNode, wait_for};
 
 /// Spawns 3 in-process cluster nodes on loopback. Node 1 bootstraps. Nodes
 /// 2 and 3 join via node 1 using the production `RaftLoop` RPC handler.

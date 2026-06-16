@@ -9,7 +9,7 @@
 //!    consistent with what was committed (no regression beyond in-flight batch).
 //! 4. New txns submitted to the new leader commit successfully.
 
-mod common;
+mod cluster_common;
 
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use nodedb_types::{
     id::{DatabaseId, VShardId},
 };
 
-use common::{spawn_with_sequencer, wait_for_sequencer_leader};
+use cluster_common::{spawn_with_sequencer, wait_for_sequencer_leader};
 
 fn two_distinct_collections() -> (String, String) {
     let mut first: Option<(String, u32)> = None;
@@ -91,7 +91,7 @@ async fn sequencer_leader_failover_no_committed_epoch_loss() {
     }
 
     // Wait for pre-failover txns to be applied on all surviving nodes.
-    common::wait_for(
+    cluster_common::wait_for(
         "pre-failover epochs applied on all nodes",
         Duration::from_secs(10),
         Duration::from_millis(20),
@@ -142,7 +142,7 @@ async fn sequencer_leader_failover_no_committed_epoch_loss() {
 
     // Wait for post-failover epochs to be applied.
     let expected_min_epoch = epoch_after_failover + 1;
-    common::wait_for(
+    cluster_common::wait_for(
         "post-failover epochs applied on new leader",
         Duration::from_secs(10),
         Duration::from_millis(20),

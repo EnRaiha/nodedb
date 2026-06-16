@@ -14,7 +14,7 @@
 //! 6. Verify that per-vshard fan-out channels received the transaction
 //!    on every participating node.
 
-mod common;
+mod cluster_common;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -29,7 +29,7 @@ use nodedb_types::{
 };
 use tokio::sync::mpsc;
 
-use common::{spawn_with_sequencer, wait_for_sequencer_leader};
+use cluster_common::{spawn_with_sequencer, wait_for_sequencer_leader};
 
 /// Find two collection names that hash to distinct vshards.
 fn two_distinct_collections() -> (String, String) {
@@ -116,7 +116,7 @@ async fn sequencer_normal_path_commit_on_all_replicas() {
     inbox.submit(tx_class).expect("submit");
 
     // Wait for all 3 nodes to have applied at least one epoch.
-    common::wait_for(
+    cluster_common::wait_for(
         "all 3 nodes apply epoch 0",
         Duration::from_secs(10),
         Duration::from_millis(20),

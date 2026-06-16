@@ -9,7 +9,7 @@
 //!   decommission plan strips the node from all groups, and the
 //!   rebalancer loop naturally re-evaluates on its next tick.
 
-mod common;
+mod cluster_common;
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -24,7 +24,7 @@ use nodedb_cluster::swim::subscriber::MembershipSubscriber;
 use nodedb_cluster::topology::{ClusterTopology, NodeInfo, NodeState};
 use nodedb_types::NodeId;
 
-use common::rebalancer::{DynamicProvider, RecordingDispatcher, lm};
+use cluster_common::rebalancer::{DynamicProvider, RecordingDispatcher, lm};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn add_node_triggers_rebalance_via_kick() {

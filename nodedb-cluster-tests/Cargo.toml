@@ -18,14 +18,23 @@ nodedb-array = { workspace = true }
 nodedb-bridge = { workspace = true }
 nodedb-cluster = { workspace = true }
 nodedb-physical = { workspace = true }
+nodedb-raft = { workspace = true }
 nodedb-types = { workspace = true }
 nodedb-test-support = { workspace = true }
 
 tokio = { workspace = true, features = ["test-util"] }
 tokio-postgres = { workspace = true }
 tempfile = "3"
+async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+nexar = { workspace = true }
+quinn = { workspace = true }
+redb = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde_json = { workspace = true }
 sonic-rs = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 zerompk = { workspace = true }

@@ -9,11 +9,11 @@
 //! is what production does when a node crashes and systemd brings
 //! it back.
 
-mod common;
+mod cluster_common;
 
 use std::time::Duration;
 
-use common::{TestNode, wait_for};
+use cluster_common::{TestNode, wait_for};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_restart_is_idempotent() {

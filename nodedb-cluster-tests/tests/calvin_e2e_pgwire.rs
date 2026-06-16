@@ -15,7 +15,7 @@
 //!    replica — the same guarantee the pgwire response waits for via the
 //!    Calvin completion registry).
 
-mod common;
+mod cluster_common;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -30,7 +30,7 @@ use nodedb_types::{
 };
 use tokio::sync::mpsc;
 
-use common::{spawn_with_sequencer, wait_for_sequencer_leader};
+use cluster_common::{spawn_with_sequencer, wait_for_sequencer_leader};
 
 /// Find two collection names that hash to distinct vshards.
 ///
@@ -122,7 +122,7 @@ async fn multi_vshard_insert_via_sequencer_admitted_and_replicated() {
     inbox.submit(tx_class).expect("inbox.submit succeeded");
 
     // Wait for all 3 replicas to apply the epoch.
-    common::wait_for(
+    cluster_common::wait_for(
         "all 3 replicas apply epoch 0",
         Duration::from_secs(10),
         Duration::from_millis(20),

@@ -32,11 +32,11 @@
 //! Either way, node 4 eventually joins and every surviving node
 //! converges on a 4-member topology.
 
-mod common;
+mod cluster_common;
 
 use std::time::Duration;
 
-use common::{TestNode, wait_for};
+use cluster_common::{TestNode, wait_for};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_falls_back_when_first_seed_is_dead() {

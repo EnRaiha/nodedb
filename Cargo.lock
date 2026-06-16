@@ -4334,20 +4334,29 @@ dependencies = [
 name = "nodedb-cluster-tests"
 version = "0.3.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
+ "nexar",
  "nodedb",
  "nodedb-array",
  "nodedb-bridge",
  "nodedb-cluster",
  "nodedb-physical",
+ "nodedb-raft",
  "nodedb-test-support",
  "nodedb-types",
+ "quinn",
+ "redb",
+ "rustls",
  "serde_json",
  "sonic-rs",
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
  "zerompk",
 ]
 

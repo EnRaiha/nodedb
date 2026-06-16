@@ -22,7 +22,7 @@
 //! planner's. The planner walks routing as ground truth and trusts
 //! the dispatcher to be idempotent.
 
-mod common;
+mod cluster_common;
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -37,7 +37,7 @@ use nodedb_cluster::swim::subscriber::MembershipSubscriber;
 use nodedb_cluster::topology::{ClusterTopology, NodeInfo, NodeState};
 use nodedb_types::NodeId;
 
-use common::rebalancer::{DynamicProvider, RecordingDispatcher, lm, wait_until};
+use cluster_common::rebalancer::{DynamicProvider, RecordingDispatcher, lm, wait_until};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_nodes_added_mid_rebalance_both_receive_moves() {

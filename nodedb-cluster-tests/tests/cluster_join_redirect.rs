@@ -7,11 +7,11 @@
 //! Exercises the redirect path in
 //! `bootstrap::join::parse_leader_hint` + `try_join_once`.
 
-mod common;
+mod cluster_common;
 
 use std::time::Duration;
 
-use common::{TestNode, wait_for};
+use cluster_common::{TestNode, wait_for};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_follows_leader_redirect_from_follower() {
