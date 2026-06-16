@@ -201,6 +201,26 @@ impl CoreLoop {
         let left_keys: Vec<&str> = left_key_strs.iter().map(|s| s.as_str()).collect();
         let right_keys: Vec<&str> = join.on.iter().map(|(_, r)| r.as_str()).collect();
 
+        // Memory-budget guard on the hash-join build side.
+        //
+        // The build side is fully materialised into `right_docs` before the
+        // `HashIndex` is constructed. For a large build side this allocation
+        // can OOM the TPC core. We check its byte total against the same
+        // `max_scan_result_bytes` budget used by unbounded document/KV/columnar
+        // scans. A budget of 0 disables the check (treated as unlimited),
+        // matching the scan-budget convention.
+        //
+        // This is NOT a spill path — we do not drop or truncate rows.  We
+        // surface a deterministic `ResourcesExhausted` error so the caller can
+        // retry with a narrower predicate or explicit LIMIT.
+        let build_budget_bytes = self.query_tuning.max_scan_result_bytes;
+        if crate::data::executor::handlers::scan_budget::scan_bytes_exceeded(
+            &right_docs,
+            build_budget_bytes,
+        ) {
+            return self.response_error(join.task, ErrorCode::ResourcesExhausted);
+        }
+
         let right_index = HashIndex::build(&right_docs, &right_keys);
 
         let mut results = probe_hash_index(&ProbeParams {
@@ -219,5 +239,54 @@ impl CoreLoop {
 
         let payload = super::super::super::response_codec::encode_binary_rows(&results);
         self.response_with_payload(join.task, payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::data::executor::handlers::scan_budget::{budget_exceeded, scan_bytes_exceeded};
+
+    /// The budget guard helper (`scan_bytes_exceeded`) that backs the hash-join
+    /// build-side memory check behaves correctly: it returns `true` only when the
+    /// accumulated bytes exceed the budget, and treats a budget of 0 as unlimited.
+    ///
+    /// A full end-to-end test (build side over-budget → `ResourcesExhausted`
+    /// response) requires a live `CoreLoop`, which is covered by the
+    /// integration/cluster test suite. This unit test verifies the threshold
+    /// function that gates the early return.
+    #[test]
+    fn build_side_budget_guard_helper_enforces_limit() {
+        // One large row that exceeds the budget.
+        let over_budget: Vec<(String, Vec<u8>)> = vec![
+            ("id1".to_string(), vec![0u8; 600]),
+            ("id2".to_string(), vec![0u8; 600]),
+        ];
+        // 603 + 603 = 1206 > 1024
+        assert!(scan_bytes_exceeded(&over_budget, 1024));
+
+        // Two small rows that fit within budget.
+        let within_budget: Vec<(String, Vec<u8>)> = vec![
+            ("id1".to_string(), vec![0u8; 100]),
+            ("id2".to_string(), vec![0u8; 100]),
+        ];
+        // 103 + 103 = 206 <= 1024
+        assert!(!scan_bytes_exceeded(&within_budget, 1024));
+    }
+
+    #[test]
+    fn build_side_budget_zero_is_unlimited() {
+        // A budget of 0 must disable the guard (matching the scan convention).
+        let huge: Vec<(String, Vec<u8>)> = vec![("id".to_string(), vec![0u8; 1_000_000])];
+        assert!(!scan_bytes_exceeded(&huge, 0));
+        // Sanity: `budget_exceeded` itself also treats 0 as unlimited.
+        assert!(!budget_exceeded(usize::MAX, 0));
+    }
+
+    #[test]
+    fn build_side_budget_exactly_at_limit_is_allowed() {
+        // Exactly on the budget boundary is NOT exceeded (strict >).
+        // One row: value 1023 bytes + id "x" (1 byte) = 1024.
+        let at_limit: Vec<(String, Vec<u8>)> = vec![("x".to_string(), vec![0u8; 1023])];
+        assert!(!scan_bytes_exceeded(&at_limit, 1024));
     }
 }
