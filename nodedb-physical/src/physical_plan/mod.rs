@@ -127,6 +127,100 @@ impl PhysicalPlan {
         }
     }
 
+    /// Whether a fanned-out plan can be streamed to the client as an unordered
+    /// union of per-source row batches, rather than fully materialized and
+    /// merged on the coordinator first.
+    ///
+    /// Returns `true` ONLY for a plain full-collection scan that imposes no
+    /// global ordering, distinctness, offset, or aggregation across the union —
+    /// i.e. one whose rows from any source can be emitted in any interleaving
+    /// without changing the result:
+    ///
+    /// - `Document::Scan` — empty `sort_keys`, `distinct == false`, `offset == 0`,
+    ///   and no window functions (a window over the union needs the full set).
+    /// - `Kv::Scan` — empty `sort_keys`.
+    /// - `Columnar::Scan` — empty `sort_keys`.
+    /// - `Timeseries::Scan` — empty `sort_keys` (none today), and no aggregation:
+    ///   empty `group_by`, empty `aggregates`, `bucket_interval_ms == 0`.
+    /// - `ProviderScan` — empty `sort_keys`, `distinct == false`, `offset == 0`.
+    ///
+    /// Everything else — aggregates, joins, recursive / lateral / facet ops,
+    /// vector / text / graph / array / spatial reads, and any sorted, distinct,
+    /// offset, windowed, or aggregating scan — returns `false`. The match is
+    /// exhaustive so a new plan variant forces an explicit streamability
+    /// decision.
+    ///
+    /// `limit` is intentionally NOT a disqualifier: a global take-N is applied
+    /// by the streaming coordinator (it stops pulling once `limit` rows have
+    /// been emitted), so a limited scan still streams correctly.
+    pub fn is_streamable_unordered_scan(&self) -> bool {
+        match self {
+            PhysicalPlan::Document(document::DocumentOp::Scan {
+                sort_keys,
+                distinct,
+                offset,
+                window_functions,
+                ..
+            }) => sort_keys.is_empty() && !*distinct && *offset == 0 && window_functions.is_empty(),
+
+            PhysicalPlan::Kv(kv::KvOp::Scan { sort_keys, .. }) => sort_keys.is_empty(),
+
+            PhysicalPlan::Columnar(columnar::ColumnarOp::Scan { sort_keys, .. }) => {
+                sort_keys.is_empty()
+            }
+
+            PhysicalPlan::Timeseries(timeseries::TimeseriesOp::Scan {
+                group_by,
+                aggregates,
+                bucket_interval_ms,
+                ..
+            }) => group_by.is_empty() && aggregates.is_empty() && *bucket_interval_ms == 0,
+
+            PhysicalPlan::Query(query::QueryOp::ProviderScan {
+                sort_keys,
+                offset,
+                distinct,
+                ..
+            }) => sort_keys.is_empty() && *offset == 0 && !*distinct,
+
+            // Every other Document / Kv / Columnar / Timeseries op, plus all
+            // other engines and query ops, are not unordered-streamable.
+            PhysicalPlan::Document(_)
+            | PhysicalPlan::Kv(_)
+            | PhysicalPlan::Columnar(_)
+            | PhysicalPlan::Timeseries(_)
+            | PhysicalPlan::Vector(_)
+            | PhysicalPlan::Graph(_)
+            | PhysicalPlan::Text(_)
+            | PhysicalPlan::Spatial(_)
+            | PhysicalPlan::Crdt(_)
+            | PhysicalPlan::Meta(_)
+            | PhysicalPlan::Array(_)
+            | PhysicalPlan::ClusterArray(_)
+            | PhysicalPlan::Query(_) => false,
+        }
+    }
+
+    /// Global take-N to apply when streaming an unordered scan.
+    ///
+    /// Returns the scan's row cap (`usize::MAX` for an effectively-unlimited
+    /// scan) so the streaming coordinator can stop after that many rows across
+    /// the union. Returns `usize::MAX` for any plan that is not a streamable
+    /// scan — callers gate on [`PhysicalPlan::is_streamable_unordered_scan`]
+    /// first, so the fallthrough is never the deciding factor.
+    pub fn streamable_scan_limit(&self) -> usize {
+        match self {
+            PhysicalPlan::Document(document::DocumentOp::Scan { limit, .. }) => *limit,
+            PhysicalPlan::Kv(kv::KvOp::Scan { count, .. }) => *count,
+            PhysicalPlan::Columnar(columnar::ColumnarOp::Scan { limit, .. }) => *limit,
+            PhysicalPlan::Timeseries(timeseries::TimeseriesOp::Scan { limit, .. }) => *limit,
+            PhysicalPlan::Query(query::QueryOp::ProviderScan { limit, .. }) => {
+                limit.unwrap_or(usize::MAX)
+            }
+            _ => usize::MAX,
+        }
+    }
+
     /// Leaf / non-recursive sharded-source check for all plan variants other
     /// than `Aggregate` and `HashJoin` (handled structurally in
     /// `is_sharded_source`).

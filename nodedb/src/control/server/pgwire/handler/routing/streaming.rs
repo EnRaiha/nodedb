@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Single-node pgwire streaming fast path for unordered SELECTs.
+//!
+//! An autocommit, multi-row SELECT compiled to a root-level
+//! `Exchange{Gather{as_aggregate:false}}` over a plain unordered scan can stream
+//! its rows straight to the client: the coordinator fans the scan to all local
+//! cores and builds a lazy `QueryResponse` that pulls row batches as they
+//! arrive, instead of materializing and merging the whole result first.
+
+use pgwire::api::results::Response;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+
+use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+
+use super::super::core::NodeDbPgHandler;
+use super::super::plan::PlanKind;
+use super::super::super::types::error_to_sqlstate;
+
+impl NodeDbPgHandler {
+    /// Build a streaming `Response` for an eligible autocommit SELECT, or
+    /// `Ok(None)` when the task is not streamable (caller falls back to the
+    /// normal dispatch path).
+    ///
+    /// Eligibility (all required):
+    ///   - single-node (no gateway — cluster fan-out streams in its own effort),
+    ///   - no post-set-op (UNION/INTERSECT/EXCEPT need the full sets),
+    ///   - `PlanKind::MultiRow` (the streamed shape is one TEXT column),
+    ///   - autocommit (not inside a BEGIN..COMMIT block — in-block reads
+    ///     participate in snapshot-isolation read tracking on the normal path),
+    ///   - the plan is `Exchange{Gather{as_aggregate:false}}` over a scan for
+    ///     which [`PhysicalPlan::is_streamable_unordered_scan`] holds.
+    ///
+    /// The returned stream is `Send + 'static`: it owns a cloned `Arc<SharedState>`
+    /// and the scan plan, borrowing neither `self` nor `task`.
+    pub(super) fn maybe_stream_select(
+        &self,
+        task: &PhysicalTask,
+        plan_kind: PlanKind,
+        post_set_op: PostSetOp,
+        addr: &std::net::SocketAddr,
+    ) -> PgWireResult<Option<Response>> {
+        if self.state.gateway.is_some()
+            || post_set_op != PostSetOp::None
+            || !matches!(plan_kind, PlanKind::MultiRow)
+            || self.sessions.transaction_state(addr)
+                == crate::control::server::pgwire::session::TransactionState::InBlock
+        {
+            return Ok(None);
+        }
+
+        let PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+            child,
+            mode: ExchangeMode::Gather {
+                as_aggregate: false,
+            },
+        })) = &task.plan
+        else {
+            return Ok(None);
+        };
+
+        if !child.is_streamable_unordered_scan() {
+            return Ok(None);
+        }
+
+        // Permission was already checked by the caller before this point.
+        let limit = child.streamable_scan_limit();
+        // Clone the child and owned state so the row stream is `Send + 'static`
+        // and does not borrow `self` or `task`.
+        let child_plan = (**child).clone();
+        let state = std::sync::Arc::clone(&self.state);
+        let stream = crate::control::server::exchange::gather::gather_all_cores_stream(
+            &state,
+            task.tenant_id,
+            task.database_id,
+            child_plan,
+            crate::types::TraceId::ZERO,
+        )
+        .map_err(|e| {
+            let (severity, code, message) = error_to_sqlstate(&e);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            )))
+        })?;
+
+        Ok(Some(super::super::stream_response::streaming_multirow_response(
+            stream, limit,
+        )))
+    }
+}

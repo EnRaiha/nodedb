@@ -304,6 +304,11 @@ async fn dispatch_task(ctx: &DispatchCtx<'_>, mut task: PhysicalTask) -> crate::
         Resolved::Plan(resolved_plan) => {
             task.plan = resolved_plan;
         }
+        // Native path materializes the stream into a Response (it streams later
+        // in its own effort); preserves the existing gather-then-return shape.
+        Resolved::Stream(s) => {
+            return crate::control::server::exchange::gather::stream_to_response(s).await;
+        }
     }
 
     // All other tasks — point ops, writes, Raft-replicated writes — route

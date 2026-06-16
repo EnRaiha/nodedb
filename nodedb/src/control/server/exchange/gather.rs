@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status};
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
+use crate::control::server::result_stream::ResultStream;
 use crate::control::arrow_convert;
 use crate::control::gateway::core::QueryContext;
 use crate::control::state::SharedState;
@@ -189,6 +190,84 @@ pub async fn gather_all_cores(
     })
 }
 
+/// Streaming sibling of [`gather_all_cores`] for single-node fan-out.
+///
+/// Dispatches `plan` to every Data-Plane core eagerly (registering a tracker
+/// receiver per core BEFORE returning, exactly like `gather_all_cores`'s
+/// prologue), then returns a [`ResultStream`] that interleaves rows from all
+/// cores as they arrive via `futures::stream::select_all`. Nothing is
+/// materialized on the coordinator — each frame flows straight through.
+///
+/// NotFound tolerance matches `gather_all_cores`: a per-core terminal
+/// `Status::Error` with `ErrorCode::NotFound` ends that core's stream cleanly
+/// (the collection shard simply has no rows on that core) rather than failing
+/// the whole stream. Any other error status propagates as a stream `Err`. This
+/// is handled by passing `tolerate_not_found: true` to
+/// [`stream_response_channel`], which centralizes the NotFound-vs-error
+/// decision in the leaf adapter.
+///
+/// Unlike `gather_all_cores`, there is no per-core timeout wrapper here: the
+/// caller (the pgwire framework polling the `QueryResponse` stream) owns the
+/// connection-level deadline, and a streamed result has no single point at
+/// which to apply a fan-out timeout without buffering. The request deadline in
+/// each per-core `Request` envelope still bounds Data-Plane work.
+pub fn gather_all_cores_stream(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+) -> crate::Result<ResultStream> {
+    use crate::control::server::result_stream::stream_response_channel;
+
+    // Track broadcast calls for observability (shared counter with broadcast.rs).
+    crate::control::server::broadcast::broadcast_call_count_increment();
+
+    let deadline_secs = state.tuning.network.default_deadline_secs;
+    let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
+
+    let num_cores = state
+        .dispatcher
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .num_cores();
+
+    // Eager dispatch: register a tracker receiver and dispatch to each core
+    // BEFORE returning the stream, so every core has the request in flight
+    // immediately (matching `gather_all_cores`'s true-parallelism prologue).
+    let mut per_core: Vec<ResultStream> = Vec::with_capacity(num_cores);
+    for core_id in 0..num_cores {
+        let request_id = state.next_request_id();
+        let vshard_id = VShardId::new(core_id as u32);
+        let request = Request {
+            request_id,
+            tenant_id,
+            database_id,
+            vshard_id,
+            plan: plan.clone(),
+            deadline: Instant::now() + Duration::from_secs(deadline_secs),
+            priority: Priority::Normal,
+            trace_id,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+        };
+
+        let rx = state.tracker.register(request_id);
+        state
+            .dispatcher
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .dispatch_to_core(core_id, request)?;
+        per_core.push(stream_response_channel(rx, max_result_bytes, true));
+    }
+
+    Ok(Box::pin(futures::stream::select_all(per_core)))
+}
+
 /// Cluster-wide gather with routing awareness.
 ///
 /// # Single-node mode
@@ -306,6 +385,17 @@ pub fn finalize_aggregate(merged_array: &[u8]) -> Vec<u8> {
         );
     }
     merged_array.to_vec()
+}
+
+/// Materialize a [`ResultStream`] into a synthetic successful Response.
+///
+/// Used by the non-pgwire `Resolved::Stream` consumers (native, internal
+/// funnel, recursive resolve) that need the fully-collected result as one
+/// merged-array `Response`, preserving their prior gather-then-return behaviour.
+pub(crate) async fn stream_to_response(stream: ResultStream) -> crate::Result<Response> {
+    let (merged, watermark_lsn) =
+        crate::control::server::result_stream::materialize(stream).await?;
+    Ok(outcome_to_response(merged, watermark_lsn))
 }
 
 /// Build a synthetic successful Response from a gathered merged-array payload.

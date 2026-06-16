@@ -150,6 +150,14 @@ async fn dispatch_remote(args: RemoteDispatchArgs<'_>) -> Result<Vec<Vec<u8>>, E
             return Ok(vec![resp.payload.to_vec()]);
         }
         crate::control::server::exchange::Resolved::Plan(p) => p,
+        // Gateway path returns collected bytes: materialize the stream into one
+        // merged-array payload. (Single-node streaming never reaches the gateway
+        // — `state.gateway.is_none()` gates the Stream branch — but handle it
+        // exhaustively and behaviour-preservingly regardless.)
+        crate::control::server::exchange::Resolved::Stream(s) => {
+            let (merged, _lsn) = crate::control::server::result_stream::materialize(s).await?;
+            return Ok(vec![merged]);
+        }
     };
 
     // Encode the plan.

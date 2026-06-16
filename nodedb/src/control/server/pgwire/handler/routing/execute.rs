@@ -273,6 +273,19 @@ impl NodeDbPgHandler {
             let resp_post_set_op = task.post_set_op;
             let plan_for_response = task.plan.clone();
 
+            // --- Single-node pgwire streaming fast path ---
+            //
+            // Permission was already checked at the top of the loop. An eligible
+            // autocommit unordered SELECT streams its rows straight to the
+            // client (see `maybe_stream_select`); everything else falls through
+            // to the normal dispatch path below.
+            if let Some(stream_response) =
+                self.maybe_stream_select(&task, plan_kind, resp_post_set_op, addr)?
+            {
+                responses.push(stream_response);
+                continue;
+            }
+
             // --- Trigger interception for DML writes ---
             let mut dml_info = crate::control::trigger::dml_hook::classify_dml_write(&task.plan);
 

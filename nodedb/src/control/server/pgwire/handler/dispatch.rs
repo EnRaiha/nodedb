@@ -163,6 +163,16 @@ impl NodeDbPgHandler {
                 Resolved::Plan(resolved_plan) => {
                     task.plan = resolved_plan;
                 }
+                // Real pgwire streaming is handled up-front in
+                // `dispatch_task_loop` (execute.rs), before `dispatch_task` is
+                // ever called: it builds a lazy `QueryResponse` directly from
+                // `gather_all_cores_stream`. A Stream reaching THIS materialize
+                // funnel (e.g. internal pgwire sub-task paths that go through
+                // `dispatch_task` rather than the loop) is collected into a
+                // Response — a safe, behaviour-preserving default.
+                Resolved::Stream(s) => {
+                    return crate::control::server::exchange::gather::stream_to_response(s).await;
+                }
             }
         }
 

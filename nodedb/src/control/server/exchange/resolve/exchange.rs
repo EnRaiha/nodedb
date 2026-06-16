@@ -23,8 +23,10 @@ use crate::data::executor::response_codec::flatten_to_relational_rows;
 use crate::types::{DatabaseId, TenantId, TraceId};
 
 use crate::control::server::exchange::gather::{
-    GatherOutcome, finalize_aggregate, gather_all_cores, gather_all_vshards, outcome_to_response,
+    GatherOutcome, finalize_aggregate, gather_all_cores, gather_all_cores_stream,
+    gather_all_vshards, outcome_to_response,
 };
+use crate::control::server::result_stream::ResultStream;
 
 use super::materialize::materialize_providers;
 
@@ -36,6 +38,12 @@ pub enum Resolved {
     /// The plan (possibly mutated by catalog materialization or Broadcast
     /// embedding) is self-contained and should be dispatched normally.
     Plan(PhysicalPlan),
+    /// The plan was a single-node, unordered, non-aggregate scan eligible for
+    /// streaming. The coordinator has eagerly dispatched it to all cores; the
+    /// carried [`ResultStream`] yields row batches as they arrive. The pgwire
+    /// path surfaces this lazily to the client; all other consumers
+    /// `materialize` it back into a `Response`/bytes (behaviour-preserving).
+    Stream(ResultStream),
 }
 
 /// Materialize catalog providers and resolve Exchange nodes in `plan`.
@@ -110,7 +118,27 @@ async fn resolve_exchange(
             {
                 Resolved::Plan(p) => p,
                 Resolved::Gathered(resp) => return Ok(Resolved::Gathered(resp)),
+                // A nested Exchange that itself resolved to a stream cannot be
+                // re-wrapped by an outer Gather without materializing first;
+                // surface it as the stream (the outer Gather is redundant —
+                // nested root-level Gathers do not occur in practice, but if one
+                // did, the inner stream is already the correct result).
+                Resolved::Stream(s) => return Ok(Resolved::Stream(s)),
             };
+
+            // Single-node streaming fast path: a non-aggregate, unordered scan
+            // fanned to local cores can stream straight to the client without
+            // coordinator-side materialization. Cluster mode and aggregate
+            // gathers keep the existing materialize-then-merge behaviour.
+            if state.gateway.is_none()
+                && !as_aggregate
+                && child.is_streamable_unordered_scan()
+            {
+                let stream =
+                    gather_all_cores_stream(state, tenant_id, database_id, child, trace_id)?;
+                return Ok(Resolved::Stream(stream));
+            }
+
             let outcome: GatherOutcome =
                 gather_all_vshards(state, tenant_id, database_id, child, trace_id).await?;
             let payload = if as_aggregate {

@@ -19,6 +19,7 @@ mod session_cmds;
 mod sql_exec;
 mod sql_prepared;
 mod sql_split;
+mod stream_response;
 mod transaction_cmds;
 mod transaction_savepoint;
 mod wal_dispatch;

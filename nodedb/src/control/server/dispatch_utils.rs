@@ -134,6 +134,12 @@ pub async fn dispatch_to_data_plane_with_source(
     {
         crate::control::server::exchange::Resolved::Gathered(resp) => return Ok(resp),
         crate::control::server::exchange::Resolved::Plan(p) => p,
+        // Internal funnel callers want a fully-collected Response, not a lazy
+        // stream: materialize the stream into one merged-array Response,
+        // preserving the prior gather-then-return behaviour on this path.
+        crate::control::server::exchange::Resolved::Stream(s) => {
+            return crate::control::server::exchange::gather::stream_to_response(s).await;
+        }
     };
 
     // Extract write metadata before the plan is moved into the request.
