@@ -80,11 +80,13 @@ impl CoreLoop {
 
             let (filtered_indices, need_json_filter) = if has_filters {
                 let row_count = mt.row_count() as usize;
-                if let Some(bitmask) = crate::data::executor::handlers::columnar_filter::eval_filters_bitmask(
-                    mt,
-                    filter_predicates,
-                    row_count,
-                ) {
+                if let Some(bitmask) =
+                    crate::data::executor::handlers::columnar_filter::eval_filters_bitmask(
+                        mt,
+                        filter_predicates,
+                        row_count,
+                    )
+                {
                     let bm_indices = nodedb_query::simd_filter::bitmask_to_indices(&bitmask);
                     (bm_indices, false)
                 } else {

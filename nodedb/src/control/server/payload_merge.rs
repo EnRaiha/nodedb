@@ -100,7 +100,11 @@ mod tests {
 
     #[test]
     fn merge_concatenates_all_elements() {
-        let chunks = vec![int_array(0, 1000), int_array(1000, 1000), int_array(2000, 500)];
+        let chunks = vec![
+            int_array(0, 1000),
+            int_array(1000, 1000),
+            int_array(2000, 500),
+        ];
         let merged = merge_msgpack_arrays(&chunks);
         let elements = extract_msgpack_elements(&merged);
         assert_eq!(

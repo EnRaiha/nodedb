@@ -56,7 +56,12 @@ async fn cross_node_select_returns_all_chunks() {
         "all 3 nodes see collection wide",
         Duration::from_secs(10),
         Duration::from_millis(50),
-        || cluster.nodes.iter().all(|n| n.cached_collection_count() >= 1),
+        || {
+            cluster
+                .nodes
+                .iter()
+                .all(|n| n.cached_collection_count() >= 1)
+        },
     )
     .await;
 
@@ -91,9 +96,10 @@ async fn cross_node_select_returns_all_chunks() {
             Duration::from_millis(100),
             || {
                 tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(count_rows(&cluster.nodes[idx].client, "SELECT id FROM wide"))
-                        >= ROWS
+                    tokio::runtime::Handle::current().block_on(count_rows(
+                        &cluster.nodes[idx].client,
+                        "SELECT id FROM wide",
+                    )) >= ROWS
                 })
             },
         )

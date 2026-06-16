@@ -419,5 +419,9 @@ fn columnar_explicit_limit_returns_exactly_n() {
     );
     let json = payload_value(&payload);
     let rows = json.as_array().unwrap();
-    assert_eq!(rows.len(), 250, "explicit limit 250 must return exactly 250 rows");
+    assert_eq!(
+        rows.len(),
+        250,
+        "explicit limit 250 must return exactly 250 rows"
+    );
 }

@@ -105,15 +105,13 @@ pub async fn dispatch_route_stream(
     version_set: &GatewayVersionSet,
 ) -> Result<ResultStream, Error> {
     match route.decision {
-        RouteDecision::Local => {
-            crate::control::server::exchange::gather::gather_all_cores_stream(
-                shared,
-                tenant_id,
-                database_id,
-                route.plan,
-                trace_id,
-            )
-        }
+        RouteDecision::Local => crate::control::server::exchange::gather::gather_all_cores_stream(
+            shared,
+            tenant_id,
+            database_id,
+            route.plan,
+            trace_id,
+        ),
         RouteDecision::Remote { node_id, vshard_id } => {
             dispatch_remote_stream(RemoteDispatchArgs {
                 plan: route.plan,
@@ -370,13 +368,14 @@ async fn dispatch_remote_stream(args: RemoteDispatchArgs<'_>) -> Result<ResultSt
     // Open the stream eagerly. A failure to even open / send the request is a
     // pre-row condition: map it like a transport failure in `dispatch_remote`
     // so the retry loop routes elsewhere on the next attempt.
-    let stream = transport.send_rpc_stream(node_id, req).await.map_err(|e| {
-        Error::NotLeader {
+    let stream = transport
+        .send_rpc_stream(node_id, req)
+        .await
+        .map_err(|e| Error::NotLeader {
             vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
             leader_node: 0,
             leader_addr: format!("node-{node_id} (stream open error: {e})"),
-        }
-    })?;
+        })?;
     // The `async_stream` body is `!Unpin`; pin it on the heap so we can pull
     // the eager first frame and then keep the tail around for `.chain`.
     let mut stream = Box::pin(stream);

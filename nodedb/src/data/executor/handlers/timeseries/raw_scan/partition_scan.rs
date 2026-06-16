@@ -160,11 +160,13 @@ pub(super) fn scan_one_partition(
 
     let row_count = timestamps.len();
     let filtered_indices = if has_filters {
-        if let Some(bitmask) = crate::data::executor::handlers::columnar_filter::eval_filters_bitmask(
-            &part_src,
-            filter_predicates,
-            row_count,
-        ) {
+        if let Some(bitmask) =
+            crate::data::executor::handlers::columnar_filter::eval_filters_bitmask(
+                &part_src,
+                filter_predicates,
+                row_count,
+            )
+        {
             nodedb_query::simd_filter::bitmask_to_indices(&bitmask)
         } else {
             match crate::data::executor::handlers::columnar_filter::eval_filters_sparse(

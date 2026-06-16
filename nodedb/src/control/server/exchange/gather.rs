@@ -19,10 +19,10 @@ use futures::future::join_all;
 use std::time::{Duration, Instant};
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status};
-use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
-use crate::control::server::result_stream::ResultStream;
 use crate::control::arrow_convert;
 use crate::control::gateway::core::QueryContext;
+use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
+use crate::control::server::result_stream::ResultStream;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
 

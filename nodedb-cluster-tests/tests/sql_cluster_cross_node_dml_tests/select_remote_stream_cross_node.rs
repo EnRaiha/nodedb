@@ -52,7 +52,12 @@ async fn cross_node_remote_stream_returns_all_chunks() {
         "all 3 nodes see collection streamwide",
         Duration::from_secs(10),
         Duration::from_millis(50),
-        || cluster.nodes.iter().all(|n| n.cached_collection_count() >= 1),
+        || {
+            cluster
+                .nodes
+                .iter()
+                .all(|n| n.cached_collection_count() >= 1)
+        },
     )
     .await;
 

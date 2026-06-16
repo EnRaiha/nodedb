@@ -263,8 +263,7 @@ impl LocalPlanExecutor {
             while let Some(batch) = stream.next().await {
                 match batch {
                     Ok(b) => {
-                        if let Err(_e) =
-                            sink.send_chunk(b.payload, b.watermark_lsn.as_u64()).await
+                        if let Err(_e) = sink.send_chunk(b.payload, b.watermark_lsn.as_u64()).await
                         {
                             // Coordinator gone — stop, cancel tracker, no terminal.
                             self.state.tracker.cancel(&request_id);
@@ -433,8 +432,11 @@ impl LocalPlanExecutor {
             DispatchCollectError, collect_bounded_response,
         };
         let max_result_bytes = self.state.tuning.network.max_query_result_bytes as usize;
-        match tokio::time::timeout(deadline, collect_bounded_response(&mut rx, max_result_bytes))
-            .await
+        match tokio::time::timeout(
+            deadline,
+            collect_bounded_response(&mut rx, max_result_bytes),
+        )
+        .await
         {
             Ok(Ok(resp)) => {
                 if resp.status == crate::bridge::envelope::Status::Error {
