@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Memory-budget bounding for unbounded (no-LIMIT) document scans.
+//! Memory-budget bounding for unbounded (no-LIMIT) scans.
 //!
 //! A `SELECT * FROM <coll>` without a LIMIT must NOT be silently truncated.
 //! Instead the Data Plane fetches every row that fits a per-core, per-query
@@ -19,12 +19,15 @@
 //! the byte budget is hit, mid-fetch) is tracked as a follow-on unit (U4/U5);
 //! the fetch-limit + post-materialization check here is the correct bound for
 //! a scan that materializes into a `Vec`.
+//!
+//! These helpers are shared across the document, KV, columnar, and timeseries
+//! scan handlers — every engine's no-LIMIT scan path uses the same bound.
 
 /// Conservative lower bound on the encoded size of one scanned row
 /// (value bytes + key). Used only to translate a byte budget into a
 /// row-count `fetch_limit` ceiling; the authoritative bound is the
-/// post-materialization byte check in [`scan_bytes_exceeded`].
-const MIN_ROW_BYTES: usize = 16;
+/// post-materialization byte check in [`budget_exceeded`].
+pub(in crate::data::executor::handlers) const MIN_ROW_BYTES: usize = 16;
 
 /// Translate the byte budget into a storage `fetch_limit` row ceiling for an
 /// otherwise-unbounded scan.
@@ -38,7 +41,11 @@ const MIN_ROW_BYTES: usize = 16;
 /// the ceiling is `budget_bytes / MIN_ROW_BYTES + 1` — the `+ 1` lets the
 /// handler detect that more rows exist than fit the budget and surface the
 /// error rather than silently dropping them.
-pub(super) fn fetch_limit_for(limit: usize, offset: usize, budget_bytes: usize) -> usize {
+pub(in crate::data::executor::handlers) fn fetch_limit_for(
+    limit: usize,
+    offset: usize,
+    budget_bytes: usize,
+) -> usize {
     if limit == usize::MAX {
         (budget_bytes / MIN_ROW_BYTES.max(1))
             .saturating_add(1)
@@ -48,40 +55,47 @@ pub(super) fn fetch_limit_for(limit: usize, offset: usize, budget_bytes: usize) 
     }
 }
 
+/// True when `total_bytes` exceeds the per-query scan budget. A `budget_bytes`
+/// of 0 disables the check (treated as unlimited), matching the row-shape helpers.
+pub(in crate::data::executor::handlers) fn budget_exceeded(
+    total_bytes: usize,
+    budget_bytes: usize,
+) -> bool {
+    budget_bytes != 0 && total_bytes > budget_bytes
+}
+
 /// Return `true` if the materialized rows exceed the byte budget.
 ///
-/// Sums each row's value bytes plus its id length and compares against
-/// `budget_bytes`. A `budget_bytes` of 0 disables the check (treated as
+/// Sums each row's value bytes plus its id length and delegates to
+/// [`budget_exceeded`]. A `budget_bytes` of 0 disables the check (treated as
 /// unlimited) so the bound can be turned off via configuration.
-pub(super) fn scan_bytes_exceeded(rows: &[(String, Vec<u8>)], budget_bytes: usize) -> bool {
+pub(in crate::data::executor::handlers) fn scan_bytes_exceeded(
+    rows: &[(String, Vec<u8>)],
+    budget_bytes: usize,
+) -> bool {
     if budget_bytes == 0 {
         return false;
     }
-    let mut total: usize = 0;
-    for (id, value) in rows {
-        total = total.saturating_add(value.len()).saturating_add(id.len());
-        if total > budget_bytes {
-            return true;
-        }
-    }
-    false
+    let total = rows.iter().fold(0usize, |acc, (id, value)| {
+        acc.saturating_add(value.len()).saturating_add(id.len())
+    });
+    budget_exceeded(total, budget_bytes)
 }
 
 /// `scan_bytes_exceeded` for the audit-log / all-versions row shape
 /// `(id, system_time_ms, body)`. The system-time `i64` is fixed-width and
 /// negligible; only `id` + `body` bytes are summed.
-pub(super) fn version_bytes_exceeded(rows: &[(String, i64, Vec<u8>)], budget_bytes: usize) -> bool {
+pub(in crate::data::executor::handlers) fn version_bytes_exceeded(
+    rows: &[(String, i64, Vec<u8>)],
+    budget_bytes: usize,
+) -> bool {
     if budget_bytes == 0 {
         return false;
     }
-    let mut total: usize = 0;
-    for (id, _sys_ms, value) in rows {
-        total = total.saturating_add(value.len()).saturating_add(id.len());
-        if total > budget_bytes {
-            return true;
-        }
-    }
-    false
+    let total = rows.iter().fold(0usize, |acc, (id, _sys_ms, value)| {
+        acc.saturating_add(value.len()).saturating_add(id.len())
+    });
+    budget_exceeded(total, budget_bytes)
 }
 
 #[cfg(test)]
@@ -109,6 +123,13 @@ mod tests {
         // Must not panic / wrap on a huge budget.
         let f = fetch_limit_for(usize::MAX, usize::MAX, usize::MAX);
         assert!(f >= 1000);
+    }
+
+    #[test]
+    fn budget_of_zero_is_unlimited() {
+        assert!(!budget_exceeded(1_000_000, 0));
+        assert!(budget_exceeded(1025, 1024));
+        assert!(!budget_exceeded(1024, 1024));
     }
 
     #[test]

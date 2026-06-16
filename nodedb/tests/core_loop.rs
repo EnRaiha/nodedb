@@ -32,6 +32,8 @@ mod test_group_by_alias;
 mod test_kv;
 #[path = "executor_tests/test_kv_advanced.rs"]
 mod test_kv_advanced;
+#[path = "executor_tests/test_kv_scan_budget.rs"]
+mod test_kv_scan_budget;
 #[path = "executor_tests/test_ollp_verification.rs"]
 mod test_ollp_verification;
 #[path = "executor_tests/test_security_and_isolation.rs"]
@@ -78,6 +80,8 @@ mod test_tenant_quota;
 mod test_timeseries;
 #[path = "executor_tests/test_timeseries_budget.rs"]
 mod test_timeseries_budget;
+#[path = "executor_tests/test_timeseries_scan_budget.rs"]
+mod test_timeseries_scan_budget;
 #[path = "executor_tests/test_transaction.rs"]
 mod test_transaction;
 #[path = "executor_tests/test_transaction_matrix.rs"]

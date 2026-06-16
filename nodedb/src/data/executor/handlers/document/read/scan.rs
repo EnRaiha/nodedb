@@ -65,7 +65,11 @@ impl CoreLoop {
         // a row ceiling derived from the byte budget (+1 row to detect "more
         // exist") so the data-plane Vec cannot grow to the whole collection.
         let scan_budget_bytes = self.query_tuning.max_scan_result_bytes;
-        let fetch_limit = super::scan_budget::fetch_limit_for(limit, offset, scan_budget_bytes);
+        let fetch_limit = crate::data::executor::handlers::scan_budget::fetch_limit_for(
+            limit,
+            offset,
+            scan_budget_bytes,
+        );
 
         let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
             Vec::new()
@@ -163,7 +167,10 @@ impl CoreLoop {
                 // rows. Only enforced for unbounded scans — an explicit
                 // `LIMIT n` is already row-bounded by the planner.
                 if limit == usize::MAX
-                    && super::scan_budget::scan_bytes_exceeded(&filtered, scan_budget_bytes)
+                    && crate::data::executor::handlers::scan_budget::scan_bytes_exceeded(
+                        &filtered,
+                        scan_budget_bytes,
+                    )
                 {
                     return self.response_error(task, ErrorCode::ResourcesExhausted);
                 }

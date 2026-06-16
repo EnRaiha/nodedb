@@ -4,8 +4,9 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::Response;
+use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::scan_budget;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::KvScanParams;
 use crate::engine::kv::current_ms;
@@ -51,19 +52,45 @@ impl CoreLoop {
 
         let now_ms = current_ms();
 
+        // A no-LIMIT SQL `SELECT * FROM <kv>` arrives as `count == usize::MAX`.
+        // Bound the engine fetch to a row ceiling derived from the per-query
+        // memory budget (+1 row to detect "more exist") so the materialized
+        // `Vec` cannot grow to the whole collection. The RESP cursor
+        // pagination path always carries a finite `count`, so it is unaffected.
+        let scan_budget_bytes = self.query_tuning.max_scan_result_bytes;
+        let unbounded = count == usize::MAX;
+        let fetch_count = if unbounded {
+            // KV scans have no row offset (pagination is cursor-based).
+            scan_budget::fetch_limit_for(count, 0, scan_budget_bytes)
+        } else {
+            count
+        };
+
         // Try to extract a single equality filter for index pushdown.
         let (filter_field, filter_value) = extract_eq_filter(filters);
         let (entries, _next_cursor) = self.kv_engine.scan(KvScanParams {
             tenant_id: tid,
             collection,
             cursor,
-            count,
+            count: fetch_count,
             now_ms,
             match_pattern,
             filter_field: filter_field.as_deref(),
             filter_value: filter_value.as_deref(),
             surrogate_ceiling,
         });
+
+        // Bound an unbounded (no-LIMIT) scan by the memory budget. Sum the raw
+        // key+value bytes and surface a deterministic error if the result would
+        // exceed the budget rather than silently truncating it.
+        if unbounded {
+            let total = entries.iter().fold(0usize, |acc, (k, v)| {
+                acc.saturating_add(k.len()).saturating_add(v.len())
+            });
+            if scan_budget::budget_exceeded(total, scan_budget_bytes) {
+                return self.response_error(task, ErrorCode::ResourcesExhausted);
+            }
+        }
 
         // Parse filter predicates for post-scan evaluation.
         // Index pushdown handles eq filters on indexed fields, but general

@@ -94,7 +94,22 @@ impl CoreLoop {
         } else {
             Vec::new()
         };
-        let limit = if limit == 0 { 1000 } else { limit };
+        // A no-LIMIT SQL `SELECT * FROM <columnar>` arrives as
+        // `limit == usize::MAX`. Capture that before the `limit == 0` rewrite
+        // so the budget bound applies only to the unbounded path. Spatial
+        // scans arrive with a finite `10000` and are therefore unaffected.
+        let scan_budget_bytes = self.query_tuning.max_scan_result_bytes;
+        let unbounded = limit == usize::MAX;
+        let limit = if limit == 0 {
+            1000
+        } else if unbounded {
+            // Bound the materialized row count to a ceiling derived from the
+            // memory budget (+1 row to detect "more exist") so the scan does
+            // not pull the whole memtable into the `matched` Vec.
+            super::super::scan_budget::fetch_limit_for(limit, 0, scan_budget_bytes)
+        } else {
+            limit
+        };
 
         // Scan-quiesce gate.
         let _scan_guard =
@@ -276,14 +291,28 @@ impl CoreLoop {
         let results: Vec<serde_json::Value> =
             matched.into_iter().take(limit).map(|(_, j)| j).collect();
 
-        match response_codec::encode_json_vec(&results) {
-            Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+        let payload = match response_codec::encode_json_vec(&results) {
+            Ok(payload) => payload,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        };
+
+        // Bound an unbounded (no-LIMIT) scan by the memory budget. The encoded
+        // msgpack payload is the authoritative size of the materialized result;
+        // surface a deterministic error if it exceeds the budget rather than
+        // silently truncating. Spatial scans are bounded (finite limit) and so
+        // skip this check.
+        if unbounded && super::super::scan_budget::budget_exceeded(payload.len(), scan_budget_bytes)
+        {
+            return self.response_error(task, ErrorCode::ResourcesExhausted);
         }
+
+        self.response_with_payload(task, payload)
     }
 }

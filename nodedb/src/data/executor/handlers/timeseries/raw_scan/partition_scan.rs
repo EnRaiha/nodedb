@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Parallel and sequential disk-partition scanning for raw mode.
+
+use std::collections::HashMap;
+
+use crate::engine::timeseries::columnar_agg::timestamp_range_filter;
+use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType};
+use crate::engine::timeseries::columnar_segment::ColumnarSegmentReader;
+
+use super::row_emit::{emit_partition_row, extract_timestamp};
+
+/// Scan disk partitions in parallel, returning rmpv rows sorted by timestamp.
+pub(super) fn scan_partitions_parallel(
+    partition_dirs: &[std::path::PathBuf],
+    time_range: (i64, i64),
+    limit: usize,
+    filter_predicates: &[crate::bridge::scan_filter::ScanFilter],
+    has_filters: bool,
+) -> Vec<rmpv::Value> {
+    if partition_dirs.len() <= 1 {
+        return partition_dirs
+            .first()
+            .map(|dir| scan_one_partition(dir, time_range, limit, filter_predicates, has_filters))
+            .unwrap_or_default();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let thread_count = available.min(partition_dirs.len()).min(8);
+
+        if thread_count <= 1 {
+            return scan_partitions_sequential(
+                partition_dirs,
+                time_range,
+                limit,
+                filter_predicates,
+                has_filters,
+            );
+        }
+
+        let chunk_size = partition_dirs.len().div_ceil(thread_count);
+        let filters_ref = filter_predicates;
+
+        let mut thread_results: Vec<Vec<rmpv::Value>> = std::thread::scope(|s| {
+            let handles: Vec<_> = partition_dirs
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        scan_partitions_sequential(
+                            chunk,
+                            time_range,
+                            limit,
+                            filters_ref,
+                            has_filters,
+                        )
+                    })
+                })
+                .collect();
+
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+
+        // Merge: each thread's results are already time-sorted (partitions are
+        // time-ordered). Flatten, sort globally, truncate to limit.
+        let total: usize = thread_results.iter().map(|v| v.len()).sum();
+        let mut merged = Vec::with_capacity(total.min(limit));
+        for batch in &mut thread_results {
+            merged.append(batch);
+        }
+        // Sort by timestamp (first field in each row map).
+        merged.sort_by_key(extract_timestamp);
+        merged.truncate(limit);
+        merged
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        scan_partitions_sequential(
+            partition_dirs,
+            time_range,
+            limit,
+            filter_predicates,
+            has_filters,
+        )
+    }
+}
+
+pub(super) fn scan_partitions_sequential(
+    partition_dirs: &[std::path::PathBuf],
+    time_range: (i64, i64),
+    limit: usize,
+    filter_predicates: &[crate::bridge::scan_filter::ScanFilter],
+    has_filters: bool,
+) -> Vec<rmpv::Value> {
+    let mut results = Vec::new();
+    for dir in partition_dirs {
+        if results.len() >= limit {
+            break;
+        }
+        let remaining = limit - results.len();
+        let rows = scan_one_partition(dir, time_range, remaining, filter_predicates, has_filters);
+        results.extend(rows);
+    }
+    results.truncate(limit);
+    results
+}
+
+/// Scan a single disk partition, returning rmpv rows.
+pub(super) fn scan_one_partition(
+    part_dir: &std::path::Path,
+    time_range: (i64, i64),
+    limit: usize,
+    filter_predicates: &[crate::bridge::scan_filter::ScanFilter],
+    has_filters: bool,
+) -> Vec<rmpv::Value> {
+    let schema = match ColumnarSegmentReader::read_schema(part_dir, None) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    // Prefetch all column files into page cache before reading.
+    let all_col_names: Vec<String> = schema.columns.iter().map(|(n, _)| n.clone()).collect();
+    crate::data::io::fadvise::prefetch_partition_columns(part_dir, &all_col_names);
+
+    let col_data: Vec<Option<ColumnData>> = schema
+        .columns
+        .iter()
+        .map(|(name, ty)| ColumnarSegmentReader::read_column(part_dir, name, *ty, None).ok())
+        .collect();
+
+    let sym_dicts: HashMap<usize, nodedb_types::timeseries::SymbolDictionary> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, ty))| *ty == ColumnType::Symbol)
+        .filter_map(|(i, (name, _))| {
+            ColumnarSegmentReader::read_symbol_dict(part_dir, name, None)
+                .ok()
+                .map(|dict| (i, dict))
+        })
+        .collect();
+
+    let ts_col = col_data.get(schema.timestamp_idx).and_then(|d| d.as_ref());
+    let Some(ts_col) = ts_col else {
+        return Vec::new();
+    };
+    let timestamps = ts_col.as_timestamps();
+    let indices = timestamp_range_filter(timestamps, time_range.0, time_range.1);
+
+    let schema_vec: Vec<(String, ColumnType)> = schema.columns.clone();
+    let part_src = crate::data::executor::handlers::columnar_filter::PartitionColumns {
+        schema: &schema_vec,
+        columns: &col_data,
+        sym_dicts: &sym_dicts,
+    };
+
+    let row_count = timestamps.len();
+    let filtered_indices = if has_filters {
+        if let Some(bitmask) = crate::data::executor::handlers::columnar_filter::eval_filters_bitmask(
+            &part_src,
+            filter_predicates,
+            row_count,
+        ) {
+            nodedb_query::simd_filter::bitmask_to_indices(&bitmask)
+        } else {
+            match crate::data::executor::handlers::columnar_filter::eval_filters_sparse(
+                &part_src,
+                filter_predicates,
+                &indices,
+            ) {
+                Some(mask) => {
+                    crate::data::executor::handlers::columnar_filter::apply_mask(&indices, &mask)
+                }
+                None => indices,
+            }
+        }
+    } else {
+        indices
+    };
+
+    let mut rows = Vec::with_capacity(filtered_indices.len().min(limit));
+    for &idx in &filtered_indices {
+        if rows.len() >= limit {
+            break;
+        }
+        let row = emit_partition_row(&schema_vec, &col_data, &sym_dicts, idx as usize);
+        rows.push(row);
+    }
+
+    // Release page cache for this partition.
+    crate::data::io::fadvise::release_partition_columns(part_dir, &all_col_names);
+
+    rows
+}

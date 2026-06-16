@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Raw scan entry point: `RawScanParams` and `execute_ts_raw_scan`.
+
+use crate::bridge::envelope::{ErrorCode, Response};
+use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::task::ExecutionTask;
+use crate::engine::timeseries::columnar_agg::timestamp_range_filter;
+
+use super::partition_scan::scan_partitions_parallel;
+use super::row_emit::{apply_computed_columns_rmpv, emit_memtable_row, rmpv_system_time};
+
+/// Parameters for a timeseries raw scan (no aggregation).
+pub(in crate::data::executor) struct RawScanParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: crate::types::TenantId,
+    pub collection: &'a str,
+    pub time_range: (i64, i64),
+    pub limit: usize,
+    pub filter_predicates: &'a [crate::bridge::scan_filter::ScanFilter],
+    pub has_filters: bool,
+    pub computed_columns: &'a [u8],
+    /// `AS OF SYSTEM TIME NULL`: emit every `_ts_system` version ordered
+    /// ascending by system time (audit-log semantics).
+    pub all_versions: bool,
+}
+
+impl CoreLoop {
+    /// Raw scan mode: emit rows from memtable + partitions.
+    pub(in crate::data::executor) fn execute_ts_raw_scan(
+        &self,
+        params: RawScanParams<'_>,
+    ) -> Response {
+        let RawScanParams {
+            task,
+            tid,
+            collection,
+            time_range,
+            limit,
+            filter_predicates,
+            has_filters,
+            computed_columns: computed_columns_bytes,
+            all_versions,
+        } = params;
+
+        // A no-LIMIT SQL `SELECT * FROM <timeseries>` arrives as
+        // `limit == usize::MAX`. Bound the row fetch to a ceiling derived from
+        // the per-query memory budget (+1 row to detect "more exist") so the
+        // materialized result cannot grow to the whole collection. Aggregate /
+        // COUNT paths never reach this handler.
+        let scan_budget_bytes = self.query_tuning.max_scan_result_bytes;
+        let unbounded = limit == usize::MAX;
+        let limit = if unbounded {
+            // Timeseries raw scans have no row offset.
+            crate::data::executor::handlers::scan_budget::fetch_limit_for(
+                limit,
+                0,
+                scan_budget_bytes,
+            )
+        } else {
+            limit
+        };
+
+        // Scan-quiesce gate.
+        let _scan_guard = match self.acquire_scan_guard(task, tid.as_u64(), collection) {
+            Ok(g) => g,
+            Err(resp) => return resp,
+        };
+
+        let key = (tid, collection.to_string());
+        let mut results: Vec<rmpv::Value> = Vec::new();
+
+        // 1. Read from memtable.
+        if let Some(mt) = self.columnar_memtables.get(&key)
+            && !mt.is_empty()
+        {
+            let schema = mt.schema();
+            let timestamps = mt.column(schema.timestamp_idx).as_timestamps();
+            let indices = timestamp_range_filter(timestamps, time_range.0, time_range.1);
+
+            let (filtered_indices, need_json_filter) = if has_filters {
+                let row_count = mt.row_count() as usize;
+                if let Some(bitmask) = crate::data::executor::handlers::columnar_filter::eval_filters_bitmask(
+                    mt,
+                    filter_predicates,
+                    row_count,
+                ) {
+                    let bm_indices = nodedb_query::simd_filter::bitmask_to_indices(&bitmask);
+                    (bm_indices, false)
+                } else {
+                    match crate::data::executor::handlers::columnar_filter::eval_filters_sparse(
+                        mt,
+                        filter_predicates,
+                        &indices,
+                    ) {
+                        Some(mask) => (
+                            crate::data::executor::handlers::columnar_filter::apply_mask(
+                                &indices, &mask,
+                            ),
+                            false,
+                        ),
+                        None => (indices, true),
+                    }
+                }
+            } else {
+                (indices, false)
+            };
+
+            let columns: Vec<_> = schema
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, (name, ty))| (i, name, ty, mt.column(i)))
+                .collect();
+            for &idx in &filtered_indices {
+                if results.len() >= limit {
+                    break;
+                }
+                let row = emit_memtable_row(mt, &columns, idx as usize);
+                if need_json_filter {
+                    // Encode rmpv row to msgpack bytes for binary filter eval.
+                    let mut buf = Vec::new();
+                    rmpv::encode::write_value(&mut buf, &row).ok();
+                    if !filter_predicates.iter().all(|f| f.matches_binary(&buf)) {
+                        continue;
+                    }
+                }
+                results.push(row);
+            }
+        }
+
+        // 2. Read from disk partitions.
+        if let Some(registry) = self.ts_registries.get(&key) {
+            let query_range = nodedb_types::timeseries::TimeRange::new(time_range.0, time_range.1);
+            let entries: Vec<_> = registry.query_partitions(&query_range);
+
+            if !entries.is_empty() {
+                let data_dir = &self.data_dir;
+                let partition_dirs: Vec<std::path::PathBuf> = entries
+                    .iter()
+                    .map(|e| data_dir.join("ts").join(collection).join(&e.dir_name))
+                    .filter(|p| p.exists())
+                    .collect();
+
+                let remaining = limit.saturating_sub(results.len());
+                if remaining > 0 && !partition_dirs.is_empty() {
+                    let partition_rows = scan_partitions_parallel(
+                        &partition_dirs,
+                        time_range,
+                        remaining,
+                        filter_predicates,
+                        has_filters,
+                    );
+                    results.extend(partition_rows);
+                    results.truncate(limit);
+                }
+            }
+        }
+
+        // Apply computed columns (e.g. time_bucket) if present.
+        let results = if !computed_columns_bytes.is_empty() {
+            let computed_cols_result: Result<Vec<crate::bridge::expr_eval::ComputedColumn>, _> =
+                zerompk::from_msgpack(computed_columns_bytes);
+            let computed_cols = match computed_cols_result {
+                Ok(cols) => cols,
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("computed_columns deserialize failed: {e}"),
+                        },
+                    );
+                }
+            };
+            if computed_cols.is_empty() {
+                results
+            } else {
+                results
+                    .into_iter()
+                    .map(|row| apply_computed_columns_rmpv(row, &computed_cols))
+                    .collect()
+            }
+        } else {
+            results
+        };
+
+        // Audit-log order: ascending by system time across all versions.
+        let results = if all_versions {
+            let mut sorted = results;
+            sorted.sort_by_key(rmpv_system_time);
+            sorted
+        } else {
+            results
+        };
+
+        let array = rmpv::Value::Array(results);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &array).unwrap_or(());
+
+        // Bound an unbounded (no-LIMIT) scan by the memory budget. The encoded
+        // msgpack payload is the authoritative size of the materialized result;
+        // surface a deterministic error if it exceeds the budget rather than
+        // silently truncating.
+        if unbounded
+            && crate::data::executor::handlers::scan_budget::budget_exceeded(
+                buf.len(),
+                scan_budget_bytes,
+            )
+        {
+            return self.response_error(task, ErrorCode::ResourcesExhausted);
+        }
+
+        self.response_with_payload(task, buf)
+    }
+}

@@ -85,7 +85,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
                 collection: collection.into(),
                 time_range,
                 projection: proj_names,
-                limit: limit.unwrap_or(10000),
+                limit: limit.unwrap_or(usize::MAX),
                 filters: filter_bytes,
                 bucket_interval_ms: 0,
                 group_by: Vec::new(),
@@ -100,7 +100,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
         EngineType::Columnar => PhysicalPlan::Columnar(ColumnarOp::Scan {
             collection: collection.into(),
             projection: proj_names,
-            limit: limit.unwrap_or(10000),
+            limit: limit.unwrap_or(usize::MAX),
             filters: filter_bytes,
             rls_filters: Vec::new(),
             sort_keys: sort.clone(),
@@ -124,7 +124,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
         EngineType::KeyValue => PhysicalPlan::Kv(KvOp::Scan {
             collection: collection.into(),
             cursor: Vec::new(),
-            count: limit.unwrap_or(10000),
+            count: limit.unwrap_or(usize::MAX),
             filters: filter_bytes,
             match_pattern: None,
             sort_keys: sort.clone(),
@@ -138,8 +138,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
                 // A no-LIMIT document scan is unbounded by row count; the Data
                 // Plane bounds it by a memory budget (`max_scan_result_bytes`)
                 // and surfaces a deterministic error rather than silently
-                // truncating. KV/columnar/timeseries keep their 10k default
-                // (bounded in follow-on units).
+                // truncating. KV, columnar, and timeseries now take the same
+                // budget-bounded `usize::MAX` path (their handlers enforce the
+                // memory budget). Spatial alone still caps at 10k — its R-tree
+                // scan path is not yet budget-aware (out of scope here).
                 limit: limit.unwrap_or(usize::MAX),
                 offset: *offset,
                 sort_keys: sort,

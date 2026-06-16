@@ -38,6 +38,7 @@ pub mod recursive;
 pub mod recursive_value;
 pub mod returning_rows;
 pub mod rls_eval;
+pub mod scan_budget;
 pub mod snapshot;
 pub mod sort_utils;
 pub mod spatial;

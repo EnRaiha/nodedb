@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-use crate::helpers::{make_ctx, payload_value, send_ok};
+use crate::helpers::{make_ctx, payload_value, send_ok, send_raw};
+use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb::bridge::scan_filter::{FilterOp, ScanFilter};
 use nodedb_physical::physical_plan::{
     AggregateSpec, ColumnarInsertIntent, ColumnarOp, PhysicalPlan, QueryOp,
@@ -284,4 +285,139 @@ fn aggregate_group_by_does_not_require_full_materialization() {
             "each group must contain exactly 100 rows, got: {row}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scan memory-budget bound (no-LIMIT scans)
+// ---------------------------------------------------------------------------
+
+/// Insert `count` tiny rows into a columnar `collection` in a single batch.
+fn insert_columnar_rows(ctx: &mut crate::helpers::TestCtx, collection: &str, count: usize) {
+    let rows: Vec<serde_json::Value> = (0..count)
+        .map(|i| serde_json::json!({ "id": format!("r{i}"), "v": i }))
+        .collect();
+    let payload = nodedb_types::json_to_msgpack(&serde_json::Value::Array(rows)).unwrap();
+    send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection: collection.into(),
+            payload,
+            format: "msgpack".into(),
+            intent: ColumnarInsertIntent::Insert,
+            on_conflict_updates: Vec::new(),
+            surrogates: Vec::new(),
+            schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
+        }),
+    );
+}
+
+/// A no-LIMIT columnar scan models `limit == usize::MAX`.
+fn columnar_scan_unbounded(collection: &str) -> PhysicalPlan {
+    PhysicalPlan::Columnar(ColumnarOp::Scan {
+        collection: collection.into(),
+        projection: Vec::new(),
+        limit: usize::MAX,
+        filters: Vec::new(),
+        rls_filters: Vec::new(),
+        sort_keys: Vec::new(),
+        system_time: nodedb_types::SystemTimeScope::Current,
+        valid_at_ms: None,
+        prefilter: None,
+        computed_columns: Vec::new(),
+    })
+}
+
+/// A no-LIMIT columnar scan over a collection larger than the historical 10k
+/// truncation point returns EVERY row when the result fits the memory budget.
+#[test]
+fn columnar_unbounded_scan_returns_all_rows_when_within_budget() {
+    let mut ctx = make_ctx();
+
+    let count = 12_000;
+    insert_columnar_rows(&mut ctx, "wide_col", count);
+
+    let payload = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        columnar_scan_unbounded("wide_col"),
+    );
+    let json = payload_value(&payload);
+    let rows = json.as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        count,
+        "no-LIMIT scan must return all {count} rows, not the old 10k cap"
+    );
+    assert!(
+        rows.len() > 10_000,
+        "regression: result was truncated at/under the old 10k default"
+    );
+}
+
+/// A no-LIMIT columnar scan whose materialized result exceeds the memory budget
+/// surfaces a deterministic `ResourcesExhausted` error — never a partial result.
+#[test]
+fn columnar_unbounded_scan_over_budget_surfaces_error() {
+    let mut ctx = make_ctx();
+
+    // Tiny per-query scan budget so a modest collection trips it.
+    ctx.core
+        .set_query_tuning(nodedb_types::config::tuning::QueryTuning {
+            max_scan_result_bytes: 256,
+            ..nodedb_types::config::tuning::QueryTuning::default()
+        });
+
+    insert_columnar_rows(&mut ctx, "big_col", 5_000);
+
+    let resp = send_raw(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        columnar_scan_unbounded("big_col"),
+    );
+    assert_eq!(
+        resp.status,
+        Status::Error,
+        "over-budget scan must surface an error"
+    );
+    assert_eq!(
+        resp.error_code,
+        Some(ErrorCode::ResourcesExhausted),
+        "must surface the deterministic resource-exhausted error"
+    );
+}
+
+/// An explicit `limit = N` still returns exactly `N` rows — the budget bound
+/// only applies to unbounded scans and must not change explicit-limit behaviour.
+#[test]
+fn columnar_explicit_limit_returns_exactly_n() {
+    let mut ctx = make_ctx();
+
+    insert_columnar_rows(&mut ctx, "limited_col", 12_000);
+
+    let payload = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        PhysicalPlan::Columnar(ColumnarOp::Scan {
+            collection: "limited_col".into(),
+            projection: Vec::new(),
+            limit: 250,
+            filters: Vec::new(),
+            rls_filters: Vec::new(),
+            sort_keys: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+            prefilter: None,
+            computed_columns: Vec::new(),
+        }),
+    );
+    let json = payload_value(&payload);
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 250, "explicit limit 250 must return exactly 250 rows");
 }

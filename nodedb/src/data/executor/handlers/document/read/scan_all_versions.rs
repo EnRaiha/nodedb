@@ -94,7 +94,7 @@ impl CoreLoop {
         // materialized result by the scan memory budget and surface a
         // deterministic error rather than silently truncating.
         if limit == usize::MAX
-            && super::scan_budget::version_bytes_exceeded(
+            && crate::data::executor::handlers::scan_budget::version_bytes_exceeded(
                 &rows,
                 self.query_tuning.max_scan_result_bytes,
             )
