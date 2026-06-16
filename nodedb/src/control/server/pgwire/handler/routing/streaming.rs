@@ -14,9 +14,9 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
 use super::super::plan::PlanKind;
-use super::super::super::types::error_to_sqlstate;
 
 impl NodeDbPgHandler {
     /// Build a streaming `Response` for an eligible autocommit SELECT, or
@@ -97,8 +97,8 @@ impl NodeDbPgHandler {
             )))
         })?;
 
-        Ok(Some(super::super::stream_response::streaming_multirow_response(
-            stream, limit,
-        )))
+        Ok(Some(
+            super::super::stream_response::streaming_multirow_response(stream, limit),
+        ))
     }
 }
