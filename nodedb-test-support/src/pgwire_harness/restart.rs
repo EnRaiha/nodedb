@@ -16,7 +16,7 @@ use nodedb::event::{EventPlane, create_event_bus};
 use nodedb::types::TenantId;
 use nodedb::wal::WalManager;
 
-use super::support::{bind_native_listener, init_test_memory_governor};
+use super::support::{bind_http_listener, bind_native_listener, init_test_memory_governor};
 use super::types::{TestClient, TestDataDir, TestServer};
 
 #[allow(dead_code)]
@@ -73,6 +73,16 @@ impl TestServer {
             }
         }
         if let Some(h) = self.native_handle.take() {
+            let mut h = h;
+            match tokio::time::timeout(Duration::from_secs(2), &mut h).await {
+                Ok(_) => {}
+                Err(_) => {
+                    h.abort();
+                    let _ = h.await;
+                }
+            }
+        }
+        if let Some(h) = self.http_handle.take() {
             let mut h = h;
             match tokio::time::timeout(Duration::from_secs(2), &mut h).await {
                 Ok(_) => {}
@@ -267,6 +277,7 @@ impl TestServer {
 
         let (native_port, native_handle) =
             bind_native_listener(&shared, &shutdown_bus, Arc::clone(&conn_semaphore)).await;
+        let (http_port, http_handle) = bind_http_listener(&shared, &shutdown_bus).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -289,6 +300,7 @@ impl TestServer {
             client: TestClient::new(client),
             pg_port: pg_addr.port(),
             native_port,
+            http_port,
             shared,
             conn_handle: Some(conn_handle),
             shutdown_bus: Some(shutdown_bus),
@@ -296,6 +308,7 @@ impl TestServer {
             core_stop_txs: Some(core_stop_txs),
             pg_handle: Some(pg_handle),
             native_handle: Some(native_handle),
+            http_handle: Some(http_handle),
             poller_handle: Some(poller_handle),
             core_handles: Some(core_handles),
             event_plane: Some(event_plane),

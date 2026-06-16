@@ -62,3 +62,29 @@ pub(super) async fn bind_native_listener(
     });
     (port, handle)
 }
+
+/// Bind an HTTP (REST/axum) listener on `127.0.0.1:0` and spawn its accept
+/// loop. Returns the listener's local port plus the handle to await on
+/// shutdown.
+pub(super) async fn bind_http_listener(
+    shared: &Arc<SharedState>,
+    shutdown_bus: &nodedb::control::shutdown::ShutdownBus,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind http listener");
+    let port = listener.local_addr().expect("http local addr").port();
+    let shared_clone = Arc::clone(shared);
+    let bus_clone = shutdown_bus.clone();
+    let handle = tokio::spawn(async move {
+        let _ = nodedb::control::server::http::server::run_with_listener(
+            listener,
+            shared_clone,
+            AuthMode::Trust,
+            None,
+            bus_clone,
+        )
+        .await;
+    });
+    (port, handle)
+}

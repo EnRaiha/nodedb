@@ -41,6 +41,8 @@ pub struct TestServer {
     /// `127.0.0.1:0` per harness so `NativeClient::connect` can reach
     /// it without configuration.
     pub native_port: u16,
+    /// HTTP (REST) listener port, bound to a fresh `127.0.0.1:0` per harness.
+    pub http_port: u16,
     /// Underlying shared state — exposed so integration tests can drive
     /// store-level side effects (e.g. seeding a session handle with a
     /// specific `ClientFingerprint`) before hitting the wire.
@@ -55,6 +57,7 @@ pub struct TestServer {
     pub(super) core_stop_txs: Option<Vec<std::sync::mpsc::Sender<()>>>,
     pub(super) pg_handle: Option<tokio::task::JoinHandle<()>>,
     pub(super) native_handle: Option<tokio::task::JoinHandle<()>>,
+    pub(super) http_handle: Option<tokio::task::JoinHandle<()>>,
     pub(super) poller_handle: Option<tokio::task::JoinHandle<()>>,
     pub(super) core_handles: Option<Vec<tokio::task::JoinHandle<()>>>,
     pub(super) event_plane: Option<EventPlane>,
@@ -97,6 +100,9 @@ impl Drop for TestServer {
             h.abort();
         }
         if let Some(h) = self.native_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.http_handle.take() {
             h.abort();
         }
         if let Some(h) = self.poller_handle.take() {

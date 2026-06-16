@@ -9,6 +9,9 @@
 //! - 400 for syntactically invalid SQL
 //! - Content-Type is the v1 vendor type on success
 
+mod common;
+use common::pgwire_harness::TestServer;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,13 +20,13 @@ use nodedb::config::auth::AuthMode;
 use nodedb::control::state::SharedState;
 use nodedb::wal::WalManager;
 
-struct TestServer {
+struct HttpOnlyServer {
     local_addr: std::net::SocketAddr,
     _server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
 
-async fn start_http(auth_mode: AuthMode) -> TestServer {
+async fn start_http(auth_mode: AuthMode) -> HttpOnlyServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let wal =
         Arc::new(WalManager::open_for_testing(&dir.path().join("query.wal")).expect("open wal"));
@@ -51,7 +54,7 @@ async fn start_http(auth_mode: AuthMode) -> TestServer {
 
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    TestServer {
+    HttpOnlyServer {
         local_addr,
         _server: handle,
         _dir: dir,
@@ -214,6 +217,63 @@ async fn query_stream_returns_400_for_missing_sql_field() {
         reqwest::StatusCode::UNPROCESSABLE_ENTITY,
         "/v1/query/stream must return 422 for missing `sql` field"
     );
+}
+
+/// A `SELECT` whose row count exceeds the Data-Plane `stream_chunk_size`
+/// (default 1000) is emitted as several frames on the lazy NDJSON path; the
+/// route must surface EVERY row as its own NDJSON line, never truncating to the
+/// first chunk. Mirrors the pgwire `streaming_select` regression guard for the
+/// HTTP sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_stream_returns_all_rows_across_chunks() {
+    const ROW_COUNT: usize = 2_500;
+
+    let srv = TestServer::start_multicores(4).await;
+    let client = reqwest::Client::new();
+    let stream_url = format!("http://127.0.0.1:{}/v1/query/stream", srv.http_port);
+
+    // Seed over the persistent pgwire connection, not 2500 separate HTTP POSTs:
+    // the HTTP sink under test is the streaming SELECT, and hammering the REST
+    // endpoint with thousands of rapid single-row inserts trips the per-tenant
+    // request rate limiter (429). The pgwire seeding path mirrors the
+    // `streaming_select` regression test.
+    srv.exec("CREATE COLLECTION http_stream WITH (engine='document_schemaless')")
+        .await
+        .expect("create collection");
+    for i in 0..ROW_COUNT {
+        srv.exec(&format!("INSERT INTO http_stream {{ id: 'r{i}', n: {i} }}"))
+            .await
+            .unwrap_or_else(|e| panic!("insert {i} failed: {e}"));
+    }
+
+    // No ORDER BY / DISTINCT / OFFSET / aggregate → streamable unordered scan.
+    let resp = client
+        .post(&stream_url)
+        .json(&serde_json::json!({"sql": "SELECT n FROM http_stream"}))
+        .send()
+        .await
+        .expect("POST /v1/query/stream");
+    assert!(
+        resp.status().is_success(),
+        "streaming SELECT must succeed; got {}",
+        resp.status()
+    );
+
+    let body = resp.text().await.expect("read ndjson body");
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        ROW_COUNT,
+        "lazy NDJSON stream must emit all {ROW_COUNT} rows, not a truncated chunk"
+    );
+    // No in-band error line should appear on the happy path.
+    for line in &lines {
+        let v: serde_json::Value = sonic_rs::from_str(line).expect("each line is valid JSON");
+        assert!(
+            v.get("error").is_none(),
+            "no NDJSON line should be an in-band error on the happy path: {line}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
