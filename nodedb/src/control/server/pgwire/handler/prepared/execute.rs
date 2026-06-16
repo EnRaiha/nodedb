@@ -117,7 +117,7 @@ impl NodeDbPgHandler {
         // empty rows. Detect this by checking whether the response is already a
         // multi-column QueryResponse whose column count matches the declared schema.
         if !stmt.result_fields.is_empty() && !is_already_shaped(&result) {
-            reproject_response(result, &stmt.result_fields).await
+            reproject_response(result, &stmt.result_fields)
         } else {
             Ok(result)
         }
@@ -147,12 +147,9 @@ fn is_already_shaped(response: &Response) -> bool {
 /// Prepared statements that reach this path are scalar / single-table SELECTs
 /// where the lookup key matches the display name; we pass the field names as
 /// the lookup keys.
-async fn reproject_response(
-    response: Response,
-    result_fields: &[FieldInfo],
-) -> PgWireResult<Response> {
+fn reproject_response(response: Response, result_fields: &[FieldInfo]) -> PgWireResult<Response> {
     let lookup_keys: Vec<String> = result_fields.iter().map(|f| f.name().to_string()).collect();
-    super::super::projection::reproject_response(response, result_fields, &lookup_keys).await
+    super::super::projection::reproject_response(response, result_fields, &lookup_keys)
 }
 
 /// Convert pgwire portal parameters to typed `ParamValue` for AST-level binding.

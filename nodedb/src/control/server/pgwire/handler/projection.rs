@@ -18,6 +18,7 @@ use futures::StreamExt;
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::data::DataRow;
 
 use super::super::types::text_field;
 
@@ -167,8 +168,8 @@ pub(super) fn lookup_keys_for_projection(items: &[ProjectionItem]) -> Vec<String
 ///
 /// The envelope produced by `payload_to_response` has one text field per row
 /// containing the row's JSON. This function:
-/// 1. Streams all envelope rows and decodes the JSON text.
-/// 2. Flattens each JSON value into a flat row object (unwrapping the
+/// 1. Streams envelope rows lazily (no collect) and decodes the JSON text.
+/// 2. Flattens each JSON value into flat row objects (unwrapping the
 ///    `{id, data: {...}}` scan wrapper when present).
 /// 3. Re-encodes each flat row object as one pgwire field per `result_fields`
 ///    column; missing columns become SQL NULL.
@@ -182,7 +183,11 @@ pub(super) fn lookup_keys_for_projection(items: &[ProjectionItem]) -> Vec<String
 /// key, and the display name is just the bare column name.
 ///
 /// Non-query responses (execution tags, empty query) pass through unchanged.
-pub(super) async fn reproject_response(
+///
+/// The returned `QueryResponse` streams rows lazily — upstream chunks from
+/// `streaming_multirow_response` flow to the client without first being
+/// collected into a `Vec`.
+pub(super) fn reproject_response(
     response: Response,
     result_fields: &[FieldInfo],
     lookup_keys: &[String],
@@ -194,65 +199,133 @@ pub(super) async fn reproject_response(
 
     let schema = Arc::new(result_fields.to_vec());
 
-    let flat_rows = collect_flat_rows(qr).await?;
+    // Clone the small, bounded per-query metadata so we can move it into the
+    // stream closure without borrowing across the async boundary.
+    let stream_schema = schema.clone();
+    let stream_lookup_keys: Vec<String> = lookup_keys.to_vec();
+    let stream_display_names: Vec<String> =
+        result_fields.iter().map(|f| f.name().to_owned()).collect();
 
-    let mut pgwire_rows = Vec::with_capacity(flat_rows.len());
-    for obj in &flat_rows {
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        for (i, lookup_key) in lookup_keys.iter().enumerate() {
-            // Try the full lookup key first (handles qualified `table.col`
-            // references against join-prefixed row objects). If that misses,
-            // fall back to the bare column name (last dot-segment) so that
-            // plain single-table queries continue to work against row objects
-            // that store unqualified keys. Last resort: fall back to the
-            // display name (the SELECT alias) — required for aliased function
-            // calls like `rrf_score(...) AS score` whose response uses the
-            // alias as the field key, not the function-call expression text.
-            let bare = lookup_key
-                .rfind('.')
-                .map(|i| &lookup_key[i + 1..])
-                .unwrap_or(lookup_key.as_str());
-            let display_name: Option<&str> = result_fields.get(i).map(|f| f.name());
-            let value = obj
-                .get(lookup_key.as_str())
-                .or_else(|| {
-                    if bare != lookup_key {
-                        obj.get(bare)
+    // Move the upstream row stream into the closure. `data_rows` is
+    // `Pin<Box<dyn Stream + Send>>` which is `Unpin` (Box makes it so),
+    // so we can move it by value and call `StreamExt::next` via a plain
+    // `&mut` reference inside the generator.
+    let mut upstream = qr.data_rows;
+
+    let row_stream = async_stream::try_stream! {
+        while let Some(row_result) = futures::StreamExt::next(&mut upstream).await {
+            let row = row_result?;
+            let Some(text) = decode_first_field_text(&row.data) else {
+                continue;
+            };
+            let value = sonic_rs::from_str::<serde_json::Value>(text).map_err(|e| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "XX000".to_owned(),
+                    format!("malformed Data-Plane response envelope: {e}"),
+                )))
+            })?;
+
+            let mut flat = Vec::new();
+            push_flat_rows(value, &mut flat);
+
+            for obj in flat {
+                let data_row = encode_projected_row(
+                    &obj,
+                    &stream_schema,
+                    &stream_lookup_keys,
+                    &stream_display_names,
+                )?;
+                yield data_row;
+            }
+        }
+    };
+
+    Ok(Response::Query(QueryResponse::new(schema, row_stream)))
+}
+
+/// Encode a single flat row object into a pgwire `DataRow` using the projected
+/// column schema.
+///
+/// For each column position `i`:
+/// - `lookup_keys[i]` is tried first (handles qualified `table.col` references
+///   against join-prefixed row objects).
+/// - Falls back to the bare column name (last dot-segment) for plain
+///   single-table queries.
+/// - Falls back to `display_names[i]` (the SELECT alias) for aliased
+///   function calls like `rrf_score(...) AS score`.
+///
+/// Missing or `null` values are encoded as SQL `NULL`.
+fn encode_projected_row(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    schema: &Arc<Vec<FieldInfo>>,
+    lookup_keys: &[String],
+    display_names: &[String],
+) -> PgWireResult<DataRow> {
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    for (i, lookup_key) in lookup_keys.iter().enumerate() {
+        let bare = lookup_key
+            .rfind('.')
+            .map(|dot_pos| &lookup_key[dot_pos + 1..])
+            .unwrap_or(lookup_key.as_str());
+        let display_name: Option<&str> = display_names.get(i).map(String::as_str);
+        let value = obj
+            .get(lookup_key.as_str())
+            .or_else(|| {
+                if bare != lookup_key {
+                    obj.get(bare)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                display_name.and_then(|n| {
+                    if n != lookup_key.as_str() && Some(n) != Some(bare) {
+                        obj.get(n)
                     } else {
                         None
                     }
                 })
-                .or_else(|| {
-                    display_name.and_then(|n| {
-                        if n != lookup_key.as_str() && Some(n) != Some(bare) {
-                            obj.get(n)
-                        } else {
-                            None
-                        }
-                    })
-                });
-            match value {
-                None | Some(serde_json::Value::Null) => {
-                    let _ = encoder.encode_field(&Option::<String>::None);
-                }
-                Some(v) => {
-                    let text = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        // PostgreSQL text format for boolean is `t`/`f`.
-                        serde_json::Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
-                        other => other.to_string(),
-                    };
-                    let _ = encoder.encode_field(&text);
-                }
+            });
+        match value {
+            None | Some(serde_json::Value::Null) => {
+                encoder.encode_field(&Option::<String>::None).map_err(|e| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "XX000".to_owned(),
+                        format!("failed to encode NULL field: {e}"),
+                    )))
+                })?;
+            }
+            Some(v) => {
+                let text = json_value_to_text(v);
+                encoder.encode_field(&text).map_err(|e| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "XX000".to_owned(),
+                        format!("failed to encode field: {e}"),
+                    )))
+                })?;
             }
         }
-        pgwire_rows.push(Ok(encoder.take_row()));
     }
+    Ok(encoder.take_row())
+}
 
-    Ok(Response::Query(QueryResponse::new(
-        schema,
-        futures::stream::iter(pgwire_rows),
-    )))
+/// Convert a JSON scalar value to its PostgreSQL text-format string.
+///
+/// - `String` values are returned as-is (no extra quoting).
+/// - `Bool` uses PostgreSQL text format: `t` for true, `f` for false.
+/// - All other scalars (`Number`, `Array`, `Object`) use their JSON
+///   `Display` representation; arrays/objects should not normally appear
+///   as individual cell values but are rendered faithfully.
+fn json_value_to_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        // PostgreSQL text format for boolean is `t`/`f`.
+        serde_json::Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Consume an envelope `QueryResponse` and return flat row objects.
@@ -364,12 +437,7 @@ pub(super) async fn reproject_star_response(response: Response) -> PgWireResult<
                         let _ = encoder.encode_field(&Option::<String>::None);
                     }
                     Some(v) => {
-                        let text = match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            // PostgreSQL text format for boolean is `t`/`f`.
-                            serde_json::Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
-                            other => other.to_string(),
-                        };
+                        let text = json_value_to_text(v);
                         let _ = encoder.encode_field(&text);
                     }
                 }
@@ -401,4 +469,180 @@ pub(super) fn decode_first_field_text(data: &bytes::BytesMut) -> Option<&str> {
         return None;
     }
     std::str::from_utf8(&data[4..4 + len]).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures::StreamExt;
+    use pgwire::api::Type;
+    use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
+    use pgwire::error::PgWireResult;
+
+    use super::super::super::types::text_field;
+    use super::{decode_first_field_text, reproject_response};
+
+    /// Build a single-column `DataRow` whose text field contains `json_str`.
+    /// The wire format is a 4-byte big-endian length prefix followed by the
+    /// UTF-8 bytes, which is what `decode_first_field_text` expects.
+    fn envelope_row(json_str: &str) -> pgwire::messages::data::DataRow {
+        let schema = Arc::new(vec![text_field("result")]);
+        let mut enc = DataRowEncoder::new(schema);
+        enc.encode_field(&json_str).unwrap();
+        enc.take_row()
+    }
+
+    /// Drain a `QueryResponse` stream into a `Vec` of `DataRow`s.
+    async fn drain(mut qr: QueryResponse) -> Vec<pgwire::messages::data::DataRow> {
+        let mut rows = Vec::new();
+        while let Some(r) = qr.data_rows.next().await {
+            rows.push(r.unwrap());
+        }
+        rows
+    }
+
+    /// Helper: read the text value of field `idx` from a `DataRow`'s raw wire buffer.
+    ///
+    /// Each field in the buffer is: 4-byte big-endian length + bytes.
+    fn field_text(row: &pgwire::messages::data::DataRow, idx: usize) -> Option<String> {
+        let data = &row.data;
+        let mut offset = 0usize;
+        for field_i in 0..=idx {
+            if offset + 4 > data.len() {
+                return None;
+            }
+            let len = i32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+            if len < 0 {
+                // NULL field
+                if field_i == idx {
+                    return None;
+                }
+                continue;
+            }
+            let len = len as usize;
+            if offset + len > data.len() {
+                return None;
+            }
+            if field_i == idx {
+                return Some(
+                    std::str::from_utf8(&data[offset..offset + len])
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+            offset += len;
+        }
+        None
+    }
+
+    /// `reproject_response` maps named columns lazily from single-row JSON envelopes.
+    #[tokio::test]
+    async fn reproject_named_columns_streams_lazily() {
+        // Two envelope DataRows, each carrying a single JSON object.
+        let row1_json = r#"{"a":1,"b":"hello"}"#;
+        let row2_json = r#"{"a":2,"b":"world"}"#;
+
+        let schema = Arc::new(vec![text_field("result")]);
+        let rows: Vec<PgWireResult<_>> =
+            vec![Ok(envelope_row(row1_json)), Ok(envelope_row(row2_json))];
+        let upstream = QueryResponse::new(schema, futures::stream::iter(rows));
+        let response = Response::Query(upstream);
+
+        let result_fields = vec![
+            FieldInfo::new("a".to_owned(), None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("b".to_owned(), None, None, Type::TEXT, FieldFormat::Text),
+        ];
+        let lookup_keys = vec!["a".to_owned(), "b".to_owned()];
+
+        let projected = reproject_response(response, &result_fields, &lookup_keys).unwrap();
+        let Response::Query(qr) = projected else {
+            panic!("expected Query response");
+        };
+
+        let out_rows = drain(qr).await;
+        assert_eq!(out_rows.len(), 2, "expected 2 output rows");
+
+        assert_eq!(field_text(&out_rows[0], 0).as_deref(), Some("1"));
+        assert_eq!(field_text(&out_rows[0], 1).as_deref(), Some("hello"));
+        assert_eq!(field_text(&out_rows[1], 0).as_deref(), Some("2"));
+        assert_eq!(field_text(&out_rows[1], 1).as_deref(), Some("world"));
+    }
+
+    /// An envelope DataRow whose JSON value is an ARRAY of row objects must be
+    /// flat-mapped: one array element → multiple output DataRows.
+    #[tokio::test]
+    async fn reproject_array_envelope_flatmaps_to_multiple_output_rows() {
+        // One envelope DataRow carrying a JSON array of 3 row objects.
+        let array_json = r#"[{"a":10,"b":"x"},{"a":20,"b":"y"},{"a":30,"b":"z"}]"#;
+
+        let schema = Arc::new(vec![text_field("result")]);
+        let rows: Vec<PgWireResult<_>> = vec![Ok(envelope_row(array_json))];
+        let upstream = QueryResponse::new(schema, futures::stream::iter(rows));
+        let response = Response::Query(upstream);
+
+        let result_fields = vec![
+            FieldInfo::new("a".to_owned(), None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("b".to_owned(), None, None, Type::TEXT, FieldFormat::Text),
+        ];
+        let lookup_keys = vec!["a".to_owned(), "b".to_owned()];
+
+        let projected = reproject_response(response, &result_fields, &lookup_keys).unwrap();
+        let Response::Query(qr) = projected else {
+            panic!("expected Query response");
+        };
+
+        let out_rows = drain(qr).await;
+        assert_eq!(out_rows.len(), 3, "array envelope must flat-map to 3 rows");
+        assert_eq!(field_text(&out_rows[0], 0).as_deref(), Some("10"));
+        assert_eq!(field_text(&out_rows[0], 1).as_deref(), Some("x"));
+        assert_eq!(field_text(&out_rows[1], 0).as_deref(), Some("20"));
+        assert_eq!(field_text(&out_rows[2], 0).as_deref(), Some("30"));
+        assert_eq!(field_text(&out_rows[2], 1).as_deref(), Some("z"));
+    }
+
+    /// A mix of single-object and array envelopes in the same upstream stream
+    /// must be handled correctly end-to-end.
+    #[tokio::test]
+    async fn reproject_mixed_single_and_array_envelopes() {
+        let single_json = r#"{"a":1,"b":"single"}"#;
+        let array_json = r#"[{"a":2,"b":"arr1"},{"a":3,"b":"arr2"}]"#;
+
+        let schema = Arc::new(vec![text_field("result")]);
+        let rows: Vec<PgWireResult<_>> =
+            vec![Ok(envelope_row(single_json)), Ok(envelope_row(array_json))];
+        let upstream = QueryResponse::new(schema, futures::stream::iter(rows));
+        let response = Response::Query(upstream);
+
+        let result_fields = vec![
+            FieldInfo::new("a".to_owned(), None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("b".to_owned(), None, None, Type::TEXT, FieldFormat::Text),
+        ];
+        let lookup_keys = vec!["a".to_owned(), "b".to_owned()];
+
+        let projected = reproject_response(response, &result_fields, &lookup_keys).unwrap();
+        let Response::Query(qr) = projected else {
+            panic!("expected Query response");
+        };
+
+        let out_rows = drain(qr).await;
+        assert_eq!(out_rows.len(), 3, "1 single + 2 array = 3 output rows");
+        assert_eq!(field_text(&out_rows[0], 1).as_deref(), Some("single"));
+        assert_eq!(field_text(&out_rows[1], 1).as_deref(), Some("arr1"));
+        assert_eq!(field_text(&out_rows[2], 1).as_deref(), Some("arr2"));
+    }
+
+    /// `decode_first_field_text` round-trips what `DataRowEncoder` writes.
+    #[test]
+    fn decode_first_field_text_reads_encoder_output() {
+        let row = envelope_row(r#"{"k":1}"#);
+        let text = decode_first_field_text(&row.data).unwrap();
+        assert_eq!(text, r#"{"k":1}"#);
+    }
 }

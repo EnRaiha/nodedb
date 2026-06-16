@@ -72,15 +72,15 @@ impl NodeDbPgHandler {
             let mut projected = Vec::with_capacity(responses.len());
             for resp in responses {
                 projected.push(
-                    super::super::projection::reproject_response(resp, &fields, &keys)
-                        .await
-                        .map_err(|e| {
+                    super::super::projection::reproject_response(resp, &fields, &keys).map_err(
+                        |e| {
                             PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".to_owned(),
                                 "XX000".to_owned(),
                                 format!("column projection failed: {e}"),
                             )))
-                        })?,
+                        },
+                    )?,
                 );
             }
             return Ok(projected);
