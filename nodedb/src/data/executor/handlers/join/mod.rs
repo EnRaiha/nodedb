@@ -2,6 +2,7 @@
 
 //! Join execution handlers — hash, sort-merge, broadcast, nested-loop, and lateral.
 
+pub(super) mod grace_partitioner;
 pub mod hash;
 mod hash_handlers;
 pub mod lateral;

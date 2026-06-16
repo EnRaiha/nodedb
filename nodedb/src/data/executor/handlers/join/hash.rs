@@ -32,7 +32,7 @@ pub(super) fn hash_join_key(
     (hasher.finish(), ranges)
 }
 
-fn extract_join_key_range(doc: &[u8], key: &str) -> Option<(usize, usize)> {
+pub(super) fn extract_join_key_range(doc: &[u8], key: &str) -> Option<(usize, usize)> {
     msgpack_scan::extract_field(doc, 0, key).or_else(|| {
         key.rsplit_once('.')
             .and_then(|(_, field)| msgpack_scan::extract_field(doc, 0, field))

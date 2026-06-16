@@ -154,7 +154,7 @@ impl<'a> Iterator for FramedRows<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SpillPartitionWriter, parse_framed_rows};
+    use super::parse_framed_rows;
 
     // ── parse_framed_rows pure unit tests (no IO) ──────────────────────────
 
@@ -202,7 +202,11 @@ mod tests {
         buf.extend_from_slice(b"short");
 
         let parsed: Vec<&[u8]> = parse_framed_rows(&buf).collect();
-        assert_eq!(parsed.len(), 1, "only the valid first frame should be yielded");
+        assert_eq!(
+            parsed.len(),
+            1,
+            "only the valid first frame should be yielded"
+        );
         assert_eq!(parsed[0], b"abc");
     }
 
@@ -274,7 +278,8 @@ mod tests {
             assert_eq!(parsed.len(), rows.len(), "row count must match");
             for (i, (expected, got)) in rows.iter().zip(parsed.iter()).enumerate() {
                 assert_eq!(
-                    *got, expected.as_slice(),
+                    *got,
+                    expected.as_slice(),
                     "row {i} content mismatch (len expected={}, got={})",
                     expected.len(),
                     got.len()
@@ -318,7 +323,10 @@ mod tests {
             let mut reader = UringReader::with_config(8, 4, 4096).unwrap();
             let bufs = reader.read_files(&[path.as_path()]);
             let parsed: Vec<&[u8]> = parse_framed_rows(&bufs[0]).collect();
-            assert!(parsed.is_empty(), "no rows should be yielded for an empty partition");
+            assert!(
+                parsed.is_empty(),
+                "no rows should be yielded for an empty partition"
+            );
         }
     }
 }

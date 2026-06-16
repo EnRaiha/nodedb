@@ -396,8 +396,6 @@ pub(in crate::data::executor) fn decoded_col_to_value(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// Verify that `scan_collection_for_each` visits exactly the same
     /// `(id, bytes)` set as `scan_collection` for a sparse/document collection.
     ///
