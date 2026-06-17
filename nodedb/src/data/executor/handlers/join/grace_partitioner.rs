@@ -53,8 +53,6 @@ pub(super) struct GraceSpec<'a> {
 ///
 /// `keys` is generic over any `AsRef<str>` element type so callers can pass
 /// `&[&str]` or `&[String]` without an intermediate `Vec<&str>` allocation.
-// Consumed by the grace-join integration (build-side spill + scan-cap removal).
-#[allow(dead_code)]
 pub(super) fn partition_hash<S: AsRef<str>>(doc: &[u8], keys: &[S]) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     for key in keys {
@@ -98,7 +96,9 @@ pub(super) fn partition_hash<S: AsRef<str>>(doc: &[u8], keys: &[S]) -> u64 {
 /// - `HashIndex`'s internal `doc_index` is relative to the slice passed to
 ///   `build`; we pass the same partition slice as `index_docs` to
 ///   `probe_hash_index`, so the indices align.
-// Consumed by the grace-join integration (build-side spill + scan-cap removal).
+// Test-only reference implementation: the production grace path streams via
+// `PartitionedSpiller` (`grace_spill.rs`) / `drive_grace_build`; this owned-Vec
+// version is kept as the multiset-equivalence oracle for those tests.
 #[allow(dead_code)]
 pub(super) fn grace_join_in_memory(
     build_docs: Vec<(String, Vec<u8>)>,

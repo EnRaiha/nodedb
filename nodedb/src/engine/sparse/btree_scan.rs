@@ -59,8 +59,7 @@ impl SparseEngine {
     /// If `f` returns `Err`, iteration stops immediately and the error is
     /// propagated. Every redb iteration error is propagated via `?` — rows are
     /// never silently dropped.
-    // consumed by scan_collection_for_each streaming routing (later U5 unit)
-    #[allow(dead_code)]
+    // consumed by `scan_collection_for_each` streaming routing
     pub fn scan_documents_for_each<F>(
         &self,
         tenant_id: u64,

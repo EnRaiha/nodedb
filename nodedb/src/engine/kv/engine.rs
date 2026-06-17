@@ -397,8 +397,7 @@ impl KvEngine {
     /// the callback error is never swallowed into `Ok`.
     ///
     /// [`scan`]: KvEngine::scan
-    // consumed by scan_collection_for_each streaming routing (later U5 unit)
-    #[allow(dead_code)]
+    // consumed by `scan_collection_for_each` streaming routing
     pub fn scan_for_each<F>(&self, params: KvScanParams<'_>, mut f: F) -> crate::Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> crate::Result<()>,

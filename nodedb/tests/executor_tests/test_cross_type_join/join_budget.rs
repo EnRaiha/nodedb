@@ -3,13 +3,21 @@
 //! Tests for the join-side memory-budget guards and the removal of the
 //! silent 50,000-row-per-side cap.
 //!
-//! Verifies two properties:
+//! Verifies these properties:
 //! 1. **Completeness past the old cap** — an inner join whose matching row
 //!    sits beyond index 50,000 IS returned when the memory budget allows it.
-//! 2. **Deterministic error over budget** — when a join side exceeds
-//!    `max_scan_result_bytes`, the join returns `ResourcesExhausted` (never a
-//!    truncated success). Covers both left-side and right-side guards for hash,
-//!    nested-loop, and sort-merge handlers.
+//! 2. **Build-side spill completion (hash join, both sides local)** — when the
+//!    build (right) side of a hash join over plain local scans exceeds
+//!    `max_scan_result_bytes`, the join no longer errors: it streams the build
+//!    side into a grace-hash partitioner that spills to disk, streams the probe
+//!    side through it, and COMPLETES with the full, correct result set.
+//! 3. **Deterministic error over budget (remaining cases)** — when a side that
+//!    is NOT covered by the build-side spill path exceeds the byte budget, the
+//!    join still returns `ResourcesExhausted` (never a truncated success). This
+//!    currently covers the hash-join PROBE (left) side, and both sides of the
+//!    nested-loop and sort-merge handlers. Streaming the hash-join probe side
+//!    against the in-memory build index (so an over-budget probe side also
+//!    completes) is the next increment of the memory-bounded-join work.
 
 use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb::bridge::scan_filter::{FilterOp, ScanFilter};
@@ -212,7 +220,14 @@ fn nested_loop_join_completeness_past_50k_cap() {
 // ── 2. Deterministic error when a side exceeds the byte budget ────────────────
 
 /// Hash join: left side (probe) over budget → `ResourcesExhausted`.
-/// This specifically exercises the newly-added left-side guard.
+///
+/// This exercises the probe-side guard. The build (right) side here is tiny
+/// (1 row), so the grace-hash build-side spill path does NOT engage (the build
+/// side never crosses budget); the join falls through to the in-memory path,
+/// which materializes the probe side and surfaces the over-budget error. This
+/// is the current memory-bounded-join boundary: streaming the probe side
+/// against the in-memory build index (so this case also completes instead of
+/// erroring) is the next increment.
 #[test]
 fn hash_join_left_side_over_budget_surfaces_error() {
     let mut ctx = make_ctx();
@@ -264,9 +279,18 @@ fn hash_join_left_side_over_budget_surfaces_error() {
     );
 }
 
-/// Hash join: right side (build) over budget → `ResourcesExhausted`.
+/// Hash join: build (right) side over budget, both sides local → the join
+/// streams the build side into a grace-hash partitioner, spills to disk,
+/// streams the probe side through it, and COMPLETES with the correct result —
+/// it does NOT surface `ResourcesExhausted`.
+///
+/// Setup: left side is a single row `k0`; right side is 500 rows `k0..k499`
+/// whose byte total far exceeds the 256-byte budget, forcing the build side to
+/// spill. The inner equi-join on `key` matches exactly one pair (`k0`), so the
+/// spilled-and-completed result must be exactly 1 row — proving the spill path
+/// produces the correct join, not merely a non-error response.
 #[test]
-fn hash_join_right_side_over_budget_surfaces_error() {
+fn hash_join_right_side_over_budget_spills_and_completes() {
     let mut ctx = make_ctx();
 
     ctx.core
@@ -275,11 +299,11 @@ fn hash_join_right_side_over_budget_surfaces_error() {
             ..nodedb_types::config::tuning::QueryTuning::default()
         });
 
-    // Small left, large right.
+    // Small left (single key k0), large right (k0..k499) — build side spills.
     batch_kv(&mut ctx, "bgtr_left", 1);
     batch_kv(&mut ctx, "bgtr_right", 500);
 
-    let resp = send_raw(
+    let payload = send_ok(
         &mut ctx.core,
         &mut ctx.tx,
         &mut ctx.rx,
@@ -302,16 +326,74 @@ fn hash_join_right_side_over_budget_surfaces_error() {
         }),
     );
 
+    let json = payload_value(&payload);
+    let rows = json
+        .as_array()
+        .unwrap_or_else(|| panic!("expected JSON array, got {json}"));
     assert_eq!(
-        resp.status,
-        Status::Error,
-        "over-budget right side must surface an error"
+        rows.len(),
+        1,
+        "build-side spill must complete the join with the one matching row (k0); got {} rows",
+        rows.len()
     );
+}
+
+/// Hash join build-side spill, MANY matches across partitions: a both-local
+/// inner join whose build side far exceeds the byte budget must spill across
+/// all 64 grace partitions and still return EVERY matching row — proving the
+/// spilled, partition-by-partition probe is complete (no dropped partitions,
+/// no truncated runs).
+///
+/// Both sides hold the same 2,000 keys `k0..k1999`; the inner equi-join on
+/// `key` matches all 2,000. With a 256-byte budget the build side spills; the
+/// probe side is streamed through the partitioner. The explicit large LIMIT
+/// means the output is not budget-capped, so all 2,000 rows must come back.
+#[test]
+fn hash_join_build_side_spill_returns_all_matches_across_partitions() {
+    let mut ctx = make_ctx();
+
+    ctx.core
+        .set_query_tuning(nodedb_types::config::tuning::QueryTuning {
+            max_scan_result_bytes: 256,
+            ..nodedb_types::config::tuning::QueryTuning::default()
+        });
+
+    let n = 2_000usize;
+    batch_kv(&mut ctx, "spill_left", n);
+    batch_kv(&mut ctx, "spill_right", n);
+
+    let payload = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        PhysicalPlan::Query(QueryOp::HashJoin {
+            left_collection: "spill_left".into(),
+            right_collection: "spill_right".into(),
+            left_alias: None,
+            right_alias: None,
+            on: vec![("key".into(), "key".into())],
+            join_type: "inner".into(),
+            limit: 1_000_000,
+            post_group_by: Vec::new(),
+            post_aggregates: Vec::new(),
+            projection: Vec::new(),
+            post_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
+            left_bitmap: None,
+            right_bitmap: None,
+        }),
+    );
+
+    let json = payload_value(&payload);
+    let rows = json
+        .as_array()
+        .unwrap_or_else(|| panic!("expected JSON array, got {json}"));
     assert_eq!(
-        resp.error_code,
-        Some(ErrorCode::ResourcesExhausted),
-        "expected ResourcesExhausted, got {:?}",
-        resp.error_code
+        rows.len(),
+        n,
+        "build-side spill across partitions must return all {n} matches; got {}",
+        rows.len()
     );
 }
 

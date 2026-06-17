@@ -257,10 +257,8 @@ fn apply_permutation(rows: &mut [(String, Vec<u8>)], indices: Vec<usize>) {
     // Wrap each row in `Option` so we can move individual elements out by
     // index without cloning. Each slot is taken exactly once during the
     // scatter, so no element is ever double-moved.
-    let mut src: Vec<Option<(String, Vec<u8>)>> = rows
-        .iter_mut()
-        .map(|r| Some(std::mem::replace(r, (String::new(), Vec::new()))))
-        .collect();
+    let mut src: Vec<Option<(String, Vec<u8>)>> =
+        rows.iter_mut().map(|r| Some(std::mem::take(r))).collect();
     for (target_pos, &src_idx) in indices.iter().enumerate() {
         // `indices` is always a permutation of `0..rows.len()`, so every slot
         // is taken exactly once. The `None` arm is unreachable in practice;
@@ -276,7 +274,9 @@ fn apply_permutation(rows: &mut [(String, Vec<u8>)], indices: Vec<usize>) {
 /// Read backend for a sort run: io_uring streaming on Linux, blocking
 /// `std::fs` (`BufReader`) when io_uring is unavailable.
 enum RunBackend {
-    Uring(UringSeqReader),
+    // Boxed: `UringSeqReader` carries an io_uring ring + chunk buffer and is far
+    // larger than the `BufReader` variant; box it to keep the enum compact.
+    Uring(Box<UringSeqReader>),
     Std(BufReader<std::fs::File>),
 }
 
@@ -289,7 +289,7 @@ pub(super) struct RunReader {
 impl RunReader {
     pub(super) fn open(path: &Path, run_idx: usize) -> crate::Result<Self> {
         let mut backend = match UringSeqReader::open_default(path) {
-            Some(r) => RunBackend::Uring(r),
+            Some(r) => RunBackend::Uring(Box::new(r)),
             None => RunBackend::Std(BufReader::new(std::fs::File::open(path).map_err(|e| {
                 crate::Error::Storage {
                     engine: "sort".into(),

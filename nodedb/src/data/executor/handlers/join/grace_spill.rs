@@ -80,8 +80,7 @@ impl SideState {
 ///
 /// `!Send` — holds [`SpillPartitionWriter`]s, which wrap `!Send` / TPC-owned
 /// io_uring writers. Lives entirely inside one Data-Plane core.
-// Consumed by the grace-join spill integration (build-side stream + over-budget spill).
-#[allow(dead_code)]
+// Consumed by `drive_grace_build` (build-side stream + over-budget spill).
 pub(super) struct PartitionedSpiller {
     /// Number of partitions (P ≥ 1; forced to 1 for cross / keyless joins).
     partitions: usize,
@@ -108,8 +107,6 @@ pub(super) struct PartitionedSpiller {
     probe: SideState,
 }
 
-// Consumed by the grace-join spill integration (build-side stream + over-budget spill).
-#[allow(dead_code)]
 impl PartitionedSpiller {
     /// Create a spiller for one join.
     ///

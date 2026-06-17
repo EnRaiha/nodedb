@@ -50,6 +50,22 @@ impl CoreLoop {
         let scan_limit =
             crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
 
+        // Gating predicate for the memory-bounded (grace-hash spill) completion
+        // path: BOTH sides must be plain local scans — no Exchange sub-plan and
+        // no bitmap prefilter on either side. Captured before the bitmap
+        // sub-plans below are consumed by `.map`.
+        //
+        // Declared deferral: spilling Exchange-supplied or bitmap-prefiltered
+        // sides needs a streaming Exchange + streaming key-normalization that
+        // does not exist yet (the rows for those sides are produced by
+        // `execute_plan` / a prefiltered scan plan and decoded all at once).
+        // Until that lands, those cases keep today's behavior exactly:
+        // materialize each side and surface `ResourcesExhausted` on over-budget.
+        let both_sides_local = left_input.is_none()
+            && right_input.is_none()
+            && left_bitmap.is_none()
+            && right_bitmap.is_none();
+
         // Evaluate bitmap sub-plans first. These prefilter the local scan for
         // each side, pushing surrogate exclusion into the document engine before
         // any msgpack decode occurs.
@@ -63,6 +79,26 @@ impl CoreLoop {
                 self, join.task, sub_plan,
             )
         });
+
+        // Memory-bounded completion path. Only when BOTH sides are plain local
+        // scans can we stream them: the build side buffers under budget (falling
+        // through to the unchanged in-memory path with byte-identical ordering)
+        // or, on crossing budget, spills to a grace-hash partitioner that
+        // streams the probe side and COMPLETES the join instead of returning
+        // `ResourcesExhausted`.
+        if both_sides_local
+            && let Some(resp) = self.try_grace_hash_join(
+                &join,
+                tid,
+                left_collection,
+                right_collection,
+                left_alias,
+                right_alias,
+                budget,
+            )
+        {
+            return resp;
+        }
 
         // Resolve the left side.
         //

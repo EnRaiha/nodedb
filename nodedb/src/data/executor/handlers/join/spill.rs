@@ -28,7 +28,6 @@
 //! The grace-hash join build/probe pipeline (`hash.rs`, future
 //! `grace_hash.rs`) is the intended consumer of these types.
 
-#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 
 use crate::data::io::uring_writer::UringWriter;
@@ -47,7 +46,6 @@ use crate::data::io::uring_writer::UringWriter;
 /// w.append_row(row_bytes)?;
 /// let path = w.finish()?;
 /// ```
-#[allow(dead_code)] // consumed by the grace-hash join build/probe pipeline
 pub(super) struct SpillPartitionWriter {
     writer: UringWriter,
 }
@@ -57,7 +55,6 @@ impl SpillPartitionWriter {
     ///
     /// Returns `None` if io_uring is unavailable or the file cannot be
     /// created, mirroring [`UringWriter::new`]'s fallback convention.
-    #[allow(dead_code)] // consumed by the grace-hash join build/probe pipeline
     pub(super) fn create(path: &Path) -> Option<Self> {
         let writer = UringWriter::new(path)?;
         Some(Self { writer })
@@ -72,7 +69,6 @@ impl SpillPartitionWriter {
     ///
     /// Returns a typed [`crate::Error`] if `row.len()` exceeds `u32::MAX` or
     /// if either write fails.
-    #[allow(dead_code)] // consumed by the grace-hash join build/probe pipeline
     pub(super) fn append_row(&mut self, row: &[u8]) -> crate::Result<()> {
         // Guard: length must fit in a u32 frame header.
         if row.len() > u32::MAX as usize {
@@ -98,7 +94,6 @@ impl SpillPartitionWriter {
     }
 
     /// Flush and close the writer, returning the spill file path.
-    #[allow(dead_code)] // consumed by the grace-hash join build/probe pipeline
     pub(super) fn finish(self) -> crate::Result<PathBuf> {
         self.writer.finish()
     }
@@ -115,7 +110,6 @@ impl SpillPartitionWriter {
 /// Yields `&buf[frame_body_start..frame_body_end]` for each valid frame.
 /// On a truncated or malformed tail the iterator stops cleanly; it never
 /// panics and never indexes out of bounds.
-#[allow(dead_code)] // consumed by the grace-hash join build/probe pipeline
 pub(super) fn parse_framed_rows(buf: &[u8]) -> FramedRows<'_> {
     FramedRows { buf, pos: 0 }
 }
@@ -123,7 +117,6 @@ pub(super) fn parse_framed_rows(buf: &[u8]) -> FramedRows<'_> {
 /// Zero-copy iterator over length-prefixed msgpack rows in a spill buffer.
 ///
 /// Produced by [`parse_framed_rows`].
-#[allow(dead_code)] // consumed by the grace-hash join build/probe pipeline
 pub(super) struct FramedRows<'a> {
     buf: &'a [u8],
     pos: usize,

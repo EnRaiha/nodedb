@@ -104,8 +104,7 @@ impl KvHashTable {
     /// dropped, and the callback error is never swallowed into `Ok`.
     ///
     /// [`scan_with_surrogate`]: KvHashTable::scan_with_surrogate
-    // consumed by scan_collection_for_each streaming routing (later U5 unit)
-    #[allow(dead_code)]
+    // consumed (via `KvEngine::scan_for_each`) by `scan_collection_for_each`
     pub fn scan_with_surrogate_for_each<F>(
         &self,
         cursor_idx: usize,

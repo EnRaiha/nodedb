@@ -63,9 +63,8 @@ impl CoreLoop {
     ///
     /// There is intentionally no `limit` parameter — bounding is the caller's
     /// responsibility (e.g. the grace-hash join pipeline).
-    // Consumed by the streamed grace-hash join build/probe pipeline (wired in a
-    // subsequent unit); defined here first as the standalone, tested primitive.
-    #[allow(dead_code)]
+    // Consumed by the streamed grace-hash join build/probe pipeline
+    // (`drive_grace_build`).
     pub(in crate::data::executor) fn scan_collection_for_each<F>(
         &self,
         tid: u64,
