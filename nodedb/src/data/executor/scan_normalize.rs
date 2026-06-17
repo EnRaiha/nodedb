@@ -546,6 +546,134 @@ mod tests {
         assert_eq!(expected, actual, "key+bytes pairs must be identical");
     }
 
+    /// ORDER contract: `scan_collection_for_each` must yield rows in the exact
+    /// same order as `scan_collection`, not merely the same set.
+    ///
+    /// We insert sparse/document rows in an intentionally non-sorted order
+    /// ("d", "a", "c", "b") so that a bug which sorts internally would produce
+    /// a different sequence from one that doesn't — making an accidental
+    /// coincidence of order impossible to hide.  Neither vector is sorted
+    /// before the assertion.
+    #[test]
+    fn for_each_matches_scan_collection_order_on_sparse_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _req_tx, _resp_rx) =
+            crate::data::executor::core_loop::tests::make_core_with_dir(dir.path());
+
+        let tid: u64 = 1;
+        let coll = "scan_order_sparse";
+
+        // Insert in non-alphabetical order so insertion order != sorted order.
+        // If either scan path sorts internally the assertion will catch the divergence.
+        core.sparse.put(tid, coll, "d", b"{\"v\":4}").unwrap();
+        core.sparse.put(tid, coll, "a", b"{\"v\":1}").unwrap();
+        core.sparse.put(tid, coll, "c", b"{\"v\":3}").unwrap();
+        core.sparse.put(tid, coll, "b", b"{\"v\":2}").unwrap();
+
+        // Reference output — NOT sorted.
+        let expected = core.scan_collection(tid, coll, usize::MAX).unwrap();
+
+        // Streaming output — NOT sorted.
+        let mut actual: Vec<(String, Vec<u8>)> = Vec::new();
+        core.scan_collection_for_each(tid, coll, |id, bytes| {
+            actual.push((id.to_owned(), bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "row counts must match: expected {}, got {}",
+            expected.len(),
+            actual.len(),
+        );
+        assert_eq!(
+            expected, actual,
+            "scan_collection_for_each must yield rows in the identical order \
+             as scan_collection (ORDER contract, not merely SET equality)"
+        );
+    }
+
+    /// ORDER contract: `scan_collection_for_each` must yield KV rows in the
+    /// exact same order as `scan_collection`.
+    ///
+    /// Keys are inserted as "k3", "k1", "k4", "k2" — deliberately non-sorted —
+    /// so that a path that sorts keys produces a different sequence from one
+    /// that preserves scan order, making an accidental coincidence impossible.
+    /// Neither vector is sorted before the assertion.
+    #[test]
+    fn for_each_matches_scan_collection_order_on_kv() {
+        use nodedb_types::Surrogate;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _req_tx, _resp_rx) =
+            crate::data::executor::core_loop::tests::make_core_with_dir(dir.path());
+
+        let tid: u64 = 1;
+        let coll = "scan_order_kv";
+        let now_ms = crate::engine::kv::current_ms();
+
+        // Empty-map msgpack value; the `key` field is injected by kv_row_to_doc.
+        let val = nodedb_types::value_to_msgpack(&nodedb_types::value::Value::Object(
+            std::collections::HashMap::new(),
+        ))
+        .unwrap();
+
+        // Insert in non-sorted order: "k3", "k1", "k4", "k2".
+        core.kv_engine
+            .put(tid, coll, b"k3", &val, 0, now_ms, Surrogate::ZERO);
+        core.kv_engine
+            .put(tid, coll, b"k1", &val, 0, now_ms, Surrogate::ZERO);
+        core.kv_engine
+            .put(tid, coll, b"k4", &val, 0, now_ms, Surrogate::ZERO);
+        core.kv_engine
+            .put(tid, coll, b"k2", &val, 0, now_ms, Surrogate::ZERO);
+
+        // Reference output — NOT sorted.
+        let expected = core.scan_collection(tid, coll, usize::MAX).unwrap();
+
+        // Streaming output — NOT sorted.
+        let mut actual: Vec<(String, Vec<u8>)> = Vec::new();
+        core.scan_collection_for_each(tid, coll, |id, bytes| {
+            actual.push((id.to_owned(), bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "row counts must match: expected {}, got {}",
+            expected.len(),
+            actual.len(),
+        );
+        assert_eq!(
+            expected, actual,
+            "scan_collection_for_each must yield KV rows in the identical order \
+             as scan_collection (ORDER contract, not merely SET equality)"
+        );
+    }
+
+    // NOTE: Columnar order-equivalence is not covered by a unit test here.
+    //
+    // `scan_collection_for_each` for columnar collections materialises the
+    // batch via the same `scan_columnar` call used by `scan_collection` (the
+    // streamed and materialised paths share one code path for columnar — see
+    // the comment in `scan_collection_for_each` step 2), so the ORDER contract
+    // is structurally guaranteed for columnar at the source-code level rather
+    // than being an independent divergence risk.
+    //
+    // Adding a columnar ORDER test here would require spinning up a
+    // `ColumnarEngine` / `ColumnarMemtable` entry in `CoreLoop`'s internal
+    // maps (neither `make_core_with_dir` nor any other helper in this test
+    // suite exposes a way to pre-populate `columnar_memtables` or
+    // `columnar_engines` without going through the full engine-init path).
+    // That setup is exercised by the columnar-specific integration tests in
+    // `nodedb/tests/executor_tests/` (e.g. `test_cross_type_join`).
+    // A follow-up can add a columnar order unit test once a suitable
+    // `make_core_with_columnar_collection` helper exists.
+
     /// Verify that a callback error from `scan_collection_for_each` is
     /// propagated immediately and stops iteration.
     #[test]
