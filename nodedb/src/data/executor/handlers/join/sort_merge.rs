@@ -6,10 +6,9 @@ use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::task::ExecutionTask;
 use nodedb_query::msgpack_scan;
 
-use super::{compare_preextracted, merge_join_docs_binary};
+use super::{SortMergeJoinParams, compare_preextracted, merge_join_docs_binary};
 
 /// Collect consecutive index positions in `indices[start..]` sharing the same key as `indices[start]`.
 fn collect_key_group_preextracted(
@@ -37,18 +36,20 @@ fn collect_key_group_preextracted(
 }
 
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_sort_merge_join(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        left_collection: &str,
-        right_collection: &str,
-        on: &[(String, String)],
-        join_type: &str,
-        limit: usize,
-        pre_sorted: bool,
+        p: SortMergeJoinParams<'_>,
     ) -> Response {
+        let SortMergeJoinParams {
+            task,
+            tid,
+            left_collection,
+            right_collection,
+            on,
+            join_type,
+            limit,
+            pre_sorted,
+        } = p;
         debug!(
             core = self.core_id,
             %left_collection,

@@ -13,7 +13,7 @@ pub mod params;
 pub mod sort_merge;
 mod spill;
 
-pub(crate) use params::{HashJoinParams, JoinParams};
+pub(crate) use params::{HashJoinParams, JoinParams, NestedLoopJoinParams, SortMergeJoinParams};
 
 use nodedb_query::msgpack_scan;
 

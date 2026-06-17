@@ -7,7 +7,7 @@ use nodedb_physical::physical_plan::QueryOp;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::join::{
-    HashJoinParams, JoinParams,
+    HashJoinParams, JoinParams, NestedLoopJoinParams, SortMergeJoinParams,
     lateral::{LateralLoopParams, LateralTopKParams},
 };
 use crate::data::executor::task::ExecutionTask;
@@ -110,15 +110,15 @@ impl CoreLoop {
                 condition,
                 join_type,
                 limit,
-            } => self.execute_nested_loop_join(
+            } => self.execute_nested_loop_join(NestedLoopJoinParams {
                 task,
                 tid,
                 left_collection,
                 right_collection,
                 condition,
                 join_type,
-                *limit,
-            ),
+                limit: *limit,
+            }),
 
             QueryOp::SortMergeJoin {
                 left_collection,
@@ -127,16 +127,16 @@ impl CoreLoop {
                 join_type,
                 limit,
                 pre_sorted,
-            } => self.execute_sort_merge_join(
+            } => self.execute_sort_merge_join(SortMergeJoinParams {
                 task,
                 tid,
                 left_collection,
                 right_collection,
                 on,
                 join_type,
-                *limit,
-                *pre_sorted,
-            ),
+                limit: *limit,
+                pre_sorted: *pre_sorted,
+            }),
 
             QueryOp::RecursiveScan {
                 collection,

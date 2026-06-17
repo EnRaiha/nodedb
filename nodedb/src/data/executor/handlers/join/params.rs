@@ -48,6 +48,34 @@ pub(crate) struct HashJoinParams<'a> {
     pub right_bitmap: Option<&'a PhysicalPlan>,
 }
 
+/// Nested-loop join: O(N×M) fallback for non-equi, theta, and cross joins.
+///
+/// `condition` is a msgpack-encoded `Vec<ScanFilter>` (empty = cross join).
+pub(crate) struct NestedLoopJoinParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub left_collection: &'a str,
+    pub right_collection: &'a str,
+    pub condition: &'a [u8],
+    pub join_type: &'a str,
+    pub limit: usize,
+}
+
+/// Sort-merge join: O((N+M)·log N) equi-join with optional pre-sorted inputs.
+///
+/// `on` is a slice of `(left_key, right_key)` column pairs. `pre_sorted`
+/// skips the sort phase when the planner guarantees inputs arrive in key order.
+pub(crate) struct SortMergeJoinParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub left_collection: &'a str,
+    pub right_collection: &'a str,
+    pub on: &'a [(String, String)],
+    pub join_type: &'a str,
+    pub limit: usize,
+    pub pre_sorted: bool,
+}
+
 impl JoinParams<'_> {
     /// Apply post-join WHERE filters and projection to result rows.
     ///

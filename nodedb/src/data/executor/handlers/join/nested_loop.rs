@@ -6,8 +6,8 @@ use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::task::ExecutionTask;
 
+use super::NestedLoopJoinParams;
 use super::merge_join_docs_binary;
 
 impl CoreLoop {
@@ -16,17 +16,19 @@ impl CoreLoop {
     ///
     /// For each left row, iterates all right rows and evaluates the join
     /// condition. Supports inner/left/right/full join types.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_nested_loop_join(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        left_collection: &str,
-        right_collection: &str,
-        condition: &[u8],
-        join_type: &str,
-        limit: usize,
+        p: NestedLoopJoinParams<'_>,
     ) -> Response {
+        let NestedLoopJoinParams {
+            task,
+            tid,
+            left_collection,
+            right_collection,
+            condition,
+            join_type,
+            limit,
+        } = p;
         debug!(
             core = self.core_id,
             %left_collection,
