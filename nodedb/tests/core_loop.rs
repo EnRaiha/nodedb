@@ -6,6 +6,8 @@
 mod helpers;
 #[path = "executor_tests/test_aggregate_aliases.rs"]
 mod test_aggregate_aliases;
+#[path = "executor_tests/test_aggregate_chunk_limit.rs"]
+mod test_aggregate_chunk_limit;
 #[path = "executor_tests/test_array_ops.rs"]
 mod test_array_ops;
 #[path = "executor_tests/test_columnar_aggregate.rs"]

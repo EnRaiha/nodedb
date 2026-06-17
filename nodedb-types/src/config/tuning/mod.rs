@@ -103,6 +103,7 @@ mod tests {
         assert_eq!(parsed.query.doc_cache_entries, 4096);
         assert_eq!(parsed.query.columnar_flush_threshold, 65_536);
         assert_eq!(parsed.query.compaction_target_bytes, 256 * 1024 * 1024);
+        assert_eq!(parsed.query.aggregate_chunk_size, 10_000);
         // New MemoryTuning fields.
         assert_eq!(parsed.memory.overflow_initial_bytes, 64 * 1024 * 1024);
         assert_eq!(parsed.memory.overflow_max_bytes, 1024 * 1024 * 1024);
@@ -127,6 +128,7 @@ default_deadline_secs = 60
         // Unset fields retain defaults.
         assert_eq!(cfg.query.columnar_flush_threshold, 65_536);
         assert_eq!(cfg.query.compaction_target_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.query.aggregate_chunk_size, 10_000);
     }
 
     #[test]

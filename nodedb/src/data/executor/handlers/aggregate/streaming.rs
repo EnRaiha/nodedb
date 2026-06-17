@@ -93,7 +93,7 @@ impl CoreLoop {
         // Accumulate matching documents. Spill errors are fatal and surfaced
         // once accumulation stops — the first error breaks out of both loops.
         let mut spill_err: Option<crate::Error> = None;
-        let chunk_size = 10_000;
+        let chunk_size = self.query_tuning.aggregate_chunk_size;
 
         for chunk in docs.chunks(chunk_size) {
             if spill_err.is_some() {

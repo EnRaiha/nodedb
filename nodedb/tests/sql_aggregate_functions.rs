@@ -211,64 +211,6 @@ async fn limit_two_on_group_by_returns_two_rows() {
     );
 }
 
-/// `LIMIT N` on a `GROUP BY` over a high-cardinality input (>10 000
-/// distinct groups) must still honour `N`. The bench triage flagged a
-/// silent widening of LIMIT to the server-side ~10 000-row page cap
-/// when the aggregate scan crosses that threshold — every top-N
-/// dashboard query against a real-sized dataset trips this. The test
-/// inserts 12 000 rows with 12 000 distinct group keys so the
-/// pre-aggregate scan-cap path can fire, then asserts LIMIT 5 yields
-/// exactly 5 rows (not ~10 000).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn limit_on_group_by_honoured_above_page_cap() {
-    let srv = TestServer::start().await;
-    srv.exec(
-        "CREATE COLLECTION events_big \
-         COLUMNS (id TEXT PRIMARY KEY, bucket TEXT, qty INTEGER) \
-         WITH (engine='document_strict')",
-    )
-    .await
-    .unwrap();
-
-    // Ingest in 200-row batches so we don't blow the SQL statement
-    // length limit. 12 000 distinct buckets total — comfortably past
-    // the bench-reported ~10 000 page cap.
-    const TOTAL_ROWS: usize = 12_000;
-    const BATCH: usize = 200;
-    let mut i = 0;
-    while i < TOTAL_ROWS {
-        let mut sql = String::from("INSERT INTO events_big (id, bucket, qty) VALUES ");
-        for j in 0..BATCH {
-            if j > 0 {
-                sql.push(',');
-            }
-            let k = i + j;
-            sql.push_str(&format!("('r{k}','b{k}',{k})"));
-        }
-        srv.exec(&sql).await.unwrap();
-        i += BATCH;
-    }
-
-    let rows = srv
-        .query_rows(
-            "SELECT bucket, COUNT(*) AS n \
-             FROM events_big \
-             GROUP BY bucket \
-             LIMIT 5",
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        rows.len(),
-        5,
-        "LIMIT 5 over a high-cardinality GROUP BY must yield 5 rows; \
-         got {} rows. A result near 10 000 would be the bench-reported \
-         silent page-cap widening.",
-        rows.len()
-    );
-}
-
 /// `SELECT DISTINCT col` must dedupe duplicate values. Surfaced
 /// while building B2 derived-FROM coverage: the inner subquery
 /// `SELECT DISTINCT category FROM items` returned every row

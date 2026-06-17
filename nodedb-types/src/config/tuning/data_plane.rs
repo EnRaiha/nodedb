@@ -79,6 +79,15 @@ pub struct QueryTuning {
     /// Default: 1_000_000.
     #[serde(default = "default_groupby_max_groups_in_mem")]
     pub groupby_max_groups_in_mem: usize,
+    /// Number of documents the streaming aggregate processes per chunk before
+    /// checking whether a spill run should be triggered.  A smaller value
+    /// reduces peak memory at the cost of more frequent spill checks; a larger
+    /// value amortises check overhead at the cost of holding more documents in
+    /// flight between checks.  The LIMIT clause is applied after all chunks are
+    /// accumulated, so this knob does not affect query correctness.
+    /// Default: 10_000.
+    #[serde(default = "default_aggregate_chunk_size")]
+    pub aggregate_chunk_size: usize,
     /// Maximum total bytes a single unbounded (no-LIMIT) document scan may
     /// materialize on a Data Plane core before the handler aborts with a
     /// deterministic `ResourcesExhausted` error.  A `SELECT * FROM <coll>`
@@ -107,6 +116,7 @@ impl Default for QueryTuning {
             columnar_flush_threshold: default_columnar_flush_threshold(),
             compaction_target_bytes: default_compaction_target_bytes(),
             groupby_max_groups_in_mem: default_groupby_max_groups_in_mem(),
+            aggregate_chunk_size: default_aggregate_chunk_size(),
             max_scan_result_bytes: default_max_scan_result_bytes(),
         }
     }
@@ -147,6 +157,9 @@ fn default_compaction_target_bytes() -> usize {
 }
 fn default_groupby_max_groups_in_mem() -> usize {
     1_000_000
+}
+fn default_aggregate_chunk_size() -> usize {
+    10_000
 }
 fn default_max_scan_result_bytes() -> usize {
     512 * 1024 * 1024
