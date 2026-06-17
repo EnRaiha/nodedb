@@ -127,8 +127,13 @@ impl CoreLoop {
             ) {
                 Some(scan_plan) => {
                     let resp = self.execute_plan(join.task, &scan_plan);
-                    crate::data::executor::response_codec::decode_response_to_docs(&resp)
-                        .unwrap_or_default()
+                    // Forward a failing sub-plan response (e.g. ResourcesExhausted
+                    // from the bitmap scan) instead of swallowing it to an empty
+                    // Vec, which would silently return a zero-row join.
+                    match crate::data::executor::response_codec::decode_response_to_docs(&resp) {
+                        Some(d) => d,
+                        None => return resp,
+                    }
                 }
                 None => match self.scan_collection(tid, left_collection, scan_limit) {
                     Ok(d) => d,
@@ -186,8 +191,13 @@ impl CoreLoop {
             ) {
                 Some(scan_plan) => {
                     let resp = self.execute_plan(join.task, &scan_plan);
-                    crate::data::executor::response_codec::decode_response_to_docs(&resp)
-                        .unwrap_or_default()
+                    // Forward a failing sub-plan response (e.g. ResourcesExhausted
+                    // from the bitmap scan) instead of swallowing it to an empty
+                    // Vec, which would silently return a zero-row join.
+                    match crate::data::executor::response_codec::decode_response_to_docs(&resp) {
+                        Some(d) => d,
+                        None => return resp,
+                    }
                 }
                 None => match self.scan_collection(tid, right_collection, scan_limit) {
                     Ok(d) => d,
