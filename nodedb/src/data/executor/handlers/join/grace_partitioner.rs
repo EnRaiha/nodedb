@@ -23,6 +23,22 @@ use std::hash::Hasher;
 
 use super::hash::{HashIndex, ProbeParams, extract_join_key_range, probe_hash_index};
 
+/// Immutable configuration for a grace-hash join — the join-key fields on each
+/// side, the join type, the output limit, the collection/alias prefixes used to
+/// qualify emitted columns, and whether unmatched build-side rows are emitted.
+///
+/// Bundled into one struct (like `ProbeParams`) so callers pass named fields
+/// rather than a long, transposition-prone positional argument list.
+pub(super) struct GraceSpec<'a> {
+    pub(super) build_keys: &'a [&'a str],
+    pub(super) probe_keys: &'a [&'a str],
+    pub(super) join_type: &'a str,
+    pub(super) limit: usize,
+    pub(super) probe_collection: &'a str,
+    pub(super) index_collection: &'a str,
+    pub(super) emit_unmatched_right: bool,
+}
+
 /// Stable, fixed-seed partition hash over a document's join-key value bytes.
 ///
 /// Mirrors `hash_join_key`'s extraction and missing-field handling EXACTLY:
@@ -34,12 +50,15 @@ use super::hash::{HashIndex, ProbeParams, extract_join_key_range, probe_hash_ind
 /// Uses [`std::hash::DefaultHasher`] (deterministic, fixed keys) rather than
 /// `RandomState`: build and probe sides MUST hash identically across calls so
 /// that equal-key rows co-locate in the same partition.
+///
+/// `keys` is generic over any `AsRef<str>` element type so callers can pass
+/// `&[&str]` or `&[String]` without an intermediate `Vec<&str>` allocation.
 // Consumed by the grace-join integration (build-side spill + scan-cap removal).
 #[allow(dead_code)]
-pub(super) fn partition_hash(doc: &[u8], keys: &[&str]) -> u64 {
+pub(super) fn partition_hash<S: AsRef<str>>(doc: &[u8], keys: &[S]) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     for key in keys {
-        if let Some((start, end)) = extract_join_key_range(doc, key) {
+        if let Some((start, end)) = extract_join_key_range(doc, key.as_ref()) {
             hasher.write(&doc[start..end]);
         } else {
             // Missing field — hash the same NIL sentinel `hash_join_key` uses.
@@ -81,19 +100,20 @@ pub(super) fn partition_hash(doc: &[u8], keys: &[&str]) -> u64 {
 ///   `probe_hash_index`, so the indices align.
 // Consumed by the grace-join integration (build-side spill + scan-cap removal).
 #[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
 pub(super) fn grace_join_in_memory(
     build_docs: Vec<(String, Vec<u8>)>,
     probe_docs: Vec<(String, Vec<u8>)>,
-    build_keys: &[&str],
-    probe_keys: &[&str],
-    join_type: &str,
     partitions: usize,
-    limit: usize,
-    probe_collection: &str,
-    index_collection: &str,
-    emit_unmatched_right: bool,
+    spec: &GraceSpec,
 ) -> Vec<Vec<u8>> {
+    let build_keys = spec.build_keys;
+    let probe_keys = spec.probe_keys;
+    let join_type = spec.join_type;
+    let limit = spec.limit;
+    let probe_collection = spec.probe_collection;
+    let index_collection = spec.index_collection;
+    let emit_unmatched_right = spec.emit_unmatched_right;
+
     // Degenerate / cross → single partition. Partitioning a cross/keyless join
     // by hash would break the cartesian product (every left row must see every
     // right row), so run the whole thing through one `HashIndex` / probe.
@@ -176,28 +196,22 @@ mod tests {
 
     /// Reference: the un-partitioned single-index probe — exactly what
     /// `execute_hash_join` does today.
-    #[allow(clippy::too_many_arguments)]
     fn reference(
         build_docs: &[(String, Vec<u8>)],
         probe_docs: &[(String, Vec<u8>)],
-        build_keys: &[&str],
-        probe_keys: &[&str],
-        join_type: &str,
-        limit: usize,
-        probe_collection: &str,
-        index_collection: &str,
+        spec: &GraceSpec,
     ) -> Vec<Vec<u8>> {
-        let index = HashIndex::build(build_docs, build_keys);
+        let index = HashIndex::build(build_docs, spec.build_keys);
         probe_hash_index(&ProbeParams {
             probe_docs,
             index: &index,
             index_docs: build_docs,
-            probe_keys,
-            join_type,
-            limit,
-            probe_collection,
-            index_collection,
-            emit_unmatched_right: true,
+            probe_keys: spec.probe_keys,
+            join_type: spec.join_type,
+            limit: spec.limit,
+            probe_collection: spec.probe_collection,
+            index_collection: spec.index_collection,
+            emit_unmatched_right: spec.emit_unmatched_right,
         })
     }
 
@@ -268,31 +282,19 @@ mod tests {
         let probe_keys = ["k"];
 
         for jt in ALL_JOIN_TYPES {
-            let reference_rows = reference(
-                &build,
-                &probe,
-                &build_keys,
-                &probe_keys,
-                jt,
-                usize::MAX,
-                "l",
-                "r",
-            );
-            let want = as_multiset(reference_rows);
+            let spec = GraceSpec {
+                build_keys: &build_keys,
+                probe_keys: &probe_keys,
+                join_type: jt,
+                limit: usize::MAX,
+                probe_collection: "l",
+                index_collection: "r",
+                emit_unmatched_right: true,
+            };
+            let want = as_multiset(reference(&build, &probe, &spec));
 
             for p in [1usize, 2, 4, 8] {
-                let candidate = grace_join_in_memory(
-                    build.clone(),
-                    probe.clone(),
-                    &build_keys,
-                    &probe_keys,
-                    jt,
-                    p,
-                    usize::MAX,
-                    "l",
-                    "r",
-                    true,
-                );
+                let candidate = grace_join_in_memory(build.clone(), probe.clone(), p, &spec);
                 assert_eq!(
                     want,
                     as_multiset(candidate),
@@ -368,29 +370,18 @@ mod tests {
         let probe_keys = ["a", "b"];
 
         for jt in ["inner", "left"] {
-            let want = as_multiset(reference(
-                &build,
-                &probe,
-                &build_keys,
-                &probe_keys,
-                jt,
-                usize::MAX,
-                "l",
-                "r",
-            ));
+            let spec = GraceSpec {
+                build_keys: &build_keys,
+                probe_keys: &probe_keys,
+                join_type: jt,
+                limit: usize::MAX,
+                probe_collection: "l",
+                index_collection: "r",
+                emit_unmatched_right: true,
+            };
+            let want = as_multiset(reference(&build, &probe, &spec));
             for p in [1usize, 2, 4, 8] {
-                let candidate = grace_join_in_memory(
-                    build.clone(),
-                    probe.clone(),
-                    &build_keys,
-                    &probe_keys,
-                    jt,
-                    p,
-                    usize::MAX,
-                    "l",
-                    "r",
-                    true,
-                );
+                let candidate = grace_join_in_memory(build.clone(), probe.clone(), p, &spec);
                 assert_eq!(
                     want,
                     as_multiset(candidate),
@@ -408,29 +399,18 @@ mod tests {
         let probe_keys = ["k"];
 
         for jt in ALL_JOIN_TYPES {
-            let want = as_multiset(reference(
-                &build,
-                &probe,
-                &build_keys,
-                &probe_keys,
-                jt,
-                usize::MAX,
-                "l",
-                "r",
-            ));
+            let spec = GraceSpec {
+                build_keys: &build_keys,
+                probe_keys: &probe_keys,
+                join_type: jt,
+                limit: usize::MAX,
+                probe_collection: "l",
+                index_collection: "r",
+                emit_unmatched_right: true,
+            };
+            let want = as_multiset(reference(&build, &probe, &spec));
             for p in [1usize, 2, 4, 8] {
-                let candidate = grace_join_in_memory(
-                    build.clone(),
-                    probe.clone(),
-                    &build_keys,
-                    &probe_keys,
-                    jt,
-                    p,
-                    usize::MAX,
-                    "l",
-                    "r",
-                    true,
-                );
+                let candidate = grace_join_in_memory(build.clone(), probe.clone(), p, &spec);
                 assert_eq!(
                     want,
                     as_multiset(candidate),
@@ -448,29 +428,18 @@ mod tests {
         let probe_keys = ["k"];
 
         for jt in ALL_JOIN_TYPES {
-            let want = as_multiset(reference(
-                &build,
-                &probe,
-                &build_keys,
-                &probe_keys,
-                jt,
-                usize::MAX,
-                "l",
-                "r",
-            ));
+            let spec = GraceSpec {
+                build_keys: &build_keys,
+                probe_keys: &probe_keys,
+                join_type: jt,
+                limit: usize::MAX,
+                probe_collection: "l",
+                index_collection: "r",
+                emit_unmatched_right: true,
+            };
+            let want = as_multiset(reference(&build, &probe, &spec));
             for p in [1usize, 2, 4, 8] {
-                let candidate = grace_join_in_memory(
-                    build.clone(),
-                    probe.clone(),
-                    &build_keys,
-                    &probe_keys,
-                    jt,
-                    p,
-                    usize::MAX,
-                    "l",
-                    "r",
-                    true,
-                );
+                let candidate = grace_join_in_memory(build.clone(), probe.clone(), p, &spec);
                 assert_eq!(
                     want,
                     as_multiset(candidate),
@@ -487,32 +456,25 @@ mod tests {
         let probe_keys = ["k"];
 
         // Reference (unbounded) inner-join count, to pick a smaller limit.
-        let full = reference(
-            &build,
-            &probe,
-            &build_keys,
-            &probe_keys,
-            "inner",
-            usize::MAX,
-            "l",
-            "r",
-        );
+        let unbounded_spec = GraceSpec {
+            build_keys: &build_keys,
+            probe_keys: &probe_keys,
+            join_type: "inner",
+            limit: usize::MAX,
+            probe_collection: "l",
+            index_collection: "r",
+            emit_unmatched_right: true,
+        };
+        let full = reference(&build, &probe, &unbounded_spec);
         assert!(full.len() >= 2, "fixture must produce >= 2 inner rows");
         let limit = full.len() - 1;
 
+        let limited_spec = GraceSpec {
+            limit,
+            ..unbounded_spec
+        };
         for p in [1usize, 2, 4, 8] {
-            let candidate = grace_join_in_memory(
-                build.clone(),
-                probe.clone(),
-                &build_keys,
-                &probe_keys,
-                "inner",
-                p,
-                limit,
-                "l",
-                "r",
-                true,
-            );
+            let candidate = grace_join_in_memory(build.clone(), probe.clone(), p, &limited_spec);
             assert_eq!(candidate.len(), limit, "limit truncation p={p}");
         }
     }
