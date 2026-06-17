@@ -53,8 +53,33 @@ pub(super) struct GraceSpec<'a> {
 ///
 /// `keys` is generic over any `AsRef<str>` element type so callers can pass
 /// `&[&str]` or `&[String]` without an intermediate `Vec<&str>` allocation.
+///
+/// This is the TOP-LEVEL partitioning hash and is defined as
+/// `partition_hash_seeded(doc, keys, 0)` — the seed-`0` behavior is fixed and
+/// must NOT change, since the spiller's top-level partition routing depends on
+/// it being stable across calls.
 pub(super) fn partition_hash<S: AsRef<str>>(doc: &[u8], keys: &[S]) -> u64 {
+    partition_hash_seeded(doc, keys, 0)
+}
+
+/// Seeded variant of [`partition_hash`] used for RECURSIVE re-partitioning of a
+/// skewed partition.
+///
+/// Re-partitioning a partition that overflowed its memory budget with the SAME
+/// hash would deterministically reproduce the same split (every row lands in the
+/// same sub-bucket), making no progress. Mixing a fresh `seed` into the hasher
+/// BEFORE the key bytes redistributes DISTINCT keys across the sub-buckets while
+/// preserving the co-location invariant WITHIN that seed: two rows with equal
+/// key bytes still hash identically (same seed, same bytes), so any pair that
+/// could match still co-locates in the same sub-partition. (Identical-key skew
+/// is therefore unsplittable at any seed — the depth cap in `grace_spill`
+/// handles that case with a clean `MemoryExhausted`.)
+///
+/// The seed is written first so that the same `(seed, keys)` pair on the build
+/// and probe sides produces matching routing.
+pub(super) fn partition_hash_seeded<S: AsRef<str>>(doc: &[u8], keys: &[S], seed: u64) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
+    hasher.write_u64(seed);
     for key in keys {
         if let Some((start, end)) = extract_join_key_range(doc, key.as_ref()) {
             hasher.write(&doc[start..end]);
@@ -495,5 +520,55 @@ mod tests {
         let m1 = msgpack_row(&[("other", serde_json::json!(1))]);
         let m2 = msgpack_row(&[("nope", serde_json::json!(2))]);
         assert_eq!(partition_hash(&m1, &keys), partition_hash(&m2, &keys));
+    }
+
+    #[test]
+    fn partition_hash_delegates_to_seed_zero() {
+        // `partition_hash` MUST be exactly `partition_hash_seeded(.., 0)` so the
+        // spiller's top-level routing is unchanged by the seeded refactor.
+        let keys = ["k"];
+        for v in 0..32i64 {
+            let row = msgpack_row(&[("k", serde_json::json!(v))]);
+            assert_eq!(
+                partition_hash(&row, &keys),
+                partition_hash_seeded(&row, &keys, 0),
+                "partition_hash must equal seed=0 for v={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_hash_seeded_redistributes_distinct_keys() {
+        // Distinct keys that collide into a small number of buckets under one
+        // seed should land in a DIFFERENT bucket distribution under another
+        // seed — i.e. re-partitioning makes progress for distinct keys.
+        let keys = ["k"];
+        const BUCKETS: u64 = 8;
+
+        let dist = |seed: u64| -> Vec<u64> {
+            (0..64i64)
+                .map(|v| {
+                    let row = msgpack_row(&[("k", serde_json::json!(v))]);
+                    partition_hash_seeded(&row, &keys, seed) % BUCKETS
+                })
+                .collect()
+        };
+
+        let d0 = dist(0);
+        let d1 = dist(1);
+        // The two seedings must not produce identical per-key bucket assignments
+        // for every key (that would mean re-partition made no progress).
+        assert_ne!(d0, d1, "seed change must redistribute distinct keys");
+
+        // Equal key bytes still co-locate WITHIN a seed (co-location invariant).
+        let a = msgpack_row(&[("k", serde_json::json!(42)), ("x", serde_json::json!("a"))]);
+        let b = msgpack_row(&[("k", serde_json::json!(42)), ("y", serde_json::json!("b"))]);
+        for seed in [0u64, 1, 7, 99] {
+            assert_eq!(
+                partition_hash_seeded(&a, &keys, seed),
+                partition_hash_seeded(&b, &keys, seed),
+                "equal key bytes must co-locate within seed={seed}"
+            );
+        }
     }
 }

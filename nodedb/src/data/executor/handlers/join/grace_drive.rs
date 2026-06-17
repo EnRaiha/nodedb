@@ -157,6 +157,15 @@ impl CoreLoop {
             unique_join_id,
         ) {
             Ok(rows) => rows,
+            // A depth-cap skew error is "over budget" semantics — identical to
+            // what the in-memory path surfaces — so it must map to
+            // `ResourcesExhausted`, NOT `Internal`. (The envelope maps
+            // `Error::MemoryExhausted` → `ErrorCode::ResourcesExhausted`; we match
+            // the variant here so the wire code is correct regardless of where
+            // the error was minted.) Any other error stays `Internal`.
+            Err(crate::Error::MemoryExhausted { .. }) => {
+                return Some(self.response_error(join.task, ErrorCode::ResourcesExhausted));
+            }
             Err(e) => {
                 return Some(self.response_error(
                     join.task,
@@ -267,6 +276,15 @@ impl CoreLoop {
                     spec,
                     GRACE_PARTITIONS,
                     per_partition_budget,
+                    // FINISH-TIME re-partition trigger: the FULL per-query budget.
+                    // `finish_and_probe` materializes ONE partition at a time, so
+                    // a partition is only too big to materialize when it exceeds
+                    // the whole-query budget — NOT `per_partition_budget` (which is
+                    // `budget / 64` and would force every partition to look
+                    // oversized). When this path runs `budget != 0` always (the
+                    // build side only crosses into spilling when `budget != 0`), so
+                    // `materialize_cap` is a real positive bound here.
+                    budget,
                     spill_dir.clone(),
                 );
                 for (_, row) in &drained {
