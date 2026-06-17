@@ -33,7 +33,9 @@ pub(super) struct JoinPlanParams<'a> {
     pub on: &'a [(String, String)],
     pub join_type: &'a nodedb_sql::types::JoinType,
     pub condition: &'a Option<nodedb_sql::types::SqlExpr>,
-    pub limit: &'a usize,
+    /// `None` = no SQL `LIMIT` (bounded by the byte budget in the handler);
+    /// `Some(n)` = explicit `LIMIT n`.
+    pub limit: &'a Option<usize>,
     pub projection: &'a [Projection],
     pub filters: &'a [Filter],
     pub tenant_id: TenantId,

@@ -200,7 +200,10 @@ pub enum SqlPlan {
         on: Vec<(String, String)>,
         join_type: JoinType,
         condition: Option<SqlExpr>,
-        limit: usize,
+        /// `None` = no SQL `LIMIT` clause (output bounded downstream by the
+        /// memory byte budget, never silently truncated); `Some(n)` = explicit
+        /// `LIMIT n` (output capped at exactly `n`).
+        limit: Option<usize>,
         /// Post-join projection: column names to keep (empty = all columns).
         projection: Vec<Projection>,
         /// Post-join filters (from WHERE clause).

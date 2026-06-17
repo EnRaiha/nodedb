@@ -88,7 +88,7 @@ pub fn plan_join_from_select(
             on: on_keys,
             join_type,
             condition,
-            limit: 10000,
+            limit: None,
             projection: Vec::new(),
             filters: Vec::new(),
         };
@@ -115,7 +115,7 @@ pub fn plan_join_from_select(
             on: vec![(sq.outer_column, sq.inner_column)],
             join_type: sq.join_type,
             condition: None,
-            limit: 10000,
+            limit: None,
             projection: Vec::new(),
             filters: Vec::new(),
         };

@@ -105,17 +105,34 @@ impl CoreLoop {
         let is_left = join_type == "left" || join_type == "full";
         let is_right = join_type == "right" || join_type == "full";
 
+        // Bound the emitted output. An explicit user `LIMIT n`
+        // (`limit != usize::MAX`) is honored exactly. A no-LIMIT join
+        // (`usize::MAX`) must NOT silently truncate at a default cap: bound its
+        // output by the per-query byte budget instead, deriving a budget
+        // row-ceiling (`+1` to detect overflow) and surfacing a deterministic
+        // `ResourcesExhausted` if it is filled. A budget of 0 = unlimited.
+        let (probe_limit, enforce_output_budget) = if limit != usize::MAX {
+            (limit, false)
+        } else if budget == 0 {
+            (usize::MAX, false)
+        } else {
+            (
+                crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget),
+                true,
+            )
+        };
+
         let mut right_matched: Vec<bool> = vec![false; right_docs.len()];
         let mut results = Vec::new();
 
         for (_, left_bytes) in &left_docs {
-            if results.len() >= limit {
+            if results.len() >= probe_limit {
                 break;
             }
 
             let mut left_matched = false;
             for (ri, (_, right_bytes)) in right_docs.iter().enumerate() {
-                if results.len() >= limit {
+                if results.len() >= probe_limit {
                     break;
                 }
 
@@ -160,7 +177,7 @@ impl CoreLoop {
         // RIGHT/FULL: emit unmatched right rows.
         if is_right {
             for (ri, (_, right_bytes)) in right_docs.iter().enumerate() {
-                if results.len() >= limit {
+                if results.len() >= probe_limit {
                     break;
                 }
                 if !right_matched[ri] {
@@ -172,6 +189,13 @@ impl CoreLoop {
                     ));
                 }
             }
+        }
+
+        // No-LIMIT join whose output filled the budget-derived ceiling: the
+        // result exceeds the byte budget, so surface a deterministic error
+        // rather than silently dropping the excess rows.
+        if enforce_output_budget && results.len() >= probe_limit {
+            return self.response_error(task, ErrorCode::ResourcesExhausted);
         }
 
         let payload = super::super::super::response_codec::encode_binary_rows(&results);

@@ -41,12 +41,20 @@ pub(in crate::data::executor::handlers) const MIN_ROW_BYTES: usize = 16;
 /// the ceiling is `budget_bytes / MIN_ROW_BYTES + 1` — the `+ 1` lets the
 /// handler detect that more rows exist than fit the budget and surface the
 /// error rather than silently dropping them.
+///
+/// A `budget_bytes` of 0 means "unlimited" (matching [`budget_exceeded`]'s
+/// convention): an unbounded scan then has NO row ceiling (`usize::MAX`).
+/// Returning the 1000-row floor here would silently truncate an unbounded scan
+/// at 1000 rows whenever the byte budget is disabled.
 pub(in crate::data::executor::handlers) fn fetch_limit_for(
     limit: usize,
     offset: usize,
     budget_bytes: usize,
 ) -> usize {
     if limit == usize::MAX {
+        if budget_bytes == 0 {
+            return usize::MAX;
+        }
         (budget_bytes / MIN_ROW_BYTES.max(1))
             .saturating_add(1)
             .max(1000)
@@ -123,6 +131,15 @@ mod tests {
         // Must not panic / wrap on a huge budget.
         let f = fetch_limit_for(usize::MAX, usize::MAX, usize::MAX);
         assert!(f >= 1000);
+    }
+
+    #[test]
+    fn unbounded_limit_with_zero_budget_is_unlimited() {
+        // budget 0 = unlimited: an unbounded scan must NOT be capped at the
+        // 1000-row floor (which would silently truncate). It has no ceiling.
+        assert_eq!(fetch_limit_for(usize::MAX, 0, 0), usize::MAX);
+        // An explicit limit is unaffected by a zero budget.
+        assert_eq!(fetch_limit_for(50, 0, 0), 1000);
     }
 
     #[test]

@@ -89,7 +89,7 @@ macro_rules! impl_scan_read_arms_for_convert_visitor {
             on: &[(String, String)],
             join_type: nodedb_sql::types::query::JoinType,
             condition: Option<&nodedb_sql::types_expr::SqlExpr>,
-            limit: usize,
+            limit: Option<usize>,
             projection: &[nodedb_sql::types::query::Projection],
             filters: &[nodedb_sql::types::filter::Filter],
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {

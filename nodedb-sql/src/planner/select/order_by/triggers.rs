@@ -64,7 +64,9 @@ pub(super) fn try_extract_sort_search(
             let ann_options = parse_ann_options(raw_func_args)?;
             let limit = match plan {
                 SqlPlan::Scan { limit, .. } => limit.unwrap_or(10),
-                SqlPlan::Join { limit, .. } => *limit,
+                // A no-LIMIT join (`None`) falls back to the same default
+                // top-k as a no-LIMIT scan; an explicit `LIMIT n` is honored.
+                SqlPlan::Join { limit, .. } => limit.unwrap_or(10),
                 _ => 10,
             };
             let ef_search = ann_options

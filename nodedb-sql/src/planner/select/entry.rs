@@ -389,9 +389,11 @@ fn apply_limit(mut plan: SqlPlan, limit_clause: &Option<ast::LimitClause>) -> Sq
         SqlPlan::Join {
             limit: ref mut l, ..
         } => {
-            if let Some(lv) = limit_val {
-                *l = lv;
-            }
+            // Record the LIMIT clause verbatim: `Some(n)` for an explicit
+            // `LIMIT n`, `None` for no clause. A no-LIMIT join is bounded
+            // downstream by the memory byte budget rather than silently
+            // truncated, so we must NOT substitute a default row cap here.
+            *l = limit_val;
         }
         _ => {}
     }
@@ -451,7 +453,7 @@ mod tests {
         }
     }
 
-    fn join_plan_with_limit(limit: usize) -> SqlPlan {
+    fn join_plan_with_limit(limit: Option<usize>) -> SqlPlan {
         SqlPlan::Join {
             left: Box::new(minimal_scan()),
             right: Box::new(minimal_scan()),
@@ -476,20 +478,23 @@ mod tests {
 
     #[test]
     fn apply_limit_sets_join_limit() {
-        let plan = join_plan_with_limit(10000);
+        // An explicit `LIMIT 5` clause is recorded as `Some(5)`.
+        let plan = join_plan_with_limit(None);
         let result = apply_limit(plan, &limit_clause(5));
         match result {
-            SqlPlan::Join { limit, .. } => assert_eq!(limit, 5),
+            SqlPlan::Join { limit, .. } => assert_eq!(limit, Some(5)),
             other => panic!("expected SqlPlan::Join, got {other:?}"),
         }
     }
 
     #[test]
-    fn apply_limit_none_leaves_join_limit_unchanged() {
-        let plan = join_plan_with_limit(10000);
+    fn apply_limit_none_leaves_join_limit_none() {
+        // No LIMIT clause stays `None` — the join is bounded by the memory
+        // budget downstream, never by a default row cap.
+        let plan = join_plan_with_limit(None);
         let result = apply_limit(plan, &None);
         match result {
-            SqlPlan::Join { limit, .. } => assert_eq!(limit, 10000),
+            SqlPlan::Join { limit, .. } => assert_eq!(limit, None),
             other => panic!("expected SqlPlan::Join, got {other:?}"),
         }
     }

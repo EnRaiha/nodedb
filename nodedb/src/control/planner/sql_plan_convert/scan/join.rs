@@ -160,7 +160,11 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
             right_alias,
             on: on_keys,
             join_type: effective_join_type,
-            limit: *limit,
+            // `QueryOp::HashJoin.limit` stays `usize`: `usize::MAX` is the
+            // sentinel for "no SQL LIMIT". The handler distinguishes this from
+            // an explicit limit and bounds a no-LIMIT join by the memory byte
+            // budget (surfacing `ResourcesExhausted`) rather than truncating.
+            limit: limit.unwrap_or(usize::MAX),
             post_group_by: Vec::new(),
             post_aggregates: Vec::new(),
             projection: join_projection,

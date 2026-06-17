@@ -196,7 +196,7 @@ pub(super) fn plan_select(
                     on: vec![(sq.outer_column.clone(), sq.inner_column.clone())],
                     join_type: sq.join_type,
                     condition: None,
-                    limit: 10000,
+                    limit: None,
                     projection: Vec::new(),
                     filters: Vec::new(),
                 });
@@ -214,7 +214,7 @@ pub(super) fn plan_select(
                 on: vec![(sq.outer_column, sq.inner_column)],
                 join_type: sq.join_type,
                 condition: None,
-                limit: 10000,
+                limit: None,
                 projection: Vec::new(),
                 filters: Vec::new(),
             };
@@ -286,7 +286,7 @@ pub(super) fn plan_select(
             on: vec![(sq.outer_column, sq.inner_column)],
             join_type: sq.join_type,
             condition: None,
-            limit: 10000,
+            limit: None,
             projection: Vec::new(),
             filters: join_filters,
         };

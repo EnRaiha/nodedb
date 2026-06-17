@@ -174,6 +174,10 @@ pub trait PlanVisitor {
     ) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::Join`].
+    ///
+    /// `limit` is `None` when the join carries no SQL `LIMIT` clause (output
+    /// bounded downstream by the memory byte budget) and `Some(n)` for an
+    /// explicit `LIMIT n`.
     fn join(
         &mut self,
         left: &SqlPlan,
@@ -181,7 +185,7 @@ pub trait PlanVisitor {
         on: &[(String, String)],
         join_type: JoinType,
         condition: Option<&SqlExpr>,
-        limit: usize,
+        limit: Option<usize>,
         projection: &[Projection],
         filters: &[Filter],
     ) -> Result<Self::Output, Self::Error>;

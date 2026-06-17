@@ -249,17 +249,42 @@ impl CoreLoop {
 
         let right_index = HashIndex::build(&right_docs, &right_keys);
 
+        // Bound the emitted output.
+        //
+        // An explicit user `LIMIT n` (`join.limit != usize::MAX`) is honored
+        // exactly — emit at most `n` rows, no further budget check. A no-LIMIT
+        // join (`usize::MAX`) must NOT silently truncate at a default cap:
+        // instead we bound its output by the per-query byte budget. We derive a
+        // budget row-ceiling (`+1` so hitting it proves the output exceeds the
+        // budget) and, if the probe fills it, surface a deterministic
+        // `ResourcesExhausted` rather than dropping the excess rows. A budget
+        // of 0 means "unlimited" → truly unbounded output.
+        let (probe_limit, enforce_output_budget) = if join.limit != usize::MAX {
+            (join.limit, false)
+        } else if budget == 0 {
+            (usize::MAX, false)
+        } else {
+            (
+                crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget),
+                true,
+            )
+        };
+
         let mut results = probe_hash_index(&ProbeParams {
             probe_docs: &left_docs,
             index: &right_index,
             index_docs: &right_docs,
             probe_keys: &left_keys,
             join_type: join.join_type,
-            limit: join.limit,
+            limit: probe_limit,
             probe_collection: left_prefix,
             index_collection: right_prefix,
             emit_unmatched_right: true,
         });
+
+        if enforce_output_budget && results.len() >= probe_limit {
+            return self.response_error(join.task, ErrorCode::ResourcesExhausted);
+        }
 
         join.filter_and_project(&mut results);
 

@@ -154,12 +154,29 @@ impl CoreLoop {
         let is_left = join_type == "left" || join_type == "full";
         let is_right = join_type == "right" || join_type == "full";
 
+        // Bound the emitted output. An explicit user `LIMIT n`
+        // (`limit != usize::MAX`) is honored exactly. A no-LIMIT join
+        // (`usize::MAX`) must NOT silently truncate at a default cap: bound its
+        // output by the per-query byte budget instead, deriving a budget
+        // row-ceiling (`+1` to detect overflow) and surfacing a deterministic
+        // `ResourcesExhausted` if it is filled. A budget of 0 = unlimited.
+        let (probe_limit, enforce_output_budget) = if limit != usize::MAX {
+            (limit, false)
+        } else if budget == 0 {
+            (usize::MAX, false)
+        } else {
+            (
+                crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget),
+                true,
+            )
+        };
+
         let mut results: Vec<Vec<u8>> = Vec::new();
         let mut li = 0usize;
         let mut ri = 0usize;
         let mut right_matched: Vec<bool> = vec![false; right_docs.len()];
         while li < left_indices.len() && ri < right_indices.len() {
-            if results.len() >= limit {
+            if results.len() >= probe_limit {
                 break;
             }
             let left_idx = left_indices[li];
@@ -210,7 +227,7 @@ impl CoreLoop {
 
                     'outer: for &lj_idx in &left_indices[li..left_end] {
                         for &rj_idx in &right_indices[ri..right_end] {
-                            if results.len() >= limit {
+                            if results.len() >= probe_limit {
                                 break 'outer;
                             }
                             right_matched[rj_idx] = true;
@@ -230,7 +247,7 @@ impl CoreLoop {
         }
 
         if is_left {
-            while li < left_indices.len() && results.len() < limit {
+            while li < left_indices.len() && results.len() < probe_limit {
                 let left_idx = left_indices[li];
                 results.push(merge_join_docs_binary(
                     &left_docs[left_idx].1,
@@ -243,7 +260,7 @@ impl CoreLoop {
         }
 
         if is_right {
-            while ri < right_indices.len() && results.len() < limit {
+            while ri < right_indices.len() && results.len() < probe_limit {
                 let right_idx = right_indices[ri];
                 if !right_matched[right_idx] {
                     results.push(merge_join_docs_binary(
@@ -255,6 +272,13 @@ impl CoreLoop {
                 }
                 ri += 1;
             }
+        }
+
+        // No-LIMIT join whose output filled the budget-derived ceiling: the
+        // result exceeds the byte budget, so surface a deterministic error
+        // rather than silently dropping the excess rows.
+        if enforce_output_budget && results.len() >= probe_limit {
+            return self.response_error(task, ErrorCode::ResourcesExhausted);
         }
 
         let payload = super::super::super::response_codec::encode_binary_rows(&results);

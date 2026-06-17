@@ -457,6 +457,169 @@ fn nested_loop_join_right_over_budget_surfaces_error() {
     );
 }
 
+// ── 3. No-LIMIT join: output bounded by byte budget, never truncated ──────────
+
+/// A no-LIMIT join (`limit == usize::MAX`) whose OUTPUT exceeds the byte budget
+/// must surface `ResourcesExhausted` — NOT a silent 10,000-row (or any) cap.
+///
+/// Strategy: a cross (nested-loop, no condition) join of two small sides whose
+/// individual byte totals fit the budget, but whose Cartesian product blows past
+/// the budget-derived output ceiling (floored at 1000 rows). 40 × 40 = 1600
+/// emitted rows ≥ 1000 → the post-emit budget check fires.
+#[test]
+fn no_limit_join_output_over_budget_surfaces_error() {
+    let mut ctx = make_ctx();
+
+    // Budget large enough that each 40-row side fits, but < 16 KiB so the
+    // unbounded output ceiling stays at its 1000-row floor.
+    ctx.core
+        .set_query_tuning(nodedb_types::config::tuning::QueryTuning {
+            max_scan_result_bytes: 4096,
+            ..nodedb_types::config::tuning::QueryTuning::default()
+        });
+
+    batch_kv(&mut ctx, "nolim_left", 40);
+    batch_kv(&mut ctx, "nolim_right", 40);
+
+    let resp = send_raw(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        PhysicalPlan::Query(QueryOp::NestedLoopJoin {
+            left_collection: "nolim_left".into(),
+            right_collection: "nolim_right".into(),
+            // Cross join (no condition) → 40 × 40 = 1600 output rows.
+            condition: Vec::new(),
+            join_type: "inner".into(),
+            // usize::MAX = no SQL LIMIT — output bounded by the byte budget.
+            limit: usize::MAX,
+        }),
+    );
+
+    assert_eq!(
+        resp.status,
+        Status::Error,
+        "no-LIMIT join over output budget must error, not silently truncate"
+    );
+    assert_eq!(
+        resp.error_code,
+        Some(ErrorCode::ResourcesExhausted),
+        "expected ResourcesExhausted, got {:?}",
+        resp.error_code
+    );
+}
+
+/// A no-LIMIT join whose output comfortably fits the budget returns ALL rows —
+/// and crucially returns MORE than the old hard-coded 10,000 cap, proving the
+/// silent cap is gone. Budget 0 = unlimited.
+///
+/// Strategy: an inner equi-join of 12,000 left rows against 12,000 right rows
+/// on matching keys → 12,000 matched rows (> 10,000). With `limit == usize::MAX`
+/// and budget 0, every matched row must come back.
+#[test]
+fn no_limit_join_within_budget_returns_all_rows_past_10k() {
+    let mut ctx = make_ctx();
+
+    // Unlimited budget so the only thing that could cap output is the old bug.
+    ctx.core
+        .set_query_tuning(nodedb_types::config::tuning::QueryTuning {
+            max_scan_result_bytes: 0,
+            ..nodedb_types::config::tuning::QueryTuning::default()
+        });
+
+    let n = 12_000usize;
+    batch_kv(&mut ctx, "allrows_left", n);
+    batch_kv(&mut ctx, "allrows_right", n);
+
+    let payload = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        PhysicalPlan::Query(QueryOp::HashJoin {
+            left_collection: "allrows_left".into(),
+            right_collection: "allrows_right".into(),
+            left_alias: None,
+            right_alias: None,
+            on: vec![("key".into(), "key".into())],
+            join_type: "inner".into(),
+            // No SQL LIMIT.
+            limit: usize::MAX,
+            post_group_by: Vec::new(),
+            post_aggregates: Vec::new(),
+            projection: Vec::new(),
+            post_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
+            left_bitmap: None,
+            right_bitmap: None,
+        }),
+    );
+
+    let json = payload_value(&payload);
+    let rows = json
+        .as_array()
+        .unwrap_or_else(|| panic!("expected JSON array, got {json}"));
+    assert_eq!(
+        rows.len(),
+        n,
+        "no-LIMIT join with unlimited budget must return all {n} rows (old 10k cap is gone); got {}",
+        rows.len()
+    );
+}
+
+/// An explicit `LIMIT k` is honored exactly regardless of budget — at most `k`
+/// rows, and the (much larger) byte-budget output check does NOT fire.
+#[test]
+fn explicit_limit_join_caps_at_k_regardless_of_budget() {
+    let mut ctx = make_ctx();
+
+    // Unlimited budget: only the explicit LIMIT should bound the output.
+    ctx.core
+        .set_query_tuning(nodedb_types::config::tuning::QueryTuning {
+            max_scan_result_bytes: 0,
+            ..nodedb_types::config::tuning::QueryTuning::default()
+        });
+
+    let n = 5_000usize;
+    batch_kv(&mut ctx, "explim_left", n);
+    batch_kv(&mut ctx, "explim_right", n);
+
+    let k = 25usize;
+    let payload = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        PhysicalPlan::Query(QueryOp::HashJoin {
+            left_collection: "explim_left".into(),
+            right_collection: "explim_right".into(),
+            left_alias: None,
+            right_alias: None,
+            on: vec![("key".into(), "key".into())],
+            join_type: "inner".into(),
+            // Explicit LIMIT k — honored exactly.
+            limit: k,
+            post_group_by: Vec::new(),
+            post_aggregates: Vec::new(),
+            projection: Vec::new(),
+            post_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
+            left_bitmap: None,
+            right_bitmap: None,
+        }),
+    );
+
+    let json = payload_value(&payload);
+    let rows = json
+        .as_array()
+        .unwrap_or_else(|| panic!("expected JSON array, got {json}"));
+    assert!(
+        rows.len() <= k,
+        "explicit LIMIT {k} join must return at most {k} rows; got {}",
+        rows.len()
+    );
+}
+
 /// Budget of 0 is unlimited — a large join must complete without error.
 #[test]
 fn join_budget_zero_is_unlimited() {

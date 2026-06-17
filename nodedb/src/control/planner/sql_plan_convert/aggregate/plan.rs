@@ -116,7 +116,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
                 right_alias,
                 on: on_keys,
                 join_type: effective_join_type,
-                limit: *join_limit,
+                // `Option<usize>` → `usize` sentinel: `usize::MAX` = no SQL
+                // LIMIT (handler bounds output by the byte budget); `Some(n)` =
+                // explicit `LIMIT n`. Mirrors the plain-join converter.
+                limit: join_limit.unwrap_or(usize::MAX),
                 post_group_by: group_strs,
                 post_aggregates: agg_pairs,
                 projection: Vec::new(),

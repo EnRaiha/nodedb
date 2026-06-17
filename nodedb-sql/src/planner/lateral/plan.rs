@@ -93,7 +93,7 @@ pub fn plan_lateral_join(
                 JoinType::Inner
             },
             condition: None,
-            limit: 10000,
+            limit: None,
             projection: outer_projection,
             filters: Vec::new(),
         })
