@@ -209,7 +209,14 @@ impl CoreLoop {
                     filtered
                 } else if filtered.len() <= self.query_tuning.sort_run_size {
                     let mut v = filtered;
-                    sort::sort_rows(&mut v, sort_keys);
+                    if let Err(e) = sort::sort_rows(&mut v, sort_keys) {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("in-memory sort failed: {e}"),
+                            },
+                        );
+                    }
                     v
                 } else {
                     match self.external_sort(filtered, sort_keys, limit.saturating_add(offset)) {

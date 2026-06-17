@@ -54,7 +54,7 @@ impl CoreLoop {
 
         for (run_idx, chunk) in rows.chunks(self.query_tuning.sort_run_size).enumerate() {
             let mut run: Vec<(String, Vec<u8>)> = chunk.to_vec();
-            sort_rows(&mut run, sort_keys);
+            sort_rows(&mut run, sort_keys)?;
 
             // Build the framed run into one buffer and write it in a single
             // pass. Writing each tiny frame field separately would be hundreds
@@ -192,9 +192,9 @@ type SortKeyOffsets = Vec<Option<(usize, usize)>>;
 pub(in crate::data::executor) fn sort_rows(
     rows: &mut [(String, Vec<u8>)],
     sort_keys: &[(String, bool)],
-) {
+) -> crate::Result<()> {
     if sort_keys.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Pre-extract sort key offsets for all rows — one scan per row instead
@@ -224,7 +224,7 @@ pub(in crate::data::executor) fn sort_rows(
     // Apply permutation in-place. `key_offsets` is no longer needed after
     // sorting the index; it is dropped here.
     drop(key_offsets);
-    apply_permutation(rows, indices);
+    apply_permutation(rows, indices)
 }
 
 /// Compare two docs using pre-extracted sort key offsets.
@@ -253,22 +253,33 @@ fn compare_with_preextracted(
 /// Apply a permutation to rows using the sorted index order.
 ///
 /// `indices[i]` = the original row index that should appear at position `i`.
-fn apply_permutation(rows: &mut [(String, Vec<u8>)], indices: Vec<usize>) {
+///
+/// Returns `Err` if `indices` is not a valid permutation of `0..rows.len()`:
+/// an out-of-range index or a duplicate (slot already consumed) both surface as
+/// `crate::Error::Internal` rather than silently producing sentinel rows.
+fn apply_permutation(rows: &mut [(String, Vec<u8>)], indices: Vec<usize>) -> crate::Result<()> {
     // Wrap each row in `Option` so we can move individual elements out by
     // index without cloning. Each slot is taken exactly once during the
     // scatter, so no element is ever double-moved.
     let mut src: Vec<Option<(String, Vec<u8>)>> =
         rows.iter_mut().map(|r| Some(std::mem::take(r))).collect();
+    let n = src.len();
     for (target_pos, &src_idx) in indices.iter().enumerate() {
-        // `indices` is always a permutation of `0..rows.len()`, so every slot
-        // is taken exactly once. The `None` arm is unreachable in practice;
-        // the debug assert catches logic regressions in tests.
-        debug_assert!(
-            src[src_idx].is_some(),
-            "apply_permutation: duplicate index {src_idx}"
-        );
-        rows[target_pos] = src[src_idx].take().unwrap_or_default();
+        // Checked access: out-of-range index is an invariant violation.
+        let slot = src.get_mut(src_idx).ok_or_else(|| crate::Error::Internal {
+            detail: format!(
+                "apply_permutation: index {src_idx} out of range (len={n}, target_pos={target_pos})"
+            ),
+        })?;
+        // None means this slot was already consumed — duplicate index in `indices`.
+        let row = slot.take().ok_or_else(|| crate::Error::Internal {
+            detail: format!(
+                "apply_permutation: duplicate index {src_idx} at target_pos={target_pos} (len={n})"
+            ),
+        })?;
+        rows[target_pos] = row;
     }
+    Ok(())
 }
 
 /// Read backend for a sort run: io_uring streaming on Linux, blocking
@@ -426,7 +437,7 @@ mod tests {
                 encode(&serde_json::json!({"id": "c", "val": 20})),
             ),
         ];
-        sort_rows(&mut rows, &[("val".into(), true)]);
+        sort_rows(&mut rows, &[("val".into(), true)]).expect("sort_rows failed");
         let order: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(order, vec!["b", "c", "a"], "ASC by val: 10, 20, 30");
     }
@@ -447,7 +458,7 @@ mod tests {
                 encode(&serde_json::json!({"id": "c", "val": 20})),
             ),
         ];
-        sort_rows(&mut rows, &[("val".into(), false)]);
+        sort_rows(&mut rows, &[("val".into(), false)]).expect("sort_rows failed");
         assert_eq!(rows[0].0, "a", "DESC first should be a (val=30)");
         assert_eq!(rows[1].0, "c", "DESC second should be c (val=20)");
         assert_eq!(rows[2].0, "b", "DESC third should be b (val=10)");
@@ -469,9 +480,48 @@ mod tests {
                 encode(&serde_json::json!({"id": "3", "name": "Bob"})),
             ),
         ];
-        sort_rows(&mut rows, &[("name".into(), true)]);
+        sort_rows(&mut rows, &[("name".into(), true)]).expect("sort_rows failed");
         assert_eq!(rows[0].0, "2", "first should be Alice");
         assert_eq!(rows[2].0, "1", "last should be Charlie");
+    }
+
+    // --- apply_permutation invariant tests ---
+
+    #[test]
+    fn apply_permutation_valid_reorders_correctly() {
+        // Permutation [2, 0, 1] moves row at index 2 → pos 0, index 0 → pos 1, index 1 → pos 2.
+        let mut rows: Vec<(String, Vec<u8>)> = vec![
+            ("a".into(), vec![1]),
+            ("b".into(), vec![2]),
+            ("c".into(), vec![3]),
+        ];
+        apply_permutation(&mut rows, vec![2, 0, 1]).expect("valid permutation must succeed");
+        assert_eq!(rows[0].0, "c");
+        assert_eq!(rows[1].0, "a");
+        assert_eq!(rows[2].0, "b");
+    }
+
+    #[test]
+    fn apply_permutation_duplicate_index_errors_not_sentinel() {
+        // indices [0, 0] is NOT a valid permutation of [0, 1].
+        // The second use of index 0 must return Err, not silently write ("", []).
+        let mut rows: Vec<(String, Vec<u8>)> = vec![("x".into(), vec![10]), ("y".into(), vec![20])];
+        let result = apply_permutation(&mut rows, vec![0, 0]);
+        assert!(
+            result.is_err(),
+            "duplicate index must return Err, not a silent sentinel row"
+        );
+    }
+
+    #[test]
+    fn apply_permutation_out_of_range_index_errors() {
+        // index 5 is out of range for a 2-element slice.
+        let mut rows: Vec<(String, Vec<u8>)> = vec![("x".into(), vec![10]), ("y".into(), vec![20])];
+        let result = apply_permutation(&mut rows, vec![0, 5]);
+        assert!(
+            result.is_err(),
+            "out-of-range index must return Err, not panic"
+        );
     }
 }
 

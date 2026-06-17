@@ -140,10 +140,17 @@ impl CoreLoop {
             let scan_result = self.scan_collection(tid, collection, limit.max(1000));
             match scan_result {
                 Ok(mut docs) => {
-                    super::super::document::sort::sort_rows(
+                    if let Err(e) = super::super::document::sort::sort_rows(
                         &mut docs,
                         &[(field.to_string(), true)],
-                    );
+                    ) {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("in-memory sort failed: {e}"),
+                            },
+                        );
+                    }
                     docs.truncate(limit);
                     // Raw msgpack passthrough — no decode/re-encode.
                     let rows: Vec<_> = docs
