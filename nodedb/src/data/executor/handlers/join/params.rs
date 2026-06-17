@@ -76,16 +76,68 @@ pub(crate) struct SortMergeJoinParams<'a> {
     pub pre_sorted: bool,
 }
 
+// ── Test helpers ─────────────────────────────────────────────────────────────
+//
+// `filter_and_project` only reads `self.post_filter_bytes` and
+// `self.projection`; it never dereferences `self.task`. The unit tests below
+// construct a `JoinParams` with a minimal `ExecutionTask` so they can call the
+// method directly without a live `CoreLoop`.
+#[cfg(test)]
+fn make_dummy_task() -> ExecutionTask {
+    use crate::bridge::envelope::{PhysicalPlan, Priority};
+    use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+    use nodedb_physical::physical_plan::DocumentOp;
+    use std::time::{Duration, Instant};
+
+    let request = crate::bridge::envelope::Request {
+        request_id: RequestId::new(1),
+        tenant_id: TenantId::new(0),
+        database_id: DatabaseId::DEFAULT,
+        vshard_id: VShardId::new(0),
+        plan: PhysicalPlan::Document(DocumentOp::PointGet {
+            collection: "test".into(),
+            document_id: "dummy".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            rls_filters: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        }),
+        deadline: Instant::now() + Duration::from_secs(30),
+        priority: Priority::Normal,
+        trace_id: TraceId::generate(),
+        consistency: ReadConsistency::Strong,
+        idempotency_key: None,
+        event_source: crate::event::EventSource::User,
+        user_roles: Vec::new(),
+        user_id: None,
+        statement_digest: None,
+    };
+    ExecutionTask::new(request)
+}
+
 impl JoinParams<'_> {
     /// Apply post-join WHERE filters and projection to result rows.
     ///
     /// Shared tail logic for hash joins and lateral joins:
     /// deserializes post-filter predicates, retains matching rows, then
     /// applies column projection — all on raw msgpack bytes.
-    pub fn filter_and_project(&self, results: &mut Vec<Vec<u8>>) {
+    ///
+    /// Returns `Ok(())` on success. Returns `Err` when `post_filter_bytes` is
+    /// non-empty but fails to deserialize — a corrupt predicate payload must
+    /// surface as an error rather than silently skipping the filter and
+    /// returning rows that should have been excluded.
+    ///
+    /// An empty `post_filter_bytes` slice is a no-op and always returns `Ok(())`.
+    pub fn filter_and_project(&self, results: &mut Vec<Vec<u8>>) -> crate::Result<()> {
         if !self.post_filter_bytes.is_empty() {
             let filters: Vec<ScanFilter> =
-                zerompk::from_msgpack(self.post_filter_bytes).unwrap_or_default();
+                zerompk::from_msgpack(self.post_filter_bytes).map_err(|e| {
+                    crate::Error::Serialization {
+                        format: "msgpack".into(),
+                        detail: format!("decode join post-filters: {e}"),
+                    }
+                })?;
             if !filters.is_empty() {
                 results.retain(|row| super::binary_row_matches_filters(row, &filters));
             }
@@ -96,5 +148,110 @@ impl JoinParams<'_> {
                 *row = super::binary_row_project(row, self.projection);
             }
         }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A row containing a msgpack map `{"score": N}` — encoded via json_to_msgpack
+    // so the byte layout matches what msgpack_scan::extract_field (used inside
+    // matches_binary) expects: standard fixmap/map16/map32 headers, fixstr keys.
+    fn row_with_score(score: i64) -> Vec<u8> {
+        nodedb_types::json_to_msgpack(&serde_json::json!({"score": score}))
+            .expect("encode test row")
+    }
+
+    /// A valid msgpack-encoded `Vec<ScanFilter>` that keeps rows whose `score`
+    /// field equals `99`.
+    fn encode_eq99_filter() -> Vec<u8> {
+        use crate::bridge::scan_filter::{FilterOp, ScanFilter};
+
+        let filters = vec![ScanFilter {
+            field: "score".into(),
+            op: FilterOp::Eq,
+            value: nodedb_types::Value::Integer(99),
+            clauses: Vec::new(),
+            expr: None,
+        }];
+        zerompk::to_msgpack_vec(&filters).expect("encode filters")
+    }
+
+    // ── Core behaviour ────────────────────────────────────────────────────────
+
+    /// Empty `post_filter_bytes` → `Ok(())` no-op: results unchanged.
+    #[test]
+    fn empty_post_filter_bytes_is_noop() {
+        let task = make_dummy_task();
+        let params = JoinParams {
+            task: &task,
+            on: &[],
+            join_type: "inner",
+            limit: usize::MAX,
+            projection: &[],
+            post_filter_bytes: &[],
+        };
+        let mut results = vec![vec![1u8, 2, 3], vec![4u8, 5, 6]];
+        assert!(params.filter_and_project(&mut results).is_ok());
+        // Results are untouched.
+        assert_eq!(results.len(), 2);
+    }
+
+    /// Non-empty but corrupt `post_filter_bytes` → `Err`, results NOT silently
+    /// left unfiltered. This is the anti-pattern the fix addresses.
+    #[test]
+    fn corrupt_post_filter_bytes_returns_err_not_silent_noop() {
+        let task = make_dummy_task();
+        let corrupt: &[u8] = b"\xff\xfe\xfd this is not valid msgpack \x00";
+        let params = JoinParams {
+            task: &task,
+            on: &[],
+            join_type: "inner",
+            limit: usize::MAX,
+            projection: &[],
+            post_filter_bytes: corrupt,
+        };
+        let mut results = vec![vec![0u8; 8]]; // would be "leaked" under the old code
+        let err = params.filter_and_project(&mut results);
+        assert!(
+            err.is_err(),
+            "corrupt post-filter bytes must return Err, not silently skip the filter"
+        );
+        // Verify the error identifies the decode failure.
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("decode join post-filters") || msg.contains("serialization"),
+            "error message should identify the decode failure, got: {msg}"
+        );
+    }
+
+    /// Valid encoded filters → matching rows retained, non-matching rows dropped
+    /// (happy path unchanged).
+    #[test]
+    fn valid_post_filter_retains_matching_rows() {
+        let task = make_dummy_task();
+        let filter_bytes = encode_eq99_filter();
+        let params = JoinParams {
+            task: &task,
+            on: &[],
+            join_type: "inner",
+            limit: usize::MAX,
+            projection: &[],
+            post_filter_bytes: &filter_bytes,
+        };
+        let mut results = vec![
+            row_with_score(99), // should be kept
+            row_with_score(42), // should be dropped
+            row_with_score(99), // should be kept
+        ];
+        assert!(params.filter_and_project(&mut results).is_ok());
+        assert_eq!(
+            results.len(),
+            2,
+            "only the two score=99 rows should survive the filter"
+        );
     }
 }

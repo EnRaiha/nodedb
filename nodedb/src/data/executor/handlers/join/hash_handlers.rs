@@ -330,7 +330,14 @@ impl CoreLoop {
             return self.response_error(join.task, ErrorCode::ResourcesExhausted);
         }
 
-        join.filter_and_project(&mut results);
+        if let Err(e) = join.filter_and_project(&mut results) {
+            return self.response_error(
+                join.task,
+                ErrorCode::Internal {
+                    detail: e.to_string(),
+                },
+            );
+        }
 
         let payload = super::super::super::response_codec::encode_binary_rows(&results);
         self.response_with_payload(join.task, payload)
