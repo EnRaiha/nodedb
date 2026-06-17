@@ -12,6 +12,7 @@ mod hash_handlers;
 pub mod lateral;
 pub mod nested_loop;
 pub mod params;
+mod row_source;
 pub mod sort_merge;
 mod spill;
 mod support;

@@ -52,6 +52,7 @@ use super::grace_partitioner::GraceSpec;
 use super::grace_spill::PartitionedSpiller;
 use super::hash::{HashIndex, ProbeParams, emit_unmatched_right_into, probe_rows_into};
 use super::params::JoinParams;
+use super::row_source::RowSource;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::scan_budget::budget_exceeded;
@@ -244,7 +245,11 @@ impl CoreLoop {
         // Buffering to Spilling exactly once, the first time the running byte
         // total crosses `budget` (matching `scan_bytes_exceeded`: id + value
         // bytes, strict `>`).
-        self.scan_collection_for_each(tid, right_collection, |id, bytes| {
+        let build_source = RowSource::LocalScan {
+            tenant_id: tid,
+            collection: right_collection.to_string(),
+        };
+        build_source.for_each(self, |id, bytes| {
             // Append this row to the active side. When a buffering side crosses
             // budget, `mem::take` the buffered rows out (leaving the buffer empty)
             // and return them so we transition Buffering → Spilling exactly once.
@@ -318,9 +323,11 @@ impl CoreLoop {
                 // error we still remove the spill dir below by routing through the
                 // shared cleanup tail.
                 let probe_result = (|| -> crate::Result<Vec<Vec<u8>>> {
-                    self.scan_collection_for_each(tid, left_collection, |_id, bytes| {
-                        spiller.push_probe(bytes)
-                    })?;
+                    let spill_probe_source = RowSource::LocalScan {
+                        tenant_id: tid,
+                        collection: left_collection.to_string(),
+                    };
+                    spill_probe_source.for_each(self, |_id, bytes| spiller.push_probe(bytes))?;
                     spiller.finish_and_probe()
                 })();
 
@@ -409,7 +416,11 @@ impl CoreLoop {
             *batch_bytes = 0;
         };
 
-        self.scan_collection_for_each(tid, left_collection, |id, bytes| {
+        let stream_probe_source = RowSource::LocalScan {
+            tenant_id: tid,
+            collection: left_collection.to_string(),
+        };
+        stream_probe_source.for_each(self, |id, bytes| {
             batch_bytes = batch_bytes
                 .saturating_add(bytes.len())
                 .saturating_add(id.len());
