@@ -386,6 +386,13 @@ fn apply_limit(mut plan: SqlPlan, limit_clause: &Option<ast::LimitClause>) -> Sq
                     .unwrap_or(lv * DEFAULT_EF_SEARCH_MULTIPLIER);
             }
         }
+        SqlPlan::Join {
+            limit: ref mut l, ..
+        } => {
+            if let Some(lv) = limit_val {
+                *l = lv;
+            }
+        }
         _ => {}
     }
     plan
@@ -418,5 +425,72 @@ impl SqlCatalog for CteCatalog<'_> {
             }));
         }
         self.inner.get_collection(database_id, name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::plan::SqlPlan;
+    use crate::types::query::{EngineType, JoinType};
+    use crate::temporal::TemporalScope;
+
+    fn minimal_scan() -> SqlPlan {
+        SqlPlan::Scan {
+            collection: "t".into(),
+            alias: None,
+            engine: EngineType::DocumentSchemaless,
+            filters: vec![],
+            projection: vec![],
+            sort_keys: vec![],
+            limit: None,
+            offset: 0,
+            distinct: false,
+            window_functions: vec![],
+            temporal: TemporalScope::default(),
+        }
+    }
+
+    fn join_plan_with_limit(limit: usize) -> SqlPlan {
+        SqlPlan::Join {
+            left: Box::new(minimal_scan()),
+            right: Box::new(minimal_scan()),
+            on: vec![],
+            join_type: JoinType::Inner,
+            condition: None,
+            limit,
+            projection: vec![],
+            filters: vec![],
+        }
+    }
+
+    fn limit_clause(n: usize) -> Option<ast::LimitClause> {
+        Some(ast::LimitClause::LimitOffset {
+            limit: Some(ast::Expr::Value(
+                ast::Value::Number(n.to_string(), false).into(),
+            )),
+            offset: None,
+            limit_by: vec![],
+        })
+    }
+
+    #[test]
+    fn apply_limit_sets_join_limit() {
+        let plan = join_plan_with_limit(10000);
+        let result = apply_limit(plan, &limit_clause(5));
+        match result {
+            SqlPlan::Join { limit, .. } => assert_eq!(limit, 5),
+            other => panic!("expected SqlPlan::Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_limit_none_leaves_join_limit_unchanged() {
+        let plan = join_plan_with_limit(10000);
+        let result = apply_limit(plan, &None);
+        match result {
+            SqlPlan::Join { limit, .. } => assert_eq!(limit, 10000),
+            other => panic!("expected SqlPlan::Join, got {other:?}"),
+        }
     }
 }
