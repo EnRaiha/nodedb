@@ -12,12 +12,15 @@
 //!    side into a grace-hash partitioner that spills to disk, streams the probe
 //!    side through it, and COMPLETES with the full, correct result set.
 //! 3. **Deterministic error over budget (remaining cases)** — when a side that
-//!    is NOT covered by the build-side spill path exceeds the byte budget, the
-//!    join still returns `ResourcesExhausted` (never a truncated success). This
-//!    currently covers the hash-join PROBE (left) side, and both sides of the
-//!    nested-loop and sort-merge handlers. Streaming the hash-join probe side
-//!    against the in-memory build index (so an over-budget probe side also
-//!    completes) is the next increment of the memory-bounded-join work.
+//!    is NOT covered by the memory-bounded hash-join path exceeds the byte
+//!    budget, the join still returns `ResourcesExhausted` (never a truncated
+//!    success). This now covers both sides of the nested-loop and sort-merge
+//!    handlers. The hash-join handler, when both sides are plain local scans,
+//!    COMPLETES for an over-budget side of EITHER kind: an over-budget build
+//!    (right) side spills to a grace-hash partitioner; an over-budget probe
+//!    (left) side is streamed in bounded batches against the in-memory build
+//!    index. (A no-LIMIT join whose OUTPUT exceeds the byte budget still
+//!    surfaces `ResourcesExhausted` — see property-bound tests below.)
 
 use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb::bridge::scan_filter::{FilterOp, ScanFilter};
@@ -219,17 +222,20 @@ fn nested_loop_join_completeness_past_50k_cap() {
 
 // ── 2. Deterministic error when a side exceeds the byte budget ────────────────
 
-/// Hash join: left side (probe) over budget → `ResourcesExhausted`.
+/// Hash join: left side (PROBE) over budget, both sides local → the join
+/// STREAMS the probe side in bounded batches against the in-memory build index
+/// and COMPLETES with the correct result — it does NOT surface
+/// `ResourcesExhausted`.
 ///
-/// This exercises the probe-side guard. The build (right) side here is tiny
-/// (1 row), so the grace-hash build-side spill path does NOT engage (the build
-/// side never crosses budget); the join falls through to the in-memory path,
-/// which materializes the probe side and surfaces the over-budget error. This
-/// is the current memory-bounded-join boundary: streaming the probe side
-/// against the in-memory build index (so this case also completes instead of
-/// erroring) is the next increment.
+/// Setup: large left side (500 rows `k0..k499`, whose byte total far exceeds
+/// the 256-byte budget) joined against a single right row `k0`. The build
+/// (right) side fits budget so the build buffers in RAM; the over-budget probe
+/// side is streamed batch-by-batch against that index. The inner equi-join on
+/// `key` matches exactly one pair (`k0`), so the streamed-and-completed result
+/// must be exactly 1 row — proving the streamed probe produces the correct
+/// join, not merely a non-error response.
 #[test]
-fn hash_join_left_side_over_budget_surfaces_error() {
+fn hash_join_left_side_over_budget_streams_and_completes() {
     let mut ctx = make_ctx();
 
     // Tiny budget: 256 bytes — easily exceeded by even a handful of rows.
@@ -239,11 +245,11 @@ fn hash_join_left_side_over_budget_surfaces_error() {
             ..nodedb_types::config::tuning::QueryTuning::default()
         });
 
-    // Large left side; small right side.
+    // Large left (probe) side; small right (build) side that fits budget.
     batch_kv(&mut ctx, "bgt_left", 500);
     batch_kv(&mut ctx, "bgt_right", 1);
 
-    let resp = send_raw(
+    let payload = send_ok(
         &mut ctx.core,
         &mut ctx.tx,
         &mut ctx.rx,
@@ -266,16 +272,16 @@ fn hash_join_left_side_over_budget_surfaces_error() {
         }),
     );
 
+    let json = payload_value(&payload);
+    let rows = json
+        .as_array()
+        .unwrap_or_else(|| panic!("expected JSON array, got {json}"));
     assert_eq!(
-        resp.status,
-        Status::Error,
-        "over-budget left side must surface an error, not a partial result"
-    );
-    assert_eq!(
-        resp.error_code,
-        Some(ErrorCode::ResourcesExhausted),
-        "expected ResourcesExhausted, got {:?}",
-        resp.error_code
+        rows.len(),
+        1,
+        "over-budget probe side must stream and complete with the one matching \
+         row (k0); got {} rows",
+        rows.len()
     );
 }
 
@@ -393,6 +399,76 @@ fn hash_join_build_side_spill_returns_all_matches_across_partitions() {
         rows.len(),
         n,
         "build-side spill across partitions must return all {n} matches; got {}",
+        rows.len()
+    );
+}
+
+/// Hash join PROBE-side streaming, MANY matches: a both-local inner join whose
+/// BUILD (right) side fits the byte budget but whose PROBE (left) side far
+/// exceeds it must stream the probe in bounded batches against the in-memory
+/// build index and still return EVERY matching row — proving the batched probe
+/// is complete (no dropped batches, no truncated runs) and that the global
+/// output limit / match logic accumulate correctly across batches.
+///
+/// Sizing (documented to satisfy "build ≤ budget < probe bytes"):
+/// - Budget = 4096 bytes.
+/// - Build (right) = 50 keys `k0..k49`. Each KV row contributes its id
+///   (`"kN"`, 2-3 bytes) plus its injected-`key` msgpack value (~12-15 bytes),
+///   so the 50-row build total (~750-900 bytes) sits well UNDER 4096 → the
+///   build side buffers in RAM (does not spill).
+/// - Probe (left) = 4000 keys `k0..k3999`. Its byte total (~60 KiB) far EXCEEDS
+///   4096 → the probe side is streamed in bounded ≤budget batches against the
+///   in-memory build index.
+///
+/// The inner equi-join on `key` matches `k0..k49` = exactly 50 rows. The
+/// explicit large LIMIT means the output is not budget-capped, so all 50 rows
+/// must come back.
+#[test]
+fn hash_join_probe_side_spill_returns_all_matches() {
+    let mut ctx = make_ctx();
+
+    ctx.core
+        .set_query_tuning(nodedb_types::config::tuning::QueryTuning {
+            max_scan_result_bytes: 4096,
+            ..nodedb_types::config::tuning::QueryTuning::default()
+        });
+
+    // Build (right) fits budget; probe (left) is far over budget.
+    batch_kv(&mut ctx, "pspill_right", 50);
+    batch_kv(&mut ctx, "pspill_left", 4000);
+
+    let payload = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        PhysicalPlan::Query(QueryOp::HashJoin {
+            left_collection: "pspill_left".into(),
+            right_collection: "pspill_right".into(),
+            left_alias: None,
+            right_alias: None,
+            on: vec![("key".into(), "key".into())],
+            join_type: "inner".into(),
+            limit: 1_000_000,
+            post_group_by: Vec::new(),
+            post_aggregates: Vec::new(),
+            projection: Vec::new(),
+            post_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
+            left_bitmap: None,
+            right_bitmap: None,
+        }),
+    );
+
+    let json = payload_value(&payload);
+    let rows = json
+        .as_array()
+        .unwrap_or_else(|| panic!("expected JSON array, got {json}"));
+    assert_eq!(
+        rows.len(),
+        50,
+        "probe-side streaming must return all 50 matches (k0..k49) across \
+         batches; got {}",
         rows.len()
     );
 }

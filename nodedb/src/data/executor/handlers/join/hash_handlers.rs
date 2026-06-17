@@ -81,11 +81,15 @@ impl CoreLoop {
         });
 
         // Memory-bounded completion path. Only when BOTH sides are plain local
-        // scans can we stream them: the build side buffers under budget (falling
-        // through to the unchanged in-memory path with byte-identical ordering)
-        // or, on crossing budget, spills to a grace-hash partitioner that
-        // streams the probe side and COMPLETES the join instead of returning
-        // `ResourcesExhausted`.
+        // scans can we stream them. For every both-local, NON-CROSS join this
+        // returns `Some` and COMPLETES the join without ever surfacing
+        // `ResourcesExhausted` for over-input-budget: the build side buffers
+        // under budget then streams the probe in bounded batches against the
+        // in-memory index, or — on crossing budget — spills to a grace-hash
+        // partitioner that streams the probe side. It returns `None` ONLY for a
+        // cross / keyless join (declared deferral: cross-join probe streaming is
+        // a separate unit), in which case the caller falls through to the
+        // unchanged in-memory path below (which handles the cartesian product).
         if both_sides_local
             && let Some(resp) = self.try_grace_hash_join(
                 &join,

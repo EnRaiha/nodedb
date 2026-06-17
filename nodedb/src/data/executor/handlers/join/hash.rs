@@ -114,11 +114,15 @@ pub(super) struct ProbeParams<'a> {
 ///
 /// Returns binary msgpack rows — no JSON decode.
 /// Uses u64 hash keys — zero String allocation for key matching.
+///
+/// This is the single-shot (fully-materialized probe side) entry point. It is
+/// composed from the streaming-friendly pieces [`probe_rows_into`] and
+/// [`emit_unmatched_right_into`] so that the grace-hash streaming path can reuse
+/// the EXACT same emission logic batch-by-batch without duplicating it. The
+/// composed behavior here is byte-identical to passing the whole probe side in a
+/// single batch.
 pub(super) fn probe_hash_index(p: &ProbeParams<'_>) -> Vec<Vec<u8>> {
-    let is_left = p.join_type == "left" || p.join_type == "full";
     let is_right = p.join_type == "right" || p.join_type == "full";
-    let is_semi = p.join_type == "semi";
-    let is_anti = p.join_type == "anti";
     let is_cross = p.join_type == "cross";
 
     // Cross join: cartesian product (no hash lookup needed).
@@ -150,6 +154,43 @@ pub(super) fn probe_hash_index(p: &ProbeParams<'_>) -> Vec<Vec<u8>> {
         Vec::new()
     };
     let mut results = Vec::new();
+
+    probe_rows_into(p, &mut results, &mut index_matched);
+
+    // RIGHT/FULL: emit unmatched index-side rows.
+    if is_right && p.emit_unmatched_right {
+        emit_unmatched_right_into(p, &mut results, &index_matched);
+    }
+
+    results
+}
+
+/// Append join output for the probe rows in `p.probe_docs` to `results`,
+/// marking `index_matched` for RIGHT/FULL hits.
+///
+/// This is the per-probe-row emission loop body factored out of
+/// [`probe_hash_index`]. It does NOT handle the cross-join cartesian product
+/// (the caller short-circuits that) and does NOT perform the unmatched-right
+/// sweep (call [`emit_unmatched_right_into`] separately, once, after all probe
+/// batches are processed).
+///
+/// `p.limit` is honored against the SHARED `results.len()`, so this is safe to
+/// call repeatedly with the same `results` for successive probe batches: the
+/// global output limit is enforced across batches, not per batch. Likewise
+/// `index_matched` is shared across batches so RIGHT/FULL match tracking
+/// accumulates correctly.
+///
+/// `index_matched` must be sized `p.index_docs.len()` for RIGHT/FULL joins (and
+/// may be empty otherwise — it is only indexed when the join is RIGHT/FULL).
+pub(super) fn probe_rows_into(
+    p: &ProbeParams<'_>,
+    results: &mut Vec<Vec<u8>>,
+    index_matched: &mut [bool],
+) {
+    let is_left = p.join_type == "left" || p.join_type == "full";
+    let is_right = p.join_type == "right" || p.join_type == "full";
+    let is_semi = p.join_type == "semi";
+    let is_anti = p.join_type == "anti";
 
     for (_, value) in p.probe_docs {
         // For RIGHT/FULL joins, we must complete the full probe to populate
@@ -192,24 +233,31 @@ pub(super) fn probe_hash_index(p: &ProbeParams<'_>) -> Vec<Vec<u8>> {
             ));
         }
     }
+}
 
-    // RIGHT/FULL: emit unmatched index-side rows.
-    // In broadcast mode, only the designated core emits these to avoid duplication.
-    if is_right && p.emit_unmatched_right {
-        for (i, (_, bytes)) in p.index_docs.iter().enumerate() {
-            if results.len() >= p.limit {
-                break;
-            }
-            if !index_matched[i] {
-                results.push(merge_join_docs_binary(
-                    &[],
-                    Some(bytes),
-                    "",
-                    p.index_collection,
-                ));
-            }
+/// Emit unmatched index-side (build/right) rows for RIGHT/FULL joins into
+/// `results`, honoring `p.limit` against the shared `results.len()`.
+///
+/// Call this exactly ONCE, after every probe batch has been fed through
+/// [`probe_rows_into`] with the shared `index_matched`. In broadcast mode only
+/// the designated core sets `p.emit_unmatched_right`; the caller is responsible
+/// for gating on that flag (this function unconditionally sweeps).
+pub(super) fn emit_unmatched_right_into(
+    p: &ProbeParams<'_>,
+    results: &mut Vec<Vec<u8>>,
+    index_matched: &[bool],
+) {
+    for (i, (_, bytes)) in p.index_docs.iter().enumerate() {
+        if results.len() >= p.limit {
+            break;
+        }
+        if !index_matched[i] {
+            results.push(merge_join_docs_binary(
+                &[],
+                Some(bytes),
+                "",
+                p.index_collection,
+            ));
         }
     }
-
-    results
 }
