@@ -433,9 +433,9 @@ impl SqlCatalog for CteCatalog<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::temporal::TemporalScope;
     use crate::types::plan::SqlPlan;
     use crate::types::query::{EngineType, JoinType};
-    use crate::temporal::TemporalScope;
 
     fn minimal_scan() -> SqlPlan {
         SqlPlan::Scan {

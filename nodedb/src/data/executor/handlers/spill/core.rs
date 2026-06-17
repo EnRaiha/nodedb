@@ -83,7 +83,9 @@ where
             detail: format!("spill serialize error: {e}"),
         })?;
 
-        let run_path = self.spill_dir.join(format!("run-{}.spill", self.spilled_runs));
+        let run_path = self
+            .spill_dir
+            .join(format!("run-{}.spill", self.spilled_runs));
         write_run_file(&run_path, &encoded)?;
 
         self.runs.push(run_path);
@@ -184,7 +186,10 @@ fn read_run_file(reader: &mut Option<UringReader>, path: &Path) -> crate::Result
         // empty run. Erroring here prevents silently dropping a run's rows.
         return Err(crate::Error::Storage {
             engine: "groupby_spill".into(),
-            detail: format!("spill run {} read back empty (read failure)", path.display()),
+            detail: format!(
+                "spill run {} read back empty (read failure)",
+                path.display()
+            ),
         });
     }
     Ok(buf)
@@ -263,7 +268,9 @@ mod tests {
         in_mem.insert("b".to_string(), 20);
         in_mem.insert("d".to_string(), 4);
 
-        let out = core.merge(&mut in_mem, 100, |dst, src| *dst += src).unwrap();
+        let out = core
+            .merge(&mut in_mem, 100, |dst, src| *dst += src)
+            .unwrap();
 
         // a: 1 + 10 = 11, b: 2 + 20 = 22, c: 3, d: 4.
         assert_eq!(out.get("a"), Some(&11));
@@ -284,7 +291,9 @@ mod tests {
 
         let mut in_mem: HashMap<String, u64> = HashMap::new();
         in_mem.insert("x".to_string(), 1);
-        let out = core.merge(&mut in_mem, 100, |dst, src| *dst += src).unwrap();
+        let out = core
+            .merge(&mut in_mem, 100, |dst, src| *dst += src)
+            .unwrap();
         assert_eq!(out.get("x"), Some(&1));
         assert_eq!(out.len(), 1);
     }
@@ -300,7 +309,9 @@ mod tests {
             .unwrap();
 
         let mut in_mem: HashMap<String, u64> = HashMap::new();
-        let out = core.merge(&mut in_mem, 100, |dst, src| *dst += src).unwrap();
+        let out = core
+            .merge(&mut in_mem, 100, |dst, src| *dst += src)
+            .unwrap();
         assert_eq!(out.get("k1"), Some(&5));
         assert_eq!(out.get("k2"), Some(&7));
         assert_eq!(out.len(), 2);

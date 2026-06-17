@@ -166,7 +166,11 @@ impl CoreLoop {
             (usize::MAX, false)
         } else {
             (
-                crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget),
+                crate::data::executor::handlers::scan_budget::fetch_limit_for(
+                    usize::MAX,
+                    0,
+                    budget,
+                ),
                 true,
             )
         };
