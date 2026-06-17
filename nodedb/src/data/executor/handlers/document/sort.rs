@@ -4,26 +4,36 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::io::{BufReader, BufWriter, Read as _, Write as _};
+use std::io::{BufReader, Read as _};
+use std::path::{Path, PathBuf};
 
 use tracing::debug;
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::io::uring_seq_reader::UringSeqReader;
+use crate::data::io::uring_writer::UringWriter;
 
 use nodedb_query::msgpack_scan;
 
 impl CoreLoop {
     /// External sort: split filtered rows into sorted runs, spill each run
-    /// to a temp file, then k-way merge to produce the final sorted output.
+    /// to a named per-run file written via io_uring, then k-way merge to
+    /// produce the final sorted output.
+    ///
+    /// Spill files are named (`run-N.spill`) and written through [`UringWriter`]
+    /// so the per-core io_uring reactor is never stalled by blocking `std::fs`
+    /// content writes. They are unlinked by [`SortSpillCleanup`] (a Drop guard),
+    /// not by tempfile auto-delete. The merge reads each run back incrementally
+    /// via [`UringSeqReader`] — one row at a time — so peak read memory is one
+    /// refill buffer per run, not the whole run.
     pub(super) fn external_sort(
         &self,
         rows: Vec<(String, Vec<u8>)>,
         sort_keys: &[(String, bool)],
         output_limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        // Spill directory for temporary sort run files. Temp files are
-        // auto-deleted on Drop; the directory persists but is cleaned up
-        // on the next external_sort call or server restart.
+        // Spill directory for the named sort run files. `create_dir_all` is a
+        // bounded metadata op (not bulk content I/O), so it stays `std::fs`.
         let spill_dir = self
             .data_dir
             .join(format!("sort-spill/core-{}", self.core_id));
@@ -34,84 +44,53 @@ impl CoreLoop {
 
         let total_rows = rows.len();
 
-        let mut run_files = Vec::new();
-        for chunk in rows.chunks(self.query_tuning.sort_run_size) {
+        // Declared FIRST so it Drops LAST — after the readers below close their
+        // fds — guaranteeing the spill files are unlinked only once no reader
+        // still holds them open.
+        let mut cleanup = SortSpillCleanup {
+            dir: spill_dir.clone(),
+            paths: Vec::new(),
+        };
+
+        for (run_idx, chunk) in rows.chunks(self.query_tuning.sort_run_size).enumerate() {
             let mut run: Vec<(String, Vec<u8>)> = chunk.to_vec();
             sort_rows(&mut run, sort_keys);
 
-            let file = tempfile::tempfile_in(&spill_dir).map_err(|e| crate::Error::Storage {
-                engine: "sort".into(),
-                detail: format!("failed to create sort temp file: {e}"),
-            })?;
-            let mut writer = BufWriter::new(file);
-
-            let count = run.len() as u32;
-            writer
-                .write_all(&count.to_le_bytes())
-                .map_err(|e| crate::Error::Storage {
-                    engine: "sort".into(),
-                    detail: format!("sort spill write: {e}"),
-                })?;
+            // Build the framed run into one buffer and write it in a single
+            // pass. Writing each tiny frame field separately would be hundreds
+            // of thousands of micro io_uring writes.
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&(run.len() as u32).to_le_bytes());
             for (id, val) in &run {
                 let id_bytes = id.as_bytes();
-                writer
-                    .write_all(&(id_bytes.len() as u32).to_le_bytes())
-                    .map_err(|e| crate::Error::Storage {
-                        engine: "sort".into(),
-                        detail: format!("sort spill write: {e}"),
-                    })?;
-                writer
-                    .write_all(id_bytes)
-                    .map_err(|e| crate::Error::Storage {
-                        engine: "sort".into(),
-                        detail: format!("sort spill write: {e}"),
-                    })?;
-                writer
-                    .write_all(&(val.len() as u32).to_le_bytes())
-                    .map_err(|e| crate::Error::Storage {
-                        engine: "sort".into(),
-                        detail: format!("sort spill write: {e}"),
-                    })?;
-                writer.write_all(val).map_err(|e| crate::Error::Storage {
-                    engine: "sort".into(),
-                    detail: format!("sort spill write: {e}"),
-                })?;
+                framed.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+                framed.extend_from_slice(id_bytes);
+                framed.extend_from_slice(&(val.len() as u32).to_le_bytes());
+                framed.extend_from_slice(val);
             }
-            writer.flush().map_err(|e| crate::Error::Storage {
-                engine: "sort".into(),
-                detail: format!("sort spill flush: {e}"),
-            })?;
 
-            let mut file = writer.into_inner().map_err(|e| crate::Error::Storage {
-                engine: "sort".into(),
-                detail: format!("sort spill into_inner: {e}"),
-            })?;
-            use std::io::Seek;
-            file.seek(std::io::SeekFrom::Start(0))
-                .map_err(|e| crate::Error::Storage {
-                    engine: "sort".into(),
-                    detail: format!("sort spill seek: {e}"),
-                })?;
-
-            run_files.push(file);
+            let run_path = spill_dir.join(format!("run-{run_idx}.spill"));
+            write_sort_run(&run_path, &framed)?;
+            cleanup.paths.push(run_path);
         }
 
         debug!(
             core = self.core_id,
-            runs = run_files.len(),
+            runs = cleanup.paths.len(),
             total_rows,
             "external sort: spilled runs"
         );
 
-        let mut readers: Vec<RunReader> = run_files
-            .into_iter()
-            .enumerate()
-            .filter_map(|(idx, file)| RunReader::new(file, idx).ok())
-            .collect();
+        // Build readers propagating errors — a run whose reader fails to init is
+        // a hard error, never a silently dropped run.
+        let mut readers: Vec<RunReader> = Vec::with_capacity(cleanup.paths.len());
+        for (idx, path) in cleanup.paths.iter().enumerate() {
+            readers.push(RunReader::open(path, idx)?);
+        }
 
         let mut heap: BinaryHeap<Reverse<MergeEntry>> = BinaryHeap::new();
         for reader in &mut readers {
-            if let Some(row) = reader.next_row() {
+            if let Some(row) = reader.next_row()? {
                 heap.push(Reverse(MergeEntry {
                     row,
                     run_idx: reader.run_idx,
@@ -126,7 +105,7 @@ impl CoreLoop {
             if result.len() >= output_limit {
                 break;
             }
-            if let Some(next_row) = readers[entry.run_idx].next_row() {
+            if let Some(next_row) = readers[entry.run_idx].next_row()? {
                 heap.push(Reverse(MergeEntry {
                     row: next_row,
                     run_idx: entry.run_idx,
@@ -136,6 +115,45 @@ impl CoreLoop {
         }
 
         Ok(result)
+    }
+}
+
+/// Drop guard that unlinks named sort spill files (and their directory).
+///
+/// Named spill files do not auto-unlink (unlike tempfile handles), so each is
+/// removed explicitly. Declared before the [`RunReader`]s in `external_sort` so
+/// it Drops last — after the readers' fds close. Unlink is a bounded metadata
+/// op, not bulk content I/O, so it stays plain `std::fs`.
+struct SortSpillCleanup {
+    dir: PathBuf,
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for SortSpillCleanup {
+    fn drop(&mut self) {
+        for p in &self.paths {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// Write one framed sort-run blob to `path`.
+///
+/// Uses [`UringWriter`] when io_uring is available; otherwise falls back to a
+/// blocking `std::fs::write` (on a non-io_uring platform there is no per-core
+/// reactor to stall, so the blocking call is plane-safe).
+fn write_sort_run(path: &Path, bytes: &[u8]) -> crate::Result<()> {
+    match UringWriter::new(path) {
+        Some(mut w) => {
+            w.append(bytes)?;
+            w.finish()?;
+            Ok(())
+        }
+        None => std::fs::write(path, bytes).map_err(|e| crate::Error::Storage {
+            engine: "sort".into(),
+            detail: format!("sort spill write error: {e}"),
+        }),
     }
 }
 
@@ -181,7 +199,7 @@ pub(in crate::data::executor) fn sort_rows(
 
     // Pre-extract sort key offsets for all rows — one scan per row instead
     // of O(N log N) scans during comparisons.
-    let mut key_offsets: Vec<SortKeyOffsets> = rows
+    let key_offsets: Vec<SortKeyOffsets> = rows
         .iter()
         .map(|(_, bytes)| {
             sort_keys
@@ -203,8 +221,10 @@ pub(in crate::data::executor) fn sort_rows(
         )
     });
 
-    // Apply permutation in-place.
-    apply_permutation(rows, &mut key_offsets, indices);
+    // Apply permutation in-place. `key_offsets` is no longer needed after
+    // sorting the index; it is dropped here.
+    drop(key_offsets);
+    apply_permutation(rows, indices);
 }
 
 /// Compare two docs using pre-extracted sort key offsets.
@@ -230,84 +250,129 @@ fn compare_with_preextracted(
     std::cmp::Ordering::Equal
 }
 
-/// Apply a permutation to rows (and key_offsets) using the sorted index order.
+/// Apply a permutation to rows using the sorted index order.
 ///
 /// `indices[i]` = the original row index that should appear at position `i`.
-fn apply_permutation(
-    rows: &mut [(String, Vec<u8>)],
-    _key_offsets: &mut [SortKeyOffsets],
-    indices: Vec<usize>,
-) {
-    // Build reordered vector then copy back. The cycle-chase approach is
-    // tricky to get right with Vec<u8> (non-Copy), so we drain and rebuild.
-    let mut temp: Vec<(String, Vec<u8>)> = std::mem::take(&mut rows.to_vec())
-        .into_iter()
-        .map(|_| (String::new(), Vec::new()))
+fn apply_permutation(rows: &mut [(String, Vec<u8>)], indices: Vec<usize>) {
+    // Wrap each row in `Option` so we can move individual elements out by
+    // index without cloning. Each slot is taken exactly once during the
+    // scatter, so no element is ever double-moved.
+    let mut src: Vec<Option<(String, Vec<u8>)>> = rows
+        .iter_mut()
+        .map(|r| Some(std::mem::replace(r, (String::new(), Vec::new()))))
         .collect();
-    // Scatter originals into temp by index order.
-    // Can't use temp directly — we need all originals available.
-    let originals: Vec<(String, Vec<u8>)> =
-        rows.iter().map(|(s, b)| (s.clone(), b.clone())).collect();
     for (target_pos, &src_idx) in indices.iter().enumerate() {
-        temp[target_pos] = originals[src_idx].clone();
-    }
-    for (i, item) in temp.into_iter().enumerate() {
-        rows[i] = item;
+        // `indices` is always a permutation of `0..rows.len()`, so every slot
+        // is taken exactly once. The `None` arm is unreachable in practice;
+        // the debug assert catches logic regressions in tests.
+        debug_assert!(
+            src[src_idx].is_some(),
+            "apply_permutation: duplicate index {src_idx}"
+        );
+        rows[target_pos] = src[src_idx].take().unwrap_or_default();
     }
 }
 
+/// Read backend for a sort run: io_uring streaming on Linux, blocking
+/// `std::fs` (`BufReader`) when io_uring is unavailable.
+enum RunBackend {
+    Uring(UringSeqReader),
+    Std(BufReader<std::fs::File>),
+}
+
 pub(super) struct RunReader {
-    pub(super) reader: BufReader<std::fs::File>,
-    pub(super) remaining: u32,
+    backend: RunBackend,
+    remaining: u32,
     pub(super) run_idx: usize,
 }
 
 impl RunReader {
-    pub(super) fn new(file: std::fs::File, run_idx: usize) -> crate::Result<Self> {
-        let mut reader = BufReader::new(file);
+    pub(super) fn open(path: &Path, run_idx: usize) -> crate::Result<Self> {
+        let mut backend = match UringSeqReader::open_default(path) {
+            Some(r) => RunBackend::Uring(r),
+            None => RunBackend::Std(BufReader::new(std::fs::File::open(path).map_err(|e| {
+                crate::Error::Storage {
+                    engine: "sort".into(),
+                    detail: format!("run reader open: {e}"),
+                }
+            })?)),
+        };
+
         let mut buf4 = [0u8; 4];
-        reader
-            .read_exact(&mut buf4)
-            .map_err(|e| crate::Error::Storage {
+        if !Self::read_full(&mut backend, &mut buf4)? {
+            return Err(crate::Error::Storage {
                 engine: "sort".into(),
-                detail: format!("run reader init: {e}"),
-            })?;
+                detail: "sort run truncated: missing count header".into(),
+            });
+        }
         let count = u32::from_le_bytes(buf4);
+
         Ok(Self {
-            reader,
+            backend,
             remaining: count,
             run_idx,
         })
     }
 
-    pub(super) fn next_row(&mut self) -> Option<(String, Vec<u8>)> {
+    /// Read exactly `dst.len()` bytes. `Ok(true)` = filled; `Ok(false)` = clean
+    /// EOF before fill; `Err` = io failure. Bridges the two backends to one
+    /// uniform contract.
+    fn read_full(backend: &mut RunBackend, dst: &mut [u8]) -> crate::Result<bool> {
+        match backend {
+            RunBackend::Uring(r) => r.read_exact(dst),
+            RunBackend::Std(r) => match r.read_exact(dst) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+                Err(e) => Err(crate::Error::Io(e)),
+            },
+        }
+    }
+
+    pub(super) fn next_row(&mut self) -> crate::Result<Option<(String, Vec<u8>)>> {
         if self.remaining == 0 {
-            return None;
+            return Ok(None);
         }
         self.remaining -= 1;
 
         let mut buf4 = [0u8; 4];
 
-        if self.reader.read_exact(&mut buf4).is_err() {
-            return None;
+        // A run that ends before `remaining` rows have been read is corruption —
+        // error, never silently drop rows.
+        if !Self::read_full(&mut self.backend, &mut buf4)? {
+            return Err(crate::Error::Storage {
+                engine: "sort".into(),
+                detail: "sort run truncated: expected row frame".into(),
+            });
         }
         let id_len = u32::from_le_bytes(buf4) as usize;
         let mut id_buf = vec![0u8; id_len];
-        if self.reader.read_exact(&mut id_buf).is_err() {
-            return None;
+        if !Self::read_full(&mut self.backend, &mut id_buf)? {
+            return Err(crate::Error::Storage {
+                engine: "sort".into(),
+                detail: "sort run truncated: expected row frame".into(),
+            });
         }
-        let id = String::from_utf8(id_buf).unwrap_or_default();
+        let id = String::from_utf8(id_buf).map_err(|_| crate::Error::Storage {
+            engine: "sort".into(),
+            detail: "sort run corrupt: id not valid utf-8".into(),
+        })?;
 
-        if self.reader.read_exact(&mut buf4).is_err() {
-            return None;
+        if !Self::read_full(&mut self.backend, &mut buf4)? {
+            return Err(crate::Error::Storage {
+                engine: "sort".into(),
+                detail: "sort run truncated: expected row frame".into(),
+            });
         }
         let val_len = u32::from_le_bytes(buf4) as usize;
         let mut val_buf = vec![0u8; val_len];
-        if self.reader.read_exact(&mut val_buf).is_err() {
-            return None;
+        if !Self::read_full(&mut self.backend, &mut val_buf)? {
+            return Err(crate::Error::Storage {
+                engine: "sort".into(),
+                detail: "sort run truncated: expected row frame".into(),
+            });
         }
 
-        Some((id, val_buf))
+        Ok(Some((id, val_buf)))
     }
 }
 
@@ -407,5 +472,116 @@ mod tests {
         sort_rows(&mut rows, &[("name".into(), true)]);
         assert_eq!(rows[0].0, "2", "first should be Alice");
         assert_eq!(rows[2].0, "1", "last should be Charlie");
+    }
+}
+
+/// End-to-end spill+merge coverage exercising the real io_uring spill write
+/// (`write_sort_run`) and streaming read (`RunReader`) path.
+///
+/// Tested at the primitive level (write_sort_run + RunReader + manual k-way
+/// heap merge) rather than via `CoreLoop::external_sort`, because constructing
+/// a `CoreLoop` requires a full Data-Plane core bring-up; the merge logic here
+/// is a faithful copy of `external_sort`'s loop so it covers the same path.
+#[cfg(all(test, target_os = "linux"))]
+mod spill_merge_tests {
+    use super::*;
+
+    fn encode(v: &serde_json::Value) -> Vec<u8> {
+        nodedb_types::json_msgpack::json_to_msgpack(v).expect("encode")
+    }
+
+    /// Build a framed run blob (count header + per-row frames) byte-identical to
+    /// `external_sort`'s spill layout.
+    fn frame(rows: &[(String, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for (id, val) in rows {
+            let idb = id.as_bytes();
+            out.extend_from_slice(&(idb.len() as u32).to_le_bytes());
+            out.extend_from_slice(idb);
+            out.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            out.extend_from_slice(val);
+        }
+        out
+    }
+
+    fn row(id: &str, val: i64) -> (String, Vec<u8>) {
+        (
+            id.to_string(),
+            encode(&serde_json::json!({"id": id, "val": val})),
+        )
+    }
+
+    /// Write several internally-sorted runs, open them via `RunReader`, drive
+    /// the same heap merge `external_sort` uses, and assert the output is
+    /// globally sorted and contains exactly every row (no drops).
+    #[test]
+    fn spill_then_kway_merge_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let sort_keys = vec![("val".to_string(), true)];
+
+        // Three runs, each internally sorted ascending by `val`.
+        let runs = [
+            vec![row("a", 1), row("d", 4), row("g", 7)],
+            vec![row("b", 2), row("e", 5), row("h", 8)],
+            vec![row("c", 3), row("f", 6), row("i", 9)],
+        ];
+
+        let mut readers: Vec<RunReader> = Vec::new();
+        for (idx, run) in runs.iter().enumerate() {
+            let path = dir.path().join(format!("run-{idx}.spill"));
+            write_sort_run(&path, &frame(run)).unwrap();
+            readers.push(RunReader::open(&path, idx).unwrap());
+        }
+
+        let mut heap: BinaryHeap<Reverse<MergeEntry>> = BinaryHeap::new();
+        for reader in &mut readers {
+            if let Some(r) = reader.next_row().unwrap() {
+                heap.push(Reverse(MergeEntry {
+                    row: r,
+                    run_idx: reader.run_idx,
+                    sort_keys: sort_keys.clone(),
+                }));
+            }
+        }
+
+        let mut out: Vec<String> = Vec::new();
+        while let Some(Reverse(entry)) = heap.pop() {
+            out.push(entry.row.0.clone());
+            if let Some(next) = readers[entry.run_idx].next_row().unwrap() {
+                heap.push(Reverse(MergeEntry {
+                    row: next,
+                    run_idx: entry.run_idx,
+                    sort_keys: sort_keys.clone(),
+                }));
+            }
+        }
+
+        // Globally sorted by val: a..i, and every row present exactly once.
+        assert_eq!(out, vec!["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+    }
+
+    /// A run whose count header claims more rows than its bytes provide must
+    /// surface an `Err` from `next_row` — never silently return fewer rows.
+    #[test]
+    fn truncated_run_errors_not_silent_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trunc.spill");
+
+        // Header says 3 rows, but only 1 row of frame bytes follows.
+        let one = vec![row("x", 1)];
+        let mut bytes = frame(&one);
+        // Overwrite the count header (first 4 bytes) with 3.
+        bytes[0..4].copy_from_slice(&3u32.to_le_bytes());
+        write_sort_run(&path, &bytes).unwrap();
+
+        let mut reader = RunReader::open(&path, 0).unwrap();
+        // First row reads back fine.
+        assert!(reader.next_row().unwrap().is_some());
+        // Second row: bytes exhausted but remaining > 0 → must error.
+        assert!(
+            reader.next_row().is_err(),
+            "truncated run must error, not silently drop rows"
+        );
     }
 }
