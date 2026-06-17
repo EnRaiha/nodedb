@@ -46,6 +46,61 @@ impl SparseEngine {
         Ok(results)
     }
 
+    /// Streaming variant of `scan_documents`: yields each `(document_id,
+    /// document_bytes)` row to `f` as it is read, holding the redb read
+    /// transaction open across callback invocations.
+    ///
+    /// Unlike `scan_documents`, no result `Vec` is materialized — peak memory
+    /// is a single row, not the whole scan. The visited rows (and their order)
+    /// are byte-identical to `scan_documents` for the same arguments: same
+    /// table, same key range, same prefix stripping, same value extraction,
+    /// same `limit` cutoff.
+    ///
+    /// If `f` returns `Err`, iteration stops immediately and the error is
+    /// propagated. Every redb iteration error is propagated via `?` — rows are
+    /// never silently dropped.
+    // consumed by scan_collection_for_each streaming routing (later U5 unit)
+    #[allow(dead_code)]
+    pub fn scan_documents_for_each<F>(
+        &self,
+        tenant_id: u64,
+        collection: &str,
+        limit: usize,
+        mut f: F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(&str, &[u8]) -> crate::Result<()>,
+    {
+        let prefix = format!("{tenant_id}:{collection}:");
+        let end = format!("{tenant_id}:{collection}:\u{ffff}");
+
+        let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
+        let table = read_txn
+            .open_table(DOCUMENTS)
+            .map_err(|e| redb_err("open table", e))?;
+
+        let range = table
+            .range(prefix.as_str()..end.as_str())
+            .map_err(|e| redb_err("doc range", e))?;
+
+        let mut count = 0usize;
+        for entry in range {
+            if count >= limit {
+                break;
+            }
+            let entry = entry.map_err(|e| redb_err("doc entry", e))?;
+            let key = entry.0.value().to_string();
+            // Extract document_id from key format "{tenant}:{collection}:{doc_id}"
+            let doc_id = key.strip_prefix(&prefix).unwrap_or(&key);
+            let value = entry.1.value();
+            f(doc_id, value)?;
+            count += 1;
+        }
+
+        debug!(collection, count, "streaming document scan");
+        Ok(())
+    }
+
     /// Scan documents in chunks, calling `handler` for each chunk.
     ///
     /// Processes up to `total_limit` documents in chunks of `chunk_size`.
@@ -388,5 +443,77 @@ impl SparseEngine {
         }
         write_txn.commit().map_err(|e| redb_err("commit", e))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SparseEngine::open(&dir.path().join("sparse.redb")).unwrap();
+        (engine, dir)
+    }
+
+    #[test]
+    fn for_each_matches_scan_documents() {
+        let (engine, _dir) = open_temp();
+        engine.put(1, "users", "u1", b"alice").unwrap();
+        engine.put(1, "users", "u2", b"bob").unwrap();
+        engine.put(1, "users", "u3", b"carol").unwrap();
+
+        let materialized = engine.scan_documents(1, "users", usize::MAX).unwrap();
+
+        let mut streamed: Vec<(String, Vec<u8>)> = Vec::new();
+        engine
+            .scan_documents_for_each(1, "users", usize::MAX, |doc_id, bytes| {
+                streamed.push((doc_id.to_string(), bytes.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+
+        // Same order, same ids, same bytes.
+        assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn for_each_respects_limit() {
+        let (engine, _dir) = open_temp();
+        engine.put(1, "users", "u1", b"alice").unwrap();
+        engine.put(1, "users", "u2", b"bob").unwrap();
+        engine.put(1, "users", "u3", b"carol").unwrap();
+
+        let materialized = engine.scan_documents(1, "users", 2).unwrap();
+
+        let mut streamed: Vec<(String, Vec<u8>)> = Vec::new();
+        engine
+            .scan_documents_for_each(1, "users", 2, |doc_id, bytes| {
+                streamed.push((doc_id.to_string(), bytes.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(materialized.len(), 2);
+        assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn for_each_propagates_callback_error() {
+        let (engine, _dir) = open_temp();
+        engine.put(1, "users", "u1", b"alice").unwrap();
+        engine.put(1, "users", "u2", b"bob").unwrap();
+
+        let mut seen = 0usize;
+        let result = engine.scan_documents_for_each(1, "users", usize::MAX, |_doc_id, _bytes| {
+            seen += 1;
+            Err(crate::Error::Internal {
+                detail: "stop".to_string(),
+            })
+        });
+
+        assert!(result.is_err());
+        // Stops at the first row — does not visit every row.
+        assert_eq!(seen, 1);
     }
 }

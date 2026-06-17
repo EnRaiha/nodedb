@@ -379,6 +379,110 @@ impl KvEngine {
 
         (owned, next_cursor)
     }
+
+    /// Streaming variant of [`scan`]: invokes `f(key, value)` for each visible
+    /// row instead of materializing a result `Vec`.
+    ///
+    /// Mirrors [`scan`] exactly: same index-accelerated path (when
+    /// `filter_field` + `filter_value` + a matching index are present), same
+    /// full-scan fallback over the hash-table slots, same `match_pattern`
+    /// filtering, same `count` cutoff, and the same `surrogate_ceiling`
+    /// visibility rule. The `(key, value)` rows passed to `f` — and their
+    /// order — are byte-identical to the rows [`scan`] would return for the
+    /// same `params`. Peak memory is a single borrowed row, not the whole scan.
+    ///
+    /// The callback receives borrowed `&[u8]` slices; it must copy any bytes it
+    /// wants to retain beyond the call. If `f` returns `Err`, iteration stops
+    /// immediately and the error is propagated — no row is silently dropped and
+    /// the callback error is never swallowed into `Ok`.
+    ///
+    /// [`scan`]: KvEngine::scan
+    // consumed by scan_collection_for_each streaming routing (later U5 unit)
+    #[allow(dead_code)]
+    pub fn scan_for_each<F>(&self, params: KvScanParams<'_>, mut f: F) -> crate::Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> crate::Result<()>,
+    {
+        let KvScanParams {
+            tenant_id,
+            collection,
+            cursor,
+            count,
+            now_ms,
+            match_pattern,
+            filter_field,
+            filter_value,
+            surrogate_ceiling,
+        } = params;
+        let tkey = table_key(tenant_id, collection);
+        let table = match self.tables.get(&tkey) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        let surrogate_visible = |s: u32| -> bool {
+            match surrogate_ceiling {
+                Some(c) => s == 0 || s <= c,
+                None => true,
+            }
+        };
+
+        // Index-accelerated path: if we have an equality filter and an index, use it.
+        // Also checks composite indexes for prefix matches.
+        if let Some(field) = filter_field
+            && let Some(value) = filter_value
+            && let Some(idx_set) = self.indexes.get(&tkey)
+        {
+            // Try single-field index first.
+            let candidate_keys = if idx_set.get_index(field).is_some() {
+                idx_set.lookup_eq(field, value)
+            } else if let Some(ci) = idx_set.find_composite_with_prefix(field) {
+                // Composite index prefix match: use leading field.
+                ci.lookup_prefix(&[value])
+            } else {
+                Vec::new() // No index available — will fall through to full scan.
+            };
+
+            if !candidate_keys.is_empty() {
+                let mut emitted = 0usize;
+                for pk in candidate_keys {
+                    if emitted >= count {
+                        break;
+                    }
+                    if let Some((val, surrogate)) = table.get_with_surrogate(pk, now_ms)
+                        && (match_pattern.is_none()
+                            || super::scan::matches_pattern_pub(pk, match_pattern))
+                        && surrogate_visible(surrogate.as_u32())
+                    {
+                        f(pk, val)?;
+                        emitted += 1;
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        // Full scan fallback: iterate hash table slots.
+        let cursor_idx = if cursor.len() >= 4 {
+            u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]) as usize
+        } else {
+            0
+        };
+
+        table.scan_with_surrogate_for_each(
+            cursor_idx,
+            count,
+            now_ms,
+            match_pattern,
+            |k, v, s| {
+                if surrogate_visible(s.as_u32()) {
+                    f(k, v)?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -709,5 +813,132 @@ mod tests {
         let ns_per_op = elapsed.as_nanos() / iters as u128;
         // 691 ns/op measured — well under document's 12μs.
         assert!(ns_per_op < 5_000, "PUT too slow: {ns_per_op} ns/op");
+    }
+
+    /// Build the full-visibility, no-filter scan params used by the normalizer.
+    fn scan_params<'a>(collection: &'a str, count: usize, now_ms: u64) -> KvScanParams<'a> {
+        KvScanParams {
+            tenant_id: 1,
+            collection,
+            cursor: &[],
+            count,
+            now_ms,
+            match_pattern: None,
+            filter_field: None,
+            filter_value: None,
+            surrogate_ceiling: None,
+        }
+    }
+
+    #[test]
+    fn scan_for_each_matches_scan() {
+        let mut e = make_engine();
+        let n = now();
+        for i in 0..5u8 {
+            e.put(1, "c", &[i], &[i * 10], 0, n, Surrogate::ZERO);
+        }
+
+        let (materialized, _next) = e.scan(scan_params("c", usize::MAX, n));
+
+        let mut streamed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        e.scan_for_each(scan_params("c", usize::MAX, n), |k, v| {
+            streamed.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+        // Same order, same keys, same bytes.
+        assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn scan_for_each_respects_count() {
+        let mut e = make_engine();
+        let n = now();
+        for i in 0..10u8 {
+            e.put(1, "c", &[i], &[i * 10], 0, n, Surrogate::ZERO);
+        }
+
+        let (materialized, _next) = e.scan(scan_params("c", 3, n));
+
+        let mut streamed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        e.scan_for_each(scan_params("c", 3, n), |k, v| {
+            streamed.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(materialized.len(), 3);
+        assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn scan_for_each_matches_scan_index_path() {
+        let mut e = make_engine();
+        let n = now();
+        e.register_index(1, "sessions", "region", 0, false, n);
+        e.put(
+            1,
+            "sessions",
+            b"s1",
+            &mp_obj(&[("region", "us-east")]),
+            0,
+            n,
+            Surrogate::ZERO,
+        );
+        e.put(
+            1,
+            "sessions",
+            b"s2",
+            &mp_obj(&[("region", "us-east")]),
+            0,
+            n,
+            Surrogate::ZERO,
+        );
+        e.put(
+            1,
+            "sessions",
+            b"s3",
+            &mp_obj(&[("region", "eu-west")]),
+            0,
+            n,
+            Surrogate::ZERO,
+        );
+
+        let indexed_params = || KvScanParams {
+            filter_field: Some("region"),
+            filter_value: Some(b"us-east"),
+            ..scan_params("sessions", usize::MAX, n)
+        };
+        let (materialized, _next) = e.scan(indexed_params());
+
+        let mut streamed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        e.scan_for_each(indexed_params(), |k, v| {
+            streamed.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn scan_for_each_propagates_callback_error() {
+        let mut e = make_engine();
+        let n = now();
+        e.put(1, "c", b"k1", b"v1", 0, n, Surrogate::ZERO);
+        e.put(1, "c", b"k2", b"v2", 0, n, Surrogate::ZERO);
+
+        let mut seen = 0usize;
+        let result = e.scan_for_each(scan_params("c", usize::MAX, n), |_k, _v| {
+            seen += 1;
+            Err(crate::Error::Internal {
+                detail: "stop".to_string(),
+            })
+        });
+
+        assert!(result.is_err());
+        // Stops at the first row — does not visit every row.
+        assert_eq!(seen, 1);
     }
 }

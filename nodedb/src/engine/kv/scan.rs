@@ -89,6 +89,56 @@ impl KvHashTable {
         (results, next_cursor)
     }
 
+    /// Streaming variant of [`scan_with_surrogate`]: invokes `f(key, value,
+    /// surrogate)` for each visited row instead of collecting into a `Vec`.
+    ///
+    /// Walks the SAME unified slot range (primary table first, then rehash
+    /// source) in the SAME order, applies the SAME expiry + pattern filtering,
+    /// and respects the SAME `count` cutoff as `scan_with_surrogate`. The rows
+    /// passed to `f` (and their order) are therefore identical to the rows the
+    /// `Vec` variant would have produced for the same arguments.
+    ///
+    /// Returns the next cursor index (`0` when the scan is complete), exactly
+    /// like `scan_with_surrogate`. If `f` returns `Err`, iteration stops
+    /// immediately and the error is propagated — rows are never silently
+    /// dropped, and the callback error is never swallowed into `Ok`.
+    ///
+    /// [`scan_with_surrogate`]: KvHashTable::scan_with_surrogate
+    // consumed by scan_collection_for_each streaming routing (later U5 unit)
+    #[allow(dead_code)]
+    pub fn scan_with_surrogate_for_each<F>(
+        &self,
+        cursor_idx: usize,
+        count: usize,
+        now_ms: u64,
+        match_pattern: Option<&str>,
+        mut f: F,
+    ) -> crate::Result<usize>
+    where
+        F: FnMut(&[u8], &[u8], Surrogate) -> crate::Result<()>,
+    {
+        let total_slots = self.capacity() + self.rehash_source_len();
+
+        let mut emitted = 0usize;
+        let mut idx = cursor_idx;
+        while emitted < count && idx < total_slots {
+            let entry = self.slot_at(idx);
+
+            if let Some(e) = entry
+                && !e.is_expired(now_ms)
+                && matches_pattern(&e.key, match_pattern)
+            {
+                let value = self.read_value(e);
+                f(e.key.as_slice(), value, e.surrogate)?;
+                emitted += 1;
+            }
+            idx += 1;
+        }
+
+        let next_cursor = if idx >= total_slots { 0 } else { idx };
+        Ok(next_cursor)
+    }
+
     /// Access a slot by unified index (primary first, then rehash source).
     fn slot_at(&self, idx: usize) -> Option<&KvEntry> {
         let cap = self.capacity();
