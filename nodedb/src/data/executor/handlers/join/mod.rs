@@ -4,6 +4,7 @@
 
 mod budget_guard;
 pub(super) mod grace_partitioner;
+mod grace_spill;
 pub mod hash;
 mod hash_handlers;
 pub mod lateral;
