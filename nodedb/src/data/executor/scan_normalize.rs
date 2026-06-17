@@ -14,6 +14,7 @@
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::kv::KvScanParams;
 use nodedb_query::msgpack_scan;
+use nodedb_types::columnar::StrictSchema;
 
 impl CoreLoop {
     /// Universal scan: reads from the correct engine for `collection` and
@@ -74,16 +75,36 @@ impl CoreLoop {
     where
         F: FnMut(&str, &[u8]) -> crate::Result<()>,
     {
-        // 1. KV engine — materializes internally; iterate the batch per-row.
-        let kv_docs = self.scan_kv(tid, collection, usize::MAX);
-        if !kv_docs.is_empty() {
-            for (id, bytes) in &kv_docs {
-                f(id, bytes)?;
-            }
+        // 1. KV engine — TRULY streams row-at-a-time via `scan_for_each`.
+        //    Mirrors the materializing path's `if !kv_docs.is_empty()`
+        //    early-return: a KV collection with zero live rows falls through.
+        let now_ms = crate::engine::kv::current_ms();
+        let mut found = false;
+        self.kv_engine.scan_for_each(
+            KvScanParams {
+                tenant_id: tid,
+                collection,
+                cursor: &[],
+                count: usize::MAX,
+                now_ms,
+                match_pattern: None,
+                filter_field: None,
+                filter_value: None,
+                surrogate_ceiling: None,
+            },
+            |key, value| {
+                found = true;
+                let (key_str, mp) = kv_row_to_doc(key, value);
+                f(&key_str, &mp)
+            },
+        )?;
+        if found {
             return Ok(());
         }
 
         // 2. Columnar — materializes internally; iterate the batch per-row.
+        // columnar stays materialized — per-row segment streaming is a separate
+        // follow-up (flushed-segment decode).
         let col_docs = self.scan_columnar(tid, collection, usize::MAX);
         if !col_docs.is_empty() {
             for (id, bytes) in &col_docs {
@@ -92,12 +113,24 @@ impl CoreLoop {
             return Ok(());
         }
 
-        // 3. Sparse/document engine (schemaless + strict) — materializes
-        //    internally via btree scan; iterate the batch per-row.
-        let sparse_docs = self.scan_sparse(tid, collection, usize::MAX)?;
-        for (id, bytes) in &sparse_docs {
-            f(id, bytes)?;
-        }
+        // 3. Sparse/document engine (schemaless + strict) — TRULY streams
+        //    row-at-a-time via `scan_documents_for_each`. The strict schema is
+        //    resolved once up front, exactly as in `scan_sparse`.
+        let config_key = (crate::types::TenantId::new(tid), collection.to_string());
+        let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
+            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
+                c.storage_mode
+            {
+                Some(schema.clone())
+            } else {
+                None
+            }
+        });
+        self.sparse
+            .scan_documents_for_each(tid, collection, usize::MAX, |id, raw| {
+                let (id_s, mp) = sparse_row_to_doc(id, raw, strict_schema.as_ref());
+                f(&id_s, &mp)
+            })?;
         Ok(())
     }
 
@@ -118,10 +151,7 @@ impl CoreLoop {
         });
         let mut results = Vec::with_capacity(entries.len());
         for (key, value) in entries {
-            let key_str = String::from_utf8_lossy(&key).to_string();
-            // Inject "key" field into the msgpack map at binary level.
-            let mp = msgpack_scan::inject_str_field(&value, "key", &key_str);
-            results.push((key_str, mp));
+            results.push(kv_row_to_doc(&key, &value));
         }
         results
     }
@@ -289,27 +319,47 @@ impl CoreLoop {
             }
         });
 
-        if let Some(ref schema) = strict_schema {
-            // Strict: Binary Tuple → msgpack → inject "id".
-            let mut normalized = Vec::with_capacity(docs.len());
-            for (id, raw) in docs {
-                let mp = super::strict_format::binary_tuple_to_msgpack(&raw, schema)
-                    .unwrap_or_else(|| super::doc_format::json_to_msgpack(&raw));
-                let mp = msgpack_scan::inject_str_field(&mp, "id", &id);
-                normalized.push((id, mp));
-            }
-            Ok(normalized)
-        } else {
-            // Schemaless: ensure standard msgpack, inject `id` field.
-            let mut normalized = Vec::with_capacity(docs.len());
-            for (id, raw) in docs {
-                let mp = super::doc_format::json_to_msgpack(&raw);
-                let mp = msgpack_scan::inject_str_field(&mp, "id", &id);
-                normalized.push((id, mp));
-            }
-            Ok(normalized)
+        let mut normalized = Vec::with_capacity(docs.len());
+        for (id, raw) in docs {
+            normalized.push(sparse_row_to_doc(&id, &raw, strict_schema.as_ref()));
         }
+        Ok(normalized)
     }
+}
+
+/// Convert a single KV engine entry to a `(key, msgpack)` document.
+///
+/// Lossy-decodes the key to a UTF-8 string and injects it as the `key`
+/// field directly into the msgpack map at the binary level (no JSON
+/// roundtrip). Shared by the materializing scan and the streaming scan so
+/// both paths produce byte-identical output.
+fn kv_row_to_doc(key: &[u8], value: &[u8]) -> (String, Vec<u8>) {
+    let key_str = String::from_utf8_lossy(key).to_string();
+    let mp = msgpack_scan::inject_str_field(value, "key", &key_str);
+    (key_str, mp)
+}
+
+/// Convert a single sparse/document row to a `(id, msgpack)` document.
+///
+/// When `strict_schema` is `Some`, the raw bytes are a Binary Tuple and are
+/// decoded via the strict schema (falling back to JSON transcoding if the
+/// tuple cannot be decoded). When `None`, the raw bytes are schemaless and
+/// are normalised from (possibly legacy JSON) to standard msgpack. In both
+/// cases the `id` field is injected identically. Shared by the materializing
+/// scan and the streaming scan so both paths produce byte-identical output.
+fn sparse_row_to_doc(
+    id: &str,
+    raw: &[u8],
+    strict_schema: Option<&StrictSchema>,
+) -> (String, Vec<u8>) {
+    let mp = if let Some(schema) = strict_schema {
+        super::strict_format::binary_tuple_to_msgpack(raw, schema)
+            .unwrap_or_else(|| super::doc_format::json_to_msgpack(raw))
+    } else {
+        super::doc_format::json_to_msgpack(raw)
+    };
+    let mp = msgpack_scan::inject_str_field(&mp, "id", id);
+    (id.to_string(), mp)
 }
 
 /// Convert a single row from a `DecodedColumn` to a `nodedb_types::value::Value`.
@@ -443,6 +493,58 @@ mod tests {
             actual.len()
         );
         assert_eq!(expected, actual, "id+bytes pairs must be identical");
+    }
+
+    /// Verify that `scan_collection_for_each` visits exactly the same
+    /// `(key, bytes)` set as `scan_collection` for a KV collection.
+    ///
+    /// This guards the KV streaming path (`scan_for_each`) against drifting
+    /// from the materializing path (`scan`/`scan_kv`): both feed the shared
+    /// `kv_row_to_doc` helper, so output must be byte-identical.
+    #[test]
+    fn for_each_matches_scan_collection_on_kv() {
+        use nodedb_types::Surrogate;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _req_tx, _resp_rx) =
+            crate::data::executor::core_loop::tests::make_core_with_dir(dir.path());
+
+        let tid: u64 = 1;
+        let coll = "kv_scan_test";
+        let now_ms = crate::engine::kv::current_ms();
+
+        // Insert three KV entries with empty-map msgpack values; the `key`
+        // field is injected identically by both scan paths.
+        let val = nodedb_types::value_to_msgpack(&nodedb_types::value::Value::Object(
+            std::collections::HashMap::new(),
+        ))
+        .unwrap();
+        core.kv_engine
+            .put(tid, coll, b"a", &val, 0, now_ms, Surrogate::ZERO);
+        core.kv_engine
+            .put(tid, coll, b"b", &val, 0, now_ms, Surrogate::ZERO);
+        core.kv_engine
+            .put(tid, coll, b"c", &val, 0, now_ms, Surrogate::ZERO);
+
+        let mut expected = core.scan_collection(tid, coll, usize::MAX).unwrap();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut actual: Vec<(String, Vec<u8>)> = Vec::new();
+        core.scan_collection_for_each(tid, coll, |id, bytes| {
+            actual.push((id.to_owned(), bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        actual.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "row counts must match: expected {}, got {}",
+            expected.len(),
+            actual.len()
+        );
+        assert_eq!(expected, actual, "key+bytes pairs must be identical");
     }
 
     /// Verify that a callback error from `scan_collection_for_each` is
