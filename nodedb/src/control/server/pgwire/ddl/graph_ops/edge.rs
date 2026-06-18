@@ -97,21 +97,18 @@ pub async fn insert_edge(
         dst_surrogate,
     });
 
-    wal_dispatch::wal_append_if_write(
-        &state.wal,
+    crate::control::server::sync::raft_dispatch::dispatch_sync_response(
+        state,
         tenant_id,
         vshard_id,
-        crate::types::DatabaseId::DEFAULT,
-        &plan,
+        plan,
+        TraceId::ZERO,
+        crate::event::EventSource::User,
     )
+    .await
     .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
-    match dispatch_utils::dispatch_to_data_plane(state, tenant_id, vshard_id, plan, TraceId::ZERO)
-        .await
-    {
-        Ok(_) => Ok(vec![Response::Execution(Tag::new("INSERT EDGE"))]),
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
-    }
+    Ok(vec![Response::Execution(Tag::new("INSERT EDGE"))])
 }
 
 /// `GRAPH DELETE EDGE IN '<collection>' FROM '<src>' TO '<dst>' TYPE '<label>'`
@@ -146,21 +143,18 @@ pub async fn delete_edge(
         dst_id: dst,
     });
 
-    wal_dispatch::wal_append_if_write(
-        &state.wal,
+    crate::control::server::sync::raft_dispatch::dispatch_sync_response(
+        state,
         tenant_id,
         vshard_id,
-        crate::types::DatabaseId::DEFAULT,
-        &plan,
+        plan,
+        TraceId::ZERO,
+        crate::event::EventSource::User,
     )
+    .await
     .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
-    match dispatch_utils::dispatch_to_data_plane(state, tenant_id, vshard_id, plan, TraceId::ZERO)
-        .await
-    {
-        Ok(_) => Ok(vec![Response::Execution(Tag::new("DELETE EDGE"))]),
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
-    }
+    Ok(vec![Response::Execution(Tag::new("DELETE EDGE"))])
 }
 
 /// `GRAPH LABEL '<node_id>' AS '<label>' [, '<label2>']`
@@ -225,8 +219,10 @@ fn properties_to_json(properties: GraphProperties) -> PgWireResult<String> {
         GraphProperties::Quoted(s) => Ok(s),
         GraphProperties::Object(obj_str) => {
             match nodedb_sql::parser::object_literal::parse_object_literal(&obj_str) {
-                Some(Ok(fields)) => Ok(sonic_rs::to_string(&nodedb_types::Value::Object(fields))
-                    .unwrap_or_else(|_| "{}".to_string())),
+                Some(Ok(fields)) => sonic_rs::to_string(&nodedb_types::Value::Object(fields))
+                    .map_err(|e| {
+                        sqlstate_error("XX000", &format!("PROPERTIES serialize error: {e}"))
+                    }),
                 Some(Err(msg)) => Err(sqlstate_error(
                     "42601",
                     &format!("PROPERTIES object literal error: {msg}"),
