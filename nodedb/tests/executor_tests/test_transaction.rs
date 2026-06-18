@@ -142,6 +142,7 @@ fn transaction_batch_rollback_on_failure() {
             dim: 3,
             field_name: String::new(),
             surrogate: nodedb_types::Surrogate::ZERO,
+            pk_bytes: None,
             provenance: None,
         }),
     );
@@ -167,6 +168,7 @@ fn transaction_batch_rollback_on_failure() {
                     dim: 3,
                     field_name: String::new(),
                     surrogate: nodedb_types::Surrogate::ZERO,
+                    pk_bytes: None,
                     provenance: None,
                 }),
             ],
@@ -324,6 +326,7 @@ fn transaction_edge_put_rolled_back_on_failure() {
             dim: 3,
             field_name: String::new(),
             surrogate: nodedb_types::Surrogate::ZERO,
+            pk_bytes: None,
             provenance: None,
         }),
     );
@@ -351,6 +354,7 @@ fn transaction_edge_put_rolled_back_on_failure() {
                     dim: 3,
                     field_name: String::new(),
                     surrogate: nodedb_types::Surrogate::ZERO,
+                    pk_bytes: None,
                     provenance: None,
                 }),
             ],
@@ -439,6 +443,7 @@ fn transaction_mixed_doc_edge_vector_rollback() {
             dim: 3,
             field_name: String::new(),
             surrogate: nodedb_types::Surrogate::ZERO,
+            pk_bytes: None,
             provenance: None,
         }),
     );
@@ -473,6 +478,7 @@ fn transaction_mixed_doc_edge_vector_rollback() {
                     dim: 3,
                     field_name: String::new(),
                     surrogate: nodedb_types::Surrogate::ZERO,
+                    pk_bytes: None,
                     provenance: None,
                 }),
             ],

@@ -11,6 +11,8 @@ use common::cluster_harness::TestCluster;
 
 use std::time::Duration;
 
+use nodedb_types::DatabaseId;
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// Simple query returning the first column of every data row.
@@ -25,6 +27,25 @@ async fn query_col0(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Read the raw surrogate bound to `(collection, pk)` from a node's local
+/// `SystemCatalog` — no SQL round-trip. Used to assert that the *same key*
+/// resolves to the *same surrogate u32* on every node (the direct proof
+/// that the proposer's surrogate is carried + bound, never re-allocated
+/// divergently per node). Mirrors the catalog reader in
+/// `hilo_surrogate_uniqueness.rs`.
+fn surrogate_for_pk(
+    shared: &std::sync::Arc<nodedb::control::state::SharedState>,
+    collection: &str,
+    pk: &str,
+) -> Option<u32> {
+    let catalog = shared.credentials.catalog().as_ref()?;
+    catalog
+        .get_surrogate_for_pk(DatabaseId::DEFAULT, collection, pk.as_bytes())
+        .ok()
+        .flatten()
+        .map(|s| s.as_u32())
 }
 
 fn pg_detail(e: &tokio_postgres::Error) -> String {
@@ -182,6 +203,121 @@ async fn surrogate_pk_scan_consistent_across_nodes() {
                 "node {idx} missing {needle}; rows={rows:?}"
             );
         }
+    }
+
+    cluster.shutdown().await;
+}
+
+/// Carry-and-bind: the coordinator's surrogate is carried on the wire and
+/// *bound* (never re-allocated) on the owner's apply path.
+///
+/// `document_strict` collections are SINGLE-vShard-homed: every row lives on
+/// ONE owning vShard/node; other nodes route reads to the owner. The
+/// coordinator (the node that receives the INSERT) assigns the surrogate at
+/// plan time, writes its OWN catalog binding, and carries the surrogate on
+/// the wire; the owner must BIND that carried value rather than re-allocate.
+///
+/// Because of single-homing, only the coordinator and the owner hold a local
+/// `(collection, pk) -> surrogate` binding — a third node that neither
+/// coordinates nor owns the key routes the read and has `None`. The real
+/// invariant is therefore NOT "every node has a binding" (a non-invariant
+/// here) but: every PRESENT binding for a given key is NON-ZERO and ALL-EQUAL
+/// — coordinator and owner agree on one authoritative surrogate. Without the
+/// carry+bind fix the owner re-allocates from its own batch and the two
+/// diverge.
+///
+///   (A) Identity (white-box): for each key, every present local-catalog
+///       binding across all nodes is non-zero and identical; and across the
+///       three keys at least one key has >=2 present bindings (proving the
+///       coordinator≠owner carry path actually ran — guards against a
+///       regression where binding silently stops happening).
+///   (B) Behavior (black-box): a `DELETE ... WHERE id = <pk>` issued from a
+///       *different* node than the inserter removes the row on *all* nodes. A
+///       divergent surrogate would make the delete a no-op on the owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_node_surrogate_binding_is_consistent_and_delete_hits() {
+    let cluster = TestCluster::spawn_three()
+        .await
+        .expect("spawn 3-node cluster");
+
+    cluster
+        .exec_ddl_on_any_leader(
+            "CREATE COLLECTION sur_bind  \
+             (id TEXT PRIMARY KEY, val TEXT) WITH (engine='document_strict')",
+        )
+        .await
+        .expect("CREATE COLLECTION sur_bind");
+
+    // ── Insert a DISTINCT key via each node ───────────────────────────
+    // Three different coordinators, one fixed owner → at least two keys are
+    // coordinated by a non-owner, exercising the owner-binds-carried path.
+    let keys: Vec<String> = (0..cluster.nodes.len())
+        .map(|i| format!("key_from_node_{i}"))
+        .collect();
+    for (i, key) in keys.iter().enumerate() {
+        cluster.nodes[i]
+            .client
+            .simple_query(&format!(
+                "INSERT INTO sur_bind (id, val) VALUES ('{key}', 'payload')"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("insert {key} via node {i}: {}", pg_detail(&e)));
+    }
+
+    cluster
+        .wait_for_full_apply_convergence(Duration::from_secs(10))
+        .await;
+
+    // ── Assertion A: every PRESENT binding for a key agrees ───────────
+    let mut max_present = 0usize;
+    for key in &keys {
+        let mut present: Vec<u32> = Vec::new();
+        for (idx, node) in cluster.nodes.iter().enumerate() {
+            if let Some(s) = surrogate_for_pk(&node.shared, "sur_bind", key) {
+                assert_ne!(
+                    s, 0,
+                    "node {idx} bound the reserved ZERO surrogate to '{key}'"
+                );
+                present.push(s);
+            }
+        }
+        assert!(
+            !present.is_empty(),
+            "no node holds a binding for '{key}' — coordinator binding lost"
+        );
+        assert!(
+            present.windows(2).all(|w| w[0] == w[1]),
+            "surrogate for '{key}' diverged across present bindings: {present:?} — \
+             the coordinator's surrogate was not carried + bound on apply"
+        );
+        max_present = max_present.max(present.len());
+    }
+    assert!(
+        max_present >= 2,
+        "no key had >=2 nodes with a present binding — the coordinator≠owner \
+         carry+bind path never ran (binding may have silently stopped)"
+    );
+
+    // ── Assertion B: cross-node delete hits the right row everywhere ──
+    // Delete the node-0 key from node 1 (NOT the inserting node).
+    let del_key = &keys[0];
+    cluster.nodes[1]
+        .client
+        .simple_query(&format!("DELETE FROM sur_bind WHERE id = '{del_key}'"))
+        .await
+        .unwrap_or_else(|e| panic!("cross-node delete {del_key} via node 1: {}", pg_detail(&e)));
+
+    cluster
+        .wait_for_full_apply_convergence(Duration::from_secs(10))
+        .await;
+
+    for (idx, node) in cluster.nodes.iter().enumerate() {
+        let rows = query_col0(&node.client, "SELECT id FROM sur_bind").await;
+        assert!(
+            !rows.iter().any(|r| r.contains(del_key.as_str())),
+            "node {idx} still has '{del_key}' after cross-node delete; rows={rows:?} \
+             — the delete missed the row (surrogate divergence)"
+        );
     }
 
     cluster.shutdown().await;

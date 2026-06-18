@@ -223,6 +223,7 @@ fn surrogate_round_trip_all_engines() {
                 dim: 3,
                 field_name: String::new(),
                 surrogate: Surrogate::new(s),
+                pk_bytes: None,
                 provenance: None,
             })
         })

@@ -129,6 +129,7 @@ impl CoreLoop {
                 dim,
                 field_name,
                 surrogate,
+                pk_bytes: _,
                 provenance: _,
             }) => {
                 let index_key = Self::vector_index_key(tid, collection, field_name);

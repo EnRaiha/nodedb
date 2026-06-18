@@ -64,6 +64,10 @@ pub enum ReplicatedWrite {
         collection: String,
         document_id: String,
         value: Vec<u8>,
+        /// Leader-assigned global surrogate, carried verbatim so every
+        /// replica binds the same identity to `document_id` (binding key
+        /// = `document_id.as_bytes()`) instead of re-allocating.
+        surrogate: u32,
     },
     PointInsert {
         collection: String,
@@ -71,15 +75,21 @@ pub enum ReplicatedWrite {
         value: Vec<u8>,
         #[serde(default)]
         if_absent: bool,
+        /// Leader-assigned global surrogate (binding key = `document_id`).
+        surrogate: u32,
     },
     PointDelete {
         collection: String,
         document_id: String,
+        /// Leader-assigned global surrogate (binding key = `document_id`).
+        surrogate: u32,
     },
     PointUpdate {
         collection: String,
         document_id: String,
         updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
+        /// Leader-assigned global surrogate (binding key = `document_id`).
+        surrogate: u32,
     },
     VectorInsert {
         collection: String,
@@ -87,11 +97,12 @@ pub enum ReplicatedWrite {
         dim: usize,
         #[serde(default)]
         field_name: String,
+        /// Leader-assigned global surrogate, carried verbatim. Bound on
+        /// apply by `pk_bytes` when `Some`, else by the surrogate's own
+        /// self-key (`as_u32().to_be_bytes()`) — never re-allocated.
+        surrogate: u32,
         /// User PK bytes (UTF-8 of the document id) when the insert
-        /// originates from a PK-bearing path; `None` for headless
-        /// inserts. Followers re-derive the surrogate via
-        /// `assigner.assign(collection, &pk_bytes)` (or
-        /// `assign_anonymous(collection)` when `None`).
+        /// originates from a PK-bearing path; `None` for headless inserts.
         #[serde(default)]
         pk_bytes: Option<Vec<u8>>,
         /// Sync provenance encoded as zerompk bytes. `None` for non-sync
@@ -105,6 +116,9 @@ pub enum ReplicatedWrite {
         collection: String,
         vectors: Vec<Vec<f32>>,
         dim: usize,
+        /// Leader-assigned global surrogates, parallel to `vectors`. Each
+        /// is bound on apply by its own self-key — never re-allocated.
+        surrogates: Vec<u32>,
     },
     VectorDelete {
         collection: String,
@@ -238,6 +252,8 @@ pub enum ReplicatedWrite {
         key: Vec<u8>,
         value: Vec<u8>,
         ttl_ms: u64,
+        /// Leader-assigned global surrogate (binding key = `key` raw bytes).
+        surrogate: u32,
     },
     KvDelete {
         collection: String,

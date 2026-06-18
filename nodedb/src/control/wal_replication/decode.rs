@@ -12,13 +12,15 @@ use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, GraphOp, KvOp, VectorOp
 ///
 /// Returns `None` if the data is not a valid ReplicatedEntry (e.g., ConfChange or no-op).
 ///
-/// `assigner`, when `Some`, drives follower-local surrogate binding for
-/// the variants that carry one: each insert/upsert/put re-derives its
-/// stable identity by calling `assigner.assign(collection, pk_bytes)`,
-/// which writes the binding to the local catalog and emits a
-/// `SurrogateBind` WAL record. When `None`, all surrogate fields fall
-/// back to `Surrogate::ZERO` (used by tests that exercise the decoder
-/// in isolation without spinning up `SharedState`).
+/// `assigner`, when `Some`, drives follower-local surrogate binding.
+/// Single-row writers (documents, KV, vector) carry the leader-assigned
+/// surrogate verbatim on the wire and call `assigner.bind(...)` to install
+/// that exact identity in the local catalog (+ `SurrogateBind` WAL record)
+/// — they never re-allocate, so the same key resolves to the same surrogate
+/// on every node. Edge/CRDT variants still re-derive via `assign`
+/// (carried surrogates land in later units). When `None`, surrogate fields
+/// fall back to the carried value / `Surrogate::ZERO` without catalog writes
+/// (used by tests that exercise the decoder without `SharedState`).
 pub fn from_replicated_entry(
     data: &[u8],
     assigner: Option<&SurrogateAssigner>,
@@ -65,9 +67,14 @@ fn to_physical_plan(
             collection,
             document_id,
             value,
+            surrogate,
         } => {
             let pk_bytes = document_id.as_bytes().to_vec();
-            let surrogate = assign_or_zero(assigner, collection, &pk_bytes)?;
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate = match assigner {
+                Some(a) => a.bind(collection, &pk_bytes, carried)?,
+                None => carried,
+            };
             PhysicalPlan::Document(DocumentOp::PointPut {
                 collection: collection.clone(),
                 document_id: document_id.clone(),
@@ -81,8 +88,14 @@ fn to_physical_plan(
             document_id,
             value,
             if_absent,
+            surrogate,
         } => {
-            let surrogate = assign_or_zero(assigner, collection, document_id.as_bytes())?;
+            let pk_bytes = document_id.as_bytes();
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate = match assigner {
+                Some(a) => a.bind(collection, pk_bytes, carried)?,
+                None => carried,
+            };
             PhysicalPlan::Document(DocumentOp::PointInsert {
                 collection: collection.clone(),
                 document_id: document_id.clone(),
@@ -94,16 +107,17 @@ fn to_physical_plan(
         ReplicatedWrite::PointDelete {
             collection,
             document_id,
+            surrogate,
         } => {
             let pk_bytes = document_id.as_bytes().to_vec();
-            // Followers re-derive the surrogate via the local catalog
-            // rev table; a missing binding means the row is unknown to
-            // this replica and the delete is a no-op once dispatched.
+            // Bind the carried (authoritative) surrogate even on a delete:
+            // a delete that applies before its insert still installs the
+            // correct identity, and the engine op is a no-op on a row that
+            // does not exist yet. Re-deriving via `lookup` would diverge.
+            let carried = nodedb_types::Surrogate::new(*surrogate);
             let surrogate = match assigner {
-                Some(a) => a
-                    .lookup(collection, &pk_bytes)?
-                    .unwrap_or(nodedb_types::Surrogate::ZERO),
-                None => nodedb_types::Surrogate::ZERO,
+                Some(a) => a.bind(collection, &pk_bytes, carried)?,
+                None => carried,
             };
             PhysicalPlan::Document(DocumentOp::PointDelete {
                 collection: collection.clone(),
@@ -117,13 +131,15 @@ fn to_physical_plan(
             collection,
             document_id,
             updates,
+            surrogate,
         } => {
             let pk_bytes = document_id.as_bytes().to_vec();
+            // Same rationale as `PointDelete`: bind the carried surrogate so
+            // identity is authoritative regardless of apply ordering.
+            let carried = nodedb_types::Surrogate::new(*surrogate);
             let surrogate = match assigner {
-                Some(a) => a
-                    .lookup(collection, &pk_bytes)?
-                    .unwrap_or(nodedb_types::Surrogate::ZERO),
-                None => nodedb_types::Surrogate::ZERO,
+                Some(a) => a.bind(collection, &pk_bytes, carried)?,
+                None => carried,
             };
             PhysicalPlan::Document(DocumentOp::PointUpdate {
                 collection: collection.clone(),
@@ -139,17 +155,20 @@ fn to_physical_plan(
             vector,
             dim,
             field_name,
+            surrogate,
             pk_bytes,
             provenance: prov_bytes,
         } => {
-            // Followers re-derive surrogate identity locally. With a
-            // PK we share the leader's binding; without one (headless
-            // batch element), allocate a follower-local anonymous
-            // surrogate so the row is still globally addressable.
-            let surrogate = match (assigner, pk_bytes) {
-                (Some(a), Some(pk)) => a.assign(collection, pk)?,
-                (Some(a), None) => a.assign_anonymous(collection)?,
-                (None, _) => nodedb_types::Surrogate::ZERO,
+            // Bind the leader-assigned surrogate verbatim — never re-allocate.
+            // With a PK we bind by it; headless inserts self-key by the
+            // surrogate's own big-endian bytes (mirrors `assign_anonymous`).
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate = match assigner {
+                Some(a) => match pk_bytes {
+                    Some(pk) => a.bind(collection, pk, carried)?,
+                    None => a.bind(collection, &carried.as_u32().to_be_bytes(), carried)?,
+                },
+                None => carried,
             };
             let provenance = decode_sync_engines::decode_provenance(prov_bytes)?;
             PhysicalPlan::Vector(VectorOp::Insert {
@@ -158,6 +177,7 @@ fn to_physical_plan(
                 dim: *dim,
                 field_name: field_name.clone(),
                 surrogate,
+                pk_bytes: pk_bytes.clone(),
                 provenance,
             })
         }
@@ -165,16 +185,40 @@ fn to_physical_plan(
             collection,
             vectors,
             dim,
+            surrogates,
         } => {
-            let surrogates = match assigner {
-                Some(a) => {
-                    let mut out = Vec::with_capacity(vectors.len());
-                    for _ in vectors {
-                        out.push(a.assign_anonymous(collection)?);
-                    }
-                    out
-                }
-                None => vec![nodedb_types::Surrogate::ZERO; vectors.len()],
+            // The carried surrogate vector MUST be 1:1 with the vectors.
+            // A mismatch is a corrupt/incompatible entry — fail loud rather
+            // than truncate or zip-shorten (which would silently drop rows
+            // or mis-bind identities).
+            if surrogates.len() != vectors.len() {
+                return Err(crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: format!(
+                        "VectorBatchInsert surrogate/vector count mismatch: {} surrogates, {} vectors",
+                        surrogates.len(),
+                        vectors.len()
+                    ),
+                });
+            }
+            // Bind each element by its self-key and use the *authoritative*
+            // returned surrogate in the plan. Each is unique by construction
+            // so first-wins returns the carried value, but consuming the
+            // return keeps this consistent with the single-row arms.
+            // Iterate `surrogates` (the raw u32 wire vec) directly to avoid
+            // a needless intermediate `Vec<Surrogate>` allocation.
+            let surrogates: Vec<nodedb_types::Surrogate> = match assigner {
+                Some(a) => surrogates
+                    .iter()
+                    .map(|&raw| {
+                        let c = nodedb_types::Surrogate::new(raw);
+                        a.bind(collection, &c.as_u32().to_be_bytes(), c)
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?,
+                None => surrogates
+                    .iter()
+                    .map(|&raw| nodedb_types::Surrogate::new(raw))
+                    .collect(),
             };
             PhysicalPlan::Vector(VectorOp::BatchInsert {
                 collection: collection.clone(),
@@ -265,8 +309,13 @@ fn to_physical_plan(
             key,
             value,
             ttl_ms,
+            surrogate,
         } => {
-            let surrogate = assign_or_zero(assigner, collection, key)?;
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate = match assigner {
+                Some(a) => a.bind(collection, key, carried)?,
+                None => carried,
+            };
             PhysicalPlan::Kv(KvOp::Put {
                 collection: collection.clone(),
                 key: key.clone(),

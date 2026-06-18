@@ -32,6 +32,7 @@ impl CoreLoop {
                 dim,
                 field_name,
                 surrogate,
+                pk_bytes: _,
                 provenance,
             } => self.execute_vector_insert(super::super::handlers::vector::VectorInsertParams {
                 task,

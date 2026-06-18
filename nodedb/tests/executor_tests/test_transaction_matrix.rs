@@ -49,6 +49,7 @@ fn vector_seed(collection: &str) -> PhysicalPlan {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        pk_bytes: None,
         provenance: None,
     })
 }
@@ -61,6 +62,7 @@ fn vector_fail(collection: &str) -> PhysicalPlan {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        pk_bytes: None,
         provenance: None,
     })
 }
@@ -189,6 +191,7 @@ fn rollback_matrix_vector_then_doc_fail() {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        pk_bytes: None,
         provenance: None,
     });
     let resp = send_raw(

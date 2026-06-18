@@ -97,9 +97,12 @@ pub(crate) fn build_insert(
     let field_name = fields.field_name.clone().unwrap_or_default();
 
     let assigner = &ctx.state.surrogate_assigner;
-    let surrogate = match fields.document_id.as_deref() {
-        Some(pk) if !pk.is_empty() => assigner.assign(collection, pk.as_bytes())?,
-        _ => assigner.assign_anonymous(collection)?,
+    let (surrogate, pk_bytes) = match fields.document_id.as_deref() {
+        Some(pk) if !pk.is_empty() => (
+            assigner.assign(collection, pk.as_bytes())?,
+            Some(pk.as_bytes().to_vec()),
+        ),
+        _ => (assigner.assign_anonymous(collection)?, None),
     };
 
     Ok(PhysicalPlan::Vector(VectorOp::Insert {
@@ -108,6 +111,7 @@ pub(crate) fn build_insert(
         dim,
         field_name,
         surrogate,
+        pk_bytes,
         provenance: None,
     }))
 }

@@ -18,6 +18,7 @@ fn replicated_entry_roundtrip() {
             collection: "users".into(),
             document_id: "u1".into(),
             value: b"alice".to_vec(),
+            surrogate: 1,
         },
     );
     let original_key = entry.idempotency_key;
@@ -36,10 +37,12 @@ fn replicated_entry_roundtrip() {
             collection,
             document_id,
             value,
+            surrogate,
         } => {
             assert_eq!(collection, "users");
             assert_eq!(document_id, "u1");
             assert_eq!(value, b"alice");
+            assert_eq!(surrogate, 1);
         }
         other => panic!("expected PointPut, got {other:?}"),
     }
@@ -52,16 +55,19 @@ fn all_write_variants_serialize() {
             collection: "c".into(),
             document_id: "d".into(),
             value: vec![1, 2, 3],
+            surrogate: 1,
         },
         ReplicatedWrite::PointDelete {
             collection: "c".into(),
             document_id: "d".into(),
+            surrogate: 1,
         },
         ReplicatedWrite::VectorInsert {
             collection: "v".into(),
             vector: vec![1.0, 2.0, 3.0],
             dim: 3,
             field_name: "embedding".into(),
+            surrogate: 7,
             pk_bytes: Some(b"doc-1".to_vec()),
             provenance: None,
         },
@@ -217,6 +223,7 @@ fn vector_insert_provenance_roundtrip() {
         dim: 3,
         field_name: "emb".into(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        pk_bytes: None,
         provenance: Some(prov.clone()),
     });
     let entry = to_replicated_entry(tenant, vshard, &plan)
@@ -246,6 +253,7 @@ fn vector_insert_provenance_roundtrip() {
         dim: 3,
         field_name: "emb".into(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        pk_bytes: None,
         provenance: None,
     });
     let entry_none = to_replicated_entry(tenant, vshard, &plan_none)

@@ -113,6 +113,7 @@ impl SyncSession {
                     dim: msg.dim,
                     field_name: msg.field_name.clone(),
                     surrogate,
+                    pk_bytes: Some(msg.id.as_bytes().to_vec()),
                 },
                 nodedb_types::sync::wire::SyncProvenance {
                     producer_id: self.producer_id,

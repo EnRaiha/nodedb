@@ -369,6 +369,7 @@ fn mixed_engine_isolation_no_cross_eviction() {
                 dim: 3,
                 field_name: String::new(),
                 surrogate: nodedb_types::Surrogate::ZERO,
+                pk_bytes: None,
                 provenance: None,
             }),
         );

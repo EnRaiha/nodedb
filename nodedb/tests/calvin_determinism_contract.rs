@@ -196,6 +196,7 @@ fn vector_insert_byte_identical() {
             dim: 3,
             field_name: String::new(),
             surrogate: nodedb_types::Surrogate::new(i),
+            pk_bytes: None,
             provenance: None,
         }));
     }

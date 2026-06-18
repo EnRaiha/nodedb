@@ -23,6 +23,7 @@ fn vector_insert_and_search() {
                     dim: 3,
                     field_name: String::new(),
                     surrogate: nodedb_types::Surrogate::ZERO,
+                    pk_bytes: None,
                     provenance: None,
                 }),
             ),

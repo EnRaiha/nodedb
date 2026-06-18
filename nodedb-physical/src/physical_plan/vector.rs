@@ -72,6 +72,13 @@ pub enum VectorOp {
         /// Control Plane via `SurrogateAssigner` before dispatch; the
         /// engine binds the HNSW node id to this surrogate.
         surrogate: Surrogate,
+        /// User PK bytes (UTF-8 of the document id) when the insert
+        /// originates from a PK-bearing path; `None` for headless
+        /// inserts. Carried on the replication wire so followers bind
+        /// the leader-assigned surrogate to this exact key rather than
+        /// re-allocating a divergent one.
+        #[serde(default)]
+        pk_bytes: Option<Vec<u8>>,
         /// Sync provenance: identifies the originating peer and sequence for idempotency.
         #[serde(default)]
         provenance: Option<nodedb_types::sync::wire::SyncProvenance>,

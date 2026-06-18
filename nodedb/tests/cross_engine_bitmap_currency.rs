@@ -188,6 +188,7 @@ fn fts_derived_bitmap_filters_vector_search() {
                 dim: 3,
                 field_name: String::new(),
                 surrogate: *surrogate,
+                pk_bytes: None,
                 provenance: None,
             })),
         })

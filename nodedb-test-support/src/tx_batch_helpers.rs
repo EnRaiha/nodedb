@@ -120,6 +120,7 @@ pub fn vector_seed(collection: &str) -> PhysicalPlan {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        pk_bytes: None,
         provenance: None,
     })
 }
@@ -131,6 +132,7 @@ pub fn vector_insert_ok(collection: &str) -> PhysicalPlan {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::new(101),
+        pk_bytes: None,
         provenance: None,
     })
 }
@@ -143,6 +145,7 @@ pub fn vector_fail(collection: &str) -> PhysicalPlan {
         dim: 3,
         field_name: String::new(),
         surrogate: nodedb_types::Surrogate::ZERO,
+        pk_bytes: None,
         provenance: None,
     })
 }

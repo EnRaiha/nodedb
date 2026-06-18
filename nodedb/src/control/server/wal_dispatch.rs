@@ -101,6 +101,7 @@ pub fn wal_append_if_write_with_creds(
             dim,
             field_name,
             surrogate,
+            pk_bytes: _,
             provenance,
         }) => {
             // The local-WAL record carries the surrogate as a u32 so

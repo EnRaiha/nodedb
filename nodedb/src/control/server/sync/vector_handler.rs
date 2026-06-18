@@ -26,6 +26,10 @@ pub struct VectorInsertParams {
     pub dim: usize,
     pub field_name: String,
     pub surrogate: Surrogate,
+    /// Raw PK bytes (the sync message's document id) used to bind the
+    /// surrogate on follower apply. Always `Some` on this path — the sync
+    /// producer always supplies a document id.
+    pub pk_bytes: Option<Vec<u8>>,
 }
 
 /// Encapsulates async Data Plane dispatch for vector insert/delete.
@@ -106,6 +110,7 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
             dim: params.dim,
             field_name: params.field_name,
             surrogate: params.surrogate,
+            pk_bytes: params.pk_bytes,
             provenance: Some(prov),
         });
 

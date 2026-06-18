@@ -246,6 +246,7 @@ pub async fn insert_document(
             dim,
             field_name: field_name.clone(),
             surrogate,
+            pk_bytes: Some(parsed.doc_id.as_bytes().to_vec()),
             provenance: None,
         });
 

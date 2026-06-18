@@ -198,6 +198,7 @@ fn kv_and_vector_coexist() {
                 dim: 3,
                 field_name: String::new(),
                 surrogate: nodedb_types::Surrogate::ZERO,
+                pk_bytes: None,
                 provenance: None,
             }),
         );

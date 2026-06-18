@@ -35,71 +35,79 @@ pub fn to_replicated_entry(
             collection,
             document_id,
             value,
-            surrogate: _,
+            surrogate,
             pk_bytes: _,
         }) => ReplicatedWrite::PointPut {
             collection: collection.clone(),
             document_id: document_id.clone(),
             value: value.clone(),
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Document(DocumentOp::PointInsert {
             collection,
             document_id,
             value,
             if_absent,
-            surrogate: _,
+            surrogate,
         }) => ReplicatedWrite::PointInsert {
             collection: collection.clone(),
             document_id: document_id.clone(),
             value: value.clone(),
             if_absent: *if_absent,
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Document(DocumentOp::PointDelete {
             collection,
             document_id,
+            surrogate,
             ..
         }) => ReplicatedWrite::PointDelete {
             collection: collection.clone(),
             document_id: document_id.clone(),
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Document(DocumentOp::PointUpdate {
             collection,
             document_id,
             updates,
+            surrogate,
             ..
         }) => ReplicatedWrite::PointUpdate {
             collection: collection.clone(),
             document_id: document_id.clone(),
             updates: updates.clone(),
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Vector(VectorOp::Insert {
             collection,
             vector,
             dim,
             field_name,
-            surrogate: _,
+            surrogate,
+            pk_bytes,
             provenance,
         }) => ReplicatedWrite::VectorInsert {
             collection: collection.clone(),
             vector: vector.clone(),
             dim: *dim,
             field_name: field_name.clone(),
-            // Surrogates are not part of the cross-node wire shape;
-            // followers re-derive identity via the assigner. Without
-            // the originating user PK at this hop, headless followers
-            // call `assign_anonymous`.
-            pk_bytes: None,
+            // Carry the leader-assigned surrogate verbatim. Followers bind
+            // (never re-allocate) by `pk_bytes` when present, else by the
+            // surrogate's own self-key.
+            surrogate: surrogate.as_u32(),
+            pk_bytes: pk_bytes.clone(),
             provenance: encode_provenance(provenance),
         },
         PhysicalPlan::Vector(VectorOp::BatchInsert {
             collection,
             vectors,
             dim,
-            surrogates: _,
+            surrogates,
         }) => ReplicatedWrite::VectorBatchInsert {
             collection: collection.clone(),
             vectors: vectors.clone(),
             dim: *dim,
+            surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
         },
         PhysicalPlan::Vector(VectorOp::Delete {
             collection,
@@ -175,12 +183,13 @@ pub fn to_replicated_entry(
             key,
             value,
             ttl_ms,
-            surrogate: _,
+            surrogate,
         }) => ReplicatedWrite::KvPut {
             collection: collection.clone(),
             key: key.clone(),
             value: value.clone(),
             ttl_ms: *ttl_ms,
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Kv(KvOp::Delete { collection, keys }) => ReplicatedWrite::KvDelete {
             collection: collection.clone(),

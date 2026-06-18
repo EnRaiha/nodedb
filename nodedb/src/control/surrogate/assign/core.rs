@@ -274,6 +274,90 @@ impl SurrogateAssigner {
         catalog.get_surrogate_for_pk(DatabaseId::DEFAULT, collection, pk_bytes)
     }
 
+    /// Bind `(collection, pk_bytes)` to a *carried* surrogate without ever
+    /// allocating, resolving concurrent carried values **first-wins** and
+    /// returning the *authoritative* surrogate the caller must use.
+    ///
+    /// Used on the Raft apply path: a coordinator assigned the surrogate at
+    /// plan time, embedded it in the plan, and carried it on the wire; the
+    /// owner installs that identity rather than drawing a fresh (divergent)
+    /// one from its own allocator. Because two different non-owner
+    /// coordinators can each assign a *different* surrogate (from disjoint
+    /// HiLo batches) for the *same* key, the owner must resolve this
+    /// deterministically: the FIRST binding wins and every later carried
+    /// value is discarded. The returned `Surrogate` is the authoritative one
+    /// (the already-bound value when one exists, else the carried value just
+    /// persisted) and MUST be used as the storage key by the caller —
+    /// otherwise the owner would create duplicate rows under different
+    /// surrogates for the same key.
+    ///
+    /// - No catalog (in-memory test fixture): returns `Ok(surrogate)` — the
+    ///   carried value is authoritative, nothing to persist (mirrors
+    ///   `assign`'s catalog-less branch).
+    /// - Binding already exists: returns `Ok(existing)` — first-wins, never
+    ///   overwrites, discards the carried value even if it differs.
+    /// - Otherwise: persist the binding + emit the durable WAL bind under the
+    ///   registry write lock (same order as `assign`), `restore_hwm` so the
+    ///   global watermark stays ahead of the carried value, and return the
+    ///   now-bound `surrogate`.
+    ///
+    /// Replay/retry is idempotent: re-applying the same entry finds the
+    /// existing binding in the pre-check and returns it without writing.
+    ///
+    /// Crucially this never touches `alloc_locked`/`maybe_flush`: the
+    /// allocator counter must NOT advance on a bind — that would burn a
+    /// surrogate and diverge from the coordinator.
+    pub fn bind(
+        &self,
+        collection: &str,
+        pk_bytes: &[u8],
+        surrogate: Surrogate,
+    ) -> crate::Result<Surrogate> {
+        let catalog = match self.credential_store.catalog().as_ref() {
+            Some(c) => c,
+            None => return Ok(surrogate),
+        };
+
+        // First-wins pre-check under a read lock: if any binding is already
+        // installed (replay, retry, or a competing coordinator's carried
+        // value applied first) it is authoritative — return it, never
+        // overwrite, discard the carried value even if it differs.
+        if let Some(existing) =
+            catalog.get_surrogate_for_pk(DatabaseId::DEFAULT, collection, pk_bytes)?
+        {
+            return Ok(existing);
+        }
+
+        // Hold the registry write lock across (re-check, persist binding,
+        // WAL bind, hwm advance) so it is one critical section — same lock
+        // discipline as `assign`, which also serializes on this write lock.
+        // `restore_hwm` itself is atomic on the counter; we call it through
+        // the held guard rather than re-locking (which would deadlock on
+        // this std `RwLock`).
+        let registry = self.registry_write()?;
+        // Re-check under the lock (TOCTOU): a concurrent `assign`/`bind` on
+        // this node could have written between the pre-check and the lock.
+        // First-wins still applies — return the existing value.
+        if let Some(existing) =
+            catalog.get_surrogate_for_pk(DatabaseId::DEFAULT, collection, pk_bytes)?
+        {
+            return Ok(existing);
+        }
+        catalog.put_surrogate(DatabaseId::DEFAULT, collection, pk_bytes, surrogate)?;
+        self.wal_appender
+            .record_bind_to_wal(surrogate.as_u32(), collection, pk_bytes)?;
+        // Advance the local watermark past the carried value so a later
+        // LOCAL `assign`/`assign_anonymous` on this node can never re-issue
+        // it. Idempotent and monotonic — never lowers, never advances the
+        // allocator's draw position (only the hwm floor).
+        registry
+            .restore_hwm(surrogate.as_u32())
+            .map_err(|e| crate::Error::Internal {
+                detail: format!("surrogate bind restore_hwm failed: {e}"),
+            })?;
+        Ok(surrogate)
+    }
+
     /// Expose the registry handle for read access by the Raft applier.
     ///
     /// The returned `Arc<RwLock<SurrogateRegistry>>` is used by

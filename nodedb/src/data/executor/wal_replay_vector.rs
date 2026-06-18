@@ -189,7 +189,10 @@ impl CoreLoop {
                         continue;
                     }
                     let surrogate = nodedb_types::Surrogate::new(surrogate_u32);
-                    let _ = doc_id;
+                    // Local replay rebinds by the carried surrogate; the
+                    // compat doc-id slot (always `None` on this write path)
+                    // maps straight through to `pk_bytes` for fidelity.
+                    let pk_bytes = doc_id.as_ref().map(|d| d.as_bytes().to_vec());
                     let vshard = crate::types::VShardId::from_collection_in_database(
                         DatabaseId::DEFAULT,
                         &collection,
@@ -204,6 +207,7 @@ impl CoreLoop {
                             dim,
                             field_name: field_name.clone(),
                             surrogate,
+                            pk_bytes,
                             provenance: provenance.clone(),
                         }),
                     );

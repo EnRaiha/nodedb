@@ -786,6 +786,7 @@ fn vector_search_with_array_surrogate_prefilter() {
             dim: 3,
             field_name: String::new(),
             surrogate: Surrogate(i + 1),
+            pk_bytes: None,
             provenance: None,
         }));
         assert_eq!(r.status, Status::Ok, "vector insert {i} failed: {r:?}");
