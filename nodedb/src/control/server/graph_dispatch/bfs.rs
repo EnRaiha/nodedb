@@ -13,13 +13,12 @@
 
 use std::collections::HashSet;
 
-use sonic_rs;
-
 use crate::bridge::envelope::Response;
 use crate::control::state::SharedState;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
-use crate::types::{Lsn, RequestId, TenantId};
+use crate::types::TenantId;
 
+use super::helpers::{encode_path, ok_response};
 use super::hop::{NeighborHopParams, execute_neighbor_hop};
 
 /// Cross-core BFS with explicit traversal options (fan-out limits, partial mode).
@@ -37,14 +36,14 @@ pub async fn cross_core_bfs_with_options(
 ) -> crate::Result<Response> {
     let mut visited: HashSet<String> = HashSet::new();
     let mut all_discovered: Vec<String> = Vec::new();
-    let mut frontier: Vec<String> = start_nodes.clone();
+    let mut frontier: Vec<String> = start_nodes;
 
-    for node in &start_nodes {
+    for node in &frontier {
         visited.insert(node.clone());
         all_discovered.push(node.clone());
     }
 
-    for depth in 0..max_depth {
+    for _depth in 0..max_depth {
         if frontier.is_empty() {
             break;
         }
@@ -58,7 +57,6 @@ pub async fn cross_core_bfs_with_options(
                 direction,
                 options,
                 discovered_so_far: all_discovered.len(),
-                remaining_depth: max_depth.saturating_sub(depth + 1),
             },
         )
         .await?;
@@ -82,18 +80,5 @@ pub async fn cross_core_bfs_with_options(
         }
     }
 
-    let payload = sonic_rs::to_vec(&all_discovered).map_err(|e| crate::Error::Serialization {
-        format: "json".into(),
-        detail: e.to_string(),
-    })?;
-
-    Ok(Response {
-        request_id: RequestId::new(0),
-        status: crate::bridge::envelope::Status::Ok,
-        attempt: 1,
-        partial: false,
-        payload: crate::bridge::envelope::Payload::from_vec(payload),
-        watermark_lsn: Lsn::ZERO,
-        error_code: None,
-    })
+    Ok(ok_response(encode_path(&all_discovered)?))
 }

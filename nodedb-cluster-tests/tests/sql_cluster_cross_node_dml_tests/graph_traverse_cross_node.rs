@@ -55,17 +55,10 @@ fn traversed_node_ids(v: &serde_json::Value) -> Vec<String> {
 /// DISTINCT reachable set — not duplicated by the vShards/cores it fans out to,
 /// and not truncated to the coordinator's local data.
 ///
-/// KNOWN GAP — distributed graph traversal is not implemented (tracked in
-/// `resource/SQL/cross_node_join_checklist.md`). `GRAPH INSERT EDGE` writes the
-/// edge to whatever node the client connects to (local SPSC dispatch), never
-/// routing it to `from_key(src)`'s cluster leader or Raft-replicating; the
-/// traversal routes reads by `from_key(src)` to that leader. Write and read
-/// land on different nodes, so a traversal coordinated from a non-owning node
-/// returns a partial set. Fixing it is a dedicated multi-part feature (cluster-
-/// routed graph writes + read scatter-gather + leadership-source consistency +
-/// Raft replication), not a single bugfix. This test reproduces the gap and
-/// becomes the gate for that effort. Single-node graph traversal is correct.
-#[ignore = "distributed graph traversal unimplemented; reproduces a known gap (see cross_node_join_checklist.md)"]
+/// Each hop partitions the incoming frontier by `from_key(node)` owner
+/// (resolved against live Raft leadership) and expands each frontier node at
+/// its owning node via a typed `NeighborsMulti` dispatch, so a traversal
+/// coordinated from a non-owning node still reaches the full set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn graph_traverse_returns_complete_distinct_set_from_any_node() {
     let cluster = TestCluster::spawn_three().await.expect("3-node cluster");

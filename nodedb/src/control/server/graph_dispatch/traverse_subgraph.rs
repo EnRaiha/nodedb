@@ -24,8 +24,9 @@ use crate::bridge::envelope::Response;
 use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
-use crate::types::{Lsn, RequestId, TenantId};
+use crate::types::TenantId;
 
+use super::helpers::ok_response;
 use super::hop::{NeighborHopParams, execute_neighbor_hop};
 
 /// Wire-shape JSON node entry. Field names mirror the client decoder in
@@ -58,12 +59,13 @@ struct WireSubGraph<'a> {
 
 /// BFS that returns a `{nodes,edges}` JSON subgraph for `GRAPH TRAVERSE`.
 ///
-/// Each hop fans `NeighborsMulti` to every Data Plane core via the
-/// shared [`execute_neighbor_hop`] helper and records:
+/// Each hop expands every frontier node at the node that owns
+/// `from_key(node)` via the shared [`execute_neighbor_hop`] helper and
+/// records:
 ///   * each newly-visited node (with its discovery depth), and
-///   * each `(src, label, dst)` edge the hop crossed where `src` is in
-///     the current frontier (local-shard portion only; see the module
-///     doc on `super::hop` for the cross-shard attribution caveat).
+///   * each `(src, label, dst)` edge the hop crossed where `src` is in the
+///     current frontier — fully attributed for BOTH the local-shard and
+///     remote-shard portions of the frontier.
 pub async fn cross_core_traverse_subgraph(
     shared: &SharedState,
     tenant_id: TenantId,
@@ -99,14 +101,14 @@ pub async fn cross_core_traverse_subgraph(
                 direction,
                 options,
                 discovered_so_far: node_order.len(),
-                remaining_depth: max_depth.saturating_sub(hop_idx + 1),
             },
         )
         .await?;
 
-        // Local edges are fully attributed. Always record them — even
-        // when the destination is already visited (an A→B→C graph with
-        // a back-edge B→A should surface that back-edge once).
+        // Edges are fully attributed for BOTH local-shard and remote-shard
+        // expansion (each frontier node was expanded at its owner). Always
+        // record them — even when the destination is already visited (an
+        // A→B→C graph with a back-edge B→A should surface that edge once).
         edges.extend(hop.local_triples);
 
         // Tag newly-discovered nodes with the current hop's depth and
@@ -157,13 +159,5 @@ pub async fn cross_core_traverse_subgraph(
         detail: e.to_string(),
     })?;
 
-    Ok(Response {
-        request_id: RequestId::new(0),
-        status: crate::bridge::envelope::Status::Ok,
-        attempt: 1,
-        partial: false,
-        payload: crate::bridge::envelope::Payload::from_vec(payload),
-        watermark_lsn: Lsn::ZERO,
-        error_code: None,
-    })
+    Ok(ok_response(payload))
 }

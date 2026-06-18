@@ -5,12 +5,18 @@
 //! In single-node mode, BFS is local: the Control Plane broadcasts
 //! `GraphNeighbors` to all Data Plane cores hop by hop and collects results.
 //!
-//! In cluster mode, after each local hop the Control Plane inspects the
-//! discovered frontier and identifies nodes that hash to shards owned by
-//! remote nodes. Those are batched into a `ScatterEnvelope` and dispatched
-//! to the remote shard leaders via
-//! `control::scatter_gather::coordinate_cross_shard_hop`. Remote results
-//! are merged before the next depth level begins.
+//! In cluster mode, each hop partitions the incoming frontier by owning
+//! vShard (resolved against live Raft leadership) BEFORE expansion: the
+//! locally-owned subset expands on local cores, and each remote-owned subset
+//! is shipped as a typed `NeighborsMulti` plan to its owning node via the
+//! gateway's `dispatch_route` primitive. Local and remote `{src,label,node}`
+//! responses decode identically and are merged before the next depth level
+//! begins. See `hop::execute_neighbor_hop`.
+//!
+//! `GRAPH PATH` (`shortest_path`) still uses the post-expansion
+//! `control::scatter_gather::coordinate_cross_shard_hop` scatter path; the
+//! per-frontier owner-targeted expansion above is specific to the BFS /
+//! subgraph traversal read path.
 
 pub mod bfs;
 pub mod helpers;
