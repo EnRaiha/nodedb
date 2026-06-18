@@ -140,7 +140,7 @@ pub(in super::super) fn convert_update(
             let pk_string = sql_value_to_string(key);
             let pk_bytes = pk_string.clone().into_bytes();
             let surrogate = match ctx.surrogate_assigner.as_ref() {
-                Some(a) => match a.lookup(collection, &pk_bytes)? {
+                Some(a) => match a.lookup(ctx.database_id, ctx.tenant_id, collection, &pk_bytes)? {
                     Some(s) => s,
                     None => continue,
                 },
@@ -211,7 +211,7 @@ pub(in super::super) fn convert_delete(
             let pk_string = sql_value_to_string(key);
             let pk_bytes = pk_string.clone().into_bytes();
             let surrogate = match ctx.surrogate_assigner.as_ref() {
-                Some(a) => match a.lookup(collection, &pk_bytes)? {
+                Some(a) => match a.lookup(ctx.database_id, ctx.tenant_id, collection, &pk_bytes)? {
                     Some(s) => s,
                     None => continue,
                 },

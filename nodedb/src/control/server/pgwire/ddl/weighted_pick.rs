@@ -150,10 +150,12 @@ pub async fn weighted_pick(
         );
         let audit_value = nodedb_types::json_to_msgpack(&audit_entry).unwrap_or_default();
         let audit_key_bytes = audit_key.into_bytes();
-        match state
-            .surrogate_assigner
-            .assign("_system_random_audit", &audit_key_bytes)
-        {
+        match state.surrogate_assigner.assign(
+            crate::types::DatabaseId::DEFAULT,
+            tenant_id,
+            "_system_random_audit",
+            &audit_key_bytes,
+        ) {
             Ok(audit_surrogate) => {
                 let audit_plan = PhysicalPlan::Kv(KvOp::Put {
                     collection: "_system_random_audit".to_string(),

@@ -113,6 +113,7 @@ pub(super) async fn materialize_document_collection(
             let pk_bytes = catalog
                 .get_pk_for_surrogate(
                     origin.source_database,
+                    tenant_id,
                     &origin.source_collection,
                     source_surrogate,
                 )
@@ -137,7 +138,7 @@ pub(super) async fn materialize_document_collection(
             // the normal INSERT path would use.
             let target_surrogate = state
                 .surrogate_assigner
-                .assign(&target_qualified, &pk_bytes)
+                .assign(db_id, tenant_id, &target_qualified, &pk_bytes)
                 .map_err(|e| crate::Error::Storage {
                     engine: "clone_materializer".into(),
                     detail: format!(

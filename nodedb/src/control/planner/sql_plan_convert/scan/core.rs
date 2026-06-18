@@ -234,7 +234,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_point_get(
             let pk_string = sql_value_to_string(key_value);
             let pk_bytes = pk_string.clone().into_bytes();
             let surrogate = match ctx.surrogate_assigner.as_ref() {
-                Some(a) => match a.lookup(collection, &pk_bytes)? {
+                Some(a) => match a.lookup(ctx.database_id, ctx.tenant_id, collection, &pk_bytes)? {
                     Some(s) => s,
                     None => {
                         // No surrogate bound in the target database yet.

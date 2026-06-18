@@ -71,6 +71,10 @@ pub struct ConvertContext {
     /// calls must use this value so that collections in different databases are
     /// routed to distinct shards and data-plane isolates them correctly.
     pub database_id: crate::types::DatabaseId,
+    /// Tenant scope for surrogate identity. Threaded into every surrogate
+    /// `assign`/`lookup` so two tenants with the same primary key in a
+    /// same-named collection resolve to distinct surrogates.
+    pub tenant_id: crate::types::TenantId,
 }
 
 impl ConvertContext {

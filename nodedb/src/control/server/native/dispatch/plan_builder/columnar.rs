@@ -87,7 +87,7 @@ fn derive_surrogates(
         if pk.is_empty() {
             out.push(Surrogate::ZERO);
         } else {
-            out.push(assigner.assign(collection, &pk)?);
+            out.push(assigner.assign(ctx.database_id(), ctx.tenant_id(), collection, &pk)?);
         }
     }
     Ok(out)

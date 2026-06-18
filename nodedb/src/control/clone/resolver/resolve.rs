@@ -158,6 +158,7 @@ pub fn resolve_read(
                     plan: &task.plan,
                     target_db_id: cur_db_id,
                     source_db_id: src_db_id,
+                    tenant_id,
                     target_coll: cur_coll_str,
                     source_coll: src_coll_name,
                     effective_source_ms: cur_effective_ms,

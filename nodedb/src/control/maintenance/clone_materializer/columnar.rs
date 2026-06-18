@@ -125,7 +125,12 @@ pub(super) async fn materialize_columnar_collection(
             // is unique per source row within the collection.
             let target_surrogate = state
                 .surrogate_assigner
-                .assign(&target_qualified, &source_surrogate_u32.to_be_bytes())
+                .assign(
+                    db_id,
+                    tenant_id,
+                    &target_qualified,
+                    &source_surrogate_u32.to_be_bytes(),
+                )
                 .map_err(|e| crate::Error::Storage {
                     engine: "clone_materializer".into(),
                     detail: format!(

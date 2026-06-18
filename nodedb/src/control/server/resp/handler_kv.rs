@@ -112,7 +112,12 @@ pub(super) async fn handle_set(
         }
     }
 
-    let surrogate = match state.surrogate_assigner.assign(&session.collection, &key) {
+    let surrogate = match state.surrogate_assigner.assign(
+        crate::types::DatabaseId::DEFAULT,
+        session.tenant_id,
+        &session.collection,
+        &key,
+    ) {
         Ok(s) => s,
         Err(e) => return RespValue::err(format!("ERR {e}")),
     };

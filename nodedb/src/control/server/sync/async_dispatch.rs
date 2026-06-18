@@ -251,10 +251,12 @@ pub(super) async fn validate_delta_constraints(
         return SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject);
     }
 
-    let surrogate = match shared
-        .surrogate_assigner
-        .assign(&delta_msg.collection, delta_msg.document_id.as_bytes())
-    {
+    let surrogate = match shared.surrogate_assigner.assign(
+        crate::types::DatabaseId::DEFAULT,
+        tenant_id,
+        &delta_msg.collection,
+        delta_msg.document_id.as_bytes(),
+    ) {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "sync: surrogate assignment failed");

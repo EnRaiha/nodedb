@@ -86,7 +86,7 @@ pub(super) async fn dispatch(
 
     // DSL: CRDT MERGE INTO (async — dispatches to Data Plane).
     if upper.starts_with("CRDT MERGE ") {
-        return Some(super::super::dsl::crdt_merge(state, identity, parts).await);
+        return Some(super::super::dsl::crdt_merge(state, identity, database_id, parts).await);
     }
 
     // CRDT operations via SQL-like syntax (async).
@@ -94,7 +94,7 @@ pub(super) async fn dispatch(
         return Some(super::super::crdt_ops::crdt_state(state, identity, sql).await);
     }
     if upper.starts_with("SELECT CRDT_APPLY(") || upper.starts_with("SELECT CRDT_APPLY (") {
-        return Some(super::super::crdt_ops::crdt_apply(state, identity, sql).await);
+        return Some(super::super::crdt_ops::crdt_apply(state, identity, database_id, sql).await);
     }
 
     // Graph DSL (`GRAPH ...`) and `MATCH` flow through the typed
@@ -128,7 +128,8 @@ pub(super) async fn dispatch(
                     return Some(super::super::match_ops::match_query(state, identity, sql).await);
                 }
                 if let Some(resp) =
-                    super::super::graph_ops::dispatch_typed(state, identity, stmt).await
+                    super::super::graph_ops::dispatch_typed(state, identity, database_id, stmt)
+                        .await
                 {
                     return Some(resp);
                 }

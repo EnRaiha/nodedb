@@ -115,7 +115,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(
             surrogates.push(nodedb_types::Surrogate::ZERO);
         } else {
             let s = match ctx.surrogate_assigner.as_ref() {
-                Some(a) => a.assign(collection, pk.as_bytes())?,
+                Some(a) => a.assign(ctx.database_id, ctx.tenant_id, collection, pk.as_bytes())?,
                 None => nodedb_types::Surrogate::ZERO,
             };
             surrogates.push(s);

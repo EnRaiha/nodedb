@@ -66,7 +66,12 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack);
         }
 
-        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.id) {
+        let surrogate = match dispatcher.assign_surrogate(
+            DatabaseId::DEFAULT,
+            self.tenant_id.unwrap_or(TenantId::new(0)),
+            &msg.collection,
+            &msg.id,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 error!(
@@ -194,7 +199,12 @@ impl SyncSession {
 
         // Resolve surrogate — idempotent: if the surrogate was never assigned,
         // the delete is a no-op.
-        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.id) {
+        let surrogate = match dispatcher.assign_surrogate(
+            DatabaseId::DEFAULT,
+            self.tenant_id.unwrap_or(TenantId::new(0)),
+            &msg.collection,
+            &msg.id,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 error!(

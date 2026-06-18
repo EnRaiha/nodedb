@@ -35,6 +35,14 @@ impl SharedState {
     ) -> crate::Result<Arc<Self>> {
         let mut credentials = CredentialStore::open(catalog_path)?;
 
+        // Bring the surrogate PK catalog up to the current key layout before
+        // any allocation path reads it: v1 (bare) → v2 (database-scoped) →
+        // v3 (database + tenant scoped). Both steps are idempotent and ordered.
+        if let Some(catalog) = credentials.catalog() {
+            catalog.migrate_surrogate_pk()?;
+            catalog.migrate_surrogate_pk_v3()?;
+        }
+
         // Share the credential store's already-open catalog (one redb file
         // handle). Opening a second `SystemCatalog` on the same path is rejected
         // by redb, which would silently disable durable fencing.

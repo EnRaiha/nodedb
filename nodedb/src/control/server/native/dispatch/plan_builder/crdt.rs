@@ -6,9 +6,9 @@ use nodedb_types::protocol::TextFields;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::CrdtOp;
 
+use super::DispatchCtx;
 use super::require_doc_id;
 
 pub(crate) fn build_read(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
@@ -20,7 +20,7 @@ pub(crate) fn build_read(fields: &TextFields, collection: &str) -> crate::Result
 }
 
 pub(crate) fn build_apply(
-    state: &SharedState,
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -42,9 +42,12 @@ pub(crate) fn build_apply(
         crate::util::fnv1a_hash(&combined)
     });
 
-    let surrogate = state
-        .surrogate_assigner
-        .assign(collection, document_id.as_bytes())?;
+    let surrogate = ctx.state.surrogate_assigner.assign(
+        ctx.database_id(),
+        ctx.tenant_id(),
+        collection,
+        document_id.as_bytes(),
+    )?;
 
     Ok(PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: collection.to_string(),

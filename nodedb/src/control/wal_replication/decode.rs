@@ -6,7 +6,7 @@ use super::decode_sync_engines;
 use super::types::{ReplicatedEntry, ReplicatedWrite};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::surrogate::SurrogateAssigner;
-use crate::types::{TenantId, VShardId};
+use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, GraphOp, KvOp, VectorOp};
 
 ///
@@ -38,21 +38,24 @@ pub fn from_replicated_entry(
         }
         _ => {}
     }
-    let plan = to_physical_plan(&entry.write, assigner)?;
-    Ok(Some((
-        TenantId::new(entry.tenant_id),
-        VShardId::new(entry.vshard_id),
-        plan,
-    )))
+    let tenant_id = TenantId::new(entry.tenant_id);
+    // Replicated entries do not carry a database id on the wire; surrogate
+    // identity for these follower-local binds is scoped to the default
+    // database and the entry's tenant.
+    let database_id = DatabaseId::DEFAULT;
+    let plan = to_physical_plan(&entry.write, database_id, tenant_id, assigner)?;
+    Ok(Some((tenant_id, VShardId::new(entry.vshard_id), plan)))
 }
 
 fn assign_or_zero(
     assigner: Option<&SurrogateAssigner>,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
     collection: &str,
     pk_bytes: &[u8],
 ) -> crate::Result<nodedb_types::Surrogate> {
     match assigner {
-        Some(a) => a.assign(collection, pk_bytes),
+        Some(a) => a.assign(database_id, tenant_id, collection, pk_bytes),
         None => Ok(nodedb_types::Surrogate::ZERO),
     }
 }
@@ -60,6 +63,8 @@ fn assign_or_zero(
 /// Convert a ReplicatedWrite back into a PhysicalPlan for Data Plane execution.
 fn to_physical_plan(
     write: &ReplicatedWrite,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
     assigner: Option<&SurrogateAssigner>,
 ) -> crate::Result<PhysicalPlan> {
     Ok(match write {
@@ -72,7 +77,7 @@ fn to_physical_plan(
             let pk_bytes = document_id.as_bytes().to_vec();
             let carried = nodedb_types::Surrogate::new(*surrogate);
             let surrogate = match assigner {
-                Some(a) => a.bind(collection, &pk_bytes, carried)?,
+                Some(a) => a.bind(database_id, tenant_id, collection, &pk_bytes, carried)?,
                 None => carried,
             };
             PhysicalPlan::Document(DocumentOp::PointPut {
@@ -93,7 +98,7 @@ fn to_physical_plan(
             let pk_bytes = document_id.as_bytes();
             let carried = nodedb_types::Surrogate::new(*surrogate);
             let surrogate = match assigner {
-                Some(a) => a.bind(collection, pk_bytes, carried)?,
+                Some(a) => a.bind(database_id, tenant_id, collection, pk_bytes, carried)?,
                 None => carried,
             };
             PhysicalPlan::Document(DocumentOp::PointInsert {
@@ -116,7 +121,7 @@ fn to_physical_plan(
             // does not exist yet. Re-deriving via `lookup` would diverge.
             let carried = nodedb_types::Surrogate::new(*surrogate);
             let surrogate = match assigner {
-                Some(a) => a.bind(collection, &pk_bytes, carried)?,
+                Some(a) => a.bind(database_id, tenant_id, collection, &pk_bytes, carried)?,
                 None => carried,
             };
             PhysicalPlan::Document(DocumentOp::PointDelete {
@@ -138,7 +143,7 @@ fn to_physical_plan(
             // identity is authoritative regardless of apply ordering.
             let carried = nodedb_types::Surrogate::new(*surrogate);
             let surrogate = match assigner {
-                Some(a) => a.bind(collection, &pk_bytes, carried)?,
+                Some(a) => a.bind(database_id, tenant_id, collection, &pk_bytes, carried)?,
                 None => carried,
             };
             PhysicalPlan::Document(DocumentOp::PointUpdate {
@@ -165,8 +170,14 @@ fn to_physical_plan(
             let carried = nodedb_types::Surrogate::new(*surrogate);
             let surrogate = match assigner {
                 Some(a) => match pk_bytes {
-                    Some(pk) => a.bind(collection, pk, carried)?,
-                    None => a.bind(collection, &carried.as_u32().to_be_bytes(), carried)?,
+                    Some(pk) => a.bind(database_id, tenant_id, collection, pk, carried)?,
+                    None => a.bind(
+                        database_id,
+                        tenant_id,
+                        collection,
+                        &carried.as_u32().to_be_bytes(),
+                        carried,
+                    )?,
                 },
                 None => carried,
             };
@@ -212,7 +223,13 @@ fn to_physical_plan(
                     .iter()
                     .map(|&raw| {
                         let c = nodedb_types::Surrogate::new(raw);
-                        a.bind(collection, &c.as_u32().to_be_bytes(), c)
+                        a.bind(
+                            database_id,
+                            tenant_id,
+                            collection,
+                            &c.as_u32().to_be_bytes(),
+                            c,
+                        )
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
                 None => surrogates
@@ -262,7 +279,13 @@ fn to_physical_plan(
             peer_id,
             provenance: prov_bytes,
         } => {
-            let surrogate = assign_or_zero(assigner, collection, document_id.as_bytes())?;
+            let surrogate = assign_or_zero(
+                assigner,
+                database_id,
+                tenant_id,
+                collection,
+                document_id.as_bytes(),
+            )?;
             let provenance = decode_sync_engines::decode_provenance(prov_bytes)?;
             PhysicalPlan::Crdt(CrdtOp::Apply {
                 collection: collection.clone(),
@@ -285,12 +308,24 @@ fn to_physical_plan(
         } => {
             let carried_src = nodedb_types::Surrogate::new(*src_surrogate);
             let src_surrogate = match assigner {
-                Some(a) => a.bind(collection, src_id.as_bytes(), carried_src)?,
+                Some(a) => a.bind(
+                    database_id,
+                    tenant_id,
+                    collection,
+                    src_id.as_bytes(),
+                    carried_src,
+                )?,
                 None => carried_src,
             };
             let carried_dst = nodedb_types::Surrogate::new(*dst_surrogate);
             let dst_surrogate = match assigner {
-                Some(a) => a.bind(collection, dst_id.as_bytes(), carried_dst)?,
+                Some(a) => a.bind(
+                    database_id,
+                    tenant_id,
+                    collection,
+                    dst_id.as_bytes(),
+                    carried_dst,
+                )?,
                 None => carried_dst,
             };
             PhysicalPlan::Graph(GraphOp::EdgePut {
@@ -323,7 +358,7 @@ fn to_physical_plan(
         } => {
             let carried = nodedb_types::Surrogate::new(*surrogate);
             let surrogate = match assigner {
-                Some(a) => a.bind(collection, key, carried)?,
+                Some(a) => a.bind(database_id, tenant_id, collection, key, carried)?,
                 None => carried,
             };
             PhysicalPlan::Kv(KvOp::Put {

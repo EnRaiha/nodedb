@@ -218,6 +218,8 @@ impl WalManager {
     /// `vshard_id` is `0` — surrogate bindings are node-global metadata.
     pub fn append_surrogate_bind(
         &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
         surrogate: u32,
         collection: &str,
         pk_bytes: &[u8],
@@ -228,9 +230,9 @@ impl WalManager {
                 .map_err(crate::Error::Wal)?;
         self.append_record(
             RecordType::SurrogateBind,
-            TenantId::new(0),
+            tenant_id,
             VShardId::new(0),
-            DatabaseId::DEFAULT,
+            database_id,
             &payload,
         )
     }

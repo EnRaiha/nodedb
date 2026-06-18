@@ -18,7 +18,7 @@
 //! round-trip OFF this hot path) lives in the sibling
 //! [`super::cluster_reserve`] module.
 
-use nodedb_types::DatabaseId;
+use nodedb_types::{DatabaseId, TenantId};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -139,7 +139,13 @@ impl SurrogateAssigner {
     /// Allocation + catalog write happen inside one critical section
     /// on the registry write-lock so the registry hwm and the
     /// persisted PK row cannot diverge under concurrent assigners.
-    pub fn assign(&self, collection: &str, pk_bytes: &[u8]) -> crate::Result<Surrogate> {
+    pub fn assign(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        collection: &str,
+        pk_bytes: &[u8],
+    ) -> crate::Result<Surrogate> {
         let catalog = match self.credential_store.catalog().as_ref() {
             Some(c) => c,
             None => return Ok(Surrogate::ZERO),
@@ -148,7 +154,9 @@ impl SurrogateAssigner {
         // Fast-path: existing binding. Done under a read lock — most
         // production calls land here once the per-collection working
         // set has been observed.
-        if let Some(s) = catalog.get_surrogate_for_pk(DatabaseId::DEFAULT, collection, pk_bytes)? {
+        if let Some(s) =
+            catalog.get_surrogate_for_pk(database_id, tenant_id, collection, pk_bytes)?
+        {
             return Ok(s);
         }
 
@@ -172,7 +180,7 @@ impl SurrogateAssigner {
             // Re-check inside the lock: another assigner may have raced
             // us between the read above and the lock acquisition.
             if let Some(s) =
-                catalog.get_surrogate_for_pk(DatabaseId::DEFAULT, collection, pk_bytes)?
+                catalog.get_surrogate_for_pk(database_id, tenant_id, collection, pk_bytes)?
             {
                 return Ok(s);
             }
@@ -196,7 +204,7 @@ impl SurrogateAssigner {
                     continue;
                 }
             };
-            catalog.put_surrogate(DatabaseId::DEFAULT, collection, pk_bytes, surrogate)?;
+            catalog.put_surrogate(database_id, tenant_id, collection, pk_bytes, surrogate)?;
             // Emit a durable WAL bind before the lock releases. Order is
             // load-bearing: a crash between catalog write and bind append
             // is invisible (the catalog row is already on disk via redb's
@@ -204,8 +212,13 @@ impl SurrogateAssigner {
             // to recover; a crash between bind append and lock release is
             // recovered by replaying the bind into the catalog (idempotent
             // via the two-table overwrite).
-            self.wal_appender
-                .record_bind_to_wal(surrogate.as_u32(), collection, pk_bytes)?;
+            self.wal_appender.record_bind_to_wal(
+                database_id,
+                tenant_id,
+                surrogate.as_u32(),
+                collection,
+                pk_bytes,
+            )?;
             self.maybe_flush(&registry, catalog)?;
             return Ok(surrogate);
         }
@@ -266,12 +279,18 @@ impl SurrogateAssigner {
     /// `Surrogate::ZERO` allocation `assign` performs in the same
     /// catalog-less mode, so a write/read pair against an unwired
     /// catalog still resolves to the same identity.
-    pub fn lookup(&self, collection: &str, pk_bytes: &[u8]) -> crate::Result<Option<Surrogate>> {
+    pub fn lookup(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        collection: &str,
+        pk_bytes: &[u8],
+    ) -> crate::Result<Option<Surrogate>> {
         let catalog = match self.credential_store.catalog().as_ref() {
             Some(c) => c,
             None => return Ok(Some(Surrogate::ZERO)),
         };
-        catalog.get_surrogate_for_pk(DatabaseId::DEFAULT, collection, pk_bytes)
+        catalog.get_surrogate_for_pk(database_id, tenant_id, collection, pk_bytes)
     }
 
     /// Bind `(collection, pk_bytes)` to a *carried* surrogate without ever
@@ -309,6 +328,8 @@ impl SurrogateAssigner {
     /// surrogate and diverge from the coordinator.
     pub fn bind(
         &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
         collection: &str,
         pk_bytes: &[u8],
         surrogate: Surrogate,
@@ -323,7 +344,7 @@ impl SurrogateAssigner {
         // value applied first) it is authoritative — return it, never
         // overwrite, discard the carried value even if it differs.
         if let Some(existing) =
-            catalog.get_surrogate_for_pk(DatabaseId::DEFAULT, collection, pk_bytes)?
+            catalog.get_surrogate_for_pk(database_id, tenant_id, collection, pk_bytes)?
         {
             return Ok(existing);
         }
@@ -339,13 +360,18 @@ impl SurrogateAssigner {
         // this node could have written between the pre-check and the lock.
         // First-wins still applies — return the existing value.
         if let Some(existing) =
-            catalog.get_surrogate_for_pk(DatabaseId::DEFAULT, collection, pk_bytes)?
+            catalog.get_surrogate_for_pk(database_id, tenant_id, collection, pk_bytes)?
         {
             return Ok(existing);
         }
-        catalog.put_surrogate(DatabaseId::DEFAULT, collection, pk_bytes, surrogate)?;
-        self.wal_appender
-            .record_bind_to_wal(surrogate.as_u32(), collection, pk_bytes)?;
+        catalog.put_surrogate(database_id, tenant_id, collection, pk_bytes, surrogate)?;
+        self.wal_appender.record_bind_to_wal(
+            database_id,
+            tenant_id,
+            surrogate.as_u32(),
+            collection,
+            pk_bytes,
+        )?;
         // Advance the local watermark past the carried value so a later
         // LOCAL `assign`/`assign_anonymous` on this node can never re-issue
         // it. Idempotent and monotonic — never lowers, never advances the
@@ -374,7 +400,12 @@ impl SurrogateAssigner {
     /// later lookup via the self-bytes returns the same surrogate, and
     /// the reverse lookup returns the self-bytes back. Keeps the
     /// catalog single-shaped — no special-case "unbound" rows.
-    pub fn assign_anonymous(&self, collection: &str) -> crate::Result<Surrogate> {
+    pub fn assign_anonymous(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        collection: &str,
+    ) -> crate::Result<Surrogate> {
         let catalog = match self.credential_store.catalog().as_ref() {
             Some(c) => c,
             None => return Ok(Surrogate::ZERO),
@@ -395,9 +426,14 @@ impl SurrogateAssigner {
                 }
             };
             let self_bytes = surrogate.as_u32().to_be_bytes();
-            catalog.put_surrogate(DatabaseId::DEFAULT, collection, &self_bytes, surrogate)?;
-            self.wal_appender
-                .record_bind_to_wal(surrogate.as_u32(), collection, &self_bytes)?;
+            catalog.put_surrogate(database_id, tenant_id, collection, &self_bytes, surrogate)?;
+            self.wal_appender.record_bind_to_wal(
+                database_id,
+                tenant_id,
+                surrogate.as_u32(),
+                collection,
+                &self_bytes,
+            )?;
             self.maybe_flush(&registry, catalog)?;
             return Ok(surrogate);
         }
@@ -453,30 +489,54 @@ mod tests {
         (dir, a)
     }
 
+    const T0: TenantId = TenantId::new(0);
+
     #[test]
     fn assign_is_idempotent_for_same_pk() {
         let (_dir, a) = open_test();
-        let s1 = a.assign("users", b"alice").unwrap();
-        let s2 = a.assign("users", b"alice").unwrap();
+        let s1 = a
+            .assign(DatabaseId::DEFAULT, T0, "users", b"alice")
+            .unwrap();
+        let s2 = a
+            .assign(DatabaseId::DEFAULT, T0, "users", b"alice")
+            .unwrap();
         assert_eq!(s1, s2);
         assert_eq!(s1, Surrogate::new(1));
     }
 
     #[test]
+    fn assign_distinct_tenants_do_not_collide() {
+        let (_dir, a) = open_test();
+        let t1 = TenantId::new(1);
+        let t2 = TenantId::new(2);
+        let s1 = a
+            .assign(DatabaseId::DEFAULT, t1, "users", b"alice")
+            .unwrap();
+        let s2 = a
+            .assign(DatabaseId::DEFAULT, t2, "users", b"alice")
+            .unwrap();
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
     fn assign_distinct_pks_returns_distinct_surrogates() {
         let (_dir, a) = open_test();
-        let s1 = a.assign("users", b"alice").unwrap();
-        let s2 = a.assign("users", b"bob").unwrap();
+        let s1 = a
+            .assign(DatabaseId::DEFAULT, T0, "users", b"alice")
+            .unwrap();
+        let s2 = a.assign(DatabaseId::DEFAULT, T0, "users", b"bob").unwrap();
         assert_ne!(s1, s2);
     }
 
     #[test]
     fn assign_writes_reverse_binding() {
         let (_dir, a) = open_test();
-        let s = a.assign("users", b"alice").unwrap();
+        let s = a
+            .assign(DatabaseId::DEFAULT, T0, "users", b"alice")
+            .unwrap();
         let cat = a.credential_store.catalog().as_ref().unwrap();
         assert_eq!(
-            cat.get_pk_for_surrogate(DatabaseId::DEFAULT, "users", s)
+            cat.get_pk_for_surrogate(DatabaseId::DEFAULT, T0, "users", s)
                 .unwrap(),
             Some(b"alice".to_vec())
         );
@@ -489,7 +549,9 @@ mod tests {
         let n = crate::control::surrogate::registry::FLUSH_OPS_THRESHOLD as usize;
         for i in 0..n {
             let pk = format!("u{i}");
-            let _ = a.assign("users", pk.as_bytes()).unwrap();
+            let _ = a
+                .assign(DatabaseId::DEFAULT, T0, "users", pk.as_bytes())
+                .unwrap();
         }
         // Either threshold (1024 ops or 200 ms elapsed) may fire
         // first; assert only that the catalog persisted *some*

@@ -149,7 +149,9 @@ pub(super) async fn dispatch(
 
     // Graph index and tree operations.
     if upper.starts_with("CREATE GRAPH INDEX ") {
-        return Some(super::super::tree_ops::create_graph_index(state, identity, sql).await);
+        return Some(
+            super::super::tree_ops::create_graph_index(state, identity, database_id, sql).await,
+        );
     }
     if upper.starts_with("SELECT TREE_SUM") || upper.starts_with("TREE_SUM") {
         return Some(super::super::tree_ops::tree_sum(state, identity, sql).await);

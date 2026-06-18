@@ -164,14 +164,18 @@ pub(crate) fn build_edge_put(
         .as_ref()
         .map(|v| sonic_rs::to_string(v).unwrap_or_default())
         .unwrap_or_default();
-    let src_surrogate = ctx
-        .state
-        .surrogate_assigner
-        .assign(collection, src.as_bytes())?;
-    let dst_surrogate = ctx
-        .state
-        .surrogate_assigner
-        .assign(collection, dst.as_bytes())?;
+    let src_surrogate = ctx.state.surrogate_assigner.assign(
+        ctx.database_id(),
+        ctx.tenant_id(),
+        collection,
+        src.as_bytes(),
+    )?;
+    let dst_surrogate = ctx.state.surrogate_assigner.assign(
+        ctx.database_id(),
+        ctx.tenant_id(),
+        collection,
+        dst.as_bytes(),
+    )?;
     Ok(PhysicalPlan::Graph(GraphOp::EdgePut {
         collection: collection.to_string(),
         src_id: src.clone(),

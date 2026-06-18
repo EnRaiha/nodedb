@@ -16,6 +16,7 @@
 
 use nodedb_types::DatabaseId;
 use nodedb_types::Surrogate;
+use nodedb_types::TenantId;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -71,6 +72,8 @@ fn apply_rls_filter(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize) {
 pub fn translate_vector_search_payload(
     payload: &[u8],
     state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
     collection: &str,
     rls_filters: &[u8],
     top_k: usize,
@@ -96,7 +99,8 @@ pub fn translate_vector_search_payload(
                 continue;
             }
             if let Ok(Some(pk_bytes)) = catalog.get_pk_for_surrogate(
-                DatabaseId::DEFAULT,
+                database_id,
+                tenant_id,
                 collection,
                 Surrogate::new(hit.id),
             ) && let Ok(s) = String::from_utf8(pk_bytes)
@@ -154,12 +158,18 @@ pub fn translate_vector_search_payload(
 /// Convenience wrapper: inspect the executed plan; if it produced
 /// vector hits, apply surrogate→PK translation. Otherwise return the
 /// payload untouched.
-pub fn translate_if_vector(payload: &[u8], plan: &PhysicalPlan, state: &SharedState) -> Vec<u8> {
+pub fn translate_if_vector(
+    payload: &[u8],
+    plan: &PhysicalPlan,
+    state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+) -> Vec<u8> {
     // The coordinator wraps sharded reads (including vector search) in an
     // `Exchange{Gather}` node; unwrap it so the underlying vector op is visible
     // and surrogate→PK hit translation still runs on the gathered payload.
     if let PhysicalPlan::Query(nodedb_physical::physical_plan::QueryOp::Exchange(op)) = plan {
-        return translate_if_vector(payload, &op.child, state);
+        return translate_if_vector(payload, &op.child, state, database_id, tenant_id);
     }
     let (collection, rls_filters, top_k): (&str, &[u8], usize) = match plan {
         PhysicalPlan::Vector(VectorOp::Search {
@@ -179,5 +189,13 @@ pub fn translate_if_vector(payload: &[u8], plan: &PhysicalPlan, state: &SharedSt
         }) => (collection.as_str(), &[][..], *top_k),
         _ => return payload.to_vec(),
     };
-    translate_vector_search_payload(payload, state, collection, rls_filters, top_k)
+    translate_vector_search_payload(
+        payload,
+        state,
+        database_id,
+        tenant_id,
+        collection,
+        rls_filters,
+        top_k,
+    )
 }

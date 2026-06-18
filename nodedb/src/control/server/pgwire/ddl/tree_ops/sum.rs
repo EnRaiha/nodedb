@@ -116,7 +116,7 @@ pub async fn tree_sum(
             let pk_bytes = node_id.as_bytes().to_vec();
             let surrogate = state
                 .surrogate_assigner
-                .lookup(coll_name, &pk_bytes)
+                .lookup(DatabaseId::DEFAULT, tenant_id, coll_name, &pk_bytes)
                 .map_err(|e| sqlstate_error("XX000", &format!("surrogate lookup: {e}")))?
                 .unwrap_or(nodedb_types::Surrogate::ZERO);
             let get_plan =

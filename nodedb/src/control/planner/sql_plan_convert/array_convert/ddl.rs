@@ -203,7 +203,9 @@ pub(in super::super) fn convert_drop_array(
                 detail: format!("array catalog remove: {e}"),
             });
         }
-        if let Err(e) = catalog.delete_all_surrogates_for_collection(ctx.database_id, name) {
+        if let Err(e) =
+            catalog.delete_all_surrogates_for_collection(ctx.database_id, ctx.tenant_id, name)
+        {
             return Err(crate::Error::PlanError {
                 detail: format!("array surrogate-map cleanup: {e}"),
             });

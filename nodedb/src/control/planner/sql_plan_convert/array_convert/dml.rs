@@ -69,7 +69,8 @@ pub(in super::super) fn convert_insert_array(
                     format: "msgpack".into(),
                     detail: format!("array coord pk encode: {e}"),
                 })?;
-            let surrogate = surrogate_assigner.assign(name, &pk_bytes)?;
+            let surrogate =
+                surrogate_assigner.assign(ctx.database_id, tenant_id, name, &pk_bytes)?;
             let hilbert =
                 encode_hilbert_prefix(&schema, &coord).map_err(|e| crate::Error::PlanError {
                     detail: format!("INSERT INTO ARRAY {name}: Hilbert prefix: {e}"),
@@ -119,7 +120,7 @@ pub(in super::super) fn convert_insert_array(
                 format: "msgpack".into(),
                 detail: format!("array coord pk encode: {e}"),
             })?;
-        let surrogate = surrogate_assigner.assign(name, &pk_bytes)?;
+        let surrogate = surrogate_assigner.assign(ctx.database_id, tenant_id, name, &pk_bytes)?;
         cells.push(ArrayPutCell {
             coord,
             attrs,

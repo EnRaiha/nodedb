@@ -42,7 +42,7 @@ pub(crate) fn build_point_get(
             let surrogate = ctx
                 .state
                 .surrogate_assigner
-                .lookup(collection, &pk_bytes)?
+                .lookup(ctx.database_id(), ctx.tenant_id(), collection, &pk_bytes)?
                 .unwrap_or(nodedb_types::Surrogate::ZERO);
             Ok(PhysicalPlan::Document(DocumentOp::PointGet {
                 collection: collection.to_string(),
@@ -67,7 +67,12 @@ pub(crate) fn build_point_put(
     match collection_type(ctx, collection) {
         Some(CollectionType::KeyValue(_)) => {
             let key = doc_id.into_bytes();
-            let surrogate = ctx.state.surrogate_assigner.assign(collection, &key)?;
+            let surrogate = ctx.state.surrogate_assigner.assign(
+                ctx.database_id(),
+                ctx.tenant_id(),
+                collection,
+                &key,
+            )?;
             Ok(PhysicalPlan::Kv(KvOp::Put {
                 collection: collection.to_string(),
                 key,
@@ -95,7 +100,12 @@ pub(crate) fn build_point_put(
         }),
         Some(CollectionType::Document(_)) | None => {
             let pk_bytes = doc_id.as_bytes().to_vec();
-            let surrogate = ctx.state.surrogate_assigner.assign(collection, &pk_bytes)?;
+            let surrogate = ctx.state.surrogate_assigner.assign(
+                ctx.database_id(),
+                ctx.tenant_id(),
+                collection,
+                &pk_bytes,
+            )?;
             Ok(PhysicalPlan::Document(DocumentOp::PointPut {
                 collection: collection.to_string(),
                 document_id: doc_id,
@@ -135,7 +145,7 @@ pub(crate) fn build_point_delete(
             let surrogate = ctx
                 .state
                 .surrogate_assigner
-                .lookup(collection, &pk_bytes)?
+                .lookup(ctx.database_id(), ctx.tenant_id(), collection, &pk_bytes)?
                 .unwrap_or(nodedb_types::Surrogate::ZERO);
             Ok(PhysicalPlan::Document(DocumentOp::PointDelete {
                 collection: collection.to_string(),
@@ -192,10 +202,12 @@ pub(crate) fn build_batch_insert(
             format: "json".into(),
             detail: format!("failed to serialize document '{}': {e}", d.id),
         })?;
-        let surrogate = ctx
-            .state
-            .surrogate_assigner
-            .assign(collection, d.id.as_bytes())?;
+        let surrogate = ctx.state.surrogate_assigner.assign(
+            ctx.database_id(),
+            ctx.tenant_id(),
+            collection,
+            d.id.as_bytes(),
+        )?;
         documents.push((d.id.clone(), value_bytes));
         surrogates.push(surrogate);
     }
@@ -230,7 +242,7 @@ pub(crate) fn build_update(
     let surrogate = ctx
         .state
         .surrogate_assigner
-        .lookup(collection, &pk_bytes)?
+        .lookup(ctx.database_id(), ctx.tenant_id(), collection, &pk_bytes)?
         .unwrap_or(nodedb_types::Surrogate::ZERO);
     Ok(PhysicalPlan::Document(DocumentOp::PointUpdate {
         collection: collection.to_string(),
@@ -268,10 +280,12 @@ pub(crate) fn build_upsert(
 ) -> crate::Result<PhysicalPlan> {
     let doc_id = require_doc_id(fields)?;
     let value = fields.data.clone().unwrap_or_default();
-    let surrogate = ctx
-        .state
-        .surrogate_assigner
-        .assign(collection, doc_id.as_bytes())?;
+    let surrogate = ctx.state.surrogate_assigner.assign(
+        ctx.database_id(),
+        ctx.tenant_id(),
+        collection,
+        doc_id.as_bytes(),
+    )?;
     Ok(PhysicalPlan::Document(DocumentOp::Upsert {
         collection: collection.to_string(),
         document_id: doc_id,

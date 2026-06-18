@@ -62,7 +62,14 @@ fn kill_restart_recovers_all_bindings_and_hwm() {
         let assigner = SurrogateAssigner::new(registry, credentials, appender);
 
         for (coll, pk) in &inserts {
-            let s = assigner.assign(coll, pk).unwrap();
+            let s = assigner
+                .assign(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    nodedb_types::TenantId::new(0),
+                    coll,
+                    pk,
+                )
+                .unwrap();
             // Track the FIRST allocation per (coll, pk); UPSERTs reuse.
             let already = expected
                 .iter()
@@ -97,14 +104,24 @@ fn kill_restart_recovers_all_bindings_and_hwm() {
     for (coll, pk, surrogate) in &expected {
         assert_eq!(
             catalog
-                .get_surrogate_for_pk(nodedb_types::DatabaseId::DEFAULT, coll, pk)
+                .get_surrogate_for_pk(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    nodedb_types::TenantId::new(0),
+                    coll,
+                    pk
+                )
                 .unwrap(),
             Some(*surrogate),
             "binding for ({coll}, {pk:?}) lost across crash",
         );
         assert_eq!(
             catalog
-                .get_pk_for_surrogate(nodedb_types::DatabaseId::DEFAULT, coll, *surrogate)
+                .get_pk_for_surrogate(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    nodedb_types::TenantId::new(0),
+                    coll,
+                    *surrogate
+                )
                 .unwrap(),
             Some(pk.clone()),
             "reverse binding for ({coll}, {surrogate:?}) lost across crash",
@@ -154,7 +171,16 @@ fn kill_restart_after_hwm_flush_threshold_recovers_via_alloc_record() {
 
         for i in 0..total {
             let pk = format!("u{i:08}");
-            last_surrogate = Some(assigner.assign("users", pk.as_bytes()).unwrap());
+            last_surrogate = Some(
+                assigner
+                    .assign(
+                        nodedb_types::DatabaseId::DEFAULT,
+                        nodedb_types::TenantId::new(0),
+                        "users",
+                        pk.as_bytes(),
+                    )
+                    .unwrap(),
+            );
         }
     }
 

@@ -43,6 +43,14 @@ impl DispatchCtx<'_> {
         self.identity.tenant_id
     }
 
+    /// Database scope for this connection: the session's current database,
+    /// falling back to the default database when none is selected.
+    pub(super) fn database_id(&self) -> crate::types::DatabaseId {
+        self.sessions
+            .get_current_database(self.peer_addr)
+            .unwrap_or(crate::types::DatabaseId::DEFAULT)
+    }
+
     pub(super) fn vshard_for_key(&self, key: &str) -> VShardId {
         VShardId::from_key(key.as_bytes())
     }

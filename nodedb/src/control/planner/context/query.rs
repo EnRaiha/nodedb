@@ -258,6 +258,7 @@ impl QueryContext {
                 .max_vector_dim
                 .load(std::sync::atomic::Ordering::Relaxed),
             database_id,
+            tenant_id,
         };
         let tasks = super::super::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
         Ok((tasks, version_set))
@@ -381,6 +382,7 @@ impl QueryContext {
                 .max_vector_dim
                 .load(std::sync::atomic::Ordering::Relaxed),
             database_id,
+            tenant_id,
         };
         let mut tasks = super::super::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
 

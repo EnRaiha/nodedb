@@ -248,6 +248,7 @@ mod tests {
             bitemporal_retention_registry: None,
             max_vector_dim: 0,
             database_id: crate::types::DatabaseId::DEFAULT,
+            tenant_id: crate::types::TenantId::new(0),
         };
         (ctx, handle)
     }

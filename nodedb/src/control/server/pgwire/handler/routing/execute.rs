@@ -271,6 +271,7 @@ impl NodeDbPgHandler {
             let plan_kind = describe_plan(&task.plan);
             let collection_for_si = extract_collection(&task.plan).map(String::from);
             let resp_post_set_op = task.post_set_op;
+            let task_database_id = task.database_id;
             let plan_for_response = task.plan.clone();
 
             // --- Single-node pgwire streaming fast path ---
@@ -473,6 +474,8 @@ impl NodeDbPgHandler {
                     &payload,
                     &plan_for_response,
                     &self.state,
+                    task_database_id,
+                    tenant_id,
                 );
                 let shaped = payload_to_response(&payload, plan_kind);
                 if let Some(notice) = shaped.notice {

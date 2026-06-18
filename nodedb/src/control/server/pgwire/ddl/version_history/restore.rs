@@ -36,7 +36,12 @@ pub async fn restore_version(
 
     let surrogate = state
         .surrogate_assigner
-        .assign(&collection, doc_id.as_bytes())
+        .assign(
+            crate::types::DatabaseId::DEFAULT,
+            tenant_id,
+            &collection,
+            doc_id.as_bytes(),
+        )
         .map_err(|e| sqlstate_error("XX000", &format!("surrogate assign: {e}")))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {

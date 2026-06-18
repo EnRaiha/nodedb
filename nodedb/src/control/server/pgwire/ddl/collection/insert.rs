@@ -228,10 +228,12 @@ pub async fn insert_document(
                 )));
             }
         }
-        let surrogate = match state
-            .surrogate_assigner
-            .assign(&parsed.coll_name, parsed.doc_id.as_bytes())
-        {
+        let surrogate = match state.surrogate_assigner.assign(
+            database_id,
+            tenant_id,
+            &parsed.coll_name,
+            parsed.doc_id.as_bytes(),
+        ) {
             Ok(s) => s,
             Err(e) => {
                 return Some(Err(sqlstate_error(

@@ -6,6 +6,7 @@
 
 use nodedb_types::DatabaseId;
 use nodedb_types::Surrogate;
+use nodedb_types::TenantId;
 use nodedb_wal::record::SurrogateBindPayload;
 
 use crate::control::security::catalog::SystemCatalog;
@@ -14,12 +15,19 @@ use crate::control::surrogate::SurrogateRegistryHandle;
 pub fn apply_surrogate_bind(
     payload: &[u8],
     database_id: DatabaseId,
+    tenant_id: TenantId,
     catalog: &SystemCatalog,
     registry: &SurrogateRegistryHandle,
 ) -> crate::Result<()> {
     let parsed = SurrogateBindPayload::from_bytes(payload).map_err(crate::Error::Wal)?;
     let surrogate = Surrogate::new(parsed.surrogate);
-    catalog.put_surrogate(database_id, &parsed.collection, &parsed.pk_bytes, surrogate)?;
+    catalog.put_surrogate(
+        database_id,
+        tenant_id,
+        &parsed.collection,
+        &parsed.pk_bytes,
+        surrogate,
+    )?;
     let guard = registry.write().map_err(|_| crate::Error::Internal {
         detail: "surrogate registry lock poisoned during WAL replay".into(),
     })?;
@@ -54,15 +62,20 @@ mod tests {
         let payload = SurrogateBindPayload::new(7u32, "users", b"alice".to_vec())
             .to_bytes()
             .unwrap();
-        apply_surrogate_bind(&payload, DatabaseId::DEFAULT, &cat, &reg).unwrap();
+        apply_surrogate_bind(&payload, DatabaseId::DEFAULT, TenantId::new(0), &cat, &reg).unwrap();
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, "users", b"alice")
+            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, TenantId::new(0), "users", b"alice")
                 .unwrap(),
             Some(Surrogate::new(7))
         );
         assert_eq!(
-            cat.get_pk_for_surrogate(DatabaseId::DEFAULT, "users", Surrogate::new(7))
-                .unwrap(),
+            cat.get_pk_for_surrogate(
+                DatabaseId::DEFAULT,
+                TenantId::new(0),
+                "users",
+                Surrogate::new(7)
+            )
+            .unwrap(),
             Some(b"alice".to_vec())
         );
         assert_eq!(reg.read().unwrap().current_hwm(), 7);
@@ -74,10 +87,10 @@ mod tests {
         let payload = SurrogateBindPayload::new(3u32, "users", b"bob".to_vec())
             .to_bytes()
             .unwrap();
-        apply_surrogate_bind(&payload, DatabaseId::DEFAULT, &cat, &reg).unwrap();
-        apply_surrogate_bind(&payload, DatabaseId::DEFAULT, &cat, &reg).unwrap();
+        apply_surrogate_bind(&payload, DatabaseId::DEFAULT, TenantId::new(0), &cat, &reg).unwrap();
+        apply_surrogate_bind(&payload, DatabaseId::DEFAULT, TenantId::new(0), &cat, &reg).unwrap();
         assert_eq!(
-            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, "users", b"bob")
+            cat.get_surrogate_for_pk(DatabaseId::DEFAULT, TenantId::new(0), "users", b"bob")
                 .unwrap(),
             Some(Surrogate::new(3))
         );

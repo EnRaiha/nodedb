@@ -60,7 +60,11 @@ pub fn purge(tenant_id: u64, name: &str, catalog: &SystemCatalog) {
     // be observed again, so leaving the catalog rows behind would
     // just be allocator-bloat. Mirrors the array-drop cleanup in
     // `array_convert::convert_drop_array`.
-    if let Err(e) = catalog.delete_all_surrogates_for_collection(DatabaseId::DEFAULT, name) {
+    if let Err(e) = catalog.delete_all_surrogates_for_collection(
+        DatabaseId::DEFAULT,
+        nodedb_types::TenantId::new(tenant_id),
+        name,
+    ) {
         warn!(
             collection = %name,
             tenant = tenant_id,

@@ -52,9 +52,11 @@ fn validate_edge_label(label: &str) -> PgWireResult<()> {
 }
 
 /// `GRAPH INSERT EDGE IN '<collection>' FROM '<src>' TO '<dst>' TYPE '<label>' [PROPERTIES '<json>' | { ... }]`
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_edge(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: String,
     src: String,
     dst: String,
@@ -80,11 +82,11 @@ pub async fn insert_edge(
 
     let src_surrogate = state
         .surrogate_assigner
-        .assign(&collection, src.as_bytes())
+        .assign(database_id, tenant_id, &collection, src.as_bytes())
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
     let dst_surrogate = state
         .surrogate_assigner
-        .assign(&collection, dst.as_bytes())
+        .assign(database_id, tenant_id, &collection, dst.as_bytes())
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
     let plan = PhysicalPlan::Graph(GraphOp::EdgePut {

@@ -72,7 +72,7 @@ pub(super) fn assign_for_pk(
     pk_bytes: &[u8],
 ) -> crate::Result<Surrogate> {
     match ctx.surrogate_assigner.as_ref() {
-        Some(a) => a.assign(collection, pk_bytes),
+        Some(a) => a.assign(ctx.database_id, ctx.tenant_id, collection, pk_bytes),
         None => Ok(Surrogate::ZERO),
     }
 }

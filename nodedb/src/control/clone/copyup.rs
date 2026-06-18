@@ -56,7 +56,7 @@ pub async fn perform_kv_clone_copyup(params: KvCopyUpParams<'_>) -> crate::Resul
     // Allocate a surrogate for the target KV row.
     let surrogate = state
         .surrogate_assigner
-        .assign(&target_coll_qualified, &kv_key)
+        .assign(target_db_id, tenant_id, &target_coll_qualified, &kv_key)
         .map_err(|e| crate::Error::Storage {
             engine: "clone_kv_copyup".into(),
             detail: format!("surrogate alloc failed: {e}"),
@@ -159,7 +159,12 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
     );
     let target_surrogate = state
         .surrogate_assigner
-        .assign(&target_coll_qualified, source_doc_id.as_bytes())
+        .assign(
+            target_db_id,
+            tenant_id,
+            &target_coll_qualified,
+            source_doc_id.as_bytes(),
+        )
         .map_err(|e| crate::Error::Storage {
             engine: "clone_copyup".into(),
             detail: format!("surrogate alloc failed: {e}"),

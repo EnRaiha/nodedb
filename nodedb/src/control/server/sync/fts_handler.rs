@@ -49,7 +49,13 @@ pub trait FtsDispatcher: Send + Sync {
     ) -> crate::Result<Vec<u8>>;
 
     /// Assign a stable surrogate for `(collection, doc_id)`.
-    fn assign_surrogate(&self, collection: &str, doc_id: &str) -> crate::Result<Surrogate>;
+    fn assign_surrogate(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        collection: &str,
+        doc_id: &str,
+    ) -> crate::Result<Surrogate>;
 }
 
 // ── SharedState adapter ──────────────────────────────────────────────────────
@@ -140,10 +146,16 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
         super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
     }
 
-    fn assign_surrogate(&self, collection: &str, doc_id: &str) -> crate::Result<Surrogate> {
+    fn assign_surrogate(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        collection: &str,
+        doc_id: &str,
+    ) -> crate::Result<Surrogate> {
         self.shared
             .surrogate_assigner
-            .assign(collection, doc_id.as_bytes())
+            .assign(database_id, tenant_id, collection, doc_id.as_bytes())
     }
 }
 
@@ -177,7 +189,13 @@ impl FtsDispatcher for NoOpFtsDispatcher {
         Err(super::raft_dispatch::noop_dispatch_error("FTS delete"))
     }
 
-    fn assign_surrogate(&self, _collection: &str, _doc_id: &str) -> crate::Result<Surrogate> {
+    fn assign_surrogate(
+        &self,
+        _database_id: DatabaseId,
+        _tenant_id: TenantId,
+        _collection: &str,
+        _doc_id: &str,
+    ) -> crate::Result<Surrogate> {
         Ok(Surrogate::ZERO)
     }
 }
@@ -261,7 +279,13 @@ mod tests {
             super::super::test_support::mock_applied_ack(&self.result, seq)
         }
 
-        fn assign_surrogate(&self, _collection: &str, _doc_id: &str) -> crate::Result<Surrogate> {
+        fn assign_surrogate(
+            &self,
+            _database_id: DatabaseId,
+            _tenant_id: TenantId,
+            _collection: &str,
+            _doc_id: &str,
+        ) -> crate::Result<Surrogate> {
             Ok(Surrogate::ZERO)
         }
     }

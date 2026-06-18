@@ -15,6 +15,7 @@ use pgwire::error::PgWireResult;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
 use super::super::types::{hex_decode, sqlstate_error, text_field};
@@ -105,6 +106,7 @@ pub async fn crdt_state(
 pub async fn crdt_apply(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let args = parse_function_args(sql);
@@ -126,7 +128,7 @@ pub async fn crdt_apply(
 
     let surrogate = state
         .surrogate_assigner
-        .assign(collection, document_id.as_bytes())
+        .assign(database_id, tenant_id, collection, document_id.as_bytes())
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {

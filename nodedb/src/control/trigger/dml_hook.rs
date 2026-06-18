@@ -275,7 +275,12 @@ pub async fn fetch_old_row(
     let pk_bytes = document_id.as_bytes().to_vec();
     let surrogate = state
         .surrogate_assigner
-        .lookup(collection, &pk_bytes)
+        .lookup(
+            crate::types::DatabaseId::DEFAULT,
+            tenant_id,
+            collection,
+            &pk_bytes,
+        )
         .ok()
         .flatten()
         .unwrap_or(nodedb_types::Surrogate::ZERO);

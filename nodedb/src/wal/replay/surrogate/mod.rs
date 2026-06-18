@@ -6,7 +6,7 @@ pub mod bind;
 pub use alloc::apply_surrogate_alloc;
 pub use bind::apply_surrogate_bind;
 
-use nodedb_types::DatabaseId;
+use nodedb_types::{DatabaseId, TenantId};
 use nodedb_wal::WalRecord;
 use nodedb_wal::record::RecordType;
 
@@ -37,7 +37,8 @@ pub fn replay_surrogate_records(
             }
             RecordType::SurrogateBind => {
                 let db = DatabaseId::new(record.header.database_id);
-                apply_surrogate_bind(&record.payload, db, catalog, registry)?;
+                let tenant = TenantId::new(record.header.tenant_id);
+                apply_surrogate_bind(&record.payload, db, tenant, catalog, registry)?;
                 stats.binds += 1;
             }
             RecordType::Noop

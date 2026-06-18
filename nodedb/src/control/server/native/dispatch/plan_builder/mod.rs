@@ -67,7 +67,7 @@ pub(crate) fn build_plan(
         OpCode::KvFieldSet => kv::build_field_set(fields, collection),
         // CRDT.
         OpCode::CrdtRead => crdt::build_read(fields, collection),
-        OpCode::CrdtApply => crdt::build_apply(ctx.state, fields, collection),
+        OpCode::CrdtApply => crdt::build_apply(ctx, fields, collection),
         OpCode::AlterCollectionPolicy => crdt::build_alter_policy(fields, collection),
         // Text/Search.
         OpCode::TextSearch => text::build_search(fields, collection),

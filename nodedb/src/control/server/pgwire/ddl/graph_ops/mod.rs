@@ -23,6 +23,7 @@ use nodedb_sql::ddl_ast::statement::{GraphStmt, NodedbStatement};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 /// Dispatch a parsed graph-DSL variant to its handler.
 ///
@@ -31,6 +32,7 @@ use crate::control::state::SharedState;
 pub async fn dispatch_typed(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     stmt: NodedbStatement,
 ) -> Option<PgWireResult<Vec<Response>>> {
     match stmt {
@@ -40,9 +42,19 @@ pub async fn dispatch_typed(
             dst,
             label,
             properties,
-        }) => {
-            Some(edge::insert_edge(state, identity, collection, src, dst, label, properties).await)
-        }
+        }) => Some(
+            edge::insert_edge(
+                state,
+                identity,
+                database_id,
+                collection,
+                src,
+                dst,
+                label,
+                properties,
+            )
+            .await,
+        ),
         NodedbStatement::Graph(GraphStmt::GraphDeleteEdge {
             collection,
             src,

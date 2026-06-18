@@ -45,7 +45,7 @@ pub async fn balance_as_of(
     let pk_bytes = key.as_bytes().to_vec();
     let surrogate = state
         .surrogate_assigner
-        .lookup(&collection, &pk_bytes)
+        .lookup(DatabaseId::DEFAULT, tenant_id, &collection, &pk_bytes)
         .map_err(|e| sqlstate_error("XX000", &format!("surrogate lookup failed: {e}")))?
         .unwrap_or(nodedb_types::Surrogate::ZERO);
     let get_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {

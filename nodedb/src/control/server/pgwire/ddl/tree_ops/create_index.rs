@@ -47,6 +47,7 @@ use super::parse::parse_edge_columns;
 pub async fn create_graph_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let tenant_id = identity.tenant_id;
@@ -74,7 +75,7 @@ pub async fn create_graph_index(
         return Err(sqlstate_error("XX000", "no catalog available"));
     };
     if catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
+        .get_collection(database_id, tenant_id.as_u64(), &collection)
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
         .is_none()
     {
@@ -99,15 +100,9 @@ pub async fn create_graph_index(
         valid_at_ms: None,
         prefilter: None,
     });
-    let scan_resp = broadcast_to_all_cores(
-        state,
-        tenant_id,
-        DatabaseId::DEFAULT,
-        scan_plan,
-        TraceId::ZERO,
-    )
-    .await
-    .map_err(|e| sqlstate_error("XX000", &format!("scan failed: {e}")))?;
+    let scan_resp = broadcast_to_all_cores(state, tenant_id, database_id, scan_plan, TraceId::ZERO)
+        .await
+        .map_err(|e| sqlstate_error("XX000", &format!("scan failed: {e}")))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
@@ -168,11 +163,11 @@ pub async fn create_graph_index(
                 let shard = VShardId::from_key(parent.as_bytes());
                 let src_surrogate = state
                     .surrogate_assigner
-                    .assign(&collection, parent.as_bytes())
+                    .assign(database_id, tenant_id, &collection, parent.as_bytes())
                     .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
                 let dst_surrogate = state
                     .surrogate_assigner
-                    .assign(&collection, child.as_bytes())
+                    .assign(database_id, tenant_id, &collection, child.as_bytes())
                     .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
                 edges_by_shard.entry(shard).or_default().push(BatchEdge {
                     collection: collection.to_string(),
@@ -194,16 +189,13 @@ pub async fn create_graph_index(
         let plan = PhysicalPlan::Graph(GraphOp::EdgePutBatch {
             edges: edges.clone(),
         });
-        if let Err(e) = wal_dispatch::wal_append_if_write(
-            &state.wal,
-            tenant_id,
-            shard,
-            DatabaseId::DEFAULT,
-            &plan,
-        ) {
+        if let Err(e) =
+            wal_dispatch::wal_append_if_write(&state.wal, tenant_id, shard, database_id, &plan)
+        {
             return surface_failure(
                 state,
                 tenant_id,
+                database_id,
                 &committed_shards,
                 format!("WAL append failed on shard {shard:?}: {e}"),
             )
@@ -212,7 +204,7 @@ pub async fn create_graph_index(
         match dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
-            DatabaseId::DEFAULT,
+            database_id,
             shard,
             plan,
             TraceId::ZERO,
@@ -224,6 +216,7 @@ pub async fn create_graph_index(
                 return surface_failure(
                     state,
                     tenant_id,
+                    database_id,
                     &committed_shards,
                     format!("edge-insert dispatch failed on shard {shard:?}: {e}"),
                 )
@@ -262,6 +255,7 @@ pub async fn create_graph_index(
 async fn surface_failure(
     state: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     committed: &[(VShardId, Vec<BatchEdge>)],
     cause: String,
 ) -> PgWireResult<Vec<Response>> {
@@ -277,7 +271,7 @@ async fn surface_failure(
                 dispatch_utils::dispatch_to_data_plane(
                     state,
                     tenant_id,
-                    DatabaseId::DEFAULT,
+                    database_id,
                     shard,
                     plan,
                     TraceId::ZERO,

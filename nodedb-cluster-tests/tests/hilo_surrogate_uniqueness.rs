@@ -37,7 +37,7 @@ use common::cluster_harness::{TestCluster, wait::wait_for};
 use std::collections::HashSet;
 use std::time::Duration;
 
-use nodedb_types::DatabaseId;
+use nodedb_types::{DatabaseId, TenantId};
 
 // ── constants ─────────────────────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ fn read_catalog_surrogates(
         return Vec::new();
     };
     catalog
-        .scan_surrogates_for_collection(DatabaseId::DEFAULT, collection)
+        .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), collection)
         .unwrap_or_default()
         .into_iter()
         .map(|(pk_bytes, surrogate)| {

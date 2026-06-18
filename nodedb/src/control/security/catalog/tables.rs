@@ -100,13 +100,21 @@ pub(super) const ARRAYS: TableDefinition<&str, &[u8]> = TableDefinition::new("_s
 pub(super) const SURROGATE_PK_LEGACY: TableDefinition<(&str, &[u8]), u32> =
     TableDefinition::new("_system.surrogate_pk");
 
-/// Table: `(database_id: u64, collection, encoded_pk_bytes)` -> `Surrogate` (u32 LE).
-///
-/// Forward direction of the PK ↔ Surrogate map with database scoping prepended.
-/// Every successful `assign_surrogate(database_id, collection, pk)` writes both
-/// the forward and reverse rows atomically in one redb txn.
-pub(super) const SURROGATE_PK: TableDefinition<(u64, &str, &[u8]), u32> =
+/// Table (legacy, v2): `(database_id: u64, collection, encoded_pk_bytes)` ->
+/// `Surrogate` (u32 LE). Database-scoped but tenant-blind. Read only by the
+/// idempotent migration that re-keys rows with `tenant_id` prepended.
+pub(super) const SURROGATE_PK_V2: TableDefinition<(u64, &str, &[u8]), u32> =
     TableDefinition::new("_system.surrogate_pk_v2");
+
+/// Table: `(database_id: u64, tenant_id: u64, collection, encoded_pk_bytes)` ->
+/// `Surrogate` (u32 LE).
+///
+/// Forward direction of the PK ↔ Surrogate map with database + tenant scoping
+/// prepended. Every successful `assign_surrogate(database_id, tenant_id,
+/// collection, pk)` writes both the forward and reverse rows atomically in one
+/// redb txn.
+pub(super) const SURROGATE_PK_V3: TableDefinition<(u64, u64, &str, &[u8]), u32> =
+    TableDefinition::new("_system.surrogate_pk_v3");
 
 /// Table (legacy): `(collection, surrogate)` -> encoded pk bytes.
 /// Used only by the idempotent migration that prefixes rows with database_id.
@@ -114,11 +122,19 @@ pub(super) const SURROGATE_PK: TableDefinition<(u64, &str, &[u8]), u32> =
 pub(super) const SURROGATE_PK_REV_LEGACY: TableDefinition<(&str, u32), &[u8]> =
     TableDefinition::new("_system.surrogate_pk_rev");
 
-/// Table: `(database_id: u64, collection, surrogate)` -> encoded pk bytes.
-///
-/// Reverse direction of `_system.surrogate_pk_v2`. Scoped per database_id.
-pub(super) const SURROGATE_PK_REV: TableDefinition<(u64, &str, u32), &[u8]> =
+/// Table (legacy, v2): `(database_id: u64, collection, surrogate)` -> encoded pk
+/// bytes. Reverse direction of `_system.surrogate_pk_v2`. Read only by the
+/// idempotent migration that re-keys rows with `tenant_id` prepended.
+pub(super) const SURROGATE_PK_REV_V2: TableDefinition<(u64, &str, u32), &[u8]> =
     TableDefinition::new("_system.surrogate_pk_rev_v2");
+
+/// Table: `(database_id: u64, tenant_id: u64, collection, surrogate)` -> encoded
+/// pk bytes.
+///
+/// Reverse direction of `_system.surrogate_pk_v3`. Scoped per `(database_id,
+/// tenant_id)`.
+pub(super) const SURROGATE_PK_REV_V3: TableDefinition<(u64, u64, &str, u32), &[u8]> =
+    TableDefinition::new("_system.surrogate_pk_rev_v3");
 
 // ── Event Plane ───────────────────────────────────────────────────────
 

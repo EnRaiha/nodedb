@@ -46,7 +46,12 @@ pub async fn crdt_apply(
     let surrogate = state
         .shared
         .surrogate_assigner
-        .assign(&collection, body.doc_id.as_bytes())
+        .assign(
+            crate::types::DatabaseId::DEFAULT,
+            identity.tenant_id,
+            &collection,
+            body.doc_id.as_bytes(),
+        )
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {

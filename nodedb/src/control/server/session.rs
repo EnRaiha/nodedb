@@ -506,7 +506,7 @@ impl Session {
                 let surrogate = self
                     .state
                     .surrogate_assigner
-                    .lookup(&collection, &pk_bytes)?
+                    .lookup(database_id, tenant_id, &collection, &pk_bytes)?
                     .unwrap_or(nodedb_types::Surrogate::ZERO);
                 PhysicalPlan::Document(DocumentOp::PointGet {
                     collection,
@@ -589,10 +589,12 @@ impl Session {
                 // Decode base64 delta. For now accept raw bytes if not valid base64.
                 let delta = delta_b64.as_bytes().to_vec();
                 let peer_id = body["peer_id"].as_u64().unwrap_or(0);
-                let surrogate = self
-                    .state
-                    .surrogate_assigner
-                    .assign(&collection, document_id.as_bytes())?;
+                let surrogate = self.state.surrogate_assigner.assign(
+                    database_id,
+                    tenant_id,
+                    &collection,
+                    document_id.as_bytes(),
+                )?;
                 PhysicalPlan::Crdt(CrdtOp::Apply {
                     collection,
                     document_id,

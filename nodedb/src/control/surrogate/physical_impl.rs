@@ -15,10 +15,12 @@ impl PhysicalSurrogateAssigner for SurrogateAssigner {
 
     fn assign(
         &self,
+        database_id: nodedb_types::DatabaseId,
+        tenant_id: nodedb_types::TenantId,
         collection: &str,
         pk_bytes: &[u8],
     ) -> Result<nodedb_types::Surrogate, SurrogateAssignError> {
-        Self::assign(self, collection, pk_bytes)
+        Self::assign(self, database_id, tenant_id, collection, pk_bytes)
             .map_err(|e| SurrogateAssignError::Backend(e.to_string()))
     }
 }

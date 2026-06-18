@@ -93,7 +93,10 @@ pub(super) async fn materialize_kv_collection(
                 continue;
             }
 
-            let surrogate = state.surrogate_assigner.assign(&target_qualified, &key)?;
+            let surrogate =
+                state
+                    .surrogate_assigner
+                    .assign(db_id, tenant_id, &target_qualified, &key)?;
             let plan = PhysicalPlan::Kv(KvOp::Put {
                 collection: target_qualified.clone(),
                 key: key.clone(),

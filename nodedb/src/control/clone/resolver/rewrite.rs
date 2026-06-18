@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use nodedb_types::DatabaseId;
+use nodedb_types::TenantId;
 
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, KvOp, PhysicalPlan, TimeseriesOp};
@@ -53,6 +54,7 @@ pub struct RewriteForSourceParams<'a> {
     pub plan: &'a PhysicalPlan,
     pub target_db_id: DatabaseId,
     pub source_db_id: DatabaseId,
+    pub tenant_id: TenantId,
     pub target_coll: &'a str,
     pub source_coll: &'a str,
     /// Effective source system-time-ms for `AS OF` rewrites (Document /
@@ -76,6 +78,7 @@ pub fn rewrite_plan_for_source(
         plan,
         target_db_id,
         source_db_id,
+        tenant_id,
         target_coll,
         source_coll,
         effective_source_ms,
@@ -140,7 +143,7 @@ pub fn rewrite_plan_for_source(
             let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
             let Some(source_surrogate) = state
                 .surrogate_assigner
-                .lookup(&source_qualified, pk_bytes)
+                .lookup(source_db_id, tenant_id, &source_qualified, pk_bytes)
                 .ok()
                 .flatten()
             else {

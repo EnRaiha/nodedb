@@ -11,7 +11,7 @@ use common::cluster_harness::TestCluster;
 
 use std::time::Duration;
 
-use nodedb_types::DatabaseId;
+use nodedb_types::{DatabaseId, TenantId};
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -42,7 +42,12 @@ fn surrogate_for_pk(
 ) -> Option<u32> {
     let catalog = shared.credentials.catalog().as_ref()?;
     catalog
-        .get_surrogate_for_pk(DatabaseId::DEFAULT, collection, pk.as_bytes())
+        .get_surrogate_for_pk(
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            collection,
+            pk.as_bytes(),
+        )
         .ok()
         .flatten()
         .map(|s| s.as_u32())

@@ -51,7 +51,12 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack);
         }
 
-        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.doc_id) {
+        let surrogate = match dispatcher.assign_surrogate(
+            DatabaseId::DEFAULT,
+            self.tenant_id.unwrap_or(TenantId::new(0)),
+            &msg.collection,
+            &msg.doc_id,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 error!(
@@ -171,7 +176,12 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack);
         }
 
-        let surrogate = match dispatcher.assign_surrogate(&msg.collection, &msg.doc_id) {
+        let surrogate = match dispatcher.assign_surrogate(
+            DatabaseId::DEFAULT,
+            self.tenant_id.unwrap_or(TenantId::new(0)),
+            &msg.collection,
+            &msg.doc_id,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 error!(

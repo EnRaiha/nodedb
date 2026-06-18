@@ -14,10 +14,11 @@
 //! catalog to keep the registry and the init path in lockstep.
 //!
 //! Migration-only tables (`_system.collections`, `_system.surrogate_pk`,
-//! `_system.surrogate_pk_rev` — the pre-database-boundary key layouts) are
-//! intentionally absent: they are read only by the idempotent migration
-//! path, which already tolerates their absence, and materialising empty
-//! copies on every fresh server would misrepresent the catalog state.
+//! `_system.surrogate_pk_rev`, `_system.surrogate_pk_v2`,
+//! `_system.surrogate_pk_rev_v2` — superseded key layouts) are intentionally
+//! absent: they are read only by the idempotent migration path, which already
+//! tolerates their absence, and materialising empty copies on every fresh
+//! server would misrepresent the catalog state.
 
 use redb::{ReadTransaction, TableError, WriteTransaction};
 
@@ -78,8 +79,8 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "vector_model_metadata" => VECTOR_MODEL_METADATA,
     "checkpoints" => CHECKPOINTS,
     // ── Surrogate identity map ──
-    "surrogate_pk" => SURROGATE_PK,
-    "surrogate_pk_rev" => SURROGATE_PK_REV,
+    "surrogate_pk_v3" => SURROGATE_PK_V3,
+    "surrogate_pk_rev_v3" => SURROGATE_PK_REV_V3,
     "surrogate_hwm" => super::surrogate_hwm::SURROGATE_HWM,
     "surrogate_reserve_index" => super::surrogate_hwm::SURROGATE_RESERVE_INDEX,
     // ── Sync producer registry ──

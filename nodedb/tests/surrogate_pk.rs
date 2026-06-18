@@ -35,20 +35,51 @@ fn assign_is_idempotent_for_same_pk() {
     let (_dir, creds) = open_credentials();
     let wal: Arc<dyn SurrogateWalAppender> = Arc::new(NoopWalAppender);
     let a = make_assigner(creds.clone(), wal);
-    let s1 = a.assign("users", b"alice").unwrap();
-    let s2 = a.assign("users", b"alice").unwrap();
-    let s3 = a.assign("users", b"alice").unwrap();
+    let s1 = a
+        .assign(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            b"alice",
+        )
+        .unwrap();
+    let s2 = a
+        .assign(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            b"alice",
+        )
+        .unwrap();
+    let s3 = a
+        .assign(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            b"alice",
+        )
+        .unwrap();
     assert_eq!(s1, s2);
     assert_eq!(s2, s3);
     let cat = creds.catalog().as_ref().unwrap();
     assert_eq!(
-        cat.get_surrogate_for_pk(nodedb_types::DatabaseId::DEFAULT, "users", b"alice")
-            .unwrap(),
+        cat.get_surrogate_for_pk(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            b"alice"
+        )
+        .unwrap(),
         Some(s1)
     );
     assert_eq!(
-        cat.get_pk_for_surrogate(nodedb_types::DatabaseId::DEFAULT, "users", s1)
-            .unwrap(),
+        cat.get_pk_for_surrogate(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            s1
+        )
+        .unwrap(),
         Some(b"alice".to_vec())
     );
 }
@@ -58,9 +89,30 @@ fn assign_distinct_pks_returns_distinct_surrogates() {
     let (_dir, creds) = open_credentials();
     let wal: Arc<dyn SurrogateWalAppender> = Arc::new(NoopWalAppender);
     let a = make_assigner(creds, wal);
-    let s1 = a.assign("users", b"alice").unwrap();
-    let s2 = a.assign("users", b"bob").unwrap();
-    let s3 = a.assign("users", b"carol").unwrap();
+    let s1 = a
+        .assign(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            b"alice",
+        )
+        .unwrap();
+    let s2 = a
+        .assign(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            b"bob",
+        )
+        .unwrap();
+    let s3 = a
+        .assign(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            b"carol",
+        )
+        .unwrap();
     assert_ne!(s1, s2);
     assert_ne!(s2, s3);
     assert_ne!(s1, s3);
@@ -73,27 +125,65 @@ fn drop_collection_wipes_surrogate_map() {
     let (_dir, creds) = open_credentials();
     let wal: Arc<dyn SurrogateWalAppender> = Arc::new(NoopWalAppender);
     let a = make_assigner(creds.clone(), wal);
-    let _ = a.assign("users", b"alice").unwrap();
-    let _ = a.assign("users", b"bob").unwrap();
-    let s_other = a.assign("orders", b"o1").unwrap();
+    let _ = a
+        .assign(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            b"alice",
+        )
+        .unwrap();
+    let _ = a
+        .assign(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            b"bob",
+        )
+        .unwrap();
+    let s_other = a
+        .assign(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "orders",
+            b"o1",
+        )
+        .unwrap();
     let cat = creds.catalog().as_ref().unwrap();
     assert_eq!(
-        cat.scan_surrogates_for_collection(nodedb_types::DatabaseId::DEFAULT, "users")
-            .unwrap()
-            .len(),
+        cat.scan_surrogates_for_collection(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users"
+        )
+        .unwrap()
+        .len(),
         2
     );
 
-    cat.delete_all_surrogates_for_collection(nodedb_types::DatabaseId::DEFAULT, "users")
-        .unwrap();
+    cat.delete_all_surrogates_for_collection(
+        nodedb_types::DatabaseId::DEFAULT,
+        nodedb_types::TenantId::new(0),
+        "users",
+    )
+    .unwrap();
     assert!(
-        cat.scan_surrogates_for_collection(nodedb_types::DatabaseId::DEFAULT, "users")
-            .unwrap()
-            .is_empty()
+        cat.scan_surrogates_for_collection(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users"
+        )
+        .unwrap()
+        .is_empty()
     );
     assert_eq!(
-        cat.get_surrogate_for_pk(nodedb_types::DatabaseId::DEFAULT, "orders", b"o1")
-            .unwrap(),
+        cat.get_surrogate_for_pk(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "orders",
+            b"o1"
+        )
+        .unwrap(),
         Some(s_other)
     );
 }
@@ -124,6 +214,8 @@ impl SurrogateWalAppender for CountingAppender {
 
     fn record_bind_to_wal(
         &self,
+        _database_id: nodedb_types::DatabaseId,
+        _tenant_id: nodedb_types::TenantId,
         _surrogate: u32,
         _collection: &str,
         _pk_bytes: &[u8],
@@ -143,7 +235,14 @@ fn flush_emits_wal_record_at_threshold() {
     let n = FLUSH_OPS_THRESHOLD as usize;
     for i in 0..n {
         let pk = format!("u{i:08}");
-        let _ = a.assign("users", pk.as_bytes()).unwrap();
+        let _ = a
+            .assign(
+                nodedb_types::DatabaseId::DEFAULT,
+                nodedb_types::TenantId::new(0),
+                "users",
+                pk.as_bytes(),
+            )
+            .unwrap();
     }
 
     let alloc_calls = wal_concrete
@@ -177,19 +276,36 @@ fn assigns_persist_across_reopen() {
         let creds = Arc::new(CredentialStore::open(&path).unwrap());
         let wal: Arc<dyn SurrogateWalAppender> = Arc::new(NoopWalAppender);
         let a = make_assigner(creds, wal);
-        s_persisted = a.assign("users", b"alice").unwrap();
+        s_persisted = a
+            .assign(
+                nodedb_types::DatabaseId::DEFAULT,
+                nodedb_types::TenantId::new(0),
+                "users",
+                b"alice",
+            )
+            .unwrap();
     }
     // Reopen — the binding row must survive.
     let creds = CredentialStore::open(&path).unwrap();
     let cat = creds.catalog().as_ref().unwrap();
     assert_eq!(
-        cat.get_surrogate_for_pk(nodedb_types::DatabaseId::DEFAULT, "users", b"alice")
-            .unwrap(),
+        cat.get_surrogate_for_pk(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            b"alice"
+        )
+        .unwrap(),
         Some(s_persisted)
     );
     assert_eq!(
-        cat.get_pk_for_surrogate(nodedb_types::DatabaseId::DEFAULT, "users", s_persisted)
-            .unwrap(),
+        cat.get_pk_for_surrogate(
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            "users",
+            s_persisted
+        )
+        .unwrap(),
         Some(b"alice".to_vec())
     );
 }

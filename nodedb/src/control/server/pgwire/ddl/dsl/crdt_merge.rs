@@ -11,12 +11,14 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
 /// CRDT MERGE INTO <collection> FROM '<source_id>' TO '<target_id>'
 pub async fn crdt_merge(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> PgWireResult<Vec<Response>> {
     if parts.len() < 7 {
@@ -70,7 +72,7 @@ pub async fn crdt_merge(
 
     let target_surrogate = state
         .surrogate_assigner
-        .assign(collection, target_id.as_bytes())
+        .assign(database_id, tenant_id, collection, target_id.as_bytes())
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
     let apply_plan = PhysicalPlan::Crdt(CrdtOp::Apply {

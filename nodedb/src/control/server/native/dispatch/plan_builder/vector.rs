@@ -69,7 +69,11 @@ pub(crate) fn build_batch_insert(
     let assigner = &ctx.state.surrogate_assigner;
     let mut surrogates = Vec::with_capacity(vectors.len());
     for _ in &vectors {
-        surrogates.push(assigner.assign_anonymous(collection)?);
+        surrogates.push(assigner.assign_anonymous(
+            ctx.database_id(),
+            ctx.tenant_id(),
+            collection,
+        )?);
     }
 
     Ok(PhysicalPlan::Vector(VectorOp::BatchInsert {
@@ -99,10 +103,18 @@ pub(crate) fn build_insert(
     let assigner = &ctx.state.surrogate_assigner;
     let (surrogate, pk_bytes) = match fields.document_id.as_deref() {
         Some(pk) if !pk.is_empty() => (
-            assigner.assign(collection, pk.as_bytes())?,
+            assigner.assign(
+                ctx.database_id(),
+                ctx.tenant_id(),
+                collection,
+                pk.as_bytes(),
+            )?,
             Some(pk.as_bytes().to_vec()),
         ),
-        _ => (assigner.assign_anonymous(collection)?, None),
+        _ => (
+            assigner.assign_anonymous(ctx.database_id(), ctx.tenant_id(), collection)?,
+            None,
+        ),
     };
 
     Ok(PhysicalPlan::Vector(VectorOp::Insert {
