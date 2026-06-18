@@ -7,9 +7,12 @@
 //!
 //! # Routing rules
 //!
-//! 1. Compute the vShard for the plan's primary collection via
-//!    [`vshard_for_collection`].
-//! 2. Look up the Raft group leader for that vShard in the routing table.
+//! 1. Consult the `strategy_fn` closure (backed by the catalog) for the plan's
+//!    primary collection to determine its [`PartitionStrategy`]:
+//!    - `CollectionHomed` → one vShard derived from [`vshard_for_collection`].
+//!    - `KeyPartitioned` → one vShard per distinct key via [`VShardId::from_key`]
+//!      (deduplicated; multiple keys mapping to the same vShard share one route).
+//! 2. Look up the Raft group leader for each vShard in the routing table.
 //! 3. If the leader is this node (`local_node_id`) → `RouteDecision::Local`.
 //! 4. If the leader is another node → `RouteDecision::Remote`.
 //! 5. For plans wrapped in `QueryOp::Exchange{Gather{..}}` the Exchange wrapper
@@ -23,34 +26,51 @@
 //! In single-node mode (routing table = `None`), all plans route locally.
 
 use nodedb_cluster::routing::{RoutingTable, vshard_for_collection};
-use nodedb_types::id::DatabaseId;
+use nodedb_types::PartitionStrategy;
+use nodedb_types::id::{DatabaseId, VShardId};
 
 use nodedb_physical::physical_plan::PhysicalPlan;
 
+use crate::Result;
+
+use super::key_extractor::KeyExtractor;
 use super::route::{RouteDecision, TaskRoute};
 use super::version_set::touched_collections;
 
 /// Compute routing decisions for a single `PhysicalPlan`.
 ///
 /// Returns a `Vec<TaskRoute>` — usually one element; multiple elements only
-/// for broadcast scans (one route per vShard).
+/// for broadcast scans (one route per vShard) or key-partitioned collections
+/// (one route per distinct key vShard).
 ///
 /// `database_id` scopes the routing hash so that the same collection name in
 /// two different databases resolves to independent vShards.
+///
+/// `strategy_fn` is called with the primary collection name and returns the
+/// [`PartitionStrategy`] for that collection. The caller builds this closure
+/// from the catalog; the router stays catalog-agnostic.
+///
+/// `extractor` is invoked only for `KeyPartitioned` collections. No collection
+/// carries that strategy yet, so [`UnwiredKeyExtractor`] is the correct
+/// sentinel and this path is unreachable in practice.
+///
+/// [`UnwiredKeyExtractor`]: super::key_extractor::UnwiredKeyExtractor
 pub fn route_plan(
     plan: PhysicalPlan,
     local_node_id: u64,
     routing: Option<&RoutingTable>,
     database_id: DatabaseId,
-) -> Vec<TaskRoute> {
+    strategy_fn: impl Fn(&str) -> PartitionStrategy,
+    extractor: &dyn KeyExtractor,
+) -> Result<Vec<TaskRoute>> {
     // In single-node mode every plan runs locally.
     let Some(routing) = routing else {
         let vshard_id = primary_vshard(&plan, database_id);
-        return vec![TaskRoute {
+        return Ok(vec![TaskRoute {
             plan,
             decision: RouteDecision::Local,
             vshard_id,
-        }];
+        }]);
     };
 
     // A sharded read/aggregate reaches the router wrapped in `Exchange{Gather}`.
@@ -83,25 +103,80 @@ pub fn route_plan(
             //   nested build-side data movement is resolved at the dispatch site
             //   (see `dispatch_remote` / `dispatch_to_data_plane`).
             if plan_contains_cluster_partitioned_leaf(&child) {
-                route_broadcast(*child, local_node_id, routing)
+                Ok(route_broadcast(*child, local_node_id, routing))
             } else {
-                let vshard_id = primary_vshard(&child, database_id);
-                let decision = resolve_decision(vshard_id, local_node_id, Some(routing), None);
-                vec![TaskRoute {
-                    plan: *child,
-                    decision,
-                    vshard_id,
-                }]
+                Ok(route_single_collection(
+                    *child,
+                    local_node_id,
+                    routing,
+                    database_id,
+                    &strategy_fn,
+                    extractor,
+                )?)
             }
         }
-        other => {
-            let vshard_id = primary_vshard(&other, database_id);
+        other => Ok(route_single_collection(
+            other,
+            local_node_id,
+            routing,
+            database_id,
+            &strategy_fn,
+            extractor,
+        )?),
+    }
+}
+
+/// Route a plan that touches exactly one primary collection (or none).
+///
+/// Consults [`PartitionStrategy`] for the primary collection name and produces:
+/// - `CollectionHomed` → one route to the collection's owning vShard
+///   (byte-identical to the original collection-homed path).
+/// - `KeyPartitioned { key }` → one route per distinct vShard derived from the
+///   plan's shard keys via [`VShardId::from_key`].
+fn route_single_collection(
+    plan: PhysicalPlan,
+    local_node_id: u64,
+    routing: &RoutingTable,
+    database_id: DatabaseId,
+    strategy_fn: &impl Fn(&str) -> PartitionStrategy,
+    extractor: &dyn KeyExtractor,
+) -> Result<Vec<TaskRoute>> {
+    let primary_name: Option<String> = touched_collections(&plan).into_iter().next();
+
+    let strategy = primary_name.as_deref().map(strategy_fn).unwrap_or_default(); // CollectionHomed for plans with no named collection
+
+    match strategy {
+        PartitionStrategy::CollectionHomed => {
+            // Byte-identical to the original primary_vshard / resolve_decision path.
+            let vshard_id = primary_name
+                .as_deref()
+                .map(|name| vshard_for_collection(database_id, name))
+                .unwrap_or(0);
             let decision = resolve_decision(vshard_id, local_node_id, Some(routing), None);
-            vec![TaskRoute {
-                plan: other,
+            Ok(vec![TaskRoute {
+                plan,
                 decision,
                 vshard_id,
-            }]
+            }])
+        }
+        PartitionStrategy::KeyPartitioned { key: key_spec } => {
+            let raw_keys = extractor.extract_keys(&plan, &key_spec)?;
+            // Deduplicate vShards: two keys that hash to the same vShard share
+            // a single cloned route rather than fanning out unnecessarily.
+            let mut seen = std::collections::HashSet::new();
+            let mut routes = Vec::new();
+            for raw_key in raw_keys {
+                let vshard_id = VShardId::from_key(&raw_key).as_u32();
+                if seen.insert(vshard_id) {
+                    let decision = resolve_decision(vshard_id, local_node_id, Some(routing), None);
+                    routes.push(TaskRoute {
+                        plan: plan.clone(),
+                        decision,
+                        vshard_id,
+                    });
+                }
+            }
+            Ok(routes)
         }
     }
 }
@@ -223,7 +298,15 @@ mod tests {
             rls_filters: vec![],
             surrogate_ceiling: None,
         });
-        let routes = route_plan(plan, 1, Some(&table), DatabaseId::DEFAULT);
+        let routes = route_plan(
+            plan,
+            1,
+            Some(&table),
+            DatabaseId::DEFAULT,
+            |_| PartitionStrategy::CollectionHomed,
+            &crate::control::gateway::UnwiredKeyExtractor,
+        )
+        .expect("route");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].decision, RouteDecision::Local);
     }
@@ -237,7 +320,15 @@ mod tests {
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
         });
-        let routes = route_plan(plan, 99, None, DatabaseId::DEFAULT);
+        let routes = route_plan(
+            plan,
+            99,
+            None,
+            DatabaseId::DEFAULT,
+            |_| PartitionStrategy::CollectionHomed,
+            &crate::control::gateway::UnwiredKeyExtractor,
+        )
+        .expect("route");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].decision, RouteDecision::Local);
     }
@@ -258,7 +349,15 @@ mod tests {
             rls_filters: vec![],
             surrogate_ceiling: None,
         });
-        let routes = route_plan(plan, 1, Some(&table), DatabaseId::DEFAULT);
+        let routes = route_plan(
+            plan,
+            1,
+            Some(&table),
+            DatabaseId::DEFAULT,
+            |_| PartitionStrategy::CollectionHomed,
+            &crate::control::gateway::UnwiredKeyExtractor,
+        )
+        .expect("route");
         assert_eq!(routes.len(), 1);
         match &routes[0].decision {
             RouteDecision::Remote { node_id, .. } => assert_eq!(*node_id, 2),
@@ -298,7 +397,15 @@ mod tests {
                 },
             },
         ));
-        let routes = route_plan(plan, 1, Some(&table), DatabaseId::DEFAULT);
+        let routes = route_plan(
+            plan,
+            1,
+            Some(&table),
+            DatabaseId::DEFAULT,
+            |_| PartitionStrategy::CollectionHomed,
+            &crate::control::gateway::UnwiredKeyExtractor,
+        )
+        .expect("route");
         // Exactly ONE route — to the collection's owning vShard.
         assert_eq!(
             routes.len(),

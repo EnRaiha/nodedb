@@ -31,6 +31,7 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 
 use super::dispatcher::{default_deadline_ms, dispatch_route};
 use super::fuser::fuse_payloads;
+use super::key_extractor::UnwiredKeyExtractor;
 use super::plan_cache::{PlanCache, PlanCacheKey, SqlKey, hash_placeholder_types, hash_sql};
 use super::retry::retry_not_leader;
 use super::route::TaskRoute;
@@ -211,18 +212,7 @@ impl Gateway {
         plan: PhysicalPlan,
         version_set: GatewayVersionSet,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        // Hold the routing guard only for the route computation, then drop it
-        // before any await points so the future remains Send.
-        let routes = {
-            let routing_guard = self
-                .shared
-                .cluster_routing
-                .as_ref()
-                .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
-            let routing = routing_guard.as_deref();
-            route_plan(plan, self.shared.node_id, routing, ctx.database_id)
-            // routing_guard dropped here
-        };
+        let routes = self.compute_routes(plan, ctx)?;
 
         let deadline_ms = default_deadline_ms(&self.shared);
         // Gateway-level byte ceiling: per-route `dispatch_to_data_plane`
@@ -333,6 +323,47 @@ impl Gateway {
         } else {
             Ok(all_payloads)
         }
+    }
+
+    /// Compute routing decisions for a plan.
+    ///
+    /// Acquires the routing guard and catalog reference, builds the
+    /// `strategy_fn` closure from the catalog, and calls [`route_plan`].
+    /// The routing guard is dropped before this function returns so the
+    /// caller's future remains `Send`.
+    ///
+    /// Shared by [`execute_with_version_set`] and [`Gateway::execute_stream`].
+    pub(super) fn compute_routes(
+        &self,
+        plan: PhysicalPlan,
+        ctx: &QueryContext,
+    ) -> Result<Vec<TaskRoute>, Error> {
+        let routing_guard = self
+            .shared
+            .cluster_routing
+            .as_ref()
+            .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
+        let routing = routing_guard.as_deref();
+        let catalog_ref = self.shared.credentials.catalog();
+        let catalog = catalog_ref.as_ref();
+        let database_id = ctx.database_id;
+        let tenant_id = ctx.tenant_id.as_u64();
+        let strategy_fn = |name: &str| {
+            catalog
+                .and_then(|c| c.get_collection(database_id, tenant_id, name).ok())
+                .flatten()
+                .map(|col| col.partition_strategy)
+                .unwrap_or_default()
+        };
+        route_plan(
+            plan,
+            self.shared.node_id,
+            routing,
+            ctx.database_id,
+            strategy_fn,
+            &UnwiredKeyExtractor,
+        )
+        // routing_guard dropped here
     }
 
     /// Collect the descriptor version set for a plan using the current catalog.

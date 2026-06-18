@@ -17,13 +17,13 @@ use super::core::{Gateway, QueryContext};
 use super::dispatcher::{default_deadline_ms, dispatch_route_stream};
 use super::retry::retry_not_leader;
 use super::route::TaskRoute;
-use super::router::{resolve_decision, route_plan};
+use super::router::resolve_decision;
 
 impl Gateway {
     /// Streaming sibling of [`execute`](Gateway::execute).
     ///
-    /// Routes `plan` the same way as `execute` (route_plan + per-route
-    /// resolve_decision), but each route produces a [`ResultStream`] of row
+    /// Routes `plan` the same way as `execute` (via [`Gateway::compute_routes`]),
+    /// but each route produces a [`ResultStream`] of row
     /// batches instead of a collected `Vec<Vec<u8>>`:
     ///
     /// - Local route → `gather_all_cores_stream` over the route's plan.
@@ -45,15 +45,7 @@ impl Gateway {
     ) -> Result<ResultStream, Error> {
         let version_set = self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id);
 
-        let routes = {
-            let routing_guard = self
-                .shared
-                .cluster_routing
-                .as_ref()
-                .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
-            let routing = routing_guard.as_deref();
-            route_plan(plan, self.shared.node_id, routing, ctx.database_id)
-        };
+        let routes = self.compute_routes(plan, ctx)?;
 
         let deadline_ms = default_deadline_ms(&self.shared);
 
