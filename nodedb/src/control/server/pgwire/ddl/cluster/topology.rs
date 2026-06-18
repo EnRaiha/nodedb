@@ -253,7 +253,7 @@ pub fn show_cluster(
         props.push(("vshards", "1024".to_string()));
     }
 
-    if let Some(status_fn) = &state.raft_status_fn {
+    if let Some(status_fn) = state.raft_status_fn.get() {
         let statuses = status_fn();
         let leaders = statuses.iter().filter(|s| s.role == "Leader").count();
         props.push(("groups_leading", leaders.to_string()));

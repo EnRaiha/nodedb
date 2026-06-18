@@ -27,7 +27,7 @@ pub fn show_raft_groups(
         ));
     }
 
-    let status_fn = match &state.raft_status_fn {
+    let status_fn = match state.raft_status_fn.get() {
         Some(f) => f,
         None => {
             return Err(sqlstate_error(
@@ -97,7 +97,7 @@ pub fn show_raft_group(
         .parse()
         .map_err(|_| sqlstate_error("42601", &format!("invalid group_id: '{}'", parts[3])))?;
 
-    let status_fn = match &state.raft_status_fn {
+    let status_fn = match state.raft_status_fn.get() {
         Some(f) => f,
         None => {
             return Err(sqlstate_error(

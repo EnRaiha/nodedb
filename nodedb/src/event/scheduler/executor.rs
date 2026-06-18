@@ -352,7 +352,7 @@ fn is_raft_group_healthy(sched: &ScheduleDef, state: &SharedState) -> bool {
     }
 
     // Single-node mode: always healthy.
-    let Some(ref status_fn) = state.raft_status_fn else {
+    let Some(status_fn) = state.raft_status_fn.get() else {
         return true;
     };
     let Some(ref routing_lock) = state.cluster_routing else {

@@ -340,6 +340,19 @@ pub fn start_raft(
         tracing::warn!("cluster_observer already set — start_raft appears to have run twice");
     }
 
+    // Publish a live Raft leader-status snapshot fn so routing (gateway +
+    // graph scatter) resolves group leadership from CURRENT Raft state
+    // rather than the (lagging) routing-table hint. Wraps the raft loop's
+    // `group_statuses()` snapshot.
+    let raft_loop_for_status = raft_loop.clone();
+    if shared
+        .raft_status_fn
+        .set(Arc::new(move || raft_loop_for_status.group_statuses()))
+        .is_err()
+    {
+        tracing::warn!("raft_status_fn already set — start_raft appears to have run twice");
+    }
+
     // Publish the raft loop handle into SharedState so the metadata
     // proposer can reach it. The handle is type-erased behind a
     // trait object to keep the SharedState field concrete.

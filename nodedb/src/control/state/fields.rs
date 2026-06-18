@@ -125,8 +125,9 @@ pub struct SharedState {
     pub raft_proposer: OnceLock<Arc<crate::control::wal_replication::RaftProposer>>,
     /// Async Raft propose with transparent leader forwarding (for array sync inbound handlers).
     pub async_raft_proposer: OnceLock<Arc<crate::control::wal_replication::AsyncRaftProposer>>,
-    /// Query Raft group statuses for observability (None in single-node mode).
-    pub raft_status_fn: Option<Arc<dyn Fn() -> Vec<nodedb_cluster::GroupStatus> + Send + Sync>>,
+    /// Query Raft group statuses for observability (unset in single-node mode).
+    pub raft_status_fn:
+        std::sync::OnceLock<Arc<dyn Fn() -> Vec<nodedb_cluster::GroupStatus> + Send + Sync>>,
     /// Cluster observability handle. Set once by `start_raft`.
     pub cluster_observer: OnceLock<Arc<nodedb_cluster::ClusterObserver>>,
     /// Registry of standardized per-loop metrics. Populated by `start_raft`.

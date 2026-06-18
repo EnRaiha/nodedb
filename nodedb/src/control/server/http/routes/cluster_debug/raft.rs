@@ -30,7 +30,7 @@ pub async fn raft_debug(
     if let Some(resp) = ensure_debug_access(&state, &identity) {
         return resp;
     }
-    let Some(status_fn) = state.shared.raft_status_fn.as_ref() else {
+    let Some(status_fn) = state.shared.raft_status_fn.get() else {
         return cluster_disabled();
     };
     let statuses = status_fn();

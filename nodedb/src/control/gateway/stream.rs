@@ -77,11 +77,8 @@ impl Gateway {
                             .cluster_routing
                             .as_ref()
                             .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
-                        let raft_snapshot: Vec<nodedb_cluster::GroupStatus> = shared
-                            .raft_status_fn
-                            .as_ref()
-                            .map(|f| f())
-                            .unwrap_or_default();
+                        let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
+                            shared.raft_status_fn.get().map(|f| f()).unwrap_or_default();
                         let live_leader = move |group_id: u64| -> u64 {
                             raft_snapshot
                                 .iter()
@@ -90,7 +87,7 @@ impl Gateway {
                                 .unwrap_or(0)
                         };
                         let live_lookup: Option<&dyn Fn(u64) -> u64> =
-                            if shared.raft_status_fn.is_some() {
+                            if shared.raft_status_fn.get().is_some() {
                                 Some(&live_leader)
                             } else {
                                 None
