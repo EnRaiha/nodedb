@@ -13,14 +13,14 @@ use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, GraphOp, KvOp, VectorOp
 /// Returns `None` if the data is not a valid ReplicatedEntry (e.g., ConfChange or no-op).
 ///
 /// `assigner`, when `Some`, drives follower-local surrogate binding.
-/// Single-row writers (documents, KV, vector) carry the leader-assigned
-/// surrogate verbatim on the wire and call `assigner.bind(...)` to install
-/// that exact identity in the local catalog (+ `SurrogateBind` WAL record)
-/// — they never re-allocate, so the same key resolves to the same surrogate
-/// on every node. Edge/CRDT variants still re-derive via `assign`
-/// (carried surrogates land in later units). When `None`, surrogate fields
-/// fall back to the carried value / `Surrogate::ZERO` without catalog writes
-/// (used by tests that exercise the decoder without `SharedState`).
+/// Single-row writers (documents, KV, vector, graph edges) carry the
+/// leader-assigned surrogate verbatim on the wire and call
+/// `assigner.bind(...)` to install that exact identity in the local catalog
+/// (+ `SurrogateBind` WAL record) — they never re-allocate, so the same key
+/// resolves to the same surrogate on every node. CRDT variants still
+/// re-derive via `assign`. When `None`, surrogate fields fall back to the
+/// carried value / `Surrogate::ZERO` without catalog writes (used by tests
+/// that exercise the decoder without `SharedState`).
 pub fn from_replicated_entry(
     data: &[u8],
     assigner: Option<&SurrogateAssigner>,
@@ -280,9 +280,19 @@ fn to_physical_plan(
             label,
             dst_id,
             properties,
+            src_surrogate,
+            dst_surrogate,
         } => {
-            let src_surrogate = assign_or_zero(assigner, collection, src_id.as_bytes())?;
-            let dst_surrogate = assign_or_zero(assigner, collection, dst_id.as_bytes())?;
+            let carried_src = nodedb_types::Surrogate::new(*src_surrogate);
+            let src_surrogate = match assigner {
+                Some(a) => a.bind(collection, src_id.as_bytes(), carried_src)?,
+                None => carried_src,
+            };
+            let carried_dst = nodedb_types::Surrogate::new(*dst_surrogate);
+            let dst_surrogate = match assigner {
+                Some(a) => a.bind(collection, dst_id.as_bytes(), carried_dst)?,
+                None => carried_dst,
+            };
             PhysicalPlan::Graph(GraphOp::EdgePut {
                 collection: collection.clone(),
                 src_id: src_id.clone(),

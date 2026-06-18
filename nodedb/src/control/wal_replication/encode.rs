@@ -158,14 +158,16 @@ pub fn to_replicated_entry(
             label,
             dst_id,
             properties,
-            src_surrogate: _,
-            dst_surrogate: _,
+            src_surrogate,
+            dst_surrogate,
         }) => ReplicatedWrite::EdgePut {
             collection: collection.clone(),
             src_id: src_id.clone(),
             label: label.clone(),
             dst_id: dst_id.clone(),
             properties: properties.clone(),
+            src_surrogate: src_surrogate.as_u32(),
+            dst_surrogate: dst_surrogate.as_u32(),
         },
         PhysicalPlan::Graph(GraphOp::EdgeDelete {
             collection,

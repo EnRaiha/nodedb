@@ -240,6 +240,13 @@ pub enum ReplicatedWrite {
         label: String,
         dst_id: String,
         properties: Vec<u8>,
+        /// Leader-assigned global surrogate for the source node (binding key =
+        /// `src_id.as_bytes()`), carried verbatim so every replica binds the
+        /// same identity instead of re-allocating.
+        src_surrogate: u32,
+        /// Leader-assigned global surrogate for the destination node (binding
+        /// key = `dst_id.as_bytes()`).
+        dst_surrogate: u32,
     },
     EdgeDelete {
         collection: String,
