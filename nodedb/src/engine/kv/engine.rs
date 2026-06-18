@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use nodedb_types::Surrogate;
 
-use super::engine_helpers::table_key;
+use super::engine_helpers::{expiry_prefix, table_key};
 use super::expiry_wheel::ExpiryWheel;
 use super::hash_table::KvHashTable;
 use super::index::KvIndexSet;
@@ -27,9 +27,9 @@ pub type ScanResult = (Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>);
 /// Owns a hash table per collection and a shared expiry wheel.
 /// Dispatched from the Data Plane executor via `PhysicalPlan::Kv(KvOp)`.
 pub struct KvEngine {
-    /// Per-collection hash tables. Key: "{tenant_id}:{collection}".
+    /// Per-collection hash tables. Key: hash of "{database_id}:{tenant_id}:{collection}".
     pub(crate) tables: HashMap<u64, KvHashTable>,
-    /// Per-collection secondary index sets. Key: "{tenant_id}:{collection}".
+    /// Per-collection secondary index sets. Key: hash of "{database_id}:{tenant_id}:{collection}".
     pub(crate) indexes: HashMap<u64, KvIndexSet>,
     /// Reverse mapping: hash → tenant_id. Enables tenant purge without
     /// reversing the FxHash. Maintained in sync with `tables`.
@@ -107,8 +107,13 @@ impl KvEngine {
     ///
     /// Returns `1` if the table existed and was removed, `0` otherwise.
     /// Idempotent — safe to re-run after partial completion.
-    pub fn purge_collection(&mut self, tenant_id: u64, collection: &str) -> usize {
-        let tkey = super::engine_helpers::table_key(tenant_id, collection);
+    pub fn purge_collection(
+        &mut self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+    ) -> usize {
+        let tkey = super::engine_helpers::table_key(database_id, tenant_id, collection);
         let mut removed = 0;
         if self.tables.remove(&tkey).is_some() {
             removed += 1;
@@ -116,14 +121,15 @@ impl KvEngine {
         self.indexes.remove(&tkey);
         self.hash_to_tenant.remove(&tkey);
         self.hash_to_collection.remove(&tkey);
-        self.sorted_indexes.purge_collection(tenant_id, collection);
+        self.sorted_indexes
+            .purge_collection(database_id, tenant_id, collection);
 
         // Eagerly drop pending TTL-wheel entries for this collection.
         // Stale entries would otherwise no-op at fire time (the table
         // they reference is gone), but they still consume reap budget
         // per tick — for a large collection with many TTLs, that's
         // wasted work until every scheduled time has passed.
-        let prefix = format!("{tenant_id}:{collection}\0").into_bytes();
+        let prefix = expiry_prefix(database_id, tenant_id, collection).into_bytes();
         let wheel_removed = self.expiry.purge_prefix(&prefix);
         if wheel_removed > 0 {
             tracing::debug!(
@@ -168,11 +174,12 @@ impl KvEngine {
     /// unbound or the collection is empty.
     pub fn key_for_surrogate(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         surrogate: Surrogate,
     ) -> Option<Vec<u8>> {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         self.tables
             .get(&tkey)?
             .key_for_surrogate(surrogate)
@@ -182,12 +189,13 @@ impl KvEngine {
     /// GET: O(1) hash table lookup. Returns None if not found or expired.
     pub fn get(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         key: &[u8],
         now_ms: u64,
     ) -> Option<Vec<u8>> {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         self.tables.get(&tkey)?.get(key, now_ms).map(|v| v.to_vec())
     }
 
@@ -197,12 +205,13 @@ impl KvEngine {
     /// source allocated AFTER the clone's AS-OF point are filtered out.
     pub fn get_with_surrogate(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         key: &[u8],
         now_ms: u64,
     ) -> Option<(Vec<u8>, nodedb_types::Surrogate)> {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         self.tables
             .get(&tkey)?
             .get_with_surrogate(key, now_ms)
@@ -216,12 +225,13 @@ impl KvEngine {
     /// - `Some(remaining_ms)` — key exists and expires in `remaining_ms` milliseconds
     pub fn get_ttl_ms(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         key: &[u8],
         now_ms: u64,
     ) -> Option<i64> {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         let table = self.tables.get(&tkey)?;
 
         // First check the key exists and isn't expired.
@@ -240,19 +250,21 @@ impl KvEngine {
     /// BATCH GET: fetch multiple keys. Returns values in order (None for missing).
     pub fn batch_get(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         keys: &[Vec<u8>],
         now_ms: u64,
     ) -> Vec<Option<Vec<u8>>> {
         keys.iter()
-            .map(|k| self.get(tenant_id, collection, k, now_ms))
+            .map(|k| self.get(database_id, tenant_id, collection, k, now_ms))
             .collect()
     }
 
     /// BATCH PUT: insert/update multiple pairs. Returns count of new keys.
     pub fn batch_put(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         entries: &[(Vec<u8>, Vec<u8>)],
@@ -263,6 +275,7 @@ impl KvEngine {
         for (key, value) in entries {
             if self
                 .put(
+                    database_id,
                     tenant_id,
                     collection,
                     key,
@@ -291,6 +304,7 @@ impl KvEngine {
     /// `params.surrogate_ceiling` enforces clone snapshot isolation when set.
     pub fn scan(&self, params: KvScanParams<'_>) -> ScanResult {
         let KvScanParams {
+            database_id,
             tenant_id,
             collection,
             cursor,
@@ -301,7 +315,7 @@ impl KvEngine {
             filter_value,
             surrogate_ceiling,
         } = params;
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         let table = match self.tables.get(&tkey) {
             Some(t) => t,
             None => return (Vec::new(), Vec::new()),
@@ -403,6 +417,7 @@ impl KvEngine {
         F: FnMut(&[u8], &[u8]) -> crate::Result<()>,
     {
         let KvScanParams {
+            database_id,
             tenant_id,
             collection,
             cursor,
@@ -413,7 +428,7 @@ impl KvEngine {
             filter_value,
             surrogate_ceiling,
         } = params;
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         let table = match self.tables.get(&tkey) {
             Some(t) => t,
             None => return Ok(()),
@@ -501,16 +516,16 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        assert!(e.get(1, "cache", b"k1", n).is_none());
+        assert!(e.get(0, 1, "cache", b"k1", n).is_none());
 
-        e.put(1, "cache", b"k1", b"v1", 0, n, Surrogate::ZERO);
-        assert_eq!(e.get(1, "cache", b"k1", n).unwrap(), b"v1");
+        e.put(0, 1, "cache", b"k1", b"v1", 0, n, Surrogate::ZERO);
+        assert_eq!(e.get(0, 1, "cache", b"k1", n).unwrap(), b"v1");
 
-        e.put(1, "cache", b"k1", b"v2", 0, n, Surrogate::ZERO);
-        assert_eq!(e.get(1, "cache", b"k1", n).unwrap(), b"v2");
+        e.put(0, 1, "cache", b"k1", b"v2", 0, n, Surrogate::ZERO);
+        assert_eq!(e.get(0, 1, "cache", b"k1", n).unwrap(), b"v2");
 
-        assert_eq!(e.delete(1, "cache", &[b"k1".to_vec()], n), 1);
-        assert!(e.get(1, "cache", b"k1", n).is_none());
+        assert_eq!(e.delete(0, 1, "cache", &[b"k1".to_vec()], n), 1);
+        assert!(e.get(0, 1, "cache", b"k1", n).is_none());
     }
 
     #[test]
@@ -519,14 +534,14 @@ mod tests {
         let n = now();
 
         // Put with 5-second TTL.
-        e.put(1, "sess", b"s1", b"data", 5000, n, Surrogate::ZERO);
-        assert!(e.get(1, "sess", b"s1", n).is_some());
+        e.put(0, 1, "sess", b"s1", b"data", 5000, n, Surrogate::ZERO);
+        assert!(e.get(0, 1, "sess", b"s1", n).is_some());
 
         // Still alive at t+4999.
-        assert!(e.get(1, "sess", b"s1", n + 4999).is_some());
+        assert!(e.get(0, 1, "sess", b"s1", n + 4999).is_some());
 
         // Expired at t+5000 (lazy fallback).
-        assert!(e.get(1, "sess", b"s1", n + 5000).is_none());
+        assert!(e.get(0, 1, "sess", b"s1", n + 5000).is_none());
 
         // Tick reaps it.
         let reaped = e.tick_expiry(n + 5000);
@@ -541,11 +556,11 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.put(1, "cache", b"k", b"v", 3000, n, Surrogate::ZERO);
-        assert!(e.persist(1, "cache", b"k"));
+        e.put(0, 1, "cache", b"k", b"v", 3000, n, Surrogate::ZERO);
+        assert!(e.persist(0, 1, "cache", b"k"));
 
         // Should never expire now.
-        assert!(e.get(1, "cache", b"k", n + 100_000).is_some());
+        assert!(e.get(0, 1, "cache", b"k", n + 100_000).is_some());
     }
 
     #[test]
@@ -553,12 +568,12 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.put(1, "cache", b"k", b"v", 0, n, Surrogate::ZERO);
-        assert!(e.get(1, "cache", b"k", n + 100_000).is_some()); // No TTL.
+        e.put(0, 1, "cache", b"k", b"v", 0, n, Surrogate::ZERO);
+        assert!(e.get(0, 1, "cache", b"k", n + 100_000).is_some()); // No TTL.
 
-        assert!(e.expire(1, "cache", b"k", 2000, n));
-        assert!(e.get(1, "cache", b"k", n + 1999).is_some());
-        assert!(e.get(1, "cache", b"k", n + 2000).is_none()); // Expired.
+        assert!(e.expire(0, 1, "cache", b"k", 2000, n));
+        assert!(e.get(0, 1, "cache", b"k", n + 1999).is_some());
+        assert!(e.get(0, 1, "cache", b"k", n + 2000).is_none()); // Expired.
     }
 
     #[test]
@@ -567,11 +582,11 @@ mod tests {
         let n = now();
 
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..5u8).map(|i| (vec![i], vec![i * 10])).collect();
-        let new_count = e.batch_put(1, "c", &entries, 0, n);
+        let new_count = e.batch_put(0, 1, "c", &entries, 0, n);
         assert_eq!(new_count, 5);
 
         let keys: Vec<Vec<u8>> = (0..7u8).map(|i| vec![i]).collect();
-        let results = e.batch_get(1, "c", &keys, n);
+        let results = e.batch_get(0, 1, "c", &keys, n);
         assert_eq!(results.len(), 7);
         assert_eq!(results[0], Some(vec![0]));
         assert_eq!(results[4], Some(vec![40]));
@@ -584,11 +599,11 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.put(1, "c", b"k", b"t1", 0, n, Surrogate::ZERO);
-        e.put(2, "c", b"k", b"t2", 0, n, Surrogate::ZERO);
+        e.put(0, 1, "c", b"k", b"t1", 0, n, Surrogate::ZERO);
+        e.put(0, 2, "c", b"k", b"t2", 0, n, Surrogate::ZERO);
 
-        assert_eq!(e.get(1, "c", b"k", n).unwrap(), b"t1");
-        assert_eq!(e.get(2, "c", b"k", n).unwrap(), b"t2");
+        assert_eq!(e.get(0, 1, "c", b"k", n).unwrap(), b"t1");
+        assert_eq!(e.get(0, 2, "c", b"k", n).unwrap(), b"t2");
     }
 
     #[test]
@@ -599,10 +614,10 @@ mod tests {
         assert_eq!(e.total_entries(), 0);
 
         for i in 0..10u32 {
-            e.put(1, "c", &i.to_be_bytes(), &[0; 32], 0, n, Surrogate::ZERO);
+            e.put(0, 1, "c", &i.to_be_bytes(), &[0; 32], 0, n, Surrogate::ZERO);
         }
         assert_eq!(e.total_entries(), 10);
-        assert_eq!(e.collection_len(1, "c"), 10);
+        assert_eq!(e.collection_len(0, 1, "c"), 10);
         assert!(e.total_mem_usage() > 0);
     }
 
@@ -622,6 +637,7 @@ mod tests {
 
         // Insert some entries before creating the index.
         e.put(
+            0,
             1,
             "sessions",
             b"s1",
@@ -631,6 +647,7 @@ mod tests {
             Surrogate::ZERO,
         );
         e.put(
+            0,
             1,
             "sessions",
             b"s2",
@@ -640,6 +657,7 @@ mod tests {
             Surrogate::ZERO,
         );
         e.put(
+            0,
             1,
             "sessions",
             b"s3",
@@ -650,16 +668,16 @@ mod tests {
         );
 
         // Create index with backfill.
-        let backfilled = e.register_index(1, "sessions", "region", 0, true, n);
+        let backfilled = e.register_index(0, 1, "sessions", "region", 0, true, n);
         assert_eq!(backfilled, 3);
 
         // Lookup by indexed field.
-        let us_east = e.index_lookup_eq(1, "sessions", "region", b"us-east");
+        let us_east = e.index_lookup_eq(0, 1, "sessions", "region", b"us-east");
         assert_eq!(us_east.len(), 2);
         assert!(us_east.contains(&b"s1".to_vec()));
         assert!(us_east.contains(&b"s2".to_vec()));
 
-        let eu_west = e.index_lookup_eq(1, "sessions", "region", b"eu-west");
+        let eu_west = e.index_lookup_eq(0, 1, "sessions", "region", b"eu-west");
         assert_eq!(eu_west.len(), 1);
     }
 
@@ -669,10 +687,11 @@ mod tests {
         let n = now();
 
         // Create index first (no backfill needed — empty collection).
-        e.register_index(1, "c", "status", 0, false, n);
+        e.register_index(0, 1, "c", "status", 0, false, n);
 
         // Insert.
         e.put(
+            0,
             1,
             "c",
             b"k1",
@@ -681,10 +700,11 @@ mod tests {
             n,
             Surrogate::ZERO,
         );
-        assert_eq!(e.index_lookup_eq(1, "c", "status", b"active").len(), 1);
+        assert_eq!(e.index_lookup_eq(0, 1, "c", "status", b"active").len(), 1);
 
         // Update: status changes.
         e.put(
+            0,
             1,
             "c",
             b"k1",
@@ -693,8 +713,8 @@ mod tests {
             n,
             Surrogate::ZERO,
         );
-        assert!(e.index_lookup_eq(1, "c", "status", b"active").is_empty());
-        assert_eq!(e.index_lookup_eq(1, "c", "status", b"inactive").len(), 1);
+        assert!(e.index_lookup_eq(0, 1, "c", "status", b"active").is_empty());
+        assert_eq!(e.index_lookup_eq(0, 1, "c", "status", b"inactive").len(), 1);
     }
 
     #[test]
@@ -702,8 +722,9 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.register_index(1, "c", "region", 0, false, n);
+        e.register_index(0, 1, "c", "region", 0, false, n);
         e.put(
+            0,
             1,
             "c",
             b"k1",
@@ -713,6 +734,7 @@ mod tests {
             Surrogate::ZERO,
         );
         e.put(
+            0,
             1,
             "c",
             b"k2",
@@ -722,10 +744,10 @@ mod tests {
             Surrogate::ZERO,
         );
 
-        assert_eq!(e.index_lookup_eq(1, "c", "region", b"us").len(), 2);
+        assert_eq!(e.index_lookup_eq(0, 1, "c", "region", b"us").len(), 2);
 
-        e.delete(1, "c", &[b"k1".to_vec()], n);
-        assert_eq!(e.index_lookup_eq(1, "c", "region", b"us").len(), 1);
+        e.delete(0, 1, "c", &[b"k1".to_vec()], n);
+        assert_eq!(e.index_lookup_eq(0, 1, "c", "region", b"us").len(), 1);
     }
 
     #[test]
@@ -734,10 +756,10 @@ mod tests {
         let n = now();
 
         // No indexes — PUT should work without index overhead.
-        assert!(!e.has_indexes(1, "c"));
-        e.put(1, "c", b"k", b"raw_value", 0, n, Surrogate::ZERO);
-        assert!(e.get(1, "c", b"k", n).is_some());
-        assert_eq!(e.write_amp_ratio(1, "c"), 0.0);
+        assert!(!e.has_indexes(0, 1, "c"));
+        e.put(0, 1, "c", b"k", b"raw_value", 0, n, Surrogate::ZERO);
+        assert!(e.get(0, 1, "c", b"k", n).is_some());
+        assert_eq!(e.write_amp_ratio(0, 1, "c"), 0.0);
     }
 
     #[test]
@@ -745,8 +767,9 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.register_index(1, "c", "status", 0, false, n);
+        e.register_index(0, 1, "c", "status", 0, false, n);
         e.put(
+            0,
             1,
             "c",
             b"k1",
@@ -755,12 +778,12 @@ mod tests {
             n,
             Surrogate::ZERO,
         );
-        assert_eq!(e.index_count(1, "c"), 1);
+        assert_eq!(e.index_count(0, 1, "c"), 1);
 
-        let dropped = e.drop_index(1, "c", "status");
+        let dropped = e.drop_index(0, 1, "c", "status");
         assert_eq!(dropped, 1);
-        assert_eq!(e.index_count(1, "c"), 0);
-        assert!(e.index_lookup_eq(1, "c", "status", b"active").is_empty());
+        assert_eq!(e.index_count(0, 1, "c"), 0);
+        assert!(e.index_lookup_eq(0, 1, "c", "status", b"active").is_empty());
     }
 
     #[test]
@@ -768,12 +791,13 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.register_index(1, "c", "a", 0, false, n);
-        e.register_index(1, "c", "b", 1, false, n);
+        e.register_index(0, 1, "c", "a", 0, false, n);
+        e.register_index(0, 1, "c", "b", 1, false, n);
 
         for i in 0..10u32 {
             let k = format!("k{i}");
             e.put(
+                0,
                 1,
                 "c",
                 k.as_bytes(),
@@ -785,7 +809,7 @@ mod tests {
         }
 
         // 10 PUTs, 2 indexes each = write amp ratio of 2.0.
-        let ratio = e.write_amp_ratio(1, "c");
+        let ratio = e.write_amp_ratio(0, 1, "c");
         assert!((ratio - 2.0).abs() < f64::EPSILON);
     }
 
@@ -798,7 +822,7 @@ mod tests {
 
         // Warmup: insert all keys once.
         for key in &keys {
-            e.put(1, "b", key, &value, 0, n, Surrogate::ZERO);
+            e.put(0, 1, "b", key, &value, 0, n, Surrogate::ZERO);
         }
 
         // Timed: 100K updates (keys already exist).
@@ -806,7 +830,7 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..iters {
             let key = &keys[(i as usize) % 10_000];
-            e.put(1, "b", key, &value, 0, n, Surrogate::ZERO);
+            e.put(0, 1, "b", key, &value, 0, n, Surrogate::ZERO);
         }
         let elapsed = start.elapsed();
         let ns_per_op = elapsed.as_nanos() / iters as u128;
@@ -817,6 +841,7 @@ mod tests {
     /// Build the full-visibility, no-filter scan params used by the normalizer.
     fn scan_params<'a>(collection: &'a str, count: usize, now_ms: u64) -> KvScanParams<'a> {
         KvScanParams {
+            database_id: 0,
             tenant_id: 1,
             collection,
             cursor: &[],
@@ -834,7 +859,7 @@ mod tests {
         let mut e = make_engine();
         let n = now();
         for i in 0..5u8 {
-            e.put(1, "c", &[i], &[i * 10], 0, n, Surrogate::ZERO);
+            e.put(0, 1, "c", &[i], &[i * 10], 0, n, Surrogate::ZERO);
         }
 
         let (materialized, _next) = e.scan(scan_params("c", usize::MAX, n));
@@ -855,7 +880,7 @@ mod tests {
         let mut e = make_engine();
         let n = now();
         for i in 0..10u8 {
-            e.put(1, "c", &[i], &[i * 10], 0, n, Surrogate::ZERO);
+            e.put(0, 1, "c", &[i], &[i * 10], 0, n, Surrogate::ZERO);
         }
 
         let (materialized, _next) = e.scan(scan_params("c", 3, n));
@@ -875,8 +900,9 @@ mod tests {
     fn scan_for_each_matches_scan_index_path() {
         let mut e = make_engine();
         let n = now();
-        e.register_index(1, "sessions", "region", 0, false, n);
+        e.register_index(0, 1, "sessions", "region", 0, false, n);
         e.put(
+            0,
             1,
             "sessions",
             b"s1",
@@ -886,6 +912,7 @@ mod tests {
             Surrogate::ZERO,
         );
         e.put(
+            0,
             1,
             "sessions",
             b"s2",
@@ -895,6 +922,7 @@ mod tests {
             Surrogate::ZERO,
         );
         e.put(
+            0,
             1,
             "sessions",
             b"s3",
@@ -925,8 +953,8 @@ mod tests {
     fn scan_for_each_propagates_callback_error() {
         let mut e = make_engine();
         let n = now();
-        e.put(1, "c", b"k1", b"v1", 0, n, Surrogate::ZERO);
-        e.put(1, "c", b"k2", b"v2", 0, n, Surrogate::ZERO);
+        e.put(0, 1, "c", b"k1", b"v1", 0, n, Surrogate::ZERO);
+        e.put(0, 1, "c", b"k2", b"v2", 0, n, Surrogate::ZERO);
 
         let mut seen = 0usize;
         let result = e.scan_for_each(scan_params("c", usize::MAX, n), |_k, _v| {

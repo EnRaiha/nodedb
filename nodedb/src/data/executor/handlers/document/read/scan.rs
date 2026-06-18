@@ -111,7 +111,12 @@ impl CoreLoop {
             let sparse_result = self.sparse.scan_documents(tid, collection, fetch_limit);
             match &sparse_result {
                 Ok(docs) if docs.is_empty() => {
-                    let fallback = self.scan_collection(tid, collection, fetch_limit);
+                    let fallback = self.scan_collection(
+                        task.request.database_id.as_u64(),
+                        tid,
+                        collection,
+                        fetch_limit,
+                    );
                     if let Ok(ref docs) = fallback
                         && !docs.is_empty()
                     {
@@ -143,7 +148,12 @@ impl CoreLoop {
             );
             match &sparse_result {
                 Ok(docs) if docs.is_empty() => self
-                    .scan_collection(tid, collection, fetch_limit)
+                    .scan_collection(
+                        task.request.database_id.as_u64(),
+                        tid,
+                        collection,
+                        fetch_limit,
+                    )
                     .map(|docs| {
                         docs.into_iter()
                             .filter(|(_, data)| {

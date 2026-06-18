@@ -25,7 +25,11 @@ use crate::data::executor::core_loop::CoreLoop;
 /// the dispatch seam is the `match self` inside [`RowSource::for_each`].
 pub(super) enum RowSource {
     /// Scan rows directly from a local collection on this core.
-    LocalScan { tenant_id: u64, collection: String },
+    LocalScan {
+        database_id: u64,
+        tenant_id: u64,
+        collection: String,
+    },
 }
 
 impl RowSource {
@@ -38,9 +42,10 @@ impl RowSource {
     {
         match self {
             RowSource::LocalScan {
+                database_id,
                 tenant_id,
                 collection,
-            } => core.scan_collection_for_each(*tenant_id, collection, f),
+            } => core.scan_collection_for_each(*database_id, *tenant_id, collection, f),
         }
     }
 }

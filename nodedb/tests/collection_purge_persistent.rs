@@ -62,6 +62,7 @@ fn kv_engine_purge_leaves_no_keys_for_collection() {
     let mut kv = KvEngine::new(now_ms, 16, 0.75, 4, 64, 1000, 1024);
 
     kv.put(
+        0,
         TENANT,
         "keep",
         b"k1",
@@ -71,6 +72,7 @@ fn kv_engine_purge_leaves_no_keys_for_collection() {
         nodedb_types::Surrogate::ZERO,
     );
     kv.put(
+        0,
         TENANT,
         "purge_me",
         b"k1",
@@ -80,6 +82,7 @@ fn kv_engine_purge_leaves_no_keys_for_collection() {
         nodedb_types::Surrogate::ZERO,
     );
     kv.put(
+        0,
         TENANT,
         "purge_me",
         b"k2",
@@ -89,16 +92,16 @@ fn kv_engine_purge_leaves_no_keys_for_collection() {
         nodedb_types::Surrogate::ZERO,
     );
 
-    let removed = kv.purge_collection(TENANT, "purge_me");
+    let removed = kv.purge_collection(0, TENANT, "purge_me");
     assert!(
         removed >= 1,
         "purge_collection must remove at least the table"
     );
 
-    assert!(kv.get(TENANT, "purge_me", b"k1", now_ms).is_none());
-    assert!(kv.get(TENANT, "purge_me", b"k2", now_ms).is_none());
+    assert!(kv.get(0, TENANT, "purge_me", b"k1", now_ms).is_none());
+    assert!(kv.get(0, TENANT, "purge_me", b"k2", now_ms).is_none());
     assert_eq!(
-        kv.get(TENANT, "keep", b"k1", now_ms),
+        kv.get(0, TENANT, "keep", b"k1", now_ms),
         Some(b"v1".to_vec()),
         "sibling collection must survive"
     );
@@ -110,6 +113,7 @@ fn kv_engine_cross_tenant_isolation() {
     let mut kv = KvEngine::new(now_ms, 16, 0.75, 4, 64, 1000, 1024);
 
     kv.put(
+        0,
         1,
         "docs",
         b"k",
@@ -119,6 +123,7 @@ fn kv_engine_cross_tenant_isolation() {
         nodedb_types::Surrogate::ZERO,
     );
     kv.put(
+        0,
         2,
         "docs",
         b"k",
@@ -128,10 +133,10 @@ fn kv_engine_cross_tenant_isolation() {
         nodedb_types::Surrogate::ZERO,
     );
 
-    kv.purge_collection(1, "docs");
-    assert!(kv.get(1, "docs", b"k", now_ms).is_none());
+    kv.purge_collection(0, 1, "docs");
+    assert!(kv.get(0, 1, "docs", b"k", now_ms).is_none());
     assert_eq!(
-        kv.get(2, "docs", b"k", now_ms),
+        kv.get(0, 2, "docs", b"k", now_ms),
         Some(b"b".to_vec()),
         "tenant 2's same-named collection must survive"
     );

@@ -193,9 +193,18 @@ impl CoreLoop {
 
             MetaOp::RenameCollection {
                 tenant_id,
+                old_database_id,
+                new_database_id,
                 old_collection,
                 new_collection,
-            } => self.execute_rename_collection(task, *tenant_id, old_collection, new_collection),
+            } => self.execute_rename_collection(
+                task,
+                *tenant_id,
+                *old_database_id,
+                *new_database_id,
+                old_collection,
+                new_collection,
+            ),
         }
     }
 }

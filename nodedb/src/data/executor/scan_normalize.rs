@@ -29,12 +29,13 @@ impl CoreLoop {
     /// (aggregate, join, sort, filter) never need engine-specific code.
     pub fn scan_collection(
         &self,
+        did: u64,
         tid: u64,
         collection: &str,
         limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
         // 1. KV engine
-        let kv_docs = self.scan_kv(tid, collection, limit);
+        let kv_docs = self.scan_kv(did, tid, collection, limit);
         if !kv_docs.is_empty() {
             return Ok(kv_docs);
         }
@@ -67,6 +68,7 @@ impl CoreLoop {
     // (`drive_grace_build`).
     pub(in crate::data::executor) fn scan_collection_for_each<F>(
         &self,
+        did: u64,
         tid: u64,
         collection: &str,
         mut f: F,
@@ -81,6 +83,7 @@ impl CoreLoop {
         let mut found = false;
         self.kv_engine.scan_for_each(
             KvScanParams {
+                database_id: did,
                 tenant_id: tid,
                 collection,
                 cursor: &[],
@@ -135,9 +138,16 @@ impl CoreLoop {
 
     /// Scan KV engine entries → standard msgpack.
     /// Injects the `key` field directly into the msgpack map — no JSON roundtrip.
-    fn scan_kv(&self, tid: u64, collection: &str, limit: usize) -> Vec<(String, Vec<u8>)> {
+    fn scan_kv(
+        &self,
+        did: u64,
+        tid: u64,
+        collection: &str,
+        limit: usize,
+    ) -> Vec<(String, Vec<u8>)> {
         let now_ms = crate::engine::kv::current_ms();
         let (entries, _next_cursor) = self.kv_engine.scan(KvScanParams {
+            database_id: did,
             tenant_id: tid,
             collection,
             cursor: &[],
@@ -472,12 +482,12 @@ mod tests {
         core.sparse.put(tid, coll, "c", raw_c).unwrap();
 
         // Collect via `scan_collection` (the reference output).
-        let mut expected = core.scan_collection(tid, coll, usize::MAX).unwrap();
+        let mut expected = core.scan_collection(0, tid, coll, usize::MAX).unwrap();
         expected.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Collect via `scan_collection_for_each`.
         let mut actual: Vec<(String, Vec<u8>)> = Vec::new();
-        core.scan_collection_for_each(tid, coll, |id, bytes| {
+        core.scan_collection_for_each(0, tid, coll, |id, bytes| {
             actual.push((id.to_owned(), bytes.to_vec()));
             Ok(())
         })
@@ -519,17 +529,17 @@ mod tests {
         ))
         .unwrap();
         core.kv_engine
-            .put(tid, coll, b"a", &val, 0, now_ms, Surrogate::ZERO);
+            .put(0, tid, coll, b"a", &val, 0, now_ms, Surrogate::ZERO);
         core.kv_engine
-            .put(tid, coll, b"b", &val, 0, now_ms, Surrogate::ZERO);
+            .put(0, tid, coll, b"b", &val, 0, now_ms, Surrogate::ZERO);
         core.kv_engine
-            .put(tid, coll, b"c", &val, 0, now_ms, Surrogate::ZERO);
+            .put(0, tid, coll, b"c", &val, 0, now_ms, Surrogate::ZERO);
 
-        let mut expected = core.scan_collection(tid, coll, usize::MAX).unwrap();
+        let mut expected = core.scan_collection(0, tid, coll, usize::MAX).unwrap();
         expected.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut actual: Vec<(String, Vec<u8>)> = Vec::new();
-        core.scan_collection_for_each(tid, coll, |id, bytes| {
+        core.scan_collection_for_each(0, tid, coll, |id, bytes| {
             actual.push((id.to_owned(), bytes.to_vec()));
             Ok(())
         })
@@ -571,11 +581,11 @@ mod tests {
         core.sparse.put(tid, coll, "b", b"{\"v\":2}").unwrap();
 
         // Reference output — NOT sorted.
-        let expected = core.scan_collection(tid, coll, usize::MAX).unwrap();
+        let expected = core.scan_collection(0, tid, coll, usize::MAX).unwrap();
 
         // Streaming output — NOT sorted.
         let mut actual: Vec<(String, Vec<u8>)> = Vec::new();
-        core.scan_collection_for_each(tid, coll, |id, bytes| {
+        core.scan_collection_for_each(0, tid, coll, |id, bytes| {
             actual.push((id.to_owned(), bytes.to_vec()));
             Ok(())
         })
@@ -622,20 +632,20 @@ mod tests {
 
         // Insert in non-sorted order: "k3", "k1", "k4", "k2".
         core.kv_engine
-            .put(tid, coll, b"k3", &val, 0, now_ms, Surrogate::ZERO);
+            .put(0, tid, coll, b"k3", &val, 0, now_ms, Surrogate::ZERO);
         core.kv_engine
-            .put(tid, coll, b"k1", &val, 0, now_ms, Surrogate::ZERO);
+            .put(0, tid, coll, b"k1", &val, 0, now_ms, Surrogate::ZERO);
         core.kv_engine
-            .put(tid, coll, b"k4", &val, 0, now_ms, Surrogate::ZERO);
+            .put(0, tid, coll, b"k4", &val, 0, now_ms, Surrogate::ZERO);
         core.kv_engine
-            .put(tid, coll, b"k2", &val, 0, now_ms, Surrogate::ZERO);
+            .put(0, tid, coll, b"k2", &val, 0, now_ms, Surrogate::ZERO);
 
         // Reference output — NOT sorted.
-        let expected = core.scan_collection(tid, coll, usize::MAX).unwrap();
+        let expected = core.scan_collection(0, tid, coll, usize::MAX).unwrap();
 
         // Streaming output — NOT sorted.
         let mut actual: Vec<(String, Vec<u8>)> = Vec::new();
-        core.scan_collection_for_each(tid, coll, |id, bytes| {
+        core.scan_collection_for_each(0, tid, coll, |id, bytes| {
             actual.push((id.to_owned(), bytes.to_vec()));
             Ok(())
         })
@@ -688,7 +698,7 @@ mod tests {
         core.sparse.put(tid, coll, "b", b"{\"v\":2}").unwrap();
 
         let mut calls = 0usize;
-        let result = core.scan_collection_for_each(tid, coll, |_id, _bytes| {
+        let result = core.scan_collection_for_each(0, tid, coll, |_id, _bytes| {
             calls += 1;
             Err(crate::Error::Internal {
                 detail: "deliberate test error".into(),

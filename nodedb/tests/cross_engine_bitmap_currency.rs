@@ -358,7 +358,7 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
     );
 
     // Verify all 4 rows exist in the columnar collection (unfiltered).
-    let all_col = core.scan_collection(1, "metrics", 100).unwrap();
+    let all_col = core.scan_collection(0, 1, "metrics", 100).unwrap();
     assert_eq!(
         all_col.len(),
         4,

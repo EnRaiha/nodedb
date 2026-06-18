@@ -13,6 +13,7 @@ use crate::engine::kv::current_ms;
 
 /// Parameters for `INSERT ... ON CONFLICT (key) DO UPDATE SET ...` on KV.
 pub(in crate::data::executor) struct KvInsertOnConflictUpdateParams<'a> {
+    pub did: u64,
     pub tid: u64,
     pub collection: &'a str,
     pub key: &'a [u8],
@@ -23,9 +24,11 @@ pub(in crate::data::executor) struct KvInsertOnConflictUpdateParams<'a> {
 }
 
 impl CoreLoop {
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_get(
         &self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -43,7 +46,7 @@ impl CoreLoop {
                 // it as pre-clone (visible) — internal rows do not
                 // originate from user post-clone writes.
                 self.kv_engine
-                    .get_with_surrogate(tid, collection, key, now_ms)
+                    .get_with_surrogate(did, tid, collection, key, now_ms)
                     .and_then(|(value, surrogate)| {
                         let s = surrogate.as_u32();
                         if s != 0 && s > ceiling {
@@ -53,7 +56,7 @@ impl CoreLoop {
                         }
                     })
             }
-            None => self.kv_engine.get(tid, collection, key, now_ms),
+            None => self.kv_engine.get(did, tid, collection, key, now_ms),
         };
         match fetched {
             Some(value) => {
@@ -78,6 +81,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_put(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -103,7 +107,7 @@ impl CoreLoop {
             .unwrap_or_else(current_ms);
         let old = self
             .kv_engine
-            .put(tid, collection, key, value, ttl_ms, now_ms, surrogate);
+            .put(did, tid, collection, key, value, ttl_ms, now_ms, surrogate);
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }
@@ -134,6 +138,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_insert(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -153,7 +158,11 @@ impl CoreLoop {
         }
 
         let now_ms = current_ms();
-        if self.kv_engine.get(tid, collection, key, now_ms).is_some() {
+        if self
+            .kv_engine
+            .get(did, tid, collection, key, now_ms)
+            .is_some()
+        {
             let key_str = String::from_utf8_lossy(key);
             return self.response_error(
                 task,
@@ -169,7 +178,7 @@ impl CoreLoop {
         }
 
         self.kv_engine
-            .put(tid, collection, key, value, ttl_ms, now_ms, surrogate);
+            .put(did, tid, collection, key, value, ttl_ms, now_ms, surrogate);
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }
@@ -193,6 +202,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_insert_if_absent(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -212,13 +222,17 @@ impl CoreLoop {
         }
 
         let now_ms = current_ms();
-        if self.kv_engine.get(tid, collection, key, now_ms).is_some() {
+        if self
+            .kv_engine
+            .get(did, tid, collection, key, now_ms)
+            .is_some()
+        {
             // Silent skip — matches the strict/schemaless `if_absent` path.
             return self.response_ok(task);
         }
 
         self.kv_engine
-            .put(tid, collection, key, value, ttl_ms, now_ms, surrogate);
+            .put(did, tid, collection, key, value, ttl_ms, now_ms, surrogate);
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }
@@ -248,6 +262,7 @@ impl CoreLoop {
         params: KvInsertOnConflictUpdateParams<'_>,
     ) -> Response {
         let KvInsertOnConflictUpdateParams {
+            did,
             tid,
             collection,
             key,
@@ -268,7 +283,7 @@ impl CoreLoop {
         }
 
         let now_ms = current_ms();
-        let existing_bytes = self.kv_engine.get(tid, collection, key, now_ms);
+        let existing_bytes = self.kv_engine.get(did, tid, collection, key, now_ms);
 
         let stored_bytes: Vec<u8> = match &existing_bytes {
             None => value.to_vec(),
@@ -319,6 +334,7 @@ impl CoreLoop {
         };
 
         self.kv_engine.put(
+            did,
             tid,
             collection,
             key,
@@ -355,13 +371,14 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_delete(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         keys: &[Vec<u8>],
     ) -> Response {
         debug!(core = self.core_id, %collection, count = keys.len(), "kv delete");
         let now_ms = current_ms();
-        let count = self.kv_engine.delete(tid, collection, keys, now_ms);
+        let count = self.kv_engine.delete(did, tid, collection, keys, now_ms);
         if let Some(ref m) = self.metrics {
             m.record_kv_delete();
         }
@@ -395,11 +412,12 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_truncate(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
     ) -> Response {
         debug!(core = self.core_id, %collection, "kv truncate");
-        let count = self.kv_engine.truncate(tid, collection);
+        let count = self.kv_engine.truncate(did, tid, collection);
         match response_codec::encode_count("deleted", count) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(

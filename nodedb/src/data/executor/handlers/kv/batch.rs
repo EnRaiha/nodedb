@@ -14,13 +14,14 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_batch_get(
         &self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         keys: &[Vec<u8>],
     ) -> Response {
         debug!(core = self.core_id, %collection, count = keys.len(), "kv batch get");
         let now_ms = current_ms();
-        let results = self.kv_engine.batch_get(tid, collection, keys, now_ms);
+        let results = self.kv_engine.batch_get(did, tid, collection, keys, now_ms);
 
         let json_results: Vec<serde_json::Value> = results
             .into_iter()
@@ -46,6 +47,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_batch_put(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         entries: &[(Vec<u8>, Vec<u8>)],
@@ -58,7 +60,7 @@ impl CoreLoop {
             .unwrap_or_else(current_ms);
         let new_count = self
             .kv_engine
-            .batch_put(tid, collection, entries, ttl_ms, now_ms);
+            .batch_put(did, tid, collection, entries, ttl_ms, now_ms);
         match response_codec::encode_count("inserted", new_count) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(

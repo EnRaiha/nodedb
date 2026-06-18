@@ -237,7 +237,12 @@ impl CoreLoop {
         }
 
         // ── Streaming aggregation (per-shard collection scan) ──────────────
-        let docs = match self.scan_collection(tid, collection, scan_limit) {
+        let docs = match self.scan_collection(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            scan_limit,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 return self.response_error(

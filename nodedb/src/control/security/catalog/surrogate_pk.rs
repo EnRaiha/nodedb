@@ -666,8 +666,13 @@ mod tests {
             Some(Surrogate::new(7))
         );
         assert_eq!(
-            cat.get_pk_for_surrogate(DatabaseId::DEFAULT, default_tenant, "users", Surrogate::new(7))
-                .unwrap(),
+            cat.get_pk_for_surrogate(
+                DatabaseId::DEFAULT,
+                default_tenant,
+                "users",
+                Surrogate::new(7)
+            )
+            .unwrap(),
             Some(b"alice".to_vec())
         );
     }

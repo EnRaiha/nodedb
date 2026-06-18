@@ -35,7 +35,7 @@ fn aggregate_count_reads_plain_columnar_engine_rows() {
         }),
     );
 
-    let docs = ctx.core.scan_collection(1, "weather", 100).unwrap();
+    let docs = ctx.core.scan_collection(0, 1, "weather", 100).unwrap();
     assert_eq!(
         docs.len(),
         3,
@@ -188,7 +188,7 @@ fn columnar_insert_triggers_memtable_flush() {
     // All rows must be readable back — the segment flush must not lose data.
     let doc_count = ctx
         .core
-        .scan_collection(1, "large_col", 70_001)
+        .scan_collection(0, 1, "large_col", 70_001)
         .unwrap()
         .len();
     assert_eq!(

@@ -93,7 +93,11 @@ impl CoreLoop {
                     // Roll back all previous writes in reverse order.
                     // If rollback itself fails, the shard state is unknown —
                     // return RollbackFailed (never warn-and-continue).
-                    let rollback_error_code = match self.rollback_undo_log(tid, undo_log) {
+                    let rollback_error_code = match self.rollback_undo_log(
+                        crate::types::DatabaseId::DEFAULT.as_u64(),
+                        tid,
+                        undo_log,
+                    ) {
                         Ok(()) => error_code,
                         Err((entry_index, detail)) => {
                             error!(
@@ -134,7 +138,11 @@ impl CoreLoop {
                 "BALANCED constraint violated, rolling back {} operations",
                 undo_log.len()
             );
-            let rollback_error_code = match self.rollback_undo_log(tid, undo_log) {
+            let rollback_error_code = match self.rollback_undo_log(
+                crate::types::DatabaseId::DEFAULT.as_u64(),
+                tid,
+                undo_log,
+            ) {
                 Ok(()) => error_code,
                 Err((entry_index, detail)) => {
                     error!(

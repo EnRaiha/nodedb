@@ -149,7 +149,9 @@ impl CoreLoop {
         };
 
         let unique_join_id = join.task.request_id().as_u64();
+        let did = join.task.request.database_id.as_u64();
         let mut results = match self.drive_grace_build(
+            did,
             tid,
             left_collection,
             right_collection,
@@ -212,8 +214,10 @@ impl CoreLoop {
     ///   RIGHT/FULL unmatched build rows. The probe is never fully materialized.
     /// - **Crossed**: switch to a [`PartitionedSpiller`], stream the probe into
     ///   it, complete the join, and remove the per-join spill directory.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn drive_grace_build(
         &self,
+        did: u64,
         tid: u64,
         left_collection: &str,
         right_collection: &str,
@@ -246,6 +250,7 @@ impl CoreLoop {
         // total crosses `budget` (matching `scan_bytes_exceeded`: id + value
         // bytes, strict `>`).
         let build_source = RowSource::LocalScan {
+            database_id: did,
             tenant_id: tid,
             collection: right_collection.to_string(),
         };
@@ -315,7 +320,7 @@ impl CoreLoop {
                 // in-memory path: same build row set/order, same `probe_rows_into`
                 // emission, same global limit / index_matched accumulation; only
                 // WHEN each probe row is processed differs, never the order.
-                self.stream_probe_against_index(tid, left_collection, &docs, spec, budget)
+                self.stream_probe_against_index(did, tid, left_collection, &docs, spec, budget)
             }
             BuildState::Spilling(mut spiller) => {
                 // Stream the PROBE (left) side directly into the spiller — never
@@ -324,6 +329,7 @@ impl CoreLoop {
                 // shared cleanup tail.
                 let probe_result = (|| -> crate::Result<Vec<Vec<u8>>> {
                     let spill_probe_source = RowSource::LocalScan {
+                        database_id: did,
                         tenant_id: tid,
                         collection: left_collection.to_string(),
                     };
@@ -368,6 +374,7 @@ impl CoreLoop {
     /// matching the unlimited in-memory path.
     fn stream_probe_against_index(
         &self,
+        did: u64,
         tid: u64,
         left_collection: &str,
         build_docs: &[(String, Vec<u8>)],
@@ -417,6 +424,7 @@ impl CoreLoop {
         };
 
         let stream_probe_source = RowSource::LocalScan {
+            database_id: did,
             tenant_id: tid,
             collection: left_collection.to_string(),
         };

@@ -72,7 +72,12 @@ pub(super) fn execute_grouping_sets(
     // Scan documents once, collect them all into memory.
     // This is necessary because we need to run multiple passes (one per set).
     // Memory is bounded by `scan_limit` from query tuning.
-    let docs_result = core.scan_collection(tid, collection, scan_limit);
+    let docs_result = core.scan_collection(
+        task.request.database_id.as_u64(),
+        tid,
+        collection,
+        scan_limit,
+    );
     let owned_docs: Vec<Vec<u8>> = match docs_result {
         Ok(docs) => docs.into_iter().map(|(_, v)| v.to_vec()).collect(),
         Err(e) => {

@@ -21,6 +21,7 @@ impl KvEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn put(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         key: &[u8],
@@ -35,7 +36,7 @@ impl KvEngine {
             NO_EXPIRY
         };
 
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
 
         // Single-pass: check indexes + get old entry meta in one HashMap lookup.
         let has_indexes = self.indexes.get(&tkey).is_some_and(|idx| !idx.is_empty());
@@ -53,7 +54,7 @@ impl KvEngine {
 
         // Cancel old expiry (before mutating the table).
         if let Some(old_ms) = old_expire {
-            let composite = expiry_key(tenant_id, collection, key);
+            let composite = expiry_key(database_id, tenant_id, collection, key);
             self.expiry.cancel(&composite, old_ms);
         }
 
@@ -79,7 +80,7 @@ impl KvEngine {
 
         // Schedule new expiry.
         if expire_at != NO_EXPIRY {
-            let composite = expiry_key(tenant_id, collection, key);
+            let composite = expiry_key(database_id, tenant_id, collection, key);
             self.expiry.insert(composite, expire_at);
         }
 
@@ -122,12 +123,13 @@ impl KvEngine {
     /// DELETE: remove key(s). Returns count of keys actually deleted.
     pub fn delete(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         keys: &[Vec<u8>],
         now_ms: u64,
     ) -> usize {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         let table = match self.tables.get_mut(&tkey) {
             Some(t) => t,
             None => return 0,
@@ -142,7 +144,7 @@ impl KvEngine {
             if let Some(meta) = table.get_entry_meta(key)
                 && meta.has_ttl
             {
-                let composite = expiry_key(tenant_id, collection, key);
+                let composite = expiry_key(database_id, tenant_id, collection, key);
                 self.expiry.cancel(&composite, meta.expire_at_ms);
             }
 
@@ -182,13 +184,14 @@ impl KvEngine {
     /// Returns true if the key was found and TTL was set.
     pub fn expire(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         key: &[u8],
         ttl_ms: u64,
         now_ms: u64,
     ) -> bool {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         let table = match self.tables.get_mut(&tkey) {
             Some(t) => t,
             None => return false,
@@ -198,13 +201,13 @@ impl KvEngine {
         if let Some(meta) = table.get_entry_meta(key)
             && meta.has_ttl
         {
-            let composite = expiry_key(tenant_id, collection, key);
+            let composite = expiry_key(database_id, tenant_id, collection, key);
             self.expiry.cancel(&composite, meta.expire_at_ms);
         }
 
         let expire_at = now_ms + ttl_ms;
         if table.set_expire(key, expire_at) {
-            let composite = expiry_key(tenant_id, collection, key);
+            let composite = expiry_key(database_id, tenant_id, collection, key);
             self.expiry.insert(composite, expire_at);
             true
         } else {
@@ -213,8 +216,14 @@ impl KvEngine {
     }
 
     /// PERSIST: remove TTL from a key. Returns true if the key was found.
-    pub fn persist(&mut self, tenant_id: u64, collection: &str, key: &[u8]) -> bool {
-        let tkey = table_key(tenant_id, collection);
+    pub fn persist(
+        &mut self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        key: &[u8],
+    ) -> bool {
+        let tkey = table_key(database_id, tenant_id, collection);
         let table = match self.tables.get_mut(&tkey) {
             Some(t) => t,
             None => return false,
@@ -223,7 +232,7 @@ impl KvEngine {
         if let Some(meta) = table.get_entry_meta(key)
             && meta.has_ttl
         {
-            let composite = expiry_key(tenant_id, collection, key);
+            let composite = expiry_key(database_id, tenant_id, collection, key);
             self.expiry.cancel(&composite, meta.expire_at_ms);
         }
 

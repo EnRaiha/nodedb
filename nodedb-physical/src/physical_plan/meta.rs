@@ -386,6 +386,8 @@ pub enum MetaOp {
     /// (e.g. `"2/orders"` for database 2, collection `orders`).
     RenameCollection {
         tenant_id: u64,
+        old_database_id: u64,
+        new_database_id: u64,
         old_collection: String,
         new_collection: String,
     },

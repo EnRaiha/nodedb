@@ -135,6 +135,7 @@ impl CoreLoop {
     /// and requires a restart to restore consistency via WAL replay.
     pub(super) fn rollback_undo_log(
         &mut self,
+        did: u64,
         tid: u64,
         undo_log: Vec<UndoEntry>,
     ) -> Result<(), (usize, String)> {
@@ -144,7 +145,7 @@ impl CoreLoop {
             // diagnostics (makes it easier to correlate with the sub-plan that
             // produced this undo entry).
             let original_idx = total.saturating_sub(1 + rev_idx);
-            self.apply_undo_entry(tid, original_idx, entry)?;
+            self.apply_undo_entry(did, tid, original_idx, entry)?;
         }
         Ok(())
     }
@@ -154,6 +155,7 @@ impl CoreLoop {
     /// state is now partially rolled back and must not serve writes.
     fn apply_undo_entry(
         &mut self,
+        did: u64,
         tid: u64,
         entry_index: usize,
         entry: UndoEntry,
@@ -172,7 +174,7 @@ impl CoreLoop {
             | UndoEntry::KvDelete { .. }
             | UndoEntry::KvBatchPut { .. }
             | UndoEntry::KvTransfer { .. }
-            | UndoEntry::KvTransferItem { .. } => self.apply_undo_kv(tid, entry_index, entry),
+            | UndoEntry::KvTransferItem { .. } => self.apply_undo_kv(did, tid, entry_index, entry),
             UndoEntry::ColumnarInsert { .. } => self.apply_undo_columnar(entry_index, entry),
             UndoEntry::TimeseriesIngest { .. } => self.apply_undo_timeseries(entry_index, entry),
         }

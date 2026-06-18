@@ -173,7 +173,11 @@ impl CoreLoop {
             .retain(|(t, c, _), _| !(*t == tid && c == &coll));
 
         // KV engine: drop this collection's hash table + indexes.
-        let kv_removed = self.kv_engine.purge_collection(tenant_id, collection);
+        let kv_removed = self.kv_engine.purge_collection(
+            task.request.database_id.as_u64(),
+            tenant_id,
+            collection,
+        );
 
         // CRDT engine: clear rows for this collection in the tenant state.
         let crdt_rows_removed = match self.crdt_engines.get_mut(&tid) {

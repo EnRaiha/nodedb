@@ -14,6 +14,7 @@ use super::engine_helpers::{parse_expiry_key, table_key};
 /// tombstones and CDC/keyspace notification events.
 #[derive(Debug, Clone)]
 pub struct ExpiredKey {
+    pub database_id: u64,
     pub tenant_id: u64,
     pub collection: String,
     pub key: Vec<u8>,
@@ -58,11 +59,12 @@ impl KvEngine {
         let mut reaped = Vec::new();
 
         for (composite_key, expire_at_ms) in &batch.expired {
-            if let Some((tid, collection, key)) = parse_expiry_key(composite_key)
-                && let Some(table) = self.tables.get_mut(&table_key(tid, &collection))
+            if let Some((did, tid, collection, key)) = parse_expiry_key(composite_key)
+                && let Some(table) = self.tables.get_mut(&table_key(did, tid, &collection))
                 && table.reap_expired(&key, *expire_at_ms)
             {
                 reaped.push(ExpiredKey {
+                    database_id: did,
                     tenant_id: tid,
                     collection,
                     key,
@@ -88,8 +90,8 @@ impl KvEngine {
     // -----------------------------------------------------------------------
 
     /// Truncate: delete all entries in a KV collection. Returns count deleted.
-    pub fn truncate(&mut self, tenant_id: u64, collection: &str) -> usize {
-        let tkey = table_key(tenant_id, collection);
+    pub fn truncate(&mut self, database_id: u64, tenant_id: u64, collection: &str) -> usize {
+        let tkey = table_key(database_id, tenant_id, collection);
         let count = self.tables.get(&tkey).map(|t| t.len()).unwrap_or(0);
 
         // Remove the hash table entirely.
@@ -117,16 +119,16 @@ impl KvEngine {
     }
 
     /// Entry count for a specific collection.
-    pub fn collection_len(&self, tenant_id: u64, collection: &str) -> usize {
-        let tkey = table_key(tenant_id, collection);
+    pub fn collection_len(&self, database_id: u64, tenant_id: u64, collection: &str) -> usize {
+        let tkey = table_key(database_id, tenant_id, collection);
         self.tables.get(&tkey).map(|t| t.len()).unwrap_or(0)
     }
 
     /// Approximate memory usage for a specific collection. Sums the
     /// hash table's own `mem_usage()` estimate; returns 0 if no table
     /// exists for `(tenant_id, collection)`.
-    pub fn collection_mem_usage(&self, tenant_id: u64, collection: &str) -> u64 {
-        let tkey = table_key(tenant_id, collection);
+    pub fn collection_mem_usage(&self, database_id: u64, tenant_id: u64, collection: &str) -> u64 {
+        let tkey = table_key(database_id, tenant_id, collection);
         self.tables
             .get(&tkey)
             .map(|t| t.mem_usage() as u64)

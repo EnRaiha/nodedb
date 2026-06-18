@@ -15,10 +15,13 @@ impl CoreLoop {
     /// Handle `MetaOp::RenameCollection`: re-key all documents and secondary
     /// indexes from `old_collection` to `new_collection` for `tenant_id` in
     /// every engine that uses db-qualified collection names for keying.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_rename_collection(
         &mut self,
         task: &ExecutionTask,
         tenant_id: u64,
+        old_database_id: u64,
+        new_database_id: u64,
         old_collection: &str,
         new_collection: &str,
     ) -> Response {
@@ -38,8 +41,13 @@ impl CoreLoop {
         }
 
         // KV engine.
-        self.kv_engine
-            .rename_collection(tenant_id, old_collection, new_collection);
+        self.kv_engine.rename_collection(
+            old_database_id,
+            new_database_id,
+            tenant_id,
+            old_collection,
+            new_collection,
+        );
 
         self.response_ok(task)
     }

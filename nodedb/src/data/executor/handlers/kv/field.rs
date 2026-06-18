@@ -14,6 +14,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_field_get(
         &self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -23,7 +24,7 @@ impl CoreLoop {
         let now_ms = current_ms();
 
         // Get the full value.
-        let Some(value) = self.kv_engine.get(tid, collection, key, now_ms) else {
+        let Some(value) = self.kv_engine.get(did, tid, collection, key, now_ms) else {
             return self.response_error(task, ErrorCode::NotFound);
         };
 
@@ -61,6 +62,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_field_set(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -70,7 +72,7 @@ impl CoreLoop {
         let now_ms = current_ms();
 
         // Read current value.
-        let current = self.kv_engine.get(tid, collection, key, now_ms);
+        let current = self.kv_engine.get(did, tid, collection, key, now_ms);
 
         // Decode current value as standard msgpack map.
         let mut doc: serde_json::Map<String, serde_json::Value> = current
@@ -123,6 +125,7 @@ impl CoreLoop {
         };
 
         self.kv_engine.put(
+            did,
             tid,
             collection,
             key,

@@ -32,8 +32,12 @@ impl CoreLoop {
         // KV engine: sum slot-value byte lengths in the live hash
         // table for this (tenant, collection). Approximate — includes
         // the per-entry overhead.
-        total_bytes =
-            total_bytes.saturating_add(self.kv_engine.collection_mem_usage(tenant_id, collection));
+        let database_id = task.request.database_id.as_u64();
+        total_bytes = total_bytes.saturating_add(self.kv_engine.collection_mem_usage(
+            database_id,
+            tenant_id,
+            collection,
+        ));
 
         // Columnar engine: flushed segments have their encoded
         // in-memory byte buffers; in-memory memtable is treated as 0

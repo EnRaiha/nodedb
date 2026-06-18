@@ -207,6 +207,11 @@ impl CoreLoop {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
+        // The snapshot stores the db-qualified collection name (e.g. "2/orders"
+        // for database 2; bare name for the default database). Recover the
+        // database id from that prefix so the restored hash key matches the one
+        // live reads compute from the same (database_id, qualified collection).
+        let database_id = database_id_from_qualified(collection);
         for (key, value, expire_at) in entries {
             let ttl_ms = if expire_at > now_ms {
                 expire_at - now_ms
@@ -216,6 +221,7 @@ impl CoreLoop {
                 continue; // Already expired.
             };
             self.kv_engine.put(
+                database_id,
                 tenant_id,
                 collection,
                 &key,
@@ -259,5 +265,17 @@ impl CoreLoop {
             }
         }
         Ok(())
+    }
+}
+
+/// Recover the database id encoded in a db-qualified collection name.
+///
+/// Non-default databases qualify their collections as `"{database_id}/{name}"`;
+/// the default database uses the bare name. A bare name (no leading numeric
+/// segment before a `/`) maps to `DatabaseId::DEFAULT` (0).
+fn database_id_from_qualified(collection: &str) -> u64 {
+    match collection.split_once('/') {
+        Some((prefix, _)) => prefix.parse::<u64>().unwrap_or(0),
+        None => 0,
     }
 }

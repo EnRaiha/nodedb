@@ -52,9 +52,9 @@ fn single_core_cross_type_hash_join() {
     }
 
     // Verify scan_collection works for both.
-    let docs = ctx.core.scan_collection(1, "docs", 100).unwrap();
+    let docs = ctx.core.scan_collection(0, 1, "docs", 100).unwrap();
     assert_eq!(docs.len(), 3, "docs: expected 3, got {}", docs.len());
-    let prefs = ctx.core.scan_collection(1, "prefs", 100).unwrap();
+    let prefs = ctx.core.scan_collection(0, 1, "prefs", 100).unwrap();
     assert_eq!(prefs.len(), 2, "prefs: expected 2, got {}", prefs.len());
 
     // Execute hash join: docs INNER JOIN prefs ON docs.id = prefs.key

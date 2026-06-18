@@ -17,6 +17,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_materialize_scan(
         &self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         cursor: &[u8],
@@ -31,6 +32,7 @@ impl CoreLoop {
 
         let now_ms = current_ms();
         let (entries, next_cursor) = self.kv_engine.scan(KvScanParams {
+            database_id: did,
             tenant_id: tid,
             collection,
             cursor,

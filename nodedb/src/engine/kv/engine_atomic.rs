@@ -37,8 +37,10 @@ impl KvEngine {
     /// - On i64 overflow: returns `Overflow` (never wraps silently).
     /// - TTL behavior: if `ttl_ms > 0` and key is new, sets TTL.
     ///   If key exists and `ttl_ms > 0`, resets TTL. If `ttl_ms == 0`, preserves.
+    #[allow(clippy::too_many_arguments)]
     pub fn incr(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         key: &[u8],
@@ -46,7 +48,7 @@ impl KvEngine {
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<i64, AtomicError> {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         let table = self.ensure_table(tkey, tenant_id, collection);
 
         let current = table.get(key, now_ms).map(|v| v.to_vec());
@@ -87,6 +89,7 @@ impl KvEngine {
             zerompk::to_msgpack_vec(&new_i64).expect("i64 always serializes")
         };
         self.atomic_put(
+            database_id,
             tenant_id,
             collection,
             tkey,
@@ -108,13 +111,14 @@ impl KvEngine {
     ///   but NaN/Infinity results are rejected as `Overflow`.
     pub fn incr_float(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         key: &[u8],
         delta: f64,
         now_ms: u64,
     ) -> Result<f64, AtomicError> {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         let table = self.ensure_table(tkey, tenant_id, collection);
 
         let current = table.get(key, now_ms).map(|v| v.to_vec());
@@ -131,6 +135,7 @@ impl KvEngine {
         let new_bytes = zerompk::to_msgpack_vec(&new_f64).expect("f64 always serializes");
         // incr_float always preserves existing TTL (ttl_ms = 0).
         self.atomic_put(
+            database_id,
             tenant_id,
             collection,
             tkey,
@@ -149,8 +154,10 @@ impl KvEngine {
     /// If current value equals `expected`, sets to `new_value` and returns success.
     /// If current value differs, returns the actual current value.
     /// If key doesn't exist and `expected` is empty, creates the key (create-if-not-exists).
+    #[allow(clippy::too_many_arguments)]
     pub fn cas(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         key: &[u8],
@@ -158,7 +165,7 @@ impl KvEngine {
         new_value: &[u8],
         now_ms: u64,
     ) -> CasResult {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         let table = self.ensure_table(tkey, tenant_id, collection);
 
         let current = table.get(key, now_ms).map(|v| v.to_vec());
@@ -213,6 +220,7 @@ impl KvEngine {
                 new_value.to_vec()
             };
             self.atomic_put(
+                database_id,
                 tenant_id,
                 collection,
                 tkey,
@@ -240,13 +248,14 @@ impl KvEngine {
     /// Preserves existing TTL.
     pub fn getset(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         key: &[u8],
         new_value: &[u8],
         now_ms: u64,
     ) -> Option<Vec<u8>> {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         let table = self.ensure_table(tkey, tenant_id, collection);
         let old = table.get(key, now_ms).map(|v| v.to_vec());
 
@@ -279,6 +288,7 @@ impl KvEngine {
 
         // GetSet preserves existing TTL (ttl_ms = 0).
         self.atomic_put(
+            database_id,
             tenant_id,
             collection,
             tkey,
@@ -318,6 +328,7 @@ impl KvEngine {
     #[allow(clippy::too_many_arguments)]
     fn atomic_put(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         tkey: u64,
@@ -350,7 +361,7 @@ impl KvEngine {
         if let Some(ref meta) = old_meta
             && meta.has_ttl
         {
-            let composite = expiry_key(tenant_id, collection, key);
+            let composite = expiry_key(database_id, tenant_id, collection, key);
             self.expiry.cancel(&composite, meta.expire_at_ms);
         }
 
@@ -374,7 +385,7 @@ impl KvEngine {
 
         // Schedule new expiry if needed.
         if expire_at != NO_EXPIRY {
-            let composite = expiry_key(tenant_id, collection, key);
+            let composite = expiry_key(database_id, tenant_id, collection, key);
             self.expiry.insert(composite, expire_at);
         }
 
@@ -481,23 +492,25 @@ mod tests {
     #[test]
     fn incr_new_key() {
         let mut engine = make_engine();
-        let result = engine.incr(1, "counters", b"hits", 10, 0, 1000);
+        let result = engine.incr(0, 1, "counters", b"hits", 10, 0, 1000);
         assert_eq!(result.unwrap(), 10);
     }
 
     #[test]
     fn incr_existing_key() {
         let mut engine = make_engine();
-        engine.incr(1, "counters", b"hits", 10, 0, 1000).unwrap();
-        let result = engine.incr(1, "counters", b"hits", 5, 0, 1000);
+        engine.incr(0, 1, "counters", b"hits", 10, 0, 1000).unwrap();
+        let result = engine.incr(0, 1, "counters", b"hits", 5, 0, 1000);
         assert_eq!(result.unwrap(), 15);
     }
 
     #[test]
     fn incr_negative_delta() {
         let mut engine = make_engine();
-        engine.incr(1, "counters", b"gold", 100, 0, 1000).unwrap();
-        let result = engine.incr(1, "counters", b"gold", -30, 0, 1000);
+        engine
+            .incr(0, 1, "counters", b"gold", 100, 0, 1000)
+            .unwrap();
+        let result = engine.incr(0, 1, "counters", b"gold", -30, 0, 1000);
         assert_eq!(result.unwrap(), 70);
     }
 
@@ -506,8 +519,8 @@ mod tests {
         let mut engine = make_engine();
         // Set to MAX.
         let bytes = zerompk::to_msgpack_vec(&i64::MAX).unwrap();
-        engine.put(1, "counters", b"max", &bytes, 0, 1000, Surrogate::ZERO);
-        let result = engine.incr(1, "counters", b"max", 1, 0, 1000);
+        engine.put(0, 1, "counters", b"max", &bytes, 0, 1000, Surrogate::ZERO);
+        let result = engine.incr(0, 1, "counters", b"max", 1, 0, 1000);
         assert!(matches!(result, Err(AtomicError::Overflow)));
     }
 
@@ -515,8 +528,8 @@ mod tests {
     fn incr_type_mismatch() {
         let mut engine = make_engine();
         let bytes = zerompk::to_msgpack_vec(&"hello").unwrap();
-        engine.put(1, "counters", b"str", &bytes, 0, 1000, Surrogate::ZERO);
-        let result = engine.incr(1, "counters", b"str", 1, 0, 1000);
+        engine.put(0, 1, "counters", b"str", &bytes, 0, 1000, Surrogate::ZERO);
+        let result = engine.incr(0, 1, "counters", b"str", 1, 0, 1000);
         assert!(matches!(result, Err(AtomicError::TypeMismatch { .. })));
     }
 
@@ -524,9 +537,9 @@ mod tests {
     fn incr_with_ttl_new_key() {
         let mut engine = make_engine();
         engine
-            .incr(1, "counters", b"daily", 1, 86_400_000, 1000)
+            .incr(0, 1, "counters", b"daily", 1, 86_400_000, 1000)
             .unwrap();
-        let ttl = engine.get_ttl_ms(1, "counters", b"daily", 1000);
+        let ttl = engine.get_ttl_ms(0, 1, "counters", b"daily", 1000);
         assert!(ttl.is_some());
         assert!(ttl.unwrap() > 0);
     }
@@ -536,10 +549,19 @@ mod tests {
         let mut engine = make_engine();
         // Set key with TTL.
         let bytes = zerompk::to_msgpack_vec(&50i64).unwrap();
-        engine.put(1, "counters", b"temp", &bytes, 5000, 1000, Surrogate::ZERO);
+        engine.put(
+            0,
+            1,
+            "counters",
+            b"temp",
+            &bytes,
+            5000,
+            1000,
+            Surrogate::ZERO,
+        );
         // Incr with ttl_ms=0 should preserve existing TTL.
-        engine.incr(1, "counters", b"temp", 10, 0, 1000).unwrap();
-        let ttl = engine.get_ttl_ms(1, "counters", b"temp", 1000);
+        engine.incr(0, 1, "counters", b"temp", 10, 0, 1000).unwrap();
+        let ttl = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
         assert!(ttl.is_some());
         assert!(ttl.unwrap() > 0);
     }
@@ -547,15 +569,17 @@ mod tests {
     #[test]
     fn incr_float_new_key() {
         let mut engine = make_engine();
-        let result = engine.incr_float(1, "scores", b"dmg", 3.125, 1000);
+        let result = engine.incr_float(0, 1, "scores", b"dmg", 3.125, 1000);
         assert!((result.unwrap() - 3.125).abs() < f64::EPSILON);
     }
 
     #[test]
     fn incr_float_existing() {
         let mut engine = make_engine();
-        engine.incr_float(1, "scores", b"dmg", 3.0, 1000).unwrap();
-        let result = engine.incr_float(1, "scores", b"dmg", 1.5, 1000);
+        engine
+            .incr_float(0, 1, "scores", b"dmg", 3.0, 1000)
+            .unwrap();
+        let result = engine.incr_float(0, 1, "scores", b"dmg", 1.5, 1000);
         assert!((result.unwrap() - 4.5).abs() < f64::EPSILON);
     }
 
@@ -563,64 +587,73 @@ mod tests {
     fn incr_float_infinity_rejected() {
         let mut engine = make_engine();
         let bytes = zerompk::to_msgpack_vec(&f64::MAX).unwrap();
-        engine.put(1, "scores", b"big", &bytes, 0, 1000, Surrogate::ZERO);
-        let result = engine.incr_float(1, "scores", b"big", f64::MAX, 1000);
+        engine.put(0, 1, "scores", b"big", &bytes, 0, 1000, Surrogate::ZERO);
+        let result = engine.incr_float(0, 1, "scores", b"big", f64::MAX, 1000);
         assert!(matches!(result, Err(AtomicError::Overflow)));
     }
 
     #[test]
     fn cas_create_if_not_exists() {
         let mut engine = make_engine();
-        let result = engine.cas(1, "state", b"player1", b"", b"idle", 1000);
+        let result = engine.cas(0, 1, "state", b"player1", b"", b"idle", 1000);
         assert!(result.success);
         assert!(result.current_value.is_none());
         // Verify key was created.
-        let val = engine.get(1, "state", b"player1", 1000);
+        let val = engine.get(0, 1, "state", b"player1", 1000);
         assert_eq!(val.as_deref(), Some(b"idle".as_slice()));
     }
 
     #[test]
     fn cas_success() {
         let mut engine = make_engine();
-        engine.put(1, "state", b"p1", b"idle", 0, 1000, Surrogate::ZERO);
-        let result = engine.cas(1, "state", b"p1", b"idle", b"in_match", 1000);
+        engine.put(0, 1, "state", b"p1", b"idle", 0, 1000, Surrogate::ZERO);
+        let result = engine.cas(0, 1, "state", b"p1", b"idle", b"in_match", 1000);
         assert!(result.success);
         assert_eq!(result.current_value.as_deref(), Some(b"idle".as_slice()));
-        let val = engine.get(1, "state", b"p1", 1000);
+        let val = engine.get(0, 1, "state", b"p1", 1000);
         assert_eq!(val.as_deref(), Some(b"in_match".as_slice()));
     }
 
     #[test]
     fn cas_failure() {
         let mut engine = make_engine();
-        engine.put(1, "state", b"p1", b"fighting", 0, 1000, Surrogate::ZERO);
-        let result = engine.cas(1, "state", b"p1", b"idle", b"in_match", 1000);
+        engine.put(0, 1, "state", b"p1", b"fighting", 0, 1000, Surrogate::ZERO);
+        let result = engine.cas(0, 1, "state", b"p1", b"idle", b"in_match", 1000);
         assert!(!result.success);
         assert_eq!(
             result.current_value.as_deref(),
             Some(b"fighting".as_slice())
         );
         // Value unchanged.
-        let val = engine.get(1, "state", b"p1", 1000);
+        let val = engine.get(0, 1, "state", b"p1", 1000);
         assert_eq!(val.as_deref(), Some(b"fighting".as_slice()));
     }
 
     #[test]
     fn getset_new_key() {
         let mut engine = make_engine();
-        let old = engine.getset(1, "session", b"tok", b"new-token", 1000);
+        let old = engine.getset(0, 1, "session", b"tok", b"new-token", 1000);
         assert!(old.is_none());
-        let val = engine.get(1, "session", b"tok", 1000);
+        let val = engine.get(0, 1, "session", b"tok", 1000);
         assert_eq!(val.as_deref(), Some(b"new-token".as_slice()));
     }
 
     #[test]
     fn getset_existing_key() {
         let mut engine = make_engine();
-        engine.put(1, "session", b"tok", b"old-token", 0, 1000, Surrogate::ZERO);
-        let old = engine.getset(1, "session", b"tok", b"new-token", 1000);
+        engine.put(
+            0,
+            1,
+            "session",
+            b"tok",
+            b"old-token",
+            0,
+            1000,
+            Surrogate::ZERO,
+        );
+        let old = engine.getset(0, 1, "session", b"tok", b"new-token", 1000);
         assert_eq!(old.as_deref(), Some(b"old-token".as_slice()));
-        let val = engine.get(1, "session", b"tok", 1000);
+        let val = engine.get(0, 1, "session", b"tok", 1000);
         assert_eq!(val.as_deref(), Some(b"new-token".as_slice()));
     }
 }

@@ -256,6 +256,7 @@ impl CoreLoop {
 
     pub(super) fn apply_undo_kv(
         &mut self,
+        did: u64,
         tid: u64,
         _entry_index: usize,
         entry: UndoEntry,
@@ -269,6 +270,7 @@ impl CoreLoop {
                 let now_ms = current_ms();
                 if let Some(old) = prior_value {
                     self.kv_engine.put(
+                        did,
                         tid,
                         &collection,
                         &key,
@@ -278,8 +280,13 @@ impl CoreLoop {
                         nodedb_types::Surrogate::ZERO,
                     );
                 } else {
-                    self.kv_engine
-                        .delete(tid, &collection, std::slice::from_ref(&key), now_ms);
+                    self.kv_engine.delete(
+                        did,
+                        tid,
+                        &collection,
+                        std::slice::from_ref(&key),
+                        now_ms,
+                    );
                 }
                 Ok(())
             }
@@ -290,6 +297,7 @@ impl CoreLoop {
             } => {
                 let now_ms = current_ms();
                 self.kv_engine.put(
+                    did,
                     tid,
                     &collection,
                     &key,
@@ -308,6 +316,7 @@ impl CoreLoop {
                 for (key, prior_value) in entries {
                     if let Some(old) = prior_value {
                         self.kv_engine.put(
+                            did,
                             tid,
                             &collection,
                             &key,
@@ -317,7 +326,7 @@ impl CoreLoop {
                             nodedb_types::Surrogate::ZERO,
                         );
                     } else {
-                        self.kv_engine.delete(tid, &collection, &[key], now_ms);
+                        self.kv_engine.delete(did, tid, &collection, &[key], now_ms);
                     }
                 }
                 Ok(())
@@ -331,6 +340,7 @@ impl CoreLoop {
             } => {
                 let now_ms = current_ms();
                 self.kv_engine.put(
+                    did,
                     tid,
                     &collection,
                     &source_key,
@@ -341,6 +351,7 @@ impl CoreLoop {
                 );
                 if let Some(old) = dest_prior {
                     self.kv_engine.put(
+                        did,
                         tid,
                         &collection,
                         &dest_key,
@@ -350,7 +361,8 @@ impl CoreLoop {
                         nodedb_types::Surrogate::ZERO,
                     );
                 } else {
-                    self.kv_engine.delete(tid, &collection, &[dest_key], now_ms);
+                    self.kv_engine
+                        .delete(did, tid, &collection, &[dest_key], now_ms);
                 }
                 Ok(())
             }
@@ -371,6 +383,7 @@ impl CoreLoop {
                 // exist; `dest_prior` is None when the dest key was a new insert
                 // and Some(old) when it overwrote an existing row.
                 self.kv_engine.put(
+                    did,
                     tid,
                     &source_collection,
                     &item_key,
@@ -382,6 +395,7 @@ impl CoreLoop {
                 // Undo the dest write.
                 if let Some(old) = dest_prior {
                     self.kv_engine.put(
+                        did,
                         tid,
                         &dest_collection,
                         &dest_key,
@@ -392,7 +406,7 @@ impl CoreLoop {
                     );
                 } else {
                     self.kv_engine
-                        .delete(tid, &dest_collection, &[dest_key], now_ms);
+                        .delete(did, tid, &dest_collection, &[dest_key], now_ms);
                 }
                 Ok(())
             }

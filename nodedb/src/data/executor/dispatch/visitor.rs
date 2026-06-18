@@ -75,7 +75,8 @@ impl<'a, 'b> PhysicalTaskVisitor for DataPlaneVisitor<'a, 'b> {
     }
 
     fn kv(&mut self, op: &KvOp) -> Result<Response, Self::Error> {
-        Ok(self.core_loop.dispatch_kv(self.task, self.tid, op))
+        let did = self.task.request.database_id.as_u64();
+        Ok(self.core_loop.dispatch_kv(self.task, did, self.tid, op))
     }
 
     fn cluster_array(&mut self, _op: &ClusterArrayOp) -> Result<Response, Self::Error> {

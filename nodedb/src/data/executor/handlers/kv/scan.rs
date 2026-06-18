@@ -13,6 +13,7 @@ use crate::engine::kv::current_ms;
 
 /// Parameters for the KV SCAN handler.
 pub(in crate::data::executor) struct KvScanHandlerParams<'a> {
+    pub did: u64,
     pub tid: u64,
     pub collection: &'a str,
     pub cursor: &'a [u8],
@@ -30,6 +31,7 @@ impl CoreLoop {
         params: KvScanHandlerParams<'_>,
     ) -> Response {
         let KvScanHandlerParams {
+            did,
             tid,
             collection,
             cursor,
@@ -69,6 +71,7 @@ impl CoreLoop {
         // Try to extract a single equality filter for index pushdown.
         let (filter_field, filter_value) = extract_eq_filter(filters);
         let (entries, _next_cursor) = self.kv_engine.scan(KvScanParams {
+            database_id: did,
             tenant_id: tid,
             collection,
             cursor,

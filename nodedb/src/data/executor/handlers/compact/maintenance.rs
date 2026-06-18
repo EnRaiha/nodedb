@@ -105,6 +105,7 @@ impl CoreLoop {
                 for ek in &expired_keys {
                     info!(
                         target: "nodedb::kv::expired",
+                        database_id = ek.database_id,
                         tenant_id = ek.tenant_id,
                         collection = %ek.collection,
                         key_len = ek.key.len(),

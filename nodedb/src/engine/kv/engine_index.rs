@@ -15,8 +15,10 @@ impl KvEngine {
     ///
     /// **Note**: backfill scans all entries synchronously. For large collections
     /// (> 10k entries), consider `backfill=false` and rebuilding offline.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_index(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field: &str,
@@ -24,7 +26,7 @@ impl KvEngine {
         backfill: bool,
         now_ms: u64,
     ) -> usize {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         let idx_set = self.indexes.entry(tkey).or_default();
 
         if !idx_set.add_index(field, field_position) {
@@ -78,8 +80,14 @@ impl KvEngine {
     /// Remove a secondary index on a field.
     ///
     /// Returns the number of index entries that were dropped.
-    pub fn drop_index(&mut self, tenant_id: u64, collection: &str, field: &str) -> usize {
-        let tkey = table_key(tenant_id, collection);
+    pub fn drop_index(
+        &mut self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        field: &str,
+    ) -> usize {
+        let tkey = table_key(database_id, tenant_id, collection);
         let idx_set = match self.indexes.get_mut(&tkey) {
             Some(s) => s,
             None => return 0,
@@ -96,12 +104,13 @@ impl KvEngine {
     /// Returns empty if the field is not indexed.
     pub fn index_lookup_eq(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field: &str,
         value: &[u8],
     ) -> Vec<Vec<u8>> {
-        let tkey = table_key(tenant_id, collection);
+        let tkey = table_key(database_id, tenant_id, collection);
         self.indexes
             .get(&tkey)
             .map(|idx| {
@@ -114,14 +123,14 @@ impl KvEngine {
     }
 
     /// Check if a collection has any secondary indexes.
-    pub fn has_indexes(&self, tenant_id: u64, collection: &str) -> bool {
-        let tkey = table_key(tenant_id, collection);
+    pub fn has_indexes(&self, database_id: u64, tenant_id: u64, collection: &str) -> bool {
+        let tkey = table_key(database_id, tenant_id, collection);
         self.indexes.get(&tkey).is_some_and(|s| !s.is_empty())
     }
 
     /// Get the write amplification ratio for a collection.
-    pub fn write_amp_ratio(&self, tenant_id: u64, collection: &str) -> f64 {
-        let tkey = table_key(tenant_id, collection);
+    pub fn write_amp_ratio(&self, database_id: u64, tenant_id: u64, collection: &str) -> f64 {
+        let tkey = table_key(database_id, tenant_id, collection);
         self.indexes
             .get(&tkey)
             .map(|s| s.write_amp_ratio())
@@ -129,8 +138,8 @@ impl KvEngine {
     }
 
     /// Get the number of secondary indexes for a collection.
-    pub fn index_count(&self, tenant_id: u64, collection: &str) -> usize {
-        let tkey = table_key(tenant_id, collection);
+    pub fn index_count(&self, database_id: u64, tenant_id: u64, collection: &str) -> usize {
+        let tkey = table_key(database_id, tenant_id, collection);
         self.indexes
             .get(&tkey)
             .map(|s| s.index_count())

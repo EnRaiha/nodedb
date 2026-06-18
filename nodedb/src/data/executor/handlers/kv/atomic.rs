@@ -12,9 +12,11 @@ use crate::engine::kv::AtomicError;
 use crate::engine::kv::current_ms;
 
 impl CoreLoop {
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_incr(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -33,7 +35,7 @@ impl CoreLoop {
             .unwrap_or_else(current_ms);
         match self
             .kv_engine
-            .incr(tid, collection, key, delta, ttl_ms, now_ms)
+            .incr(did, tid, collection, key, delta, ttl_ms, now_ms)
         {
             Ok(new_value) => {
                 if let Some(ref m) = self.metrics {
@@ -78,6 +80,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_incr_float(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -95,7 +98,7 @@ impl CoreLoop {
             .unwrap_or_else(current_ms);
         match self
             .kv_engine
-            .incr_float(tid, collection, key, delta, now_ms)
+            .incr_float(did, tid, collection, key, delta, now_ms)
         {
             Ok(new_value) => {
                 if let Some(ref m) = self.metrics {
@@ -137,9 +140,11 @@ impl CoreLoop {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_cas(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -158,7 +163,7 @@ impl CoreLoop {
             .unwrap_or_else(current_ms);
         let result = self
             .kv_engine
-            .cas(tid, collection, key, expected, new_value, now_ms);
+            .cas(did, tid, collection, key, expected, new_value, now_ms);
 
         if result.success {
             if let Some(ref m) = self.metrics {
@@ -196,6 +201,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_getset(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -213,7 +219,7 @@ impl CoreLoop {
             .unwrap_or_else(current_ms);
         let old = self
             .kv_engine
-            .getset(tid, collection, key, new_value, now_ms);
+            .getset(did, tid, collection, key, new_value, now_ms);
 
         if let Some(ref m) = self.metrics {
             m.record_kv_put();

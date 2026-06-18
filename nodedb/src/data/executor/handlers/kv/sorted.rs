@@ -13,21 +13,38 @@ use crate::engine::kv::sorted_index::key::{SortColumn, SortDirection, SortKeyEnc
 use crate::engine::kv::sorted_index::manager::SortedIndexDef;
 use crate::engine::kv::sorted_index::window::WindowConfig;
 
+/// Parameters for `execute_kv_register_sorted_index`.
+pub(in crate::data::executor) struct KvRegisterSortedIndexParams<'a> {
+    pub did: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub index_name: &'a str,
+    pub sort_columns: &'a [(String, String)],
+    pub key_column: &'a str,
+    pub window_type: &'a str,
+    pub window_timestamp_column: &'a str,
+    pub window_start_ms: u64,
+    pub window_end_ms: u64,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_register_sorted_index(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        index_name: &str,
-        sort_columns: &[(String, String)],
-        key_column: &str,
-        window_type: &str,
-        window_timestamp_column: &str,
-        window_start_ms: u64,
-        window_end_ms: u64,
+        params: KvRegisterSortedIndexParams<'_>,
     ) -> Response {
+        let KvRegisterSortedIndexParams {
+            did,
+            tid,
+            collection,
+            index_name,
+            sort_columns,
+            key_column,
+            window_type,
+            window_timestamp_column,
+            window_start_ms,
+            window_end_ms,
+        } = params;
         debug!(core = self.core_id, %collection, %index_name, "kv register sorted index");
 
         let columns: Vec<SortColumn> = sort_columns
@@ -79,7 +96,9 @@ impl CoreLoop {
             window,
         };
 
-        let backfilled = self.kv_engine.register_sorted_index(tid, collection, def);
+        let backfilled = self
+            .kv_engine
+            .register_sorted_index(did, tid, collection, def);
 
         let result = serde_json::json!({
             "index": index_name,
@@ -94,12 +113,13 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_drop_sorted_index(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         index_name: &str,
     ) -> Response {
         debug!(core = self.core_id, %index_name, "kv drop sorted index");
 
-        if self.kv_engine.drop_sorted_index(tid, index_name) {
+        if self.kv_engine.drop_sorted_index(did, tid, index_name) {
             let result = serde_json::json!({ "dropped": index_name });
             match response_codec::encode_json(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
@@ -113,6 +133,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_sorted_index_rank(
         &self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         index_name: &str,
         primary_key: &[u8],
@@ -122,7 +143,7 @@ impl CoreLoop {
 
         match self
             .kv_engine
-            .sorted_index_rank(tid, index_name, primary_key, now_ms)
+            .sorted_index_rank(did, tid, index_name, primary_key, now_ms)
         {
             Some(rank) => match response_codec::encode_json(&serde_json::json!({ "rank": rank })) {
                 Ok(payload) => self.response_with_payload(task, payload),
@@ -138,6 +159,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_sorted_index_top_k(
         &self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         index_name: &str,
         k: u32,
@@ -147,7 +169,7 @@ impl CoreLoop {
 
         match self
             .kv_engine
-            .sorted_index_top_k(tid, index_name, k, now_ms)
+            .sorted_index_top_k(did, tid, index_name, k, now_ms)
         {
             Some(entries) => {
                 let rows: Vec<serde_json::Value> = entries
@@ -168,9 +190,11 @@ impl CoreLoop {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_sorted_index_range(
         &self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         index_name: &str,
         score_min: Option<&[u8]>,
@@ -181,7 +205,7 @@ impl CoreLoop {
 
         match self
             .kv_engine
-            .sorted_index_range(tid, index_name, score_min, score_max, now_ms)
+            .sorted_index_range(did, tid, index_name, score_min, score_max, now_ms)
         {
             Some(entries) => {
                 let rows: Vec<serde_json::Value> = entries
@@ -205,13 +229,17 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_sorted_index_count(
         &self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         index_name: &str,
     ) -> Response {
         debug!(core = self.core_id, %index_name, "kv sorted index count");
         let now_ms = current_ms();
 
-        match self.kv_engine.sorted_index_count(tid, index_name, now_ms) {
+        match self
+            .kv_engine
+            .sorted_index_count(did, tid, index_name, now_ms)
+        {
             Some(count) => match response_codec::encode_count("count", count as usize) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => self.response_error(task, e),
@@ -223,6 +251,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_sorted_index_score(
         &self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         index_name: &str,
         primary_key: &[u8],
@@ -231,7 +260,7 @@ impl CoreLoop {
 
         match self
             .kv_engine
-            .sorted_index_score(tid, index_name, primary_key)
+            .sorted_index_score(did, tid, index_name, primary_key)
         {
             Some(sort_key) => {
                 let b64 =

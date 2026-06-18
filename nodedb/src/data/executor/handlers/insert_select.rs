@@ -43,7 +43,12 @@ impl CoreLoop {
         };
 
         let fetch_limit = source_limit.saturating_mul(10).max(1000);
-        let mut source_docs = match self.scan_collection(tid, source_collection, fetch_limit) {
+        let mut source_docs = match self.scan_collection(
+            task.request.database_id.as_u64(),
+            tid,
+            source_collection,
+            fetch_limit,
+        ) {
             Ok(docs) => docs,
             Err(e) => {
                 return self.response_error(

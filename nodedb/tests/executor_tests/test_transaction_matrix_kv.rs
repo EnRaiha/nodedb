@@ -286,7 +286,7 @@ fn rollback_matrix_columnar_then_doc_fail() {
     );
 
     // Confirm columnar collection is empty before the batch.
-    let before = core.scan_collection(1, "metrics", 100).unwrap();
+    let before = core.scan_collection(0, 1, "metrics", 100).unwrap();
     assert!(before.is_empty(), "columnar must be empty before batch");
 
     // Build a columnar insert payload: one row.
@@ -330,7 +330,7 @@ fn rollback_matrix_columnar_then_doc_fail() {
     );
 
     // Columnar collection must be empty — rollback_memtable_inserts was called.
-    let after = core.scan_collection(1, "metrics", 100).unwrap();
+    let after = core.scan_collection(0, 1, "metrics", 100).unwrap();
     assert!(
         after.is_empty(),
         "columnar insert must be rolled back; found {} rows after rollback",

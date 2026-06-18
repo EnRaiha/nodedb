@@ -16,14 +16,17 @@ impl KvEngine {
     /// used as the logical collection identifier (e.g. `"2/orders"`).
     ///
     /// Returns the number of entries migrated, or 0 if the source did not exist.
+    #[allow(clippy::too_many_arguments)]
     pub fn rename_collection(
         &mut self,
+        old_database_id: u64,
+        new_database_id: u64,
         tenant_id: u64,
         old_collection: &str,
         new_collection: &str,
     ) -> usize {
-        let old_key = table_key(tenant_id, old_collection);
-        let new_key = table_key(tenant_id, new_collection);
+        let old_key = table_key(old_database_id, tenant_id, old_collection);
+        let new_key = table_key(new_database_id, tenant_id, new_collection);
 
         // Nothing to migrate if the source table doesn't exist.
         let Some(table) = self.tables.remove(&old_key) else {
@@ -45,8 +48,13 @@ impl KvEngine {
         }
 
         // Move sorted index (if present).
-        self.sorted_indexes
-            .rename_collection(tenant_id, old_collection, new_collection);
+        self.sorted_indexes.rename_collection(
+            old_database_id,
+            new_database_id,
+            tenant_id,
+            old_collection,
+            new_collection,
+        );
 
         // The expiry wheel encodes collection names in composite keys
         // (see `expiry_key` in engine_helpers.rs). Re-keying individual

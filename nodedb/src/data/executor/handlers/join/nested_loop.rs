@@ -46,7 +46,12 @@ impl CoreLoop {
         let scan_limit =
             crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
 
-        let left_docs = match self.scan_collection(tid, left_collection, scan_limit) {
+        let left_docs = match self.scan_collection(
+            task.request.database_id.as_u64(),
+            tid,
+            left_collection,
+            scan_limit,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 return self.response_error(
@@ -66,7 +71,12 @@ impl CoreLoop {
             return err;
         }
 
-        let right_docs = match self.scan_collection(tid, right_collection, scan_limit) {
+        let right_docs = match self.scan_collection(
+            task.request.database_id.as_u64(),
+            tid,
+            right_collection,
+            scan_limit,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 return self.response_error(

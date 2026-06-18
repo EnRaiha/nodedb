@@ -84,6 +84,7 @@ impl CoreLoop {
             }
 
             let tenant_id = record.header.tenant_id;
+            let database_id = record.header.database_id;
             let record_lsn = record.header.lsn;
 
             // Try to detect KV records by discriminator prefix in the payload.
@@ -97,6 +98,7 @@ impl CoreLoop {
                         continue;
                     }
                     self.kv_engine.put(
+                        database_id,
                         tenant_id,
                         &collection,
                         &key,
@@ -119,8 +121,14 @@ impl CoreLoop {
                     if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
                         continue;
                     }
-                    self.kv_engine
-                        .batch_put(tenant_id, &collection, &entries, ttl_ms, now_ms);
+                    self.kv_engine.batch_put(
+                        database_id,
+                        tenant_id,
+                        &collection,
+                        &entries,
+                        ttl_ms,
+                        now_ms,
+                    );
                     puts += entries.len();
                     continue;
                 }
@@ -140,7 +148,8 @@ impl CoreLoop {
                     if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
                         continue;
                     }
-                    self.kv_engine.delete(tenant_id, &collection, &keys, now_ms);
+                    self.kv_engine
+                        .delete(database_id, tenant_id, &collection, &keys, now_ms);
                     deletes += keys.len();
                     continue;
                 }
@@ -153,7 +162,7 @@ impl CoreLoop {
                     if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
                         continue;
                     }
-                    self.kv_engine.truncate(tenant_id, &collection);
+                    self.kv_engine.truncate(database_id, tenant_id, &collection);
                     deletes += 1;
                 }
             }

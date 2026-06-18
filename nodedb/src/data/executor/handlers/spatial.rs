@@ -126,7 +126,7 @@ impl CoreLoop {
 
         // Pre-load all docs from scan_collection (handles both sparse and columnar).
         let all_docs: std::collections::HashMap<String, Vec<u8>> = self
-            .scan_collection(tid, collection, 10_000)
+            .scan_collection(task.request.database_id.as_u64(), tid, collection, 10_000)
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -222,7 +222,12 @@ impl CoreLoop {
         debug!(core = self.core_id, %collection, "spatial full scan (no R-tree index yet)");
 
         let scan_limit = limit * 10;
-        let entries = match self.scan_collection(tid, collection, scan_limit) {
+        let entries = match self.scan_collection(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            scan_limit,
+        ) {
             Ok(e) => e,
             Err(e) => {
                 return self.response_error(

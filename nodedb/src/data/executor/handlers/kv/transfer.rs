@@ -16,6 +16,7 @@ use crate::engine::kv::current_ms;
 
 /// Parameters for an atomic fungible transfer.
 pub(in crate::data::executor) struct TransferParams<'a> {
+    pub did: u64,
     pub tid: u64,
     pub collection: &'a str,
     pub source_key: &'a [u8],
@@ -34,6 +35,7 @@ impl CoreLoop {
         params: TransferParams<'_>,
     ) -> Response {
         let TransferParams {
+            did,
             tid,
             collection,
             source_key,
@@ -50,8 +52,8 @@ impl CoreLoop {
         let now_ms = current_ms();
 
         // Step 1: Read both values atomically (same core, no interleaving).
-        let source_val = self.kv_engine.get(tid, collection, source_key, now_ms);
-        let dest_val = self.kv_engine.get(tid, collection, dest_key, now_ms);
+        let source_val = self.kv_engine.get(did, tid, collection, source_key, now_ms);
+        let dest_val = self.kv_engine.get(did, tid, collection, dest_key, now_ms);
 
         let Some(source_bytes) = source_val else {
             return self.response_error(task, ErrorCode::NotFound);
@@ -114,6 +116,7 @@ impl CoreLoop {
         // Write lower key first to match the documented lock ordering.
         if source_key <= dest_key {
             self.kv_engine.put(
+                did,
                 tid,
                 collection,
                 source_key,
@@ -123,6 +126,7 @@ impl CoreLoop {
                 nodedb_types::Surrogate::ZERO,
             );
             self.kv_engine.put(
+                did,
                 tid,
                 collection,
                 dest_key,
@@ -133,6 +137,7 @@ impl CoreLoop {
             );
         } else {
             self.kv_engine.put(
+                did,
                 tid,
                 collection,
                 dest_key,
@@ -142,6 +147,7 @@ impl CoreLoop {
                 nodedb_types::Surrogate::ZERO,
             );
             self.kv_engine.put(
+                did,
                 tid,
                 collection,
                 source_key,
@@ -200,9 +206,11 @@ impl CoreLoop {
     }
 
     /// Atomic non-fungible item transfer: verify + delete + insert in one pass.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_transfer_item(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         source_collection: &str,
         dest_collection: &str,
@@ -218,14 +226,18 @@ impl CoreLoop {
         let now_ms = current_ms();
 
         // Step 1: Verify source owns the item.
-        let Some(item_data) = self.kv_engine.get(tid, source_collection, item_key, now_ms) else {
+        let Some(item_data) = self
+            .kv_engine
+            .get(did, tid, source_collection, item_key, now_ms)
+        else {
             return self.response_error(task, ErrorCode::NotFound);
         };
 
         // Step 2: Delete from source, insert at dest — atomic (single core).
         self.kv_engine
-            .delete(tid, source_collection, &[item_key.to_vec()], now_ms);
+            .delete(did, tid, source_collection, &[item_key.to_vec()], now_ms);
         self.kv_engine.put(
+            did,
             tid,
             dest_collection,
             dest_key,

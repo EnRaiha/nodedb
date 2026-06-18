@@ -137,7 +137,12 @@ impl CoreLoop {
         // If the index returned nothing, fall back to full scan + sort.
         // This handles collections without a secondary index on `field`.
         if results.is_empty() {
-            let scan_result = self.scan_collection(tid, collection, limit.max(1000));
+            let scan_result = self.scan_collection(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                limit.max(1000),
+            );
             match scan_result {
                 Ok(mut docs) => {
                     if let Err(e) = super::super::document::sort::sort_rows(

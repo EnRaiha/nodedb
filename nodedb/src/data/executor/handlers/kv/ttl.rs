@@ -14,6 +14,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_expire(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -24,7 +25,10 @@ impl CoreLoop {
             .epoch_system_ms
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
-        if self.kv_engine.expire(tid, collection, key, ttl_ms, now_ms) {
+        if self
+            .kv_engine
+            .expire(did, tid, collection, key, ttl_ms, now_ms)
+        {
             self.response_ok(task)
         } else {
             self.response_error(task, ErrorCode::NotFound)
@@ -34,12 +38,13 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_persist(
         &mut self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
     ) -> Response {
         debug!(core = self.core_id, %collection, "kv persist");
-        if self.kv_engine.persist(tid, collection, key) {
+        if self.kv_engine.persist(did, tid, collection, key) {
             self.response_ok(task)
         } else {
             self.response_error(task, ErrorCode::NotFound)
@@ -49,6 +54,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_get_ttl(
         &self,
         task: &ExecutionTask,
+        did: u64,
         tid: u64,
         collection: &str,
         key: &[u8],
@@ -57,7 +63,7 @@ impl CoreLoop {
         let now_ms = current_ms();
         let ttl_ms = self
             .kv_engine
-            .get_ttl_ms(tid, collection, key, now_ms)
+            .get_ttl_ms(did, tid, collection, key, now_ms)
             .unwrap_or(-2); // -2 = key does not exist.
         match response_codec::encode_json(&serde_json::json!({ "ttl_ms": ttl_ms })) {
             Ok(payload) => self.response_with_payload(task, payload),

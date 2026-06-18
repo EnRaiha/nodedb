@@ -21,6 +21,7 @@ pub type ScanBatchWithSurrogate<'a> = (Vec<(&'a [u8], &'a [u8], Surrogate)>, usi
 /// `surrogate_ceiling` enforces clone snapshot isolation: rows whose
 /// surrogate exceeds the ceiling are hidden from the caller.
 pub struct KvScanParams<'a> {
+    pub database_id: u64,
     pub tenant_id: u64,
     pub collection: &'a str,
     pub cursor: &'a [u8],

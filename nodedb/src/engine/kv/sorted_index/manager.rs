@@ -74,12 +74,14 @@ impl SortedIndexManager {
     /// from the KV hash table, used to populate the index from existing data.
     pub fn register(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         def: SortedIndexDef,
         existing_entries: impl Iterator<Item = (Vec<u8>, Vec<u8>)>,
     ) -> u32 {
-        let idx_key = index_key(tenant_id, &def.name);
-        let tbl_key = super::super::engine_helpers::table_key(tenant_id, &def.collection);
+        let idx_key = index_key(database_id, tenant_id, &def.name);
+        let tbl_key =
+            super::super::engine_helpers::table_key(database_id, tenant_id, &def.collection);
 
         let mut tree = OrderStatTree::new();
         let mut backfilled = 0u32;
@@ -103,8 +105,13 @@ impl SortedIndexManager {
 
     /// Drop every sorted index belonging to `(tenant_id, collection)`.
     /// Returns the number of indexes removed.
-    pub fn purge_collection(&mut self, tenant_id: u64, collection: &str) -> usize {
-        let tbl_key = super::super::engine_helpers::table_key(tenant_id, collection);
+    pub fn purge_collection(
+        &mut self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+    ) -> usize {
+        let tbl_key = super::super::engine_helpers::table_key(database_id, tenant_id, collection);
         let idx_keys = self.collection_indexes.remove(&tbl_key).unwrap_or_default();
         let mut removed = 0;
         for idx_key in &idx_keys {
@@ -116,14 +123,15 @@ impl SortedIndexManager {
     }
 
     /// Drop a sorted index. Returns `true` if it existed.
-    pub fn drop(&mut self, tenant_id: u64, index_name: &str) -> bool {
-        let idx_key = index_key(tenant_id, index_name);
+    pub fn drop(&mut self, database_id: u64, tenant_id: u64, index_name: &str) -> bool {
+        let idx_key = index_key(database_id, tenant_id, index_name);
 
         let Some(idx) = self.indexes.remove(&idx_key) else {
             return false;
         };
 
-        let tbl_key = super::super::engine_helpers::table_key(tenant_id, &idx.def.collection);
+        let tbl_key =
+            super::super::engine_helpers::table_key(database_id, tenant_id, &idx.def.collection);
         if let Some(list) = self.collection_indexes.get_mut(&tbl_key) {
             list.retain(|k| k != &idx_key);
         }
@@ -185,14 +193,16 @@ impl SortedIndexManager {
     /// accessible under the target database context.
     pub fn rename_collection(
         &mut self,
+        old_database_id: u64,
+        new_database_id: u64,
         tenant_id: u64,
         old_collection: &str,
         new_collection: &str,
     ) {
         use super::super::engine_helpers::table_key;
 
-        let old_key = table_key(tenant_id, old_collection);
-        let new_key = table_key(tenant_id, new_collection);
+        let old_key = table_key(old_database_id, tenant_id, old_collection);
+        let new_key = table_key(new_database_id, tenant_id, new_collection);
 
         let Some(index_names) = self.collection_indexes.remove(&old_key) else {
             return;
@@ -216,12 +226,13 @@ impl SortedIndexManager {
     /// For windowed indexes, only entries within the current window are counted.
     pub fn rank(
         &self,
+        database_id: u64,
         tenant_id: u64,
         index_name: &str,
         primary_key: &[u8],
         now_ms: u64,
     ) -> Option<u32> {
-        let idx = self.get_index(tenant_id, index_name)?;
+        let idx = self.get_index(database_id, tenant_id, index_name)?;
 
         if idx.def.window.is_unwindowed() {
             return idx.tree.rank(primary_key);
@@ -241,12 +252,13 @@ impl SortedIndexManager {
     /// Returns `(rank, primary_key)` pairs.
     pub fn top_k(
         &self,
+        database_id: u64,
         tenant_id: u64,
         index_name: &str,
         k: u32,
         now_ms: u64,
     ) -> Option<Vec<(u32, Vec<u8>)>> {
-        let idx = self.get_index(tenant_id, index_name)?;
+        let idx = self.get_index(database_id, tenant_id, index_name)?;
 
         if idx.def.window.is_unwindowed() {
             let entries = idx.tree.top_k(k);
@@ -272,13 +284,14 @@ impl SortedIndexManager {
     /// Returns `(rank, primary_key)` pairs.
     pub fn range(
         &self,
+        database_id: u64,
         tenant_id: u64,
         index_name: &str,
         score_min: Option<&[u8]>,
         score_max: Option<&[u8]>,
         now_ms: u64,
     ) -> Option<Vec<(u32, Vec<u8>)>> {
-        let idx = self.get_index(tenant_id, index_name)?;
+        let idx = self.get_index(database_id, tenant_id, index_name)?;
 
         let entries = idx.tree.range(score_min, score_max);
 
@@ -303,8 +316,14 @@ impl SortedIndexManager {
     }
 
     /// Get the total count of entries in a sorted index.
-    pub fn count(&self, tenant_id: u64, index_name: &str, now_ms: u64) -> Option<u32> {
-        let idx = self.get_index(tenant_id, index_name)?;
+    pub fn count(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        index_name: &str,
+        now_ms: u64,
+    ) -> Option<u32> {
+        let idx = self.get_index(database_id, tenant_id, index_name)?;
 
         if idx.def.window.is_unwindowed() {
             return Some(idx.tree.count());
@@ -318,19 +337,35 @@ impl SortedIndexManager {
     }
 
     /// Get the sort key for a primary key in a sorted index (ZSCORE equivalent).
-    pub fn score(&self, tenant_id: u64, index_name: &str, primary_key: &[u8]) -> Option<Vec<u8>> {
-        let idx = self.get_index(tenant_id, index_name)?;
+    pub fn score(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        index_name: &str,
+        primary_key: &[u8],
+    ) -> Option<Vec<u8>> {
+        let idx = self.get_index(database_id, tenant_id, index_name)?;
         idx.tree.get_sort_key(primary_key).map(|s| s.to_vec())
     }
 
     /// Get the index definition.
-    pub fn get_def(&self, tenant_id: u64, index_name: &str) -> Option<&SortedIndexDef> {
-        let idx = self.get_index(tenant_id, index_name)?;
+    pub fn get_def(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        index_name: &str,
+    ) -> Option<&SortedIndexDef> {
+        let idx = self.get_index(database_id, tenant_id, index_name)?;
         Some(&idx.def)
     }
 
-    fn get_index(&self, tenant_id: u64, index_name: &str) -> Option<&SortedIndex> {
-        let idx_key = index_key(tenant_id, index_name);
+    fn get_index(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        index_name: &str,
+    ) -> Option<&SortedIndex> {
+        let idx_key = index_key(database_id, tenant_id, index_name);
         self.indexes.get(&idx_key)
     }
 }
@@ -343,8 +378,8 @@ impl Default for SortedIndexManager {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-fn index_key(tenant_id: u64, index_name: &str) -> String {
-    format!("{tenant_id}:{index_name}")
+fn index_key(database_id: u64, tenant_id: u64, index_name: &str) -> String {
+    format!("{database_id}:{tenant_id}:{index_name}")
 }
 
 /// Extract field values from a MessagePack-encoded KV value and build a sort key.
@@ -440,9 +475,9 @@ mod tests {
             make_entry("bob", 200),
             make_entry("charlie", 150),
         ];
-        let count = mgr.register(1, def, entries.into_iter());
+        let count = mgr.register(0, 1, def, entries.into_iter());
         assert_eq!(count, 3);
-        assert_eq!(mgr.count(1, "lb", 0), Some(3));
+        assert_eq!(mgr.count(0, 1, "lb", 0), Some(3));
     }
 
     #[test]
@@ -454,12 +489,12 @@ mod tests {
             make_entry("bob", 300),
             make_entry("charlie", 200),
         ];
-        mgr.register(1, def, entries.into_iter());
+        mgr.register(0, 1, def, entries.into_iter());
 
         // DESC: bob(300) = rank 1, charlie(200) = rank 2, alice(100) = rank 3
-        assert_eq!(mgr.rank(1, "lb", b"bob", 0), Some(1));
-        assert_eq!(mgr.rank(1, "lb", b"charlie", 0), Some(2));
-        assert_eq!(mgr.rank(1, "lb", b"alice", 0), Some(3));
+        assert_eq!(mgr.rank(0, 1, "lb", b"bob", 0), Some(1));
+        assert_eq!(mgr.rank(0, 1, "lb", b"charlie", 0), Some(2));
+        assert_eq!(mgr.rank(0, 1, "lb", b"alice", 0), Some(3));
     }
 
     #[test]
@@ -471,9 +506,9 @@ mod tests {
             make_entry("bob", 300),
             make_entry("charlie", 200),
         ];
-        mgr.register(1, def, entries.into_iter());
+        mgr.register(0, 1, def, entries.into_iter());
 
-        let top2 = mgr.top_k(1, "lb", 2, 0).unwrap();
+        let top2 = mgr.top_k(0, 1, "lb", 2, 0).unwrap();
         assert_eq!(top2.len(), 2);
         assert_eq!(top2[0], (1, b"bob".to_vec()));
         assert_eq!(top2[1], (2, b"charlie".to_vec()));
@@ -483,9 +518,9 @@ mod tests {
     fn on_put_updates_index() {
         let mut mgr = SortedIndexManager::new();
         let def = make_def("lb", "scores");
-        mgr.register(1, def, std::iter::empty());
+        mgr.register(0, 1, def, std::iter::empty());
 
-        let tbl_key = super::super::super::engine_helpers::table_key(1, "scores");
+        let tbl_key = super::super::super::engine_helpers::table_key(0, 1, "scores");
 
         // Simulate PUTs.
         let score_bytes = SortKeyEncoder::encode_i64(100).to_vec();
@@ -494,10 +529,10 @@ mod tests {
         let score_bytes = SortKeyEncoder::encode_i64(200).to_vec();
         mgr.on_put(tbl_key, b"bob", &[("score".into(), score_bytes)]);
 
-        assert_eq!(mgr.count(1, "lb", 0), Some(2));
+        assert_eq!(mgr.count(0, 1, "lb", 0), Some(2));
         // DESC: bob(200) = rank 1, alice(100) = rank 2
-        assert_eq!(mgr.rank(1, "lb", b"bob", 0), Some(1));
-        assert_eq!(mgr.rank(1, "lb", b"alice", 0), Some(2));
+        assert_eq!(mgr.rank(0, 1, "lb", b"bob", 0), Some(1));
+        assert_eq!(mgr.rank(0, 1, "lb", b"alice", 0), Some(2));
     }
 
     #[test]
@@ -505,25 +540,25 @@ mod tests {
         let mut mgr = SortedIndexManager::new();
         let def = make_def("lb", "scores");
         let entries = vec![make_entry("alice", 100), make_entry("bob", 200)];
-        mgr.register(1, def, entries.into_iter());
+        mgr.register(0, 1, def, entries.into_iter());
 
-        let tbl_key = super::super::super::engine_helpers::table_key(1, "scores");
+        let tbl_key = super::super::super::engine_helpers::table_key(0, 1, "scores");
         mgr.on_delete(tbl_key, b"bob");
 
-        assert_eq!(mgr.count(1, "lb", 0), Some(1));
-        assert_eq!(mgr.rank(1, "lb", b"alice", 0), Some(1));
-        assert!(mgr.rank(1, "lb", b"bob", 0).is_none());
+        assert_eq!(mgr.count(0, 1, "lb", 0), Some(1));
+        assert_eq!(mgr.rank(0, 1, "lb", b"alice", 0), Some(1));
+        assert!(mgr.rank(0, 1, "lb", b"bob", 0).is_none());
     }
 
     #[test]
     fn drop_index() {
         let mut mgr = SortedIndexManager::new();
         let def = make_def("lb", "scores");
-        mgr.register(1, def, std::iter::empty());
+        mgr.register(0, 1, def, std::iter::empty());
 
-        assert!(mgr.drop(1, "lb"));
-        assert!(!mgr.drop(1, "lb")); // Already dropped.
-        assert!(mgr.count(1, "lb", 0).is_none());
+        assert!(mgr.drop(0, 1, "lb"));
+        assert!(!mgr.drop(0, 1, "lb")); // Already dropped.
+        assert!(mgr.count(0, 1, "lb", 0).is_none());
     }
 
     #[test]
@@ -531,10 +566,10 @@ mod tests {
         let mut mgr = SortedIndexManager::new();
         let def = make_def("lb", "scores");
         let entries = vec![make_entry("alice", 100)];
-        mgr.register(1, def, entries.into_iter());
+        mgr.register(0, 1, def, entries.into_iter());
 
-        let sort_key = mgr.score(1, "lb", b"alice");
+        let sort_key = mgr.score(0, 1, "lb", b"alice");
         assert!(sort_key.is_some());
-        assert!(mgr.score(1, "lb", b"nonexistent").is_none());
+        assert!(mgr.score(0, 1, "lb", b"nonexistent").is_none());
     }
 }

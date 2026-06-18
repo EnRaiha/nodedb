@@ -24,6 +24,7 @@ impl CoreLoop {
         op: &KvOp,
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
+        let did = task.request.database_id.as_u64();
         match op {
             // ── Read-only KV ops — no undo needed ───────────────────────────
             KvOp::Get { .. }
@@ -37,7 +38,7 @@ impl CoreLoop {
             | KvOp::SortedIndexRange { .. }
             | KvOp::SortedIndexCount { .. }
             | KvOp::SortedIndexScore { .. } => {
-                let resp = self.execute_kv(task, tid, op);
+                let resp = self.execute_kv(task, did, tid, op);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv read failed".into(),
@@ -67,9 +68,9 @@ impl CoreLoop {
                 surrogate,
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(tid, collection, key, now_ms);
-                let resp =
-                    self.execute_kv_put(task, tid, collection, key, value, *ttl_ms, *surrogate);
+                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let resp = self
+                    .execute_kv_put(task, did, tid, collection, key, value, *ttl_ms, *surrogate);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv put failed".into(),
@@ -90,8 +91,8 @@ impl CoreLoop {
                 ttl_ms,
                 surrogate,
             } => {
-                let resp =
-                    self.execute_kv_insert(task, tid, collection, key, value, *ttl_ms, *surrogate);
+                let resp = self
+                    .execute_kv_insert(task, did, tid, collection, key, value, *ttl_ms, *surrogate);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv insert failed".into(),
@@ -114,9 +115,12 @@ impl CoreLoop {
                 surrogate,
             } => {
                 let now_ms = current_ms();
-                let was_absent = self.kv_engine.get(tid, collection, key, now_ms).is_none();
+                let was_absent = self
+                    .kv_engine
+                    .get(did, tid, collection, key, now_ms)
+                    .is_none();
                 let resp = self.execute_kv_insert_if_absent(
-                    task, tid, collection, key, value, *ttl_ms, *surrogate,
+                    task, did, tid, collection, key, value, *ttl_ms, *surrogate,
                 );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
@@ -138,8 +142,8 @@ impl CoreLoop {
                 collection, key, ..
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(tid, collection, key, now_ms);
-                let resp = self.execute_kv(task, tid, op);
+                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let resp = self.execute_kv(task, did, tid, op);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv insert-on-conflict-update failed".into(),
@@ -159,11 +163,11 @@ impl CoreLoop {
                 let priors: Vec<(Vec<u8>, Vec<u8>)> = keys
                     .iter()
                     .filter_map(|k| {
-                        let v = self.kv_engine.get(tid, collection, k, now_ms)?;
+                        let v = self.kv_engine.get(did, tid, collection, k, now_ms)?;
                         Some((k.clone(), v))
                     })
                     .collect();
-                let resp = self.execute_kv_delete(task, tid, collection, keys);
+                let resp = self.execute_kv_delete(task, did, tid, collection, keys);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv delete failed".into(),
@@ -188,11 +192,11 @@ impl CoreLoop {
                 let prior_entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = entries
                     .iter()
                     .map(|(k, _v)| {
-                        let prior = self.kv_engine.get(tid, collection, k, now_ms);
+                        let prior = self.kv_engine.get(did, tid, collection, k, now_ms);
                         (k.clone(), prior)
                     })
                     .collect();
-                let resp = self.execute_kv_batch_put(task, tid, collection, entries, *ttl_ms);
+                let resp = self.execute_kv_batch_put(task, did, tid, collection, entries, *ttl_ms);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv batch put failed".into(),
@@ -211,8 +215,8 @@ impl CoreLoop {
                 updates,
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(tid, collection, key, now_ms);
-                let resp = self.execute_kv_field_set(task, tid, collection, key, updates);
+                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let resp = self.execute_kv_field_set(task, did, tid, collection, key, updates);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv field set failed".into(),
@@ -233,8 +237,8 @@ impl CoreLoop {
                 ttl_ms,
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(tid, collection, key, now_ms);
-                let resp = self.execute_kv_incr(task, tid, collection, key, *delta, *ttl_ms);
+                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let resp = self.execute_kv_incr(task, did, tid, collection, key, *delta, *ttl_ms);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv incr failed".into(),
@@ -254,8 +258,8 @@ impl CoreLoop {
                 delta,
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(tid, collection, key, now_ms);
-                let resp = self.execute_kv_incr_float(task, tid, collection, key, *delta);
+                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let resp = self.execute_kv_incr_float(task, did, tid, collection, key, *delta);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv incr float failed".into(),
@@ -276,8 +280,9 @@ impl CoreLoop {
                 new_value,
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(tid, collection, key, now_ms);
-                let resp = self.execute_kv_cas(task, tid, collection, key, expected, new_value);
+                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let resp =
+                    self.execute_kv_cas(task, did, tid, collection, key, expected, new_value);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv cas failed".into(),
@@ -298,8 +303,8 @@ impl CoreLoop {
                 new_value,
             } => {
                 let now_ms = current_ms();
-                let prior = self.kv_engine.get(tid, collection, key, now_ms);
-                let resp = self.execute_kv_getset(task, tid, collection, key, new_value);
+                let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
+                let resp = self.execute_kv_getset(task, did, tid, collection, key, new_value);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv get-set failed".into(),
@@ -320,9 +325,9 @@ impl CoreLoop {
                 ..
             } => {
                 let now_ms = current_ms();
-                let source_prior = self.kv_engine.get(tid, collection, source_key, now_ms);
-                let dest_prior = self.kv_engine.get(tid, collection, dest_key, now_ms);
-                let resp = self.execute_kv(task, tid, op);
+                let source_prior = self.kv_engine.get(did, tid, collection, source_key, now_ms);
+                let dest_prior = self.kv_engine.get(did, tid, collection, dest_key, now_ms);
+                let resp = self.execute_kv(task, did, tid, op);
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv transfer failed".into(),
@@ -351,10 +356,15 @@ impl CoreLoop {
                 dest_key,
             } => {
                 let now_ms = current_ms();
-                let source_prior = self.kv_engine.get(tid, source_collection, item_key, now_ms);
-                let dest_prior = self.kv_engine.get(tid, dest_collection, dest_key, now_ms);
+                let source_prior =
+                    self.kv_engine
+                        .get(did, tid, source_collection, item_key, now_ms);
+                let dest_prior = self
+                    .kv_engine
+                    .get(did, tid, dest_collection, dest_key, now_ms);
                 let resp = self.execute_kv_transfer_item(
                     task,
+                    did,
                     tid,
                     source_collection,
                     dest_collection,

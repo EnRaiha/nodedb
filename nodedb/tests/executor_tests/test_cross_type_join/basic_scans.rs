@@ -50,7 +50,7 @@ fn kv_put_scan_roundtrip() {
         }),
     );
 
-    let kv_docs = ctx.core.scan_collection(1, "prefs", 100).unwrap();
+    let kv_docs = ctx.core.scan_collection(0, 1, "prefs", 100).unwrap();
     assert_eq!(
         kv_docs.len(),
         2,
@@ -180,7 +180,7 @@ fn schemaless_put_scan_roundtrip() {
         }),
     );
 
-    let docs = ctx.core.scan_collection(1, "docs", 100).unwrap();
+    let docs = ctx.core.scan_collection(0, 1, "docs", 100).unwrap();
     assert_eq!(docs.len(), 2, "expected 2 docs, got {}", docs.len());
 
     for (doc_id, bytes) in &docs {

@@ -175,7 +175,7 @@ impl CoreLoop {
                         None => return resp,
                     }
                 }
-                None => match self.scan_collection(tid, left_collection, scan_limit) {
+                None => match self.scan_collection(join.task.request.database_id.as_u64(), tid, left_collection, scan_limit) {
                     Ok(d) => d,
                     Err(e) => {
                         return self.response_error(
@@ -190,7 +190,12 @@ impl CoreLoop {
             let keys = join.on.iter().map(|(l, _)| l.clone()).collect();
             (docs, keys)
         } else {
-            let docs = match self.scan_collection(tid, left_collection, scan_limit) {
+            let docs = match self.scan_collection(
+                join.task.request.database_id.as_u64(),
+                tid,
+                left_collection,
+                scan_limit,
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     return self.response_error(
@@ -239,7 +244,12 @@ impl CoreLoop {
                         None => return resp,
                     }
                 }
-                None => match self.scan_collection(tid, right_collection, scan_limit) {
+                None => match self.scan_collection(
+                    join.task.request.database_id.as_u64(),
+                    tid,
+                    right_collection,
+                    scan_limit,
+                ) {
                     Ok(d) => d,
                     Err(e) => {
                         return self.response_error(
@@ -252,7 +262,12 @@ impl CoreLoop {
                 },
             }
         } else {
-            match self.scan_collection(tid, right_collection, scan_limit) {
+            match self.scan_collection(
+                join.task.request.database_id.as_u64(),
+                tid,
+                right_collection,
+                scan_limit,
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     return self.response_error(
