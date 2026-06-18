@@ -54,7 +54,7 @@ pub async fn dropped_collections(
                 .unwrap_or(0)
         };
 
-        let mut r: HashMap<String, Value> = HashMap::with_capacity(7);
+        let mut r: HashMap<String, Value> = HashMap::with_capacity(8);
         r.insert("tenant_id".into(), Value::Integer(coll.tenant_id as i64));
         r.insert("name".into(), Value::String(coll.name.clone()));
         r.insert("owner".into(), Value::String(coll.owner.clone()));
@@ -70,6 +70,10 @@ pub async fn dropped_collections(
         r.insert(
             "size_bytes_estimate".into(),
             Value::Integer(size_estimate as i64),
+        );
+        r.insert(
+            "partition_strategy".into(),
+            Value::String(coll.partition_strategy.as_str().into()),
         );
         rows.push(encode_row(r)?);
     }

@@ -28,6 +28,7 @@ impl SqlCatalog for TestCatalog {
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
             }),
             "users" => Some(CollectionInfo {
                 name: "users".into(),
@@ -39,6 +40,7 @@ impl SqlCatalog for TestCatalog {
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
             }),
             "orders" => Some(CollectionInfo {
                 name: "orders".into(),
@@ -50,6 +52,7 @@ impl SqlCatalog for TestCatalog {
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
             }),
             "docs" => Some(CollectionInfo {
                 name: "docs".into(),
@@ -61,6 +64,7 @@ impl SqlCatalog for TestCatalog {
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
             }),
             "tags" => Some(CollectionInfo {
                 name: "tags".into(),
@@ -72,6 +76,7 @@ impl SqlCatalog for TestCatalog {
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
             }),
             "user_prefs" => Some(CollectionInfo {
                 name: "user_prefs".into(),
@@ -83,6 +88,7 @@ impl SqlCatalog for TestCatalog {
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
             }),
             "embeddings" => Some(CollectionInfo {
                 name: "embeddings".into(),
@@ -94,6 +100,7 @@ impl SqlCatalog for TestCatalog {
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
             }),
             _ => None,
         };

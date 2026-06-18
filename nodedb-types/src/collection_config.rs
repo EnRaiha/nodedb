@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vector-primary collection configuration types.
+//! Vector-primary collection configuration types, plus partition-strategy
+//! metadata.
 //!
 //! `PrimaryEngine` is a parallel attribute to `CollectionType` that tells the
 //! planner which engine is the primary access path for a collection.
 //! Vectors remain an index — not a collection type — but a `primary = 'vector'`
 //! attribute means the vector index is the hot path and the document store is
 //! a metadata sidecar.
+//!
+//! `PartitionStrategy` records HOW a collection is distributed across vShards.
+//! It is the single authoritative source for partition metadata; future routing
+//! and resharding layers read this field instead of inferring from engine type.
 
 use crate::collection::CollectionType;
 use crate::columnar::{ColumnarProfile, DocumentMode};
@@ -176,6 +181,92 @@ pub enum PayloadAtom {
         high: Option<crate::Value>,
         high_inclusive: bool,
     },
+}
+
+/// Names WHAT a key-partitioned collection hashes to derive its vShard.
+///
+/// Defined as substrate for future routing and array layers; not yet populated
+/// at create time for those paths — only `PartitionStrategy::CollectionHomed`
+/// is used at create time in this release.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub enum KeySpec {
+    /// Graph edge endpoint node-id string (hashed via VShardId::from_key).
+    NodeId,
+    /// Array name ‖ tile-id (array tile routing).
+    ArrayTile,
+}
+
+/// How a collection's rows are distributed across vShards.
+///
+/// This is the authoritative per-collection partition metadata. Future routing,
+/// Calvin, and resharding layers read this field instead of inferring
+/// distribution from engine type.
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub enum PartitionStrategy {
+    /// All rows live on one owning vShard derived from (db_id, collection).
+    ///
+    /// Every base collection is collection-homed today: Document (schemaless
+    /// and strict), Columnar (plain, timeseries, spatial), and Key-Value all
+    /// route to a single vShard that owns the collection. Graph edge-key
+    /// partitioning and Array tile partitioning are operation-level concerns
+    /// handled separately and are NOT reflected here at create time.
+    #[default]
+    CollectionHomed,
+    /// Rows routed by hashing a key field. Reserved for future key-partitioned
+    /// collections; not populated at create time in this release.
+    KeyPartitioned { key: KeySpec },
+}
+
+impl PartitionStrategy {
+    /// Derive the create-time default strategy from a [`CollectionType`].
+    ///
+    /// Every base engine is collection-homed today:
+    /// - `Document` (schemaless and strict): single-vShard B-tree ownership.
+    /// - `Columnar` (plain, timeseries, spatial): single-vShard segment
+    ///   ownership; timeseries append partitioning is a write-path concern,
+    ///   not a metadata-level partition strategy.
+    /// - `KeyValue`: single-vShard hash-index ownership; per-key routing is
+    ///   internal to the engine, not exposed at the collection layer.
+    ///
+    /// Graph edge-key and Array tile partitioning are operation-level and are
+    /// handled separately — they are NOT set here at collection create time.
+    pub fn default_for_collection_type(ct: &CollectionType) -> Self {
+        match ct {
+            CollectionType::Document(DocumentMode::Schemaless) => Self::CollectionHomed,
+            CollectionType::Document(DocumentMode::Strict(_)) => Self::CollectionHomed,
+            CollectionType::Columnar(ColumnarProfile::Plain) => Self::CollectionHomed,
+            CollectionType::Columnar(ColumnarProfile::Timeseries { .. }) => Self::CollectionHomed,
+            CollectionType::Columnar(ColumnarProfile::Spatial { .. }) => Self::CollectionHomed,
+            CollectionType::KeyValue(_) => Self::CollectionHomed,
+        }
+    }
+
+    /// Stable lowercase tag for catalog and SHOW output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CollectionHomed => "collection_homed",
+            Self::KeyPartitioned { .. } => "key_partitioned",
+        }
+    }
 }
 
 #[cfg(test)]

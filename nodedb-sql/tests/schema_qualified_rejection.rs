@@ -29,6 +29,7 @@ impl SqlCatalog for Catalog {
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
             }),
             "orders" => Some(CollectionInfo {
                 name: "orders".into(),
@@ -40,6 +41,7 @@ impl SqlCatalog for Catalog {
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
             }),
             _ => None,
         };

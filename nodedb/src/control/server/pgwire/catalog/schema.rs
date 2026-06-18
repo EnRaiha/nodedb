@@ -171,6 +171,7 @@ pub fn catalog_columns(table: &str) -> Option<Vec<CatalogColumn>> {
             col("deactivated_at_ns", Int8),
             col("retention_expires_at_ns", Int8),
             col("size_bytes_estimate", Int8),
+            col("partition_strategy", Text),
         ],
         "_system.l2_cleanup_queue" => vec![
             col("tenant_id", Int8),
@@ -215,5 +216,7 @@ pub fn catalog_collection_info(name: &str) -> Option<CollectionInfo> {
         bitemporal: false,
         primary: nodedb_types::PrimaryEngine::default(),
         vector_primary: None,
+        // Catalog relations are synthetic, read-only, and never sharded.
+        partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
     })
 }

@@ -35,6 +35,7 @@ impl SqlCatalog for TimeseriesCatalog {
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
             }),
             _ => None,
         };

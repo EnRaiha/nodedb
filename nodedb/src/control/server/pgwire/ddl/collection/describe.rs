@@ -196,6 +196,7 @@ pub fn show_collections(
         text_field("name"),
         text_field("owner"),
         int8_field("created_at"),
+        text_field("partition_strategy"),
     ]);
 
     let collections = if let Some(catalog) = state.credentials.catalog() {
@@ -227,6 +228,9 @@ pub fn show_collections(
             .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
         encoder
             .encode_field(&(coll.created_at as i64))
+            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        encoder
+            .encode_field(&coll.partition_strategy.as_str())
             .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
         rows.push(Ok(encoder.take_row()));
     }

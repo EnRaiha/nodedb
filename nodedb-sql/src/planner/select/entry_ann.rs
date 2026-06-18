@@ -295,6 +295,7 @@ mod tests {
                     bitemporal: false,
                     primary: nodedb_types::PrimaryEngine::Document,
                     vector_primary: None,
+                    partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
                 }))
             } else {
                 Ok(None)

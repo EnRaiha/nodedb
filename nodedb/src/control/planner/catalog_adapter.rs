@@ -311,6 +311,7 @@ impl SqlCatalog for OriginCatalog {
             bitemporal: stored.bitemporal,
             primary: stored.primary,
             vector_primary: stored.vector_primary,
+            partition_strategy: stored.partition_strategy,
         }))
     }
 

@@ -200,6 +200,7 @@ impl TableScope {
                     bitemporal: false,
                     primary: nodedb_types::PrimaryEngine::Document,
                     vector_primary: None,
+                    partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
                 },
             })?;
             return Ok(());
@@ -264,6 +265,7 @@ fn resolve_array_tvf(
         bitemporal: false,
         primary: nodedb_types::PrimaryEngine::Document,
         vector_primary: None,
+        partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
     };
     Ok(Some(ResolvedTable {
         name: view.name,
@@ -361,6 +363,7 @@ mod tests {
             bitemporal: false,
             primary: PrimaryEngine::Document,
             vector_primary: None,
+            partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
         }
     }
 
@@ -375,6 +378,7 @@ mod tests {
             bitemporal: false,
             primary: PrimaryEngine::Document,
             vector_primary: None,
+            partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
         }
     }
 

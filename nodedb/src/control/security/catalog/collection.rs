@@ -157,6 +157,15 @@ pub struct StoredCollection {
     /// Vector-primary configuration, present only when `primary == Vector`.
     #[msgpack(default)]
     pub vector_primary: Option<nodedb_types::VectorPrimaryConfig>,
+    /// How this collection's rows are distributed across vShards.
+    ///
+    /// Defaults to `CollectionHomed` on deserialization so catalog entries
+    /// written before this field was added continue to behave correctly —
+    /// every pre-existing collection is collection-homed, making `default`
+    /// the safe zero-migration value (unlike a surrogate where a default would
+    /// be wrong). No wire-version bump is required.
+    #[msgpack(default)]
+    pub partition_strategy: nodedb_types::PartitionStrategy,
     /// Best-effort estimate of this collection's on-core data size in
     /// bytes. Summed across every engine's in-memory state for the
     /// `(tenant, collection)` pair on the node that most recently
@@ -238,6 +247,9 @@ impl StoredCollection {
             size_bytes_estimate: 0,
             primary: nodedb_types::PrimaryEngine::Document,
             vector_primary: None,
+            partition_strategy: nodedb_types::PartitionStrategy::default_for_collection_type(
+                &nodedb_types::CollectionType::document(),
+            ),
             database_id: DatabaseId::DEFAULT,
             cloned_from: None,
             clone_status: CloneStatus::default(),

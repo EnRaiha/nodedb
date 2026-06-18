@@ -142,6 +142,8 @@ pub async fn build_and_persist(
     let balanced = parse_balanced_clause_from_raw(balanced_raw.unwrap_or(""))
         .map_err(|e| sqlstate_error("42601", &e))?;
 
+    let partition_strategy =
+        nodedb_types::PartitionStrategy::default_for_collection_type(&collection_type);
     let coll = StoredCollection {
         tenant_id: tenant_id.as_u64(),
         name: name.to_string(),
@@ -174,6 +176,7 @@ pub async fn build_and_persist(
         size_bytes_estimate: 0,
         primary,
         vector_primary,
+        partition_strategy,
         database_id,
         cloned_from: None,
         clone_status: nodedb_types::CloneStatus::default(),

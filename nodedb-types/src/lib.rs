@@ -67,7 +67,9 @@ pub use audit_dml::AuditDmlMode;
 pub use bbox::{BoundingBox, geometry_bbox};
 pub use clone::{CloneOrigin, CloneStatus, MAX_CLONE_DEPTH};
 pub use collection::{CollectionType, CollectionTypeParseError};
-pub use collection_config::{PayloadAtom, PayloadIndexKind, PrimaryEngine, VectorPrimaryConfig};
+pub use collection_config::{
+    KeySpec, PartitionStrategy, PayloadAtom, PayloadIndexKind, PrimaryEngine, VectorPrimaryConfig,
+};
 pub use columnar::{
     ColumnDef, ColumnType, ColumnarProfile, ColumnarSchema, DocumentMode, SchemaError, StrictSchema,
 };

@@ -28,6 +28,11 @@ pub struct CollectionInfo {
     /// Vector-primary configuration. `Some` only when
     /// `primary == PrimaryEngine::Vector`.
     pub vector_primary: Option<nodedb_types::VectorPrimaryConfig>,
+    /// How this collection's rows are distributed across vShards.
+    ///
+    /// Authoritative per-collection partition metadata. Future routing layers
+    /// read this instead of inferring distribution from engine type.
+    pub partition_strategy: nodedb_types::PartitionStrategy,
 }
 
 /// Secondary index metadata surfaced to the SQL planner.

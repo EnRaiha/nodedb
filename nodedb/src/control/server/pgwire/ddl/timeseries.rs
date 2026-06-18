@@ -95,6 +95,7 @@ pub fn create_timeseries(
         size_bytes_estimate: 0,
         primary: nodedb_types::PrimaryEngine::Columnar,
         vector_primary: None,
+        partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
         database_id,
         cloned_from: None,
         clone_status: nodedb_types::CloneStatus::default(),
