@@ -120,12 +120,13 @@ impl LocalPlanExecutor {
             self.state.tuning.network.default_deadline_secs,
         ));
 
+        let database_id = DatabaseId::from(req.database_id);
+
         // ── 2. Descriptor version validation ──────────────────────────────────
         let catalog_ref = self.state.credentials.catalog();
         if let Some(catalog) = catalog_ref.as_ref() {
             for entry in &req.descriptor_versions {
-                match catalog.get_collection(DatabaseId::DEFAULT, req.tenant_id, &entry.collection)
-                {
+                match catalog.get_collection(database_id, req.tenant_id, &entry.collection) {
                     Ok(Some(stored)) => {
                         let actual = if stored.descriptor_version == 0 {
                             1
@@ -183,7 +184,6 @@ impl LocalPlanExecutor {
         // ── 4. Dispatch through local SPSC bridge ─────────────────────────────
         let request_id = self.state.next_request_id();
         let tenant_id = crate::types::TenantId::new(req.tenant_id);
-        let database_id = crate::types::DatabaseId::from(req.database_id);
 
         let request = Request {
             request_id,
@@ -302,6 +302,8 @@ impl LocalPlanExecutor {
             self.state.tuning.network.default_deadline_secs,
         ));
 
+        let database_id = DatabaseId::from(req.database_id);
+
         // ── 2. Descriptor version validation ──────────────────────────────────
         //
         // For each (collection, version) pair the caller sent, look up the local
@@ -311,8 +313,7 @@ impl LocalPlanExecutor {
         let catalog_ref = self.state.credentials.catalog();
         if let Some(catalog) = catalog_ref.as_ref() {
             for entry in &req.descriptor_versions {
-                match catalog.get_collection(DatabaseId::DEFAULT, req.tenant_id, &entry.collection)
-                {
+                match catalog.get_collection(database_id, req.tenant_id, &entry.collection) {
                     Ok(Some(stored)) => {
                         // Version 0 is the pre-B.1 sentinel; treat as 1 (same
                         // floor the drain gate uses).
@@ -383,7 +384,6 @@ impl LocalPlanExecutor {
         // Build a Request, register a oneshot tracker, dispatch, and await the response.
         let request_id = self.state.next_request_id();
         let tenant_id = crate::types::TenantId::new(req.tenant_id);
-        let database_id = crate::types::DatabaseId::from(req.database_id);
 
         let request = Request {
             request_id,
