@@ -355,6 +355,41 @@ pub fn start_raft(
     shared
         .surrogate_assigner
         .install_shared(Arc::downgrade(&shared));
+    // Routing can lag or be self-only during cluster bring-up, but
+    // topology already tells us whether this process can collide with
+    // peer allocators. Latch HiLo mode before the eager refiller starts.
+    let cluster_member_count = handle
+        .topology
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .all_nodes()
+        .filter(|node| node.state.receives_log())
+        .count();
+    if cluster_member_count > 1 {
+        shared.surrogate_assigner.enable_reservation_mode();
+    }
+
+    // Spawn the per-node surrogate reservation refiller. It owns ALL batch
+    // reservation so the latency-critical `assign` insert path never blocks
+    // on the metadata-Raft round-trip in steady state: it eagerly reserves
+    // the first batch on its first iteration (before inserts arrive) and
+    // tops the batch up whenever the hot path nudges it below the
+    // low-watermark. The loop self-gates via `should_use_reservation`, so it
+    // is a cheap park on single-node / single-member deployments. Same
+    // lifetime/shutdown pattern as the sequencer ticker below.
+    let refiller = shared.surrogate_assigner.clone();
+    let refiller_shared = Arc::downgrade(&shared);
+    let sr_refill = shutdown_rx.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = refiller.run_refill_loop(refiller_shared) => {}
+            _ = async {
+                let mut rx = sr_refill;
+                let _ = rx.changed().await;
+            } => {}
+        }
+        info!("surrogate refill loop stopped");
+    });
 
     // Subscribe to the boot-time readiness watch BEFORE spawning the
     // tick loop so we cannot miss the first transition. The receiver

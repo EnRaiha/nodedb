@@ -44,14 +44,20 @@ impl SharedState {
             // call to short-circuit to `Surrogate::ZERO` — collapsing
             // every row in every test to the same substrate key.
             let registry = Arc::clone(&s.surrogate_registry);
-            // Seed the registry's high-watermark from the catalog so
-            // restarts in a re-opened test fixture pick up where the
-            // previous session left off.
+            // Seed the registry's high-watermark AND applied-reserve cursor
+            // from the catalog so restarts in a re-opened test fixture pick up
+            // where the previous session left off — and so cluster-mode
+            // metadata-log replay skips already-applied reservations rather
+            // than double-counting `G`.
             if let Some(catalog) = credentials.catalog()
                 && let Ok(hwm) = catalog.get_surrogate_hwm()
+                && let Ok(reserve_index) = catalog.get_surrogate_reserve_index()
                 && let Ok(mut reg) = registry.write()
             {
-                *reg = crate::control::surrogate::SurrogateRegistry::from_persisted_hwm(hwm);
+                *reg = crate::control::surrogate::SurrogateRegistry::from_persisted(
+                    hwm,
+                    reserve_index,
+                );
             }
             let wal_appender: Arc<dyn crate::control::surrogate::SurrogateWalAppender> = Arc::new(
                 crate::control::surrogate::WalSurrogateAppender::new(wal_for_assigner),

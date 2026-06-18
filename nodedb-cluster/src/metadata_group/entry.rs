@@ -187,6 +187,28 @@ pub enum MetadataEntry {
         hwm: u32,
     },
 
+    /// Reserve a disjoint batch of surrogates for one node (HiLo).
+    ///
+    /// The carved `[start, end)` range is **not** carried in the entry:
+    /// it is computed AT APPLY by advancing the cluster-wide surrogate
+    /// global watermark on every node. Because every node applies the
+    /// metadata log in the same order against an identical watermark,
+    /// all nodes deterministically agree on which range this reservation
+    /// carves — guaranteeing globally-unique, disjoint surrogate batches
+    /// without any node ever minting a value another node also minted.
+    ///
+    /// `node_id` + `request_id` identify the requesting node and the
+    /// specific in-flight reservation so the owning node's host-side
+    /// applier can (a) install the carved batch locally and (b) fire the
+    /// completion signal that unblocks the waiting allocation path. Only
+    /// the owning node installs the batch; every other node merely
+    /// advances the watermark so future reservations stay disjoint.
+    SurrogateReserve {
+        node_id: u64,
+        request_id: u64,
+        batch_size: u32,
+    },
+
     /// Join-token lifecycle transition (L.4). Proposed by the
     /// bootstrap-listener handler on every state change so that all
     /// Raft peers can enforce single-use token semantics even after a

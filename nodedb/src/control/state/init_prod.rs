@@ -158,8 +158,15 @@ impl SharedState {
         // allocations cannot collide with pre-restart ones.
         let surrogate_registry_handle: crate::control::surrogate::SurrogateRegistryHandle = {
             let initial = if let Some(catalog) = credentials.catalog() {
+                // Seed BOTH the global watermark `G` and the applied-reserve
+                // cursor so cluster-mode metadata-log replay skips every
+                // `SurrogateReserve` already folded into `G` (no restart
+                // double-count). Single-node history has cursor 0, so the
+                // single-node path (which never proposes `SurrogateReserve`)
+                // is unaffected.
                 let hwm = catalog.get_surrogate_hwm()?;
-                crate::control::surrogate::SurrogateRegistry::from_persisted_hwm(hwm)
+                let reserve_index = catalog.get_surrogate_reserve_index()?;
+                crate::control::surrogate::SurrogateRegistry::from_persisted(hwm, reserve_index)
             } else {
                 crate::control::surrogate::SurrogateRegistry::new()
             };

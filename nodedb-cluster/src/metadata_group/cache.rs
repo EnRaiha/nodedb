@@ -135,6 +135,13 @@ impl MetadataCache {
                 // applier calls `SurrogateRegistry::restore_hwm`. The
                 // cluster cache has no surrogate state to track.
             }
+            MetadataEntry::SurrogateReserve { .. } => {
+                // Surrogate batch reservation is host-side only: the
+                // production applier advances the global watermark via
+                // `SurrogateRegistry::reserve_from_global` on every node
+                // and installs the batch on the owning node. The cluster
+                // cache has no surrogate state to track.
+            }
             MetadataEntry::JoinTokenTransition { .. } => {
                 // Token lifecycle transitions are enforced by the bootstrap-
                 // listener handler at apply time. The cluster cache records

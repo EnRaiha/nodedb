@@ -255,6 +255,59 @@ pub fn propose_surrogate_hwm(shared: &SharedState, hwm: u32) -> Result<u64, Erro
     Ok(log_index)
 }
 
+/// Propose a HiLo surrogate batch reservation to the metadata Raft group
+/// and wait for the commit (returns the assigned log index).
+///
+/// In single-node / no-cluster mode (no `metadata_raft` installed),
+/// returns `Ok(0)` immediately — single-node uses the local `alloc_one`
+/// path and never reaches here. Kept as a safety guard only.
+///
+/// The carved `[start, end)` range is NOT decided here: it is computed
+/// at apply time on every node by advancing the global watermark in
+/// identical log order (see `MetadataEntry::SurrogateReserve`). The
+/// caller therefore cannot learn the range from this commit-wait alone
+/// — `wait_for` returns on COMMIT, before the apply handler runs. The
+/// owning node's apply handler fires an explicit completion signal
+/// (`SurrogateAssigner::complete_reservation`) that the caller awaits
+/// separately to learn the range.
+///
+/// `node_id` + `request_id` identify this node's specific in-flight
+/// reservation so the apply handler routes the batch + signal back to it.
+pub fn propose_surrogate_reserve(
+    shared: &SharedState,
+    node_id: u64,
+    request_id: u64,
+    batch_size: u32,
+) -> Result<u64, Error> {
+    let Some(handle) = shared.metadata_raft.get() else {
+        return Ok(0);
+    };
+
+    let entry = MetadataEntry::SurrogateReserve {
+        node_id,
+        request_id,
+        batch_size,
+    };
+    let raw = encode_entry(&entry).map_err(|e| Error::Config {
+        detail: format!("surrogate_reserve encode: {e}"),
+    })?;
+
+    let log_index = handle.propose(raw)?;
+
+    let watcher = shared.applied_index_watcher(METADATA_GROUP_ID);
+    let outcome =
+        tokio::task::block_in_place(|| watcher.wait_for(log_index, DEFAULT_PROPOSE_TIMEOUT));
+    if !outcome.is_reached() {
+        return Err(Error::Config {
+            detail: format!(
+                "surrogate_reserve propose timed out waiting for log index {log_index}"
+            ),
+        });
+    }
+
+    Ok(log_index)
+}
+
 /// Propose a Lite client registration through the metadata Raft group and
 /// wait for it to be applied locally.
 ///
