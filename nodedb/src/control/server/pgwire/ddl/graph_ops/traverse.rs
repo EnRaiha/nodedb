@@ -16,6 +16,7 @@ use crate::engine::graph::traversal_options::GraphTraversalOptions;
 use crate::engine::graph::traversal_options::MAX_GRAPH_TRAVERSAL_DEPTH;
 use crate::types::TraceId;
 use nodedb_physical::physical_plan::GraphOp;
+use nodedb_types::DatabaseId;
 
 use super::response::payload_to_query_response;
 
@@ -131,6 +132,7 @@ pub async fn neighbors(
     match crate::control::server::broadcast::broadcast_to_all_cores(
         state,
         tenant_id,
+        DatabaseId::DEFAULT,
         plan,
         TraceId::ZERO,
     )

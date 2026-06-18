@@ -329,6 +329,7 @@ async fn dispatch_task(ctx: &DispatchCtx<'_>, mut task: PhysicalTask) -> crate::
         return broadcast_count_to_all_cores(
             ctx.state,
             task.tenant_id,
+            task.database_id,
             task.plan,
             TraceId::ZERO,
             "inserted",
@@ -346,6 +347,7 @@ async fn dispatch_task(ctx: &DispatchCtx<'_>, mut task: PhysicalTask) -> crate::
         return broadcast_count_to_all_cores(
             ctx.state,
             task.tenant_id,
+            task.database_id,
             task.plan,
             TraceId::ZERO,
             "dropped",

@@ -43,7 +43,7 @@ use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
-use crate::types::{TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::GraphOp;
 
 /// A fully-attributed edge crossed by the hop: `(src, label, dst)`.
@@ -263,6 +263,7 @@ async fn expand_local(
     let resp = crate::control::server::broadcast::broadcast_to_all_cores(
         shared,
         tenant_id,
+        DatabaseId::DEFAULT,
         plan,
         TraceId::ZERO,
     )

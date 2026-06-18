@@ -117,6 +117,7 @@ impl NodeDbPgHandler {
             return crate::control::server::broadcast::broadcast_count_to_all_cores(
                 &self.state,
                 task.tenant_id,
+                task.database_id,
                 task.plan,
                 TraceId::ZERO,
                 "inserted",
@@ -136,6 +137,7 @@ impl NodeDbPgHandler {
             return crate::control::server::broadcast::broadcast_count_to_all_cores(
                 &self.state,
                 task.tenant_id,
+                task.database_id,
                 task.plan,
                 TraceId::ZERO,
                 "dropped",

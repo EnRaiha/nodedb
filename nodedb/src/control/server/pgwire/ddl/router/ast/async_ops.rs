@@ -308,6 +308,7 @@ pub(super) async fn try_dispatch_async(
                 collection,
                 index_name.as_deref(),
                 *concurrent,
+                database_id,
             )
             .await,
         ),

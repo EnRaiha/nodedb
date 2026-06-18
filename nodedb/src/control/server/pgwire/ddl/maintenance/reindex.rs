@@ -29,6 +29,7 @@ pub async fn handle_reindex(
     collection: &str,
     index_name: Option<&str>,
     concurrent: bool,
+    database_id: DatabaseId,
 ) -> PgWireResult<Vec<Response>> {
     let collection = collection.to_lowercase();
     let index_name = index_name.map(str::to_lowercase);
@@ -37,7 +38,7 @@ pub async fn handle_reindex(
     // Verify the collection exists.
     if let Some(catalog) = state.credentials.catalog()
         && catalog
-            .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
+            .get_collection(database_id, tenant_id.as_u64(), &collection)
             .ok()
             .flatten()
             .is_none()
@@ -58,7 +59,11 @@ pub async fn handle_reindex(
         });
         let trace_id = TraceId::generate();
         crate::control::server::broadcast::broadcast_register_to_all_cores(
-            state, tenant_id, plan, trace_id,
+            state,
+            tenant_id,
+            database_id,
+            plan,
+            trace_id,
         )
         .await
         .map_err(|e| {

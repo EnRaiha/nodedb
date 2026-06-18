@@ -104,9 +104,15 @@ pub async fn show_graph_stats(
         as_of,
     });
 
-    let resp = broadcast_to_all_cores(state, identity.tenant_id, plan, TraceId::ZERO)
-        .await
-        .map_err(|e| sqlstate_error("58000", &format!("graph stats dispatch failed: {e}")))?;
+    let resp = broadcast_to_all_cores(
+        state,
+        identity.tenant_id,
+        DatabaseId::DEFAULT,
+        plan,
+        TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| sqlstate_error("58000", &format!("graph stats dispatch failed: {e}")))?;
 
     let merged: Vec<CollectionStats> = decode_merged_stats(resp.payload.as_bytes())
         .map_err(|e| sqlstate_error("XX000", &format!("graph stats decode failed: {e}")))?;

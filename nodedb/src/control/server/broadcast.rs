@@ -48,13 +48,14 @@ pub(crate) fn broadcast_call_count_increment() {
 pub async fn broadcast_to_all_cores(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
 ) -> crate::Result<Response> {
     let outcome = crate::control::server::exchange::gather_all_cores(
         shared,
         tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         plan,
         trace_id,
     )
@@ -75,6 +76,7 @@ pub async fn broadcast_to_all_cores(
 pub async fn broadcast_count_to_all_cores(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
     count_key: &str,
@@ -93,7 +95,7 @@ pub async fn broadcast_count_to_all_cores(
         let request = Request {
             request_id,
             tenant_id,
-            database_id: DatabaseId::DEFAULT,
+            database_id,
             vshard_id,
             plan: plan.clone(),
             deadline: Instant::now()
@@ -182,11 +184,10 @@ pub async fn broadcast_count_to_all_cores(
 pub async fn broadcast_register_to_all_cores(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
 ) -> crate::Result<()> {
-    use std::time::{Duration, Instant};
-
     let num_cores = shared
         .dispatcher
         .lock()
@@ -200,7 +201,7 @@ pub async fn broadcast_register_to_all_cores(
         let request = Request {
             request_id,
             tenant_id,
-            database_id: DatabaseId::DEFAULT,
+            database_id,
             vshard_id,
             plan: plan.clone(),
             deadline: Instant::now()

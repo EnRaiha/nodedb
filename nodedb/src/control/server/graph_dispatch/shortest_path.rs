@@ -13,7 +13,7 @@ use crate::bridge::envelope::{PhysicalPlan, Response};
 use crate::control::scatter_gather;
 use crate::control::state::SharedState;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
-use crate::types::{TenantId, TraceId};
+use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_physical::physical_plan::GraphOp;
 
 use super::helpers::{encode_path, ok_response};
@@ -75,6 +75,7 @@ pub async fn cross_core_shortest_path(
         let resp = crate::control::server::broadcast::broadcast_to_all_cores(
             shared,
             tenant_id,
+            DatabaseId::DEFAULT,
             plan,
             TraceId::ZERO,
         )

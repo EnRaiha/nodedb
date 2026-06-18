@@ -99,9 +99,15 @@ pub async fn create_graph_index(
         valid_at_ms: None,
         prefilter: None,
     });
-    let scan_resp = broadcast_to_all_cores(state, tenant_id, scan_plan, TraceId::ZERO)
-        .await
-        .map_err(|e| sqlstate_error("XX000", &format!("scan failed: {e}")))?;
+    let scan_resp = broadcast_to_all_cores(
+        state,
+        tenant_id,
+        DatabaseId::DEFAULT,
+        scan_plan,
+        TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &format!("scan failed: {e}")))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);

@@ -242,6 +242,7 @@ async fn dispatch_register_from_stored_inner(
     crate::control::server::broadcast::broadcast_register_to_all_cores(
         state,
         tenant_id,
+        coll.database_id,
         plan,
         TraceId::ZERO,
     )

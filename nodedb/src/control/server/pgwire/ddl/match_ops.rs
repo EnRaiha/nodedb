@@ -16,6 +16,7 @@ use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
 use crate::types::TraceId;
 use nodedb_physical::physical_plan::GraphOp;
+use nodedb_types::DatabaseId;
 
 use super::super::types::{sqlstate_error, text_field};
 
@@ -85,7 +86,15 @@ pub async fn match_query(
     });
 
     // Broadcast to all cores.
-    match broadcast::broadcast_to_all_cores(state, tenant_id, plan, TraceId::ZERO).await {
+    match broadcast::broadcast_to_all_cores(
+        state,
+        tenant_id,
+        DatabaseId::DEFAULT,
+        plan,
+        TraceId::ZERO,
+    )
+    .await
+    {
         Ok(resp) => match_payload_to_response(&resp.payload, &column_names),
         Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
     }
