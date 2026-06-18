@@ -51,6 +51,7 @@ pub(super) async fn dispatch_kv(
             dispatch_utils::dispatch_to_data_plane(
                 state,
                 session.tenant_id,
+                DatabaseId::DEFAULT,
                 vshard,
                 plan,
                 TraceId::ZERO,
@@ -95,6 +96,7 @@ pub(super) async fn dispatch_kv_write(
         None => dispatch_utils::dispatch_to_data_plane(
             state,
             session.tenant_id,
+            DatabaseId::DEFAULT,
             vshard,
             plan,
             TraceId::ZERO,

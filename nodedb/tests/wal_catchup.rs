@@ -87,6 +87,7 @@ impl TestStack {
         let resp = nodedb::control::server::dispatch_utils::dispatch_to_data_plane(
             &self.shared,
             TenantId::new(1),
+            DatabaseId::DEFAULT,
             VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection),
             plan,
             TraceId::ZERO,

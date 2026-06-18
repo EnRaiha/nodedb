@@ -132,6 +132,7 @@ pub async fn tree_sum(
             if let Ok(resp) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
                 state,
                 tenant_id,
+                crate::types::DatabaseId::DEFAULT,
                 coll_vshard,
                 get_plan,
                 TraceId::ZERO,

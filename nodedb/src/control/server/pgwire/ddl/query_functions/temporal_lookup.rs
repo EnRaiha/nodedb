@@ -57,10 +57,16 @@ pub async fn temporal_lookup(
         prefilter: None,
     });
 
-    let scan_resp =
-        dispatch_utils::dispatch_to_data_plane(state, tenant_id, vshard, scan_plan, TraceId::ZERO)
-            .await
-            .map_err(|e| sqlstate_error("XX000", &format!("scan failed: {e}")))?;
+    let scan_resp = dispatch_utils::dispatch_to_data_plane(
+        state,
+        tenant_id,
+        crate::types::DatabaseId::DEFAULT,
+        vshard,
+        scan_plan,
+        TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &format!("scan failed: {e}")))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);

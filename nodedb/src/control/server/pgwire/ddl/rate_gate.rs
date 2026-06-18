@@ -77,6 +77,7 @@ pub async fn rate_check(
         match crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
+            crate::types::DatabaseId::DEFAULT,
             vshard,
             check,
             TraceId::ZERO,
@@ -105,6 +106,7 @@ pub async fn rate_check(
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,
@@ -181,6 +183,7 @@ pub async fn rate_remaining(
     let current = match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,
@@ -239,6 +242,7 @@ pub async fn rate_reset(
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,
@@ -274,6 +278,7 @@ async fn read_ttl_ms(
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,

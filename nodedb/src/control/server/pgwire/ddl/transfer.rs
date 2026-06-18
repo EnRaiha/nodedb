@@ -69,6 +69,7 @@ pub async fn transfer(
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,
@@ -134,6 +135,7 @@ pub async fn transfer_item(
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard_src,
         plan,
         TraceId::ZERO,

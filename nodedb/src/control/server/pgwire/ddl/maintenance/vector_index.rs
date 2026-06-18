@@ -46,6 +46,7 @@ pub async fn handle_show_vector_index(
     let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,
@@ -131,6 +132,7 @@ pub async fn handle_alter_vector_index_seal(
     crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,
@@ -160,6 +162,7 @@ pub async fn handle_alter_vector_index_compact(
     crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,
@@ -317,6 +320,7 @@ pub async fn handle_alter_vector_index_set(
         crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
+            crate::types::DatabaseId::DEFAULT,
             vshard,
             set_plan,
             TraceId::ZERO,
@@ -337,6 +341,7 @@ pub async fn handle_alter_vector_index_set(
         crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
+            crate::types::DatabaseId::DEFAULT,
             vshard,
             plan,
             TraceId::ZERO,

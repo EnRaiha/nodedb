@@ -92,6 +92,7 @@ pub(crate) async fn handle_direct_op(
             match dispatch_utils::dispatch_to_data_plane(
                 ctx.state,
                 tenant_id,
+                crate::types::DatabaseId::DEFAULT,
                 vshard_id,
                 plan,
                 TraceId::ZERO,

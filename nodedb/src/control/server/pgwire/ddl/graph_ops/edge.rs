@@ -17,7 +17,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::server::{dispatch_utils, wal_dispatch};
 use crate::control::state::SharedState;
-use crate::types::{TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::GraphOp;
 
 /// Maximum byte length for an edge label string. Keeps a single `TYPE`
@@ -188,17 +188,18 @@ pub async fn set_node_labels(
         PhysicalPlan::Graph(GraphOp::SetNodeLabels { node_id, labels })
     };
 
-    wal_dispatch::wal_append_if_write(
-        &state.wal,
-        tenant_id,
-        vshard_id,
-        crate::types::DatabaseId::DEFAULT,
-        &plan,
-    )
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    wal_dispatch::wal_append_if_write(&state.wal, tenant_id, vshard_id, DatabaseId::DEFAULT, &plan)
+        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
-    match dispatch_utils::dispatch_to_data_plane(state, tenant_id, vshard_id, plan, TraceId::ZERO)
-        .await
+    match dispatch_utils::dispatch_to_data_plane(
+        state,
+        tenant_id,
+        DatabaseId::DEFAULT,
+        vshard_id,
+        plan,
+        TraceId::ZERO,
+    )
+    .await
     {
         Ok(_) => {
             let tag = if remove { "UNLABEL" } else { "LABEL" };

@@ -21,7 +21,7 @@ use nodedb_types::TenantId;
 
 use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::state::SharedState;
-use crate::types::{TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 
 /// Dispatch a pre-execution scan for the given collection and serialized
@@ -36,7 +36,7 @@ use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 pub async fn run_preexec_scan(
     shared: &SharedState,
     tenant_id: TenantId,
-    database_id: crate::types::DatabaseId,
+    database_id: DatabaseId,
     collection: &str,
     filter_bytes: Vec<u8>,
 ) -> crate::Result<Vec<u32>> {
@@ -60,8 +60,15 @@ pub async fn run_preexec_scan(
         prefilter: None,
     });
 
-    let response =
-        dispatch_to_data_plane(shared, tenant_id, vshard_id, scan_plan, TraceId::ZERO).await?;
+    let response = dispatch_to_data_plane(
+        shared,
+        tenant_id,
+        database_id,
+        vshard_id,
+        scan_plan,
+        TraceId::ZERO,
+    )
+    .await?;
 
     if response.status != crate::bridge::envelope::Status::Ok {
         return Err(crate::Error::Storage {

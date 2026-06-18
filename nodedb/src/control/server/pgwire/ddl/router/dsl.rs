@@ -266,6 +266,7 @@ pub(super) async fn dispatch(
                 match crate::control::server::dispatch_utils::dispatch_to_data_plane(
                     state,
                     tenant_id,
+                    database_id,
                     vshard,
                     plan,
                     TraceId::ZERO,

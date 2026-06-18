@@ -198,6 +198,7 @@ pub async fn create_index(
     let backfill_resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         backfill_plan,
         TraceId::ZERO,
@@ -357,6 +358,7 @@ pub async fn drop_index(
             if let Err(e) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
                 state,
                 tenant_id,
+                crate::types::DatabaseId::DEFAULT,
                 vshard,
                 plan,
                 TraceId::ZERO,

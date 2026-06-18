@@ -166,6 +166,7 @@ pub async fn weighted_pick(
                 if let Err(e) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
                     state,
                     tenant_id,
+                    DatabaseId::DEFAULT,
                     VShardId::from_collection_in_database(
                         DatabaseId::DEFAULT,
                         "_system_random_audit",
@@ -228,6 +229,7 @@ async fn scan_all_entries(
     let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,

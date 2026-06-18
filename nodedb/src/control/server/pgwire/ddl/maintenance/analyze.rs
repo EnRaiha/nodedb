@@ -88,6 +88,7 @@ pub async fn handle_analyze(
                 let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
                     state,
                     task.tenant_id,
+                    task.database_id,
                     task.vshard_id,
                     task.plan,
                     TraceId::ZERO,

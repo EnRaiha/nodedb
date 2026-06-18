@@ -96,6 +96,7 @@ pub async fn remote_write(
             None => crate::control::server::dispatch_utils::dispatch_to_data_plane(
                 &state.shared,
                 tenant_id,
+                DatabaseId::DEFAULT,
                 vshard,
                 plan,
                 TraceId::generate(),

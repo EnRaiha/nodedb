@@ -60,6 +60,7 @@ pub(super) async fn dispatch_task_via_gateway(
             dispatch_utils::dispatch_to_data_plane(
                 ctx.state,
                 tenant_id,
+                crate::types::DatabaseId::DEFAULT,
                 vshard_id,
                 plan,
                 TraceId::ZERO,

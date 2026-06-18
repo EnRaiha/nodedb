@@ -241,6 +241,7 @@ pub(super) async fn dispatch_plan(
     if let Err(e) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard_id,
         plan,
         TraceId::ZERO,
@@ -350,6 +351,7 @@ pub(super) async fn plan_and_dispatch(
         let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
+            task.database_id,
             task.vshard_id,
             task.plan,
             TraceId::ZERO,

@@ -89,6 +89,7 @@ fn current_timestamp_ms() -> u64 {
 pub async fn dispatch_to_data_plane(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     vshard_id: VShardId,
     plan: PhysicalPlan,
     trace_id: TraceId,
@@ -96,6 +97,7 @@ pub async fn dispatch_to_data_plane(
     dispatch_to_data_plane_with_source(
         shared,
         tenant_id,
+        database_id,
         vshard_id,
         plan,
         trace_id,
@@ -112,6 +114,7 @@ pub async fn dispatch_to_data_plane(
 pub async fn dispatch_to_data_plane_with_source(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     vshard_id: VShardId,
     plan: PhysicalPlan,
     trace_id: TraceId,
@@ -125,7 +128,7 @@ pub async fn dispatch_to_data_plane_with_source(
     // and already done upstream on the pgwire/native paths.
     let plan = match crate::control::server::exchange::resolve_exchange_in_plan(
         shared,
-        DatabaseId::DEFAULT,
+        database_id,
         tenant_id,
         plan,
         trace_id,
@@ -163,7 +166,7 @@ pub async fn dispatch_to_data_plane_with_source(
     let request = Request {
         request_id,
         tenant_id,
-        database_id: DatabaseId::DEFAULT,
+        database_id,
         vshard_id,
         plan,
         deadline: Instant::now() + Duration::from_secs(shared.tuning.network.default_deadline_secs),
@@ -233,7 +236,7 @@ pub async fn dispatch_to_data_plane_with_source(
         // CDC opt-in check for timeseries: skip publishing unless cdc_enabled.
         // Document collections always publish (backward compatible).
         let should_publish = if is_columnar_collection {
-            is_timeseries_cdc_enabled(shared, tenant_id, &collection)
+            is_timeseries_cdc_enabled(shared, database_id, tenant_id, &collection)
         } else {
             true
         };
@@ -398,10 +401,14 @@ fn extract_write_metadata(
 /// Returns `false` (CDC off) by default for timeseries to prevent
 /// high-cardinality metric streams from flooding the ChangeStream bus.
 /// Users opt in via `CREATE TIMESERIES name WITH (cdc = 'true')`.
-fn is_timeseries_cdc_enabled(shared: &SharedState, tenant_id: TenantId, collection: &str) -> bool {
+fn is_timeseries_cdc_enabled(
+    shared: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    collection: &str,
+) -> bool {
     if let Some(catalog) = shared.credentials.catalog()
-        && let Ok(Some(coll)) =
-            catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), collection)
+        && let Ok(Some(coll)) = catalog.get_collection(database_id, tenant_id.as_u64(), collection)
         && coll.collection_type.is_timeseries()
     {
         if let Some(config) = coll.get_timeseries_config()

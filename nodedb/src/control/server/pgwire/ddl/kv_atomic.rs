@@ -175,6 +175,7 @@ async fn dispatch_and_respond(
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,

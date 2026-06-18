@@ -129,6 +129,7 @@ pub async fn dispatch_sync_response(
     crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
         state,
         tenant_id,
+        DatabaseId::DEFAULT,
         vshard_id,
         plan,
         trace_id,

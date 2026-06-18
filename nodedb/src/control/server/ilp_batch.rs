@@ -183,6 +183,7 @@ async fn flush_ilp_batch_inner(
                 crate::control::server::dispatch_utils::dispatch_to_data_plane(
                     state,
                     tenant_id,
+                    DatabaseId::DEFAULT,
                     vshard_id,
                     plan,
                     TraceId::ZERO,

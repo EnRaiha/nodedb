@@ -43,6 +43,7 @@ pub async fn execute_sql(
                 crate::control::server::dispatch_utils::dispatch_to_data_plane(
                     shared,
                     task.tenant_id,
+                    task.database_id,
                     task.vshard_id,
                     task.plan,
                     trace_id,

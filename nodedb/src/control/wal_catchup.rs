@@ -19,7 +19,7 @@ use tracing::{debug, info};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
-use crate::types::{TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::TimeseriesOp;
 use nodedb_types::Lsn;
 
@@ -159,6 +159,7 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
         match crate::control::server::dispatch_utils::dispatch_to_data_plane(
             shared,
             tenant_id,
+            DatabaseId::DEFAULT,
             vshard_id,
             plan,
             TraceId::ZERO,

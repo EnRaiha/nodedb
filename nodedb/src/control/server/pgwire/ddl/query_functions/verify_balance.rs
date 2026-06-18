@@ -81,6 +81,7 @@ pub async fn verify_balance(
     let target_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         target_vshard,
         target_scan,
         TraceId::ZERO,
@@ -112,6 +113,7 @@ pub async fn verify_balance(
     let source_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        crate::types::DatabaseId::DEFAULT,
         source_vshard,
         source_scan,
         TraceId::ZERO,

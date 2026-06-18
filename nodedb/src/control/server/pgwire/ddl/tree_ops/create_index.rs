@@ -39,7 +39,7 @@ use crate::control::server::broadcast::broadcast_to_all_cores;
 use crate::control::server::pgwire::types::{sqlstate_error, text_field};
 use crate::control::server::{dispatch_utils, wal_dispatch};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp};
 
 use super::parse::parse_edge_columns;
@@ -192,7 +192,7 @@ pub async fn create_graph_index(
             &state.wal,
             tenant_id,
             shard,
-            crate::types::DatabaseId::DEFAULT,
+            DatabaseId::DEFAULT,
             &plan,
         ) {
             return surface_failure(
@@ -203,8 +203,15 @@ pub async fn create_graph_index(
             )
             .await;
         }
-        match dispatch_utils::dispatch_to_data_plane(state, tenant_id, shard, plan, TraceId::ZERO)
-            .await
+        match dispatch_utils::dispatch_to_data_plane(
+            state,
+            tenant_id,
+            DatabaseId::DEFAULT,
+            shard,
+            plan,
+            TraceId::ZERO,
+        )
+        .await
         {
             Ok(_) => committed_shards.push((shard, edges)),
             Err(e) => {
@@ -248,7 +255,7 @@ pub async fn create_graph_index(
 /// failure would be the exact pattern the forward-path bug had.
 async fn surface_failure(
     state: &SharedState,
-    tenant_id: crate::types::TenantId,
+    tenant_id: TenantId,
     committed: &[(VShardId, Vec<BatchEdge>)],
     cause: String,
 ) -> PgWireResult<Vec<Response>> {
@@ -264,6 +271,7 @@ async fn surface_failure(
                 dispatch_utils::dispatch_to_data_plane(
                     state,
                     tenant_id,
+                    DatabaseId::DEFAULT,
                     shard,
                     plan,
                     TraceId::ZERO,

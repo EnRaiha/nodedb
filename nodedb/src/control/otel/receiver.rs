@@ -22,7 +22,7 @@ use tracing::info;
 use super::proto;
 use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::state::SharedState;
-use crate::types::{TenantId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 
 /// Configuration for the OTLP receiver.
@@ -382,9 +382,10 @@ async fn ingest_ilp(
     dispatch_to_data_plane(
         shared,
         TenantId::new(1),
+        DatabaseId::DEFAULT,
         VShardId::new(0),
         plan,
-        nodedb_types::TraceId::ZERO,
+        TraceId::ZERO,
     )
     .await?;
     Ok(1)

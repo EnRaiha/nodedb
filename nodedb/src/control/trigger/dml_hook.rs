@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use sonic_rs;
 
 use crate::control::state::SharedState;
-use crate::types::{TenantId, TraceId};
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::DocumentOp;
 
 use super::registry::DmlEvent;
@@ -288,11 +288,12 @@ pub async fn fetch_old_row(
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
-    let vshard_id = crate::types::VShardId::from_key(document_id.as_bytes());
+    let vshard_id = VShardId::from_key(document_id.as_bytes());
 
     let resp = match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
+        DatabaseId::DEFAULT,
         vshard_id,
         plan,
         TraceId::ZERO,

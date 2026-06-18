@@ -115,6 +115,7 @@ async fn execute_select(
         let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
+            task.database_id,
             task.vshard_id,
             task.plan,
             TraceId::ZERO,
@@ -234,6 +235,7 @@ async fn dispatch_sql(
         crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
+            task.database_id,
             task.vshard_id,
             task.plan,
             TraceId::ZERO,

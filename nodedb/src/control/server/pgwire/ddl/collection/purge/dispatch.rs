@@ -34,6 +34,7 @@ pub async fn dispatch_unregister_collection(
     if let Err(e) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant,
+        crate::types::DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,

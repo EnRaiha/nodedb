@@ -48,7 +48,9 @@ pub async fn dispatch_route(
     version_set: &GatewayVersionSet,
 ) -> Result<Vec<Vec<u8>>, Error> {
     match route.decision {
-        RouteDecision::Local => dispatch_local(route, shared, tenant_id, trace_id).await,
+        RouteDecision::Local => {
+            dispatch_local(route, shared, tenant_id, database_id, trace_id).await
+        }
         RouteDecision::Remote { node_id, vshard_id } => {
             dispatch_remote(RemoteDispatchArgs {
                 plan: route.plan,
@@ -143,10 +145,19 @@ async fn dispatch_local(
     route: TaskRoute,
     shared: &Arc<SharedState>,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     trace_id: TraceId,
 ) -> Result<Vec<Vec<u8>>, Error> {
     let vshard_id = VShardId::new(route.vshard_id);
-    let resp = dispatch_to_data_plane(shared, tenant_id, vshard_id, route.plan, trace_id).await?;
+    let resp = dispatch_to_data_plane(
+        shared,
+        tenant_id,
+        database_id,
+        vshard_id,
+        route.plan,
+        trace_id,
+    )
+    .await?;
     Ok(vec![resp.payload.to_vec()])
 }
 

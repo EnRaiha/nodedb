@@ -359,6 +359,7 @@ async fn dispatch_and_respond_tag(
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         identity.tenant_id,
+        DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,
@@ -383,6 +384,7 @@ async fn dispatch_and_respond_json(
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         identity.tenant_id,
+        DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,
@@ -415,6 +417,7 @@ async fn dispatch_and_respond_rows(
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         identity.tenant_id,
+        DatabaseId::DEFAULT,
         vshard,
         plan,
         TraceId::ZERO,

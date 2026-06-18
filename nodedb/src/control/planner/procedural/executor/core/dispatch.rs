@@ -90,6 +90,7 @@ impl<'a> StatementExecutor<'a> {
                 crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
                     self.state,
                     task.tenant_id,
+                    task.database_id,
                     task.vshard_id,
                     task.plan,
                     TraceId::ZERO,
@@ -179,6 +180,7 @@ impl<'a> StatementExecutor<'a> {
                 crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
                     self.state,
                     task.tenant_id,
+                    task.database_id,
                     task.vshard_id,
                     task.plan,
                     TraceId::ZERO,
@@ -188,6 +190,7 @@ impl<'a> StatementExecutor<'a> {
             }
         } else {
             let tenant_id = tasks[0].tenant_id;
+            let database_id = tasks[0].database_id;
             let vshard_id = tasks[0].vshard_id;
             let plans: Vec<_> = tasks.into_iter().map(|t| t.plan).collect();
             let batch_plan = crate::bridge::envelope::PhysicalPlan::Meta(
@@ -196,6 +199,7 @@ impl<'a> StatementExecutor<'a> {
             crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
                 self.state,
                 tenant_id,
+                database_id,
                 vshard_id,
                 batch_plan,
                 TraceId::ZERO,

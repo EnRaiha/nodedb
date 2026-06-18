@@ -132,6 +132,7 @@ async fn enforce_subquery_check(
         let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
+            task.database_id,
             task.vshard_id,
             task.plan,
             TraceId::ZERO,

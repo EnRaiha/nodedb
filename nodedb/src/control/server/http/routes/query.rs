@@ -191,6 +191,7 @@ pub async fn query(
                     let response = dispatch_to_data_plane(
                         &state,
                         task.tenant_id,
+                        task.database_id,
                         task.vshard_id,
                         task.plan,
                         trace_id,
@@ -256,6 +257,7 @@ fn wal_append_if_write(
 async fn dispatch_to_data_plane(
     state: &AppState,
     tenant_id: crate::types::TenantId,
+    database_id: nodedb_types::DatabaseId,
     vshard_id: VShardId,
     plan: PhysicalPlan,
     trace_id: TraceId,
@@ -263,6 +265,7 @@ async fn dispatch_to_data_plane(
     crate::control::server::dispatch_utils::dispatch_to_data_plane(
         &state.shared,
         tenant_id,
+        database_id,
         vshard_id,
         plan,
         trace_id,
@@ -428,6 +431,7 @@ pub async fn query_ndjson(
                 crate::control::server::dispatch_utils::dispatch_to_data_plane(
                     &state.shared,
                     task.tenant_id,
+                    task.database_id,
                     task.vshard_id,
                     task.plan,
                     trace_id,

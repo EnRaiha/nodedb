@@ -16,7 +16,7 @@ use nodedb_types::sync::wire::array::{ArrayRejectMsg, ArrayRejectReason};
 use tracing::{error, warn};
 
 use crate::control::wal_replication::ReplicatedEntry;
-use crate::types::{TraceId, VShardId};
+use crate::types::{DatabaseId, TraceId, VShardId};
 
 use super::inbound::{InboundOutcome, OriginArrayInbound};
 use super::reject::build_reject;
@@ -138,6 +138,7 @@ impl OriginArrayInbound {
             match crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
                 self.shared(),
                 self.tenant_id(),
+                DatabaseId::DEFAULT,
                 vshard,
                 data_plane_op,
                 TraceId::ZERO,
