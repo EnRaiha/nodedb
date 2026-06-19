@@ -73,6 +73,7 @@ impl CoreLoop {
                                     super::text_extract::extract_indexable_text(&doc);
                                 if !text_content.is_empty() {
                                     let _ = self.inverted.index_document(
+                                        task.request.database_id.as_u64(),
                                         crate::types::TenantId::new(tid),
                                         collection,
                                         surrogate,

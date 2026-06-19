@@ -122,6 +122,7 @@ impl CoreLoop {
                     let text_content = extract_indexable_text(&doc);
                     if !text_content.is_empty() {
                         let _ = self.inverted.index_document(
+                            database_id,
                             TenantId::new(tid),
                             collection,
                             surrogate,
@@ -210,9 +211,12 @@ impl CoreLoop {
         match self.sparse.delete(database_id, tid, collection, row_key) {
             Ok(_) => {
                 if let Some(s) = crate::engine::document::store::doc_id_to_surrogate(row_key) {
-                    let _ = self
-                        .inverted
-                        .remove_document(TenantId::new(tid), collection, s);
+                    let _ = self.inverted.remove_document(
+                        database_id,
+                        TenantId::new(tid),
+                        collection,
+                        s,
+                    );
                 }
                 let _ =
                     self.sparse

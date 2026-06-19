@@ -33,46 +33,55 @@ use crate::posting::{Posting, QueryMode, TextSearchResult};
 use crate::search::phrase;
 use crate::search::query_parser::parse_query;
 
+/// Query and tuning parameters for a BM25 search.
+///
+/// The `(database_id, tid, collection)` scope is passed separately so the
+/// same struct can be shared by callers that hold the tenant id as either a
+/// raw `u64` (this crate) or a strongly-typed `TenantId` (the Origin wrapper).
+pub struct FtsSearchParams<'a> {
+    /// Raw query string (may contain `NOT <term>` / `-<term>` negation).
+    pub query: &'a str,
+    /// Maximum number of results to return.
+    pub top_k: usize,
+    /// When `true`, unmatched terms fall back to fuzzy (Levenshtein) lookup.
+    pub fuzzy_enabled: bool,
+    /// Boolean combination mode for multi-term queries (AND or OR).
+    pub mode: QueryMode,
+    /// Optional surrogate bitmap restricting the candidate set before scoring.
+    pub prefilter: Option<&'a SurrogateBitmap>,
+}
+
+/// Inputs to the AND-mode post-filter that drops BMW candidates which do not
+/// match at least `num_terms` of the analyzed query tokens.
+struct FilterAndModeParams<'a> {
+    database_id: u64,
+    tid: u64,
+    collection: &'a str,
+    query_tokens: &'a [String],
+    candidates: &'a [TextSearchResult],
+    num_terms: usize,
+}
+
 impl<B: FtsBackend> FtsIndex<B> {
-    /// Search the index using BM25 scoring.
+    /// Search the index with explicit boolean mode, fuzzy, and optional prefilter.
     ///
     /// Supports `NOT <term>` and `-<term>` negation in the query string.
     /// Returns `Err(FtsIndexError::InvalidQuery)` for ill-formed queries such
     /// as NOT-only queries or unsupported parenthesised groups.
     pub fn search(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
-        query: &str,
-        top_k: usize,
-        fuzzy_enabled: bool,
-        prefilter: Option<&SurrogateBitmap>,
+        params: FtsSearchParams<'_>,
     ) -> Result<Vec<TextSearchResult>, FtsIndexError<B::Error>> {
-        self.search_with_mode(
-            tid,
-            collection,
+        let FtsSearchParams {
             query,
             top_k,
             fuzzy_enabled,
-            QueryMode::And,
+            mode,
             prefilter,
-        )
-    }
-
-    /// Search with explicit boolean mode (AND or OR).
-    ///
-    /// Supports `NOT <term>` and `-<term>` negation in the query string.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_with_mode(
-        &self,
-        tid: u64,
-        collection: &str,
-        query: &str,
-        top_k: usize,
-        fuzzy_enabled: bool,
-        mode: QueryMode,
-        prefilter: Option<&SurrogateBitmap>,
-    ) -> Result<Vec<TextSearchResult>, FtsIndexError<B::Error>> {
+        } = params;
         // Parse the query for NOT / - negation operators before analysis.
         let parsed = parse_query(query)?;
 
@@ -84,7 +93,7 @@ impl<B: FtsBackend> FtsIndex<B> {
         let negative_raw_terms = parsed.negative;
 
         let base_tokens = self
-            .analyze_for_collection(tid, collection, &positive_raw)
+            .analyze_for_collection(database_id, tid, collection, &positive_raw)
             .map_err(FtsIndexError::backend)?;
         if base_tokens.is_empty() {
             return Ok(Vec::new());
@@ -92,20 +101,20 @@ impl<B: FtsBackend> FtsIndex<B> {
 
         let base_token_count = base_tokens.len();
         let query_tokens = self
-            .expand_query_with_synonyms(tid, base_tokens)
+            .expand_query_with_synonyms(database_id, tid, base_tokens)
             .map_err(FtsIndexError::backend)?;
         let num_query_terms = query_tokens.len();
         let and_threshold = base_token_count;
 
         let raw_tokens = if fuzzy_enabled {
-            self.tokenize_raw_for_collection(tid, collection, &positive_raw)
+            self.tokenize_raw_for_collection(database_id, tid, collection, &positive_raw)
                 .map_err(FtsIndexError::backend)?
         } else {
             Vec::new()
         };
 
         let (total_docs, avg_doc_len) = self
-            .index_stats(tid, collection)
+            .index_stats(database_id, tid, collection)
             .map_err(FtsIndexError::backend)?;
         if total_docs == 0 {
             return Ok(Vec::new());
@@ -114,7 +123,8 @@ impl<B: FtsBackend> FtsIndex<B> {
         // Build the negative-term exclusion set before scoring.
         // Negative terms are analyzed and synonym-expanded just like positive
         // terms. The result is a set of doc IDs that match any negative term.
-        let negative_set = self.build_negative_set(tid, collection, &negative_raw_terms)?;
+        let negative_set =
+            self.build_negative_set(database_id, tid, collection, &negative_raw_terms)?;
 
         let bmw_params = super::bmw::query::BmwParams {
             query_tokens: &query_tokens,
@@ -131,7 +141,7 @@ impl<B: FtsBackend> FtsIndex<B> {
             prefilter,
         };
         if let Ok(Some(bmw_results)) =
-            super::bmw::query::bmw_search(self, tid, collection, &bmw_params)
+            super::bmw::query::bmw_search(self, database_id, tid, collection, &bmw_params)
         {
             if mode == QueryMode::Or || and_threshold == 1 {
                 let mut results: Vec<TextSearchResult> = bmw_results
@@ -144,7 +154,14 @@ impl<B: FtsBackend> FtsIndex<B> {
             }
 
             let and_results = self
-                .filter_and_mode(tid, collection, &query_tokens, &bmw_results, and_threshold)
+                .filter_and_mode(FilterAndModeParams {
+                    database_id,
+                    tid,
+                    collection,
+                    query_tokens: &query_tokens,
+                    candidates: &bmw_results,
+                    num_terms: and_threshold,
+                })
                 .map_err(FtsIndexError::backend)?;
 
             if !and_results.is_empty() {
@@ -160,7 +177,13 @@ impl<B: FtsBackend> FtsIndex<B> {
                 .into_iter()
                 .filter(|r| !negative_set.contains(&r.doc_id))
                 .map(|mut r| {
-                    let matched = self.count_term_matches(tid, collection, &query_tokens, r.doc_id);
+                    let matched = self.count_term_matches(
+                        database_id,
+                        tid,
+                        collection,
+                        &query_tokens,
+                        r.doc_id,
+                    );
                     let coverage = matched as f32 / and_threshold as f32;
                     r.score *= coverage;
                     r
@@ -186,7 +209,7 @@ impl<B: FtsBackend> FtsIndex<B> {
         for (i, token) in query_tokens.iter().enumerate() {
             let postings = self
                 .backend
-                .read_postings(tid, collection, token)
+                .read_postings(database_id, tid, collection, token)
                 .map_err(FtsIndexError::backend)?;
             if !postings.is_empty() {
                 term_postings.push((postings, false));
@@ -196,7 +219,7 @@ impl<B: FtsBackend> FtsIndex<B> {
                     .map(String::as_str)
                     .unwrap_or(token.as_str());
                 let (fuzzy_posts, is_fuzzy) = self
-                    .fuzzy_lookup(tid, collection, raw)
+                    .fuzzy_lookup(database_id, tid, collection, raw)
                     .map_err(FtsIndexError::backend)?;
                 term_postings.push((fuzzy_posts, is_fuzzy));
             } else {
@@ -222,7 +245,7 @@ impl<B: FtsBackend> FtsIndex<B> {
 
                 let doc_len = self
                     .backend
-                    .read_doc_length(tid, collection, posting.doc_id)
+                    .read_doc_length(database_id, tid, collection, posting.doc_id)
                     .map_err(FtsIndexError::backend)?
                     .unwrap_or(1);
 
@@ -295,6 +318,7 @@ impl<B: FtsBackend> FtsIndex<B> {
     /// lookup, matching the same pipeline as positive terms.
     fn build_negative_set(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         raw_negative_terms: &[String],
@@ -306,7 +330,7 @@ impl<B: FtsBackend> FtsIndex<B> {
         // Analyze all negative terms together (join is safe for standard analyzer).
         let neg_raw = raw_negative_terms.join(" ");
         let neg_base_tokens = self
-            .analyze_for_collection(tid, collection, &neg_raw)
+            .analyze_for_collection(database_id, tid, collection, &neg_raw)
             .map_err(FtsIndexError::backend)?;
 
         if neg_base_tokens.is_empty() {
@@ -315,7 +339,7 @@ impl<B: FtsBackend> FtsIndex<B> {
 
         // Synonym-expand negative tokens so negating 'db' also excludes 'database'.
         let neg_tokens = self
-            .expand_query_with_synonyms(tid, neg_base_tokens)
+            .expand_query_with_synonyms(database_id, tid, neg_base_tokens)
             .map_err(FtsIndexError::backend)?;
 
         let mut excluded: std::collections::HashSet<Surrogate> = std::collections::HashSet::new();
@@ -323,6 +347,7 @@ impl<B: FtsBackend> FtsIndex<B> {
         // Collect postings from memtable + segments for each negative token.
         let term_blocks = crate::lsm::query::collect_merged_term_blocks(
             &self.backend,
+            database_id,
             tid,
             collection,
             self.memtable(),
@@ -343,7 +368,7 @@ impl<B: FtsBackend> FtsIndex<B> {
         for token in &neg_tokens {
             let postings = self
                 .backend
-                .read_postings(tid, collection, token)
+                .read_postings(database_id, tid, collection, token)
                 .map_err(FtsIndexError::backend)?;
             for posting in postings {
                 excluded.insert(posting.doc_id);
@@ -355,14 +380,19 @@ impl<B: FtsBackend> FtsIndex<B> {
 
     fn filter_and_mode(
         &self,
-        tid: u64,
-        collection: &str,
-        query_tokens: &[String],
-        candidates: &[TextSearchResult],
-        num_terms: usize,
+        params: FilterAndModeParams<'_>,
     ) -> Result<Vec<TextSearchResult>, B::Error> {
+        let FilterAndModeParams {
+            database_id,
+            tid,
+            collection,
+            query_tokens,
+            candidates,
+            num_terms,
+        } = params;
         let term_blocks = crate::lsm::query::collect_merged_term_blocks(
             &self.backend,
+            database_id,
             tid,
             collection,
             self.memtable(),
@@ -386,6 +416,7 @@ impl<B: FtsBackend> FtsIndex<B> {
 
     fn count_term_matches(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         query_tokens: &[String],
@@ -393,6 +424,7 @@ impl<B: FtsBackend> FtsIndex<B> {
     ) -> usize {
         let term_blocks = match crate::lsm::query::collect_merged_term_blocks(
             &self.backend,
+            database_id,
             tid,
             collection,
             self.memtable(),
@@ -434,12 +466,14 @@ impl<B: FtsBackend> FtsIndex<B> {
 mod tests {
     use nodedb_types::{Surrogate, SurrogateBitmap};
 
+    use super::FtsSearchParams;
     use crate::backend::memory::MemoryBackend;
     use crate::index::FtsIndex;
     use crate::index::error::FtsIndexError;
     use crate::posting::QueryMode;
     use crate::search::query_parser::InvalidQuery;
 
+    const DB: u64 = 0;
     const T: u64 = 1;
     const D1: Surrogate = Surrogate(1);
     const D2: Surrogate = Surrogate(2);
@@ -447,11 +481,17 @@ mod tests {
 
     fn make_index() -> FtsIndex<MemoryBackend> {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "The quick brown fox jumps over the lazy dog")
+        idx.index_document(
+            DB,
+            T,
+            "docs",
+            D1,
+            "The quick brown fox jumps over the lazy dog",
+        )
+        .unwrap();
+        idx.index_document(DB, T, "docs", D2, "A fast brown dog runs across the field")
             .unwrap();
-        idx.index_document(T, "docs", D2, "A fast brown dog runs across the field")
-            .unwrap();
-        idx.index_document(T, "docs", D3, "Rust programming language for systems")
+        idx.index_document(DB, T, "docs", D3, "Rust programming language for systems")
             .unwrap();
         idx
     }
@@ -459,7 +499,20 @@ mod tests {
     #[test]
     fn basic_search() {
         let idx = make_index();
-        let results = idx.search(T, "docs", "brown fox", 10, false, None).unwrap();
+        let results = idx
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "brown fox",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
+            .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].doc_id, D1);
     }
@@ -467,13 +520,24 @@ mod tests {
     #[test]
     fn search_with_stemming() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "running distributed databases")
+        idx.index_document(DB, T, "docs", D1, "running distributed databases")
             .unwrap();
-        idx.index_document(T, "docs", D2, "the cat sat on a mat")
+        idx.index_document(DB, T, "docs", D2, "the cat sat on a mat")
             .unwrap();
 
         let results = idx
-            .search(T, "docs", "database distribution", 10, false, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "database distribution",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
             .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].doc_id, D1);
@@ -483,7 +547,18 @@ mod tests {
     fn or_mode() {
         let idx = make_index();
         let results = idx
-            .search_with_mode(T, "docs", "brown fox", 10, false, QueryMode::Or, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "brown fox",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::Or,
+                    prefilter: None,
+                },
+            )
             .unwrap();
         assert!(results.len() >= 2);
     }
@@ -491,20 +566,23 @@ mod tests {
     #[test]
     fn and_mode_filters() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "Rust programming language")
+        idx.index_document(DB, T, "docs", D1, "Rust programming language")
             .unwrap();
-        idx.index_document(T, "docs", D2, "Python programming language")
+        idx.index_document(DB, T, "docs", D2, "Python programming language")
             .unwrap();
 
         let results = idx
-            .search_with_mode(
+            .search(
+                DB,
                 T,
                 "docs",
-                "rust programming",
-                10,
-                false,
-                QueryMode::And,
-                None,
+                FtsSearchParams {
+                    query: "rust programming",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
             )
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -514,13 +592,24 @@ mod tests {
     #[test]
     fn and_fallback_to_or() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "rust programming language")
+        idx.index_document(DB, T, "docs", D1, "rust programming language")
             .unwrap();
-        idx.index_document(T, "docs", D2, "python programming language")
+        idx.index_document(DB, T, "docs", D2, "python programming language")
             .unwrap();
 
         let results = idx
-            .search(T, "docs", "rust python", 10, false, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust python",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
             .unwrap();
         assert_eq!(results.len(), 2);
         for r in &results {
@@ -531,13 +620,24 @@ mod tests {
     #[test]
     fn and_no_fallback_when_results_exist() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "rust programming language")
+        idx.index_document(DB, T, "docs", D1, "rust programming language")
             .unwrap();
-        idx.index_document(T, "docs", D2, "python programming language")
+        idx.index_document(DB, T, "docs", D2, "python programming language")
             .unwrap();
 
         let results = idx
-            .search(T, "docs", "rust programming", 10, false, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust programming",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc_id, D1);
@@ -546,38 +646,86 @@ mod tests {
     #[test]
     fn empty_query() {
         let idx = make_index();
-        let results = idx.search(T, "docs", "the a is", 10, false, None).unwrap();
+        let results = idx
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "the a is",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
+            .unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn collections_isolated() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "col_a", D1, "alpha bravo charlie")
+        idx.index_document(DB, T, "col_a", D1, "alpha bravo charlie")
             .unwrap();
-        idx.index_document(T, "col_b", D1, "delta echo foxtrot")
+        idx.index_document(DB, T, "col_b", D1, "delta echo foxtrot")
             .unwrap();
 
         assert_eq!(
-            idx.search(T, "col_a", "alpha", 10, false, None)
-                .unwrap()
-                .len(),
+            idx.search(
+                DB,
+                T,
+                "col_a",
+                FtsSearchParams {
+                    query: "alpha",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None
+                }
+            )
+            .unwrap()
+            .len(),
             1
         );
         assert!(
-            idx.search(T, "col_b", "alpha", 10, false, None)
-                .unwrap()
-                .is_empty()
+            idx.search(
+                DB,
+                T,
+                "col_b",
+                FtsSearchParams {
+                    query: "alpha",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None
+                }
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
     #[test]
     fn fuzzy_search() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "distributed database systems")
+        idx.index_document(DB, T, "docs", D1, "distributed database systems")
             .unwrap();
 
-        let results = idx.search(T, "docs", "databse", 10, true, None).unwrap();
+        let results = idx
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "databse",
+                    top_k: 10,
+                    fuzzy_enabled: true,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
+            .unwrap();
         assert!(!results.is_empty());
         assert!(results[0].fuzzy);
     }
@@ -585,13 +733,24 @@ mod tests {
     #[test]
     fn phrase_boost_consecutive() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "the quick brown fox jumped")
+        idx.index_document(DB, T, "docs", D1, "the quick brown fox jumped")
             .unwrap();
-        idx.index_document(T, "docs", D2, "a brown dog chased a fox")
+        idx.index_document(DB, T, "docs", D2, "a brown dog chased a fox")
             .unwrap();
 
         let results = idx
-            .search_with_mode(T, "docs", "brown fox", 10, false, QueryMode::Or, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "brown fox",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::Or,
+                    prefilter: None,
+                },
+            )
             .unwrap();
         assert!(results.len() >= 2);
         assert_eq!(results[0].doc_id, D1);
@@ -600,20 +759,62 @@ mod tests {
     #[test]
     fn phrase_boost_no_effect_single_term() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "hello world").unwrap();
+        idx.index_document(DB, T, "docs", D1, "hello world")
+            .unwrap();
 
-        let results = idx.search(T, "docs", "hello", 10, false, None).unwrap();
+        let results = idx
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "hello",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn tenants_isolated() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(1, "docs", D1, "alpha bravo").unwrap();
-        idx.index_document(2, "docs", D1, "charlie delta").unwrap();
+        idx.index_document(DB, 1, "docs", D1, "alpha bravo")
+            .unwrap();
+        idx.index_document(DB, 2, "docs", D1, "charlie delta")
+            .unwrap();
 
-        let r1 = idx.search(1, "docs", "alpha", 10, false, None).unwrap();
-        let r2 = idx.search(2, "docs", "alpha", 10, false, None).unwrap();
+        let r1 = idx
+            .search(
+                DB,
+                1,
+                "docs",
+                FtsSearchParams {
+                    query: "alpha",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
+            .unwrap();
+        let r2 = idx
+            .search(
+                DB,
+                2,
+                "docs",
+                FtsSearchParams {
+                    query: "alpha",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
+            .unwrap();
         assert_eq!(r1.len(), 1);
         assert!(r2.is_empty());
     }
@@ -622,17 +823,30 @@ mod tests {
     fn prefilter_excludes_non_member_surrogates() {
         let idx = FtsIndex::new(MemoryBackend::new());
 
-        idx.index_document(T, "docs", D1, "rust language system")
+        idx.index_document(DB, T, "docs", D1, "rust language system")
             .unwrap();
-        idx.index_document(T, "docs", D2, "rust rust rust rust rust")
+        idx.index_document(DB, T, "docs", D2, "rust rust rust rust rust")
             .unwrap();
-        idx.index_document(T, "docs", D3, "rust rust rust rust rust rust")
+        idx.index_document(DB, T, "docs", D3, "rust rust rust rust rust rust")
             .unwrap();
 
         let mut bm = SurrogateBitmap::new();
         bm.insert(D1);
 
-        let results = idx.search(T, "docs", "rust", 10, false, Some(&bm)).unwrap();
+        let results = idx
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: Some(&bm),
+                },
+            )
+            .unwrap();
 
         assert_eq!(results.len(), 1, "only D1 should be returned");
         assert_eq!(results[0].doc_id, D1);
@@ -646,7 +860,20 @@ mod tests {
             "D3 must be excluded"
         );
 
-        let all_results = idx.search(T, "docs", "rust", 10, false, None).unwrap();
+        let all_results = idx
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
+            .unwrap();
         assert_eq!(all_results.len(), 3, "all docs returned without prefilter");
         assert!(
             all_results[0].doc_id == D2 || all_results[0].doc_id == D3,
@@ -655,7 +882,18 @@ mod tests {
 
         let empty_bm = SurrogateBitmap::new();
         let empty_results = idx
-            .search(T, "docs", "rust", 10, false, Some(&empty_bm))
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: Some(&empty_bm),
+                },
+            )
             .unwrap();
         assert!(empty_results.is_empty(), "empty prefilter → no results");
 
@@ -663,7 +901,18 @@ mod tests {
         bm23.insert(D2);
         bm23.insert(D3);
         let results23 = idx
-            .search(T, "docs", "rust", 10, false, Some(&bm23))
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: Some(&bm23),
+                },
+            )
             .unwrap();
         assert_eq!(results23.len(), 2);
         assert!(!results23.iter().any(|r| r.doc_id == D1));
@@ -675,15 +924,26 @@ mod tests {
     fn not_keyword_excludes_documents() {
         let idx = FtsIndex::new(MemoryBackend::new());
         // D1: rust + python, D2: rust + ruby, D3: python + ruby
-        idx.index_document(T, "docs", D1, "rust python programming")
+        idx.index_document(DB, T, "docs", D1, "rust python programming")
             .unwrap();
-        idx.index_document(T, "docs", D2, "rust ruby programming")
+        idx.index_document(DB, T, "docs", D2, "rust ruby programming")
             .unwrap();
-        idx.index_document(T, "docs", D3, "python ruby programming")
+        idx.index_document(DB, T, "docs", D3, "python ruby programming")
             .unwrap();
 
         let results = idx
-            .search(T, "docs", "rust NOT python", 10, false, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust NOT python",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
             .unwrap();
         // Must include D2 (rust, no python), must not include D1 (has python).
         assert!(
@@ -699,15 +959,26 @@ mod tests {
     #[test]
     fn dash_prefix_excludes_documents() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "rust python programming")
+        idx.index_document(DB, T, "docs", D1, "rust python programming")
             .unwrap();
-        idx.index_document(T, "docs", D2, "rust ruby programming")
+        idx.index_document(DB, T, "docs", D2, "rust ruby programming")
             .unwrap();
-        idx.index_document(T, "docs", D3, "python ruby programming")
+        idx.index_document(DB, T, "docs", D3, "python ruby programming")
             .unwrap();
 
         let results = idx
-            .search(T, "docs", "rust -python", 10, false, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust -python",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
             .unwrap();
         assert!(results.iter().any(|r| r.doc_id == D2));
         assert!(!results.iter().any(|r| r.doc_id == D1));
@@ -716,15 +987,26 @@ mod tests {
     #[test]
     fn multiple_not_excludes_all_negated() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "rust python programming")
+        idx.index_document(DB, T, "docs", D1, "rust python programming")
             .unwrap();
-        idx.index_document(T, "docs", D2, "rust ruby programming")
+        idx.index_document(DB, T, "docs", D2, "rust ruby programming")
             .unwrap();
-        idx.index_document(T, "docs", D3, "rust systems programming")
+        idx.index_document(DB, T, "docs", D3, "rust systems programming")
             .unwrap();
 
         let results = idx
-            .search(T, "docs", "rust NOT python NOT ruby", 10, false, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust NOT python NOT ruby",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
             .unwrap();
         // Only D3 has neither python nor ruby.
         assert!(results.iter().any(|r| r.doc_id == D3));
@@ -735,13 +1017,38 @@ mod tests {
     #[test]
     fn not_nonexistent_term_returns_all_positives() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "rust programming")
+        idx.index_document(DB, T, "docs", D1, "rust programming")
             .unwrap();
-        idx.index_document(T, "docs", D2, "rust systems").unwrap();
+        idx.index_document(DB, T, "docs", D2, "rust systems")
+            .unwrap();
 
-        let results_plain = idx.search(T, "docs", "rust", 10, false, None).unwrap();
+        let results_plain = idx
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
+            .unwrap();
         let results_not = idx
-            .search(T, "docs", "rust NOT nonexistentxyz", 10, false, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust NOT nonexistentxyz",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
             .unwrap();
 
         let plain_ids: std::collections::HashSet<Surrogate> =
@@ -757,11 +1064,22 @@ mod tests {
     #[test]
     fn negative_only_returns_invalid_query_error() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "python programming")
+        idx.index_document(DB, T, "docs", D1, "python programming")
             .unwrap();
 
         let err = idx
-            .search(T, "docs", "NOT python", 10, false, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "NOT python",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
             .unwrap_err();
         assert!(
             matches!(err, FtsIndexError::InvalidQuery(InvalidQuery::NegativeOnly)),
@@ -772,11 +1090,22 @@ mod tests {
     #[test]
     fn parentheses_after_not_returns_invalid_query_error() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "rust programming")
+        idx.index_document(DB, T, "docs", D1, "rust programming")
             .unwrap();
 
         let err = idx
-            .search(T, "docs", "rust NOT (python OR ruby)", 10, false, None)
+            .search(
+                DB,
+                T,
+                "docs",
+                FtsSearchParams {
+                    query: "rust NOT (python OR ruby)",
+                    top_k: 10,
+                    fuzzy_enabled: false,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
             .unwrap_err();
         assert!(
             matches!(

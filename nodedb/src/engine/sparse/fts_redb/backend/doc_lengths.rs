@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Per-document token-length operations against `DOC_LENGTHS`
-//! keyed by `(tenant_id, collection, surrogate_u32)`.
+//! keyed by `(database_id, tenant_id, collection, surrogate_u32)`.
 
 use nodedb_types::Surrogate;
 
@@ -11,6 +11,7 @@ use crate::engine::sparse::fts_redb::tables::DOC_LENGTHS;
 
 pub(super) fn read(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     doc_id: Surrogate,
@@ -22,7 +23,7 @@ pub(super) fn read(
     let table = read_txn
         .open_table(DOC_LENGTHS)
         .map_err(|e| redb_err("open doc_lengths", e))?;
-    match table.get((tid, collection, doc_id.as_u32())) {
+    match table.get((database_id, tid, collection, doc_id.as_u32())) {
         Ok(Some(val)) => {
             let len: u32 = zerompk::from_msgpack(val.value())
                 .map_err(|e| redb_err("deserialize doc_length", e))?;
@@ -35,6 +36,7 @@ pub(super) fn read(
 
 pub(super) fn write(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     doc_id: Surrogate,
@@ -51,7 +53,10 @@ pub(super) fn write(
         let bytes =
             zerompk::to_msgpack_vec(&length).map_err(|e| redb_err("serialize doc_len", e))?;
         table
-            .insert((tid, collection, doc_id.as_u32()), bytes.as_slice())
+            .insert(
+                (database_id, tid, collection, doc_id.as_u32()),
+                bytes.as_slice(),
+            )
             .map_err(|e| redb_err("insert doc_len", e))?;
     }
     write_txn.commit().map_err(|e| redb_err("commit", e))?;
@@ -60,6 +65,7 @@ pub(super) fn write(
 
 pub(super) fn remove(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     doc_id: Surrogate,
@@ -72,7 +78,7 @@ pub(super) fn remove(
         let mut table = write_txn
             .open_table(DOC_LENGTHS)
             .map_err(|e| redb_err("open doc_lengths", e))?;
-        let _ = table.remove((tid, collection, doc_id.as_u32()));
+        let _ = table.remove((database_id, tid, collection, doc_id.as_u32()));
     }
     write_txn.commit().map_err(|e| redb_err("commit", e))?;
     Ok(())

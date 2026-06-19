@@ -68,6 +68,7 @@ impl CoreLoop {
                 // Revert inverted index — best-effort; FTS index inconsistency is
                 // recoverable via re-index, unlike primary store inconsistency.
                 let _ = self.inverted.remove_document(
+                    crate::types::DatabaseId::DEFAULT.as_u64(),
                     crate::types::TenantId::new(tid),
                     &collection,
                     surrogate,

@@ -9,6 +9,7 @@
 use nodedb_types::TenantId;
 
 use super::core::InvertedIndex;
+use crate::engine::sparse::fts_redb::CompactCommit;
 
 impl InvertedIndex {
     /// Atomically write a new merged FTS segment and remove the source segments
@@ -18,37 +19,24 @@ impl InvertedIndex {
     /// segments remain intact for the next maintenance pass. The single
     /// transaction also guarantees that no reader observes both the new and
     /// the old segments simultaneously.
-    pub fn compact_commit(
-        &self,
-        tid: TenantId,
-        collection: &str,
-        new_segment_id: &str,
-        new_segment_data: &[u8],
-        merged_ids: &[String],
-    ) -> crate::Result<()> {
-        self.inner.backend().compact_commit(
-            tid.as_u64(),
-            collection,
-            new_segment_id,
-            new_segment_data,
-            merged_ids,
-        )
+    pub fn compact_commit(&self, params: CompactCommit<'_>) -> crate::Result<()> {
+        self.inner.backend().compact_commit(params)
     }
 
-    /// Enumerate every `(TenantId, collection)` pair that has at least one
-    /// FTS segment in the backing store.
+    /// Enumerate every `(database_id, TenantId, collection)` triple that has at
+    /// least one FTS segment in the backing store.
     ///
     /// Used by the maintenance cycle to discover compaction candidates
     /// without requiring a separate in-memory registry of FTS-indexed
     /// collections.
-    pub fn list_all_fts_collections(&self) -> crate::Result<Vec<(TenantId, String)>> {
+    pub fn list_all_fts_collections(&self) -> crate::Result<Vec<(u64, TenantId, String)>> {
         self.inner
             .backend()
             .list_all_fts_collections()
-            .map(|pairs| {
-                pairs
+            .map(|triples| {
+                triples
                     .into_iter()
-                    .map(|(t, c)| (TenantId::new(t), c))
+                    .map(|(d, t, c)| (d, TenantId::new(t), c))
                     .collect()
             })
     }

@@ -10,8 +10,15 @@ impl<B: FtsBackend> FtsIndex<B> {
     ///
     /// Returns `(total_docs, avg_doc_len)`. If the collection is empty,
     /// returns `(0, 1.0)` to avoid division by zero.
-    pub fn index_stats(&self, tid: u64, collection: &str) -> Result<(u32, f32), B::Error> {
-        let (count, total_len) = self.backend.collection_stats(tid, collection)?;
+    pub fn index_stats(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> Result<(u32, f32), B::Error> {
+        let (count, total_len) = self
+            .backend
+            .collection_stats(database_id, tid, collection)?;
         let avg = if count > 0 {
             total_len as f32 / count as f32
         } else {
@@ -27,12 +34,13 @@ mod tests {
     use crate::index::FtsIndex;
     use nodedb_types::Surrogate;
 
+    const DB: u64 = 0;
     const T: u64 = 1;
 
     #[test]
     fn empty_collection_stats() {
         let idx: FtsIndex<MemoryBackend> = FtsIndex::new(MemoryBackend::new());
-        let (count, avg) = idx.index_stats(T, "empty").unwrap();
+        let (count, avg) = idx.index_stats(DB, T, "empty").unwrap();
         assert_eq!(count, 0);
         assert!((avg - 1.0).abs() < f32::EPSILON);
     }
@@ -40,12 +48,12 @@ mod tests {
     #[test]
     fn stats_after_indexing() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", Surrogate(1), "hello world greeting")
+        idx.index_document(DB, T, "docs", Surrogate(1), "hello world greeting")
             .unwrap();
-        idx.index_document(T, "docs", Surrogate(2), "hello rust")
+        idx.index_document(DB, T, "docs", Surrogate(2), "hello rust")
             .unwrap();
 
-        let (count, avg) = idx.index_stats(T, "docs").unwrap();
+        let (count, avg) = idx.index_stats(DB, T, "docs").unwrap();
         assert_eq!(count, 2);
         assert!(avg > 0.0);
     }

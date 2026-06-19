@@ -168,7 +168,6 @@ impl CoreLoop {
             array_segment_kek: None,
             governor: None,
             maintenance_budget: None,
-            tenant_database_map: std::collections::HashMap::new(),
             spsc_read_depth: SPSC_READ_DEPTH_NORMAL,
             pressure_suspend_reads: false,
             pressure_normal_ticks: 0,

@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Three-source hybrid search handler: vector + BM25 text + graph BFS, fused via weighted RRF.
-//!
-//! Pipeline:
-//! 1. Vector search from the HNSW index — top-K by distance.
-//! 2. BM25 full-text search from the inverted index — top-K by score.
-//! 3. Graph BFS from `graph_seed_id` up to `graph_depth` hops — scored by hop distance.
-//! 4. All three ranked lists are fused via `reciprocal_rank_fusion_weighted` with
-//!    per-source k-constants `(vector_k, text_k, graph_k)`.
-//! 5. Final top-K fused results are materialised with per-source rank diagnostics.
+//! Hybrid (vector + text) search handler for the Data Plane CoreLoop.
 
 use tracing::debug;
 
@@ -16,72 +8,78 @@ use nodedb_fts::FtsSearchParams;
 use nodedb_fts::posting::QueryMode;
 
 use crate::bridge::envelope::{ErrorCode, Response};
-use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::graph_rag::graph_nodes_to_ranked_results;
-use crate::data::executor::task::ExecutionTask;
-use crate::engine::graph::edge_store::Direction;
 
-/// Parameters for [`CoreLoop::execute_hybrid_search_triple`].
-pub(in crate::data::executor) struct HybridSearchTripleParams<'a> {
+use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::task::ExecutionTask;
+use crate::types::TenantId;
+
+/// Default hybrid search weight: 0.5 = equal vector + text.
+const DEFAULT_VECTOR_WEIGHT: f32 = 0.5;
+
+/// Parameters for [`CoreLoop::execute_hybrid_search`].
+pub(in crate::data::executor) struct HybridSearchParams<'a> {
     pub tid: u64,
     pub collection: &'a str,
     pub query_vector: &'a [f32],
     pub query_text: &'a str,
-    pub graph_seed_id: &'a str,
-    pub graph_depth: usize,
-    pub graph_edge_label: Option<&'a str>,
     pub top_k: usize,
     pub ef_search: usize,
     pub fuzzy: bool,
-    pub rrf_k: (f64, f64, f64),
+    pub vector_weight: f32,
     pub filter_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
     pub rls_filters: &'a [u8],
     pub score_alias: Option<&'a str>,
 }
 
 impl CoreLoop {
-    /// Execute a three-source hybrid search: vector + BM25 text + graph BFS, fused via RRF.
+    /// Execute a hybrid search: vector + text, fused via weighted RRF.
     ///
-    /// `rrf_k` is `(vector_k, text_k, graph_k)`. Lower k → steeper rank discount → more
-    /// influence from that source.
-    pub(in crate::data::executor) fn execute_hybrid_search_triple(
+    /// `score_alias` overrides the response field name for the RRF score
+    /// column. When `None` the executor uses the fixed default `rrf_score`.
+    pub(in crate::data::executor) fn execute_hybrid_search(
         &self,
         task: &ExecutionTask,
-        params: HybridSearchTripleParams<'_>,
+        params: HybridSearchParams<'_>,
     ) -> Response {
-        let HybridSearchTripleParams {
+        let HybridSearchParams {
             tid,
             collection,
             query_vector,
             query_text,
-            graph_seed_id,
-            graph_depth,
-            graph_edge_label,
             top_k,
             ef_search,
             fuzzy,
-            rrf_k,
+            vector_weight,
             filter_bitmap,
             rls_filters,
             score_alias,
         } = params;
-        let tenant_id = crate::types::TenantId::new(tid);
+        let tenant_id = TenantId::new(tid);
         debug!(
             core = self.core_id,
             tid,
             %collection,
             %query_text,
-            %graph_seed_id,
-            graph_depth,
             top_k,
-            "hybrid search triple"
+            vector_weight,
+            "hybrid search"
         );
 
+        // Scan-quiesce gate.
         let _scan_guard = match self.acquire_scan_guard(task, tid, collection) {
             Ok(g) => g,
             Err(resp) => return resp,
         };
 
+        let weight = if vector_weight <= 0.0 || vector_weight >= 1.0 {
+            DEFAULT_VECTOR_WEIGHT
+        } else {
+            vector_weight
+        };
+        let text_weight = 1.0 - weight;
+
+        // Fetch more candidates than top_k from each engine so RRF has
+        // enough material to fuse. 3x is a good balance.
         let fetch_k = top_k.saturating_mul(3).max(20);
 
         // 1. Vector search.
@@ -113,7 +111,7 @@ impl CoreLoop {
             Vec::new()
         };
 
-        // 2. BM25 text search.
+        // 2. Text search (no surrogate prefilter for the text leg of hybrid search).
         let text_results = self
             .inverted
             .search(
@@ -130,22 +128,26 @@ impl CoreLoop {
             )
             .unwrap_or_default();
 
-        // 3. Graph BFS from seed node.
-        let edge_label_owned = graph_edge_label.map(str::to_string);
-        let (graph_expanded, hop_distances, _bfs_truncated) = self.bfs_with_distances(
-            task.request.database_id.as_u64(),
-            tid,
-            &[graph_seed_id],
-            graph_edge_label,
-            Direction::Out,
-            graph_depth,
-            self.query_tuning.bfs_memory_budget_bytes / self.query_tuning.bfs_bytes_per_node,
-        );
-
-        // 4. Build ranked lists.
+        // 3. Build ranked lists for weighted RRF.
+        // Higher weight → lower k → steeper rank discount → more influence.
         use crate::query::fusion::{RankedResult, reciprocal_rank_fusion_weighted};
-        let _ = edge_label_owned; // consumed above
 
+        let base_k = 60.0_f64;
+        let k_vector = if weight > 0.01 {
+            base_k / weight as f64
+        } else {
+            base_k * 100.0
+        };
+        let k_text = if text_weight > 0.01 {
+            base_k / text_weight as f64
+        } else {
+            base_k * 100.0
+        };
+
+        // Translate vector local-hnsw IDs to surrogate-hex doc_ids so the
+        // vector and text legs share the same RRF key space. Headless rows
+        // (no surrogate binding) fall back to a non-fusable sentinel —
+        // they cannot match any FTS doc_id, which is the correct behavior.
         let vector_ranked: Vec<RankedResult> = vector_results
             .iter()
             .enumerate()
@@ -174,16 +176,14 @@ impl CoreLoop {
             })
             .collect();
 
-        let graph_ranked = graph_nodes_to_ranked_results(&graph_expanded, &hop_distances);
-
-        let (k_vector, k_text, k_graph) = rrf_k;
         let fused = reciprocal_rank_fusion_weighted(
-            &[vector_ranked, text_ranked, graph_ranked],
-            &[k_vector, k_text, k_graph],
+            &[vector_ranked, text_ranked],
+            &[k_vector, k_text],
             top_k,
         );
 
-        // 5. Materialise results with per-engine rank diagnostics (reusing HybridSearchHit).
+        // Build response with per-engine rank diagnostics.
+        // RLS post-fusion: filter fused results by looking up each document.
         let results: Vec<_> = fused
             .iter()
             .filter(|f| {

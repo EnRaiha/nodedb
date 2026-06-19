@@ -33,7 +33,8 @@ impl CoreLoop {
         };
 
         let tid = TenantId::new(tenant_id);
-        if let Err(e) = self.inverted.put_synonym_group(tid, &record) {
+        let database_id = task.request.database_id.as_u64();
+        if let Err(e) = self.inverted.put_synonym_group(database_id, tid, &record) {
             return self.response_error(
                 task,
                 ErrorCode::Internal {
@@ -53,7 +54,8 @@ impl CoreLoop {
         name: &str,
     ) -> Response {
         let tid = TenantId::new(tenant_id);
-        if let Err(e) = self.inverted.delete_synonym_group(tid, name) {
+        let database_id = task.request.database_id.as_u64();
+        if let Err(e) = self.inverted.delete_synonym_group(database_id, tid, name) {
             return self.response_error(
                 task,
                 ErrorCode::Internal {

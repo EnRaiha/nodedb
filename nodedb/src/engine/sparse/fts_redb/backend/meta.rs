@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Opaque metadata blobs (docmap, fieldnorms, analyzer, language)
-//! against `INDEX_META` keyed by `(tenant_id, collection, subkey)`.
+//! against `INDEX_META` keyed by `(database_id, tenant_id, collection, subkey)`.
 
 use super::core::RedbFtsBackend;
 use super::shared::redb_err;
@@ -9,6 +9,7 @@ use crate::engine::sparse::fts_redb::tables::INDEX_META;
 
 pub(super) fn read(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     subkey: &str,
@@ -20,7 +21,7 @@ pub(super) fn read(
     let table = read_txn
         .open_table(INDEX_META)
         .map_err(|e| redb_err("open index_meta", e))?;
-    match table.get((tid, collection, subkey)) {
+    match table.get((database_id, tid, collection, subkey)) {
         Ok(Some(val)) => Ok(Some(val.value().to_vec())),
         Ok(None) => Ok(None),
         Err(e) => Err(redb_err("get meta", e)),
@@ -29,6 +30,7 @@ pub(super) fn read(
 
 pub(super) fn write(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     subkey: &str,
@@ -43,7 +45,7 @@ pub(super) fn write(
             .open_table(INDEX_META)
             .map_err(|e| redb_err("open index_meta", e))?;
         table
-            .insert((tid, collection, subkey), value)
+            .insert((database_id, tid, collection, subkey), value)
             .map_err(|e| redb_err("insert meta", e))?;
     }
     write_txn.commit().map_err(|e| redb_err("commit", e))?;

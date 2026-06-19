@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! LSM segment blobs against `SEGMENTS`
-//! keyed by `(tenant_id, collection, segment_id)`.
+//! keyed by `(database_id, tenant_id, collection, segment_id)`.
 
 use redb::ReadableTable as _;
 
@@ -12,6 +12,7 @@ use crate::storage::quarantine::engines::validate_fts_segment_bytes;
 
 pub(super) fn write(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     segment_id: &str,
@@ -26,7 +27,7 @@ pub(super) fn write(
             .open_table(SEGMENTS)
             .map_err(|e| redb_err("open segments", e))?;
         table
-            .insert((tid, collection, segment_id), data)
+            .insert((database_id, tid, collection, segment_id), data)
             .map_err(|e| redb_err("insert segment", e))?;
     }
     write_txn.commit().map_err(|e| redb_err("commit", e))?;
@@ -35,6 +36,7 @@ pub(super) fn write(
 
 pub(super) fn read(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     segment_id: &str,
@@ -46,7 +48,7 @@ pub(super) fn read(
     let table = read_txn
         .open_table(SEGMENTS)
         .map_err(|e| redb_err("open segments", e))?;
-    let bytes = match table.get((tid, collection, segment_id)) {
+    let bytes = match table.get((database_id, tid, collection, segment_id)) {
         Ok(Some(val)) => val.value().to_vec(),
         Ok(None) => return Ok(None),
         Err(e) => return Err(redb_err("get segment", e)),
@@ -67,6 +69,7 @@ pub(super) fn read(
 
 pub(super) fn list(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
 ) -> crate::Result<Vec<String>> {
@@ -78,15 +81,16 @@ pub(super) fn list(
         .open_table(SEGMENTS)
         .map_err(|e| redb_err("open segments", e))?;
     let ids: Vec<String> = table
-        .range((tid, collection, "")..=(tid, collection, MAX_SUBKEY))
+        .range((database_id, tid, collection, "")..=(database_id, tid, collection, MAX_SUBKEY))
         .map_err(|e| redb_err("range", e))?
-        .filter_map(|r| r.ok().map(|(k, _)| k.value().2.to_string()))
+        .filter_map(|r| r.ok().map(|(k, _)| k.value().3.to_string()))
         .collect();
     Ok(ids)
 }
 
 pub(super) fn remove(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     segment_id: &str,
@@ -103,11 +107,28 @@ pub(super) fn remove(
         // the error so a corrupt index or aborted txn surfaces; the absent-key
         // case (`Ok(None)`) is intentionally a no-op, not an error.
         table
-            .remove((tid, collection, segment_id))
+            .remove((database_id, tid, collection, segment_id))
             .map_err(|e| redb_err("remove segment", e))?;
     }
     write_txn.commit().map_err(|e| redb_err("commit", e))?;
     Ok(())
+}
+
+/// Inputs to [`compact_commit`]: the merged-segment write plus the source
+/// segment ids to remove, scoped to one `(database, tenant, collection)`.
+pub struct CompactCommit<'a> {
+    /// Owning database id.
+    pub database_id: u64,
+    /// Owning tenant id (raw storage form).
+    pub tid: u64,
+    /// Collection whose segments are being compacted.
+    pub collection: &'a str,
+    /// Id of the new merged segment to write.
+    pub new_segment_id: &'a str,
+    /// Bytes of the new merged segment.
+    pub new_segment_data: &'a [u8],
+    /// Ids of the source segments to remove after the merged write.
+    pub merged_ids: &'a [String],
 }
 
 /// Atomically register a new merged segment and remove the source segments
@@ -120,12 +141,16 @@ pub(super) fn remove(
 /// on a reader that opens a concurrent read transaction.
 pub(super) fn compact_commit(
     backend: &RedbFtsBackend,
-    tid: u64,
-    collection: &str,
-    new_segment_id: &str,
-    new_segment_data: &[u8],
-    merged_ids: &[String],
+    params: CompactCommit<'_>,
 ) -> crate::Result<()> {
+    let CompactCommit {
+        database_id,
+        tid,
+        collection,
+        new_segment_id,
+        new_segment_data,
+        merged_ids,
+    } = params;
     let write_txn = backend
         .db
         .begin_write()
@@ -135,7 +160,10 @@ pub(super) fn compact_commit(
             .open_table(SEGMENTS)
             .map_err(|e| redb_err("open segments for compact", e))?;
         table
-            .insert((tid, collection, new_segment_id), new_segment_data)
+            .insert(
+                (database_id, tid, collection, new_segment_id),
+                new_segment_data,
+            )
             .map_err(|e| redb_err("insert merged segment", e))?;
         for id in merged_ids {
             // Propagate remove errors so a failed source-segment removal aborts
@@ -143,7 +171,7 @@ pub(super) fn compact_commit(
             // which both old and new segments are visible to readers, causing
             // double-counted postings during BM25 scoring.
             table
-                .remove((tid, collection, id.as_str()))
+                .remove((database_id, tid, collection, id.as_str()))
                 .map_err(|e| redb_err("remove merged source segment", e))?;
         }
     }
@@ -153,13 +181,15 @@ pub(super) fn compact_commit(
     Ok(())
 }
 
-/// Enumerate all `(tid, collection)` pairs that have at least one segment
-/// stored in the SEGMENTS table.
+/// Enumerate all `(database_id, tid, collection)` triples that have at least one
+/// segment stored in the SEGMENTS table.
 ///
 /// Used by maintenance to discover which collections need FTS LSM compaction
 /// without requiring the executor to maintain a separate registry of
 /// FTS-indexed collections.
-pub(super) fn list_all_collections(backend: &RedbFtsBackend) -> crate::Result<Vec<(u64, String)>> {
+pub(super) fn list_all_collections(
+    backend: &RedbFtsBackend,
+) -> crate::Result<Vec<(u64, u64, String)>> {
     let read_txn = backend
         .db
         .begin_read()
@@ -168,18 +198,18 @@ pub(super) fn list_all_collections(backend: &RedbFtsBackend) -> crate::Result<Ve
         .open_table(SEGMENTS)
         .map_err(|e| redb_err("open segments", e))?;
 
-    let mut collections: Vec<(u64, String)> = Vec::new();
-    let mut last: Option<(u64, String)> = None;
+    let mut collections: Vec<(u64, u64, String)> = Vec::new();
+    let mut last: Option<(u64, u64, String)> = None;
 
     for entry in table.iter().map_err(|e| redb_err("iter segments", e))? {
         let (key, _) = entry.map_err(|e| redb_err("next segment key", e))?;
-        let (tid, collection, _) = key.value();
+        let (database_id, tid, collection, _) = key.value();
         let coll = collection.to_string();
         match &last {
-            Some((t, c)) if *t == tid && c == &coll => {}
+            Some((d, t, c)) if *d == database_id && *t == tid && c == &coll => {}
             _ => {
-                collections.push((tid, coll.clone()));
-                last = Some((tid, coll));
+                collections.push((database_id, tid, coll.clone()));
+                last = Some((database_id, tid, coll));
             }
         }
     }

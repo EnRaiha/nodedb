@@ -14,6 +14,7 @@ use nodedb_fts::backend::FtsBackend;
 use nodedb_fts::posting::Posting;
 use nodedb_types::Surrogate;
 
+use super::segments::CompactCommit;
 use super::shared::redb_err;
 use crate::engine::sparse::fts_redb::tables::{DOC_LENGTHS, INDEX_META, POSTINGS, SEGMENTS, STATS};
 use crate::storage::quarantine::QuarantineRegistry;
@@ -21,8 +22,8 @@ use crate::storage::quarantine::QuarantineRegistry;
 /// Redb-backed FTS backend.
 ///
 /// All persistent tables are keyed by the structural tuple
-/// `(tenant_id, collection, …)` — tenant isolation is enforced by the
-/// table schema, never by lexical-prefix ordering.
+/// `(database_id, tenant_id, collection, …)` — database and tenant isolation
+/// are enforced by the table schema, never by lexical-prefix ordering.
 pub struct RedbFtsBackend {
     pub(super) db: Arc<Database>,
     /// Shared quarantine registry for corrupt FTS segment bytes.
@@ -74,28 +75,14 @@ impl RedbFtsBackend {
     /// All mutations run in a single redb write transaction so the operation
     /// is crash-safe: a crash mid-compaction leaves the original segments
     /// intact and the maintenance cycle retries on the next pass.
-    pub fn compact_commit(
-        &self,
-        tid: u64,
-        collection: &str,
-        new_segment_id: &str,
-        new_segment_data: &[u8],
-        merged_ids: &[String],
-    ) -> crate::Result<()> {
-        super::segments::compact_commit(
-            self,
-            tid,
-            collection,
-            new_segment_id,
-            new_segment_data,
-            merged_ids,
-        )
+    pub fn compact_commit(&self, params: CompactCommit<'_>) -> crate::Result<()> {
+        super::segments::compact_commit(self, params)
     }
 
-    /// Enumerate all `(tid, collection)` pairs that have at least one FTS
-    /// segment. Used by maintenance to discover compaction candidates without
-    /// a separate registry.
-    pub fn list_all_fts_collections(&self) -> crate::Result<Vec<(u64, String)>> {
+    /// Enumerate all `(database_id, tid, collection)` triples that have at least
+    /// one FTS segment. Used by maintenance to discover compaction candidates
+    /// without a separate registry.
+    pub fn list_all_fts_collections(&self) -> crate::Result<Vec<(u64, u64, String)>> {
         super::segments::list_all_collections(self)
     }
 }
@@ -103,119 +90,177 @@ impl RedbFtsBackend {
 impl FtsBackend for RedbFtsBackend {
     type Error = crate::Error;
 
-    fn read_postings(&self, tid: u64, collection: &str, term: &str) -> crate::Result<Vec<Posting>> {
-        super::postings::read(self, tid, collection, term)
+    fn read_postings(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        term: &str,
+    ) -> crate::Result<Vec<Posting>> {
+        super::postings::read(self, database_id, tid, collection, term)
     }
 
     fn write_postings(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         term: &str,
         postings: &[Posting],
     ) -> crate::Result<()> {
-        super::postings::write(self, tid, collection, term, postings)
+        super::postings::write(self, database_id, tid, collection, term, postings)
     }
 
-    fn remove_postings(&self, tid: u64, collection: &str, term: &str) -> crate::Result<()> {
-        super::postings::remove(self, tid, collection, term)
+    fn remove_postings(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        term: &str,
+    ) -> crate::Result<()> {
+        super::postings::remove(self, database_id, tid, collection, term)
     }
 
     fn read_doc_length(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         doc_id: Surrogate,
     ) -> crate::Result<Option<u32>> {
-        super::doc_lengths::read(self, tid, collection, doc_id)
+        super::doc_lengths::read(self, database_id, tid, collection, doc_id)
     }
 
     fn write_doc_length(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         doc_id: Surrogate,
         length: u32,
     ) -> crate::Result<()> {
-        super::doc_lengths::write(self, tid, collection, doc_id, length)
+        super::doc_lengths::write(self, database_id, tid, collection, doc_id, length)
     }
 
     fn remove_doc_length(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         doc_id: Surrogate,
     ) -> crate::Result<()> {
-        super::doc_lengths::remove(self, tid, collection, doc_id)
+        super::doc_lengths::remove(self, database_id, tid, collection, doc_id)
     }
 
-    fn collection_terms(&self, tid: u64, collection: &str) -> crate::Result<Vec<String>> {
-        super::postings::collection_terms(self, tid, collection)
+    fn collection_terms(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> crate::Result<Vec<String>> {
+        super::postings::collection_terms(self, database_id, tid, collection)
     }
 
-    fn collection_stats(&self, tid: u64, collection: &str) -> crate::Result<(u32, u64)> {
-        super::stats::read(self, tid, collection)
+    fn collection_stats(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> crate::Result<(u32, u64)> {
+        super::stats::read(self, database_id, tid, collection)
     }
 
-    fn increment_stats(&self, tid: u64, collection: &str, doc_len: u32) -> crate::Result<()> {
-        super::stats::increment(self, tid, collection, doc_len)
+    fn increment_stats(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        doc_len: u32,
+    ) -> crate::Result<()> {
+        super::stats::increment(self, database_id, tid, collection, doc_len)
     }
 
-    fn decrement_stats(&self, tid: u64, collection: &str, doc_len: u32) -> crate::Result<()> {
-        super::stats::decrement(self, tid, collection, doc_len)
+    fn decrement_stats(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        doc_len: u32,
+    ) -> crate::Result<()> {
+        super::stats::decrement(self, database_id, tid, collection, doc_len)
     }
 
     fn read_meta(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         subkey: &str,
     ) -> crate::Result<Option<Vec<u8>>> {
-        super::meta::read(self, tid, collection, subkey)
+        super::meta::read(self, database_id, tid, collection, subkey)
     }
 
     fn write_meta(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         subkey: &str,
         value: &[u8],
     ) -> crate::Result<()> {
-        super::meta::write(self, tid, collection, subkey, value)
+        super::meta::write(self, database_id, tid, collection, subkey, value)
     }
 
     fn write_segment(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         segment_id: &str,
         data: &[u8],
     ) -> crate::Result<()> {
-        super::segments::write(self, tid, collection, segment_id, data)
+        super::segments::write(self, database_id, tid, collection, segment_id, data)
     }
 
     fn read_segment(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         segment_id: &str,
     ) -> crate::Result<Option<Vec<u8>>> {
-        super::segments::read(self, tid, collection, segment_id)
+        super::segments::read(self, database_id, tid, collection, segment_id)
     }
 
-    fn list_segments(&self, tid: u64, collection: &str) -> crate::Result<Vec<String>> {
-        super::segments::list(self, tid, collection)
+    fn list_segments(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> crate::Result<Vec<String>> {
+        super::segments::list(self, database_id, tid, collection)
     }
 
-    fn remove_segment(&self, tid: u64, collection: &str, segment_id: &str) -> crate::Result<()> {
-        super::segments::remove(self, tid, collection, segment_id)
+    fn remove_segment(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        segment_id: &str,
+    ) -> crate::Result<()> {
+        super::segments::remove(self, database_id, tid, collection, segment_id)
     }
 
-    fn purge_collection(&self, tid: u64, collection: &str) -> crate::Result<usize> {
-        super::purge::collection(self, tid, collection)
+    fn purge_collection(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> crate::Result<usize> {
+        super::purge::collection(self, database_id, tid, collection)
     }
 
-    fn purge_tenant(&self, tid: u64) -> crate::Result<usize> {
-        super::purge::tenant(self, tid)
+    fn purge_tenant(&self, database_id: u64, tid: u64) -> crate::Result<usize> {
+        super::purge::tenant(self, database_id, tid)
     }
 }

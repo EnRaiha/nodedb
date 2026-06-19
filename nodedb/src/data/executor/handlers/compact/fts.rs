@@ -38,15 +38,13 @@
 //! - `fts_enumeration_failed` is set when the segments-table read txn itself
 //!   fails — we couldn't even discover what work was needed.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nodedb_fts::backend::FtsBackend as _;
 use nodedb_fts::lsm::compaction::{
-    CompactError, CompactionConfig, SegmentMeta, compact_level, needs_compaction, parse_level,
-    segment_id,
+    CompactError, CompactLevelParams, CompactionConfig, SegmentMeta, compact_level,
+    needs_compaction, parse_level, segment_id,
 };
-use nodedb_mem::MemoryGovernor;
 use tracing::info;
 
 use crate::data::executor::core_loop::CoreLoop;
@@ -66,17 +64,15 @@ pub(super) struct FtsCompactionOutcome {
     pub enumeration_failed: bool,
 }
 
-/// Parameters for a single FTS compaction pass.
+/// Identifies one `(database, tenant, collection)` FTS compaction unit.
 ///
-/// Grouping them into a struct avoids triggering `clippy::too_many_arguments`
-/// in the helper that calls `compact_level`.
-struct FtsCompactParams<'a> {
-    backend: &'a crate::engine::sparse::fts_redb::backend::RedbFtsBackend,
-    tid: u64,
+/// Bundled so `compact_one_fts_collection` stays within the argument budget;
+/// `force`, the shared `config`, and the mutable `outcome` accumulator are
+/// passed alongside it.
+struct FtsCompactionTarget<'a> {
+    database_id: u64,
+    tid: TenantId,
     collection: &'a str,
-    segments: &'a [SegmentMeta],
-    level: u32,
-    governor: Option<&'a Arc<MemoryGovernor>>,
 }
 
 impl CoreLoop {
@@ -111,8 +107,17 @@ impl CoreLoop {
             }
         };
 
-        for (tid, collection) in collections {
-            self.compact_one_fts_collection(tid, &collection, force, &config, &mut outcome);
+        for (database_id, tid, collection) in collections {
+            self.compact_one_fts_collection(
+                FtsCompactionTarget {
+                    database_id,
+                    tid,
+                    collection: &collection,
+                },
+                force,
+                &config,
+                &mut outcome,
+            );
         }
 
         outcome
@@ -123,31 +128,40 @@ impl CoreLoop {
     /// `outcome.deferred`; success increments `outcome.merged`.
     fn compact_one_fts_collection(
         &mut self,
-        tid: TenantId,
-        collection: &str,
+        target: FtsCompactionTarget<'_>,
         force: bool,
         config: &CompactionConfig,
         outcome: &mut FtsCompactionOutcome,
     ) {
-        let db = self.database_for_tenant(tid);
+        let FtsCompactionTarget {
+            database_id,
+            tid,
+            collection,
+        } = target;
+        let db = nodedb_types::DatabaseId::new(database_id);
         let tid_u64 = tid.as_u64();
 
         // Resolve segment list before acquiring the lease so we only hold
         // the lease across actual merge work, not the read path.
-        let segment_ids = match self.inverted.backend().list_segments(tid_u64, collection) {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::warn!(
-                    core = self.core_id,
-                    tid = tid_u64,
-                    collection = %collection,
-                    error = %e,
-                    "FTS compaction: failed to list segments — deferred to next cycle"
-                );
-                outcome.deferred += 1;
-                return;
-            }
-        };
+        let segment_ids =
+            match self
+                .inverted
+                .backend()
+                .list_segments(database_id, tid_u64, collection)
+            {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!(
+                        core = self.core_id,
+                        tid = tid_u64,
+                        collection = %collection,
+                        error = %e,
+                        "FTS compaction: failed to list segments — deferred to next cycle"
+                    );
+                    outcome.deferred += 1;
+                    return;
+                }
+            };
 
         if segment_ids.is_empty() {
             return;
@@ -186,8 +200,9 @@ impl CoreLoop {
         };
 
         let governor = self.governor.as_ref();
-        let params = FtsCompactParams {
+        let params = CompactLevelParams {
             backend: self.inverted.backend(),
+            database_id,
             tid: tid_u64,
             collection,
             segments: &segments,
@@ -195,20 +210,23 @@ impl CoreLoop {
             governor,
         };
 
-        match run_compact_level(params) {
+        match compact_level(params) {
             Ok(Some((new_bytes, merged_ids))) => {
                 let new_level = level + 1;
                 let new_id_num = fts_new_segment_id();
                 let new_seg_id = segment_id(new_id_num, new_level);
                 let merged_count = merged_ids.len() as u64;
 
-                match self.inverted.compact_commit(
-                    tid,
-                    collection,
-                    &new_seg_id,
-                    &new_bytes,
-                    &merged_ids,
-                ) {
+                match self
+                    .inverted
+                    .compact_commit(crate::engine::sparse::fts_redb::CompactCommit {
+                        database_id,
+                        tid: tid_u64,
+                        collection,
+                        new_segment_id: &new_seg_id,
+                        new_segment_data: &new_bytes,
+                        merged_ids: &merged_ids,
+                    }) {
                     Ok(()) => {
                         outcome.merged += merged_count;
                         info!(
@@ -264,20 +282,6 @@ impl CoreLoop {
         }
         // `_lease` drops here, recording elapsed wall-clock into the budget window.
     }
-}
-
-/// Delegate to `compact_level` with the grouped parameters.
-fn run_compact_level(
-    p: FtsCompactParams<'_>,
-) -> Result<Option<nodedb_fts::lsm::compaction::CompactionResult>, CompactError<crate::Error>> {
-    compact_level(
-        p.backend,
-        p.tid,
-        p.collection,
-        p.segments,
-        p.level,
-        p.governor,
-    )
 }
 
 /// Generate a unique numeric segment ID for the output of a compaction.

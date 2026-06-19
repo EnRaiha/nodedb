@@ -5,12 +5,26 @@
 
 use tracing::debug;
 
-use nodedb_fts::posting::{MatchOffset, Posting, QueryMode, TextSearchResult};
+use nodedb_fts::FtsSearchParams;
+use nodedb_fts::posting::{MatchOffset, Posting, TextSearchResult};
 use nodedb_types::{Surrogate, TenantId};
 
 use super::core::InvertedIndex;
 use super::errors::{fts_index_err, inverted_err};
 use crate::engine::sparse::fts_redb::tables::POSTINGS;
+
+/// Query and tuning parameters for an inverted-index phrase search.
+///
+/// The `(database_id, tid, collection)` scope is passed separately so callers
+/// can reuse their existing scope variables.
+pub struct PhraseSearchParams<'a> {
+    /// Ordered terms that must appear as a contiguous sequence.
+    pub terms: &'a [String],
+    /// Maximum number of results to return.
+    pub top_k: usize,
+    /// Optional surrogate bitmap restricting candidates before position match.
+    pub prefilter: Option<&'a nodedb_types::SurrogateBitmap>,
+}
 
 impl InvertedIndex {
     /// Search the inverted index for an exact phrase.
@@ -23,12 +37,16 @@ impl InvertedIndex {
     /// `prefilter` bitmap restricts the candidate set before position matching.
     pub fn phrase_search(
         &self,
+        database_id: u64,
         tid: TenantId,
         collection: &str,
-        terms: &[String],
-        top_k: usize,
-        prefilter: Option<&nodedb_types::SurrogateBitmap>,
+        params: PhraseSearchParams<'_>,
     ) -> crate::Result<Vec<TextSearchResult>> {
+        let PhraseSearchParams {
+            terms,
+            top_k,
+            prefilter,
+        } = params;
         if terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -46,7 +64,7 @@ impl InvertedIndex {
             let analyzed = nodedb_fts::analyze(term);
             let canonical = analyzed.into_iter().next().unwrap_or_else(|| term.clone());
             let postings: Vec<Posting> = postings_table
-                .get((t, collection, canonical.as_str()))
+                .get((database_id, t, collection, canonical.as_str()))
                 .map_err(|e| inverted_err("read posting", e))?
                 .and_then(|v| zerompk::from_msgpack(v.value()).ok())
                 .unwrap_or_default();
@@ -109,55 +127,19 @@ impl InvertedIndex {
         Ok(results)
     }
 
-    /// Search the inverted index using BM25 scoring.
+    /// Search the inverted index using BM25 scoring with explicit params.
     ///
     /// Supports `NOT <term>` and `-<term>` negation in the query string.
     /// Returns `Err` for invalid queries (NOT-only, unsupported parentheses).
     pub fn search(
         &self,
+        database_id: u64,
         tid: TenantId,
         collection: &str,
-        query: &str,
-        top_k: usize,
-        fuzzy_enabled: bool,
-        prefilter: Option<&nodedb_types::SurrogateBitmap>,
+        params: FtsSearchParams<'_>,
     ) -> crate::Result<Vec<TextSearchResult>> {
         self.inner
-            .search(
-                tid.as_u64(),
-                collection,
-                query,
-                top_k,
-                fuzzy_enabled,
-                prefilter,
-            )
-            .map_err(fts_index_err)
-    }
-
-    /// Search with explicit boolean mode (AND or OR).
-    ///
-    /// Supports `NOT <term>` and `-<term>` negation in the query string.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_with_mode(
-        &self,
-        tid: TenantId,
-        collection: &str,
-        query: &str,
-        top_k: usize,
-        fuzzy_enabled: bool,
-        mode: QueryMode,
-        prefilter: Option<&nodedb_types::SurrogateBitmap>,
-    ) -> crate::Result<Vec<TextSearchResult>> {
-        self.inner
-            .search_with_mode(
-                tid.as_u64(),
-                collection,
-                query,
-                top_k,
-                fuzzy_enabled,
-                mode,
-                prefilter,
-            )
+            .search(database_id, tid.as_u64(), collection, params)
             .map_err(fts_index_err)
     }
 

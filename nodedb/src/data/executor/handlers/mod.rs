@@ -45,6 +45,8 @@ pub mod spatial;
 pub mod spatial_sync;
 pub(super) mod spill;
 pub mod text_search;
+pub mod text_search_hybrid;
+pub mod text_search_scan;
 pub mod text_search_triple;
 pub mod timeseries;
 mod timeseries_gap_fill;

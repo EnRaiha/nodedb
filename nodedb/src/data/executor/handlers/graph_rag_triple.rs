@@ -10,6 +10,8 @@
 //!    per-source k-constants `(vector_k, text_k, graph_k)`.
 //! 5. Final top-N results are materialised.
 
+use nodedb_fts::FtsSearchParams;
+use nodedb_fts::posting::QueryMode;
 use tracing::debug;
 
 use crate::bridge::envelope::Response;
@@ -69,7 +71,18 @@ impl CoreLoop {
         let fetch_k = final_top_k.saturating_mul(3).max(20);
         let text_results = self
             .inverted
-            .search(tid_typed, collection, bm25_query, fetch_k, true, None)
+            .search(
+                task.request.database_id.as_u64(),
+                tid_typed,
+                collection,
+                FtsSearchParams {
+                    query: bm25_query,
+                    top_k: fetch_k,
+                    fuzzy_enabled: true,
+                    mode: QueryMode::And,
+                    prefilter: None,
+                },
+            )
             .unwrap_or_default();
 
         // Graph BFS from vector-nearest nodes.

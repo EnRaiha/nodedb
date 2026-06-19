@@ -90,6 +90,27 @@ impl<E> CompactError<E> {
     }
 }
 
+/// Inputs to [`compact_level`].
+///
+/// Groups the backend handle, the `(database_id, tid, collection)` scope, the
+/// candidate segment list, the target level, and the optional memory governor.
+pub struct CompactLevelParams<'a, B: FtsBackend> {
+    /// Backend the source segments are read from.
+    pub backend: &'a B,
+    /// Owning database id.
+    pub database_id: u64,
+    /// Owning tenant id.
+    pub tid: u64,
+    /// Collection whose segments are being compacted.
+    pub collection: &'a str,
+    /// All known segments for the collection (filtered to `level` internally).
+    pub segments: &'a [SegmentMeta],
+    /// Level whose segments are merged into `level + 1`.
+    pub level: u32,
+    /// Optional memory governor budgeting each `Vec::with_capacity`.
+    pub governor: Option<&'a Arc<MemoryGovernor>>,
+}
+
 /// Perform compaction: merge all segments at `level` into one segment at `level + 1`.
 ///
 /// Returns the merged segment bytes and the ids of segments that were merged
@@ -99,13 +120,17 @@ impl<E> CompactError<E> {
 /// via [`MemoryGovernor::reserve`]. If the budget is exhausted the function
 /// returns [`CompactError::Budget`] before allocating.
 pub fn compact_level<B: FtsBackend>(
-    backend: &B,
-    tid: u64,
-    collection: &str,
-    segments: &[SegmentMeta],
-    level: u32,
-    governor: Option<&Arc<MemoryGovernor>>,
+    params: CompactLevelParams<'_, B>,
 ) -> Result<Option<CompactionResult>, CompactError<B::Error>> {
+    let CompactLevelParams {
+        backend,
+        database_id,
+        tid,
+        collection,
+        segments,
+        level,
+        governor,
+    } = params;
     let to_merge: Vec<&SegmentMeta> = segments.iter().filter(|s| s.level == level).collect();
     if to_merge.len() < 2 {
         return Ok(None);
@@ -129,7 +154,7 @@ pub fn compact_level<B: FtsBackend>(
 
     for meta in &to_merge {
         if let Some(data) = backend
-            .read_segment(tid, collection, &meta.segment_id)
+            .read_segment(database_id, tid, collection, &meta.segment_id)
             .map_err(CompactError::backend)?
             && let Ok(reader) = SegmentReader::open(data)
         {

@@ -18,10 +18,24 @@ use super::core::InvertedIndex;
 use super::errors::inverted_err;
 use crate::engine::sparse::fts_redb::tables::{DOC_LENGTHS, POSTINGS, STATS};
 
+/// `(database_id, tenant, collection, surrogate)` scope shared by the
+/// transaction-participating indexing entry points.
+pub struct IndexDocScope<'a> {
+    /// Owning database id.
+    pub database_id: u64,
+    /// Owning tenant id.
+    pub tid: TenantId,
+    /// Collection the document belongs to.
+    pub collection: &'a str,
+    /// Global surrogate identity of the document.
+    pub surrogate: Surrogate,
+}
+
 impl InvertedIndex {
     /// Index a document's text content.
     pub fn index_document(
         &self,
+        database_id: u64,
         tid: TenantId,
         collection: &str,
         surrogate: Surrogate,
@@ -34,7 +48,16 @@ impl InvertedIndex {
 
         let db = self.inner.backend().db();
         let write_txn = db.begin_write().map_err(|e| inverted_err("write txn", e))?;
-        self.write_index_data(&write_txn, tid, collection, surrogate, &tokens)?;
+        self.write_index_data(
+            &write_txn,
+            IndexDocScope {
+                database_id,
+                tid,
+                collection,
+                surrogate,
+            },
+            &tokens,
+        )?;
         write_txn
             .commit()
             .map_err(|e| inverted_err("commit index", e))?;
@@ -45,16 +68,14 @@ impl InvertedIndex {
     pub fn index_document_in_txn(
         &self,
         txn: &WriteTransaction,
-        tid: TenantId,
-        collection: &str,
-        surrogate: Surrogate,
+        scope: IndexDocScope<'_>,
         text: &str,
     ) -> crate::Result<()> {
         let tokens = nodedb_fts::analyze(text);
         if tokens.is_empty() {
             return Ok(());
         }
-        self.write_index_data(txn, tid, collection, surrogate, &tokens)
+        self.write_index_data(txn, scope, &tokens)
     }
 
     /// Core indexing logic: writes postings, doc length, and stats within
@@ -63,11 +84,15 @@ impl InvertedIndex {
     fn write_index_data(
         &self,
         txn: &WriteTransaction,
-        tid: TenantId,
-        collection: &str,
-        surrogate: Surrogate,
+        scope: IndexDocScope<'_>,
         tokens: &[String],
     ) -> crate::Result<()> {
+        let IndexDocScope {
+            database_id,
+            tid,
+            collection,
+            surrogate,
+        } = scope;
         let t = tid.as_u64();
 
         let mut term_postings: HashMap<&str, (u32, Vec<u32>)> = HashMap::new();
@@ -93,7 +118,7 @@ impl InvertedIndex {
             };
 
             let mut existing: Vec<Posting> = postings_table
-                .get((t, collection, *term))
+                .get((database_id, t, collection, *term))
                 .ok()
                 .flatten()
                 .and_then(|v| zerompk::from_msgpack(v.value()).ok())
@@ -105,7 +130,7 @@ impl InvertedIndex {
             let bytes = zerompk::to_msgpack_vec(&existing)
                 .map_err(|e| inverted_err("serialize postings", e))?;
             postings_table
-                .insert((t, collection, *term), bytes.as_slice())
+                .insert((database_id, t, collection, *term), bytes.as_slice())
                 .map_err(|e| inverted_err("insert posting", e))?;
         }
         drop(postings_table);
@@ -116,19 +141,23 @@ impl InvertedIndex {
         let len_bytes =
             zerompk::to_msgpack_vec(&doc_len).map_err(|e| inverted_err("serialize doc_len", e))?;
         lengths
-            .insert((t, collection, surrogate.as_u32()), len_bytes.as_slice())
+            .insert(
+                (database_id, t, collection, surrogate.as_u32()),
+                len_bytes.as_slice(),
+            )
             .map_err(|e| inverted_err("insert doc_len", e))?;
         drop(lengths);
 
-        Self::update_stats_in_txn(txn, tid, collection, doc_len as i64)?;
+        Self::update_stats_in_txn(txn, database_id, tid, collection, doc_len as i64)?;
 
-        debug!(tid = t, %collection, surrogate = surrogate.as_u32(), tokens = tokens.len(), terms = term_postings.len(), "indexed document");
+        debug!(database_id, tid = t, %collection, surrogate = surrogate.as_u32(), tokens = tokens.len(), terms = term_postings.len(), "indexed document");
         Ok(())
     }
 
     /// Atomically update `(doc_count, total_token_sum)` in STATS.
     pub(super) fn update_stats_in_txn(
         txn: &WriteTransaction,
+        database_id: u64,
         tid: TenantId,
         collection: &str,
         delta: i64,
@@ -138,7 +167,7 @@ impl InvertedIndex {
             .open_table(STATS)
             .map_err(|e| inverted_err("open stats", e))?;
         let (mut count, mut total) = stats
-            .get((t, collection))
+            .get((database_id, t, collection))
             .ok()
             .flatten()
             .and_then(|v| zerompk::from_msgpack::<(u32, u64)>(v.value()).ok())
@@ -155,7 +184,7 @@ impl InvertedIndex {
         let bytes = zerompk::to_msgpack_vec(&(count, total))
             .map_err(|e| inverted_err("serialize stats", e))?;
         stats
-            .insert((t, collection), bytes.as_slice())
+            .insert((database_id, t, collection), bytes.as_slice())
             .map_err(|e| inverted_err("insert stats", e))?;
         Ok(())
     }
@@ -163,6 +192,7 @@ impl InvertedIndex {
     /// Remove a document from the inverted index.
     pub fn remove_document(
         &self,
+        database_id: u64,
         tid: TenantId,
         collection: &str,
         surrogate: Surrogate,
@@ -177,14 +207,18 @@ impl InvertedIndex {
                 .map_err(|e| inverted_err("open postings", e))?;
 
             let terms: Vec<String> = postings_table
-                .range((t, collection, "")..=(t, collection, "\u{10ffff}"))
+                .range(
+                    (database_id, t, collection, "")..=(database_id, t, collection, "\u{10ffff}"),
+                )
                 .map_err(|e| inverted_err("range", e))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().2.to_string()))
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().3.to_string()))
                 .collect();
 
             let mut updates: Vec<(String, Option<Vec<u8>>)> = Vec::new();
             for term in &terms {
-                if let Ok(Some(val)) = postings_table.get((t, collection, term.as_str())) {
+                if let Ok(Some(val)) =
+                    postings_table.get((database_id, t, collection, term.as_str()))
+                {
                     let mut list: Vec<Posting> =
                         zerompk::from_msgpack(val.value()).unwrap_or_default();
                     let before = list.len();
@@ -204,12 +238,15 @@ impl InvertedIndex {
                 match new_val {
                     None => {
                         postings_table
-                            .remove((t, collection, term.as_str()))
+                            .remove((database_id, t, collection, term.as_str()))
                             .map_err(|e| inverted_err("remove posting", e))?;
                     }
                     Some(bytes) => {
                         postings_table
-                            .insert((t, collection, term.as_str()), bytes.as_slice())
+                            .insert(
+                                (database_id, t, collection, term.as_str()),
+                                bytes.as_slice(),
+                            )
                             .map_err(|e| inverted_err("update posting", e))?;
                     }
                 }
@@ -220,19 +257,25 @@ impl InvertedIndex {
                 .map_err(|e| inverted_err("open doc_lengths", e))?;
 
             let old_len = lengths
-                .get((t, collection, surrogate.as_u32()))
+                .get((database_id, t, collection, surrogate.as_u32()))
                 .ok()
                 .flatten()
                 .and_then(|v| zerompk::from_msgpack::<u32>(v.value()).ok())
                 .unwrap_or(0);
 
             lengths
-                .remove((t, collection, surrogate.as_u32()))
+                .remove((database_id, t, collection, surrogate.as_u32()))
                 .map_err(|e| inverted_err("remove doc length", e))?;
             drop(lengths);
 
             if old_len > 0 {
-                Self::update_stats_in_txn(&write_txn, tid, collection, -(old_len as i64))?;
+                Self::update_stats_in_txn(
+                    &write_txn,
+                    database_id,
+                    tid,
+                    collection,
+                    -(old_len as i64),
+                )?;
             }
 
             // Note: the docmap sub-key in INDEX_META (previously maintained by the

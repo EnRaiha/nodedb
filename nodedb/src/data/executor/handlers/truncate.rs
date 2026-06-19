@@ -57,6 +57,7 @@ impl CoreLoop {
                 // (legacy non-surrogate docs) produce None and skip FTS.
                 if let Some(surrogate) = crate::engine::document::store::doc_id_to_surrogate(doc_id)
                     && let Err(e) = self.inverted.remove_document(
+                        database_id,
                         crate::types::TenantId::new(tid),
                         collection,
                         surrogate,

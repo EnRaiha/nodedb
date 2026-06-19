@@ -6,6 +6,9 @@ use crate::bridge::envelope::Response;
 use nodedb_physical::physical_plan::TextOp;
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::text_search::TextSearchParams;
+use crate::data::executor::handlers::text_search_hybrid::HybridSearchParams;
+use crate::data::executor::handlers::text_search_triple::HybridSearchTripleParams;
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
@@ -21,13 +24,15 @@ impl CoreLoop {
                 rls_filters,
             } => self.execute_text_search(
                 task,
-                tid,
-                collection,
-                query,
-                *top_k,
-                *fuzzy,
-                prefilter.as_ref(),
-                rls_filters,
+                TextSearchParams {
+                    tid,
+                    collection,
+                    query,
+                    top_k: *top_k,
+                    fuzzy: *fuzzy,
+                    prefilter: prefilter.as_ref(),
+                    rls_filters,
+                },
             ),
 
             TextOp::BM25ScoreScan {
@@ -59,17 +64,19 @@ impl CoreLoop {
                 score_alias,
             } => self.execute_hybrid_search(
                 task,
-                tid,
-                collection,
-                query_vector,
-                query_text,
-                *top_k,
-                *ef_search,
-                *fuzzy,
-                *vector_weight,
-                filter_bitmap.as_ref(),
-                rls_filters,
-                score_alias.as_deref(),
+                HybridSearchParams {
+                    tid,
+                    collection,
+                    query_vector,
+                    query_text,
+                    top_k: *top_k,
+                    ef_search: *ef_search,
+                    fuzzy: *fuzzy,
+                    vector_weight: *vector_weight,
+                    filter_bitmap: filter_bitmap.as_ref(),
+                    rls_filters,
+                    score_alias: score_alias.as_deref(),
+                },
             ),
 
             TextOp::FtsIndexDoc {
@@ -110,20 +117,22 @@ impl CoreLoop {
                 score_alias,
             } => self.execute_hybrid_search_triple(
                 task,
-                tid,
-                collection,
-                query_vector,
-                query_text,
-                graph_seed_id,
-                *graph_depth,
-                graph_edge_label.as_deref(),
-                *top_k,
-                *ef_search,
-                *fuzzy,
-                *rrf_k,
-                filter_bitmap.as_ref(),
-                rls_filters,
-                score_alias.as_deref(),
+                HybridSearchTripleParams {
+                    tid,
+                    collection,
+                    query_vector,
+                    query_text,
+                    graph_seed_id,
+                    graph_depth: *graph_depth,
+                    graph_edge_label: graph_edge_label.as_deref(),
+                    top_k: *top_k,
+                    ef_search: *ef_search,
+                    fuzzy: *fuzzy,
+                    rrf_k: *rrf_k,
+                    filter_bitmap: filter_bitmap.as_ref(),
+                    rls_filters,
+                    score_alias: score_alias.as_deref(),
+                },
             ),
         }
     }

@@ -69,25 +69,31 @@ fn make_test_segment() -> Vec<u8> {
         .expect("test segment build must succeed")
 }
 
-/// Return the number of L0 segments for `(tenant, collection)`.
+/// Return the number of L0 segments for `(database, tenant, collection)`.
 ///
 /// Uses `nodedb_fts::lsm::compaction::parse_level` rather than a hardcoded
 /// `"L0:"` prefix so changes to the segment-id format don't silently break
 /// the test's level filter.
-fn l0_count(core: &CoreLoop, tenant: TenantId, collection: &str) -> usize {
-    core.fts_list_segments(tenant, collection)
+fn l0_count(core: &CoreLoop, db: DatabaseId, tenant: TenantId, collection: &str) -> usize {
+    core.fts_list_segments(db.as_u64(), tenant, collection)
         .unwrap_or_default()
         .into_iter()
         .filter(|id| nodedb_fts::lsm::compaction::parse_level(id) == 0)
         .count()
 }
 
-/// Write `n` L0 segments for `(tenant, collection)`.
-fn write_l0_segments(core: &CoreLoop, tenant: TenantId, collection: &str, n: usize) {
+/// Write `n` L0 segments for `(database, tenant, collection)`.
+fn write_l0_segments(
+    core: &CoreLoop,
+    db: DatabaseId,
+    tenant: TenantId,
+    collection: &str,
+    n: usize,
+) {
     let segment_data = make_test_segment();
     for i in 0..n {
         let seg_id = nodedb_fts::lsm::compaction::segment_id(i as u64, 0);
-        core.fts_write_segment(tenant, collection, &seg_id, &segment_data)
+        core.fts_write_segment(db.as_u64(), tenant, collection, &seg_id, &segment_data)
             .expect("fts_write_segment must succeed");
     }
 }
@@ -122,10 +128,6 @@ fn fts_compaction_respects_maintenance_budget() {
     let tenant_hot = TenantId::new(201);
     let collection = "articles";
 
-    // Map tenants to their databases so the budget tracker can resolve caps.
-    core.set_tenant_database(tenant_cold, db_cold);
-    core.set_tenant_database(tenant_hot, db_hot);
-
     // Install a budget tracker.
     let tracker = Arc::new(MaintenanceBudgetTracker::new());
     // db_cold: 25% of 60s = 15s cap per minute — far from exhausted.
@@ -145,16 +147,16 @@ fn fts_compaction_respects_maintenance_budget() {
 
     // Write 9 L0 segments for each collection (one above the default limit of 8).
     let over_limit = 9usize;
-    write_l0_segments(&core, tenant_cold, collection, over_limit);
-    write_l0_segments(&core, tenant_hot, collection, over_limit);
+    write_l0_segments(&core, db_cold, tenant_cold, collection, over_limit);
+    write_l0_segments(&core, db_hot, tenant_hot, collection, over_limit);
 
     assert_eq!(
-        l0_count(&core, tenant_cold, collection),
+        l0_count(&core, db_cold, tenant_cold, collection),
         over_limit,
         "db_cold should start with {over_limit} L0 segments"
     );
     assert_eq!(
-        l0_count(&core, tenant_hot, collection),
+        l0_count(&core, db_hot, tenant_hot, collection),
         over_limit,
         "db_hot should start with {over_limit} L0 segments"
     );
@@ -168,7 +170,7 @@ fn fts_compaction_respects_maintenance_budget() {
         "fts_compacted must be > 0 when db_cold is under budget; got {}",
         stats.fts_compacted
     );
-    let cold_l0_after = l0_count(&core, tenant_cold, collection);
+    let cold_l0_after = l0_count(&core, db_cold, tenant_cold, collection);
     assert!(
         cold_l0_after < over_limit,
         "db_cold L0 count must decrease after compaction (before={over_limit}, after={cold_l0_after})"
@@ -180,7 +182,7 @@ fn fts_compaction_respects_maintenance_budget() {
         "fts_deferred must be > 0 when db_hot is over its maintenance budget; got {}",
         stats.fts_deferred
     );
-    let hot_l0_after = l0_count(&core, tenant_hot, collection);
+    let hot_l0_after = l0_count(&core, db_hot, tenant_hot, collection);
     assert_eq!(
         hot_l0_after, over_limit,
         "db_hot L0 segments must be unchanged when deferred (expected={over_limit}, got={hot_l0_after})"
@@ -200,8 +202,6 @@ fn fts_compaction_force_bypasses_budget() {
     let tenant_hot = TenantId::new(202);
     let collection = "posts";
 
-    core.set_tenant_database(tenant_hot, db_hot);
-
     let tracker = Arc::new(MaintenanceBudgetTracker::new());
     tracker.set_cap(db_hot, 1);
     core.set_maintenance_budget(Arc::clone(&tracker));
@@ -213,8 +213,8 @@ fn fts_compaction_force_bypasses_budget() {
         "db_hot budget must be exhausted before forced compaction run"
     );
 
-    write_l0_segments(&core, tenant_hot, collection, 9);
-    assert_eq!(l0_count(&core, tenant_hot, collection), 9);
+    write_l0_segments(&core, db_hot, tenant_hot, collection, 9);
+    assert_eq!(l0_count(&core, db_hot, tenant_hot, collection), 9);
 
     // Forced compaction must bypass the budget gate.
     let stats = core.run_compaction(true);
@@ -232,7 +232,7 @@ fn fts_compaction_force_bypasses_budget() {
         !stats.fts_enumeration_failed,
         "fts_enumeration_failed must be false on a healthy backend"
     );
-    let l0_after = l0_count(&core, tenant_hot, collection);
+    let l0_after = l0_count(&core, db_hot, tenant_hot, collection);
     assert!(
         l0_after < 9,
         "forced compaction must reduce L0 count (before=9, after={l0_after})"

@@ -157,6 +157,7 @@ pub(super) fn apply_hnsw(
 
 pub(super) fn apply_fts(
     core: &mut CoreLoop,
+    database_id: &nodedb_types::DatabaseId,
     tenant_id: &TenantId,
     collection_key: &str,
     rebuild: FtsRebuild,
@@ -171,11 +172,12 @@ pub(super) fn apply_fts(
         analyzer_meta,
     } = rebuild;
 
+    let db_u64 = database_id.as_u64();
     let tid = tenant_id.as_u64();
     let backend = core.inverted.backend();
 
     // Purge existing postings for the collection, then write the compacted set.
-    if let Err(e) = backend.purge_collection(tid, collection_key) {
+    if let Err(e) = backend.purge_collection(db_u64, tid, collection_key) {
         error!(
             core = core.core_id,
             collection = %collection_key,
@@ -186,7 +188,7 @@ pub(super) fn apply_fts(
     }
 
     for (term, ps) in &postings {
-        if let Err(e) = backend.write_postings(tid, collection_key, term, ps) {
+        if let Err(e) = backend.write_postings(db_u64, tid, collection_key, term, ps) {
             error!(
                 core = core.core_id,
                 term,
@@ -197,7 +199,7 @@ pub(super) fn apply_fts(
         }
     }
     for (surrogate, len) in &doc_lengths {
-        if let Err(e) = backend.write_doc_length(tid, collection_key, *surrogate, *len) {
+        if let Err(e) = backend.write_doc_length(db_u64, tid, collection_key, *surrogate, *len) {
             error!(
                 core = core.core_id,
                 error = %e,
@@ -209,16 +211,16 @@ pub(super) fn apply_fts(
     // Restore collection-level stats via synthetic increment.
     for _ in 0..doc_count {
         // increment_stats with doc_len=0 just bumps the doc counter.
-        let _ = backend.increment_stats(tid, collection_key, 0);
+        let _ = backend.increment_stats(db_u64, tid, collection_key, 0);
     }
     // Restore total_tokens by writing a single doc with all tokens.
     if total_tokens > 0 && doc_count > 0 {
         let tokens_per_doc = (total_tokens / doc_count as u64) as u32;
-        let _ = backend.increment_stats(tid, collection_key, tokens_per_doc);
+        let _ = backend.increment_stats(db_u64, tid, collection_key, tokens_per_doc);
     }
 
     if let Some(meta_bytes) = analyzer_meta
-        && let Err(e) = backend.write_meta(tid, collection_key, "analyzer", &meta_bytes)
+        && let Err(e) = backend.write_meta(db_u64, tid, collection_key, "analyzer", &meta_bytes)
     {
         warn!(
             core = core.core_id,

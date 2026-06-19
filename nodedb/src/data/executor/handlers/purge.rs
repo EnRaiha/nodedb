@@ -72,7 +72,7 @@ impl CoreLoop {
         // 3. Inverted index (fulltext): postings + doc_lengths (persistent, redb).
         let inv = match self
             .inverted
-            .purge_tenant(crate::types::TenantId::new(tenant_id))
+            .purge_tenant(database_id, crate::types::TenantId::new(tenant_id))
         {
             Ok(n) => n,
             Err(e) => {

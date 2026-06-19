@@ -321,7 +321,9 @@ fn delete_edges_for_node_cascades_tombstones() {
         )
         .unwrap();
 
-    store.delete_edges_for_node(DB.as_u64(), T, "alice", 1_000).unwrap();
+    store
+        .delete_edges_for_node(DB.as_u64(), T, "alice", 1_000)
+        .unwrap();
 
     assert!(
         store

@@ -93,6 +93,11 @@ impl CoreLoop {
 
             let tenant_id = record.header.tenant_id;
             let record_lsn = record.header.lsn;
+            // Replayed writes land under the database recorded in the WAL header.
+            // Pre-scoping records carry `database_id == 0`, which maps to
+            // `DatabaseId::DEFAULT` — exactly where the migration placed legacy
+            // rows, so old and replayed data co-locate correctly.
+            let database_id = DatabaseId::new(record.header.database_id);
 
             if is_fts_index {
                 let payload = match FtsIndexPayload::from_bytes(&record.payload) {
@@ -132,12 +137,12 @@ impl CoreLoop {
                 let prov = payload.provenance.clone();
 
                 let vshard = crate::types::VShardId::from_collection_in_database(
-                    DatabaseId::DEFAULT,
+                    database_id,
                     &payload.collection,
                 );
                 let task = Self::replay_fts_task(
                     nodedb_types::TenantId::new(tenant_id),
-                    DatabaseId::DEFAULT,
+                    database_id,
                     vshard,
                     PhysicalPlan::Text(TextOp::FtsIndexDoc {
                         collection: payload.collection.clone(),
@@ -205,12 +210,12 @@ impl CoreLoop {
                 let prov = payload.provenance.clone();
 
                 let vshard = crate::types::VShardId::from_collection_in_database(
-                    DatabaseId::DEFAULT,
+                    database_id,
                     &payload.collection,
                 );
                 let task = Self::replay_fts_task(
                     nodedb_types::TenantId::new(tenant_id),
-                    DatabaseId::DEFAULT,
+                    database_id,
                     vshard,
                     PhysicalPlan::Text(TextOp::FtsDeleteDoc {
                         collection: payload.collection.clone(),

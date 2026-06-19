@@ -54,9 +54,10 @@ impl CoreLoop {
 
         // ── Engine write ────────────────────────────────────────────────────
         let tenant_id = nodedb_types::TenantId::new(tid);
+        let database_id = task.request.database_id.as_u64();
         match self
             .inverted
-            .index_document(tenant_id, collection, surrogate, text)
+            .index_document(database_id, tenant_id, collection, surrogate, text)
         {
             Ok(()) => {
                 if let Some(prov) = provenance {
@@ -107,9 +108,10 @@ impl CoreLoop {
 
         // ── Engine write ────────────────────────────────────────────────────
         let tenant_id = nodedb_types::TenantId::new(tid);
+        let database_id = task.request.database_id.as_u64();
         match self
             .inverted
-            .remove_document(tenant_id, collection, surrogate)
+            .remove_document(database_id, tenant_id, collection, surrogate)
         {
             Ok(()) => {
                 if let Some(prov) = provenance {

@@ -104,6 +104,7 @@ impl<B: FtsBackend> FtsIndex<B> {
     /// `debug_assert!`, which would be a silent-wrap equivalent.
     pub fn index_document(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         doc_id: Surrogate,
@@ -115,7 +116,7 @@ impl<B: FtsBackend> FtsIndex<B> {
         }
 
         let tokens = self
-            .analyze_for_collection(tid, collection, text)
+            .analyze_for_collection(database_id, tid, collection, text)
             .map_err(FtsIndexError::backend)?;
         if tokens.is_empty() {
             return Ok(());
@@ -137,26 +138,26 @@ impl<B: FtsBackend> FtsIndex<B> {
                 fieldnorm: smallfloat::encode(doc_len),
                 positions: positions.clone(),
             };
-            let scoped_term = memtable_key(tid, collection, term);
+            let scoped_term = memtable_key(database_id, tid, collection, term);
             self.memtable.insert(&scoped_term, compact);
         }
         self.memtable.record_doc(doc_id, doc_len);
 
         // Write document length, fieldnorm, and update incremental stats.
         self.backend
-            .write_doc_length(tid, collection, doc_id, doc_len)
+            .write_doc_length(database_id, tid, collection, doc_id, doc_len)
             .map_err(FtsIndexError::backend)?;
-        self.write_fieldnorm(tid, collection, doc_id, doc_len)
+        self.write_fieldnorm(database_id, tid, collection, doc_id, doc_len)
             .map_err(FtsIndexError::backend)?;
         self.backend
-            .increment_stats(tid, collection, doc_len)
+            .increment_stats(database_id, tid, collection, doc_len)
             .map_err(FtsIndexError::backend)?;
 
         if self.memtable.should_flush() {
-            self.flush_memtable(tid, collection)?;
+            self.flush_memtable(database_id, tid, collection)?;
         }
 
-        debug!(tid, %collection, doc_id = doc_id.0, tokens = tokens.len(), terms = term_data.len(), "indexed document");
+        debug!(database_id, tid, %collection, doc_id = doc_id.0, tokens = tokens.len(), terms = term_data.len(), "indexed document");
         Ok(())
     }
 
@@ -169,6 +170,7 @@ impl<B: FtsBackend> FtsIndex<B> {
     /// active index before persisting.
     pub fn flush_memtable(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
     ) -> Result<(), FtsIndexError<B::Error>> {
@@ -181,62 +183,73 @@ impl<B: FtsBackend> FtsIndex<B> {
         let seg_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         let id = compaction::segment_id(seg_id, 0);
         self.backend
-            .write_segment(tid, collection, &id, &segment_bytes)
+            .write_segment(database_id, tid, collection, &id, &segment_bytes)
             .map_err(FtsIndexError::backend)?;
 
-        debug!(tid, %collection, seg_id, bytes = segment_bytes.len(), "flushed memtable to segment");
+        debug!(database_id, tid, %collection, seg_id, bytes = segment_bytes.len(), "flushed memtable to segment");
         Ok(())
     }
 
     /// Remove a document from the index.
     pub fn remove_document(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         doc_id: Surrogate,
     ) -> Result<(), B::Error> {
-        let doc_len = self.backend.read_doc_length(tid, collection, doc_id)?;
+        let doc_len = self
+            .backend
+            .read_doc_length(database_id, tid, collection, doc_id)?;
 
         self.memtable.remove_doc(doc_id);
-        self.backend.remove_doc_length(tid, collection, doc_id)?;
+        self.backend
+            .remove_doc_length(database_id, tid, collection, doc_id)?;
 
         if let Some(len) = doc_len {
-            self.backend.decrement_stats(tid, collection, len)?;
+            self.backend
+                .decrement_stats(database_id, tid, collection, len)?;
         }
 
         Ok(())
     }
 
     /// Purge all entries for a collection. Returns count of removed entries.
-    pub fn purge_collection(&self, tid: u64, collection: &str) -> Result<usize, B::Error> {
+    pub fn purge_collection(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> Result<usize, B::Error> {
         self.memtable
-            .drain_collection(&memtable_collection_prefix(tid, collection));
-        self.backend.purge_collection(tid, collection)
+            .drain_collection(&memtable_collection_prefix(database_id, tid, collection));
+        self.backend.purge_collection(database_id, tid, collection)
     }
 
-    /// Purge all entries for a tenant across every collection.
-    pub fn purge_tenant(&self, tid: u64) -> Result<usize, B::Error> {
-        self.memtable.drain_collection(&memtable_tenant_prefix(tid));
-        self.backend.purge_tenant(tid)
+    /// Purge all entries for a `(database_id, tenant)` across every collection.
+    pub fn purge_tenant(&self, database_id: u64, tid: u64) -> Result<usize, B::Error> {
+        self.memtable
+            .drain_collection(&memtable_tenant_prefix(database_id, tid));
+        self.backend.purge_tenant(database_id, tid)
     }
 }
 
-/// Memtable key format: `"{tid}:{collection}:{term}"`. The memtable is a
-/// single in-memory map shared across tenants, so keys must carry the
-/// full tenant + collection scope.
-pub(crate) fn memtable_key(tid: u64, collection: &str, term: &str) -> String {
-    format!("{tid}:{collection}:{term}")
+/// Memtable key format: `"{database_id}:{tid}:{collection}:{term}"`. The
+/// memtable is a single in-memory map shared across databases and tenants,
+/// so keys must carry the full database + tenant + collection scope.
+pub(crate) fn memtable_key(database_id: u64, tid: u64, collection: &str, term: &str) -> String {
+    format!("{database_id}:{tid}:{collection}:{term}")
 }
 
 /// Prefix used by `drain_collection` to remove all memtable entries for
-/// a given `(tid, collection)`.
-pub(crate) fn memtable_collection_prefix(tid: u64, collection: &str) -> String {
-    format!("{tid}:{collection}:")
+/// a given `(database_id, tid, collection)`.
+pub(crate) fn memtable_collection_prefix(database_id: u64, tid: u64, collection: &str) -> String {
+    format!("{database_id}:{tid}:{collection}:")
 }
 
-/// Prefix used to remove every memtable entry for a given tenant.
-pub(crate) fn memtable_tenant_prefix(tid: u64) -> String {
-    format!("{tid}:")
+/// Prefix used to remove every memtable entry for a given `(database_id, tenant)`.
+pub(crate) fn memtable_tenant_prefix(database_id: u64, tid: u64) -> String {
+    format!("{database_id}:{tid}:")
 }
 
 #[cfg(test)]
@@ -247,6 +260,7 @@ mod tests {
 
     use super::*;
 
+    const DB: u64 = 0;
     const T: u64 = 1;
 
     fn make_index() -> FtsIndex<MemoryBackend> {
@@ -273,7 +287,7 @@ mod tests {
         // boundary check directly.
         let oversize_term = "x".repeat(crate::lsm::segment::format::MAX_TERM_LEN + 1);
         idx.memtable.insert(
-            &super::memtable_key(T, "docs", &oversize_term),
+            &super::memtable_key(DB, T, "docs", &oversize_term),
             CompactPosting {
                 doc_id: Surrogate(1),
                 term_freq: 1,
@@ -284,9 +298,9 @@ mod tests {
         idx.memtable.record_doc(Surrogate(1), 1);
 
         let err = idx
-            .flush_memtable(T, "docs")
+            .flush_memtable(DB, T, "docs")
             .expect_err("flush must reject oversize term");
-        let key_overhead = super::memtable_key(T, "docs", "").len();
+        let key_overhead = super::memtable_key(DB, T, "docs", "").len();
         match err {
             FtsIndexError::TermTooLong { len, max } => {
                 assert_eq!(len, oversize_term.len() + key_overhead);
@@ -299,7 +313,7 @@ mod tests {
     #[test]
     fn index_writes_to_memtable() {
         let idx = make_index();
-        idx.index_document(T, "docs", Surrogate(1), "hello world greeting")
+        idx.index_document(DB, T, "docs", Surrogate(1), "hello world greeting")
             .unwrap();
 
         assert!(!idx.memtable.is_empty());
@@ -321,6 +335,7 @@ mod tests {
         };
 
         idx.index_document(
+            DB,
             T,
             "docs",
             Surrogate(1),
@@ -329,7 +344,7 @@ mod tests {
         .unwrap();
 
         assert!(idx.memtable.is_empty());
-        let segments = idx.backend.list_segments(T, "docs").unwrap();
+        let segments = idx.backend.list_segments(DB, T, "docs").unwrap();
         assert!(!segments.is_empty(), "segment should have been written");
     }
 
@@ -338,38 +353,38 @@ mod tests {
         let idx = make_index();
         // Surrogates must be in 1..=MAX_INDEXABLE_SURROGATE. Surrogate::ZERO is
         // the unassigned sentinel and is now rejected at index time.
-        idx.index_document(T, "docs", Surrogate(10), "hello world greeting")
+        idx.index_document(DB, T, "docs", Surrogate(10), "hello world greeting")
             .unwrap();
-        idx.index_document(T, "docs", Surrogate(11), "hello rust language")
+        idx.index_document(DB, T, "docs", Surrogate(11), "hello rust language")
             .unwrap();
 
-        let (count, _) = idx.backend.collection_stats(T, "docs").unwrap();
+        let (count, _) = idx.backend.collection_stats(DB, T, "docs").unwrap();
         assert_eq!(count, 2);
     }
 
     #[test]
     fn remove_decrements_stats() {
         let idx = make_index();
-        idx.index_document(T, "docs", Surrogate(10), "hello world")
+        idx.index_document(DB, T, "docs", Surrogate(10), "hello world")
             .unwrap();
-        idx.index_document(T, "docs", Surrogate(11), "hello rust")
+        idx.index_document(DB, T, "docs", Surrogate(11), "hello rust")
             .unwrap();
 
-        idx.remove_document(T, "docs", Surrogate(10)).unwrap();
+        idx.remove_document(DB, T, "docs", Surrogate(10)).unwrap();
 
-        let (count, _) = idx.backend.collection_stats(T, "docs").unwrap();
+        let (count, _) = idx.backend.collection_stats(DB, T, "docs").unwrap();
         assert_eq!(count, 1);
     }
 
     #[test]
     fn index_updates_stats() {
         let idx = make_index();
-        idx.index_document(T, "docs", Surrogate(10), "hello world greeting")
+        idx.index_document(DB, T, "docs", Surrogate(10), "hello world greeting")
             .unwrap();
-        idx.index_document(T, "docs", Surrogate(11), "hello rust language")
+        idx.index_document(DB, T, "docs", Surrogate(11), "hello rust language")
             .unwrap();
 
-        let (count, total) = idx.backend.collection_stats(T, "docs").unwrap();
+        let (count, total) = idx.backend.collection_stats(DB, T, "docs").unwrap();
         assert_eq!(count, 2);
         assert!(total > 0);
     }
@@ -377,23 +392,26 @@ mod tests {
     #[test]
     fn purge_collection_preserves_others() {
         let idx = make_index();
-        idx.index_document(T, "col_a", Surrogate(1), "alpha bravo")
+        idx.index_document(DB, T, "col_a", Surrogate(1), "alpha bravo")
             .unwrap();
-        idx.index_document(T, "col_b", Surrogate(1), "delta echo")
+        idx.index_document(DB, T, "col_b", Surrogate(1), "delta echo")
             .unwrap();
 
-        idx.purge_collection(T, "col_a").unwrap();
-        assert_eq!(idx.backend.collection_stats(T, "col_a").unwrap(), (0, 0));
-        assert!(idx.backend.collection_stats(T, "col_b").unwrap().0 > 0);
+        idx.purge_collection(DB, T, "col_a").unwrap();
+        assert_eq!(
+            idx.backend.collection_stats(DB, T, "col_a").unwrap(),
+            (0, 0)
+        );
+        assert!(idx.backend.collection_stats(DB, T, "col_b").unwrap().0 > 0);
 
         assert!(
             !idx.memtable
-                .get_postings(&memtable_key(T, "col_b", "delta"))
+                .get_postings(&memtable_key(DB, T, "col_b", "delta"))
                 .is_empty()
         );
         assert!(
             idx.memtable
-                .get_postings(&memtable_key(T, "col_a", "alpha"))
+                .get_postings(&memtable_key(DB, T, "col_a", "alpha"))
                 .is_empty()
         );
     }
@@ -401,9 +419,9 @@ mod tests {
     #[test]
     fn empty_text_is_noop() {
         let idx = make_index();
-        idx.index_document(T, "docs", Surrogate(1), "the a is")
+        idx.index_document(DB, T, "docs", Surrogate(1), "the a is")
             .unwrap();
-        assert_eq!(idx.backend.collection_stats(T, "docs").unwrap(), (0, 0));
+        assert_eq!(idx.backend.collection_stats(DB, T, "docs").unwrap(), (0, 0));
         assert!(idx.memtable.is_empty());
     }
 
@@ -415,7 +433,7 @@ mod tests {
     fn index_document_rejects_zero_surrogate() {
         let idx = make_index();
         let err = idx
-            .index_document(T, "docs", Surrogate(0), "hello world")
+            .index_document(DB, T, "docs", Surrogate(0), "hello world")
             .unwrap_err();
         assert!(
             matches!(err, FtsIndexError::SurrogateOutOfRange { surrogate } if surrogate == Surrogate(0)),
@@ -429,7 +447,7 @@ mod tests {
     fn index_document_rejects_u32_max_surrogate() {
         let idx = make_index();
         let err = idx
-            .index_document(T, "docs", Surrogate(u32::MAX), "hello world")
+            .index_document(DB, T, "docs", Surrogate(u32::MAX), "hello world")
             .unwrap_err();
         assert!(
             matches!(err, FtsIndexError::SurrogateOutOfRange { .. }),
@@ -452,7 +470,7 @@ mod tests {
         // by separately verifying Surrogate(u32::MAX) is rejected (above).
         let idx = make_index();
         // Verify a normal valid surrogate works (guards pass).
-        idx.index_document(T, "docs", Surrogate(1), "boundary check")
+        idx.index_document(DB, T, "docs", Surrogate(1), "boundary check")
             .unwrap();
         // Confirm the constant is correct.
         assert_eq!(

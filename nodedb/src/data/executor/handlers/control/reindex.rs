@@ -166,7 +166,7 @@ impl CoreLoop {
                             apply_csr(self, &database_id, &tenant_id, &collection_key, bytes);
                         }
                         RebuildOutput::Fts(rebuild) => {
-                            apply_fts(self, &tenant_id, &collection_key, rebuild);
+                            apply_fts(self, &database_id, &tenant_id, &collection_key, rebuild);
                         }
                     }
                     info!(
@@ -310,22 +310,22 @@ impl CoreLoop {
         use nodedb_fts::backend::FtsBackend;
 
         let database_id = task.request.database_id;
+        let db_u64 = database_id.as_u64();
         let tid = tenant_id.as_u64();
         let backend = self.inverted.backend();
 
-        let terms =
-            backend
-                .collection_terms(tid, collection_key)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "fts".to_string(),
-                    detail: format!("FTS terms: {e}"),
-                })?;
+        let terms = backend
+            .collection_terms(db_u64, tid, collection_key)
+            .map_err(|e| crate::Error::Storage {
+                engine: "fts".to_string(),
+                detail: format!("FTS terms: {e}"),
+            })?;
 
         let mut postings: Vec<(String, Vec<nodedb_fts::posting::Posting>)> =
             Vec::with_capacity(terms.len());
         for term in &terms {
             let ps = backend
-                .read_postings(tid, collection_key, term)
+                .read_postings(db_u64, tid, collection_key, term)
                 .map_err(|e| crate::Error::Storage {
                     engine: "fts".to_string(),
                     detail: format!("FTS postings '{term}': {e}"),
@@ -339,7 +339,8 @@ impl CoreLoop {
             for p in ps {
                 let k = p.doc_id.as_u32();
                 if let std::collections::hash_map::Entry::Vacant(slot) = dl_map.entry(k)
-                    && let Ok(Some(dl)) = backend.read_doc_length(tid, collection_key, p.doc_id)
+                    && let Ok(Some(dl)) =
+                        backend.read_doc_length(db_u64, tid, collection_key, p.doc_id)
                 {
                     slot.insert(dl);
                 }
@@ -350,16 +351,15 @@ impl CoreLoop {
             .map(|(&k, &dl)| (nodedb_types::Surrogate::new(k), dl))
             .collect();
 
-        let (doc_count, total_tokens) =
-            backend
-                .collection_stats(tid, collection_key)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "fts".to_string(),
-                    detail: format!("FTS stats: {e}"),
-                })?;
+        let (doc_count, total_tokens) = backend
+            .collection_stats(db_u64, tid, collection_key)
+            .map_err(|e| crate::Error::Storage {
+                engine: "fts".to_string(),
+                detail: format!("FTS stats: {e}"),
+            })?;
 
         let analyzer_meta = backend
-            .read_meta(tid, collection_key, "analyzer")
+            .read_meta(db_u64, tid, collection_key, "analyzer")
             .unwrap_or(None);
 
         let input = FtsRebuild {

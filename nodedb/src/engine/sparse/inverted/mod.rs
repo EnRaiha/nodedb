@@ -24,4 +24,7 @@ mod synonyms;
 mod tests;
 
 pub use core::InvertedIndex;
+pub use indexing::IndexDocScope;
+pub use nodedb_fts::FtsSearchParams;
 pub use nodedb_fts::posting::{MatchOffset, Posting, QueryMode, TextSearchResult};
+pub use search::PhraseSearchParams;

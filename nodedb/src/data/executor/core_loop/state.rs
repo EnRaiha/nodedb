@@ -351,13 +351,6 @@ pub struct CoreLoop {
     pub(in crate::data::executor) maintenance_budget:
         Option<Arc<crate::control::maintenance::MaintenanceBudgetTracker>>,
 
-    /// Mapping from `TenantId` to the `DatabaseId` that owns the tenant.
-    ///
-    /// Populated lazily as requests arrive (sourced from `task.request.database_id`).
-    /// Used by the maintenance budget tracker to look up per-database caps when
-    /// iterating collections keyed by `TenantId`.
-    pub(in crate::data::executor) tenant_database_map: HashMap<TenantId, DatabaseId>,
-
     /// Current SPSC drain batch size, adjusted by memory pressure.
     ///
     /// Normal: 64.  Critical: halved (floor 1).  Emergency: 0 (new reads

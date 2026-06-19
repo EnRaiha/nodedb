@@ -39,45 +39,6 @@ impl CoreLoop {
         self.maintenance_budget = Some(tracker);
     }
 
-    /// Record the `TenantId → DatabaseId` mapping for a tenant seen in a request.
-    ///
-    /// Called by dispatch handlers when `task.request.database_id` is available
-    /// so the maintenance budget tracker can look up per-database caps when
-    /// iterating collections that are keyed only by `TenantId`.
-    pub(in crate::data::executor) fn record_tenant_database(
-        &mut self,
-        tenant: crate::types::TenantId,
-        db: nodedb_types::DatabaseId,
-    ) {
-        self.tenant_database_map.entry(tenant).or_insert(db);
-    }
-
-    /// Register a `TenantId → DatabaseId` mapping.
-    ///
-    /// In production the mapping is populated lazily from request headers.
-    /// This method allows tests and bootstrapping code to prime the mapping
-    /// explicitly so the maintenance budget tracker can resolve per-database
-    /// caps for tenants that have not yet processed any requests.
-    pub fn set_tenant_database(
-        &mut self,
-        tenant: crate::types::TenantId,
-        db: nodedb_types::DatabaseId,
-    ) {
-        self.tenant_database_map.insert(tenant, db);
-    }
-
-    /// Resolve the `DatabaseId` for a `TenantId`. Falls back to
-    /// `DatabaseId::DEFAULT` when the mapping has not been seen yet.
-    pub(in crate::data::executor) fn database_for_tenant(
-        &self,
-        tenant: crate::types::TenantId,
-    ) -> nodedb_types::DatabaseId {
-        self.tenant_database_map
-            .get(&tenant)
-            .copied()
-            .unwrap_or(nodedb_types::DatabaseId::DEFAULT)
-    }
-
     /// Set checkpoint coordinator config (called after open, before event loop).
     pub fn set_checkpoint_config(&mut self, config: crate::storage::checkpoint::CheckpointConfig) {
         self.checkpoint_coordinator =

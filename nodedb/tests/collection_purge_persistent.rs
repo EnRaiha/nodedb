@@ -12,6 +12,8 @@ use nodedb::engine::kv::KvEngine;
 use nodedb::engine::sparse::btree::SparseEngine;
 use nodedb::engine::sparse::inverted::InvertedIndex;
 use nodedb::types::TenantId;
+use nodedb_fts::FtsSearchParams;
+use nodedb_fts::posting::QueryMode;
 use nodedb_types::Surrogate;
 
 const TENANT: u64 = 7;
@@ -154,20 +156,42 @@ fn inverted_index_purge_is_scoped_to_collection() {
     let tid = TenantId::new(TENANT);
 
     inverted
-        .index_document(tid, "keep", Surrogate(1), "hello world")
+        .index_document(DB, tid, "keep", Surrogate(1), "hello world")
         .unwrap();
     inverted
-        .index_document(tid, "purge_me", Surrogate(2), "hello universe")
+        .index_document(DB, tid, "purge_me", Surrogate(2), "hello universe")
         .unwrap();
 
-    inverted.purge_collection(tid, "purge_me").unwrap();
+    inverted.purge_collection(DB, tid, "purge_me").unwrap();
 
     let purged = inverted
-        .search(tid, "purge_me", "hello", 10, false, None)
+        .search(
+            DB,
+            tid,
+            "purge_me",
+            FtsSearchParams {
+                query: "hello",
+                top_k: 10,
+                fuzzy_enabled: false,
+                mode: QueryMode::And,
+                prefilter: None,
+            },
+        )
         .unwrap();
     assert!(purged.is_empty(), "purged collection must return no hits");
     let kept = inverted
-        .search(tid, "keep", "hello", 10, false, None)
+        .search(
+            DB,
+            tid,
+            "keep",
+            FtsSearchParams {
+                query: "hello",
+                top_k: 10,
+                fuzzy_enabled: false,
+                mode: QueryMode::And,
+                prefilter: None,
+            },
+        )
         .unwrap();
     assert_eq!(kept.len(), 1);
 }

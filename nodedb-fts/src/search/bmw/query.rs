@@ -32,6 +32,7 @@ pub struct BmwParams<'a> {
 /// Run BMW search over the FtsIndex.
 pub fn bmw_search<B: FtsBackend>(
     index: &FtsIndex<B>,
+    database_id: u64,
     tid: u64,
     collection: &str,
     p: &BmwParams<'_>,
@@ -40,6 +41,7 @@ pub fn bmw_search<B: FtsBackend>(
 
     let mut lsm_term_blocks = lsm_query::collect_merged_term_blocks(
         &index.backend,
+        database_id,
         tid,
         collection,
         index.memtable(),
@@ -59,7 +61,7 @@ pub fn bmw_search<B: FtsBackend>(
         let has_any_backend = p.query_tokens.iter().any(|tok| {
             index
                 .backend
-                .read_postings(tid, collection, tok)
+                .read_postings(database_id, tid, collection, tok)
                 .ok()
                 .is_some_and(|v| !v.is_empty())
         });
@@ -72,9 +74,11 @@ pub fn bmw_search<B: FtsBackend>(
         if lsm_term_blocks[i].df == 0 {
             // First, try an exact backend lookup (covers Origin's redb-direct indexing
             // path which bypasses the LSM memtable).
-            let backend_posts = index.backend.read_postings(tid, collection, token)?;
+            let backend_posts = index
+                .backend
+                .read_postings(database_id, tid, collection, token)?;
             if !backend_posts.is_empty() {
-                let compact = to_compact(&backend_posts, index, tid, collection)?;
+                let compact = to_compact(&backend_posts, index, database_id, tid, collection)?;
                 let blocks = into_blocks(compact);
                 lsm_term_blocks[i] = TermBlocks::from_blocks(blocks);
                 continue;
@@ -82,10 +86,10 @@ pub fn bmw_search<B: FtsBackend>(
             // Fall back to fuzzy matching when no exact posting exists.
             if p.fuzzy_enabled {
                 let raw = p.raw_tokens.get(i).unwrap_or(token);
-                let (posts, is_fuzzy) = index.fuzzy_lookup(tid, collection, raw)?;
+                let (posts, is_fuzzy) = index.fuzzy_lookup(database_id, tid, collection, raw)?;
                 has_fuzzy[i] = is_fuzzy;
                 if !posts.is_empty() {
-                    let compact = to_compact(&posts, index, tid, collection)?;
+                    let compact = to_compact(&posts, index, database_id, tid, collection)?;
                     let blocks = into_blocks(compact);
                     lsm_term_blocks[i] = TermBlocks::from_blocks(blocks);
                 }
@@ -126,13 +130,14 @@ pub fn bmw_search<B: FtsBackend>(
 fn to_compact<B: FtsBackend>(
     postings: &[Posting],
     index: &FtsIndex<B>,
+    database_id: u64,
     tid: u64,
     collection: &str,
 ) -> Result<Vec<CompactPosting>, B::Error> {
     let mut compact = Vec::with_capacity(postings.len());
     for p in postings {
         let fieldnorm = index
-            .read_fieldnorm(tid, collection, p.doc_id)?
+            .read_fieldnorm(database_id, tid, collection, p.doc_id)?
             .map(smallfloat::encode)
             .unwrap_or_else(|| smallfloat::encode(p.term_freq));
         compact.push(CompactPosting {
@@ -153,6 +158,7 @@ mod tests {
     use crate::backend::memory::MemoryBackend;
     use crate::index::FtsIndex;
 
+    const DB: u64 = 0;
     const T: u64 = 1;
     const D1: Surrogate = Surrogate(1);
     const D2: Surrogate = Surrogate(2);
@@ -181,19 +187,25 @@ mod tests {
     #[test]
     fn bmw_query_basic() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "The quick brown fox jumps over the lazy dog")
+        idx.index_document(
+            DB,
+            T,
+            "docs",
+            D1,
+            "The quick brown fox jumps over the lazy dog",
+        )
+        .unwrap();
+        idx.index_document(DB, T, "docs", D2, "A fast brown dog runs across the field")
             .unwrap();
-        idx.index_document(T, "docs", D2, "A fast brown dog runs across the field")
-            .unwrap();
-        idx.index_document(T, "docs", D3, "Rust programming language for systems")
+        idx.index_document(DB, T, "docs", D3, "Rust programming language for systems")
             .unwrap();
 
         let tokens = crate::analyze("brown fox");
-        let (total, avg) = idx.index_stats(T, "docs").unwrap();
+        let (total, avg) = idx.index_stats(DB, T, "docs").unwrap();
         let bm25 = Bm25Params::default();
         let p = make_params(&tokens, total, avg, 10, false, &bm25);
 
-        let results = bmw_search(&idx, T, "docs", &p).unwrap().unwrap();
+        let results = bmw_search(&idx, DB, T, "docs", &p).unwrap().unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].doc_id, D1);
     }
@@ -205,7 +217,7 @@ mod tests {
         let bm25 = Bm25Params::default();
         let p = make_params(&tokens, 0, 1.0, 10, false, &bm25);
 
-        let result = bmw_search(&idx, T, "empty", &p).unwrap();
+        let result = bmw_search(&idx, DB, T, "empty", &p).unwrap();
         assert!(result.is_none());
     }
 
@@ -213,28 +225,28 @@ mod tests {
     fn bmw_query_respects_top_k() {
         let idx = FtsIndex::new(MemoryBackend::new());
         for i in 1..=50u32 {
-            idx.index_document(T, "docs", Surrogate(i), &format!("common term word{i}"))
+            idx.index_document(DB, T, "docs", Surrogate(i), &format!("common term word{i}"))
                 .unwrap();
         }
 
         let tokens = crate::analyze("common term");
-        let (total, avg) = idx.index_stats(T, "docs").unwrap();
+        let (total, avg) = idx.index_stats(DB, T, "docs").unwrap();
         let bm25 = Bm25Params::default();
         let p = make_params(&tokens, total, avg, 5, false, &bm25);
 
-        let results = bmw_search(&idx, T, "docs", &p).unwrap().unwrap();
+        let results = bmw_search(&idx, DB, T, "docs", &p).unwrap().unwrap();
         assert_eq!(results.len(), 5);
     }
 
     #[test]
     fn bmw_query_with_fuzzy() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "distributed database systems")
+        idx.index_document(DB, T, "docs", D1, "distributed database systems")
             .unwrap();
 
         let stemmed = crate::analyze("databse");
         let raw = crate::analyzer::pipeline::tokenize_no_stem("databse");
-        let (total, avg) = idx.index_stats(T, "docs").unwrap();
+        let (total, avg) = idx.index_stats(DB, T, "docs").unwrap();
         let bm25 = Bm25Params::default();
         let p = BmwParams {
             query_tokens: &stemmed,
@@ -247,7 +259,7 @@ mod tests {
             prefilter: None,
         };
 
-        let result = bmw_search(&idx, T, "docs", &p);
+        let result = bmw_search(&idx, DB, T, "docs", &p);
         match &result {
             Ok(Some(r)) => assert!(!r.is_empty(), "BMW returned empty results"),
             Ok(None) => panic!("BMW returned None (no term blocks)"),
@@ -258,17 +270,17 @@ mod tests {
     #[test]
     fn bmw_query_uses_memtable() {
         let idx = FtsIndex::new(MemoryBackend::new());
-        idx.index_document(T, "docs", D1, "hello world greeting")
+        idx.index_document(DB, T, "docs", D1, "hello world greeting")
             .unwrap();
 
         assert!(!idx.memtable().is_empty());
 
         let tokens = crate::analyze("hello");
-        let (total, avg) = idx.index_stats(T, "docs").unwrap();
+        let (total, avg) = idx.index_stats(DB, T, "docs").unwrap();
         let bm25 = Bm25Params::default();
         let p = make_params(&tokens, total, avg, 10, false, &bm25);
 
-        let results = bmw_search(&idx, T, "docs", &p).unwrap().unwrap();
+        let results = bmw_search(&idx, DB, T, "docs", &p).unwrap().unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].doc_id, D1);
     }

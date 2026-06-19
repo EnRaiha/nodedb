@@ -432,6 +432,7 @@ impl CoreLoop {
                 match crate::engine::document::store::doc_id_to_surrogate(doc_id) {
                     Some(surrogate) => {
                         if let Err(e) = self.inverted.remove_document(
+                            task.request.database_id.as_u64(),
                             crate::types::TenantId::new(tid),
                             collection,
                             surrogate,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Corpus statistics against the dedicated `STATS` table
-//! keyed by `(tenant_id, collection)`.
+//! keyed by `(database_id, tenant_id, collection)`.
 
 use redb::ReadableTable;
 
@@ -11,6 +11,7 @@ use crate::engine::sparse::fts_redb::tables::STATS;
 
 pub(super) fn read(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
 ) -> crate::Result<(u32, u64)> {
@@ -21,7 +22,7 @@ pub(super) fn read(
     let table = read_txn
         .open_table(STATS)
         .map_err(|e| redb_err("open stats", e))?;
-    match table.get((tid, collection)) {
+    match table.get((database_id, tid, collection)) {
         Ok(Some(val)) => {
             let stats: (u32, u64) =
                 zerompk::from_msgpack(val.value()).map_err(|e| redb_err("deserialize stats", e))?;
@@ -34,23 +35,31 @@ pub(super) fn read(
 
 pub(super) fn increment(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     doc_len: u32,
 ) -> crate::Result<()> {
-    bump(backend, tid, collection, doc_len as i64)
+    bump(backend, database_id, tid, collection, doc_len as i64)
 }
 
 pub(super) fn decrement(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     doc_len: u32,
 ) -> crate::Result<()> {
-    bump(backend, tid, collection, -(doc_len as i64))
+    bump(backend, database_id, tid, collection, -(doc_len as i64))
 }
 
-fn bump(backend: &RedbFtsBackend, tid: u64, collection: &str, delta: i64) -> crate::Result<()> {
+fn bump(
+    backend: &RedbFtsBackend,
+    database_id: u64,
+    tid: u64,
+    collection: &str,
+    delta: i64,
+) -> crate::Result<()> {
     let write_txn = backend
         .db
         .begin_write()
@@ -60,7 +69,7 @@ fn bump(backend: &RedbFtsBackend, tid: u64, collection: &str, delta: i64) -> cra
             .open_table(STATS)
             .map_err(|e| redb_err("open stats", e))?;
         let (mut count, mut total) = table
-            .get((tid, collection))
+            .get((database_id, tid, collection))
             .ok()
             .flatten()
             .and_then(|v| zerompk::from_msgpack::<(u32, u64)>(v.value()).ok())
@@ -75,7 +84,7 @@ fn bump(backend: &RedbFtsBackend, tid: u64, collection: &str, delta: i64) -> cra
         let bytes =
             zerompk::to_msgpack_vec(&(count, total)).map_err(|e| redb_err("serialize stats", e))?;
         table
-            .insert((tid, collection), bytes.as_slice())
+            .insert((database_id, tid, collection), bytes.as_slice())
             .map_err(|e| redb_err("insert stats", e))?;
     }
     write_txn.commit().map_err(|e| redb_err("commit", e))?;

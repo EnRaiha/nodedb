@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Posting-list operations against the `POSTINGS` table
-//! keyed by `(tenant_id, collection, term)`.
+//! keyed by `(database_id, tenant_id, collection, term)`.
 
 use nodedb_fts::posting::Posting;
 
@@ -11,6 +11,7 @@ use crate::engine::sparse::fts_redb::tables::POSTINGS;
 
 pub(super) fn read(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     term: &str,
@@ -22,7 +23,7 @@ pub(super) fn read(
     let table = read_txn
         .open_table(POSTINGS)
         .map_err(|e| redb_err("open postings", e))?;
-    match table.get((tid, collection, term)) {
+    match table.get((database_id, tid, collection, term)) {
         Ok(Some(val)) => {
             let list: Vec<Posting> = zerompk::from_msgpack(val.value())
                 .map_err(|e| redb_err("deserialize postings", e))?;
@@ -35,6 +36,7 @@ pub(super) fn read(
 
 pub(super) fn write(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     term: &str,
@@ -49,12 +51,12 @@ pub(super) fn write(
             .open_table(POSTINGS)
             .map_err(|e| redb_err("open postings", e))?;
         if postings.is_empty() {
-            let _ = table.remove((tid, collection, term));
+            let _ = table.remove((database_id, tid, collection, term));
         } else {
             let bytes = zerompk::to_msgpack_vec(&postings.to_vec())
                 .map_err(|e| redb_err("serialize postings", e))?;
             table
-                .insert((tid, collection, term), bytes.as_slice())
+                .insert((database_id, tid, collection, term), bytes.as_slice())
                 .map_err(|e| redb_err("insert posting", e))?;
         }
     }
@@ -64,6 +66,7 @@ pub(super) fn write(
 
 pub(super) fn remove(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
     term: &str,
@@ -76,7 +79,7 @@ pub(super) fn remove(
         let mut table = write_txn
             .open_table(POSTINGS)
             .map_err(|e| redb_err("open postings", e))?;
-        let _ = table.remove((tid, collection, term));
+        let _ = table.remove((database_id, tid, collection, term));
     }
     write_txn.commit().map_err(|e| redb_err("commit", e))?;
     Ok(())
@@ -84,6 +87,7 @@ pub(super) fn remove(
 
 pub(super) fn collection_terms(
     backend: &RedbFtsBackend,
+    database_id: u64,
     tid: u64,
     collection: &str,
 ) -> crate::Result<Vec<String>> {
@@ -96,9 +100,9 @@ pub(super) fn collection_terms(
         .map_err(|e| redb_err("open postings", e))?;
 
     let terms: Vec<String> = table
-        .range((tid, collection, "")..=(tid, collection, MAX_SUBKEY))
+        .range((database_id, tid, collection, "")..=(database_id, tid, collection, MAX_SUBKEY))
         .map_err(|e| redb_err("range", e))?
-        .filter_map(|r| r.ok().map(|(k, _)| k.value().2.to_string()))
+        .filter_map(|r| r.ok().map(|(k, _)| k.value().3.to_string()))
         .collect();
     Ok(terms)
 }

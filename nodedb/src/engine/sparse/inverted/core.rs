@@ -48,19 +48,25 @@ impl InvertedIndex {
         self.inner.backend_mut()
     }
 
-    /// Purge all inverted index entries for a tenant. Structural drop via
-    /// tuple ranges on every FTS table.
-    pub fn purge_tenant(&self, tid: TenantId) -> crate::Result<usize> {
+    /// Purge all inverted index entries for a `(database, tenant)`. Structural
+    /// drop via tuple ranges on every FTS table.
+    pub fn purge_tenant(&self, database_id: u64, tid: TenantId) -> crate::Result<usize> {
         self.inner
-            .purge_tenant(tid.as_u64())
+            .purge_tenant(database_id, tid.as_u64())
             .map_err(into_result_err)
     }
 
-    /// Purge all inverted index entries for a single `(tenant, collection)`.
-    /// Structural drop via tuple ranges on every FTS table.
-    pub fn purge_collection(&self, tid: TenantId, collection: &str) -> crate::Result<usize> {
+    /// Purge all inverted index entries for a single
+    /// `(database, tenant, collection)`. Structural drop via tuple ranges on
+    /// every FTS table.
+    pub fn purge_collection(
+        &self,
+        database_id: u64,
+        tid: TenantId,
+        collection: &str,
+    ) -> crate::Result<usize> {
         self.inner
-            .purge_collection(tid.as_u64(), collection)
+            .purge_collection(database_id, tid.as_u64(), collection)
             .map_err(into_result_err)
     }
 }

@@ -173,9 +173,12 @@ impl CoreLoop {
                 if !text_content.is_empty()
                     && let Err(e) = self.inverted.index_document_in_txn(
                         txn,
-                        crate::types::TenantId::new(tid),
-                        collection,
-                        surrogate,
+                        crate::engine::sparse::inverted::IndexDocScope {
+                            database_id,
+                            tid: crate::types::TenantId::new(tid),
+                            collection,
+                            surrogate,
+                        },
                         &text_content,
                     )
                 {

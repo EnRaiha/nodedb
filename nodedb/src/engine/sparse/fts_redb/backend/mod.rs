@@ -10,3 +10,4 @@ mod shared;
 mod stats;
 
 pub use core::RedbFtsBackend;
+pub use segments::CompactCommit;

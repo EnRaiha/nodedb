@@ -107,6 +107,7 @@ impl CoreLoop {
                 // user-visible PK — keep the cascade keyed the same way
                 // so a delete actually wipes the term postings.
                 if let Err(e) = self.inverted.remove_document(
+                    database_id,
                     crate::types::TenantId::new(tid),
                     collection,
                     surrogate,

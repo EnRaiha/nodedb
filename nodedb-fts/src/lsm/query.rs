@@ -27,16 +27,17 @@ use nodedb_mem::{EngineId, MemoryGovernor};
 /// serves as an accounting and backpressure signal.
 pub fn collect_merged_term_blocks<B: FtsBackend>(
     backend: &B,
+    database_id: u64,
     tid: u64,
     collection: &str,
     memtable: &Memtable,
     query_tokens: &[String],
     governor: Option<&Arc<MemoryGovernor>>,
 ) -> Result<Vec<TermBlocks>, B::Error> {
-    let seg_ids = backend.list_segments(tid, collection)?;
+    let seg_ids = backend.list_segments(database_id, tid, collection)?;
     let mut readers: Vec<SegmentReader> = Vec::new();
     for id in &seg_ids {
-        if let Some(data) = backend.read_segment(tid, collection, id)?
+        if let Some(data) = backend.read_segment(database_id, tid, collection, id)?
             && let Ok(reader) = SegmentReader::open(data)
         {
             readers.push(reader);
@@ -51,7 +52,7 @@ pub fn collect_merged_term_blocks<B: FtsBackend>(
     let mut term_blocks_list = Vec::with_capacity(query_tokens.len());
 
     for token in query_tokens {
-        let scoped_term = memtable_key(tid, collection, token);
+        let scoped_term = memtable_key(database_id, tid, collection, token);
         let mt_postings = memtable.get_postings(&scoped_term);
 
         let seg_postings: Vec<Vec<CompactPosting>> = readers
@@ -91,11 +92,12 @@ pub fn collect_merged_term_blocks<B: FtsBackend>(
 /// Used by fuzzy matching to scan available terms.
 pub fn collect_all_terms<B: FtsBackend>(
     backend: &B,
+    database_id: u64,
     tid: u64,
     collection: &str,
     memtable: &Memtable,
 ) -> Result<Vec<String>, B::Error> {
-    let prefix = memtable_collection_prefix(tid, collection);
+    let prefix = memtable_collection_prefix(database_id, tid, collection);
     let mut terms: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for key in memtable.terms() {
@@ -104,9 +106,9 @@ pub fn collect_all_terms<B: FtsBackend>(
         }
     }
 
-    let seg_ids = backend.list_segments(tid, collection)?;
+    let seg_ids = backend.list_segments(database_id, tid, collection)?;
     for id in &seg_ids {
-        if let Some(data) = backend.read_segment(tid, collection, id)?
+        if let Some(data) = backend.read_segment(database_id, tid, collection, id)?
             && let Ok(reader) = SegmentReader::open(data)
         {
             for term in reader.terms() {
@@ -121,10 +123,11 @@ pub fn collect_all_terms<B: FtsBackend>(
 /// Compute merged corpus stats from memtable + all segments.
 pub fn merged_collection_stats<B: FtsBackend>(
     backend: &B,
+    database_id: u64,
     tid: u64,
     collection: &str,
 ) -> Result<(u32, f32), B::Error> {
-    let (count, total) = backend.collection_stats(tid, collection)?;
+    let (count, total) = backend.collection_stats(database_id, tid, collection)?;
     let avg = if count > 0 {
         total as f32 / count as f32
     } else {
@@ -142,6 +145,7 @@ mod tests {
     use crate::lsm::segment::writer;
     use std::collections::HashMap;
 
+    const DB: u64 = 0;
     const T: u64 = 1;
 
     fn cp(doc_id: u32, tf: u32) -> CompactPosting {
@@ -157,12 +161,12 @@ mod tests {
     fn memtable_only() {
         let backend = MemoryBackend::new();
         let mt = Memtable::new(MemtableConfig::default());
-        mt.insert(&memtable_key(T, "col", "hello"), cp(0, 2));
-        mt.insert(&memtable_key(T, "col", "hello"), cp(1, 1));
+        mt.insert(&memtable_key(DB, T, "col", "hello"), cp(0, 2));
+        mt.insert(&memtable_key(DB, T, "col", "hello"), cp(1, 1));
 
         let tokens = vec!["hello".to_string()];
         let term_blocks =
-            collect_merged_term_blocks(&backend, T, "col", &mt, &tokens, None).unwrap();
+            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, None).unwrap();
 
         assert_eq!(term_blocks.len(), 1);
         assert_eq!(term_blocks[0].df, 2);
@@ -175,13 +179,13 @@ mod tests {
         postings.insert("hello".to_string(), vec![cp(0, 1), cp(5, 2)]);
         let seg_bytes = writer::flush_to_segment(postings).unwrap();
         backend
-            .write_segment(T, "col", "L0:0000000000000001", &seg_bytes)
+            .write_segment(DB, T, "col", "L0:0000000000000001", &seg_bytes)
             .unwrap();
 
         let mt = Memtable::new(MemtableConfig::default());
         let tokens = vec!["hello".to_string()];
         let term_blocks =
-            collect_merged_term_blocks(&backend, T, "col", &mt, &tokens, None).unwrap();
+            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, None).unwrap();
 
         assert_eq!(term_blocks.len(), 1);
         assert_eq!(term_blocks[0].df, 2);
@@ -195,16 +199,16 @@ mod tests {
         seg_postings.insert("hello".to_string(), vec![cp(0, 1), cp(5, 2)]);
         let seg_bytes = writer::flush_to_segment(seg_postings).unwrap();
         backend
-            .write_segment(T, "col", "L0:0000000000000001", &seg_bytes)
+            .write_segment(DB, T, "col", "L0:0000000000000001", &seg_bytes)
             .unwrap();
 
         let mt = Memtable::new(MemtableConfig::default());
-        mt.insert(&memtable_key(T, "col", "hello"), cp(0, 10));
-        mt.insert(&memtable_key(T, "col", "hello"), cp(3, 1));
+        mt.insert(&memtable_key(DB, T, "col", "hello"), cp(0, 10));
+        mt.insert(&memtable_key(DB, T, "col", "hello"), cp(3, 1));
 
         let tokens = vec!["hello".to_string()];
         let term_blocks =
-            collect_merged_term_blocks(&backend, T, "col", &mt, &tokens, None).unwrap();
+            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, None).unwrap();
 
         assert_eq!(term_blocks.len(), 1);
         assert_eq!(term_blocks[0].df, 3);
@@ -217,7 +221,7 @@ mod tests {
 
         let tokens = vec!["nonexistent".to_string()];
         let term_blocks =
-            collect_merged_term_blocks(&backend, T, "col", &mt, &tokens, None).unwrap();
+            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, None).unwrap();
 
         assert_eq!(term_blocks.len(), 1);
         assert_eq!(term_blocks[0].df, 0);

@@ -114,7 +114,7 @@ impl CoreLoop {
 
         // Inverted index: postings + doc_lengths + stats + segments.
         let inv_removed = retry_reclaim("inverted.purge_collection", tenant_id, collection, || {
-            self.inverted.purge_collection(tid, collection)
+            self.inverted.purge_collection(database_id, tid, collection)
         })
         .unwrap_or(0);
 
