@@ -75,6 +75,7 @@ pub(super) struct NeighborHopParams<'a> {
 pub(super) async fn execute_neighbor_hop(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     params: NeighborHopParams<'_>,
 ) -> crate::Result<HopOutput> {
     let NeighborHopParams {
@@ -101,6 +102,7 @@ pub(super) async fn execute_neighbor_hop(
         let triples = expand_local(
             shared,
             tenant_id,
+            database_id,
             frontier,
             edge_label,
             direction,
@@ -125,6 +127,7 @@ pub(super) async fn execute_neighbor_hop(
         expand_local(
             shared,
             tenant_id,
+            database_id,
             &local_nodes,
             edge_label,
             direction,
@@ -140,6 +143,7 @@ pub(super) async fn execute_neighbor_hop(
         let remote_triples = expand_remote(
             shared,
             tenant_id,
+            database_id,
             remote_by_owner,
             edge_label,
             direction,
@@ -248,6 +252,7 @@ fn partition_frontier_by_owner(
 async fn expand_local(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     node_ids: &[String],
     edge_label: Option<&str>,
     direction: Direction,
@@ -263,7 +268,7 @@ async fn expand_local(
     let resp = crate::control::server::broadcast::broadcast_to_all_cores(
         shared,
         tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         plan,
         TraceId::ZERO,
     )
@@ -277,6 +282,7 @@ async fn expand_local(
 async fn expand_remote(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     owners: Vec<RemoteOwnerBatch>,
     edge_label: Option<&str>,
     direction: Direction,
@@ -297,7 +303,6 @@ async fn expand_remote(
         })?;
     let shared_arc: &Arc<SharedState> = &gateway.shared;
 
-    let database_id = crate::types::DatabaseId::DEFAULT;
     let deadline_ms = default_deadline_ms(shared);
     // Graph structural ops touch no named collection, so the version set is
     // empty (descriptor-version checks do not apply to node-id-keyed edges).

@@ -125,7 +125,10 @@ pub(super) async fn dispatch(
                         nodedb_sql::ddl_ast::statement::GraphStmt::MatchQuery { .. }
                     )
                 ) {
-                    return Some(super::super::match_ops::match_query(state, identity, sql).await);
+                    return Some(
+                        super::super::match_ops::match_query(state, identity, database_id, sql)
+                            .await,
+                    );
                 }
                 if let Some(resp) =
                     super::super::graph_ops::dispatch_typed(state, identity, database_id, stmt)

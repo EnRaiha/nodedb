@@ -154,10 +154,12 @@ pub(super) async fn dispatch(
         );
     }
     if upper.starts_with("SELECT TREE_SUM") || upper.starts_with("TREE_SUM") {
-        return Some(super::super::tree_ops::tree_sum(state, identity, sql).await);
+        return Some(super::super::tree_ops::tree_sum(state, identity, database_id, sql).await);
     }
     if upper.starts_with("SELECT TREE_CHILDREN") || upper.starts_with("TREE_CHILDREN") {
-        return Some(super::super::tree_ops::tree_children(state, identity, sql).await);
+        return Some(
+            super::super::tree_ops::tree_children(state, identity, database_id, sql).await,
+        );
     }
 
     // Timeseries: CREATE TIMESERIES, SHOW PARTITIONS, ALTER TIMESERIES.

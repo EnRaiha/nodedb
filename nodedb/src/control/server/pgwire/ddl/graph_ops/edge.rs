@@ -164,6 +164,7 @@ pub async fn delete_edge(
 pub async fn set_node_labels(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     node_id: String,
     labels: Vec<String>,
     remove: bool,
@@ -190,13 +191,13 @@ pub async fn set_node_labels(
         PhysicalPlan::Graph(GraphOp::SetNodeLabels { node_id, labels })
     };
 
-    wal_dispatch::wal_append_if_write(&state.wal, tenant_id, vshard_id, DatabaseId::DEFAULT, &plan)
+    wal_dispatch::wal_append_if_write(&state.wal, tenant_id, vshard_id, database_id, &plan)
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
     match dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         vshard_id,
         plan,
         TraceId::ZERO,

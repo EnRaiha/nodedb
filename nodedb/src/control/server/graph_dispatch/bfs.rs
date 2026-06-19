@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use crate::bridge::envelope::Response;
 use crate::control::state::SharedState;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 use super::helpers::{encode_path, ok_response};
 use super::hop::{NeighborHopParams, execute_neighbor_hop};
@@ -25,9 +25,11 @@ use super::hop::{NeighborHopParams, execute_neighbor_hop};
 ///
 /// This is the cluster-aware entry point. Callers pass
 /// `&GraphTraversalOptions::default()` for standard traversal.
+#[allow(clippy::too_many_arguments)]
 pub async fn cross_core_bfs_with_options(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     start_nodes: Vec<String>,
     edge_label: Option<String>,
     direction: crate::engine::graph::edge_store::Direction,
@@ -51,6 +53,7 @@ pub async fn cross_core_bfs_with_options(
         let hop = execute_neighbor_hop(
             shared,
             tenant_id,
+            database_id,
             NeighborHopParams {
                 frontier: &frontier,
                 edge_label: edge_label.as_deref(),

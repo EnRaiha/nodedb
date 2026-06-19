@@ -28,6 +28,7 @@ use super::helpers::{encode_path, ok_response};
 pub async fn cross_core_shortest_path(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     src: String,
     dst: String,
     edge_label: Option<String>,
@@ -75,7 +76,7 @@ pub async fn cross_core_shortest_path(
         let resp = crate::control::server::broadcast::broadcast_to_all_cores(
             shared,
             tenant_id,
-            DatabaseId::DEFAULT,
+            database_id,
             plan,
             TraceId::ZERO,
         )
@@ -123,6 +124,7 @@ pub async fn cross_core_shortest_path(
                         edge_label: edge_label.as_deref(),
                         direction,
                         remaining_depth: remaining,
+                        database_id,
                     },
                 )
                 .await?;

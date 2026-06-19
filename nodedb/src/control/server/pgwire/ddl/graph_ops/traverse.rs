@@ -75,6 +75,7 @@ fn check_tenant_graph_depth(
 pub async fn traverse(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     start: String,
     depth: usize,
     edge_label: Option<String>,
@@ -95,6 +96,7 @@ pub async fn traverse(
     match crate::control::server::graph_dispatch::cross_core_traverse_subgraph(
         state,
         tenant_id,
+        database_id,
         start,
         edge_label,
         dir,
@@ -112,6 +114,7 @@ pub async fn traverse(
 pub async fn neighbors(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     node: String,
     edge_label: Option<String>,
     direction: GraphDirection,
@@ -132,7 +135,7 @@ pub async fn neighbors(
     match crate::control::server::broadcast::broadcast_to_all_cores(
         state,
         tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         plan,
         TraceId::ZERO,
     )
@@ -153,6 +156,7 @@ pub async fn neighbors(
 pub async fn shortest_path(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     src: String,
     dst: String,
     max_depth: usize,
@@ -168,7 +172,13 @@ pub async fn shortest_path(
     let tenant_id = identity.tenant_id;
     check_tenant_graph_depth(state, tenant_id, max_depth, "MAX_DEPTH")?;
     match crate::control::server::graph_dispatch::cross_core_shortest_path(
-        state, tenant_id, src, dst, edge_label, max_depth,
+        state,
+        tenant_id,
+        database_id,
+        src,
+        dst,
+        edge_label,
+        max_depth,
     )
     .await
     {

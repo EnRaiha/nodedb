@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 
 use crate::control::state::SharedState;
 use crate::engine::graph::traversal_options::{GraphResponseMeta, GraphTraversalOptions};
-use crate::types::{TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 
 /// A batch of node IDs targeted at a specific shard.
 ///
@@ -212,6 +212,10 @@ pub struct CrossShardHopParams<'a> {
     pub edge_label: Option<&'a str>,
     pub direction: crate::engine::graph::edge_store::Direction,
     pub remaining_depth: usize,
+    /// Session database scope. Threaded into the per-traversal
+    /// `QueryContext` and SQL plan so remote shard hops route and plan
+    /// against the caller's database, not the hardcoded default.
+    pub database_id: DatabaseId,
 }
 
 pub async fn coordinate_cross_shard_hop(
@@ -226,6 +230,7 @@ pub async fn coordinate_cross_shard_hop(
         edge_label,
         direction,
         remaining_depth,
+        database_id,
     } = params;
     // Fast path: nothing to scatter.
     if cross_shard_targets.is_empty() {
@@ -339,7 +344,7 @@ pub async fn coordinate_cross_shard_hop(
                 let gw_ctx = crate::control::gateway::core::QueryContext {
                     tenant_id: crate::types::TenantId::new(tenant_id_u64),
                     trace_id: TraceId::generate(),
-                    database_id: nodedb_types::id::DatabaseId::DEFAULT,
+                    database_id,
                 };
 
                 // Build a fresh QueryContext per traversal using cloned inputs
@@ -355,7 +360,7 @@ pub async fn coordinate_cross_shard_hop(
                         plan_ctx.plan_sql(
                             &sql_for_plan,
                             crate::types::TenantId::new(tenant_id_u64),
-                            crate::types::DatabaseId::DEFAULT,
+                            database_id,
                         ),
                     )
                 });

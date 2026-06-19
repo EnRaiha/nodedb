@@ -24,7 +24,7 @@ use crate::bridge::envelope::Response;
 use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 use super::helpers::ok_response;
 use super::hop::{NeighborHopParams, execute_neighbor_hop};
@@ -66,9 +66,11 @@ struct WireSubGraph<'a> {
 ///   * each `(src, label, dst)` edge the hop crossed where `src` is in the
 ///     current frontier — fully attributed for BOTH the local-shard and
 ///     remote-shard portions of the frontier.
+#[allow(clippy::too_many_arguments)]
 pub async fn cross_core_traverse_subgraph(
     shared: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     start: String,
     edge_label: Option<String>,
     direction: Direction,
@@ -95,6 +97,7 @@ pub async fn cross_core_traverse_subgraph(
         let hop = execute_neighbor_hop(
             shared,
             tenant_id,
+            database_id,
             NeighborHopParams {
                 frontier: &frontier,
                 edge_label: edge_label.as_deref(),

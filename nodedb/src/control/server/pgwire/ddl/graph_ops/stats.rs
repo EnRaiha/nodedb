@@ -54,6 +54,7 @@ use nodedb_physical::physical_plan::GraphOp;
 pub async fn show_graph_stats(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: Option<String>,
     verbose: bool,
     as_of: Option<i64>,
@@ -82,7 +83,7 @@ pub async fn show_graph_stats(
             Some(c) => c,
             None => return Err(sqlstate_error("XX000", "catalog not available")),
         };
-        match catalog.get_collection(DatabaseId::DEFAULT, identity.tenant_id.as_u64(), name) {
+        match catalog.get_collection(database_id, identity.tenant_id.as_u64(), name) {
             Ok(Some(c)) if c.is_active => {}
             Ok(Some(_)) => {
                 return Err(sqlstate_error(
@@ -104,15 +105,9 @@ pub async fn show_graph_stats(
         as_of,
     });
 
-    let resp = broadcast_to_all_cores(
-        state,
-        identity.tenant_id,
-        DatabaseId::DEFAULT,
-        plan,
-        TraceId::ZERO,
-    )
-    .await
-    .map_err(|e| sqlstate_error("58000", &format!("graph stats dispatch failed: {e}")))?;
+    let resp = broadcast_to_all_cores(state, identity.tenant_id, database_id, plan, TraceId::ZERO)
+        .await
+        .map_err(|e| sqlstate_error("58000", &format!("graph stats dispatch failed: {e}")))?;
 
     let merged: Vec<CollectionStats> = decode_merged_stats(resp.payload.as_bytes())
         .map_err(|e| sqlstate_error("XX000", &format!("graph stats decode failed: {e}")))?;

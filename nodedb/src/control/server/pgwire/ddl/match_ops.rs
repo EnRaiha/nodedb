@@ -27,6 +27,7 @@ use super::super::types::{sqlstate_error, text_field};
 pub async fn match_query(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     // Parse the MATCH query.
@@ -86,14 +87,8 @@ pub async fn match_query(
     });
 
     // Broadcast to all cores.
-    match broadcast::broadcast_to_all_cores(
-        state,
-        tenant_id,
-        DatabaseId::DEFAULT,
-        plan,
-        TraceId::ZERO,
-    )
-    .await
+    match broadcast::broadcast_to_all_cores(state, tenant_id, database_id, plan, TraceId::ZERO)
+        .await
     {
         Ok(resp) => match_payload_to_response(&resp.payload, &column_names),
         Err(e) => Err(sqlstate_error("XX000", &e.to_string())),

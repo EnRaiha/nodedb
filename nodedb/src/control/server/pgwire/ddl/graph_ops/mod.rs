@@ -65,24 +65,50 @@ pub async fn dispatch_typed(
             node_id,
             labels,
             remove,
-        }) => Some(edge::set_node_labels(state, identity, node_id, labels, remove).await),
+        }) => {
+            Some(edge::set_node_labels(state, identity, database_id, node_id, labels, remove).await)
+        }
         NodedbStatement::Graph(GraphStmt::GraphTraverse {
             start,
             depth,
             edge_label,
             direction,
-        }) => Some(traverse::traverse(state, identity, start, depth, edge_label, direction).await),
+        }) => Some(
+            traverse::traverse(
+                state,
+                identity,
+                database_id,
+                start,
+                depth,
+                edge_label,
+                direction,
+            )
+            .await,
+        ),
         NodedbStatement::Graph(GraphStmt::GraphNeighbors {
             node,
             edge_label,
             direction,
-        }) => Some(traverse::neighbors(state, identity, node, edge_label, direction).await),
+        }) => Some(
+            traverse::neighbors(state, identity, database_id, node, edge_label, direction).await,
+        ),
         NodedbStatement::Graph(GraphStmt::GraphPath {
             src,
             dst,
             max_depth,
             edge_label,
-        }) => Some(traverse::shortest_path(state, identity, src, dst, max_depth, edge_label).await),
+        }) => Some(
+            traverse::shortest_path(
+                state,
+                identity,
+                database_id,
+                src,
+                dst,
+                max_depth,
+                edge_label,
+            )
+            .await,
+        ),
         NodedbStatement::Graph(GraphStmt::GraphAlgo {
             algorithm,
             collection,
@@ -100,6 +126,7 @@ pub async fn dispatch_typed(
             algo::algo(
                 state,
                 identity,
+                database_id,
                 &algorithm,
                 collection,
                 edge_label,
@@ -122,7 +149,9 @@ pub async fn dispatch_typed(
             collection,
             verbose,
             as_of,
-        }) => Some(stats::show_graph_stats(state, identity, collection, verbose, as_of).await),
+        }) => Some(
+            stats::show_graph_stats(state, identity, database_id, collection, verbose, as_of).await,
+        ),
         // Non-graph NodedbStatement variants (CreateCollection, DropCollection,
         // etc.) return None so the caller can route them to the correct handler.
         _ => None,

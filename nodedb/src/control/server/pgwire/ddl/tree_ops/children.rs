@@ -15,12 +15,14 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::types::{sqlstate_error, text_field};
 use crate::control::state::SharedState;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
+use crate::types::DatabaseId;
 
 use super::parse::{extract_function_args, extract_number_after};
 
 pub async fn tree_children(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let tenant_id = identity.tenant_id;
@@ -46,6 +48,7 @@ pub async fn tree_children(
     let bfs_result = crate::control::server::graph_dispatch::cross_core_bfs_with_options(
         state,
         tenant_id,
+        database_id,
         vec![root_id],
         Some(graph_index),
         dir,
