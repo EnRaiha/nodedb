@@ -4,20 +4,23 @@
 //! + docmap files.
 //!
 //! Checkpoint layout (see `spatial_checkpoint.rs`):
-//! `{data_dir}/spatial-ckpt/{sanitized_tid:coll:field}.ckpt` + `.docmap`.
-//! `sanitize_key` replaces `:` with `__`. We walk the dir and unlink
-//! any file whose desanitized stem is `{tid}:{coll}:*`.
+//! `{data_dir}/spatial-ckpt/{db}_{tid}_{enc(coll)}_{enc(field)}.ckpt` + `.docmap`.
+//! The filename prefix is built by the SAME encoder the write path uses
+//! ([`spatial_checkpoint_prefix`]) so the `starts_with` match can never drift
+//! from the on-disk names.
 
 use std::path::Path;
 
 use tracing::{debug, warn};
 
 use super::ReclaimStats;
+use crate::data::executor::spatial_checkpoint::spatial_checkpoint_prefix;
 
 /// Unlink every spatial checkpoint + docmap file for
-/// `(tenant_id, collection)`. Returns stats; idempotent.
+/// `(database_id, tenant_id, collection)`. Returns stats; idempotent.
 pub fn reclaim_spatial_checkpoints(
     data_dir: &Path,
+    database_id: u64,
     tenant_id: u64,
     collection: &str,
 ) -> ReclaimStats {
@@ -26,9 +29,9 @@ pub fn reclaim_spatial_checkpoints(
         return ReclaimStats::default();
     }
 
-    // Files on disk are sanitized (":" → "__"), so match the sanitized
-    // prefix directly instead of round-tripping every entry.
-    let prefix_sanitized = format!("{tenant_id}__{collection}__");
+    // Build the prefix via the shared encoder so it always matches the
+    // filenames produced by `checkpoint_spatial_indexes`.
+    let prefix = spatial_checkpoint_prefix(database_id, tenant_id, collection);
 
     let mut stats = ReclaimStats::default();
     let entries = match std::fs::read_dir(&ckpt_dir) {
@@ -47,7 +50,7 @@ pub fn reclaim_spatial_checkpoints(
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !name.starts_with(&prefix_sanitized) {
+        if !name.starts_with(&prefix) {
             continue;
         }
         // Only sweep `.ckpt`, `.ckpt.tmp`, `.docmap`, `.docmap.tmp`.
@@ -92,25 +95,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
         let ckpt = base.join("spatial-ckpt");
-        write(&ckpt.join("1__places__geom.ckpt"), b"x");
-        write(&ckpt.join("1__places__geom.docmap"), b"yy");
-        write(&ckpt.join("1__places__home.ckpt"), b"zzz");
+        // New-format names: {db}_{tid}_{coll}_{field}.
+        write(&ckpt.join("0_1_places_geom.ckpt"), b"x");
+        write(&ckpt.join("0_1_places_geom.docmap"), b"yy");
+        write(&ckpt.join("0_1_places_home.ckpt"), b"zzz");
         // Keep: different collection.
-        write(&ckpt.join("1__stores__geom.ckpt"), b"keep");
+        write(&ckpt.join("0_1_stores_geom.ckpt"), b"keep");
         // Keep: different tenant.
-        write(&ckpt.join("2__places__geom.ckpt"), b"keep2");
+        write(&ckpt.join("0_2_places_geom.ckpt"), b"keep2");
+        // Keep: different database.
+        write(&ckpt.join("1_1_places_geom.ckpt"), b"keep3");
 
-        let stats = reclaim_spatial_checkpoints(base, 1, "places");
+        let stats = reclaim_spatial_checkpoints(base, 0, 1, "places");
         assert_eq!(stats.files_unlinked, 3);
         assert_eq!(stats.bytes_freed, 1 + 2 + 3);
-        assert!(ckpt.join("1__stores__geom.ckpt").exists());
-        assert!(ckpt.join("2__places__geom.ckpt").exists());
+        assert!(ckpt.join("0_1_stores_geom.ckpt").exists());
+        assert!(ckpt.join("0_2_places_geom.ckpt").exists());
+        assert!(ckpt.join("1_1_places_geom.ckpt").exists());
     }
 
     #[test]
     fn empty_dir_is_noop() {
         let tmp = TempDir::new().unwrap();
-        let s = reclaim_spatial_checkpoints(tmp.path(), 1, "x");
+        let s = reclaim_spatial_checkpoints(tmp.path(), 0, 1, "x");
         assert_eq!(s.files_unlinked, 0);
     }
 }

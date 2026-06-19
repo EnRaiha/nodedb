@@ -78,8 +78,9 @@ impl CoreLoop {
             query_bbox
         };
 
+        let db_id = task.request.database_id;
         let tid_id = crate::types::TenantId::new(tid);
-        let spatial_key = (tid_id, collection.to_string(), field.to_string());
+        let spatial_key = (db_id, tid_id, collection.to_string(), field.to_string());
         let has_index = self.spatial_indexes.contains_key(&spatial_key);
         let limit = if limit == 0 { 1000 } else { limit };
 
@@ -140,6 +141,7 @@ impl CoreLoop {
             }
 
             let doc_id = match self.spatial_doc_map.get(&(
+                db_id,
                 tid_id,
                 collection.to_string(),
                 field.to_string(),
@@ -447,13 +449,20 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type":"Point","coordinates":[lng,lat]}))
                 .unwrap();
         let bbox = nodedb_types::bbox::geometry_bbox(&geom);
+        let db_id = DatabaseId::DEFAULT;
         let tid_id = TenantId::new(tid);
-        let spatial_key = (tid_id, collection.to_string(), field.to_string());
+        let spatial_key = (db_id, tid_id, collection.to_string(), field.to_string());
         let entry_id = fnv1a_hash(doc_id.as_bytes());
         let rtree = core.spatial_indexes.entry(spatial_key.clone()).or_default();
         rtree.insert(RTreeEntry { id: entry_id, bbox });
         core.spatial_doc_map.insert(
-            (tid_id, collection.to_string(), field.to_string(), entry_id),
+            (
+                db_id,
+                tid_id,
+                collection.to_string(),
+                field.to_string(),
+                entry_id,
+            ),
             doc_id.clone(),
         );
 

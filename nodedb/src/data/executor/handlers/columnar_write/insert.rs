@@ -372,6 +372,7 @@ impl CoreLoop {
 
         // Populate R-tree for geometry columns so spatial predicates work.
         {
+            let db_id = task.request.database_id;
             let tid = task.request.tenant_id;
             let schema = engine.schema().clone();
             let geom_cols: Vec<usize> = schema
@@ -412,12 +413,18 @@ impl CoreLoop {
                             _ => continue,
                         };
                         let bbox = nodedb_types::bbox::geometry_bbox(&geom);
-                        let index_key = (tid, collection.to_string(), col_def.name.clone());
+                        let index_key = (db_id, tid, collection.to_string(), col_def.name.clone());
                         let entry_id = crate::util::fnv1a_hash(doc_id.as_bytes());
                         let rtree = self.spatial_indexes.entry(index_key.clone()).or_default();
                         rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
                         self.spatial_doc_map.insert(
-                            (tid, collection.to_string(), col_def.name.clone(), entry_id),
+                            (
+                                db_id,
+                                tid,
+                                collection.to_string(),
+                                col_def.name.clone(),
+                                entry_id,
+                            ),
                             doc_id.clone(),
                         );
                     }

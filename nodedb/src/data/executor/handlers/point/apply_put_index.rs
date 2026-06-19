@@ -35,14 +35,21 @@ impl CoreLoop {
                 {
                     has_geometry = true;
                     let bbox = nodedb_types::bbox::geometry_bbox(&geom);
+                    let db_id = nodedb_types::DatabaseId::new(database_id);
                     let tid_id = crate::types::TenantId::new(tid);
-                    let spatial_key = (tid_id, collection.to_string(), field_name.clone());
+                    let spatial_key = (db_id, tid_id, collection.to_string(), field_name.clone());
                     let entry_id = crate::util::fnv1a_hash(document_id.as_bytes());
                     let rtree = self.spatial_indexes.entry(spatial_key.clone()).or_default();
                     rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
                     // Maintain reverse map: entry_id → document_id.
                     self.spatial_doc_map.insert(
-                        (tid_id, collection.to_string(), field_name.clone(), entry_id),
+                        (
+                            db_id,
+                            tid_id,
+                            collection.to_string(),
+                            field_name.clone(),
+                            entry_id,
+                        ),
                         document_id.to_string(),
                     );
                 }

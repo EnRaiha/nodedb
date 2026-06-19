@@ -119,8 +119,9 @@ impl CoreLoop {
         let tid_key = TenantId::new(tenant_id);
         let spatial_removed = {
             let before = self.spatial_indexes.len();
-            self.spatial_indexes.retain(|(t, _, _), _| *t != tid_key);
-            self.spatial_doc_map.retain(|(t, _, _, _), _| *t != tid_key);
+            self.spatial_indexes.retain(|(_, t, _, _), _| *t != tid_key);
+            self.spatial_doc_map
+                .retain(|(_, t, _, _, _), _| *t != tid_key);
             before - self.spatial_indexes.len()
         };
 

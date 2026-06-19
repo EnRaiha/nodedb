@@ -158,10 +158,12 @@ impl CoreLoop {
         }
 
         // ── 2. Update R-tree ────────────────────────────────────────────────
+        let db_id = task.request.database_id;
         let tenant_id = TenantId::new(tid);
-        let spatial_key = (tenant_id, collection.to_string(), field.to_string());
+        let spatial_key = (db_id, tenant_id, collection.to_string(), field.to_string());
         let entry_id = fnv1a_hash(doc_id.as_bytes());
         let doc_map_key = (
+            db_id,
             tenant_id,
             collection.to_string(),
             field.to_string(),
@@ -247,10 +249,12 @@ impl CoreLoop {
             return self.response_error(task, e);
         }
 
+        let db_id = task.request.database_id;
         let tenant_id = TenantId::new(tid);
-        let spatial_key = (tenant_id, collection.to_string(), field.to_string());
+        let spatial_key = (db_id, tenant_id, collection.to_string(), field.to_string());
         let entry_id = fnv1a_hash(doc_id.as_bytes());
         let doc_map_key = (
+            db_id,
             tenant_id,
             collection.to_string(),
             field.to_string(),

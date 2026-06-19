@@ -145,20 +145,26 @@ impl CoreLoop {
                 // find the entry. Hashing the user PK would leak ghost
                 // bbox entries that survive the row's removal.
                 let entry_id = crate::util::fnv1a_hash(row_key.as_bytes());
+                let db_id = nodedb_types::DatabaseId::new(database_id);
                 let tid_id = crate::types::TenantId::new(tid);
                 let spatial_fields: Vec<String> = self
                     .spatial_indexes
                     .keys()
-                    .filter(|(t, c, _)| *t == tid_id && c == collection)
-                    .map(|(_, _, f)| f.clone())
+                    .filter(|(d, t, c, _)| *d == db_id && *t == tid_id && c == collection)
+                    .map(|(_, _, _, f)| f.clone())
                     .collect();
                 for field in spatial_fields {
-                    let skey = (tid_id, collection.to_string(), field.clone());
+                    let skey = (db_id, tid_id, collection.to_string(), field.clone());
                     if let Some(rtree) = self.spatial_indexes.get_mut(&skey) {
                         rtree.delete(entry_id);
                     }
-                    self.spatial_doc_map
-                        .remove(&(tid_id, collection.to_string(), field, entry_id));
+                    self.spatial_doc_map.remove(&(
+                        db_id,
+                        tid_id,
+                        collection.to_string(),
+                        field,
+                        entry_id,
+                    ));
                 }
 
                 // Record deletion for edge referential integrity.

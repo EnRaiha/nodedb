@@ -161,9 +161,9 @@ impl CoreLoop {
         let spatial_removed = {
             let before = self.spatial_indexes.len();
             self.spatial_indexes
-                .retain(|(t, c, _), _| !(*t == tid && c == &coll));
+                .retain(|(d, t, c, _), _| !(*d == db && *t == tid && c == &coll));
             self.spatial_doc_map
-                .retain(|(t, c, _, _), _| !(*t == tid && c == &coll));
+                .retain(|(d, t, c, _, _), _| !(*d == db && *t == tid && c == &coll));
             before - self.spatial_indexes.len()
         };
 
@@ -212,6 +212,7 @@ impl CoreLoop {
         ));
         l1_stats.merge(reclaim::spatial::reclaim_spatial_checkpoints(
             &self.data_dir,
+            db.as_u64(),
             tenant_id,
             collection,
         ));

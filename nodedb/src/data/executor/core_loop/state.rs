@@ -106,15 +106,18 @@ pub struct CoreLoop {
     /// Full-text inverted index (BM25), shares redb with sparse engine.
     pub(in crate::data::executor) inverted: InvertedIndex,
 
-    /// Per-collection spatial R-tree indexes, keyed by (TenantId, collection, field).
+    /// Per-collection spatial R-tree indexes, keyed by
+    /// (DatabaseId, TenantId, collection, field).
     /// Lazily initialized when a spatial query or geometry insert first targets a field.
-    pub(in crate::data::executor) spatial_indexes:
-        std::collections::HashMap<(TenantId, String, String), crate::engine::spatial::RTree>,
+    pub(in crate::data::executor) spatial_indexes: std::collections::HashMap<
+        (DatabaseId, TenantId, String, String),
+        crate::engine::spatial::RTree,
+    >,
 
     /// Reverse map from R-tree entry ID → document ID,
-    /// keyed by (TenantId, collection, field, entry_id).
+    /// keyed by (DatabaseId, TenantId, collection, field, entry_id).
     pub(in crate::data::executor) spatial_doc_map:
-        std::collections::HashMap<(TenantId, String, String, u64), String>,
+        std::collections::HashMap<(DatabaseId, TenantId, String, String, u64), String>,
 
     /// Base data directory for this core (used for sort spill temp files).
     pub(in crate::data::executor) data_dir: std::path::PathBuf,

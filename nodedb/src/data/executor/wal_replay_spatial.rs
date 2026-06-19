@@ -97,6 +97,7 @@ impl CoreLoop {
             }
 
             let tenant_id = record.header.tenant_id;
+            let database_id = DatabaseId::new(record.header.database_id);
             let record_lsn = record.header.lsn;
 
             if is_spatial_put {
@@ -153,12 +154,12 @@ impl CoreLoop {
                 let prov = payload.provenance.clone();
 
                 let vshard = crate::types::VShardId::from_collection_in_database(
-                    DatabaseId::DEFAULT,
+                    database_id,
                     &payload.collection,
                 );
                 let task = Self::replay_spatial_task(
                     nodedb_types::TenantId::new(tenant_id),
-                    DatabaseId::DEFAULT,
+                    database_id,
                     vshard,
                     PhysicalPlan::Spatial(SpatialOp::Insert {
                         collection: payload.collection.clone(),
@@ -228,12 +229,12 @@ impl CoreLoop {
                 let prov = payload.provenance.clone();
 
                 let vshard = crate::types::VShardId::from_collection_in_database(
-                    DatabaseId::DEFAULT,
+                    database_id,
                     &payload.collection,
                 );
                 let task = Self::replay_spatial_task(
                     nodedb_types::TenantId::new(tenant_id),
-                    DatabaseId::DEFAULT,
+                    database_id,
                     vshard,
                     PhysicalPlan::Spatial(SpatialOp::Delete {
                         collection: payload.collection.clone(),
