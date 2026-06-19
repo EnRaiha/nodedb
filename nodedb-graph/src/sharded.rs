@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::{Entry, Iter, IterMut};
 
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 
 use crate::GraphError;
 use crate::csr::CsrIndex;
@@ -47,7 +47,7 @@ use crate::csr::CsrIndex;
 /// against that single partition and cannot reach any other tenant's
 /// state.
 pub struct ShardedCsrIndex {
-    partitions: HashMap<TenantId, CsrIndex>,
+    partitions: HashMap<(DatabaseId, TenantId), CsrIndex>,
 }
 
 impl ShardedCsrIndex {
@@ -63,13 +63,13 @@ impl ShardedCsrIndex {
     /// Returns `None` if the tenant has never inserted any graph data.
     /// Callers expecting a read-only view of a possibly-empty partition
     /// should treat `None` as "empty" rather than as an error.
-    pub fn partition(&self, tid: TenantId) -> Option<&CsrIndex> {
-        self.partitions.get(&tid)
+    pub fn partition(&self, db: DatabaseId, tid: TenantId) -> Option<&CsrIndex> {
+        self.partitions.get(&(db, tid))
     }
 
     /// Mutable access to a tenant's partition, if it exists.
-    pub fn partition_mut(&mut self, tid: TenantId) -> Option<&mut CsrIndex> {
-        self.partitions.get_mut(&tid)
+    pub fn partition_mut(&mut self, db: DatabaseId, tid: TenantId) -> Option<&mut CsrIndex> {
+        self.partitions.get_mut(&(db, tid))
     }
 
     /// Mutable access to a tenant's partition, creating an empty one
@@ -79,8 +79,8 @@ impl ShardedCsrIndex {
     /// call this once to resolve the partition, then operate on the
     /// returned `&mut CsrIndex` exactly as they would on a standalone
     /// instance.
-    pub fn get_or_create(&mut self, tid: TenantId) -> &mut CsrIndex {
-        self.partitions.entry(tid).or_default()
+    pub fn get_or_create(&mut self, db: DatabaseId, tid: TenantId) -> &mut CsrIndex {
+        self.partitions.entry((db, tid)).or_default()
     }
 
     /// Drop a tenant's entire graph state.
@@ -90,8 +90,8 @@ impl ShardedCsrIndex {
     /// structural deletion replaces the former "range-scan and erase
     /// every key with the `{tid}:` prefix" approach, which was both
     /// slow and coupled to the lexical encoding.
-    pub fn drop_partition(&mut self, tid: TenantId) -> bool {
-        self.partitions.remove(&tid).is_some()
+    pub fn drop_partition(&mut self, db: DatabaseId, tid: TenantId) -> bool {
+        self.partitions.remove(&(db, tid)).is_some()
     }
 
     /// Collection-scoped in-memory reclaim.
@@ -104,13 +104,13 @@ impl ShardedCsrIndex {
     /// in-memory CSR state is eliminated on the next tenant `drop_partition`
     /// call (triggered by tenant deletion) or on server restart (CSR is
     /// rebuilt from the now-clean EdgeStore).
-    pub fn drop_collection(&mut self, _tid: TenantId, _collection: &str) {
+    pub fn drop_collection(&mut self, _db: DatabaseId, _tid: TenantId, _collection: &str) {
         // Intentional no-op. See doc comment above.
     }
 
     /// Whether a partition exists for the tenant.
-    pub fn contains_partition(&self, tid: TenantId) -> bool {
-        self.partitions.contains_key(&tid)
+    pub fn contains_partition(&self, db: DatabaseId, tid: TenantId) -> bool {
+        self.partitions.contains_key(&(db, tid))
     }
 
     /// Number of tenants with graph state on this core.
@@ -121,14 +121,14 @@ impl ShardedCsrIndex {
     /// Iterate all (tenant, partition) pairs. Used for checkpointing,
     /// memory accounting, and administrative views that genuinely
     /// need to see every tenant's state.
-    pub fn iter(&self) -> Iter<'_, TenantId, CsrIndex> {
+    pub fn iter(&self) -> Iter<'_, (DatabaseId, TenantId), CsrIndex> {
         self.partitions.iter()
     }
 
     /// Mutable iteration over all partitions. Used by `compact()` and
     /// similar maintenance passes that apply per-partition without
     /// needing tenant routing.
-    pub fn iter_mut(&mut self) -> IterMut<'_, TenantId, CsrIndex> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, (DatabaseId, TenantId), CsrIndex> {
         self.partitions.iter_mut()
     }
 
@@ -151,14 +151,18 @@ impl ShardedCsrIndex {
     /// given `CsrIndex`. Used by the rebuild path — after rebuilding a
     /// tenant's CSR from persistent edge storage, this installs it
     /// atomically.
-    pub fn install_partition(&mut self, tid: TenantId, csr: CsrIndex) {
-        self.partitions.insert(tid, csr);
+    pub fn install_partition(&mut self, db: DatabaseId, tid: TenantId, csr: CsrIndex) {
+        self.partitions.insert((db, tid), csr);
     }
 
     /// Access or create a partition via the `Entry` API, for cases that
     /// need conditional initialization with a non-default constructor.
-    pub fn entry(&mut self, tid: TenantId) -> Entry<'_, TenantId, CsrIndex> {
-        self.partitions.entry(tid)
+    pub fn entry(
+        &mut self,
+        db: DatabaseId,
+        tid: TenantId,
+    ) -> Entry<'_, (DatabaseId, TenantId), CsrIndex> {
+        self.partitions.entry((db, tid))
     }
 }
 
@@ -176,20 +180,22 @@ mod tests {
         TenantId::new(n)
     }
 
+    const DB: DatabaseId = DatabaseId::DEFAULT;
+
     #[test]
     fn empty_sharded_has_no_partitions() {
         let sharded = ShardedCsrIndex::new();
         assert_eq!(sharded.partition_count(), 0);
-        assert!(!sharded.contains_partition(tid(1)));
-        assert!(sharded.partition(tid(1)).is_none());
+        assert!(!sharded.contains_partition(DB, tid(1)));
+        assert!(sharded.partition(DB, tid(1)).is_none());
     }
 
     #[test]
     fn get_or_create_installs_empty_partition() {
         let mut sharded = ShardedCsrIndex::new();
-        let part = sharded.get_or_create(tid(7));
+        let part = sharded.get_or_create(DB, tid(7));
         assert_eq!(part.node_count(), 0);
-        assert!(sharded.contains_partition(tid(7)));
+        assert!(sharded.contains_partition(DB, tid(7)));
         assert_eq!(sharded.partition_count(), 1);
     }
 
@@ -202,16 +208,16 @@ mod tests {
         let mut sharded = ShardedCsrIndex::new();
 
         sharded
-            .get_or_create(tid(1))
+            .get_or_create(DB, tid(1))
             .add_edge("alice", "knows", "bob")
             .unwrap();
         sharded
-            .get_or_create(tid(2))
+            .get_or_create(DB, tid(2))
             .add_edge("alice", "knows", "carol")
             .unwrap();
 
-        let p1 = sharded.partition(tid(1)).unwrap();
-        let p2 = sharded.partition(tid(2)).unwrap();
+        let p1 = sharded.partition(DB, tid(1)).unwrap();
+        let p2 = sharded.partition(DB, tid(2)).unwrap();
 
         // Tenant 1 sees alice→bob; no carol.
         assert!(p1.contains_node("alice"));
@@ -231,15 +237,15 @@ mod tests {
     fn node_names_are_unprefixed() {
         let mut sharded = ShardedCsrIndex::new();
         sharded
-            .get_or_create(tid(42))
+            .get_or_create(DB, tid(42))
             .add_edge("alice", "knows", "bob")
             .unwrap();
         sharded
-            .get_or_create(tid(42))
+            .get_or_create(DB, tid(42))
             .compact()
             .expect("no governor, cannot fail");
 
-        let part = sharded.partition(tid(42)).unwrap();
+        let part = sharded.partition(DB, tid(42)).unwrap();
         let alice_id = part.node_id("alice").expect("alice must be present");
         // The stored name is exactly what the caller inserted — never
         // `"42:alice"`. Structural partitioning keeps shard ids out of
@@ -251,50 +257,50 @@ mod tests {
     fn drop_partition_removes_tenant_state() {
         let mut sharded = ShardedCsrIndex::new();
         sharded
-            .get_or_create(tid(1))
+            .get_or_create(DB, tid(1))
             .add_edge("a", "l", "b")
             .unwrap();
-        assert!(sharded.contains_partition(tid(1)));
+        assert!(sharded.contains_partition(DB, tid(1)));
 
-        assert!(sharded.drop_partition(tid(1)));
-        assert!(!sharded.contains_partition(tid(1)));
+        assert!(sharded.drop_partition(DB, tid(1)));
+        assert!(!sharded.contains_partition(DB, tid(1)));
         assert_eq!(sharded.partition_count(), 0);
 
         // Second drop is a no-op, not an error.
-        assert!(!sharded.drop_partition(tid(1)));
+        assert!(!sharded.drop_partition(DB, tid(1)));
     }
 
     #[test]
     fn drop_partition_does_not_touch_other_tenants() {
         let mut sharded = ShardedCsrIndex::new();
         sharded
-            .get_or_create(tid(1))
+            .get_or_create(DB, tid(1))
             .add_edge("a", "l", "b")
             .unwrap();
         sharded
-            .get_or_create(tid(2))
+            .get_or_create(DB, tid(2))
             .add_edge("c", "l", "d")
             .unwrap();
 
-        sharded.drop_partition(tid(1));
-        assert!(!sharded.contains_partition(tid(1)));
-        assert!(sharded.contains_partition(tid(2)));
-        assert!(sharded.partition(tid(2)).unwrap().contains_node("c"));
+        sharded.drop_partition(DB, tid(1));
+        assert!(!sharded.contains_partition(DB, tid(1)));
+        assert!(sharded.contains_partition(DB, tid(2)));
+        assert!(sharded.partition(DB, tid(2)).unwrap().contains_node("c"));
     }
 
     #[test]
     fn install_partition_replaces_existing() {
         let mut sharded = ShardedCsrIndex::new();
         sharded
-            .get_or_create(tid(1))
+            .get_or_create(DB, tid(1))
             .add_edge("old", "l", "value")
             .unwrap();
 
         let mut replacement = CsrIndex::new();
         replacement.add_edge("new", "l", "value").unwrap();
-        sharded.install_partition(tid(1), replacement);
+        sharded.install_partition(DB, tid(1), replacement);
 
-        let part = sharded.partition(tid(1)).unwrap();
+        let part = sharded.partition(DB, tid(1)).unwrap();
         assert!(part.contains_node("new"));
         assert!(!part.contains_node("old"));
     }
@@ -304,7 +310,7 @@ mod tests {
         let mut sharded = ShardedCsrIndex::new();
         for t in 1..=3 {
             sharded
-                .get_or_create(tid(t))
+                .get_or_create(DB, tid(t))
                 .add_edge("a", "l", "b")
                 .unwrap();
         }
@@ -312,7 +318,7 @@ mod tests {
         // merges them into the dense CSR arrays for every partition.
         sharded.compact_all().expect("no governor, cannot fail");
         for t in 1..=3 {
-            let part = sharded.partition(tid(t)).unwrap();
+            let part = sharded.partition(DB, tid(t)).unwrap();
             assert_eq!(part.edge_count(), 1);
             assert_eq!(part.node_count(), 2);
         }

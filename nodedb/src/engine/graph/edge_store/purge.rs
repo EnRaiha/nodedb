@@ -14,9 +14,9 @@ use redb::ReadableTable;
 use super::store::{EDGES, EdgeStore, REVERSE_EDGES, redb_err};
 
 impl EdgeStore {
-    /// Purge all edges belonging to a tenant. O(tenant-size) range
-    /// delete — no cross-tenant scan.
-    pub fn purge_tenant(&self, tid: TenantId) -> crate::Result<usize> {
+    /// Purge all edges belonging to a `(database, tenant)`. O(tenant-size)
+    /// range delete — no cross-tenant or cross-database scan.
+    pub fn purge_tenant(&self, db: u64, tid: TenantId) -> crate::Result<usize> {
         let t = tid.as_u64();
         let write_txn = self
             .db
@@ -29,13 +29,13 @@ impl EdgeStore {
                 .open_table(EDGES)
                 .map_err(|e| redb_err("open edges", e))?;
             let keys: Vec<String> = edges
-                .range((t, "")..(t + 1, ""))
+                .range((db, t, "")..(db, t + 1, ""))
                 .map_err(|e| redb_err("edge range", e))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().1.to_string()))
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().2.to_string()))
                 .collect();
             removed += keys.len();
             for key in &keys {
-                let _ = edges.remove((t, key.as_str()));
+                let _ = edges.remove((db, t, key.as_str()));
             }
         }
 
@@ -44,13 +44,13 @@ impl EdgeStore {
                 .open_table(REVERSE_EDGES)
                 .map_err(|e| redb_err("open reverse", e))?;
             let keys: Vec<String> = rev_t
-                .range((t, "")..(t + 1, ""))
+                .range((db, t, "")..(db, t + 1, ""))
                 .map_err(|e| redb_err("rev range", e))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().1.to_string()))
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().2.to_string()))
                 .collect();
             removed += keys.len();
             for key in &keys {
-                let _ = rev_t.remove((t, key.as_str()));
+                let _ = rev_t.remove((db, t, key.as_str()));
             }
         }
 
@@ -60,9 +60,14 @@ impl EdgeStore {
         Ok(removed)
     }
 
-    /// Purge all edges belonging to a specific collection within a tenant.
-    /// Returns the number of forward edges removed.
-    pub fn purge_collection(&self, tid: TenantId, collection: &str) -> crate::Result<usize> {
+    /// Purge all edges belonging to a specific collection within a
+    /// `(database, tenant)`. Returns the number of forward edges removed.
+    pub fn purge_collection(
+        &self,
+        db: u64,
+        tid: TenantId,
+        collection: &str,
+    ) -> crate::Result<usize> {
         let t = tid.as_u64();
         let prefix = format!("{collection}\x00");
         let prefix_end = format!("{collection}\x01");
@@ -78,13 +83,13 @@ impl EdgeStore {
                 .open_table(EDGES)
                 .map_err(|e| redb_err("open edges", e))?;
             let keys: Vec<String> = edges
-                .range((t, prefix.as_str())..(t, prefix_end.as_str()))
+                .range((db, t, prefix.as_str())..(db, t, prefix_end.as_str()))
                 .map_err(|e| redb_err("edge range", e))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().1.to_string()))
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().2.to_string()))
                 .collect();
             removed += keys.len();
             for key in &keys {
-                let _ = edges.remove((t, key.as_str()));
+                let _ = edges.remove((db, t, key.as_str()));
             }
         }
 
@@ -93,12 +98,12 @@ impl EdgeStore {
                 .open_table(REVERSE_EDGES)
                 .map_err(|e| redb_err("open reverse", e))?;
             let keys: Vec<String> = rev_t
-                .range((t, prefix.as_str())..(t, prefix_end.as_str()))
+                .range((db, t, prefix.as_str())..(db, t, prefix_end.as_str()))
                 .map_err(|e| redb_err("rev range", e))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().1.to_string()))
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().2.to_string()))
                 .collect();
             for key in &keys {
-                let _ = rev_t.remove((t, key.as_str()));
+                let _ = rev_t.remove((db, t, key.as_str()));
             }
         }
 

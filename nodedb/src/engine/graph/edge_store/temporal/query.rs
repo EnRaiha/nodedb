@@ -15,15 +15,17 @@
 
 use std::collections::HashMap;
 
-use nodedb_types::{TenantId, ms_to_ordinal_upper};
+use nodedb_types::{DatabaseId, TenantId, ms_to_ordinal_upper};
 
 use super::super::store::{EDGES, Edge, EdgeStore, REVERSE_EDGES, redb_err};
 use super::{EdgeRef, is_sentinel, parse_versioned_edge_key};
 
 impl EdgeStore {
     /// Bitemporal outbound neighbors. See module docs for semantics.
+    #[allow(clippy::too_many_arguments)]
     pub fn neighbors_out_as_of(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         src: &str,
@@ -51,12 +53,12 @@ impl EdgeStore {
         // resolver below, so we only need the set of candidate bases here.
         let mut bases: HashMap<(String, String), ()> = HashMap::new();
         let range = table
-            .range((t, prefix.as_str())..)
+            .range((db, t, prefix.as_str())..)
             .map_err(|e| redb_err("range", e))?;
         for entry in range {
             let (key, _val) = entry.map_err(|e| redb_err("iter", e))?;
-            let (kt, composite) = key.value();
-            if kt != t || !composite.starts_with(&prefix) {
+            let (kd, kt, composite) = key.value();
+            if kd != db || kt != t || !composite.starts_with(&prefix) {
                 break;
             }
             let Some((_coll, _src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
@@ -73,7 +75,7 @@ impl EdgeStore {
         let mut edges = Vec::with_capacity(bases.len());
         for ((label, dst), _) in bases {
             let Some(props) = self.ceiling_resolve_edge(
-                EdgeRef::new(tid, collection, src, &label, &dst),
+                EdgeRef::new(DatabaseId::new(db), tid, collection, src, &label, &dst),
                 cutoff,
                 valid_at_ms,
             )?
@@ -92,8 +94,10 @@ impl EdgeStore {
     }
 
     /// Bitemporal inbound neighbors. See module docs for semantics.
+    #[allow(clippy::too_many_arguments)]
     pub fn neighbors_in_as_of(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         dst: &str,
@@ -119,12 +123,12 @@ impl EdgeStore {
         // `(label, logical_src)` base → (latest_sys ≤ cutoff, sentinel flag).
         let mut latest: HashMap<(String, String), (i64, bool)> = HashMap::new();
         let range = table
-            .range((t, prefix.as_str())..)
+            .range((db, t, prefix.as_str())..)
             .map_err(|e| redb_err("range", e))?;
         for entry in range {
             let (key, val) = entry.map_err(|e| redb_err("iter", e))?;
-            let (kt, composite) = key.value();
-            if kt != t || !composite.starts_with(&prefix) {
+            let (kd, kt, composite) = key.value();
+            if kd != db || kt != t || !composite.starts_with(&prefix) {
                 break;
             }
             let Some((_coll, _rev_dst, rev_label, rev_src, sys)) =
@@ -153,7 +157,7 @@ impl EdgeStore {
                 continue;
             }
             let Some(props) = self.ceiling_resolve_edge(
-                EdgeRef::new(tid, collection, &src_id, &label, dst),
+                EdgeRef::new(DatabaseId::new(db), tid, collection, &src_id, &label, dst),
                 cutoff,
                 valid_at_ms,
             )?

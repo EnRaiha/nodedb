@@ -84,6 +84,7 @@ impl CoreLoop {
 
         let start_ids: Vec<&str> = vector_scores.keys().map(String::as_str).collect();
         let (expanded_nodes, hop_distances, bfs_truncated) = self.bfs_with_distances(
+            task.request.database_id.as_u64(),
             tenant_id,
             &start_ids,
             edge_label.as_deref(),
@@ -141,12 +142,9 @@ impl CoreLoop {
         vector_top_k: usize,
         vector_field: &str,
     ) -> Result<VectorNodeScores, Response> {
-        let index_key = CoreLoop::vector_index_key(
-            task.request.database_id.as_u64(),
-            tenant_id,
-            collection,
-            vector_field,
-        );
+        let database_id = task.request.database_id.as_u64();
+        let index_key =
+            CoreLoop::vector_index_key(database_id, tenant_id, collection, vector_field);
         let Some(index) = self.vector_collections.get(&index_key) else {
             return Err(self.response_error(task, ErrorCode::NotFound));
         };
@@ -166,7 +164,7 @@ impl CoreLoop {
         // (CSR partition reverse map). Vectors without a surrogate binding, or
         // surrogates not bound to any graph node, emit a non-matching sentinel
         // that BFS will skip as a missing seed.
-        let csr = self.csr_partition(tenant_id);
+        let csr = self.csr_partition(database_id, tenant_id);
         let mut vector_scores: HashMap<String, (usize, f32)> = HashMap::new();
         for (rank, result) in vector_results.iter().enumerate() {
             let node_id = index
@@ -236,8 +234,10 @@ impl CoreLoop {
     }
 
     /// BFS traversal that also tracks hop distances from start nodes.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn bfs_with_distances(
         &self,
+        database_id: u64,
         tid: u64,
         start_nodes: &[&str],
         label_filter: Option<&str>,
@@ -273,7 +273,7 @@ impl CoreLoop {
                 break;
             }
 
-            let neighbors = match self.csr_partition(tid) {
+            let neighbors = match self.csr_partition(database_id, tid) {
                 Some(part) => part.neighbors(&node, label_filter, direction),
                 None => Vec::new(),
             };

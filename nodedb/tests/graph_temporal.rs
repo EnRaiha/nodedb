@@ -13,6 +13,7 @@ use nodedb::engine::graph::edge_store::EdgeStore;
 use nodedb_types::TenantId;
 
 const T: TenantId = TenantId::new(1);
+const DB: nodedb_types::DatabaseId = nodedb_types::DatabaseId::DEFAULT;
 const COLL: &str = "people";
 
 fn open_store() -> (EdgeStore, tempfile::TempDir) {
@@ -28,7 +29,7 @@ fn insert_update_softdelete_ceiling_roundtrip() {
     // v1 @ ordinal 100
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "alice", "KNOWS", "bob"),
             b"v1",
             100,
             100,
@@ -38,7 +39,7 @@ fn insert_update_softdelete_ceiling_roundtrip() {
     // v2 @ ordinal 200 (overwrites)
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "alice", "KNOWS", "bob"),
             b"v2",
             200,
             200,
@@ -48,7 +49,7 @@ fn insert_update_softdelete_ceiling_roundtrip() {
     // tombstone @ ordinal 300
     store
         .soft_delete_edge(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "alice", "KNOWS", "bob"),
             300,
         )
         .unwrap();
@@ -57,7 +58,9 @@ fn insert_update_softdelete_ceiling_roundtrip() {
     assert_eq!(
         store
             .ceiling_resolve_edge(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+                nodedb::engine::graph::edge_store::EdgeRef::new(
+                    DB, T, COLL, "alice", "KNOWS", "bob"
+                ),
                 99,
                 None
             )
@@ -68,7 +71,9 @@ fn insert_update_softdelete_ceiling_roundtrip() {
     assert_eq!(
         store
             .ceiling_resolve_edge(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+                nodedb::engine::graph::edge_store::EdgeRef::new(
+                    DB, T, COLL, "alice", "KNOWS", "bob"
+                ),
                 150,
                 None
             )
@@ -79,7 +84,9 @@ fn insert_update_softdelete_ceiling_roundtrip() {
     assert_eq!(
         store
             .ceiling_resolve_edge(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+                nodedb::engine::graph::edge_store::EdgeRef::new(
+                    DB, T, COLL, "alice", "KNOWS", "bob"
+                ),
                 250,
                 None
             )
@@ -90,7 +97,9 @@ fn insert_update_softdelete_ceiling_roundtrip() {
     assert_eq!(
         store
             .ceiling_resolve_edge(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+                nodedb::engine::graph::edge_store::EdgeRef::new(
+                    DB, T, COLL, "alice", "KNOWS", "bob"
+                ),
                 350,
                 None
             )
@@ -102,7 +111,7 @@ fn insert_update_softdelete_ceiling_roundtrip() {
     // Current-state get_edge must see None (latest is tombstone).
     assert!(
         store
-            .get_edge(T, COLL, "alice", "KNOWS", "bob")
+            .get_edge(0, T, COLL, "alice", "KNOWS", "bob")
             .unwrap()
             .is_none()
     );
@@ -114,7 +123,7 @@ fn gdpr_erase_distinct_from_soft_delete() {
 
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "u1", "PAID", "vendor"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "u1", "PAID", "vendor"),
             b"100usd",
             10,
             10,
@@ -123,7 +132,7 @@ fn gdpr_erase_distinct_from_soft_delete() {
         .unwrap();
     store
         .gdpr_erase_edge(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "u1", "PAID", "vendor"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "u1", "PAID", "vendor"),
             20,
         )
         .unwrap();
@@ -131,12 +140,12 @@ fn gdpr_erase_distinct_from_soft_delete() {
     // After erasure, current-state is empty.
     assert!(
         store
-            .get_edge(T, COLL, "u1", "PAID", "vendor")
+            .get_edge(0, T, COLL, "u1", "PAID", "vendor")
             .unwrap()
             .is_none()
     );
     // But the raw export still shows the erasure marker — audit preservation.
-    let raw = store.scan_edges_for_tenant(T).unwrap();
+    let raw = store.scan_edges_for_tenant(0, T).unwrap();
     let found = raw.iter().any(|(_k, v)| v == &[0xFEu8]);
     assert!(found, "GDPR erasure marker must persist in storage");
 }
@@ -147,7 +156,7 @@ fn csr_rebuild_as_of_omits_post_cutoff_writes() {
 
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
             b"x",
             100,
             100,
@@ -156,7 +165,7 @@ fn csr_rebuild_as_of_omits_post_cutoff_writes() {
         .unwrap();
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "c"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "c"),
             b"y",
             200,
             200,
@@ -166,12 +175,12 @@ fn csr_rebuild_as_of_omits_post_cutoff_writes() {
 
     // Current-state rebuild sees both edges.
     let csr_now = rebuild_sharded_from_store(&store).unwrap();
-    let part_now = csr_now.partition(T).expect("partition exists");
+    let part_now = csr_now.partition(DB, T).expect("partition exists");
     assert_eq!(part_now.node_count(), 3);
 
     // AS OF ordinal 150 only sees the first edge.
     let sharded = rebuild_sharded_from_store_as_of(&store, Some(150)).unwrap();
-    let part = sharded.partition(T).expect("partition exists");
+    let part = sharded.partition(DB, T).expect("partition exists");
     assert_eq!(part.node_count(), 2, "only a + b at ordinal 150");
 }
 
@@ -181,7 +190,7 @@ fn soft_delete_then_reinsert_resurrects_current_state() {
 
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
             b"v1",
             10,
             10,
@@ -190,15 +199,15 @@ fn soft_delete_then_reinsert_resurrects_current_state() {
         .unwrap();
     store
         .soft_delete_edge(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
             20,
         )
         .unwrap();
-    assert!(store.get_edge(T, COLL, "a", "L", "b").unwrap().is_none());
+    assert!(store.get_edge(0, T, COLL, "a", "L", "b").unwrap().is_none());
 
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
             b"v2",
             30,
             30,
@@ -206,7 +215,7 @@ fn soft_delete_then_reinsert_resurrects_current_state() {
         )
         .unwrap();
     assert_eq!(
-        store.get_edge(T, COLL, "a", "L", "b").unwrap().unwrap(),
+        store.get_edge(0, T, COLL, "a", "L", "b").unwrap().unwrap(),
         b"v2".to_vec()
     );
     // Historical read at ordinal 25 (between tombstone and re-insert)
@@ -214,7 +223,7 @@ fn soft_delete_then_reinsert_resurrects_current_state() {
     assert!(
         store
             .ceiling_resolve_edge(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+                nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
                 25,
                 None
             )
@@ -230,7 +239,7 @@ fn valid_time_filter_selects_applicable_version() {
     // Two disjoint valid-time windows for the same system-time progression.
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
             b"old",
             10,
             0,
@@ -239,7 +248,7 @@ fn valid_time_filter_selects_applicable_version() {
         .unwrap();
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
             b"new",
             20,
             200,
@@ -250,7 +259,7 @@ fn valid_time_filter_selects_applicable_version() {
     assert_eq!(
         store
             .ceiling_resolve_edge(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+                nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
                 i64::MAX,
                 Some(50)
             )
@@ -261,7 +270,7 @@ fn valid_time_filter_selects_applicable_version() {
     assert_eq!(
         store
             .ceiling_resolve_edge(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+                nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
                 i64::MAX,
                 Some(300)
             )
@@ -273,7 +282,7 @@ fn valid_time_filter_selects_applicable_version() {
     assert!(
         store
             .ceiling_resolve_edge(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+                nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
                 i64::MAX,
                 Some(150)
             )
@@ -293,7 +302,7 @@ fn delete_edges_for_node_cascades_tombstones() {
         let ord = 10 + n as i64;
         store
             .put_edge_versioned(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, src, "KNOWS", dst),
+                nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, src, "KNOWS", dst),
                 b"p",
                 ord,
                 ord,
@@ -304,7 +313,7 @@ fn delete_edges_for_node_cascades_tombstones() {
     // Unrelated edge must survive.
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "eve", "KNOWS", "frank"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "eve", "KNOWS", "frank"),
             b"p",
             100,
             100,
@@ -312,29 +321,29 @@ fn delete_edges_for_node_cascades_tombstones() {
         )
         .unwrap();
 
-    store.delete_edges_for_node(T, "alice", 1_000).unwrap();
+    store.delete_edges_for_node(DB.as_u64(), T, "alice", 1_000).unwrap();
 
     assert!(
         store
-            .get_edge(T, COLL, "alice", "KNOWS", "bob")
+            .get_edge(0, T, COLL, "alice", "KNOWS", "bob")
             .unwrap()
             .is_none()
     );
     assert!(
         store
-            .get_edge(T, COLL, "alice", "KNOWS", "carol")
+            .get_edge(0, T, COLL, "alice", "KNOWS", "carol")
             .unwrap()
             .is_none()
     );
     assert!(
         store
-            .get_edge(T, COLL, "dave", "KNOWS", "alice")
+            .get_edge(0, T, COLL, "dave", "KNOWS", "alice")
             .unwrap()
             .is_none()
     );
     assert_eq!(
         store
-            .get_edge(T, COLL, "eve", "KNOWS", "frank")
+            .get_edge(0, T, COLL, "eve", "KNOWS", "frank")
             .unwrap()
             .unwrap(),
         b"p".to_vec()
@@ -344,7 +353,9 @@ fn delete_edges_for_node_cascades_tombstones() {
     assert_eq!(
         store
             .ceiling_resolve_edge(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+                nodedb::engine::graph::edge_store::EdgeRef::new(
+                    DB, T, COLL, "alice", "KNOWS", "bob"
+                ),
                 500,
                 None
             )

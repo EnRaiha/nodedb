@@ -75,6 +75,7 @@ impl CoreLoop {
         // Graph BFS from vector-nearest nodes.
         let start_ids: Vec<&str> = vector_scores.keys().map(String::as_str).collect();
         let (expanded_nodes, hop_distances, bfs_truncated) = self.bfs_with_distances(
+            task.request.database_id.as_u64(),
             tenant_id,
             &start_ids,
             edge_label.as_deref(),

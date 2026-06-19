@@ -108,7 +108,7 @@ impl CoreLoop {
 
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
-        self.maybe_register_edge(tid, collection, surrogate, value);
+        self.maybe_register_edge(database_id, tid, collection, surrogate, value);
 
         self.emit_put_event(task, tid, collection, row_key, value, None);
 
@@ -122,6 +122,7 @@ impl CoreLoop {
     /// were inserted via plain document INSERT.
     fn maybe_register_edge(
         &mut self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         surrogate: Surrogate,
@@ -154,6 +155,7 @@ impl CoreLoop {
         use crate::engine::graph::edge_store::EdgeRef;
         if let Err(e) = self.edge_store.put_edge_versioned(
             EdgeRef::new(
+                nodedb_types::DatabaseId::new(database_id),
                 crate::types::TenantId::new(tid),
                 collection,
                 &src,
@@ -167,7 +169,7 @@ impl CoreLoop {
         ) {
             tracing::debug!(err = %e, %src, %dst, %label, %collection, "edge store write failed during graph overlay registration");
         }
-        let partition = self.csr_partition_mut(tid);
+        let partition = self.csr_partition_mut(database_id, tid);
         let csr_result = if (weight - 1.0).abs() > f64::EPSILON {
             partition.add_edge_weighted(&src, &label, &dst, weight)
         } else {

@@ -260,6 +260,7 @@ impl StringColumn {
 pub fn extract_edge_properties(
     edge_store: &crate::engine::graph::edge_store::EdgeStore,
     csr: &crate::engine::graph::csr::CsrIndex,
+    db: nodedb_types::DatabaseId,
     tid: nodedb_types::TenantId,
     property_names: &[&str],
 ) -> Result<PropertyColumns, crate::Error> {
@@ -271,10 +272,10 @@ pub fn extract_edge_properties(
     let tenant_edges: Vec<_> = edge_store
         .scan_all_edges_decoded(None)?
         .into_iter()
-        .filter(|(rec_tid, _, _, _, _, _)| *rec_tid == tid)
+        .filter(|(rec_db, rec_tid, _, _, _, _, _)| *rec_db == db && *rec_tid == tid)
         .collect();
 
-    for (_tid, _coll, src_name, _label, _dst, properties) in &tenant_edges {
+    for (_db, _tid, _coll, src_name, _label, _dst, properties) in &tenant_edges {
         if properties.is_empty() {
             continue;
         }
@@ -414,6 +415,7 @@ mod tests {
         store
             .put_edge_versioned(
                 EdgeRef::new(
+                    nodedb_types::DatabaseId::DEFAULT,
                     nodedb_types::TenantId::new(1),
                     "col",
                     "alice",
@@ -432,6 +434,7 @@ mod tests {
         let columns = extract_edge_properties(
             &store,
             &csr,
+            nodedb_types::DatabaseId::DEFAULT,
             nodedb_types::TenantId::new(1),
             &["weight", "label"],
         )
@@ -455,7 +458,14 @@ mod tests {
         use crate::engine::graph::edge_store::EdgeRef;
         store
             .put_edge_versioned(
-                EdgeRef::new(nodedb_types::TenantId::new(1), "col", "a", "L", "b"),
+                EdgeRef::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    nodedb_types::TenantId::new(1),
+                    "col",
+                    "a",
+                    "L",
+                    "b",
+                ),
                 b"",
                 1,
                 1,
@@ -464,9 +474,14 @@ mod tests {
             .unwrap();
 
         let csr = crate::engine::graph::csr::rebuild::rebuild_from_store(&store).unwrap();
-        let columns =
-            extract_edge_properties(&store, &csr, nodedb_types::TenantId::new(1), &["weight"])
-                .unwrap();
+        let columns = extract_edge_properties(
+            &store,
+            &csr,
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(1),
+            &["weight"],
+        )
+        .unwrap();
 
         // No properties extracted.
         assert!(columns.f64_columns.is_empty());

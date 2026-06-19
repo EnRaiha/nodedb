@@ -46,13 +46,14 @@ impl EdgeStore {
     /// O(edges-in-collection).
     pub fn collection_stats(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         as_of: Option<i64>,
     ) -> crate::Result<CollectionStats> {
         match as_of {
-            None => self.collection_stats_live(tid, collection),
-            Some(ts) => self.collection_stats_historical(tid, collection, ts),
+            None => self.collection_stats_live(db, tid, collection),
+            Some(ts) => self.collection_stats_historical(db, tid, collection, ts),
         }
     }
 
@@ -67,12 +68,13 @@ impl EdgeStore {
     /// collection and materialising counts at ordinal `ts`. O(total-edges-for-tenant).
     pub fn tenant_stats(
         &self,
+        db: u64,
         tid: TenantId,
         as_of: Option<i64>,
     ) -> crate::Result<Vec<CollectionStats>> {
         match as_of {
-            None => self.tenant_stats_live(tid),
-            Some(ts) => self.tenant_stats_historical(tid, ts),
+            None => self.tenant_stats_live(db, tid),
+            Some(ts) => self.tenant_stats_historical(db, tid, ts),
         }
     }
 
@@ -80,6 +82,7 @@ impl EdgeStore {
 
     fn collection_stats_live(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
     ) -> crate::Result<CollectionStats> {
@@ -95,13 +98,13 @@ impl EdgeStore {
             .map_err(|e| redb_err("open graph_stats (read)", e))?;
 
         let summary_bytes = stats_table
-            .get((t, skey.as_str()))
+            .get((db, t, skey.as_str()))
             .map_err(|e| redb_err("read summary", e))?;
 
         if let Some(bytes) = summary_bytes {
             let summary = SummaryRow::decode(bytes.value())?;
             drop(bytes);
-            let labels = read_labels_from_table(&stats_table, t, collection)?;
+            let labels = read_labels_from_table(&stats_table, db, t, collection)?;
             return Ok(CollectionStats {
                 collection: collection.to_string(),
                 edge_count: summary.edge_count,
@@ -116,18 +119,18 @@ impl EdgeStore {
         // Summary row absent — check whether EDGES has entries for this collection.
         // If so, rebuild atomically; otherwise return zeros.
         let prefix = format!("{collection}\x00");
-        let has_edges = self.collection_prefix_has_entries(tid, &prefix)?;
+        let has_edges = self.collection_prefix_has_entries(db, tid, &prefix)?;
         if !has_edges {
             return Ok(CollectionStats::zero(collection.to_string()));
         }
 
         // Rebuild: scan live EDGES for this collection at current-state.
-        let rebuilt = self.collection_stats_historical(tid, collection, i64::MAX)?;
-        self.write_stats_atomically(tid, collection, &rebuilt)?;
+        let rebuilt = self.collection_stats_historical(db, tid, collection, i64::MAX)?;
+        self.write_stats_atomically(db, tid, collection, &rebuilt)?;
         Ok(rebuilt)
     }
 
-    fn tenant_stats_live(&self, tid: TenantId) -> crate::Result<Vec<CollectionStats>> {
+    fn tenant_stats_live(&self, db: u64, tid: TenantId) -> crate::Result<Vec<CollectionStats>> {
         let t = tid.as_u64();
 
         let read_txn = self
@@ -138,15 +141,15 @@ impl EdgeStore {
             .open_table(GRAPH_STATS)
             .map_err(|e| redb_err("open graph_stats (tenant read)", e))?;
 
-        // Scan summary rows for this tenant.
+        // Scan summary rows for this (database, tenant).
         let mut collections: Vec<String> = Vec::new();
         let range = stats_table
-            .range((t, "")..(t + 1, ""))
+            .range((db, t, "")..(db, t + 1, ""))
             .map_err(|e| redb_err("tenant_stats range", e))?;
 
         for entry in range {
             let (k, _v) = entry.map_err(|e| redb_err("tenant_stats iter", e))?;
-            let (_kt, row_key) = k.value();
+            let (_kd, _kt, row_key) = k.value();
             // Only collect summary rows — they end with "\x00summary".
             if row_key.ends_with("\x00summary") {
                 let collection = row_key.trim_end_matches("\x00summary").to_string();
@@ -158,12 +161,12 @@ impl EdgeStore {
 
         if collections.is_empty() {
             // No summary rows exist — scan EDGES to discover collections and rebuild.
-            return self.tenant_stats_historical(tid, i64::MAX);
+            return self.tenant_stats_historical(db, tid, i64::MAX);
         }
 
         let mut result = Vec::with_capacity(collections.len());
         for coll in collections {
-            let s = self.collection_stats_live(tid, &coll)?;
+            let s = self.collection_stats_live(db, tid, &coll)?;
             result.push(s);
         }
         result.sort_by(|a, b| a.collection.cmp(&b.collection));
@@ -174,6 +177,7 @@ impl EdgeStore {
 
     fn collection_stats_historical(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         as_of: i64,
@@ -189,12 +193,13 @@ impl EdgeStore {
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges (historical)", e))?;
 
-        let stats = materialise_collection_stats(collection, &edges, t, &prefix, as_of)?;
+        let stats = materialise_collection_stats(collection, &edges, db, t, &prefix, as_of)?;
         Ok(stats)
     }
 
     fn tenant_stats_historical(
         &self,
+        db: u64,
         tid: TenantId,
         as_of: i64,
     ) -> crate::Result<Vec<CollectionStats>> {
@@ -207,16 +212,16 @@ impl EdgeStore {
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges (tenant_stats_hist)", e))?;
 
-        // One pass across all tenant edges — collect per-collection accumulators.
+        // One pass across all (db, tenant) edges — collect per-collection accumulators.
         let mut per_coll: HashMap<String, CollectionAccum> = HashMap::new();
 
         let range = edges
-            .range((t, "")..(t + 1, ""))
+            .range((db, t, "")..(db, t + 1, ""))
             .map_err(|e| redb_err("tenant_stats_hist range", e))?;
 
         for entry in range {
             let (k, v) = entry.map_err(|e| redb_err("tenant_stats_hist iter", e))?;
-            let (_kt, composite) = k.value();
+            let (_kd, _kt, composite) = k.value();
             let Some((coll, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
                 continue;
             };
@@ -248,7 +253,12 @@ impl EdgeStore {
 
     // ── cold-start rebuild helpers ────────────────────────────────────────────
 
-    fn collection_prefix_has_entries(&self, tid: TenantId, prefix: &str) -> crate::Result<bool> {
+    fn collection_prefix_has_entries(
+        &self,
+        db: u64,
+        tid: TenantId,
+        prefix: &str,
+    ) -> crate::Result<bool> {
         let t = tid.as_u64();
         let read_txn = self
             .db
@@ -258,20 +268,21 @@ impl EdgeStore {
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges (prefix check)", e))?;
         let mut range = edges
-            .range((t, prefix)..)
+            .range((db, t, prefix)..)
             .map_err(|e| redb_err("prefix range", e))?;
         match range.next() {
             None => Ok(false),
             Some(Err(e)) => Err(redb_err("prefix range first", e)),
             Some(Ok((k, _))) => {
-                let (kt, composite) = k.value();
-                Ok(kt == t && composite.starts_with(prefix))
+                let (kd, kt, composite) = k.value();
+                Ok(kd == db && kt == t && composite.starts_with(prefix))
             }
         }
     }
 
     fn write_stats_atomically(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         stats: &CollectionStats,
@@ -292,13 +303,13 @@ impl EdgeStore {
                 distinct_label_count: stats.distinct_label_count,
             };
             let skey = summary_key(collection);
-            st.insert((t, skey.as_str()), summary.encode()?.as_slice())
+            st.insert((db, t, skey.as_str()), summary.encode()?.as_slice())
                 .map_err(|e| redb_err("insert rebuilt summary", e))?;
 
             for (label, count) in &stats.labels {
                 let lkey = label_key(collection, label);
                 let lrow = LabelRow { count: *count };
-                st.insert((t, lkey.as_str()), lrow.encode()?.as_slice())
+                st.insert((db, t, lkey.as_str()), lrow.encode()?.as_slice())
                     .map_err(|e| redb_err("insert rebuilt label", e))?;
             }
         }
@@ -312,20 +323,21 @@ impl EdgeStore {
 // ── free functions ────────────────────────────────────────────────────────────
 
 fn read_labels_from_table(
-    stats_table: &redb::ReadOnlyTable<(u64, &str), &[u8]>,
+    stats_table: &redb::ReadOnlyTable<(u64, u64, &str), &[u8]>,
+    db: u64,
     t: u64,
     collection: &str,
 ) -> crate::Result<Vec<(String, u64)>> {
     let lp = label_prefix(collection);
     let range = stats_table
-        .range((t, lp.as_str())..)
+        .range((db, t, lp.as_str())..)
         .map_err(|e| redb_err("label scan range", e))?;
 
     let mut labels = Vec::new();
     for entry in range {
         let (k, v) = entry.map_err(|e| redb_err("label scan iter", e))?;
-        let (kt, row_key) = k.value();
-        if kt != t || !row_key.starts_with(&lp) {
+        let (kd, kt, row_key) = k.value();
+        if kd != db || kt != t || !row_key.starts_with(&lp) {
             break;
         }
         let label_name = row_key[lp.len()..].to_string();
@@ -338,7 +350,8 @@ fn read_labels_from_table(
 
 fn materialise_collection_stats(
     collection: &str,
-    edges: &redb::ReadOnlyTable<(u64, &str), &[u8]>,
+    edges: &redb::ReadOnlyTable<(u64, u64, &str), &[u8]>,
+    db: u64,
     t: u64,
     prefix: &str,
     as_of: i64,
@@ -355,13 +368,13 @@ fn materialise_collection_stats(
     let mut bases: HashMap<String, BaseEntry> = HashMap::new();
 
     let range = edges
-        .range((t, prefix)..)
+        .range((db, t, prefix)..)
         .map_err(|e| redb_err("materialise range", e))?;
 
     for entry in range {
         let (k, v) = entry.map_err(|e| redb_err("materialise iter", e))?;
-        let (kt, composite) = k.value();
-        if kt != t || !composite.starts_with(prefix) {
+        let (kd, kt, composite) = k.value();
+        if kd != db || kt != t || !composite.starts_with(prefix) {
             break;
         }
         let Some((_c, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {

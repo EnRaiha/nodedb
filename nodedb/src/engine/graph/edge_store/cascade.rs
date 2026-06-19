@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use super::store::{BaseKey, EDGES, EdgeStore, redb_err};
 use super::temporal::{EdgeRef, is_sentinel, parse_versioned_edge_key};
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 
 impl EdgeStore {
     /// Soft-delete every edge incident on `node` (as either src or dst) in
@@ -15,23 +15,32 @@ impl EdgeStore {
     /// live (non-sentinel) latest version.
     pub fn delete_edges_for_node(
         &self,
+        db: u64,
         tid: TenantId,
         node: &str,
         system_from: i64,
     ) -> crate::Result<()> {
         // Snapshot all live bases touching `node`. Done in a read txn first
         // so the write txn can call soft_delete_edge without nested locks.
-        let bases = self.live_bases_touching_node(tid, node)?;
+        let bases = self.live_bases_touching_node(db, tid, node)?;
         for (collection, src, label, dst) in &bases {
-            self.soft_delete_edge(EdgeRef::new(tid, collection, src, label, dst), system_from)?;
+            self.soft_delete_edge(
+                EdgeRef::new(DatabaseId::new(db), tid, collection, src, label, dst),
+                system_from,
+            )?;
         }
         Ok(())
     }
 
     /// Enumerate `(collection, src, label, dst)` tuples for every base edge
-    /// in this tenant whose latest version touches `node` as src or dst and
-    /// is not a sentinel.
-    fn live_bases_touching_node(&self, tid: TenantId, node: &str) -> crate::Result<Vec<BaseKey>> {
+    /// in this `(database, tenant)` whose latest version touches `node` as src
+    /// or dst and is not a sentinel.
+    fn live_bases_touching_node(
+        &self,
+        db: u64,
+        tid: TenantId,
+        node: &str,
+    ) -> crate::Result<Vec<BaseKey>> {
         let t = tid.as_u64();
         let read_txn = self
             .db
@@ -42,12 +51,14 @@ impl EdgeStore {
             .map_err(|e| redb_err("open edges", e))?;
 
         let mut latest: HashMap<BaseKey, (i64, bool)> = HashMap::new();
+        // DB-scoped range: a node-delete in database A must NOT cascade into
+        // the same tenant's edges in database B.
         let range = table
-            .range((t, "")..(t + 1, ""))
+            .range((db, t, "")..(db, t + 1, ""))
             .map_err(|e| redb_err("iter", e))?;
         for entry in range {
             let (k, v) = entry.map_err(|e| redb_err("iter entry", e))?;
-            let composite = k.value().1;
+            let composite = k.value().2;
             let Some((coll, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
                 continue;
             };
@@ -84,6 +95,8 @@ mod tests {
     use nodedb_types::OrdinalClock;
 
     const T: TenantId = TenantId::new(1);
+    const DB: DatabaseId = DatabaseId::DEFAULT;
+    const D: u64 = 0;
     const COLL: &str = "people";
 
     fn make_store() -> (EdgeStore, tempfile::TempDir) {
@@ -96,7 +109,7 @@ mod tests {
         let ord = clock.next_ordinal();
         store
             .put_edge_versioned(
-                EdgeRef::new(T, COLL, src, label, dst),
+                EdgeRef::new(DB, T, COLL, src, label, dst),
                 p,
                 ord,
                 ord,
@@ -115,28 +128,30 @@ mod tests {
         put(&store, &clock, "eve", "KNOWS", "frank", b"4");
 
         let purge_ord = clock.next_ordinal();
-        store.delete_edges_for_node(T, "alice", purge_ord).unwrap();
+        store
+            .delete_edges_for_node(D, T, "alice", purge_ord)
+            .unwrap();
 
         assert!(
             store
-                .get_edge(T, COLL, "alice", "KNOWS", "bob")
+                .get_edge(D, T, COLL, "alice", "KNOWS", "bob")
                 .unwrap()
                 .is_none()
         );
         assert!(
             store
-                .get_edge(T, COLL, "alice", "KNOWS", "carol")
+                .get_edge(D, T, COLL, "alice", "KNOWS", "carol")
                 .unwrap()
                 .is_none()
         );
         assert!(
             store
-                .get_edge(T, COLL, "dave", "KNOWS", "alice")
+                .get_edge(D, T, COLL, "dave", "KNOWS", "alice")
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
-            store.get_edge(T, COLL, "eve", "KNOWS", "frank").unwrap(),
+            store.get_edge(D, T, COLL, "eve", "KNOWS", "frank").unwrap(),
             Some(b"4".to_vec())
         );
     }
@@ -148,18 +163,18 @@ mod tests {
         put(&store, &clock, "alice", "KNOWS", "bob", b"1");
         store
             .soft_delete_edge(
-                EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+                EdgeRef::new(DB, T, COLL, "alice", "KNOWS", "bob"),
                 clock.next_ordinal(),
             )
             .unwrap();
 
         // Should be a no-op — no live bases to cascade through.
         store
-            .delete_edges_for_node(T, "alice", clock.next_ordinal())
+            .delete_edges_for_node(D, T, "alice", clock.next_ordinal())
             .unwrap();
         assert!(
             store
-                .get_edge(T, COLL, "alice", "KNOWS", "bob")
+                .get_edge(D, T, COLL, "alice", "KNOWS", "bob")
                 .unwrap()
                 .is_none()
         );

@@ -47,8 +47,9 @@ impl CoreLoop {
             // Restore graph edges. Keys are the unscoped
             // `"src\0label\0dst"` form; tenant is supplied from context.
             let tid = crate::types::TenantId::new(tenant_id);
+            let database_id = task.request.database_id.as_u64();
             for (key, props) in &snap.edges {
-                if let Err(e) = self.edge_store.put_edge_raw(tid, key, props) {
+                if let Err(e) = self.edge_store.put_edge_raw(database_id, tid, key, props) {
                     warn!(key, error = %e, "failed to restore edge");
                     continue;
                 }

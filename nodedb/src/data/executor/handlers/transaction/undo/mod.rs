@@ -168,7 +168,7 @@ impl CoreLoop {
                 self.apply_undo_vector(tid, entry_index, entry)
             }
             UndoEntry::PutEdge { .. } | UndoEntry::DeleteEdge { .. } => {
-                self.apply_undo_edge(tid, entry_index, entry)
+                self.apply_undo_edge(did, tid, entry_index, entry)
             }
             UndoEntry::KvPut { .. }
             | UndoEntry::KvDelete { .. }

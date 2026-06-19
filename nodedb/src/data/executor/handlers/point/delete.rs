@@ -125,11 +125,14 @@ impl CoreLoop {
                 }
 
                 // Cascade 3: Remove graph edges where this document is src or dst.
-                let edges_removed = self.csr_partition_mut(tid).remove_node_edges(document_id);
+                let edges_removed = self
+                    .csr_partition_mut(database_id, tid)
+                    .remove_node_edges(document_id);
                 if edges_removed > 0 {
                     // Also tombstone in persistent edge store.
                     let cascade_ord = self.hlc.next_ordinal();
                     if let Err(e) = self.edge_store.delete_edges_for_node(
+                        database_id,
                         nodedb_types::TenantId::new(tid),
                         document_id,
                         cascade_ord,
@@ -168,7 +171,7 @@ impl CoreLoop {
                 }
 
                 // Record deletion for edge referential integrity.
-                self.mark_node_deleted(tid, document_id);
+                self.mark_node_deleted(database_id, tid, document_id);
 
                 // Invalidate document cache.
                 self.doc_cache.invalidate(

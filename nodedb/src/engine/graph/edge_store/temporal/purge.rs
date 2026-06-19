@@ -30,6 +30,7 @@ impl EdgeStore {
     /// removals are paired 1:1).
     pub fn purge_superseded_versions(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         cutoff_system_ms: i64,
@@ -38,7 +39,7 @@ impl EdgeStore {
         let t = tid.as_u64();
 
         // Pass 1: scan read-only, group by base, collect delete candidates.
-        let victims = self.collect_purge_victims(t, collection, cutoff_ordinal)?;
+        let victims = self.collect_purge_victims(db, t, collection, cutoff_ordinal)?;
         if victims.is_empty() {
             return Ok(0);
         }
@@ -58,9 +59,9 @@ impl EdgeStore {
 
             for v in &victims {
                 edges
-                    .remove((t, v.fwd_key.as_str()))
+                    .remove((db, t, v.fwd_key.as_str()))
                     .map_err(|e| redb_err("remove edge", e))?;
-                rev.remove((t, v.rev_key.as_str()))
+                rev.remove((db, t, v.rev_key.as_str()))
                     .map_err(|e| redb_err("remove reverse", e))?;
             }
         }
@@ -73,6 +74,7 @@ impl EdgeStore {
 
     fn collect_purge_victims(
         &self,
+        db: u64,
         t: u64,
         collection: &str,
         cutoff_ordinal: i64,
@@ -97,8 +99,8 @@ impl EdgeStore {
         // current candidate is provably not the latest and the cutoff
         // predicate gates inclusion.
 
-        let low = (t, "");
-        let high = (t + 1, "");
+        let low = (db, t, "");
+        let high = (db, t + 1, "");
         let range = edges
             .range(low..high)
             .map_err(|e| redb_err("range purge", e))?;
@@ -107,7 +109,7 @@ impl EdgeStore {
         let mut victims: Vec<Victim> = Vec::new();
         for entry in range {
             let (k, _v) = entry.map_err(|e| redb_err("entry purge", e))?;
-            let (_tid, key_str) = k.value();
+            let (_db, _tid, key_str) = k.value();
             let Some((parsed_coll, src, label, dst, system_from)) =
                 parse_versioned_edge_key(key_str)
             else {
@@ -186,6 +188,10 @@ impl Victim {
 mod tests {
     use super::*;
     use crate::engine::graph::edge_store::temporal::keys::EdgeRef;
+    use nodedb_types::DatabaseId;
+
+    const DB: DatabaseId = DatabaseId::DEFAULT;
+    const D: u64 = 0;
 
     fn fresh_store() -> (tempfile::TempDir, EdgeStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -203,14 +209,14 @@ mod tests {
     fn count_edges(store: &EdgeStore, tid: TenantId, collection: &str) -> usize {
         let read_txn = store.db.begin_read().unwrap();
         let edges = read_txn.open_table(EDGES).unwrap();
-        let low = (tid.as_u64(), "");
-        let high = (tid.as_u64() + 1, "");
+        let low = (D, tid.as_u64(), "");
+        let high = (D, tid.as_u64() + 1, "");
         edges
             .range(low..high)
             .unwrap()
             .filter_map(|r| {
                 let (k, _) = r.ok()?;
-                let (_t, s) = k.value();
+                let (_d, _t, s) = k.value();
                 let (c, ..) = parse_versioned_edge_key(s)?;
                 (c == collection).then_some(())
             })
@@ -221,7 +227,7 @@ mod tests {
     fn purge_drops_superseded_versions_below_cutoff() {
         let (_dir, store) = fresh_store();
         let tid = TenantId::new(1);
-        let edge = EdgeRef::new(tid, "c", "a", "L", "b");
+        let edge = EdgeRef::new(DB, tid, "c", "a", "L", "b");
 
         // Three versions at ms = 100, 200, 300. Cutoff at 250 should drop
         // version 100 (< cutoff AND not latest). Version 200 is < cutoff
@@ -233,7 +239,7 @@ mod tests {
         }
         assert_eq!(count_edges(&store, tid, "c"), 3);
 
-        let purged = store.purge_superseded_versions(tid, "c", 150).unwrap();
+        let purged = store.purge_superseded_versions(D, tid, "c", 150).unwrap();
         assert_eq!(purged, 1, "only v@100 is below cutoff AND superseded");
         assert_eq!(count_edges(&store, tid, "c"), 2);
     }
@@ -242,11 +248,13 @@ mod tests {
     fn purge_never_deletes_latest_version() {
         let (_dir, store) = fresh_store();
         let tid = TenantId::new(1);
-        let edge = EdgeRef::new(tid, "c", "a", "L", "b");
+        let edge = EdgeRef::new(DB, tid, "c", "a", "L", "b");
         put(&store, edge, ms_to_ordinal_upper(100));
 
         // Cutoff way in the future. Only one version: keep it.
-        let purged = store.purge_superseded_versions(tid, "c", 10_000).unwrap();
+        let purged = store
+            .purge_superseded_versions(D, tid, "c", 10_000)
+            .unwrap();
         assert_eq!(purged, 0);
         assert_eq!(count_edges(&store, tid, "c"), 1);
     }
@@ -256,9 +264,9 @@ mod tests {
         let (_dir, store) = fresh_store();
         let tid = TenantId::new(1);
         let other_tenant = TenantId::new(2);
-        let e1 = EdgeRef::new(tid, "c", "a", "L", "b");
-        let e_other_tenant = EdgeRef::new(other_tenant, "c", "a", "L", "b");
-        let e_other_coll = EdgeRef::new(tid, "d", "a", "L", "b");
+        let e1 = EdgeRef::new(DB, tid, "c", "a", "L", "b");
+        let e_other_tenant = EdgeRef::new(DB, other_tenant, "c", "a", "L", "b");
+        let e_other_coll = EdgeRef::new(DB, tid, "d", "a", "L", "b");
 
         for ms in [100i64, 200, 300] {
             put(&store, e1, ms_to_ordinal_upper(ms));
@@ -267,7 +275,7 @@ mod tests {
         }
 
         // Purge only (tid=1, "c") below 250.
-        let purged = store.purge_superseded_versions(tid, "c", 150).unwrap();
+        let purged = store.purge_superseded_versions(D, tid, "c", 150).unwrap();
         assert_eq!(purged, 1);
         assert_eq!(count_edges(&store, tid, "c"), 2);
         assert_eq!(count_edges(&store, tid, "d"), 3);
@@ -278,12 +286,12 @@ mod tests {
     fn purge_is_idempotent() {
         let (_dir, store) = fresh_store();
         let tid = TenantId::new(1);
-        let edge = EdgeRef::new(tid, "c", "a", "L", "b");
+        let edge = EdgeRef::new(DB, tid, "c", "a", "L", "b");
         for ms in [100i64, 200, 300] {
             put(&store, edge, ms_to_ordinal_upper(ms));
         }
-        let first = store.purge_superseded_versions(tid, "c", 150).unwrap();
-        let second = store.purge_superseded_versions(tid, "c", 150).unwrap();
+        let first = store.purge_superseded_versions(D, tid, "c", 150).unwrap();
+        let second = store.purge_superseded_versions(D, tid, "c", 150).unwrap();
         assert_eq!(first, 1);
         assert_eq!(second, 0);
     }

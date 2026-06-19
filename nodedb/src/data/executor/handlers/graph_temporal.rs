@@ -55,9 +55,11 @@ impl CoreLoop {
             ?valid_at_ms,
             "graph temporal neighbors"
         );
+        let database_id = task.request.database_id.as_u64();
         let tenant = TenantId::new(tid);
         let edges_result = match direction {
             Direction::Out => self.edge_store.neighbors_out_as_of(
+                database_id,
                 tenant,
                 collection,
                 node_id,
@@ -66,6 +68,7 @@ impl CoreLoop {
                 valid_at_ms,
             ),
             Direction::In => self.edge_store.neighbors_in_as_of(
+                database_id,
                 tenant,
                 collection,
                 node_id,
@@ -75,6 +78,7 @@ impl CoreLoop {
             ),
             Direction::Both => {
                 let out = self.edge_store.neighbors_out_as_of(
+                    database_id,
                     tenant,
                     collection,
                     node_id,
@@ -84,6 +88,7 @@ impl CoreLoop {
                 );
                 match out {
                     Ok(mut out) => match self.edge_store.neighbors_in_as_of(
+                        database_id,
                         tenant,
                         collection,
                         node_id,
@@ -149,9 +154,11 @@ impl CoreLoop {
             "graph temporal algorithm dispatch"
         );
         let cutoff_ordinal = system_as_of_ms.map(ms_to_ordinal_upper);
+        let database_id = task.request.database_id.as_u64();
 
         let scoped_csr = match super::graph_algo::build_csr_for_collection(
             &self.edge_store,
+            database_id,
             tid,
             &params.collection,
             params.edge_label.as_deref(),

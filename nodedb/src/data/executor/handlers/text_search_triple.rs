@@ -99,6 +99,7 @@ impl CoreLoop {
         // 3. Graph BFS from seed node.
         let edge_label_owned = graph_edge_label.map(str::to_string);
         let (graph_expanded, hop_distances, _bfs_truncated) = self.bfs_with_distances(
+            task.request.database_id.as_u64(),
             tid,
             &[graph_seed_id],
             graph_edge_label,

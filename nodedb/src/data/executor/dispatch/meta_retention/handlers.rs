@@ -249,10 +249,13 @@ impl CoreLoop {
         cutoff_system_ms: i64,
     ) -> Response {
         let tid = TenantId::new(tenant_id);
-        match self
-            .edge_store
-            .purge_superseded_versions(tid, collection, cutoff_system_ms)
-        {
+        let database_id = task.request.database_id.as_u64();
+        match self.edge_store.purge_superseded_versions(
+            database_id,
+            tid,
+            collection,
+            cutoff_system_ms,
+        ) {
             Ok(n) => {
                 if n > 0 {
                     tracing::info!(

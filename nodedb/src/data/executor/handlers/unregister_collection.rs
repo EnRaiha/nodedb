@@ -118,15 +118,16 @@ impl CoreLoop {
         })
         .unwrap_or(0);
 
-        // Graph edge store: remove all edges scoped to this collection.
+        // Graph edge store: remove all edges scoped to this (database, collection).
         let edges_removed =
             retry_reclaim("edge_store.purge_collection", tenant_id, collection, || {
-                self.edge_store.purge_collection(tid, collection)
+                self.edge_store
+                    .purge_collection(database_id, tid, collection)
             })
             .unwrap_or(0);
         // The CSR in-memory index is collection-agnostic. Stale edges will
         // be absent from the next CSR rebuild (which reads from EdgeStore).
-        self.csr.drop_collection(tid, collection);
+        self.csr.drop_collection(db, tid, collection);
 
         // ── In-memory, tuple-keyed state (reclaimable today) ─────────────────
 

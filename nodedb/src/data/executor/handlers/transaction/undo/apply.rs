@@ -167,11 +167,13 @@ impl CoreLoop {
 
     pub(super) fn apply_undo_edge(
         &mut self,
+        did: u64,
         tid: u64,
         entry_index: usize,
         entry: UndoEntry,
     ) -> Result<(), (usize, String)> {
         use crate::engine::graph::edge_store::EdgeRef;
+        let database = nodedb_types::DatabaseId::new(did);
         match entry {
             UndoEntry::PutEdge {
                 collection,
@@ -182,7 +184,8 @@ impl CoreLoop {
             } => {
                 let tenant = nodedb_types::TenantId::new(tid);
                 let ord = self.hlc.next_ordinal();
-                let edge_ref = EdgeRef::new(tenant, &collection, &src_id, &label, &dst_id);
+                let edge_ref =
+                    EdgeRef::new(database, tenant, &collection, &src_id, &label, &dst_id);
                 if let Some(old_props) = old_properties {
                     let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
                     self.edge_store
@@ -212,7 +215,7 @@ impl CoreLoop {
                             );
                             (entry_index, detail)
                         })?;
-                    self.csr_partition_mut(tid)
+                    self.csr_partition_mut(did, tid)
                         .remove_edge(&src_id, &label, &dst_id);
                 }
                 Ok(())
@@ -229,7 +232,7 @@ impl CoreLoop {
                 let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
                 self.edge_store
                     .put_edge_versioned(
-                        EdgeRef::new(tenant, &collection, &src_id, &label, &dst_id),
+                        EdgeRef::new(database, tenant, &collection, &src_id, &label, &dst_id),
                         &old_properties,
                         ord,
                         valid_from_ms,
@@ -248,7 +251,7 @@ impl CoreLoop {
                     })?;
                 let weight =
                     crate::engine::graph::csr::extract_weight_from_properties(&old_properties);
-                let partition = self.csr_partition_mut(tid);
+                let partition = self.csr_partition_mut(did, tid);
                 let csr_res = if weight != 1.0 {
                     partition.add_edge_weighted(&src_id, &label, &dst_id, weight)
                 } else {

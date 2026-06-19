@@ -10,7 +10,7 @@
 
 use nodedb_graph::CsrIndex;
 use nodedb_graph::csr::weights::extract_weight_from_properties;
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
@@ -46,8 +46,10 @@ impl CoreLoop {
             );
         }
 
+        let database_id = task.request.database_id.as_u64();
         let scoped_csr = match build_csr_for_collection(
             &self.edge_store,
+            database_id,
             tid,
             &params.collection,
             params.edge_label.as_deref(),
@@ -73,28 +75,31 @@ impl CoreLoop {
     }
 }
 
-/// Build a `CsrIndex` containing only the edges for a specific `(tid, collection)`,
-/// optionally filtered to a single edge label. Reads from the versioned EdgeStore
-/// so the result reflects current state (pass `None` for `system_as_of`) or a
-/// historical snapshot (pass a bitemporal ordinal cutoff).
+/// Build a `CsrIndex` containing only the edges for a specific
+/// `(database, tid, collection)`, optionally filtered to a single edge label.
+/// Reads from the versioned EdgeStore so the result reflects current state
+/// (pass `None` for `system_as_of`) or a historical snapshot (pass a bitemporal
+/// ordinal cutoff).
 ///
 /// Two-pass construction: first intern all endpoint nodes so isolated nodes get
 /// stable ids, then insert edges. This matches the pattern in `CsrSnapshot::from_edge_store_as_of`.
 pub(super) fn build_csr_for_collection(
     edge_store: &EdgeStore,
+    database_id: u64,
     tid: u64,
     collection: &str,
     edge_label: Option<&str>,
     system_as_of: Option<i64>,
 ) -> crate::Result<CsrIndex> {
     let records = edge_store.scan_all_edges_decoded(system_as_of)?;
+    let target_db = DatabaseId::new(database_id);
     let target_tid = TenantId::new(tid);
 
     let mut csr = CsrIndex::new();
 
     // Pass 1: intern endpoint nodes.
-    for (rec_tid, coll, src, label, dst, _props) in &records {
-        if *rec_tid != target_tid || coll != collection {
+    for (rec_db, rec_tid, coll, src, label, dst, _props) in &records {
+        if *rec_db != target_db || *rec_tid != target_tid || coll != collection {
             continue;
         }
         if edge_label.is_some_and(|el| label != el) {
@@ -109,8 +114,8 @@ pub(super) fn build_csr_for_collection(
     }
 
     // Pass 2: insert edges.
-    for (rec_tid, coll, src, label, dst, props) in &records {
-        if *rec_tid != target_tid || coll != collection {
+    for (rec_db, rec_tid, coll, src, label, dst, props) in &records {
+        if *rec_db != target_db || *rec_tid != target_tid || coll != collection {
             continue;
         }
         if edge_label.is_some_and(|el| label != el) {

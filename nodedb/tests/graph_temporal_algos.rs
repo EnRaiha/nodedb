@@ -11,6 +11,7 @@ use nodedb::engine::graph::olap::snapshot::CsrSnapshot;
 use nodedb_types::TenantId;
 
 const T: TenantId = TenantId::new(1);
+const DB: nodedb_types::DatabaseId = nodedb_types::DatabaseId::DEFAULT;
 const COLL: &str = "g";
 
 fn open_store() -> (EdgeStore, tempfile::TempDir) {
@@ -26,7 +27,7 @@ fn snapshot_topology_differs_across_ordinals() {
     // Ordinal 100: chain a → b → c
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
             b"",
             100,
             100,
@@ -35,7 +36,7 @@ fn snapshot_topology_differs_across_ordinals() {
         .unwrap();
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "b", "L", "c"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "b", "L", "c"),
             b"",
             101,
             101,
@@ -46,7 +47,7 @@ fn snapshot_topology_differs_across_ordinals() {
     // Ordinal 200: add d → a so there's a back-edge cycle candidate later
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "d", "L", "a"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "d", "L", "a"),
             b"",
             200,
             200,
@@ -55,17 +56,17 @@ fn snapshot_topology_differs_across_ordinals() {
         .unwrap();
 
     // Snapshot at 150 — only 2 edges, 3 nodes.
-    let snap_old = CsrSnapshot::from_edge_store_as_of(&store, T, Some(150)).unwrap();
+    let snap_old = CsrSnapshot::from_edge_store_as_of(&store, DB, T, Some(150)).unwrap();
     assert_eq!(snap_old.edge_count(), 2);
     assert_eq!(snap_old.node_count(), 3);
 
     // Snapshot at 250 — full 3 edges, 4 nodes.
-    let snap_new = CsrSnapshot::from_edge_store_as_of(&store, T, Some(250)).unwrap();
+    let snap_new = CsrSnapshot::from_edge_store_as_of(&store, DB, T, Some(250)).unwrap();
     assert_eq!(snap_new.edge_count(), 3);
     assert_eq!(snap_new.node_count(), 4);
 
     // Current-state snapshot matches the latest.
-    let snap_cur = CsrSnapshot::from_edge_store_as_of(&store, T, None).unwrap();
+    let snap_cur = CsrSnapshot::from_edge_store_as_of(&store, DB, T, None).unwrap();
     assert_eq!(snap_cur.edge_count(), 3);
     assert_eq!(snap_cur.node_count(), 4);
 }
@@ -76,7 +77,7 @@ fn snapshot_honors_tombstones_and_gdpr_erasure() {
 
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
             b"",
             10,
             10,
@@ -85,7 +86,7 @@ fn snapshot_honors_tombstones_and_gdpr_erasure() {
         .unwrap();
     store
         .put_edge_versioned(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "c"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "c"),
             b"",
             20,
             20,
@@ -94,23 +95,23 @@ fn snapshot_honors_tombstones_and_gdpr_erasure() {
         .unwrap();
     store
         .soft_delete_edge(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "b"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "b"),
             30,
         )
         .unwrap();
     store
         .gdpr_erase_edge(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "c"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "c"),
             40,
         )
         .unwrap();
 
     // At ordinal 25: both edges live.
-    let snap_mid = CsrSnapshot::from_edge_store_as_of(&store, T, Some(25)).unwrap();
+    let snap_mid = CsrSnapshot::from_edge_store_as_of(&store, DB, T, Some(25)).unwrap();
     assert_eq!(snap_mid.edge_count(), 2);
 
     // At ordinal 50: both gone (tombstoned + erased).
-    let snap_after = CsrSnapshot::from_edge_store_as_of(&store, T, Some(50)).unwrap();
+    let snap_after = CsrSnapshot::from_edge_store_as_of(&store, DB, T, Some(50)).unwrap();
     assert_eq!(snap_after.edge_count(), 0);
 }
 
@@ -123,7 +124,7 @@ fn pagerank_ranks_differ_across_temporal_rebuilds() {
         let ord = 100 + i as i64;
         store
             .put_edge_versioned(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, src, "L", "hub"),
+                nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, src, "L", "hub"),
                 b"",
                 ord,
                 ord,
@@ -135,25 +136,25 @@ fn pagerank_ranks_differ_across_temporal_rebuilds() {
     // Ordinal 200: topology flips — 'hub' now points outward; no inbound edges.
     store
         .soft_delete_edge(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "a", "L", "hub"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "a", "L", "hub"),
             200,
         )
         .unwrap();
     store
         .soft_delete_edge(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "b", "L", "hub"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "b", "L", "hub"),
             201,
         )
         .unwrap();
     store
         .soft_delete_edge(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "c", "L", "hub"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "c", "L", "hub"),
             202,
         )
         .unwrap();
     store
         .soft_delete_edge(
-            nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "d", "L", "hub"),
+            nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "d", "L", "hub"),
             203,
         )
         .unwrap();
@@ -161,7 +162,7 @@ fn pagerank_ranks_differ_across_temporal_rebuilds() {
         let ord = 210 + i as i64;
         store
             .put_edge_versioned(
-                nodedb::engine::graph::edge_store::EdgeRef::new(T, COLL, "hub", "L", dst),
+                nodedb::engine::graph::edge_store::EdgeRef::new(DB, T, COLL, "hub", "L", dst),
                 b"",
                 ord,
                 ord,
@@ -191,7 +192,7 @@ fn pagerank_ranks_differ_across_temporal_rebuilds() {
 
     // Old topology — 'hub' is a sink and should have the highest rank.
     let sharded_old = rebuild_sharded_from_store_as_of(&store, Some(150)).unwrap();
-    let csr_old = sharded_old.partition(T).expect("partition at 150");
+    let csr_old = sharded_old.partition(DB, T).expect("partition at 150");
     let old_ranks = ranks(pagerank::run(csr_old, &params));
     let old_hub_rank = *old_ranks.get("hub").expect("hub present in old");
     let old_a_rank = *old_ranks.get("a").expect("a present in old");
@@ -202,7 +203,7 @@ fn pagerank_ranks_differ_across_temporal_rebuilds() {
 
     // New topology — hub is a source, leaves a/b/c/d should now dominate.
     let sharded_new = rebuild_sharded_from_store_as_of(&store, Some(250)).unwrap();
-    let csr_new = sharded_new.partition(T).expect("partition at 250");
+    let csr_new = sharded_new.partition(DB, T).expect("partition at 250");
     let new_ranks = ranks(pagerank::run(csr_new, &params));
     let new_hub_rank = *new_ranks.get("hub").expect("hub present in new");
     let new_a_rank = *new_ranks.get("a").expect("a present in new");

@@ -238,6 +238,7 @@ pub(super) fn apply_fts(
 
 pub(super) fn apply_csr(
     core: &mut CoreLoop,
+    database_id: &nodedb_types::DatabaseId,
     tenant_id: &TenantId,
     collection_key: &str,
     bytes: Vec<u8>,
@@ -269,7 +270,8 @@ pub(super) fn apply_csr(
         rebuilt
     };
 
-    core.csr.install_partition(*tenant_id, rebuilt);
+    core.csr
+        .install_partition(*database_id, *tenant_id, rebuilt);
     info!(
         core = core.core_id,
         collection = %collection_key,

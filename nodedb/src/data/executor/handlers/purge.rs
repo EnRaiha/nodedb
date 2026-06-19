@@ -45,10 +45,11 @@ impl CoreLoop {
             }
         };
 
-        // 2. Graph engine: edges in redb.
+        // 2. Graph engine: edges in redb. DB-scoped — a tenant's graph in
+        // database A must not be purged by a purge in database B.
         let edges = match self
             .edge_store
-            .purge_tenant(crate::types::TenantId::new(tenant_id))
+            .purge_tenant(database_id, crate::types::TenantId::new(tenant_id))
         {
             Ok(n) => n,
             Err(e) => {
@@ -56,13 +57,17 @@ impl CoreLoop {
                 0
             }
         };
-        // CSR in-memory index: drop the tenant's partition outright. O(1)
-        // structural deletion — no key-prefix scan needed.
-        self.csr
-            .drop_partition(crate::types::TenantId::new(tenant_id));
-        // Deleted-nodes tracker: drop the whole tenant bucket.
-        self.deleted_nodes
-            .remove(&crate::types::TenantId::new(tenant_id));
+        // CSR in-memory index: drop the (database, tenant) partition outright.
+        // O(1) structural deletion — no key-prefix scan needed.
+        self.csr.drop_partition(
+            nodedb_types::DatabaseId::new(database_id),
+            crate::types::TenantId::new(tenant_id),
+        );
+        // Deleted-nodes tracker: drop the whole (database, tenant) bucket.
+        self.deleted_nodes.remove(&(
+            nodedb_types::DatabaseId::new(database_id),
+            crate::types::TenantId::new(tenant_id),
+        ));
 
         // 3. Inverted index (fulltext): postings + doc_lengths (persistent, redb).
         let inv = match self

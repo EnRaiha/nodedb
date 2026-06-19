@@ -2,7 +2,7 @@
 
 //! Versioned-key builders, parsers, sentinel constants, and `EdgeRef`.
 
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 
 /// Soft-delete marker.
 pub const TOMBSTONE_SENTINEL: &[u8] = &[0xFF];
@@ -14,10 +14,11 @@ pub const GDPR_ERASURE_SENTINEL: &[u8] = &[0xFE];
 /// Width of the zero-padded `system_from` ordinal suffix.
 pub const SYSTEM_TIME_WIDTH: usize = 20;
 
-/// Identifies a base edge: tenant + collection + `(src, label, dst)` triple.
-/// Borrowed so write paths don't allocate per edge.
+/// Identifies a base edge: database + tenant + collection + `(src, label, dst)`
+/// triple. Borrowed so write paths don't allocate per edge.
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeRef<'a> {
+    pub db: DatabaseId,
     pub tid: TenantId,
     pub collection: &'a str,
     pub src: &'a str,
@@ -27,6 +28,7 @@ pub struct EdgeRef<'a> {
 
 impl<'a> EdgeRef<'a> {
     pub const fn new(
+        db: DatabaseId,
         tid: TenantId,
         collection: &'a str,
         src: &'a str,
@@ -34,6 +36,7 @@ impl<'a> EdgeRef<'a> {
         dst: &'a str,
     ) -> Self {
         Self {
+            db,
             tid,
             collection,
             src,
@@ -46,6 +49,7 @@ impl<'a> EdgeRef<'a> {
     /// the reverse-index key shape.
     pub const fn reversed(self) -> Self {
         Self {
+            db: self.db,
             tid: self.tid,
             collection: self.collection,
             src: self.dst,
@@ -167,7 +171,7 @@ mod tests {
 
     #[test]
     fn edge_ref_reversed_swaps_src_dst() {
-        let e = EdgeRef::new(TenantId::new(1), "c", "a", "L", "b");
+        let e = EdgeRef::new(DatabaseId::DEFAULT, TenantId::new(1), "c", "a", "L", "b");
         let r = e.reversed();
         assert_eq!(r.src, "b");
         assert_eq!(r.dst, "a");

@@ -187,6 +187,7 @@ fn restore_edge_data(
 ) -> crate::Result<()> {
     for kv in edges {
         edge_store.put_edge_raw(
+            kv.database_id,
             nodedb_types::TenantId::new(kv.tenant_id),
             &kv.key,
             &kv.value,

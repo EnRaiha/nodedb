@@ -21,7 +21,7 @@ use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::EdgeStore;
 use nodedb_graph::LocalNodeId;
 use nodedb_graph::csr::weights::extract_weight_from_properties;
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 
 /// Immutable graph snapshot for analytical workloads.
 ///
@@ -84,6 +84,7 @@ impl CsrSnapshot {
     /// the caller materialized.
     pub fn from_edge_store_as_of(
         edge_store: &EdgeStore,
+        db: DatabaseId,
         tid: TenantId,
         system_as_of: Option<i64>,
     ) -> crate::Result<Self> {
@@ -92,8 +93,8 @@ impl CsrSnapshot {
 
         // First pass: intern every endpoint so isolated vertices still land
         // in the snapshot (CSR rebuild parity).
-        for (rec_tid, _coll, src, _label, dst, _props) in &records {
-            if *rec_tid != tid {
+        for (rec_db, rec_tid, _coll, src, _label, dst, _props) in &records {
+            if *rec_db != db || *rec_tid != tid {
                 continue;
             }
             csr.add_node(src).map_err(|e| crate::Error::Internal {
@@ -105,8 +106,8 @@ impl CsrSnapshot {
         }
 
         // Second pass: insert edges with weight extraction.
-        for (rec_tid, _coll, src, label, dst, props) in &records {
-            if *rec_tid != tid {
+        for (rec_db, rec_tid, _coll, src, label, dst, props) in &records {
+            if *rec_db != db || *rec_tid != tid {
                 continue;
             }
             let weight = extract_weight_from_properties(props);

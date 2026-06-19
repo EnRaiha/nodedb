@@ -53,7 +53,7 @@ impl CoreLoop {
         // 2. Graph edges: scan edge_store by tenant prefix.
         match self
             .edge_store
-            .scan_edges_for_tenant(crate::types::TenantId::new(tenant_id))
+            .scan_edges_for_tenant(database_id, crate::types::TenantId::new(tenant_id))
         {
             Ok(edges) => snapshot.edges = edges,
             Err(e) => warn!(tenant_id, error = %e, "snapshot: edge scan failed, skipping"),

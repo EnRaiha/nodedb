@@ -38,6 +38,7 @@ impl EdgeStore {
             edge.dst,
             system_as_of,
         )?;
+        let d = edge.db.as_u64();
         let t = edge.tid.as_u64();
 
         let read_txn = self
@@ -50,14 +51,14 @@ impl EdgeStore {
 
         // Inclusive upper — the exact key at system_as_of is a valid ceiling.
         let range = table
-            .range((t, prefix.as_str())..=(t, upper.as_str()))
+            .range((d, t, prefix.as_str())..=(d, t, upper.as_str()))
             .map_err(|e| redb_err("ceiling range", e))?;
 
         // Walk newest-first by reversing the iterator.
         for entry in range.rev() {
             let (k, v) = entry.map_err(|e| redb_err("ceiling iter", e))?;
-            let (kt, composite) = k.value();
-            if kt != t || !composite.starts_with(&prefix) {
+            let (kd, kt, composite) = k.value();
+            if kd != d || kt != t || !composite.starts_with(&prefix) {
                 break;
             }
             let bytes = v.value();

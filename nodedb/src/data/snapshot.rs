@@ -79,6 +79,7 @@ pub struct KvPair {
     zerompk::FromMessagePack,
 )]
 pub struct TenantKvPair {
+    pub database_id: u64,
     pub tenant_id: u64,
     pub key: String,
     pub value: Vec<u8>,
@@ -206,6 +207,7 @@ mod tests {
                 value: vec![],
             }],
             edges: vec![TenantKvPair {
+                database_id: 0,
                 tenant_id: 1,
                 key: "u1\0knows\0u2".into(),
                 value: b"{}".to_vec(),

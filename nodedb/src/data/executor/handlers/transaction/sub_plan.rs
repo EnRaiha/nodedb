@@ -203,6 +203,7 @@ impl CoreLoop {
                 let old_properties = self
                     .edge_store
                     .get_edge(
+                        dummy_task.request.database_id.as_u64(),
                         nodedb_types::TenantId::new(tid),
                         collection,
                         src_id,
@@ -248,6 +249,7 @@ impl CoreLoop {
                 let old_properties = self
                     .edge_store
                     .get_edge(
+                        dummy_task.request.database_id.as_u64(),
                         nodedb_types::TenantId::new(tid),
                         collection,
                         src_id,

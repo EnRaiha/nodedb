@@ -18,6 +18,7 @@ impl CoreLoop {
         frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     ) -> Response {
         debug!(core = self.core_id, tid, "graph match execution");
+        let database_id = task.request.database_id.as_u64();
 
         // Deserialize the MatchQuery from MessagePack.
         let query: MatchQuery = match zerompk::from_msgpack(query_bytes) {
@@ -36,7 +37,7 @@ impl CoreLoop {
         // Execute the pattern match on the caller's CSR partition +
         // EdgeStore. An absent partition means "this tenant has no
         // graph state" — return the empty row set rather than error.
-        let partition = match self.csr_partition(tid) {
+        let partition = match self.csr_partition(database_id, tid) {
             Some(p) => p,
             None => {
                 let payload = match crate::engine::graph::pattern::executor::rows_to_msgpack(&[]) {

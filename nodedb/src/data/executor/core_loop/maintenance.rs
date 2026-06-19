@@ -235,25 +235,29 @@ impl CoreLoop {
             return 0;
         }
         let mut removed = 0;
-        // Copy (tenant, node) pairs so we can mutate `self.csr` and
-        // `self.edge_store` without borrowing the map during
+        // Copy (database, tenant, node) tuples so we can mutate `self.csr`
+        // and `self.edge_store` without borrowing the map during
         // iteration.
-        let work: Vec<(crate::types::TenantId, String)> = self
+        let work: Vec<(nodedb_types::DatabaseId, crate::types::TenantId, String)> = self
             .deleted_nodes
             .iter()
-            .flat_map(|(tid, set)| set.iter().map(move |n| (*tid, n.clone())))
+            .flat_map(|((db, tid), set)| set.iter().map(move |n| (*db, *tid, n.clone())))
             .collect();
         let swept_nodes = work.len();
-        for (tid, node) in &work {
-            let edges = match self.csr.partition_mut(*tid) {
+        for (db, tid, node) in &work {
+            let edges = match self.csr.partition_mut(*db, *tid) {
                 Some(partition) => partition.remove_node_edges(node),
                 None => 0,
             };
             if edges > 0 {
                 let ord = self.hlc.next_ordinal();
-                if let Err(e) = self.edge_store.delete_edges_for_node(*tid, node, ord) {
+                if let Err(e) = self
+                    .edge_store
+                    .delete_edges_for_node(db.as_u64(), *tid, node, ord)
+                {
                     tracing::warn!(
                         core = self.core_id,
+                        db = db.as_u64(),
                         tid = tid.as_u64(),
                         node = %node,
                         error = %e,

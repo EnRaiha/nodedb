@@ -28,10 +28,11 @@ use nodedb::engine::graph::edge_store::temporal::EdgeRef;
 use nodedb_types::TenantId;
 
 const T: TenantId = TenantId::new(1);
+const DB: nodedb_types::DatabaseId = nodedb_types::DatabaseId::DEFAULT;
 const COLL: &str = "users";
 
 fn e<'a>(src: &'a str, label: &'a str, dst: &'a str) -> EdgeRef<'a> {
-    EdgeRef::new(T, COLL, src, label, dst)
+    EdgeRef::new(DB, T, COLL, src, label, dst)
 }
 
 /// Functional state snapshot at one system-time cutoff: outbound and
@@ -40,7 +41,7 @@ fn snapshot_at(store: &EdgeStore, nodes: &[&str], cutoff: i64) -> Vec<(String, S
     let mut out = Vec::new();
     for n in nodes {
         let outs = store
-            .neighbors_out_as_of(T, COLL, n, None, Some(cutoff), None)
+            .neighbors_out_as_of(0, T, COLL, n, None, Some(cutoff), None)
             .unwrap();
         for ed in outs {
             out.push((
@@ -50,7 +51,7 @@ fn snapshot_at(store: &EdgeStore, nodes: &[&str], cutoff: i64) -> Vec<(String, S
             ));
         }
         let ins = store
-            .neighbors_in_as_of(T, COLL, n, None, Some(cutoff), None)
+            .neighbors_in_as_of(0, T, COLL, n, None, Some(cutoff), None)
             .unwrap();
         for ed in ins {
             out.push((
@@ -125,7 +126,7 @@ fn ceiling_resolves_correctly_after_crash_mid_write() {
 
     // Reverse index symmetry survives reopen.
     let ins = store
-        .neighbors_in_as_of(T, COLL, "b", None, Some(1_000), None)
+        .neighbors_in_as_of(0, T, COLL, "b", None, Some(1_000), None)
         .unwrap();
     assert_eq!(ins.len(), 1, "v2 inbound to b survives reopen");
     assert_eq!(ins[0].properties, b"v2");

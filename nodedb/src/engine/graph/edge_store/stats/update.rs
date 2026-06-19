@@ -35,8 +35,10 @@ use super::table::{GRAPH_STATS, LabelRow, NodeRow, SummaryRow, label_key, node_k
 /// `node[dst].refcount` (bumping `summary.distinct_node_count` per new node).
 ///
 /// If a prior live version exists this is an update — counters are unchanged.
+#[allow(clippy::too_many_arguments)]
 pub fn increment_for_insert(
     write_txn: &WriteTransaction,
+    db: u64,
     tid: u64,
     collection: &str,
     label: &str,
@@ -46,6 +48,7 @@ pub fn increment_for_insert(
 ) -> crate::Result<()> {
     if prior_live_exists(
         write_txn,
+        db,
         tid,
         collection,
         src,
@@ -62,13 +65,13 @@ pub fn increment_for_insert(
 
     // --- summary row ---
     let skey = summary_key(collection);
-    let mut summary = read_summary(&stats, tid, &skey)?;
+    let mut summary = read_summary(&stats, db, tid, &skey)?;
 
     summary.edge_count = summary.edge_count.saturating_add(1);
 
     // --- label row ---
     let lkey = label_key(collection, label);
-    let lrow = read_label_opt(&stats, tid, &lkey)?;
+    let lrow = read_label_opt(&stats, db, tid, &lkey)?;
     let new_label_count = match lrow {
         None => {
             summary.distinct_label_count = summary.distinct_label_count.saturating_add(1);
@@ -78,7 +81,7 @@ pub fn increment_for_insert(
     };
     stats
         .insert(
-            (tid, lkey.as_str()),
+            (db, tid, lkey.as_str()),
             LabelRow {
                 count: new_label_count,
             }
@@ -88,14 +91,14 @@ pub fn increment_for_insert(
         .map_err(|e| redb_err("insert label row", e))?;
 
     // --- node rows (src and dst; handle self-loop: only one row) ---
-    increment_node(&mut stats, tid, collection, src, &mut summary)?;
+    increment_node(&mut stats, db, tid, collection, src, &mut summary)?;
     if src != dst {
-        increment_node(&mut stats, tid, collection, dst, &mut summary)?;
+        increment_node(&mut stats, db, tid, collection, dst, &mut summary)?;
     }
 
     // Write summary last so all increments are already done.
     stats
-        .insert((tid, skey.as_str()), summary.encode()?.as_slice())
+        .insert((db, tid, skey.as_str()), summary.encode()?.as_slice())
         .map_err(|e| redb_err("insert summary row", e))?;
 
     Ok(())
@@ -112,8 +115,10 @@ pub fn increment_for_insert(
 /// decrementing `summary.distinct_node_count` when refcount reaches zero).
 ///
 /// If there was no prior live version, this is a no-op for the counters.
+#[allow(clippy::too_many_arguments)]
 pub fn decrement_for_delete(
     write_txn: &WriteTransaction,
+    db: u64,
     tid: u64,
     collection: &str,
     label: &str,
@@ -123,6 +128,7 @@ pub fn decrement_for_delete(
 ) -> crate::Result<()> {
     if !prior_live_exists(
         write_txn,
+        db,
         tid,
         collection,
         src,
@@ -138,24 +144,24 @@ pub fn decrement_for_delete(
         .map_err(|e| redb_err("open graph_stats (decrement)", e))?;
 
     let skey = summary_key(collection);
-    let mut summary = read_summary(&stats, tid, &skey)?;
+    let mut summary = read_summary(&stats, db, tid, &skey)?;
 
     summary.edge_count = summary.edge_count.saturating_sub(1);
 
     // --- label row ---
     let lkey = label_key(collection, label);
-    let lrow = read_label_opt(&stats, tid, &lkey)?;
+    let lrow = read_label_opt(&stats, db, tid, &lkey)?;
     if let Some(r) = lrow {
         let new_count = r.count.saturating_sub(1);
         if new_count == 0 {
             stats
-                .remove((tid, lkey.as_str()))
+                .remove((db, tid, lkey.as_str()))
                 .map_err(|e| redb_err("remove label row", e))?;
             summary.distinct_label_count = summary.distinct_label_count.saturating_sub(1);
         } else {
             stats
                 .insert(
-                    (tid, lkey.as_str()),
+                    (db, tid, lkey.as_str()),
                     LabelRow { count: new_count }.encode()?.as_slice(),
                 )
                 .map_err(|e| redb_err("update label row", e))?;
@@ -163,13 +169,13 @@ pub fn decrement_for_delete(
     }
 
     // --- node rows ---
-    decrement_node(&mut stats, tid, collection, src, &mut summary)?;
+    decrement_node(&mut stats, db, tid, collection, src, &mut summary)?;
     if src != dst {
-        decrement_node(&mut stats, tid, collection, dst, &mut summary)?;
+        decrement_node(&mut stats, db, tid, collection, dst, &mut summary)?;
     }
 
     stats
-        .insert((tid, skey.as_str()), summary.encode()?.as_slice())
+        .insert((db, tid, skey.as_str()), summary.encode()?.as_slice())
         .map_err(|e| redb_err("update summary row", e))?;
 
     Ok(())
@@ -180,8 +186,10 @@ pub fn decrement_for_delete(
 /// Returns `true` when a live (non-sentinel) version of the base edge exists
 /// in EDGES at any `system_from` strictly less than `exclude_system_from`,
 /// using the same `WriteTransaction`'s consistent view.
+#[allow(clippy::too_many_arguments)]
 fn prior_live_exists(
     write_txn: &WriteTransaction,
+    db: u64,
     tid: u64,
     collection: &str,
     src: &str,
@@ -195,13 +203,13 @@ fn prior_live_exists(
         .map_err(|e| redb_err("open edges (prior_live probe)", e))?;
 
     let range = edges
-        .range((tid, prefix.as_str())..)
+        .range((db, tid, prefix.as_str())..)
         .map_err(|e| redb_err("prior_live range", e))?;
 
     for entry in range {
         let (k, v) = entry.map_err(|e| redb_err("prior_live iter", e))?;
-        let (kt, composite) = k.value();
-        if kt != tid || !composite.starts_with(&prefix) {
+        let (kd, kt, composite) = k.value();
+        if kd != db || kt != tid || !composite.starts_with(&prefix) {
             break;
         }
         let Some((_c, _s, _l, _d, sys)) = parse_versioned_edge_key(composite) else {
@@ -222,12 +230,13 @@ fn prior_live_exists(
 }
 
 fn read_summary(
-    stats: &redb::Table<'_, (u64, &str), &[u8]>,
+    stats: &redb::Table<'_, (u64, u64, &str), &[u8]>,
+    db: u64,
     tid: u64,
     skey: &str,
 ) -> crate::Result<SummaryRow> {
     match stats
-        .get((tid, skey))
+        .get((db, tid, skey))
         .map_err(|e| redb_err("read summary row", e))?
     {
         Some(g) => SummaryRow::decode(g.value()),
@@ -236,12 +245,13 @@ fn read_summary(
 }
 
 fn read_label_opt(
-    stats: &redb::Table<'_, (u64, &str), &[u8]>,
+    stats: &redb::Table<'_, (u64, u64, &str), &[u8]>,
+    db: u64,
     tid: u64,
     lkey: &str,
 ) -> crate::Result<Option<LabelRow>> {
     match stats
-        .get((tid, lkey))
+        .get((db, tid, lkey))
         .map_err(|e| redb_err("read label row", e))?
     {
         Some(g) => Ok(Some(LabelRow::decode(g.value())?)),
@@ -250,7 +260,8 @@ fn read_label_opt(
 }
 
 fn increment_node(
-    stats: &mut redb::Table<'_, (u64, &str), &[u8]>,
+    stats: &mut redb::Table<'_, (u64, u64, &str), &[u8]>,
+    db: u64,
     tid: u64,
     collection: &str,
     node_id: &str,
@@ -259,7 +270,7 @@ fn increment_node(
     let nkey = node_key(collection, node_id);
     let existing_bytes: Option<Vec<u8>> = {
         let guard = stats
-            .get((tid, nkey.as_str()))
+            .get((db, tid, nkey.as_str()))
             .map_err(|e| redb_err("read node row", e))?;
         guard.map(|g| g.value().to_vec())
     };
@@ -272,7 +283,7 @@ fn increment_node(
     };
     stats
         .insert(
-            (tid, nkey.as_str()),
+            (db, tid, nkey.as_str()),
             NodeRow {
                 refcount: new_refcount,
             }
@@ -284,7 +295,8 @@ fn increment_node(
 }
 
 fn decrement_node(
-    stats: &mut redb::Table<'_, (u64, &str), &[u8]>,
+    stats: &mut redb::Table<'_, (u64, u64, &str), &[u8]>,
+    db: u64,
     tid: u64,
     collection: &str,
     node_id: &str,
@@ -293,7 +305,7 @@ fn decrement_node(
     let nkey = node_key(collection, node_id);
     let existing_bytes: Option<Vec<u8>> = {
         let guard = stats
-            .get((tid, nkey.as_str()))
+            .get((db, tid, nkey.as_str()))
             .map_err(|e| redb_err("read node row", e))?;
         guard.map(|g| g.value().to_vec())
     };
@@ -301,13 +313,13 @@ fn decrement_node(
         let current = NodeRow::decode(&b)?.refcount;
         if current <= 1 {
             stats
-                .remove((tid, nkey.as_str()))
+                .remove((db, tid, nkey.as_str()))
                 .map_err(|e| redb_err("remove node row", e))?;
             summary.distinct_node_count = summary.distinct_node_count.saturating_sub(1);
         } else {
             stats
                 .insert(
-                    (tid, nkey.as_str()),
+                    (db, tid, nkey.as_str()),
                     NodeRow {
                         refcount: current - 1,
                     }
@@ -324,13 +336,14 @@ fn decrement_node(
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::TenantId;
+    use nodedb_types::{DatabaseId, TenantId};
 
     use crate::engine::graph::edge_store::EdgeStore;
     use crate::engine::graph::edge_store::stats::table::CollectionStats;
     use crate::engine::graph::edge_store::temporal::keys::versioned_edge_key;
     use crate::engine::graph::edge_store::temporal::payload::EdgeValuePayload;
 
+    const DB: DatabaseId = DatabaseId::DEFAULT;
     const T1: TenantId = TenantId::new(1);
     const T2: TenantId = TenantId::new(2);
     const COLL: &str = "people";
@@ -345,7 +358,7 @@ mod tests {
         store
             .put_edge_versioned(
                 crate::engine::graph::edge_store::temporal::keys::EdgeRef::new(
-                    T1, COLL, src, label, dst,
+                    DB, T1, COLL, src, label, dst,
                 ),
                 b"props",
                 sys,
@@ -359,7 +372,7 @@ mod tests {
         store
             .soft_delete_edge(
                 crate::engine::graph::edge_store::temporal::keys::EdgeRef::new(
-                    T1, COLL, src, label, dst,
+                    DB, T1, COLL, src, label, dst,
                 ),
                 sys,
             )
@@ -367,7 +380,7 @@ mod tests {
     }
 
     fn stats(store: &EdgeStore) -> CollectionStats {
-        store.collection_stats(T1, COLL, None).unwrap()
+        store.collection_stats(DB.as_u64(), T1, COLL, None).unwrap()
     }
 
     // 1. Single put → counters show 1 edge / 2 nodes / 1 label.
@@ -469,16 +482,16 @@ mod tests {
         let payload = EdgeValuePayload::new(0, i64::MAX, b"p".to_vec())
             .encode()
             .unwrap();
-        store.put_edge_raw(T1, &key, &payload).unwrap();
+        store.put_edge_raw(DB.as_u64(), T1, &key, &payload).unwrap();
 
         // First call: no summary row → triggers rebuild.
-        let s1 = store.collection_stats(T1, COLL, None).unwrap();
+        let s1 = store.collection_stats(DB.as_u64(), T1, COLL, None).unwrap();
         assert_eq!(s1.edge_count, 1);
         assert_eq!(s1.distinct_node_count, 2);
         assert_eq!(s1.distinct_label_count, 1);
 
         // Second call: reads from cached summary (still correct).
-        let s2 = store.collection_stats(T1, COLL, None).unwrap();
+        let s2 = store.collection_stats(DB.as_u64(), T1, COLL, None).unwrap();
         assert_eq!(s2, s1);
     }
 
@@ -489,7 +502,7 @@ mod tests {
         store
             .put_edge_versioned(
                 crate::engine::graph::edge_store::temporal::keys::EdgeRef::new(
-                    T1, COLL, "a", "L", "b",
+                    DB, T1, COLL, "a", "L", "b",
                 ),
                 b"t1",
                 100,
@@ -500,7 +513,7 @@ mod tests {
         store
             .put_edge_versioned(
                 crate::engine::graph::edge_store::temporal::keys::EdgeRef::new(
-                    T2, COLL, "x", "M", "y",
+                    DB, T2, COLL, "x", "M", "y",
                 ),
                 b"t2",
                 100,
@@ -509,8 +522,8 @@ mod tests {
             )
             .unwrap();
 
-        let s1 = store.collection_stats(T1, COLL, None).unwrap();
-        let s2 = store.collection_stats(T2, COLL, None).unwrap();
+        let s1 = store.collection_stats(DB.as_u64(), T1, COLL, None).unwrap();
+        let s2 = store.collection_stats(DB.as_u64(), T2, COLL, None).unwrap();
 
         assert_eq!(s1.edge_count, 1);
         assert_eq!(s1.labels, vec![("L".to_string(), 1)]);
@@ -526,7 +539,7 @@ mod tests {
         store
             .put_edge_versioned(
                 crate::engine::graph::edge_store::temporal::keys::EdgeRef::new(
-                    T1, "alpha", "a", "L", "b",
+                    DB, T1, "alpha", "a", "L", "b",
                 ),
                 b"p",
                 100,
@@ -537,7 +550,7 @@ mod tests {
         store
             .put_edge_versioned(
                 crate::engine::graph::edge_store::temporal::keys::EdgeRef::new(
-                    T1, "beta", "c", "L", "d",
+                    DB, T1, "beta", "c", "L", "d",
                 ),
                 b"p",
                 100,
@@ -546,7 +559,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut all = store.tenant_stats(T1, None).unwrap();
+        let mut all = store.tenant_stats(DB.as_u64(), T1, None).unwrap();
         all.sort_by(|a, b| a.collection.cmp(&b.collection));
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].collection, "alpha");

@@ -24,7 +24,8 @@ impl CoreLoop {
         let max_depth =
             max_depth.min(crate::engine::graph::traversal_options::MAX_GRAPH_TRAVERSAL_DEPTH);
         debug!(core = self.core_id, tid, %src, %dst, ?edge_label, max_depth, "graph path");
-        let path = match self.csr_partition(tid) {
+        let database_id = task.request.database_id.as_u64();
+        let path = match self.csr_partition(database_id, tid) {
             Some(partition) => partition.shortest_path(
                 src,
                 dst,
@@ -73,9 +74,10 @@ impl CoreLoop {
             depth,
             "graph subgraph"
         );
+        let database_id = task.request.database_id.as_u64();
         let depth = depth.min(crate::engine::graph::traversal_options::MAX_GRAPH_TRAVERSAL_DEPTH);
         let refs: Vec<&str> = start_nodes.iter().map(String::as_str).collect();
-        let edges: Vec<(String, String, String)> = match self.csr_partition(tid) {
+        let edges: Vec<(String, String, String)> = match self.csr_partition(database_id, tid) {
             Some(partition) => partition.subgraph(
                 &refs,
                 edge_label.as_deref(),

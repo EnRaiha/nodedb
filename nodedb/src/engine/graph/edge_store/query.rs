@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 
 use super::store::{Direction, Edge, EdgeStore, REVERSE_EDGES, redb_err};
 use super::temporal::{
@@ -8,10 +8,11 @@ use super::temporal::{
 };
 
 impl EdgeStore {
-    /// Outbound neighbors of a node within the caller's tenant and
+    /// Outbound neighbors of a node within the caller's database, tenant and
     /// collection, current-state only.
     pub fn neighbors_out(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         src: &str,
@@ -23,6 +24,7 @@ impl EdgeStore {
         };
 
         self.scan_edges_with_prefix(
+            db,
             tid,
             &prefix,
             |fwd_collection, fwd_src, fwd_label, fwd_dst| Edge {
@@ -42,6 +44,7 @@ impl EdgeStore {
     /// and drops bases whose latest reverse entry is a sentinel.
     pub fn neighbors_in(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         dst: &str,
@@ -69,12 +72,12 @@ impl EdgeStore {
         // logical base `(coll, src, label, dst)` i.e. after the swap.
         let mut latest: HashMap<(String, String, String), (i64, bool)> = HashMap::new();
         let range = table
-            .range((t, prefix.as_str())..)
+            .range((db, t, prefix.as_str())..)
             .map_err(|e| redb_err("range", e))?;
         for entry in range {
             let (key, val) = entry.map_err(|e| redb_err("iter", e))?;
-            let (kt, composite) = key.value();
-            if kt != t || !composite.starts_with(&prefix) {
+            let (kd, kt, composite) = key.value();
+            if kd != db || kt != t || !composite.starts_with(&prefix) {
                 break;
             }
             let Some((_coll, _rev_dst, rev_label, rev_src, sys)) =
@@ -103,7 +106,14 @@ impl EdgeStore {
                 continue;
             }
             let Some(props) = self.ceiling_resolve_edge(
-                EdgeRef::new(tid, collection, &src_id, &label, &dst_id),
+                EdgeRef::new(
+                    DatabaseId::new(db),
+                    tid,
+                    collection,
+                    &src_id,
+                    &label,
+                    &dst_id,
+                ),
                 i64::MAX,
                 None,
             )?
@@ -124,6 +134,7 @@ impl EdgeStore {
     /// All neighbors (both directions) within the caller's tenant and collection.
     pub fn neighbors(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         node: &str,
@@ -131,11 +142,11 @@ impl EdgeStore {
         direction: Direction,
     ) -> crate::Result<Vec<Edge>> {
         match direction {
-            Direction::Out => self.neighbors_out(tid, collection, node, label_filter),
-            Direction::In => self.neighbors_in(tid, collection, node, label_filter),
+            Direction::Out => self.neighbors_out(db, tid, collection, node, label_filter),
+            Direction::In => self.neighbors_in(db, tid, collection, node, label_filter),
             Direction::Both => {
-                let mut out = self.neighbors_out(tid, collection, node, label_filter)?;
-                let inbound = self.neighbors_in(tid, collection, node, label_filter)?;
+                let mut out = self.neighbors_out(db, tid, collection, node, label_filter)?;
+                let inbound = self.neighbors_in(db, tid, collection, node, label_filter)?;
                 out.extend(inbound);
                 Ok(out)
             }
@@ -145,25 +156,29 @@ impl EdgeStore {
     /// Count outbound edges from a source node (current-state).
     pub fn out_degree(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         src: &str,
         label_filter: Option<&str>,
     ) -> crate::Result<usize> {
         Ok(self
-            .neighbors_out(tid, collection, src, label_filter)?
+            .neighbors_out(db, tid, collection, src, label_filter)?
             .len())
     }
 
     /// Count inbound edges to a destination node (current-state).
     pub fn in_degree(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         dst: &str,
         label_filter: Option<&str>,
     ) -> crate::Result<usize> {
-        Ok(self.neighbors_in(tid, collection, dst, label_filter)?.len())
+        Ok(self
+            .neighbors_in(db, tid, collection, dst, label_filter)?
+            .len())
     }
 }
 

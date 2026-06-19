@@ -71,6 +71,10 @@ impl CoreLoop {
 
         let graph_path = data_dir.join(format!("graph/core-{core_id}.redb"));
         let edge_store = EdgeStore::open(&graph_path)?;
+        // Database-scoping migration: rewrite legacy un-scoped edge / reverse /
+        // stats rows into the database-scoped v2 tables under
+        // DatabaseId::DEFAULT. Idempotent and a no-op once migrated.
+        edge_store.migrate_edges_v2()?;
         let csr = crate::engine::graph::csr::rebuild::rebuild_sharded_from_store(&edge_store)?;
 
         // Inverted index shares the sparse engine's redb database.

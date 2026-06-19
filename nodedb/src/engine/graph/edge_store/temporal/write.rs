@@ -31,6 +31,7 @@ impl EdgeStore {
         let rev = versioned_edge_key(edge.collection, edge.dst, edge.label, edge.src, system_from)?;
         let payload =
             EdgeValuePayload::new(valid_from_ms, valid_until_ms, properties.to_vec()).encode()?;
+        let d = edge.db.as_u64();
         let t = edge.tid.as_u64();
 
         let write_txn = self
@@ -42,7 +43,7 @@ impl EdgeStore {
                 .open_table(EDGES)
                 .map_err(|e| redb_err("open edges", e))?;
             edges
-                .insert((t, fwd.as_str()), payload.as_slice())
+                .insert((d, t, fwd.as_str()), payload.as_slice())
                 .map_err(|e| redb_err("insert versioned edge", e))?;
             drop(edges);
 
@@ -50,12 +51,13 @@ impl EdgeStore {
                 .open_table(REVERSE_EDGES)
                 .map_err(|e| redb_err("open reverse", e))?;
             rev_t
-                .insert((t, rev.as_str()), &[] as &[u8])
+                .insert((d, t, rev.as_str()), &[] as &[u8])
                 .map_err(|e| redb_err("insert reverse", e))?;
             drop(rev_t);
 
             increment_for_insert(
                 &write_txn,
+                d,
                 t,
                 edge.collection,
                 edge.label,
@@ -85,6 +87,7 @@ impl EdgeStore {
         let prefix = edge_version_prefix(edge.collection, edge.src, edge.label, edge.dst);
         let upper =
             versioned_edge_key(edge.collection, edge.src, edge.label, edge.dst, system_from)?;
+        let d = edge.db.as_u64();
         let t = edge.tid.as_u64();
 
         let prior = {
@@ -96,13 +99,13 @@ impl EdgeStore {
                 .open_table(EDGES)
                 .map_err(|e| redb_err("open edges", e))?;
             let range = table
-                .range((t, prefix.as_str())..=(t, upper.as_str()))
+                .range((d, t, prefix.as_str())..=(d, t, upper.as_str()))
                 .map_err(|e| redb_err("close referrer range", e))?;
             let mut found: Option<EdgeValuePayload> = None;
             for entry in range.rev() {
                 let (k, v) = entry.map_err(|e| redb_err("close referrer iter", e))?;
-                let (kt, composite) = k.value();
-                if kt != t || !composite.starts_with(&prefix) {
+                let (kd, kt, composite) = k.value();
+                if kd != d || kt != t || !composite.starts_with(&prefix) {
                     break;
                 }
                 let bytes = v.value();
@@ -154,6 +157,7 @@ impl EdgeStore {
         );
         let fwd = versioned_edge_key(edge.collection, edge.src, edge.label, edge.dst, system_from)?;
         let rev = versioned_edge_key(edge.collection, edge.dst, edge.label, edge.src, system_from)?;
+        let d = edge.db.as_u64();
         let t = edge.tid.as_u64();
 
         let write_txn = self
@@ -165,7 +169,7 @@ impl EdgeStore {
                 .open_table(EDGES)
                 .map_err(|e| redb_err("open edges", e))?;
             edges
-                .insert((t, fwd.as_str()), sentinel)
+                .insert((d, t, fwd.as_str()), sentinel)
                 .map_err(|e| redb_err("insert sentinel edge", e))?;
             drop(edges);
 
@@ -173,12 +177,13 @@ impl EdgeStore {
                 .open_table(REVERSE_EDGES)
                 .map_err(|e| redb_err("open reverse", e))?;
             rev_t
-                .insert((t, rev.as_str()), sentinel)
+                .insert((d, t, rev.as_str()), sentinel)
                 .map_err(|e| redb_err("insert sentinel reverse", e))?;
             drop(rev_t);
 
             decrement_for_delete(
                 &write_txn,
+                d,
                 t,
                 edge.collection,
                 edge.label,

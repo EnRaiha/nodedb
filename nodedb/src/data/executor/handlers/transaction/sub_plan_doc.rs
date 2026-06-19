@@ -217,10 +217,13 @@ impl CoreLoop {
                 let _ =
                     self.sparse
                         .delete_indexes_for_document(database_id, tid, collection, row_key);
-                let edges_removed = self.csr_partition_mut(tid).remove_node_edges(row_key);
+                let edges_removed = self
+                    .csr_partition_mut(database_id, tid)
+                    .remove_node_edges(row_key);
                 if edges_removed > 0 {
                     let cascade_ord = self.hlc.next_ordinal();
                     let _ = self.edge_store.delete_edges_for_node(
+                        database_id,
                         nodedb_types::TenantId::new(tid),
                         row_key,
                         cascade_ord,

@@ -30,6 +30,7 @@ fn graph_system_as_of(
 impl CoreLoop {
     pub(super) fn dispatch_graph(&mut self, task: &ExecutionTask, op: &GraphOp) -> Response {
         let tid = task.request.tenant_id.as_u64();
+        let database_id = task.request.database_id.as_u64();
         // Pressure guard for write operations.
         let is_write = matches!(
             op,
@@ -201,7 +202,7 @@ impl CoreLoop {
             } => self.execute_graph_match(task, tid, query, frontier_bitmap.as_ref()),
 
             GraphOp::SetNodeLabels { node_id, labels } => {
-                let partition = self.csr_partition_mut(tid);
+                let partition = self.csr_partition_mut(database_id, tid);
                 for label in labels {
                     if let Err(e) = partition.add_node_label(node_id, label) {
                         return self.response_error(
@@ -216,7 +217,7 @@ impl CoreLoop {
             }
 
             GraphOp::RemoveNodeLabels { node_id, labels } => {
-                let partition = self.csr_partition_mut(tid);
+                let partition = self.csr_partition_mut(database_id, tid);
                 for label in labels {
                     partition.remove_node_label(node_id, label);
                 }

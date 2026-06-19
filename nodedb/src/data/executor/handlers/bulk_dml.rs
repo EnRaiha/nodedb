@@ -348,6 +348,7 @@ impl CoreLoop {
         ollp_predicted_surrogates: Option<&[u32]>,
     ) -> Response {
         debug!(core = self.core_id, %collection, has_returning = returning.is_some(), "bulk delete");
+        let database_id = task.request.database_id.as_u64();
 
         // Empty `filter_bytes` means "no WHERE clause" — match every row.
         let filters: Vec<ScanFilter> = if filter_bytes.is_empty() {
@@ -452,10 +453,13 @@ impl CoreLoop {
                     warn!(core = self.core_id, %collection, %doc_id, error = %e, "bulk delete: secondary index cascade failed");
                 }
                 // Cascade: graph edges.
-                let edges_removed = self.csr_partition_mut(tid).remove_node_edges(doc_id);
+                let edges_removed = self
+                    .csr_partition_mut(database_id, tid)
+                    .remove_node_edges(doc_id);
                 let cascade_ord = self.hlc.next_ordinal();
                 if edges_removed > 0
                     && let Err(e) = self.edge_store.delete_edges_for_node(
+                        database_id,
                         nodedb_types::TenantId::new(tid),
                         doc_id,
                         cascade_ord,
@@ -463,7 +467,7 @@ impl CoreLoop {
                 {
                     warn!(core = self.core_id, %doc_id, error = %e, "bulk delete: edge cascade failed");
                 }
-                self.mark_node_deleted(tid, doc_id);
+                self.mark_node_deleted(database_id, tid, doc_id);
                 self.doc_cache.invalidate(
                     task.request.database_id.as_u64(),
                     tid,

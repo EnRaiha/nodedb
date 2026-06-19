@@ -4,7 +4,7 @@
 
 #![cfg(test)]
 
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 
 use super::{
     EdgeRef, EdgeValuePayload, GDPR_ERASURE_SENTINEL, TOMBSTONE_SENTINEL, versioned_edge_key,
@@ -13,6 +13,7 @@ use crate::engine::graph::edge_store::EdgeStore;
 use crate::engine::graph::edge_store::store::{EDGES, REVERSE_EDGES};
 
 const T: TenantId = TenantId::new(1);
+const DB: DatabaseId = DatabaseId::DEFAULT;
 const COLL: &str = "people";
 
 fn make_store() -> (EdgeStore, tempfile::TempDir) {
@@ -22,7 +23,7 @@ fn make_store() -> (EdgeStore, tempfile::TempDir) {
 }
 
 fn e<'a>(src: &'a str, label: &'a str, dst: &'a str) -> EdgeRef<'a> {
-    EdgeRef::new(T, COLL, src, label, dst)
+    EdgeRef::new(DB, T, COLL, src, label, dst)
 }
 
 #[test]
@@ -117,7 +118,10 @@ fn gdpr_erase_distinct_from_tombstone_but_both_hide() {
     let key = versioned_edge_key(COLL, "a", "L", "b", 200).unwrap();
     let txn = store.db.begin_read().unwrap();
     let table = txn.open_table(EDGES).unwrap();
-    let val = table.get((T.as_u64(), key.as_str())).unwrap().unwrap();
+    let val = table
+        .get((DB.as_u64(), T.as_u64(), key.as_str()))
+        .unwrap()
+        .unwrap();
     assert_eq!(val.value(), GDPR_ERASURE_SENTINEL);
     assert_ne!(val.value(), TOMBSTONE_SENTINEL);
 }
@@ -164,7 +168,10 @@ fn reverse_index_is_versioned_symmetrically() {
     let rev_key = versioned_edge_key(COLL, "b", "L", "a", 100).unwrap();
     let txn = store.db.begin_read().unwrap();
     let table = txn.open_table(REVERSE_EDGES).unwrap();
-    let val = table.get((T.as_u64(), rev_key.as_str())).unwrap().unwrap();
+    let val = table
+        .get((DB.as_u64(), T.as_u64(), rev_key.as_str()))
+        .unwrap()
+        .unwrap();
     assert!(val.value().is_empty());
 
     // Payload encoding check.

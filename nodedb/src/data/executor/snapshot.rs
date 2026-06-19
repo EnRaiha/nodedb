@@ -30,7 +30,8 @@ impl CoreLoop {
             .edge_store
             .export_edges()?
             .into_iter()
-            .map(|(tid, k, v)| TenantKvPair {
+            .map(|(db, tid, k, v)| TenantKvPair {
+                database_id: db.as_u64(),
                 tenant_id: tid.as_u64(),
                 key: k,
                 value: v,

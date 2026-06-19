@@ -14,6 +14,7 @@ use nodedb::engine::graph::edge_store::{Direction, EdgeRef, EdgeStore};
 use nodedb_types::{TenantId, ms_to_ordinal_upper};
 
 const T: TenantId = TenantId::new(1);
+const DB: nodedb_types::DatabaseId = nodedb_types::DatabaseId::DEFAULT;
 const COLL: &str = "people";
 
 fn open_store() -> (EdgeStore, tempfile::TempDir) {
@@ -29,7 +30,7 @@ fn put(store: &EdgeStore, src: &str, label: &str, dst: &str, ms: i64) {
     let ord = ms * 1_000_000; // ms → ns, matches HLC ordinal granularity
     store
         .put_edge_versioned(
-            EdgeRef::new(T, COLL, src, label, dst),
+            EdgeRef::new(DB, T, COLL, src, label, dst),
             b"v",
             ord,
             ord,
@@ -46,10 +47,10 @@ fn neighbors_out_as_of_none_matches_current_state() {
     put(&store, "alice", "KNOWS", "carol", 200);
 
     let current = store
-        .neighbors_out(T, COLL, "alice", Some("KNOWS"))
+        .neighbors_out(0, T, COLL, "alice", Some("KNOWS"))
         .unwrap();
     let temporal_none = store
-        .neighbors_out_as_of(T, COLL, "alice", Some("KNOWS"), None, None)
+        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), None, None)
         .unwrap();
 
     assert_eq!(current.len(), 2);
@@ -69,10 +70,10 @@ fn neighbors_out_as_of_honors_system_cutoff() {
     put(&store, "alice", "KNOWS", "carol", 200);
 
     let at_150 = store
-        .neighbors_out_as_of(T, COLL, "alice", Some("KNOWS"), Some(150), None)
+        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(150), None)
         .unwrap();
     let at_250 = store
-        .neighbors_out_as_of(T, COLL, "alice", Some("KNOWS"), Some(250), None)
+        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(250), None)
         .unwrap();
 
     let dsts_150: Vec<_> = at_150.iter().map(|e| e.dst_id.as_str()).collect();
@@ -88,16 +89,16 @@ fn neighbors_out_as_of_respects_tombstone_at_cutoff() {
     put(&store, "alice", "KNOWS", "bob", 100);
     store
         .soft_delete_edge(
-            EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+            EdgeRef::new(DB, T, COLL, "alice", "KNOWS", "bob"),
             300 * 1_000_000,
         )
         .unwrap();
 
     let before = store
-        .neighbors_out_as_of(T, COLL, "alice", Some("KNOWS"), Some(200), None)
+        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(200), None)
         .unwrap();
     let after = store
-        .neighbors_out_as_of(T, COLL, "alice", Some("KNOWS"), Some(400), None)
+        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(400), None)
         .unwrap();
 
     assert_eq!(before.len(), 1);
@@ -112,7 +113,7 @@ fn neighbors_out_as_of_applies_valid_time_predicate() {
     // v1: valid [0, 100)
     store
         .put_edge_versioned(
-            EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+            EdgeRef::new(DB, T, COLL, "alice", "KNOWS", "bob"),
             b"v1",
             10,
             0,
@@ -122,7 +123,7 @@ fn neighbors_out_as_of_applies_valid_time_predicate() {
     // v2: valid [200, 300)
     store
         .put_edge_versioned(
-            EdgeRef::new(T, COLL, "alice", "KNOWS", "bob"),
+            EdgeRef::new(DB, T, COLL, "alice", "KNOWS", "bob"),
             b"v2",
             20,
             200,
@@ -132,16 +133,16 @@ fn neighbors_out_as_of_applies_valid_time_predicate() {
 
     // No version is valid at t=150 — hole in the valid-time coverage.
     let at_150 = store
-        .neighbors_out_as_of(T, COLL, "alice", Some("KNOWS"), Some(10_000), Some(150))
+        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(10_000), Some(150))
         .unwrap();
     assert!(at_150.is_empty(), "expected empty, got {at_150:?}");
 
     // Valid-time 50 matches v1; 250 matches v2.
     let at_50 = store
-        .neighbors_out_as_of(T, COLL, "alice", Some("KNOWS"), Some(10_000), Some(50))
+        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(10_000), Some(50))
         .unwrap();
     let at_250 = store
-        .neighbors_out_as_of(T, COLL, "alice", Some("KNOWS"), Some(10_000), Some(250))
+        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(10_000), Some(250))
         .unwrap();
     assert_eq!(at_50.len(), 1);
     assert_eq!(at_250.len(), 1);
@@ -155,10 +156,10 @@ fn neighbors_in_as_of_honors_system_cutoff() {
     put(&store, "carol", "KNOWS", "bob", 200);
 
     let at_150 = store
-        .neighbors_in_as_of(T, COLL, "bob", Some("KNOWS"), Some(150), None)
+        .neighbors_in_as_of(0, T, COLL, "bob", Some("KNOWS"), Some(150), None)
         .unwrap();
     let at_250 = store
-        .neighbors_in_as_of(T, COLL, "bob", Some("KNOWS"), Some(250), None)
+        .neighbors_in_as_of(0, T, COLL, "bob", Some("KNOWS"), Some(250), None)
         .unwrap();
 
     let srcs_150: Vec<_> = at_150.iter().map(|e| e.src_id.as_str()).collect();
@@ -181,8 +182,8 @@ fn temporal_algorithm_rebuild_matches_expected_topology_at_cutoff() {
     let at_150 = rebuild_sharded_from_store_as_of(&store, Some(ms_to_ordinal_upper(150))).unwrap();
     let at_250 = rebuild_sharded_from_store_as_of(&store, Some(ms_to_ordinal_upper(250))).unwrap();
 
-    let p150 = at_150.partition(T).unwrap();
-    let p250 = at_250.partition(T).unwrap();
+    let p150 = at_150.partition(DB, T).unwrap();
+    let p250 = at_250.partition(DB, T).unwrap();
 
     // At ms=150 only the first edge is visible.
     assert_eq!(p150.edge_count(), 1, "at 150ms expected 1 edge");
@@ -205,20 +206,20 @@ fn temporal_algorithm_direction_matters_across_cutoffs() {
 
     // Verify direction of the 1-hop neighbor set.
     let src_out_150 = store
-        .neighbors_out_as_of(T, COLL, "source", Some("R"), Some(150), None)
+        .neighbors_out_as_of(0, T, COLL, "source", Some("R"), Some(150), None)
         .unwrap();
     let src_out_400 = store
-        .neighbors_out_as_of(T, COLL, "source", Some("R"), Some(400), None)
+        .neighbors_out_as_of(0, T, COLL, "source", Some("R"), Some(400), None)
         .unwrap();
     let sink_out_400 = store
-        .neighbors_out_as_of(T, COLL, "sink", Some("R"), Some(400), None)
+        .neighbors_out_as_of(0, T, COLL, "sink", Some("R"), Some(400), None)
         .unwrap();
 
     assert_eq!(src_out_150.len(), 1);
     assert_eq!(src_out_400.len(), 1);
     assert_eq!(sink_out_400.len(), 1);
-    assert_eq!(at_150.partition(T).unwrap().edge_count(), 1);
-    assert_eq!(at_400.partition(T).unwrap().edge_count(), 2);
+    assert_eq!(at_150.partition(DB, T).unwrap().edge_count(), 1);
+    assert_eq!(at_400.partition(DB, T).unwrap().edge_count(), 2);
     let direction = Direction::Out;
     let _ = direction; // silence unused-import on this lightweight test
 }

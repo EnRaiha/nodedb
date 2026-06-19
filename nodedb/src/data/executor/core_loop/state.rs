@@ -137,7 +137,7 @@ pub struct CoreLoop {
     /// scoped-string tracker; it's now structurally tenant-partitioned
     /// like every other graph concern.
     pub(in crate::data::executor) deleted_nodes:
-        HashMap<TenantId, std::collections::HashSet<String>>,
+        HashMap<(nodedb_types::DatabaseId, TenantId), std::collections::HashSet<String>>,
 
     /// Idempotency key deduplication: maps processed idempotency keys to
     /// whether they succeeded (true) or failed (false). Uses `VecDeque`

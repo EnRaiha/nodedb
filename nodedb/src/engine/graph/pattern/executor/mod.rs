@@ -370,14 +370,15 @@ mod tests {
         let store = EdgeStore::open(&dir.path().join("graph.redb")).unwrap();
 
         use crate::engine::graph::edge_store::EdgeRef;
-        use nodedb_types::TenantId;
+        use nodedb_types::{DatabaseId, TenantId};
+        const DB: DatabaseId = DatabaseId::DEFAULT;
         const T: TenantId = TenantId::new(1);
         let mut ord = 0i64;
         let mut put = |src: &str, label: &str, dst: &str| {
             ord += 1;
             store
                 .put_edge_versioned(
-                    EdgeRef::new(T, "col", src, label, dst),
+                    EdgeRef::new(DB, T, "col", src, label, dst),
                     b"",
                     ord,
                     ord,

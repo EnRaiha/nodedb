@@ -45,7 +45,14 @@ fn edge_store_end_to_end_purge() {
     let dir = tempfile::tempdir().unwrap();
     let store = EdgeStore::open(&dir.path().join("g.redb")).unwrap();
     let tid = TenantId::new(1);
-    let edge = EdgeRef::new(tid, "friends", "alice", "KNOWS", "bob");
+    let edge = EdgeRef::new(
+        nodedb_types::DatabaseId::DEFAULT,
+        tid,
+        "friends",
+        "alice",
+        "KNOWS",
+        "bob",
+    );
 
     // Three system-time versions (ordinals derived from ms so the
     // purge's ms→ordinal conversion lines up with the stored keys).
@@ -58,13 +65,13 @@ fn edge_store_end_to_end_purge() {
 
     // Cutoff 150 ms: only v@100 is both < cutoff AND superseded.
     let purged = store
-        .purge_superseded_versions(tid, "friends", /* cutoff_system_ms */ 150)
+        .purge_superseded_versions(0, tid, "friends", /* cutoff_system_ms */ 150)
         .unwrap();
     assert_eq!(purged, 1, "only v@100 is both below cutoff and superseded");
 
     // Idempotent.
     let purged2 = store
-        .purge_superseded_versions(tid, "friends", 150)
+        .purge_superseded_versions(0, tid, "friends", 150)
         .unwrap();
     assert_eq!(purged2, 0);
 }

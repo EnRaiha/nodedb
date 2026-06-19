@@ -163,7 +163,7 @@ impl CoreLoop {
                             apply_hnsw(self, &database_id, &tenant_id, &collection_key, bytes);
                         }
                         RebuildOutput::Csr { bytes } => {
-                            apply_csr(self, &tenant_id, &collection_key, bytes);
+                            apply_csr(self, &database_id, &tenant_id, &collection_key, bytes);
                         }
                         RebuildOutput::Fts(rebuild) => {
                             apply_fts(self, &tenant_id, &collection_key, rebuild);
@@ -390,7 +390,7 @@ impl CoreLoop {
         collection_key: &str,
     ) -> crate::Result<()> {
         let database_id = task.request.database_id;
-        let partition = match self.csr.partition(tenant_id) {
+        let partition = match self.csr.partition(database_id, tenant_id) {
             Some(p) => p,
             None => return Ok(()), // nothing to rebuild
         };

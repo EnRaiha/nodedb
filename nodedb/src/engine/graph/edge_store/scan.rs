@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 use redb::ReadableTable;
 
 use super::store::{
@@ -17,7 +17,11 @@ use super::temporal::{
 impl EdgeStore {
     /// Scan every raw forward record belonging to a tenant
     /// (versioned composite key + raw value bytes). Used by snapshot export.
-    pub fn scan_edges_for_tenant(&self, tid: TenantId) -> crate::Result<Vec<(String, Vec<u8>)>> {
+    pub fn scan_edges_for_tenant(
+        &self,
+        db: u64,
+        tid: TenantId,
+    ) -> crate::Result<Vec<(String, Vec<u8>)>> {
         let t = tid.as_u64();
         let read_txn = self
             .db
@@ -29,11 +33,11 @@ impl EdgeStore {
 
         let mut results = Vec::new();
         let range = table
-            .range((t, "")..(t + 1, ""))
+            .range((db, t, "")..(db, t + 1, ""))
             .map_err(|e| redb_err("edge range", e))?;
         for entry in range {
             let entry = entry.map_err(|e| redb_err("edge entry", e))?;
-            results.push((entry.0.value().1.to_string(), entry.1.value().to_vec()));
+            results.push((entry.0.value().2.to_string(), entry.1.value().to_vec()));
         }
         Ok(results)
     }
@@ -61,7 +65,7 @@ impl EdgeStore {
 
         for entry in table.iter().map_err(|e| redb_err("iter", e))? {
             let (k, v) = entry.map_err(|e| redb_err("iter entry", e))?;
-            let (t, composite) = k.value();
+            let (db, t, composite) = k.value();
             let Some((coll, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
                 continue;
             };
@@ -69,6 +73,7 @@ impl EdgeStore {
                 continue;
             }
             let base: TenantBaseKey = (
+                db,
                 t,
                 coll.to_string(),
                 src.to_string(),
@@ -101,8 +106,16 @@ impl EdgeStore {
         }
 
         let mut out = Vec::with_capacity(latest.len());
-        for ((t, coll, src, label, dst), (_sys, props)) in latest {
-            out.push((TenantId::new(t), coll, src, label, dst, props));
+        for ((db, t, coll, src, label, dst), (_sys, props)) in latest {
+            out.push((
+                DatabaseId::new(db),
+                TenantId::new(t),
+                coll,
+                src,
+                label,
+                dst,
+                props,
+            ));
         }
         Ok(out)
     }
@@ -114,6 +127,7 @@ impl EdgeStore {
     /// Reverse-index mirror is maintained with the same suffix.
     pub fn put_edge_raw(
         &self,
+        db: u64,
         tid: TenantId,
         composite_key: &str,
         value: &[u8],
@@ -135,13 +149,13 @@ impl EdgeStore {
                 .open_table(EDGES)
                 .map_err(|e| redb_err("open edges", e))?;
             edges
-                .insert((t, composite_key), value)
+                .insert((db, t, composite_key), value)
                 .map_err(|e| redb_err("insert edge", e))?;
             let mut rev_t = write_txn
                 .open_table(REVERSE_EDGES)
                 .map_err(|e| redb_err("open reverse", e))?;
             rev_t
-                .insert((t, rev_key.as_str()), rev_value)
+                .insert((db, t, rev_key.as_str()), rev_value)
                 .map_err(|e| redb_err("insert reverse", e))?;
         }
         write_txn.commit().map_err(|e| redb_err("commit edge", e))?;
@@ -151,6 +165,7 @@ impl EdgeStore {
     /// Get an edge's current-state properties. `None` if no live version.
     pub fn get_edge(
         &self,
+        db: u64,
         tid: TenantId,
         collection: &str,
         src: &str,
@@ -158,7 +173,7 @@ impl EdgeStore {
         dst: &str,
     ) -> crate::Result<Option<Vec<u8>>> {
         self.ceiling_resolve_edge(
-            EdgeRef::new(tid, collection, src, label, dst),
+            EdgeRef::new(DatabaseId::new(db), tid, collection, src, label, dst),
             i64::MAX,
             None,
         )
@@ -169,6 +184,7 @@ impl EdgeStore {
     /// a live latest version. Used by `neighbors_out` and friends.
     pub(super) fn scan_edges_with_prefix<F>(
         &self,
+        db: u64,
         tid: TenantId,
         prefix: &str,
         mut make_edge: F,
@@ -188,13 +204,13 @@ impl EdgeStore {
         let mut latest: HashMap<BaseKey, (i64, Vec<u8>)> = HashMap::new();
 
         let range = table
-            .range((t, prefix)..)
+            .range((db, t, prefix)..)
             .map_err(|e| redb_err("range", e))?;
 
         for entry in range {
             let (key, val) = entry.map_err(|e| redb_err("iter", e))?;
-            let (kt, composite) = key.value();
-            if kt != t || !composite.starts_with(prefix) {
+            let (kd, kt, composite) = key.value();
+            if kd != db || kt != t || !composite.starts_with(prefix) {
                 break;
             }
             let Some((coll, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
@@ -241,6 +257,8 @@ mod tests {
     use nodedb_types::OrdinalClock;
 
     const T: TenantId = TenantId::new(1);
+    const DB: DatabaseId = DatabaseId::DEFAULT;
+    const D: u64 = 0;
     const COLL: &str = "people";
 
     fn make_store() -> (EdgeStore, tempfile::TempDir) {
@@ -250,7 +268,7 @@ mod tests {
     }
 
     fn e<'a>(src: &'a str, label: &'a str, dst: &'a str) -> EdgeRef<'a> {
-        EdgeRef::new(T, COLL, src, label, dst)
+        EdgeRef::new(DB, T, COLL, src, label, dst)
     }
 
     fn put(store: &EdgeStore, clock: &OrdinalClock, src: &str, label: &str, dst: &str, p: &[u8]) {
@@ -271,14 +289,14 @@ mod tests {
         let clock = OrdinalClock::new();
         put(&store, &clock, "alice", "KNOWS", "bob", b"props");
 
-        let result = store.get_edge(T, COLL, "alice", "KNOWS", "bob").unwrap();
+        let result = store.get_edge(D, T, COLL, "alice", "KNOWS", "bob").unwrap();
         assert_eq!(result, Some(b"props".to_vec()));
     }
 
     #[test]
     fn get_nonexistent_edge_returns_none() {
         let (store, _dir) = make_store();
-        let result = store.get_edge(T, COLL, "alice", "KNOWS", "bob").unwrap();
+        let result = store.get_edge(D, T, COLL, "alice", "KNOWS", "bob").unwrap();
         assert!(result.is_none());
     }
 
@@ -290,7 +308,7 @@ mod tests {
         soft_delete(&store, &clock, "alice", "KNOWS", "bob");
         assert!(
             store
-                .get_edge(T, COLL, "alice", "KNOWS", "bob")
+                .get_edge(D, T, COLL, "alice", "KNOWS", "bob")
                 .unwrap()
                 .is_none()
         );
@@ -304,7 +322,7 @@ mod tests {
         soft_delete(&store, &clock, "alice", "KNOWS", "bob");
         put(&store, &clock, "alice", "KNOWS", "bob", b"v2");
         assert_eq!(
-            store.get_edge(T, COLL, "alice", "KNOWS", "bob").unwrap(),
+            store.get_edge(D, T, COLL, "alice", "KNOWS", "bob").unwrap(),
             Some(b"v2".to_vec())
         );
     }
@@ -319,7 +337,7 @@ mod tests {
         soft_delete(&store, &clock, "a", "L", "c");
 
         let edges = store
-            .scan_edges_with_prefix(T, &format!("{COLL}\x00a\x00L\x00"), |c, s, l, d| Edge {
+            .scan_edges_with_prefix(D, T, &format!("{COLL}\x00a\x00L\x00"), |c, s, l, d| Edge {
                 collection: c.to_string(),
                 src_id: s.to_string(),
                 label: l.to_string(),
@@ -343,7 +361,7 @@ mod tests {
 
         let out = store.scan_all_edges_decoded(None).unwrap();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].5, b"v2".to_vec());
+        assert_eq!(out[0].6, b"v2".to_vec());
     }
 
     #[test]
@@ -359,10 +377,10 @@ mod tests {
 
         let at_150 = store.scan_all_edges_decoded(Some(150)).unwrap();
         assert_eq!(at_150.len(), 1);
-        assert_eq!(at_150[0].5, b"v1".to_vec());
+        assert_eq!(at_150[0].6, b"v1".to_vec());
 
         let at_250 = store.scan_all_edges_decoded(Some(250)).unwrap();
-        assert_eq!(at_250[0].5, b"v2".to_vec());
+        assert_eq!(at_250[0].6, b"v2".to_vec());
 
         let at_350 = store.scan_all_edges_decoded(Some(350)).unwrap();
         assert!(
@@ -378,7 +396,7 @@ mod tests {
         let t2 = TenantId::new(2);
         store
             .put_edge_versioned(
-                EdgeRef::new(t1, COLL, "a", "L", "b"),
+                EdgeRef::new(DB, t1, COLL, "a", "L", "b"),
                 b"t1",
                 10,
                 10,
@@ -387,7 +405,7 @@ mod tests {
             .unwrap();
         store
             .put_edge_versioned(
-                EdgeRef::new(t2, COLL, "a", "L", "b"),
+                EdgeRef::new(DB, t2, COLL, "a", "L", "b"),
                 b"t2",
                 20,
                 20,
@@ -395,11 +413,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.get_edge(t1, COLL, "a", "L", "b").unwrap(),
+            store.get_edge(D, t1, COLL, "a", "L", "b").unwrap(),
             Some(b"t1".to_vec())
         );
         assert_eq!(
-            store.get_edge(t2, COLL, "a", "L", "b").unwrap(),
+            store.get_edge(D, t2, COLL, "a", "L", "b").unwrap(),
             Some(b"t2".to_vec())
         );
     }
@@ -411,21 +429,23 @@ mod tests {
         let payload = EdgeValuePayload::new(0, i64::MAX, b"hello".to_vec())
             .encode()
             .unwrap();
-        store.put_edge_raw(T, &key, &payload).unwrap();
+        store.put_edge_raw(D, T, &key, &payload).unwrap();
         assert_eq!(
-            store.get_edge(T, COLL, "a", "L", "b").unwrap(),
+            store.get_edge(D, T, COLL, "a", "L", "b").unwrap(),
             Some(b"hello".to_vec())
         );
 
         let tkey = versioned_edge_key(COLL, "a", "L", "b", 200).unwrap();
-        store.put_edge_raw(T, &tkey, TOMBSTONE_SENTINEL).unwrap();
-        assert!(store.get_edge(T, COLL, "a", "L", "b").unwrap().is_none());
+        store.put_edge_raw(D, T, &tkey, TOMBSTONE_SENTINEL).unwrap();
+        assert!(store.get_edge(D, T, COLL, "a", "L", "b").unwrap().is_none());
     }
 
     #[test]
     fn put_edge_raw_rejects_unversioned_key() {
         let (store, _dir) = make_store();
-        let err = store.put_edge_raw(T, "c\x00a\x00L\x00b", b"x").unwrap_err();
+        let err = store
+            .put_edge_raw(D, T, "c\x00a\x00L\x00b", b"x")
+            .unwrap_err();
         match err {
             crate::Error::BadRequest { detail } => {
                 assert!(detail.contains("malformed versioned key"));

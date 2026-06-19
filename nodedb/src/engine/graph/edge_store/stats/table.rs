@@ -3,7 +3,7 @@
 //! `GRAPH_STATS` table definition, row payload types, key builders, and the
 //! `CollectionStats` public return type.
 //!
-//! Key shape: `(tenant: u64, key: String)` where `key` is
+//! Key shape: `(db: u64, tenant: u64, key: String)` where `key` is
 //! `"<collection>\x00<kind>[\x00<discriminator>]"`.
 //!
 //! Row kinds:
@@ -15,10 +15,16 @@ use serde::{Deserialize, Serialize};
 
 use redb::TableDefinition;
 
-/// `GRAPH_STATS` table: tenant-qualified stat rows.
-/// Key: `(tid_u64, "<collection>\x00<kind>[\x00<discriminator>]")`
+/// `GRAPH_STATS` table: database- and tenant-qualified stat rows.
+/// Key: `(db_u64, tid_u64, "<collection>\x00<kind>[\x00<discriminator>]")`
 /// Value: zerompk-encoded payload (SummaryRow | LabelRow | NodeRow).
-pub const GRAPH_STATS: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("graph_stats");
+pub const GRAPH_STATS: TableDefinition<(u64, u64, &str), &[u8]> =
+    TableDefinition::new("graph_stats_v2");
+
+/// Legacy (pre-database-scoping) `(tid, key)` stats table. Read only by the
+/// `migrate_edges_v2` rewrite; never touched by live paths.
+pub const GRAPH_STATS_LEGACY: TableDefinition<(u64, &str), &[u8]> =
+    TableDefinition::new("graph_stats");
 
 // ── Row payload types ─────────────────────────────────────────────────────────
 

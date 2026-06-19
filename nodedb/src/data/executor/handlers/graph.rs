@@ -44,8 +44,9 @@ impl CoreLoop {
         dst_surrogate: nodedb_types::Surrogate,
     ) -> Response {
         debug!(core = self.core_id, tid, %collection, %src_id, %label, %dst_id, "edge put");
+        let database_id = task.request.database_id.as_u64();
 
-        if self.is_node_deleted(tid, src_id) {
+        if self.is_node_deleted(database_id, tid, src_id) {
             return self.response_error(
                 task,
                 ErrorCode::RejectedDanglingEdge {
@@ -53,7 +54,7 @@ impl CoreLoop {
                 },
             );
         }
-        if self.is_node_deleted(tid, dst_id) {
+        if self.is_node_deleted(database_id, tid, dst_id) {
             return self.response_error(
                 task,
                 ErrorCode::RejectedDanglingEdge {
@@ -66,7 +67,14 @@ impl CoreLoop {
         let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
         use crate::engine::graph::edge_store::EdgeRef;
         match self.edge_store.put_edge_versioned(
-            EdgeRef::new(TenantId::new(tid), collection, src_id, label, dst_id),
+            EdgeRef::new(
+                task.request.database_id,
+                TenantId::new(tid),
+                collection,
+                src_id,
+                label,
+                dst_id,
+            ),
             properties,
             ord,
             valid_from_ms,
@@ -74,7 +82,7 @@ impl CoreLoop {
         ) {
             Ok(()) => {
                 let weight = crate::engine::graph::csr::extract_weight_from_properties(properties);
-                let partition = self.csr_partition_mut(tid);
+                let partition = self.csr_partition_mut(database_id, tid);
                 let csr_result = if weight != 1.0 {
                     partition.add_edge_weighted(src_id, label, dst_id, weight)
                 } else {
@@ -114,8 +122,9 @@ impl CoreLoop {
         edges: &[nodedb_physical::physical_plan::BatchEdge],
     ) -> Response {
         debug!(core = self.core_id, count = edges.len(), "edge put batch");
+        let database_id = task.request.database_id.as_u64();
         for (idx, edge) in edges.iter().enumerate() {
-            if self.is_node_deleted(tid, &edge.src_id) {
+            if self.is_node_deleted(database_id, tid, &edge.src_id) {
                 return self.response_error(
                     task,
                     ErrorCode::RejectedDanglingEdge {
@@ -123,7 +132,7 @@ impl CoreLoop {
                     },
                 );
             }
-            if self.is_node_deleted(tid, &edge.dst_id) {
+            if self.is_node_deleted(database_id, tid, &edge.dst_id) {
                 return self.response_error(
                     task,
                     ErrorCode::RejectedDanglingEdge {
@@ -136,6 +145,7 @@ impl CoreLoop {
             use crate::engine::graph::edge_store::EdgeRef;
             match self.edge_store.put_edge_versioned(
                 EdgeRef::new(
+                    task.request.database_id,
                     TenantId::new(tid),
                     &edge.collection,
                     &edge.src_id,
@@ -148,7 +158,7 @@ impl CoreLoop {
                 i64::MAX,
             ) {
                 Ok(()) => {
-                    let partition = self.csr_partition_mut(tid);
+                    let partition = self.csr_partition_mut(database_id, tid);
                     if let Err(e) = partition.add_edge(&edge.src_id, &edge.label, &edge.dst_id) {
                         return self.response_error(
                             task,
@@ -189,11 +199,13 @@ impl CoreLoop {
             count = edges.len(),
             "edge delete batch"
         );
+        let database_id = task.request.database_id.as_u64();
         for edge in edges {
             let ord = self.hlc.next_ordinal();
             use crate::engine::graph::edge_store::EdgeRef;
             let _ = self.edge_store.soft_delete_edge(
                 EdgeRef::new(
+                    task.request.database_id,
                     TenantId::new(tid),
                     &edge.collection,
                     &edge.src_id,
@@ -202,7 +214,7 @@ impl CoreLoop {
                 ),
                 ord,
             );
-            let partition = self.csr_partition_mut(tid);
+            let partition = self.csr_partition_mut(database_id, tid);
             partition.remove_edge(&edge.src_id, &edge.label, &edge.dst_id);
         }
         if !edges.is_empty() {
@@ -222,14 +234,22 @@ impl CoreLoop {
         dst_id: &str,
     ) -> Response {
         debug!(core = self.core_id, tid, %collection, %src_id, %label, %dst_id, "edge delete");
+        let database_id = task.request.database_id.as_u64();
         let ord = self.hlc.next_ordinal();
         use crate::engine::graph::edge_store::EdgeRef;
         match self.edge_store.soft_delete_edge(
-            EdgeRef::new(TenantId::new(tid), collection, src_id, label, dst_id),
+            EdgeRef::new(
+                task.request.database_id,
+                TenantId::new(tid),
+                collection,
+                src_id,
+                label,
+                dst_id,
+            ),
             ord,
         ) {
             Ok(_) => {
-                let partition = self.csr_partition_mut(tid);
+                let partition = self.csr_partition_mut(database_id, tid);
                 partition.remove_edge(src_id, label, dst_id);
                 self.checkpoint_coordinator.mark_dirty("sparse", 1);
                 self.response_ok(task)
@@ -263,9 +283,10 @@ impl CoreLoop {
             depth,
             "graph hop"
         );
+        let database_id = task.request.database_id.as_u64();
         let depth = depth.min(crate::engine::graph::traversal_options::MAX_GRAPH_TRAVERSAL_DEPTH);
         let refs: Vec<&str> = start_nodes.iter().map(String::as_str).collect();
-        let result: Vec<String> = match self.csr_partition(tid) {
+        let result: Vec<String> = match self.csr_partition(database_id, tid) {
             Some(partition) => partition.traverse_bfs(
                 &refs,
                 edge_label.as_deref(),
@@ -302,7 +323,8 @@ impl CoreLoop {
         direction: crate::engine::graph::edge_store::Direction,
     ) -> Response {
         debug!(core = self.core_id, tid, %node_id, ?edge_label, ?direction, "graph neighbors");
-        let neighbors: Vec<(String, String)> = match self.csr_partition(tid) {
+        let database_id = task.request.database_id.as_u64();
+        let neighbors: Vec<(String, String)> = match self.csr_partition(database_id, tid) {
             Some(partition) => partition.neighbors(node_id, edge_label.as_deref(), direction),
             None => Vec::new(),
         };
@@ -355,10 +377,11 @@ impl CoreLoop {
         } else {
             max_results as usize
         };
+        let database_id = task.request.database_id.as_u64();
         let mut owned: Vec<(String, String, String)> =
             Vec::with_capacity(node_ids.len().min(cap) * 4);
         let mut truncated = false;
-        if let Some(partition) = self.csr_partition(tid) {
+        if let Some(partition) = self.csr_partition(database_id, tid) {
             'outer: for raw_src in node_ids {
                 let neighbors = partition.neighbors(raw_src, edge_label.as_deref(), direction);
                 for (label, node) in neighbors {
