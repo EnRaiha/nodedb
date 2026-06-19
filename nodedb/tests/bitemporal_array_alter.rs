@@ -84,6 +84,7 @@ async fn alter_raises_retention_round_trip() {
             };
             fresh_registry
                 .register(
+                    nodedb_types::DatabaseId::DEFAULT,
                     TenantId::new(0),
                     e.name.clone(),
                     BitemporalEngineKind::Array,

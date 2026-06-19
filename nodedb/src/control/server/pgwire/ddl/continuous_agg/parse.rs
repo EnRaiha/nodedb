@@ -78,6 +78,10 @@ pub(super) fn parse_create_sql(sql: &str) -> PgWireResult<ContinuousAggregateDef
     let (refresh_policy, retention_period_ms) = extract_with_options(&upper, sql);
 
     Ok(ContinuousAggregateDef {
+        // Placeholder: the caller (`create_continuous_aggregate`) rebuilds
+        // the def with the session's real `database_id`. This parse-only
+        // intermediate never reaches the catalog or Data Plane.
+        database_id: nodedb_types::DatabaseId::DEFAULT.as_u64(),
         name,
         source,
         bucket_interval,

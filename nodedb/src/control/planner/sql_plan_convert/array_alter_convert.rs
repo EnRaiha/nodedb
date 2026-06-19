@@ -117,7 +117,7 @@ pub(super) fn convert_alter_array(
         let array_tid = TenantId::new(0);
         match audit_retain_ms {
             Some(None) => {
-                registry.unregister(array_tid, name);
+                registry.unregister(ctx.database_id, array_tid, name);
             }
             Some(Some(retain_ms)) => {
                 let retention = BitemporalRetention {
@@ -126,7 +126,13 @@ pub(super) fn convert_alter_array(
                     minimum_audit_retain_ms: new_min,
                 };
                 registry
-                    .register(array_tid, name, BitemporalEngineKind::Array, retention)
+                    .register(
+                        ctx.database_id,
+                        array_tid,
+                        name,
+                        BitemporalEngineKind::Array,
+                        retention,
+                    )
                     .map_err(|e| crate::Error::PlanError {
                         detail: format!("ALTER ARRAY {name}: registry register: {e}"),
                     })?;
@@ -140,7 +146,13 @@ pub(super) fn convert_alter_array(
                         minimum_audit_retain_ms: new_min,
                     };
                     registry
-                        .register(array_tid, name, BitemporalEngineKind::Array, retention)
+                        .register(
+                            ctx.database_id,
+                            array_tid,
+                            name,
+                            BitemporalEngineKind::Array,
+                            retention,
+                        )
                         .map_err(|e| crate::Error::PlanError {
                             detail: format!("ALTER ARRAY {name}: registry re-register: {e}"),
                         })?;

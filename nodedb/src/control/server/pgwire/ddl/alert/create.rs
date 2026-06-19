@@ -29,6 +29,9 @@ pub struct CreateAlertRequest<'a> {
     pub recover_after: u32,
     pub severity: &'a str,
     pub notify_targets_raw: &'a str,
+    /// Session database the alert is created in. Scopes catalog lookups,
+    /// the in-memory registry, and background eval-loop dispatch routing.
+    pub database_id: DatabaseId,
 }
 
 /// Handle `CREATE ALERT`. Converts raw strings to `AlertCondition` and `Vec<NotifyTarget>`.
@@ -48,6 +51,7 @@ pub fn create_alert(
         recover_after,
         severity,
         notify_targets_raw,
+        database_id,
     } = *req;
     require_tenant_admin(identity, "create alerts")?;
 
@@ -56,7 +60,7 @@ pub fn create_alert(
     // Validate collection exists.
     if let Some(catalog) = state.credentials.catalog()
         && catalog
-            .get_collection(DatabaseId::DEFAULT, tenant_id, collection)
+            .get_collection(database_id, tenant_id, collection)
             .ok()
             .flatten()
             .is_none()
@@ -68,7 +72,11 @@ pub fn create_alert(
     }
 
     // Check for duplicate alert name.
-    if state.alert_registry.get(tenant_id, name).is_some() {
+    if state
+        .alert_registry
+        .get(database_id.as_u64(), tenant_id, name)
+        .is_some()
+    {
         return Err(sqlstate_error(
             "42710",
             &format!("alert '{name}' already exists"),
@@ -92,6 +100,7 @@ pub fn create_alert(
         .as_secs();
 
     let def = AlertDef {
+        database_id: database_id.as_u64(),
         tenant_id,
         name: name.to_string(),
         collection: collection.to_string(),

@@ -39,7 +39,8 @@ impl CoreLoop {
             }
 
             MetaOp::UnregisterContinuousAggregate { name } => {
-                self.continuous_agg_mgr.unregister(name);
+                self.continuous_agg_mgr
+                    .unregister(task.request.database_id.as_u64(), name);
                 tracing::info!(name, "continuous aggregate unregistered");
                 self.response_ok(task)
             }

@@ -77,9 +77,14 @@ pub fn spawn_post_apply_async_side_effects(
         }
         // `DeleteContinuousAggregate` dispatches unregister to every
         // core so per-node runtime state is reclaimed symmetrically.
-        CatalogEntry::DeleteContinuousAggregate { tenant_id, name } => {
+        CatalogEntry::DeleteContinuousAggregate {
+            database_id,
+            tenant_id,
+            name,
+        } => {
             tokio::spawn(async move {
-                super::continuous_aggregate::delete_async(tenant_id, name, shared).await;
+                super::continuous_aggregate::delete_async(database_id, tenant_id, name, shared)
+                    .await;
             });
         }
         // ── Variants with no async side effect today ─────────────────────────

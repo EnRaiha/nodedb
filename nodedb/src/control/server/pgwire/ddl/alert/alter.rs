@@ -8,6 +8,7 @@
 //! ALTER ALERT <name> DISABLE
 //! ```
 
+use nodedb_types::DatabaseId;
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 
@@ -19,6 +20,7 @@ use super::super::super::types::{require_tenant_admin, sqlstate_error};
 pub fn alter_alert(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     action: &str,
 ) -> PgWireResult<Vec<Response>> {
@@ -28,7 +30,7 @@ pub fn alter_alert(
 
     let mut def = state
         .alert_registry
-        .get(tenant_id, name)
+        .get(database_id.as_u64(), tenant_id, name)
         .ok_or_else(|| sqlstate_error("42704", &format!("alert '{name}' does not exist")))?;
 
     match action {

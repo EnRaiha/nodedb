@@ -170,7 +170,7 @@ impl CoreLoop {
     ) -> Response {
         let wm = self
             .continuous_agg_mgr
-            .get_watermark(aggregate_name)
+            .get_watermark(task.request.database_id.as_u64(), aggregate_name)
             .cloned()
             .unwrap_or_default();
         match response_codec::encode_serde(&wm) {

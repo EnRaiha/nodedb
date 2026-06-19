@@ -8,9 +8,9 @@ use crate::event::alert::types::AlertDef;
 impl SystemCatalog {
     /// Store an alert rule definition.
     ///
-    /// Key format: `"{tenant_id}:{alert_name}"`.
+    /// Key format: `(database_id, "{tenant_id}:{alert_name}")`.
     pub fn put_alert_rule(&self, def: &AlertDef) -> crate::Result<()> {
-        let key = alert_key(def.tenant_id, &def.name);
+        let inner_key = alert_key(def.tenant_id, &def.name);
         let bytes =
             zerompk::to_msgpack_vec(def).map_err(|e| catalog_err("serialize alert rule", e))?;
         let write_txn = self
@@ -22,15 +22,20 @@ impl SystemCatalog {
                 .open_table(ALERT_RULES)
                 .map_err(|e| catalog_err("open alert_rules", e))?;
             table
-                .insert(key.as_str(), bytes.as_slice())
+                .insert((def.database_id, inner_key.as_str()), bytes.as_slice())
                 .map_err(|e| catalog_err("insert alert rule", e))?;
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
     /// Delete an alert rule. Returns true if it existed.
-    pub fn delete_alert_rule(&self, tenant_id: u64, name: &str) -> crate::Result<bool> {
-        let key = alert_key(tenant_id, name);
+    pub fn delete_alert_rule(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<bool> {
+        let inner_key = alert_key(tenant_id, name);
         let write_txn = self
             .db
             .begin_write()
@@ -41,7 +46,7 @@ impl SystemCatalog {
                 .open_table(ALERT_RULES)
                 .map_err(|e| catalog_err("open alert_rules", e))?;
             existed = table
-                .remove(key.as_str())
+                .remove((database_id, inner_key.as_str()))
                 .map_err(|e| catalog_err("delete alert rule", e))?
                 .is_some();
         }
@@ -49,7 +54,8 @@ impl SystemCatalog {
         Ok(existed)
     }
 
-    /// Load all alert rules (all tenants).
+    /// Load all alert rules (all databases, all tenants). Each returned
+    /// def carries its own `database_id`.
     pub fn load_all_alert_rules(&self) -> crate::Result<Vec<AlertDef>> {
         let read_txn = self
             .db
@@ -61,7 +67,7 @@ impl SystemCatalog {
 
         let mut rules = Vec::new();
         let mut range = table
-            .range::<&str>(..)
+            .range::<(u64, &str)>(..)
             .map_err(|e| catalog_err("range alert_rules", e))?;
         while let Some(Ok((_key, value))) = range.next() {
             if let Ok(def) = zerompk::from_msgpack::<AlertDef>(value.value()) {
@@ -88,6 +94,7 @@ mod tests {
 
     fn make_alert(name: &str) -> AlertDef {
         AlertDef {
+            database_id: 0,
             tenant_id: 1,
             name: name.into(),
             collection: "metrics".into(),
@@ -128,8 +135,8 @@ mod tests {
     fn delete_alert_rule() {
         let cat = make_catalog();
         cat.put_alert_rule(&make_alert("a1")).unwrap();
-        assert!(cat.delete_alert_rule(1, "a1").unwrap());
-        assert!(!cat.delete_alert_rule(1, "a1").unwrap());
+        assert!(cat.delete_alert_rule(0, 1, "a1").unwrap());
+        assert!(!cat.delete_alert_rule(0, 1, "a1").unwrap());
         assert!(cat.load_all_alert_rules().unwrap().is_empty());
     }
 }

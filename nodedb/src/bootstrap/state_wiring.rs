@@ -255,6 +255,11 @@ pub fn wire_state(
                     minimum_audit_retain_ms: entry.minimum_audit_retain_ms.unwrap_or(0),
                 };
                 if let Err(e) = shared.bitemporal_retention_registry.register(
+                    // The array catalog is global (not database-scoped), so its
+                    // bitemporal retention is registered under the default
+                    // database. Per-database array isolation is a separate
+                    // initiative.
+                    crate::types::DatabaseId::DEFAULT,
                     crate::types::TenantId::new(0),
                     entry.name.clone(),
                     crate::engine::bitemporal::BitemporalEngineKind::Array,

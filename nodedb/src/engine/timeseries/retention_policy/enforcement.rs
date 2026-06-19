@@ -90,8 +90,7 @@ async fn enforcement_loop(
                         crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
                             &state,
                             tenant_id,
-                            // TODO(A8-followup): retention_policy_registry not yet keyed by database.
-                            DatabaseId::DEFAULT,
+                            DatabaseId::new(policy.database_id),
                             &policy.collection,
                             plan,
                             Duration::from_secs(30),
@@ -119,8 +118,7 @@ async fn enforcement_loop(
             if let Err(e) = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
                 &state,
                 tenant_id,
-                // TODO(A8-followup): retention_policy_registry not yet keyed by database.
-                DatabaseId::DEFAULT,
+                DatabaseId::new(policy.database_id),
                 &policy.collection,
                 plan,
                 Duration::from_secs(30),
@@ -177,8 +175,7 @@ async fn check_watermark_coverage(
     match crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
-        // TODO(A8-followup): retention_policy_registry not yet keyed by database.
-        DatabaseId::DEFAULT,
+        DatabaseId::new(policy.database_id),
         &policy.collection,
         plan,
         Duration::from_secs(10),
@@ -215,6 +212,7 @@ mod tests {
 
     fn make_policy(eval_ms: u64) -> RetentionPolicyDef {
         RetentionPolicyDef {
+            database_id: 0,
             tenant_id: 1,
             name: "test".into(),
             collection: "metrics".into(),

@@ -194,6 +194,7 @@ pub fn hydrate_bitemporal_registry_from_array_catalog(
             minimum_audit_retain_ms: entry.minimum_audit_retain_ms.unwrap_or(0),
         };
         if let Err(e) = registry.register(
+            nodedb_types::DatabaseId::DEFAULT,
             TenantId::new(0),
             entry.name.clone(),
             BitemporalEngineKind::Array,

@@ -156,6 +156,7 @@ pub(super) async fn try_dispatch_async(
             create_retention_policy(
                 state,
                 identity,
+                database_id,
                 name,
                 collection,
                 body_raw,

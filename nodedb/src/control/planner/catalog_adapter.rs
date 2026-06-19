@@ -160,7 +160,7 @@ impl OriginCatalog {
             None => return false,
         };
         registry
-            .get(self.tenant_id, collection)
+            .get(self.database_id.as_u64(), self.tenant_id, collection)
             .is_some_and(|p| p.auto_tier)
     }
 }

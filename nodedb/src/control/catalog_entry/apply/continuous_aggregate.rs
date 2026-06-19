@@ -25,8 +25,8 @@ pub fn put(stored: &StoredContinuousAggregate, catalog: &SystemCatalog) {
     );
 }
 
-pub fn delete(tenant_id: u64, name: &str, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_continuous_aggregate(tenant_id, name) {
+pub fn delete(database_id: u64, tenant_id: u64, name: &str, catalog: &SystemCatalog) {
+    if let Err(e) = catalog.delete_continuous_aggregate(database_id, tenant_id, name) {
         warn!(
             cagg = %name,
             tenant = tenant_id,

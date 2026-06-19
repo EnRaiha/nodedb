@@ -36,6 +36,7 @@ pub async fn drop_continuous_aggregate(
     let tenant_id = identity.tenant_id;
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteContinuousAggregate {
+        database_id: database_id.as_u64(),
         tenant_id: tenant_id.as_u64(),
         name: name.clone(),
     };

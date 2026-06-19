@@ -35,8 +35,10 @@ pub async fn put_async(tenant_id: u64, name: String, def_bytes: Vec<u8>, shared:
             return;
         }
     };
+    let database_id = def.database_id;
     dispatch_meta(
         shared,
+        database_id,
         tenant_id,
         &name,
         MetaOp::RegisterContinuousAggregate { def },
@@ -46,10 +48,17 @@ pub async fn put_async(tenant_id: u64, name: String, def_bytes: Vec<u8>, shared:
 }
 
 /// Dispatch `MetaOp::UnregisterContinuousAggregate` to every core
-/// on this node.
-pub async fn delete_async(tenant_id: u64, name: String, shared: Arc<SharedState>) {
+/// on this node. `database_id` scopes the unregister to the right
+/// per-database manager map.
+pub async fn delete_async(
+    database_id: u64,
+    tenant_id: u64,
+    name: String,
+    shared: Arc<SharedState>,
+) {
     dispatch_meta(
         shared,
+        database_id,
         tenant_id,
         &name,
         MetaOp::UnregisterContinuousAggregate { name: name.clone() },
@@ -60,6 +69,7 @@ pub async fn delete_async(tenant_id: u64, name: String, shared: Arc<SharedState>
 
 async fn dispatch_meta(
     shared: Arc<SharedState>,
+    database_id: u64,
     tenant_id: u64,
     name: &str,
     op: MetaOp,
@@ -79,7 +89,7 @@ async fn dispatch_meta(
             let request = Request {
                 request_id,
                 tenant_id: TenantId::new(tenant_id),
-                database_id: DatabaseId::DEFAULT,
+                database_id: DatabaseId::new(database_id),
                 vshard_id: VShardId::new(core_id as u32),
                 plan: PhysicalPlan::Meta(op.clone()),
                 deadline: std::time::Instant::now() + timeout,

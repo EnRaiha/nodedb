@@ -8,8 +8,21 @@
 use crate::engine::timeseries::continuous_agg::AggregateExpr;
 
 /// Complete definition of a tiered retention policy.
+///
+/// Map-encoded so fields (e.g. `database_id`) can be added with
+/// `#[msgpack(default)]` and older rows still decode without a migration.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+#[msgpack(map)]
 pub struct RetentionPolicyDef {
+    /// Owning database. Scopes catalog keys, the in-memory registry, and
+    /// background-enforcement dispatch so a policy created in one database
+    /// never enforces against another database's storage.
+    ///
+    /// `#[msgpack(default)]`: rows persisted before database scoping decode
+    /// with `0` (`DatabaseId::DEFAULT`), which is exactly the database those
+    /// legacy rows lived in — no migration required.
+    #[msgpack(default)]
+    pub database_id: u64,
     /// Owning tenant.
     pub tenant_id: u64,
     /// Policy name (unique per tenant).
@@ -115,6 +128,7 @@ mod tests {
     #[test]
     fn aggregate_name_generation() {
         let def = RetentionPolicyDef {
+            database_id: 0,
             tenant_id: 1,
             name: "sensor_policy".into(),
             collection: "sensor_data".into(),

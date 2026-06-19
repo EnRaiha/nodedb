@@ -128,6 +128,7 @@ fn registry_rejects_audit_below_floor() {
     let reg = BitemporalRetentionRegistry::new();
     let err = reg
         .register(
+            nodedb_types::DatabaseId::DEFAULT,
             TenantId::new(1),
             "users",
             BitemporalEngineKind::DocumentStrict,
@@ -151,6 +152,7 @@ fn registry_snapshot_yields_one_entry_per_engine_kind() {
         minimum_audit_retain_ms: 0,
     };
     reg.register(
+        nodedb_types::DatabaseId::DEFAULT,
         TenantId::new(1),
         "friends",
         BitemporalEngineKind::EdgeStore,
@@ -158,6 +160,7 @@ fn registry_snapshot_yields_one_entry_per_engine_kind() {
     )
     .unwrap();
     reg.register(
+        nodedb_types::DatabaseId::DEFAULT,
         TenantId::new(1),
         "users",
         BitemporalEngineKind::DocumentStrict,
@@ -165,6 +168,7 @@ fn registry_snapshot_yields_one_entry_per_engine_kind() {
     )
     .unwrap();
     reg.register(
+        nodedb_types::DatabaseId::DEFAULT,
         TenantId::new(1),
         "events",
         BitemporalEngineKind::Columnar,

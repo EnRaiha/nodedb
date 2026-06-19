@@ -52,19 +52,27 @@ pub(super) fn sequence_exists(
 pub(super) fn alert_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
 ) -> bool {
     let tid = identity.tenant_id.as_u64();
-    state.alert_registry.get(tid, name).is_some()
+    state
+        .alert_registry
+        .get(database_id.as_u64(), tid, name)
+        .is_some()
 }
 
 pub(super) fn retention_policy_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
 ) -> bool {
     let tid = identity.tenant_id.as_u64();
-    state.retention_policy_registry.get(tid, name).is_some()
+    state
+        .retention_policy_registry
+        .get(database_id.as_u64(), tid, name)
+        .is_some()
 }
 
 pub(super) fn change_stream_exists(

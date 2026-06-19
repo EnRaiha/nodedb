@@ -4,6 +4,7 @@
 //!
 //! Syntax: `DROP ALERT <name>`
 
+use nodedb_types::DatabaseId;
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 
@@ -16,6 +17,7 @@ use super::ALERT_RULES_CRDT_COLLECTION;
 pub fn drop_alert(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> PgWireResult<Vec<Response>> {
     require_tenant_admin(identity, "drop alerts")?;
@@ -26,7 +28,11 @@ pub fn drop_alert(
     let name = parts[2].to_lowercase();
     let tenant_id = identity.tenant_id.as_u64();
 
-    if state.alert_registry.get(tenant_id, &name).is_none() {
+    if state
+        .alert_registry
+        .get(database_id.as_u64(), tenant_id, &name)
+        .is_none()
+    {
         return Err(sqlstate_error(
             "42704",
             &format!("alert '{name}' does not exist"),
@@ -40,7 +46,7 @@ pub fn drop_alert(
         .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
 
     catalog
-        .delete_alert_rule(tenant_id, &name)
+        .delete_alert_rule(database_id.as_u64(), tenant_id, &name)
         .map_err(|e| sqlstate_error("XX000", &format!("catalog delete: {e}")))?;
 
     // Emit CRDT tombstone delta.
@@ -62,7 +68,9 @@ pub fn drop_alert(
     state.alert_hysteresis.remove_alert(tenant_id, &name);
 
     // Remove from registry.
-    state.alert_registry.unregister(tenant_id, &name);
+    state
+        .alert_registry
+        .unregister(database_id.as_u64(), tenant_id, &name);
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

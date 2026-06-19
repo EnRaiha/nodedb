@@ -181,8 +181,7 @@ async fn execute_aggregate_scan(
     let payload = sync_dispatch::dispatch_async(
         state,
         tenant_id,
-        // TODO(A8-followup): alert registry not yet keyed by database.
-        crate::types::DatabaseId::DEFAULT,
+        crate::types::DatabaseId::new(alert.database_id),
         &alert.collection,
         plan,
         Duration::from_secs(30),
@@ -278,6 +277,7 @@ mod tests {
 
     fn make_alert(name: &str) -> AlertDef {
         AlertDef {
+            database_id: 0,
             tenant_id: 1,
             name: name.into(),
             collection: "sensor_data".into(),

@@ -8,9 +8,9 @@ use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
 impl SystemCatalog {
     /// Store a retention policy definition.
     ///
-    /// Key format: `"{tenant_id}:{policy_name}"`.
+    /// Key format: `(database_id, "{tenant_id}:{policy_name}")`.
     pub fn put_retention_policy(&self, def: &RetentionPolicyDef) -> crate::Result<()> {
-        let key = retention_policy_key(def.tenant_id, &def.name);
+        let inner_key = retention_policy_key(def.tenant_id, &def.name);
         let bytes = zerompk::to_msgpack_vec(def)
             .map_err(|e| catalog_err("serialize retention policy", e))?;
         let write_txn = self
@@ -22,15 +22,20 @@ impl SystemCatalog {
                 .open_table(RETENTION_POLICIES)
                 .map_err(|e| catalog_err("open retention_policies", e))?;
             table
-                .insert(key.as_str(), bytes.as_slice())
+                .insert((def.database_id, inner_key.as_str()), bytes.as_slice())
                 .map_err(|e| catalog_err("insert retention policy", e))?;
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
     /// Delete a retention policy. Returns true if it existed.
-    pub fn delete_retention_policy(&self, tenant_id: u64, name: &str) -> crate::Result<bool> {
-        let key = retention_policy_key(tenant_id, name);
+    pub fn delete_retention_policy(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<bool> {
+        let inner_key = retention_policy_key(tenant_id, name);
         let write_txn = self
             .db
             .begin_write()
@@ -41,7 +46,7 @@ impl SystemCatalog {
                 .open_table(RETENTION_POLICIES)
                 .map_err(|e| catalog_err("open retention_policies", e))?;
             existed = table
-                .remove(key.as_str())
+                .remove((database_id, inner_key.as_str()))
                 .map_err(|e| catalog_err("delete retention policy", e))?
                 .is_some();
         }
@@ -49,7 +54,8 @@ impl SystemCatalog {
         Ok(existed)
     }
 
-    /// Load all retention policies (all tenants).
+    /// Load all retention policies (all databases, all tenants). Each
+    /// returned def carries its own `database_id`.
     pub fn load_all_retention_policies(&self) -> crate::Result<Vec<RetentionPolicyDef>> {
         let read_txn = self
             .db
@@ -61,7 +67,7 @@ impl SystemCatalog {
 
         let mut policies = Vec::new();
         let mut range = table
-            .range::<&str>(..)
+            .range::<(u64, &str)>(..)
             .map_err(|e| catalog_err("range retention_policies", e))?;
         while let Some(Ok((_key, value))) = range.next() {
             if let Ok(def) = zerompk::from_msgpack::<RetentionPolicyDef>(value.value()) {
@@ -90,6 +96,7 @@ mod tests {
     fn put_and_load() {
         let cat = make_catalog();
         let def = RetentionPolicyDef {
+            database_id: 0,
             tenant_id: 1,
             name: "sensor_policy".into(),
             collection: "sensor_data".into(),
@@ -130,6 +137,7 @@ mod tests {
     fn delete_retention_policy() {
         let cat = make_catalog();
         let def = RetentionPolicyDef {
+            database_id: 0,
             tenant_id: 1,
             name: "p1".into(),
             collection: "c1".into(),
@@ -147,8 +155,8 @@ mod tests {
             created_at: 0,
         };
         cat.put_retention_policy(&def).unwrap();
-        assert!(cat.delete_retention_policy(1, "p1").unwrap());
-        assert!(!cat.delete_retention_policy(1, "p1").unwrap());
+        assert!(cat.delete_retention_policy(0, 1, "p1").unwrap());
+        assert!(!cat.delete_retention_policy(0, 1, "p1").unwrap());
         assert!(cat.load_all_retention_policies().unwrap().is_empty());
     }
 
@@ -156,6 +164,7 @@ mod tests {
     fn overwrite_policy() {
         let cat = make_catalog();
         let mut def = RetentionPolicyDef {
+            database_id: 0,
             tenant_id: 1,
             name: "p1".into(),
             collection: "c1".into(),

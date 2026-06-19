@@ -161,7 +161,11 @@ fn primary_row_owner(
             .flatten()
             .map(|c| c.owner),
         object_type::CONTINUOUS_AGGREGATE => catalog
-            .get_continuous_aggregate(tenant_id, name)
+            // This recovery-repair owner lookup is keyed only by
+            // (tenant_id, name); like the COLLECTION arm above it resolves
+            // within the default database. Cross-database owner repair is a
+            // separate verifier initiative.
+            .get_continuous_aggregate(DatabaseId::DEFAULT.as_u64(), tenant_id, name)
             .ok()
             .flatten()
             .map(|c| c.owner),

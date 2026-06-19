@@ -31,6 +31,7 @@ use crate::control::server::pgwire::ddl::sequence::{alter_sequence, create_seque
 use crate::control::server::pgwire::ddl::trigger::alter_trigger;
 use crate::control::server::pgwire::ddl::user::{alter_user, create_user};
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::database_ops::try_dispatch_database;
 
@@ -40,6 +41,7 @@ pub(super) fn try_dispatch_sync(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     stmt: &NodedbStatement,
+    database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     // Database DDL (all synchronous — catalog reads/writes only).
     if let Some(result) = try_dispatch_database(state, identity, stmt) {
@@ -77,7 +79,7 @@ pub(super) fn try_dispatch_sync(
         }
 
         NodedbStatement::Automation(AutomationStmt::AlterAlert { name, action }) => {
-            Some(alter_alert(state, identity, name, action))
+            Some(alter_alert(state, identity, database_id, name, action))
         }
 
         NodedbStatement::StreamView(StreamViewStmt::AlterChangeStream { name, action }) => {
@@ -180,6 +182,7 @@ pub(super) fn try_dispatch_sync(
         }) => Some(alter_retention_policy(
             state,
             identity,
+            database_id,
             name,
             action,
             set_key.as_deref(),
@@ -233,6 +236,7 @@ pub(super) fn try_dispatch_sync(
                 recover_after: *recover_after,
                 severity,
                 notify_targets_raw,
+                database_id,
             },
         )),
 

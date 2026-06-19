@@ -19,6 +19,14 @@ use nodedb_types::Hlc;
 #[derive(zerompk::ToMessagePack, zerompk::FromMessagePack, Debug, Clone)]
 #[msgpack(map, allow_unknown_fields)]
 pub struct StoredContinuousAggregate {
+    /// Owning database. Scopes the catalog key so an aggregate named
+    /// identically in two databases never collides on disk.
+    ///
+    /// `#[msgpack(default)]`: rows persisted before database scoping decode
+    /// with `0` (`DatabaseId::DEFAULT`) — the database those legacy rows
+    /// lived in — so no migration is required.
+    #[msgpack(default)]
+    pub database_id: u64,
     pub tenant_id: u64,
     pub name: String,
     pub source: String,

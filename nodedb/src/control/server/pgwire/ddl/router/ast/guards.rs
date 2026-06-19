@@ -106,7 +106,7 @@ pub(super) fn try_dispatch_guards(
             name,
             if_exists: true,
         }) => {
-            if !alert_exists(state, identity, name) {
+            if !alert_exists(state, identity, database_id, name) {
                 return Some(Ok(vec![Response::Execution(Tag::new("DROP ALERT"))]));
             }
             None
@@ -116,7 +116,7 @@ pub(super) fn try_dispatch_guards(
             name,
             if_exists: true,
         }) => {
-            if !retention_policy_exists(state, identity, name) {
+            if !retention_policy_exists(state, identity, database_id, name) {
                 return Some(Ok(vec![Response::Execution(Tag::new(
                     "DROP RETENTION POLICY",
                 ))]));

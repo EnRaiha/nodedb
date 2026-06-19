@@ -32,6 +32,7 @@ use super::parse::parse_create_retention_policy;
 pub async fn create_retention_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     collection: &str,
     body_raw: &str,
@@ -52,7 +53,7 @@ pub async fn create_retention_policy(
 
     // Validate collection exists and is timeseries.
     if let Some(catalog) = state.credentials.catalog() {
-        match catalog.get_collection(DatabaseId::DEFAULT, tenant_id, &parsed.collection) {
+        match catalog.get_collection(database_id, tenant_id, &parsed.collection) {
             Ok(Some(coll)) if coll.collection_type.is_timeseries() => {}
             Ok(Some(_)) => {
                 return Err(sqlstate_error(
@@ -72,7 +73,7 @@ pub async fn create_retention_policy(
     // Check for duplicate policy name.
     if state
         .retention_policy_registry
-        .get(tenant_id, &parsed.name)
+        .get(database_id.as_u64(), tenant_id, &parsed.name)
         .is_some()
     {
         return Err(sqlstate_error(
@@ -84,7 +85,7 @@ pub async fn create_retention_policy(
     // Check no other policy already targets this collection.
     if state
         .retention_policy_registry
-        .get_for_collection(tenant_id, &parsed.collection)
+        .get_for_collection(database_id.as_u64(), tenant_id, &parsed.collection)
         .is_some()
     {
         return Err(sqlstate_error(
@@ -102,6 +103,7 @@ pub async fn create_retention_policy(
         .as_secs();
 
     let def = crate::engine::timeseries::retention_policy::types::RetentionPolicyDef {
+        database_id: database_id.as_u64(),
         tenant_id,
         name: parsed.name.clone(),
         collection: parsed.collection.clone(),
@@ -149,10 +151,12 @@ pub async fn create_retention_policy(
             .await
             .map_err(|e| {
                 // Roll back: remove from registry and catalog on failure.
-                state
-                    .retention_policy_registry
-                    .unregister(tenant_id, &def.name);
-                let _ = catalog.delete_retention_policy(tenant_id, &def.name);
+                state.retention_policy_registry.unregister(
+                    database_id.as_u64(),
+                    tenant_id,
+                    &def.name,
+                );
+                let _ = catalog.delete_retention_policy(database_id.as_u64(), tenant_id, &def.name);
                 sqlstate_error("XX000", &format!("failed to auto-wire aggregates: {e}"))
             })?;
     }

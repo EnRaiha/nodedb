@@ -78,8 +78,8 @@ pub(super) const L2_CLEANUP_QUEUE: TableDefinition<(u64, &str), &[u8]> =
 pub(super) const MATERIALIZED_VIEWS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.materialized_views");
 
-/// Table: "{tenant_id}:{name}" -> MessagePack-serialized continuous aggregate metadata.
-pub(super) const CONTINUOUS_AGGREGATES: TableDefinition<&str, &[u8]> =
+/// Table: `(database_id: u64, "{tenant_id}:{name}")` -> MessagePack-serialized continuous aggregate metadata.
+pub(super) const CONTINUOUS_AGGREGATES: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("_system.continuous_aggregates");
 
 /// Table: "{tenant_id}:{name}" -> MessagePack-serialized user function definition.
@@ -150,12 +150,12 @@ pub(super) const CONSUMER_GROUPS: TableDefinition<&str, &[u8]> =
 pub(super) const SCHEDULES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.schedules");
 
-/// Table: "{tenant_id}:{policy_name}" -> MessagePack-serialized RetentionPolicyDef.
-pub(super) const RETENTION_POLICIES: TableDefinition<&str, &[u8]> =
+/// Table: `(database_id: u64, "{tenant_id}:{policy_name}")` -> MessagePack-serialized RetentionPolicyDef.
+pub(super) const RETENTION_POLICIES: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("_system.retention_policies");
 
-/// Table: "{tenant_id}:{alert_name}" -> MessagePack-serialized AlertDef.
-pub(super) const ALERT_RULES: TableDefinition<&str, &[u8]> =
+/// Table: `(database_id: u64, "{tenant_id}:{alert_name}")` -> MessagePack-serialized AlertDef.
+pub(super) const ALERT_RULES: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("_system.alert_rules");
 
 /// Table: "{tenant_id}:{topic_name}" -> MessagePack-serialized TopicDef.

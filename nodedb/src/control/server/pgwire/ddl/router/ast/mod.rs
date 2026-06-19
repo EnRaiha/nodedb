@@ -32,7 +32,7 @@ pub(super) async fn try_dispatch(
     if let Some(result) = try_dispatch_guards(state, identity, stmt, database_id) {
         return Some(result);
     }
-    if let Some(result) = try_dispatch_sync(state, identity, stmt) {
+    if let Some(result) = try_dispatch_sync(state, identity, stmt, database_id) {
         return Some(result);
     }
     try_dispatch_async(state, identity, stmt, database_id).await

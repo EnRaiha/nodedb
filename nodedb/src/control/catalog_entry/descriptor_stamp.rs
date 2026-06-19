@@ -119,7 +119,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutContinuousAggregate(mut stored) => {
             let prior = catalog
-                .get_continuous_aggregate(stored.tenant_id, &stored.name)
+                .get_continuous_aggregate(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|c| c.descriptor_version)

@@ -25,6 +25,7 @@ use super::super::super::types::{int8_field, sqlstate_error, text_field};
 pub fn show_retention_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: nodedb_types::DatabaseId,
     parts: &[&str],
 ) -> PgWireResult<Vec<Response>> {
     let tenant_id = identity.tenant_id.as_u64();
@@ -35,7 +36,9 @@ pub fn show_retention_policy(
         None
     };
 
-    let policies = state.retention_policy_registry.list_for_tenant(tenant_id);
+    let policies = state
+        .retention_policy_registry
+        .list_for_tenant_in_database(database_id.as_u64(), tenant_id);
 
     let schema = Arc::new(vec![
         text_field("policy_name"),

@@ -11,9 +11,10 @@ use super::types::AlertDef;
 
 /// Thread-safe in-memory registry of alert rules.
 ///
-/// Keyed by `(tenant_id, alert_name)`. Lives on the Control Plane (`Send + Sync`).
+/// Keyed by `(database_id, tenant_id, alert_name)`. Lives on the Control
+/// Plane (`Send + Sync`).
 pub struct AlertRegistry {
-    by_name: RwLock<HashMap<(u64, String), AlertDef>>,
+    by_name: RwLock<HashMap<(u64, u64, String), AlertDef>>,
 }
 
 impl AlertRegistry {
@@ -23,27 +24,29 @@ impl AlertRegistry {
         }
     }
 
-    fn read_map(&self) -> std::sync::RwLockReadGuard<'_, HashMap<(u64, String), AlertDef>> {
+    fn read_map(&self) -> std::sync::RwLockReadGuard<'_, HashMap<(u64, u64, String), AlertDef>> {
         self.by_name.read().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn write_map(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<(u64, String), AlertDef>> {
+    fn write_map(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<(u64, u64, String), AlertDef>> {
         self.by_name.write().unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn register(&self, def: AlertDef) {
-        let key = (def.tenant_id, def.name.clone());
+        let key = (def.database_id, def.tenant_id, def.name.clone());
         self.write_map().insert(key, def);
     }
 
-    pub fn unregister(&self, tenant_id: u64, name: &str) -> bool {
+    pub fn unregister(&self, database_id: u64, tenant_id: u64, name: &str) -> bool {
         self.write_map()
-            .remove(&(tenant_id, name.to_string()))
+            .remove(&(database_id, tenant_id, name.to_string()))
             .is_some()
     }
 
-    pub fn get(&self, tenant_id: u64, name: &str) -> Option<AlertDef> {
-        self.read_map().get(&(tenant_id, name.to_string())).cloned()
+    pub fn get(&self, database_id: u64, tenant_id: u64, name: &str) -> Option<AlertDef> {
+        self.read_map()
+            .get(&(database_id, tenant_id, name.to_string()))
+            .cloned()
     }
 
     pub fn update(&self, def: AlertDef) {
@@ -74,7 +77,7 @@ impl AlertRegistry {
         let mut map = self.write_map();
         map.clear();
         for alert in fresh {
-            let key = (alert.tenant_id, alert.name.clone());
+            let key = (alert.database_id, alert.tenant_id, alert.name.clone());
             map.insert(key, alert);
         }
         Ok(())
@@ -85,6 +88,18 @@ impl AlertRegistry {
         self.read_map()
             .values()
             .filter(|a| a.tenant_id == tenant_id)
+            .cloned()
+            .collect()
+    }
+
+    /// List all alert rules for a tenant within a single database.
+    ///
+    /// Used by `SHOW ALERTS`, which must not leak rules from other databases
+    /// the tenant exists in into the current session.
+    pub fn list_for_tenant_in_database(&self, database_id: u64, tenant_id: u64) -> Vec<AlertDef> {
+        self.read_map()
+            .values()
+            .filter(|a| a.database_id == database_id && a.tenant_id == tenant_id)
             .cloned()
             .collect()
     }
@@ -106,7 +121,7 @@ impl AlertRegistry {
         }
         let mut map = self.write_map();
         for alert in alerts {
-            let key = (alert.tenant_id, alert.name.clone());
+            let key = (alert.database_id, alert.tenant_id, alert.name.clone());
             map.insert(key, alert);
         }
         tracing::info!(count = map.len(), "loaded alert rules from catalog");
@@ -126,6 +141,7 @@ mod tests {
 
     fn make_alert(tenant_id: u64, name: &str) -> AlertDef {
         AlertDef {
+            database_id: 0,
             tenant_id,
             name: name.into(),
             collection: "metrics".into(),
@@ -152,18 +168,18 @@ mod tests {
     fn register_and_get() {
         let reg = AlertRegistry::new();
         reg.register(make_alert(1, "high_temp"));
-        assert!(reg.get(1, "high_temp").is_some());
-        assert!(reg.get(1, "other").is_none());
-        assert!(reg.get(2, "high_temp").is_none());
+        assert!(reg.get(0, 1, "high_temp").is_some());
+        assert!(reg.get(0, 1, "other").is_none());
+        assert!(reg.get(0, 2, "high_temp").is_none());
     }
 
     #[test]
     fn unregister() {
         let reg = AlertRegistry::new();
         reg.register(make_alert(1, "a1"));
-        assert!(reg.unregister(1, "a1"));
-        assert!(!reg.unregister(1, "a1"));
-        assert!(reg.get(1, "a1").is_none());
+        assert!(reg.unregister(0, 1, "a1"));
+        assert!(!reg.unregister(0, 1, "a1"));
+        assert!(reg.get(0, 1, "a1").is_none());
     }
 
     #[test]

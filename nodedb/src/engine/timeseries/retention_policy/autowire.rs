@@ -51,6 +51,7 @@ pub async fn register_tiers(
         let interval_str = format_interval_ms(tier.resolution_ms);
 
         let agg_def = ContinuousAggregateDef {
+            database_id: def.database_id,
             name: agg_name.clone(),
             source: source.clone(),
             bucket_interval: interval_str,
@@ -69,8 +70,7 @@ pub async fn register_tiers(
         crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
             state,
             tenant_id,
-            // TODO(A8-followup): retention_policy_registry not yet keyed by database.
-            DatabaseId::DEFAULT,
+            DatabaseId::new(def.database_id),
             &source,
             plan,
             Duration::from_secs(5),
@@ -113,8 +113,7 @@ pub async fn unregister_tiers(
         crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
             state,
             tenant_id,
-            // TODO(A8-followup): retention_policy_registry not yet keyed by database.
-            DatabaseId::DEFAULT,
+            DatabaseId::new(def.database_id),
             route_collection,
             plan,
             Duration::from_secs(5),

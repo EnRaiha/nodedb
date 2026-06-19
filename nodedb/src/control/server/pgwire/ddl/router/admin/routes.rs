@@ -76,32 +76,52 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // CREATE ALERT is fully dispatched via typed AST (ast.rs).
     if upper.starts_with("DROP ALERT ") {
         return Some(super::super::super::alert::drop_alert(
-            state, identity, parts,
+            state,
+            identity,
+            database_id,
+            parts,
         ));
     }
     // ALTER ALERT is fully dispatched via typed AST (ast.rs).
     if upper.starts_with("SHOW ALERT STATUS ") {
         let name = parts.get(4).unwrap_or(&"");
         return Some(super::super::super::alert::show_alert_status(
-            state, identity, name,
+            state,
+            identity,
+            database_id,
+            name,
         ));
     }
     if upper.starts_with("SHOW ALERT") {
-        return Some(super::super::super::alert::show_alerts(state, identity));
+        return Some(super::super::super::alert::show_alerts(
+            state,
+            identity,
+            database_id,
+        ));
     }
 
     // Retention policies.
     // CREATE RETENTION POLICY is fully dispatched via typed AST (ast.rs).
     if upper.starts_with("DROP RETENTION POLICY ") {
         return Some(
-            super::super::super::retention_policy::drop_retention_policy(state, identity, parts)
-                .await,
+            super::super::super::retention_policy::drop_retention_policy(
+                state,
+                identity,
+                database_id,
+                parts,
+            )
+            .await,
         );
     }
     // ALTER RETENTION POLICY is fully dispatched via typed AST (ast.rs).
     if upper.starts_with("SHOW RETENTION POLIC") {
         return Some(
-            super::super::super::retention_policy::show_retention_policy(state, identity, parts),
+            super::super::super::retention_policy::show_retention_policy(
+                state,
+                identity,
+                database_id,
+                parts,
+            ),
         );
     }
 
@@ -254,7 +274,12 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
 
     // EXPLAIN TIERS ON <collection> [RANGE <start> <end>]
     if upper.starts_with("EXPLAIN TIERS ") {
-        return Some(super::super::helpers::explain_tiers(state, identity, parts));
+        return Some(super::super::helpers::explain_tiers(
+            state,
+            identity,
+            database_id,
+            parts,
+        ));
     }
 
     // EXPLAIN PERMISSION / EXPLAIN SCOPE.

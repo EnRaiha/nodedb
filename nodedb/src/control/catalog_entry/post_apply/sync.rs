@@ -120,7 +120,9 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         CatalogEntry::PutContinuousAggregate(stored) => {
             continuous_aggregate::put((**stored).clone(), Arc::clone(shared));
         }
-        CatalogEntry::DeleteContinuousAggregate { tenant_id, name } => {
+        CatalogEntry::DeleteContinuousAggregate {
+            tenant_id, name, ..
+        } => {
             continuous_aggregate::delete(*tenant_id, name.clone(), Arc::clone(shared));
         }
         CatalogEntry::PutTenant(stored) => {

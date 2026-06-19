@@ -13,17 +13,31 @@ use super::refresh;
 use super::watermark::WatermarkState;
 use crate::engine::timeseries::columnar_memtable::ColumnarDrainResult;
 
+/// Key scoping every continuous-aggregate map by database: `(database_id, name)`
+/// (or `(database_id, source)` for the dependency graph).
+type AggKey = (u64, String);
+
+/// Materialized partials for one aggregate:
+/// `(bucket_ts, group_key) → PartialAggregate`.
+type MaterializedBuckets = HashMap<(i64, Vec<u32>), PartialAggregate>;
+
 /// Manages all continuous aggregates for a timeseries engine instance.
+///
+/// Every map is scoped by `(database_id, name)` (or `(database_id, source)`
+/// for the dependency graph) so an aggregate named identically in two
+/// databases never collides and never materializes against the wrong
+/// database's storage.
 pub struct ContinuousAggregateManager {
-    /// Registered aggregate definitions, keyed by aggregate name.
-    definitions: HashMap<String, ContinuousAggregateDef>,
-    /// Per-aggregate watermark state.
-    watermarks: HashMap<String, WatermarkState>,
+    /// Registered aggregate definitions, keyed by `(database_id, agg_name)`.
+    definitions: HashMap<AggKey, ContinuousAggregateDef>,
+    /// Per-aggregate watermark state, keyed by `(database_id, agg_name)`.
+    watermarks: HashMap<AggKey, WatermarkState>,
     /// Materialized aggregate data:
-    /// `agg_name → (bucket_ts, group_key) → PartialAggregate`.
-    materialized: HashMap<String, HashMap<(i64, Vec<u32>), PartialAggregate>>,
-    /// Dependency graph: `source → [aggregates that depend on it]`.
-    dependencies: HashMap<String, Vec<String>>,
+    /// `(database_id, agg_name) → (bucket_ts, group_key) → PartialAggregate`.
+    materialized: HashMap<AggKey, MaterializedBuckets>,
+    /// Dependency graph: `(database_id, source) → [aggregate names that
+    /// depend on it within that database]`.
+    dependencies: HashMap<AggKey, Vec<String>>,
 }
 
 impl ContinuousAggregateManager {
@@ -38,39 +52,49 @@ impl ContinuousAggregateManager {
 
     // -- Registration --
 
-    /// Register a new continuous aggregate.
+    /// Register a new continuous aggregate. The database scope is taken
+    /// from `def.database_id` so every internal map is keyed consistently.
     pub fn register(&mut self, def: ContinuousAggregateDef) {
+        let database_id = def.database_id;
         let source = def.source.clone();
         let name = def.name.clone();
 
-        self.watermarks.entry(name.clone()).or_default();
-        self.materialized.entry(name.clone()).or_default();
+        self.watermarks
+            .entry((database_id, name.clone()))
+            .or_default();
+        self.materialized
+            .entry((database_id, name.clone()))
+            .or_default();
         self.dependencies
-            .entry(source)
+            .entry((database_id, source))
             .or_default()
             .push(name.clone());
-        self.definitions.insert(name, def);
+        self.definitions.insert((database_id, name), def);
     }
 
     /// Remove a continuous aggregate.
-    pub fn unregister(&mut self, name: &str) {
-        if let Some(def) = self.definitions.remove(name) {
-            self.watermarks.remove(name);
-            self.materialized.remove(name);
-            if let Some(deps) = self.dependencies.get_mut(&def.source) {
+    pub fn unregister(&mut self, database_id: u64, name: &str) {
+        let key = (database_id, name.to_string());
+        if let Some(def) = self.definitions.remove(&key) {
+            self.watermarks.remove(&key);
+            self.materialized.remove(&key);
+            if let Some(deps) = self
+                .dependencies
+                .get_mut(&(database_id, def.source.clone()))
+            {
                 deps.retain(|n| n != name);
             }
         }
     }
 
     /// Get a registered definition.
-    pub fn get_definition(&self, name: &str) -> Option<&ContinuousAggregateDef> {
-        self.definitions.get(name)
+    pub fn get_definition(&self, database_id: u64, name: &str) -> Option<&ContinuousAggregateDef> {
+        self.definitions.get(&(database_id, name.to_string()))
     }
 
     /// Get watermark state for an aggregate.
-    pub fn get_watermark(&self, name: &str) -> Option<&WatermarkState> {
-        self.watermarks.get(name)
+    pub fn get_watermark(&self, database_id: u64, name: &str) -> Option<&WatermarkState> {
+        self.watermarks.get(&(database_id, name.to_string()))
     }
 
     /// Number of registered aggregates.
@@ -88,20 +112,22 @@ impl ContinuousAggregateManager {
     /// Returns the names of aggregates that were refreshed.
     pub fn on_flush(
         &mut self,
+        database_id: u64,
         source_collection: &str,
         drain: &ColumnarDrainResult,
         now_ms: i64,
     ) -> Vec<String> {
         let agg_names: Vec<String> = self
             .dependencies
-            .get(source_collection)
+            .get(&(database_id, source_collection.to_string()))
             .cloned()
             .unwrap_or_default();
 
         let mut refreshed = Vec::new();
 
         for agg_name in &agg_names {
-            let Some(def) = self.definitions.get(agg_name) else {
+            let key = (database_id, agg_name.clone());
+            let Some(def) = self.definitions.get(&key) else {
                 continue;
             };
             if def.refresh_policy != RefreshPolicy::OnFlush || def.stale {
@@ -109,13 +135,13 @@ impl ContinuousAggregateManager {
             }
 
             let def_clone = def.clone();
-            let watermark = self.watermarks.get(agg_name).cloned().unwrap_or_default();
-            let mat = self.materialized.entry(agg_name.clone()).or_default();
+            let watermark = self.watermarks.get(&key).cloned().unwrap_or_default();
+            let mat = self.materialized.entry(key.clone()).or_default();
 
             let result = refresh::refresh_from_drain(&def_clone, drain, &watermark, mat);
 
             // Update watermark.
-            if let Some(wm) = self.watermarks.get_mut(agg_name) {
+            if let Some(wm) = self.watermarks.get_mut(&key) {
                 wm.advance(result.max_ts, result.rows_processed, now_ms);
                 if let Some(o3_ts) = result.o3_min_ts {
                     wm.record_o3(o3_ts);
@@ -125,12 +151,13 @@ impl ContinuousAggregateManager {
             refreshed.push(agg_name.clone());
         }
 
-        // Multi-tier chaining: check if refreshed aggregates have downstream dependents.
+        // Multi-tier chaining: check if refreshed aggregates have downstream
+        // dependents within the same database.
         let mut chain_refreshed = Vec::new();
         for name in &refreshed {
-            if let Some(downstream) = self.dependencies.get(name).cloned() {
+            if let Some(downstream) = self.dependencies.get(&(database_id, name.clone())).cloned() {
                 for ds_name in &downstream {
-                    if let Some(ds_def) = self.definitions.get(ds_name)
+                    if let Some(ds_def) = self.definitions.get(&(database_id, ds_name.clone()))
                         && ds_def.refresh_policy == RefreshPolicy::OnFlush
                         && !ds_def.stale
                     {
@@ -144,16 +171,23 @@ impl ContinuousAggregateManager {
     }
 
     /// Manually refresh an aggregate (for Manual or Periodic policies).
-    pub fn manual_refresh(&mut self, agg_name: &str, drain: &ColumnarDrainResult, now_ms: i64) {
-        let Some(def) = self.definitions.get(agg_name).cloned() else {
+    pub fn manual_refresh(
+        &mut self,
+        database_id: u64,
+        agg_name: &str,
+        drain: &ColumnarDrainResult,
+        now_ms: i64,
+    ) {
+        let key = (database_id, agg_name.to_string());
+        let Some(def) = self.definitions.get(&key).cloned() else {
             return;
         };
-        let watermark = self.watermarks.get(agg_name).cloned().unwrap_or_default();
-        let mat = self.materialized.entry(agg_name.to_string()).or_default();
+        let watermark = self.watermarks.get(&key).cloned().unwrap_or_default();
+        let mat = self.materialized.entry(key.clone()).or_default();
 
         let result = refresh::refresh_from_drain(&def, drain, &watermark, mat);
 
-        if let Some(wm) = self.watermarks.get_mut(agg_name) {
+        if let Some(wm) = self.watermarks.get_mut(&key) {
             wm.advance(result.max_ts, result.rows_processed, now_ms);
             if let Some(o3_ts) = result.o3_min_ts {
                 wm.record_o3(o3_ts);
@@ -164,48 +198,59 @@ impl ContinuousAggregateManager {
     // -- Query --
 
     /// Get materialized results for an aggregate, sorted by bucket.
-    pub fn get_materialized(&self, agg_name: &str) -> Option<Vec<&PartialAggregate>> {
-        self.materialized.get(agg_name).map(|m| {
-            let mut results: Vec<&PartialAggregate> = m.values().collect();
-            results.sort_by_key(|p| p.bucket_ts);
-            results
-        })
+    pub fn get_materialized(
+        &self,
+        database_id: u64,
+        agg_name: &str,
+    ) -> Option<Vec<&PartialAggregate>> {
+        self.materialized
+            .get(&(database_id, agg_name.to_string()))
+            .map(|m| {
+                let mut results: Vec<&PartialAggregate> = m.values().collect();
+                results.sort_by_key(|p| p.bucket_ts);
+                results
+            })
     }
 
     /// Get materialized results within a time range.
     pub fn get_materialized_range(
         &self,
+        database_id: u64,
         agg_name: &str,
         start_ms: i64,
         end_ms: i64,
     ) -> Option<Vec<&PartialAggregate>> {
-        self.materialized.get(agg_name).map(|m| {
-            let mut results: Vec<&PartialAggregate> = m
-                .values()
-                .filter(|p| p.bucket_ts >= start_ms && p.bucket_ts <= end_ms)
-                .collect();
-            results.sort_by_key(|p| p.bucket_ts);
-            results
-        })
+        self.materialized
+            .get(&(database_id, agg_name.to_string()))
+            .map(|m| {
+                let mut results: Vec<&PartialAggregate> = m
+                    .values()
+                    .filter(|p| p.bucket_ts >= start_ms && p.bucket_ts <= end_ms)
+                    .collect();
+                results.sort_by_key(|p| p.bucket_ts);
+                results
+            })
     }
 
     // -- Retention --
 
-    /// Apply retention: remove materialized buckets older than retention period.
+    /// Apply retention across every registered aggregate (all databases on
+    /// this core): remove materialized buckets older than each aggregate's
+    /// retention period. Keys are `(database_id, agg_name)`.
     pub fn apply_retention(&mut self, now_ms: i64) -> usize {
         let mut total_removed = 0;
-        let defs: Vec<(String, u64)> = self
+        let defs: Vec<((u64, String), u64)> = self
             .definitions
-            .values()
-            .map(|d| (d.name.clone(), d.retention_period_ms))
+            .iter()
+            .map(|(key, d)| (key.clone(), d.retention_period_ms))
             .collect();
 
-        for (name, retention_ms) in defs {
+        for (key, retention_ms) in defs {
             if retention_ms == 0 {
                 continue;
             }
             let cutoff = now_ms - retention_ms as i64;
-            if let Some(mat) = self.materialized.get_mut(&name) {
+            if let Some(mat) = self.materialized.get_mut(&key) {
                 let before = mat.len();
                 mat.retain(|&(bucket_ts, _), _| bucket_ts > cutoff);
                 total_removed += before - mat.len();
@@ -217,10 +262,14 @@ impl ContinuousAggregateManager {
     // -- Schema invalidation --
 
     /// Mark aggregates as stale after source schema change.
-    pub fn invalidate_for_source(&mut self, source: &str) {
-        if let Some(agg_names) = self.dependencies.get(source).cloned() {
+    pub fn invalidate_for_source(&mut self, database_id: u64, source: &str) {
+        if let Some(agg_names) = self
+            .dependencies
+            .get(&(database_id, source.to_string()))
+            .cloned()
+        {
             for name in &agg_names {
-                if let Some(def) = self.definitions.get_mut(name.as_str()) {
+                if let Some(def) = self.definitions.get_mut(&(database_id, name.clone())) {
                     def.stale = true;
                 }
             }
@@ -228,8 +277,8 @@ impl ContinuousAggregateManager {
     }
 
     /// Mark a specific aggregate as stale.
-    pub fn invalidate(&mut self, name: &str) {
-        if let Some(def) = self.definitions.get_mut(name) {
+    pub fn invalidate(&mut self, database_id: u64, name: &str) {
+        if let Some(def) = self.definitions.get_mut(&(database_id, name.to_string())) {
             def.stale = true;
         }
     }
@@ -241,11 +290,9 @@ impl ContinuousAggregateManager {
         self.definitions
             .values()
             .map(|def| {
-                let wm = self.watermarks.get(&def.name);
-                let bucket_count = self
-                    .materialized
-                    .get(&def.name)
-                    .map_or(0, |m| m.len() as u64);
+                let key = (def.database_id, def.name.clone());
+                let wm = self.watermarks.get(&key);
+                let bucket_count = self.materialized.get(&key).map_or(0, |m| m.len() as u64);
                 AggregateInfo {
                     name: def.name.clone(),
                     source: def.source.clone(),
@@ -302,6 +349,7 @@ mod tests {
 
     fn make_agg_def(name: &str, source: &str, bucket: &str) -> ContinuousAggregateDef {
         ContinuousAggregateDef {
+            database_id: 0,
             name: name.into(),
             source: source.into(),
             bucket_interval: bucket.into(),
@@ -353,7 +401,7 @@ mod tests {
     fn unregister() {
         let mut mgr = ContinuousAggregateManager::new();
         mgr.register(make_agg_def("metrics_1m", "metrics", "1m"));
-        mgr.unregister("metrics_1m");
+        mgr.unregister(0, "metrics_1m");
         assert_eq!(mgr.aggregate_count(), 0);
     }
 
@@ -364,13 +412,13 @@ mod tests {
 
         // 6000 samples at 1s intervals = 100 minutes.
         let drain = make_drain(6000, 1_700_000_000_000, 1000);
-        let refreshed = mgr.on_flush("metrics", &drain, 1_700_000_100_000);
+        let refreshed = mgr.on_flush(0, "metrics", &drain, 1_700_000_100_000);
         assert_eq!(refreshed, vec!["metrics_1m"]);
 
-        let results = mgr.get_materialized("metrics_1m").unwrap();
+        let results = mgr.get_materialized(0, "metrics_1m").unwrap();
         assert!(results.len() >= 90);
 
-        let wm = mgr.get_watermark("metrics_1m").unwrap();
+        let wm = mgr.get_watermark(0, "metrics_1m").unwrap();
         assert!(wm.watermark_ts > 1_700_000_000_000);
         assert_eq!(wm.rows_aggregated, 6000);
     }
@@ -381,14 +429,14 @@ mod tests {
         mgr.register(make_agg_def("metrics_1m", "metrics", "1m"));
 
         let drain1 = make_drain(1000, 1_700_000_000_000, 1000);
-        mgr.on_flush("metrics", &drain1, 1_700_000_001_000);
-        let count1 = mgr.get_materialized("metrics_1m").unwrap().len();
+        mgr.on_flush(0, "metrics", &drain1, 1_700_000_001_000);
+        let count1 = mgr.get_materialized(0, "metrics_1m").unwrap().len();
 
         let drain2 = make_drain(1000, 1_700_000_000_000, 1000);
-        mgr.on_flush("metrics", &drain2, 1_700_000_002_000);
+        mgr.on_flush(0, "metrics", &drain2, 1_700_000_002_000);
 
         // Same time range → same bucket count, but counts doubled.
-        let results = mgr.get_materialized("metrics_1m").unwrap();
+        let results = mgr.get_materialized(0, "metrics_1m").unwrap();
         assert_eq!(results.len(), count1);
         let mid = &results[results.len() / 2];
         assert!(mid.count > 60); // doubled from ~30 each.
@@ -424,9 +472,9 @@ mod tests {
             .unwrap();
         }
         let drain = mt.drain();
-        mgr.on_flush("metrics", &drain, 1_700_000_001_000);
+        mgr.on_flush(0, "metrics", &drain, 1_700_000_001_000);
 
-        let results = mgr.get_materialized("metrics_1m").unwrap();
+        let results = mgr.get_materialized(0, "metrics_1m").unwrap();
         let unique_keys: std::collections::HashSet<&Vec<u32>> =
             results.iter().map(|p| &p.group_key).collect();
         assert_eq!(unique_keys.len(), 2);
@@ -438,13 +486,13 @@ mod tests {
         mgr.register(make_agg_def("metrics_1m", "metrics", "1m"));
 
         let drain1 = make_drain(100, 1_700_000_060_000, 1000);
-        mgr.on_flush("metrics", &drain1, 1_700_000_200_000);
+        mgr.on_flush(0, "metrics", &drain1, 1_700_000_200_000);
 
         // O3: older data below watermark.
         let drain2 = make_drain(100, 1_700_000_000_000, 1000);
-        mgr.on_flush("metrics", &drain2, 1_700_000_300_000);
+        mgr.on_flush(0, "metrics", &drain2, 1_700_000_300_000);
 
-        let wm = mgr.get_watermark("metrics_1m").unwrap();
+        let wm = mgr.get_watermark(0, "metrics_1m").unwrap();
         assert!(wm.o3_watermark_ts.is_some());
     }
 
@@ -456,13 +504,13 @@ mod tests {
         mgr.register(def);
 
         let drain = make_drain(1200, 1_700_000_000_000, 1000);
-        mgr.on_flush("metrics", &drain, 1_700_000_000_000);
+        mgr.on_flush(0, "metrics", &drain, 1_700_000_000_000);
 
-        let before = mgr.get_materialized("metrics_1m").unwrap().len();
+        let before = mgr.get_materialized(0, "metrics_1m").unwrap().len();
         let now = 1_700_000_000_000 + 15 * 60_000;
         let removed = mgr.apply_retention(now);
         assert!(removed > 0);
-        assert!(mgr.get_materialized("metrics_1m").unwrap().len() < before);
+        assert!(mgr.get_materialized(0, "metrics_1m").unwrap().len() < before);
     }
 
     #[test]
@@ -470,11 +518,11 @@ mod tests {
         let mut mgr = ContinuousAggregateManager::new();
         mgr.register(make_agg_def("metrics_1m", "metrics", "1m"));
 
-        mgr.invalidate_for_source("metrics");
-        assert!(mgr.get_definition("metrics_1m").unwrap().stale);
+        mgr.invalidate_for_source(0, "metrics");
+        assert!(mgr.get_definition(0, "metrics_1m").unwrap().stale);
 
         let drain = make_drain(100, 1_700_000_000_000, 1000);
-        let refreshed = mgr.on_flush("metrics", &drain, 1_700_000_100_000);
+        let refreshed = mgr.on_flush(0, "metrics", &drain, 1_700_000_100_000);
         assert!(refreshed.is_empty()); // Stale → skipped.
     }
 
@@ -486,11 +534,11 @@ mod tests {
         mgr.register(def);
 
         let drain = make_drain(100, 1_700_000_000_000, 1000);
-        let refreshed = mgr.on_flush("metrics", &drain, 1_700_000_100_000);
+        let refreshed = mgr.on_flush(0, "metrics", &drain, 1_700_000_100_000);
         assert!(refreshed.is_empty()); // Manual → not triggered by flush.
 
-        mgr.manual_refresh("metrics_1m", &drain, 1_700_000_100_000);
-        assert!(!mgr.get_materialized("metrics_1m").unwrap().is_empty());
+        mgr.manual_refresh(0, "metrics_1m", &drain, 1_700_000_100_000);
+        assert!(!mgr.get_materialized(0, "metrics_1m").unwrap().is_empty());
     }
 
     #[test]
@@ -499,12 +547,12 @@ mod tests {
         mgr.register(make_agg_def("metrics_1m", "metrics", "1m"));
 
         let drain = make_drain(3600, 1_700_000_000_000, 1000);
-        mgr.on_flush("metrics", &drain, 1_700_000_000_000);
+        mgr.on_flush(0, "metrics", &drain, 1_700_000_000_000);
 
         let start = 1_700_000_000_000 + 20 * 60_000;
         let end = start + 10 * 60_000;
         let results = mgr
-            .get_materialized_range("metrics_1m", start, end)
+            .get_materialized_range(0, "metrics_1m", start, end)
             .unwrap();
         assert!(!results.is_empty());
         assert!(results.len() <= 11);

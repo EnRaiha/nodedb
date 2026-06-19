@@ -177,7 +177,11 @@ pub enum CatalogEntry {
     /// collection that holds materialized rows is NOT deleted —
     /// operators drop it separately with `DROP COLLECTION` if
     /// desired (mirrors the materialized-view contract).
-    DeleteContinuousAggregate { tenant_id: u64, name: String },
+    DeleteContinuousAggregate {
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
+    },
 
     // ── Tenant ─────────────────────────────────────────────────────
     /// Upsert a tenant identity record. Quotas are NOT part of

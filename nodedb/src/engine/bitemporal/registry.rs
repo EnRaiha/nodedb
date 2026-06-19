@@ -20,7 +20,7 @@ use std::sync::RwLock;
 use nodedb_types::config::BitemporalRetention;
 use nodedb_wal::TemporalPurgeEngine;
 
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 /// Which bitemporal-capable engine backs a collection. Determines which
 /// `MetaOp::TemporalPurge*` variant the scheduler dispatches.
@@ -69,6 +69,10 @@ pub enum RegisterError {
 
 #[derive(Debug, Clone)]
 pub struct Entry {
+    /// Owning database. Scopes the enforcement-loop's temporal-purge
+    /// dispatch so a collection's audit-retention purge runs against the
+    /// right database's storage.
+    pub database_id: DatabaseId,
     pub tenant_id: TenantId,
     pub collection: String,
     pub engine: BitemporalEngineKind,
@@ -76,7 +80,7 @@ pub struct Entry {
 }
 
 pub struct BitemporalRetentionRegistry {
-    inner: RwLock<HashMap<(TenantId, String), Entry>>,
+    inner: RwLock<HashMap<(DatabaseId, TenantId, String), Entry>>,
 }
 
 impl BitemporalRetentionRegistry {
@@ -93,6 +97,7 @@ impl BitemporalRetentionRegistry {
     /// here with a typed error rather than silently accepted.
     pub fn register(
         &self,
+        database_id: DatabaseId,
         tenant_id: TenantId,
         collection: impl Into<String>,
         engine: BitemporalEngineKind,
@@ -100,8 +105,9 @@ impl BitemporalRetentionRegistry {
     ) -> Result<(), RegisterError> {
         retention.validate()?;
         let collection = collection.into();
-        let key = (tenant_id, collection.clone());
+        let key = (database_id, tenant_id, collection.clone());
         let entry = Entry {
+            database_id,
             tenant_id,
             collection,
             engine,
@@ -113,9 +119,9 @@ impl BitemporalRetentionRegistry {
     }
 
     /// Remove a collection's policy. Idempotent.
-    pub fn unregister(&self, tenant_id: TenantId, collection: &str) {
+    pub fn unregister(&self, database_id: DatabaseId, tenant_id: TenantId, collection: &str) {
         let mut w = self.inner.write().unwrap_or_else(|p| p.into_inner());
-        w.remove(&(tenant_id, collection.to_string()));
+        w.remove(&(database_id, tenant_id, collection.to_string()));
     }
 
     /// Snapshot all registered entries. Used by the enforcement loop to
@@ -158,6 +164,7 @@ mod tests {
     fn register_accepts_above_floor() {
         let r = BitemporalRetentionRegistry::new();
         r.register(
+            DatabaseId::DEFAULT,
             TenantId::new(1),
             "users",
             BitemporalEngineKind::DocumentStrict,
@@ -172,6 +179,7 @@ mod tests {
         let r = BitemporalRetentionRegistry::new();
         let err = r
             .register(
+                DatabaseId::DEFAULT,
                 TenantId::new(1),
                 "users",
                 BitemporalEngineKind::DocumentStrict,
@@ -186,6 +194,7 @@ mod tests {
     fn register_replaces_existing() {
         let r = BitemporalRetentionRegistry::new();
         r.register(
+            DatabaseId::DEFAULT,
             TenantId::new(1),
             "c",
             BitemporalEngineKind::EdgeStore,
@@ -193,6 +202,7 @@ mod tests {
         )
         .unwrap();
         r.register(
+            DatabaseId::DEFAULT,
             TenantId::new(1),
             "c",
             BitemporalEngineKind::EdgeStore,
@@ -207,14 +217,15 @@ mod tests {
     fn unregister_is_idempotent() {
         let r = BitemporalRetentionRegistry::new();
         r.register(
+            DatabaseId::DEFAULT,
             TenantId::new(1),
             "c",
             BitemporalEngineKind::Columnar,
             ret(60_000, 0),
         )
         .unwrap();
-        r.unregister(TenantId::new(1), "c");
-        r.unregister(TenantId::new(1), "c");
+        r.unregister(DatabaseId::DEFAULT, TenantId::new(1), "c");
+        r.unregister(DatabaseId::DEFAULT, TenantId::new(1), "c");
         assert!(r.is_empty());
     }
 
@@ -246,6 +257,7 @@ mod tests {
     fn register_accepts_array_kind() {
         let r = BitemporalRetentionRegistry::new();
         r.register(
+            DatabaseId::DEFAULT,
             TenantId::new(0),
             "my_array",
             BitemporalEngineKind::Array,

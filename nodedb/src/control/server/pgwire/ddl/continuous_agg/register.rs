@@ -43,12 +43,10 @@ pub async fn register_persisted_continuous_aggregates(state: &SharedState) {
         };
         let plan = PhysicalPlan::Meta(MetaOp::RegisterContinuousAggregate { def: def.clone() });
         let tenant_id = crate::types::TenantId::new(s.tenant_id);
-        // TODO(A8-followup): StoredContinuousAggregate is not yet keyed by
-        // database; boot-time replay has no session database to thread.
         if let Err(e) = sync_dispatch::dispatch_async(
             state,
             tenant_id,
-            crate::types::DatabaseId::DEFAULT,
+            crate::types::DatabaseId::new(def.database_id),
             &def.source,
             plan,
             Duration::from_secs(5),

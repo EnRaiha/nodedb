@@ -131,8 +131,7 @@ async fn run_one(state: &Arc<SharedState>, entry: &Entry) {
     match crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
-        // TODO(A8-followup): bitemporal enforcement not yet database-scoped.
-        crate::types::DatabaseId::DEFAULT,
+        entry.database_id,
         &entry.collection,
         plan,
         Duration::from_secs(DISPATCH_DEADLINE_SECS),

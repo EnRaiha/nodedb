@@ -257,6 +257,7 @@ mod tests {
 
     fn make_policy() -> RetentionPolicyDef {
         RetentionPolicyDef {
+            database_id: 0,
             tenant_id: 1,
             name: "sensor_policy".into(),
             collection: "sensor_data".into(),

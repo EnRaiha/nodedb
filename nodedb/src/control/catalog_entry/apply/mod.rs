@@ -118,9 +118,11 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             materialized_view::delete(*tenant_id, name, catalog)
         }
         CatalogEntry::PutContinuousAggregate(stored) => continuous_aggregate::put(stored, catalog),
-        CatalogEntry::DeleteContinuousAggregate { tenant_id, name } => {
-            continuous_aggregate::delete(*tenant_id, name, catalog)
-        }
+        CatalogEntry::DeleteContinuousAggregate {
+            database_id,
+            tenant_id,
+            name,
+        } => continuous_aggregate::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutTenant(stored) => tenant::put(stored, catalog),
         CatalogEntry::DeleteTenant { tenant_id } => tenant::delete(*tenant_id, catalog),
         CatalogEntry::PutRlsPolicy(stored) => rls::put(stored, catalog),

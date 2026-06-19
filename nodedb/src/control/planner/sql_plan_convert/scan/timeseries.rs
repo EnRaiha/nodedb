@@ -43,7 +43,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
     // AUTO_TIER: split query across retention tiers if enabled.
     if *tiered
         && let Some(registry) = &ctx.retention_registry
-        && let Some(policy) = registry.get(tenant_id.as_u64(), collection)
+        && let Some(policy) = registry.get(ctx.database_id.as_u64(), tenant_id.as_u64(), collection)
         && policy.auto_tier
     {
         return Ok(super::super::super::auto_tier::plan_tiered_scan(

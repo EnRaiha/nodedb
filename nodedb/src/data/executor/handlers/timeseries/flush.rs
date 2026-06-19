@@ -150,7 +150,9 @@ impl CoreLoop {
         }
 
         // Fire continuous aggregate hook.
-        let refreshed = self.continuous_agg_mgr.on_flush(collection, &drain, now_ms);
+        let refreshed =
+            self.continuous_agg_mgr
+                .on_flush(database_id.as_u64(), collection, &drain, now_ms);
         if !refreshed.is_empty() {
             tracing::debug!(
                 collection,

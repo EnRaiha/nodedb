@@ -79,6 +79,7 @@ pub async fn create_continuous_aggregate(
     };
 
     let def = ContinuousAggregateDef {
+        database_id: database_id.as_u64(),
         name: def_from_parts.name,
         source: def_from_parts.source,
         bucket_interval: def_from_parts.bucket_interval,
@@ -109,7 +110,9 @@ pub async fn create_continuous_aggregate(
             }
         }
 
-        if let Ok(Some(_)) = catalog.get_continuous_aggregate(tenant_id.as_u64(), &def.name) {
+        if let Ok(Some(_)) =
+            catalog.get_continuous_aggregate(database_id.as_u64(), tenant_id.as_u64(), &def.name)
+        {
             return Err(sqlstate_error(
                 "42P07",
                 &format!("continuous aggregate '{}' already exists", def.name),
@@ -131,6 +134,7 @@ pub async fn create_continuous_aggregate(
     })?;
 
     let stored = StoredContinuousAggregate {
+        database_id: database_id.as_u64(),
         tenant_id: tenant_id.as_u64(),
         name: def.name.clone(),
         source: def.source.clone(),

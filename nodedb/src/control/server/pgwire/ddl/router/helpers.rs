@@ -5,6 +5,7 @@ use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 /// Execute `NDB_CHUNK_TEXT(text, chunk_size, overlap, strategy)` and return rows.
 ///
@@ -237,6 +238,7 @@ pub(super) async fn select_from_topic(
 pub(super) fn explain_tiers(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> PgWireResult<Vec<Response>> {
     use super::super::super::types::{sqlstate_error, text_field};
@@ -256,7 +258,7 @@ pub(super) fn explain_tiers(
 
     let policy = state
         .retention_policy_registry
-        .get_for_collection(tenant_id, &collection)
+        .get_for_collection(database_id.as_u64(), tenant_id, &collection)
         .ok_or_else(|| {
             sqlstate_error(
                 "42704",

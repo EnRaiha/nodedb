@@ -9,6 +9,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Definition of a continuous aggregate.
+///
+/// Map-encoded so fields (e.g. `database_id`) can be added with
+/// `#[msgpack(default)]` and older persisted definitions still decode
+/// without a migration.
 #[derive(
     Debug,
     Clone,
@@ -18,7 +22,17 @@ use serde::{Deserialize, Serialize};
     zerompk::ToMessagePack,
     zerompk::FromMessagePack,
 )]
+#[msgpack(map)]
 pub struct ContinuousAggregateDef {
+    /// Owning database. Scopes the Data-Plane manager's per-name maps and
+    /// catalog keys so an aggregate named identically in two databases
+    /// never collides or materializes against the wrong database's storage.
+    ///
+    /// `#[msgpack(default)]`: definitions persisted before database scoping
+    /// decode with `0` (`DatabaseId::DEFAULT`) — the database those legacy
+    /// rows lived in — so no migration is required.
+    #[msgpack(default)]
+    pub database_id: u64,
     /// Name of this aggregate (e.g., "metrics_1m").
     pub name: String,
     /// Source collection or aggregate to read from.

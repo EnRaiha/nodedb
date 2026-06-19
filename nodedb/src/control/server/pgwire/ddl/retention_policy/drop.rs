@@ -7,6 +7,7 @@
 //! DROP RETENTION POLICY <name> [ON <collection>]
 //! ```
 
+use nodedb_types::DatabaseId;
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 
@@ -18,6 +19,7 @@ use super::super::super::types::{require_tenant_admin, sqlstate_error};
 pub async fn drop_retention_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> PgWireResult<Vec<Response>> {
     require_tenant_admin(identity, "drop retention policies")?;
@@ -35,7 +37,7 @@ pub async fn drop_retention_policy(
     // Verify policy exists and capture definition for cleanup.
     let policy_def = state
         .retention_policy_registry
-        .get(tenant_id, &name)
+        .get(database_id.as_u64(), tenant_id, &name)
         .ok_or_else(|| {
             sqlstate_error(
                 "42704",
@@ -51,7 +53,7 @@ pub async fn drop_retention_policy(
         .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
 
     catalog
-        .delete_retention_policy(tenant_id, &name)
+        .delete_retention_policy(database_id.as_u64(), tenant_id, &name)
         .map_err(|e| sqlstate_error("XX000", &format!("catalog delete: {e}")))?;
 
     // Emit CRDT tombstone delta.
@@ -87,7 +89,9 @@ pub async fn drop_retention_policy(
     let collection = policy_def.collection.clone();
 
     // Remove from in-memory registry.
-    state.retention_policy_registry.unregister(tenant_id, &name);
+    state
+        .retention_policy_registry
+        .unregister(database_id.as_u64(), tenant_id, &name);
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

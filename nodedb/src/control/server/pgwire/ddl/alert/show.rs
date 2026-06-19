@@ -17,9 +17,12 @@ use super::super::super::types::{int8_field, sqlstate_error, text_field};
 pub fn show_alerts(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: nodedb_types::DatabaseId,
 ) -> PgWireResult<Vec<Response>> {
     let tenant_id = identity.tenant_id.as_u64();
-    let alerts = state.alert_registry.list_for_tenant(tenant_id);
+    let alerts = state
+        .alert_registry
+        .list_for_tenant_in_database(database_id.as_u64(), tenant_id);
 
     let schema = Arc::new(vec![
         text_field("name"),
@@ -94,13 +97,18 @@ pub fn show_alerts(
 pub fn show_alert_status(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: nodedb_types::DatabaseId,
     name: &str,
 ) -> PgWireResult<Vec<Response>> {
     let tenant_id = identity.tenant_id.as_u64();
     let name = name.to_lowercase();
 
     // Verify alert exists.
-    if state.alert_registry.get(tenant_id, &name).is_none() {
+    if state
+        .alert_registry
+        .get(database_id.as_u64(), tenant_id, &name)
+        .is_none()
+    {
         return Err(sqlstate_error(
             "42704",
             &format!("alert '{name}' does not exist"),

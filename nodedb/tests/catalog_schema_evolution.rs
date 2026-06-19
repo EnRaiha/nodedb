@@ -299,6 +299,7 @@ fn schedule_def_missing_target_collection_decodes() {
 }
 
 #[derive(zerompk::ToMessagePack)]
+#[msgpack(map)]
 struct RetentionPolicyDefPrev {
     tenant_id: u64,
     name: String,

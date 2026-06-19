@@ -9,6 +9,7 @@
 //! ALTER RETENTION POLICY <name> ON <collection> SET EVAL_INTERVAL = '<duration>'
 //! ```
 
+use nodedb_types::DatabaseId;
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 
@@ -20,10 +21,12 @@ use super::super::super::types::{require_tenant_admin, sqlstate_error};
 /// Handle `ALTER RETENTION POLICY <name> ENABLE | DISABLE | SET <key> = <value>`.
 ///
 /// `name`, `action`, `set_key`, and `set_value` come from the typed
-/// [`NodedbStatement::AlterRetentionPolicy`] variant.
+/// [`NodedbStatement::AlterRetentionPolicy`] variant. `database_id` scopes
+/// the in-memory registry lookup to the session's database.
 pub fn alter_retention_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     action: &str,
     set_key: Option<&str>,
@@ -36,7 +39,7 @@ pub fn alter_retention_policy(
     // Load existing policy.
     let mut def = state
         .retention_policy_registry
-        .get(tenant_id, name)
+        .get(database_id.as_u64(), tenant_id, name)
         .ok_or_else(|| {
             sqlstate_error(
                 "42704",

@@ -138,6 +138,7 @@ pub(in super::super) fn convert_create_array(
         };
         registry
             .register(
+                ctx.database_id,
                 TenantId::new(0),
                 name,
                 crate::engine::bitemporal::BitemporalEngineKind::Array,

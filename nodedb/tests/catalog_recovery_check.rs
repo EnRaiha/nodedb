@@ -59,6 +59,7 @@ fn make_alert_def(
 ) -> nodedb::event::alert::types::AlertDef {
     use nodedb::event::alert::types::{AlertCondition, AlertDef, CompareOp};
     AlertDef {
+        database_id: 0,
         tenant_id,
         name: name.to_string(),
         collection: collection.to_string(),
@@ -123,6 +124,7 @@ fn make_retention_policy(
 ) -> nodedb::engine::timeseries::retention_policy::types::RetentionPolicyDef {
     use nodedb::engine::timeseries::retention_policy::types::{RetentionPolicyDef, TierDef};
     RetentionPolicyDef {
+        database_id: 0,
         tenant_id,
         name: name.to_string(),
         collection: collection.to_string(),
