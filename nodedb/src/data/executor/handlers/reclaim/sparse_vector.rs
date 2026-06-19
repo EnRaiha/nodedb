@@ -3,20 +3,23 @@
 //! Sparse-vector engine reclaim — unlink per-collection checkpoint files.
 //!
 //! Checkpoint layout (see `sparse_vector_checkpoint.rs`):
-//! `{data_dir}/sparse-vector-ckpt/{sanitized_key}.ckpt`. `sanitize_key`
-//! replaces `:` with `__`, so per-`(tenant, collection, field)` keys
-//! land as `{tid}__{coll}__{field}.ckpt`.
+//! `{data_dir}/sparse-vector-ckpt/{db}_{tid}_{enc(coll)}_{enc(field)}.ckpt`.
+//! The filename prefix is built by the SAME encoder the write path uses
+//! ([`sparse_vector_checkpoint_prefix`]) so the `starts_with` match can never
+//! drift from the on-disk names.
 
 use std::path::Path;
 
 use tracing::{debug, warn};
 
 use super::ReclaimStats;
+use crate::data::executor::sparse_vector_checkpoint::sparse_vector_checkpoint_prefix;
 
 /// Unlink every sparse-vector checkpoint file for
-/// `(tenant_id, collection)`. Returns stats; idempotent.
+/// `(database_id, tenant_id, collection)`. Returns stats; idempotent.
 pub fn reclaim_sparse_vector_checkpoints(
     data_dir: &Path,
+    database_id: u64,
     tenant_id: u64,
     collection: &str,
 ) -> ReclaimStats {
@@ -24,7 +27,10 @@ pub fn reclaim_sparse_vector_checkpoints(
     if !ckpt_dir.exists() {
         return ReclaimStats::default();
     }
-    let prefix_sanitized = format!("{tenant_id}__{collection}__");
+
+    // Build the prefix via the shared encoder so it always matches the
+    // filenames produced by `checkpoint_sparse_vector_indexes`.
+    let prefix = sparse_vector_checkpoint_prefix(database_id, tenant_id, collection);
 
     let mut stats = ReclaimStats::default();
     let entries = match std::fs::read_dir(&ckpt_dir) {
@@ -43,7 +49,7 @@ pub fn reclaim_sparse_vector_checkpoints(
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !name.starts_with(&prefix_sanitized) {
+        if !name.starts_with(&prefix) {
             continue;
         }
         let is_ours = name.ends_with(".ckpt") || name.ends_with(".ckpt.tmp");
@@ -83,14 +89,20 @@ mod tests {
     fn matches_tenant_collection_prefix() {
         let tmp = TempDir::new().unwrap();
         let ckpt = tmp.path().join("sparse-vector-ckpt");
-        write(&ckpt.join("1__docs__title.ckpt"), b"x");
-        write(&ckpt.join("1__docs__body.ckpt"), b"yy");
-        write(&ckpt.join("1__posts__title.ckpt"), b"keep");
-        write(&ckpt.join("2__docs__title.ckpt"), b"keep");
+        // New-format names: {db}_{tid}_{enc(coll)}_{enc(field)}.
+        write(&ckpt.join("0_1_docs_title.ckpt"), b"x");
+        write(&ckpt.join("0_1_docs_body.ckpt"), b"yy");
+        // Keep: different collection.
+        write(&ckpt.join("0_1_posts_title.ckpt"), b"keep");
+        // Keep: different tenant.
+        write(&ckpt.join("0_2_docs_title.ckpt"), b"keep");
+        // Keep: different database.
+        write(&ckpt.join("1_1_docs_title.ckpt"), b"keep3");
 
-        let stats = reclaim_sparse_vector_checkpoints(tmp.path(), 1, "docs");
+        let stats = reclaim_sparse_vector_checkpoints(tmp.path(), 0, 1, "docs");
         assert_eq!(stats.files_unlinked, 2);
-        assert!(ckpt.join("1__posts__title.ckpt").exists());
-        assert!(ckpt.join("2__docs__title.ckpt").exists());
+        assert!(ckpt.join("0_1_posts_title.ckpt").exists());
+        assert!(ckpt.join("0_2_docs_title.ckpt").exists());
+        assert!(ckpt.join("1_1_docs_title.ckpt").exists());
     }
 }

@@ -18,6 +18,7 @@
 
 use nodedb_types::DatabaseId;
 
+use super::checkpoint_encoding::{dec_component, enc_component};
 use super::core_loop::CoreLoop;
 use crate::types::TenantId;
 
@@ -202,24 +203,6 @@ impl CoreLoop {
             tracing::info!(core = self.core_id, loaded, "spatial checkpoints loaded");
         }
     }
-}
-
-/// Percent-encode the bytes that are unsafe as a filename component or that
-/// collide with the structural `_` separator. db/tenant ids are numeric and
-/// pass through unchanged. Order: `%` FIRST.
-fn enc_component(s: &str) -> String {
-    s.replace('%', "%25")
-        .replace('_', "%5F")
-        .replace('/', "%2F")
-        .replace('\0', "%00")
-}
-
-/// Inverse of [`enc_component`]. `%25` LAST.
-fn dec_component(s: &str) -> String {
-    s.replace("%5F", "_")
-        .replace("%2F", "/")
-        .replace("%00", "\0")
-        .replace("%25", "%")
 }
 
 /// Build the full filename stem for a spatial checkpoint:

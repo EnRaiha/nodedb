@@ -188,10 +188,11 @@ pub struct CoreLoop {
     pub(in crate::data::executor) ivf_indexes:
         HashMap<(DatabaseId, TenantId, String), crate::engine::vector::ivf::IvfPqIndex>,
 
-    /// Per-collection sparse vector inverted indexes, keyed by (TenantId, collection, field).
+    /// Per-collection sparse vector inverted indexes, keyed by
+    /// (DatabaseId, TenantId, collection, field).
     /// The field is `"_sparse"` when no named field is specified.
     pub(in crate::data::executor) sparse_vector_indexes:
-        HashMap<(TenantId, String, String), SparseInvertedIndex>,
+        HashMap<(DatabaseId, TenantId, String, String), SparseInvertedIndex>,
 
     /// Compaction interval (how often `maybe_run_maintenance` triggers).
     pub(in crate::data::executor) compaction_interval: std::time::Duration,

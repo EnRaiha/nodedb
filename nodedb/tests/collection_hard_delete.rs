@@ -175,7 +175,7 @@ fn reclaim_handlers_are_idempotent_on_missing_files() {
     // empty data dir.
     let vector = reclaim::vector::reclaim_vector_checkpoints(base, 0, TENANT, "x");
     let spatial = reclaim::spatial::reclaim_spatial_checkpoints(base, 0, TENANT, "x");
-    let sparse = reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, TENANT, "x");
+    let sparse = reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, 0, TENANT, "x");
     let ts = reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x");
 
     assert_eq!(vector.files_unlinked, 0);
@@ -186,7 +186,7 @@ fn reclaim_handlers_are_idempotent_on_missing_files() {
     // Re-running must still succeed (no "already deleted" error).
     let _ = reclaim::vector::reclaim_vector_checkpoints(base, 0, TENANT, "x");
     let _ = reclaim::spatial::reclaim_spatial_checkpoints(base, 0, TENANT, "x");
-    let _ = reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, TENANT, "x");
+    let _ = reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, 0, TENANT, "x");
     let _ = reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x");
 }
 

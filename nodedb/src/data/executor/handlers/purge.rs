@@ -136,9 +136,9 @@ impl CoreLoop {
         // Chain hashes: remove for this tenant.
         self.chain_hashes.retain(|(t, _), _| *t != tid_key);
 
-        // Sparse vector indexes: remove for this tenant.
+        // Sparse vector indexes: remove for this tenant (all databases).
         self.sparse_vector_indexes
-            .retain(|(t, _, _), _| *t != tid_key);
+            .retain(|(_, t, _, _), _| *t != tid_key);
 
         // Columnar engines + flushed segments: remove for this tenant.
         self.columnar_engines.retain(|(_, t, _), _| *t != tid_key);

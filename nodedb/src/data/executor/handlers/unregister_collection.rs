@@ -173,9 +173,9 @@ impl CoreLoop {
         self.columnar_flushed_segments
             .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
 
-        // Sparse vector indexes (tuple key: tenant, collection, field).
+        // Sparse vector indexes (tuple key: database, tenant, collection, field).
         self.sparse_vector_indexes
-            .retain(|(t, c, _), _| !(*t == tid && c == &coll));
+            .retain(|(d, t, c, _), _| !(*d == db && *t == tid && c == &coll));
 
         // KV engine: drop this collection's hash table + indexes.
         let kv_removed = self.kv_engine.purge_collection(
@@ -219,6 +219,7 @@ impl CoreLoop {
         ));
         l1_stats.merge(reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(
             &self.data_dir,
+            db.as_u64(),
             tenant_id,
             collection,
         ));

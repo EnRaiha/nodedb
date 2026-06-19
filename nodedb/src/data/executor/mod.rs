@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub(crate) mod checkpoint_encoding;
 pub mod core_loop;
 mod dispatch;
 pub(crate) mod doc_format;
