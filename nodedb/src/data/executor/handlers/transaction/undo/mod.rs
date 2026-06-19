@@ -111,7 +111,7 @@ pub(in crate::data::executor) enum UndoEntry {
     /// rows that were tombstoned by an upsert (their PK index entries must be
     /// restored and their tombstone bits cleared).
     ColumnarInsert {
-        collection_key: (TenantId, String),
+        collection_key: (nodedb_types::DatabaseId, TenantId, String),
         row_count_before: usize,
         inserted_pks: Vec<Vec<u8>>,
         displaced: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)>,

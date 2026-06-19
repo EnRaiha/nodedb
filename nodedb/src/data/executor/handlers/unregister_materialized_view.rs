@@ -32,6 +32,7 @@ impl CoreLoop {
             tenant_id, name, "starting materialized view reclaim"
         );
         let tid = TenantId::new(tenant_id);
+        let db = task.request.database_id;
         let nm = name.to_string();
 
         // MV columnar state lives in the same per-core maps as a
@@ -45,12 +46,12 @@ impl CoreLoop {
 
         let before_engines = self.columnar_engines.len();
         self.columnar_engines
-            .retain(|(t, c), _| !(*t == tid && c == &nm));
+            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &nm));
         let engines_removed = before_engines - self.columnar_engines.len();
 
         let before_segments = self.columnar_flushed_segments.len();
         self.columnar_flushed_segments
-            .retain(|(t, c), _| !(*t == tid && c == &nm));
+            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &nm));
         let segments_removed = before_segments - self.columnar_flushed_segments.len();
 
         // Doc cache: an MV's rows can be cached the same way a

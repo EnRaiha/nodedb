@@ -41,7 +41,7 @@ impl CoreLoop {
         }
 
         // 2. Columnar memtable
-        let col_docs = self.scan_columnar(tid, collection, limit);
+        let col_docs = self.scan_columnar(did, tid, collection, limit);
         if !col_docs.is_empty() {
             return Ok(col_docs);
         }
@@ -107,7 +107,7 @@ impl CoreLoop {
         // 2. Columnar — materializes internally; iterate the batch per-row.
         // columnar stays materialized — per-row segment streaming is a separate
         // follow-up (flushed-segment decode).
-        let col_docs = self.scan_columnar(tid, collection, usize::MAX);
+        let col_docs = self.scan_columnar(did, tid, collection, usize::MAX);
         if !col_docs.is_empty() {
             for (id, bytes) in &col_docs {
                 f(id, bytes)?;
@@ -166,8 +166,19 @@ impl CoreLoop {
     }
 
     /// Scan columnar rows → standard msgpack.
-    fn scan_columnar(&self, tid: u64, collection: &str, limit: usize) -> Vec<(String, Vec<u8>)> {
+    fn scan_columnar(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        limit: usize,
+    ) -> Vec<(String, Vec<u8>)> {
         let engine_key = (crate::types::TenantId::new(tid), collection.to_string());
+        let columnar_key = (
+            nodedb_types::DatabaseId::new(database_id),
+            crate::types::TenantId::new(tid),
+            collection.to_string(),
+        );
         if let Some(mt) = self.columnar_memtables.get(&engine_key) {
             let schema = mt.schema();
             let row_count = (mt.row_count() as usize).min(limit);
@@ -207,7 +218,7 @@ impl CoreLoop {
             return results;
         }
 
-        let Some(engine) = self.columnar_engines.get(&engine_key) else {
+        let Some(engine) = self.columnar_engines.get(&columnar_key) else {
             return Vec::new();
         };
 
@@ -215,7 +226,7 @@ impl CoreLoop {
         let mut results = Vec::new();
 
         // 1. Read from flushed segments (older rows drained from prior memtable flushes).
-        if let Some(segments) = self.columnar_flushed_segments.get(&engine_key) {
+        if let Some(segments) = self.columnar_flushed_segments.get(&columnar_key) {
             for (seg_idx, seg_bytes) in segments.iter().enumerate() {
                 if results.len() >= limit {
                     break;

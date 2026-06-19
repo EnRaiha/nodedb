@@ -118,7 +118,11 @@ impl CoreLoop {
                 Err(resp) => return resp,
             };
 
-        let engine_key = (task.request.tenant_id, collection.to_string());
+        let engine_key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
 
         let engine = match self.columnar_engines.get(&engine_key) {
             Some(e) => e,

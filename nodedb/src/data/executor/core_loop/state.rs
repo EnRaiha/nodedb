@@ -216,17 +216,17 @@ pub struct CoreLoop {
 
     /// Per-collection columnar mutation engines for plain/spatial profiles.
     /// Uses `nodedb-columnar`'s `MutationEngine` with full INSERT/UPDATE/DELETE.
-    /// Key: (TenantId, collection).
+    /// Key: (DatabaseId, TenantId, collection).
     pub(in crate::data::executor) columnar_engines:
-        HashMap<(TenantId, String), nodedb_columnar::MutationEngine>,
+        HashMap<(DatabaseId, TenantId, String), nodedb_columnar::MutationEngine>,
 
-    /// Flushed columnar segment bytes, keyed by (TenantId, collection).
+    /// Flushed columnar segment bytes, keyed by (DatabaseId, TenantId, collection).
     /// Each entry is a list of encoded segment buffers produced by `SegmentWriter`.
     /// Kept in memory so `scan_columnar` can read rows that were drained from the
     /// active memtable during a flush (otherwise those rows would be lost until a
     /// real on-disk segment reader is wired up).
     pub(in crate::data::executor) columnar_flushed_segments:
-        HashMap<(TenantId, String), Vec<Vec<u8>>>,
+        HashMap<(DatabaseId, TenantId, String), Vec<Vec<u8>>>,
 
     /// Per-collection max WAL LSN that has been ingested into the memtable.
     /// Used by the WAL catch-up deduplication: if a catch-up record's LSN

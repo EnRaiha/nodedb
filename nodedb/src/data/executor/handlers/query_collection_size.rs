@@ -42,7 +42,8 @@ impl CoreLoop {
         // Columnar engine: flushed segments have their encoded
         // in-memory byte buffers; in-memory memtable is treated as 0
         // (refresh after flush for a stable number).
-        if let Some(segs) = self.columnar_flushed_segments.get(&key) {
+        let columnar_key = (task.request.database_id, tid, collection.to_string());
+        if let Some(segs) = self.columnar_flushed_segments.get(&columnar_key) {
             for seg in segs {
                 total_bytes = total_bytes.saturating_add(seg.len() as u64);
             }

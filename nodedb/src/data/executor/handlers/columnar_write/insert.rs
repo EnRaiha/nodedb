@@ -97,7 +97,11 @@ impl CoreLoop {
             );
         }
 
-        let engine_key = (task.request.tenant_id, collection.to_string());
+        let engine_key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
         let tid = task.request.tenant_id.as_u64();
         let bitemporal = self.is_bitemporal(tid, collection);
         // Ensure MutationEngine exists (auto-create on first write).

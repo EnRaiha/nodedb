@@ -16,11 +16,16 @@ impl CoreLoop {
     /// Creates the engine on first call. Used by the spatial insert path.
     pub(in crate::data::executor) fn ingest_doc_to_columnar(
         &mut self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         obj: &serde_json::Map<String, serde_json::Value>,
     ) {
-        let engine_key = (crate::types::TenantId::new(tid), collection.to_string());
+        let engine_key = (
+            nodedb_types::DatabaseId::new(database_id),
+            crate::types::TenantId::new(tid),
+            collection.to_string(),
+        );
         let bitemporal = self.is_bitemporal(tid, collection);
         let sys_now = if bitemporal {
             self.bitemporal_now_ms()

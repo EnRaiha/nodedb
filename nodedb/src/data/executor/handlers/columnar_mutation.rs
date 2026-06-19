@@ -27,7 +27,11 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, %collection, "columnar update");
 
-        let key = (task.request.tenant_id, collection.to_string());
+        let key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
         let engine = match self.columnar_engines.get_mut(&key) {
             Some(e) => e,
             None => {
@@ -145,7 +149,11 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, %collection, "columnar delete");
 
-        let key = (task.request.tenant_id, collection.to_string());
+        let key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
         let engine = match self.columnar_engines.get_mut(&key) {
             Some(e) => e,
             None => {

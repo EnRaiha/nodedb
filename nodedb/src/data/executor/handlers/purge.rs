@@ -136,9 +136,9 @@ impl CoreLoop {
             .retain(|(t, _, _), _| *t != tid_key);
 
         // Columnar engines + flushed segments: remove for this tenant.
-        self.columnar_engines.retain(|(t, _), _| *t != tid_key);
+        self.columnar_engines.retain(|(_, t, _), _| *t != tid_key);
         self.columnar_flushed_segments
-            .retain(|(t, _), _| *t != tid_key);
+            .retain(|(_, t, _), _| *t != tid_key);
 
         info!(
             core = self.core_id,

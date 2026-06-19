@@ -46,8 +46,9 @@ impl CoreLoop {
 
         let tid = task.request.tenant_id;
         let engine_key = (tid, collection.to_string());
+        let columnar_key = (task.request.database_id, tid, collection.to_string());
 
-        let Some(engine) = self.columnar_engines.get(&engine_key) else {
+        let Some(engine) = self.columnar_engines.get(&columnar_key) else {
             // Not a plain/spatial collection. Check if it is a timeseries
             // collection (data lives in columnar_memtables / ts_registries).
             let has_ts_memtable = self
@@ -88,7 +89,7 @@ impl CoreLoop {
         // ids so restart-safety is trivial (the cursor always moves forward).
         let flushed: Vec<Vec<u8>> = self
             .columnar_flushed_segments
-            .get(&engine_key)
+            .get(&columnar_key)
             .cloned()
             .unwrap_or_default();
 
@@ -238,7 +239,7 @@ impl CoreLoop {
             };
 
             if memtable_start_row != usize::MAX {
-                let engine = self.columnar_engines.get(&engine_key).unwrap();
+                let engine = self.columnar_engines.get(&columnar_key).unwrap();
                 let schema = engine.schema().clone();
                 let ts_system_idx = schema.columns.iter().position(|c| c.name == "_ts_system");
 

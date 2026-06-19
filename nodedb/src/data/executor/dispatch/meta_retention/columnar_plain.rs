@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::scan_normalize::decoded_col_to_value;
@@ -33,11 +33,12 @@ impl CoreLoop {
     /// record that covers the batch.
     pub(super) fn plain_columnar_purge(
         &mut self,
+        database_id: DatabaseId,
         tid: TenantId,
         collection: &str,
         cutoff_system_ms: i64,
     ) -> crate::Result<usize> {
-        let key = (tid, collection.to_string());
+        let key = (database_id, tid, collection.to_string());
         let engine = match self.columnar_engines.get(&key) {
             Some(e) => e,
             None => return Ok(0),

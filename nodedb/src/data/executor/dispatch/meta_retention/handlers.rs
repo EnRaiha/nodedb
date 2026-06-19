@@ -404,7 +404,8 @@ impl CoreLoop {
         }
 
         // Plain columnar profile: row-level purge via delete bitmaps.
-        match self.plain_columnar_purge(tid, collection, cutoff_system_ms) {
+        match self.plain_columnar_purge(task.request.database_id, tid, collection, cutoff_system_ms)
+        {
             Ok(n) => {
                 if n > 0 {
                     tracing::info!(

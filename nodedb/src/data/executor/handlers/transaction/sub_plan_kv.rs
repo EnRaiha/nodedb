@@ -43,7 +43,11 @@ impl CoreLoop {
         schema_bytes: &[u8],
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
-        let collection_key = (task.request.tenant_id, collection.to_string());
+        let collection_key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
 
         let row_count_before = self
             .columnar_engines
@@ -84,7 +88,7 @@ impl CoreLoop {
     /// columnar insert, without executing the insert.
     fn capture_columnar_insert_undo_state(
         &self,
-        collection_key: &(TenantId, String),
+        collection_key: &(nodedb_types::DatabaseId, TenantId, String),
         payload: &[u8],
         intent: ColumnarInsertIntent,
     ) -> ColumnarUndoState {

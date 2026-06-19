@@ -14,7 +14,7 @@ impl CoreLoop {
     /// prior row that has already been flushed out of the memtable.
     pub(in crate::data::executor) fn read_flushed_row_by_pk(
         &self,
-        engine_key: &(crate::types::TenantId, String),
+        engine_key: &(nodedb_types::DatabaseId, crate::types::TenantId, String),
         pk_bytes: &[u8],
     ) -> Option<Vec<Value>> {
         let engine = self.columnar_engines.get(engine_key)?;
@@ -39,7 +39,7 @@ impl CoreLoop {
             crate::storage::quarantine::engines::open_segment_with_quarantine(
                 reg,
                 seg_bytes,
-                &engine_key.1,
+                &engine_key.2,
                 &seg_id_str,
             )
             .ok()?

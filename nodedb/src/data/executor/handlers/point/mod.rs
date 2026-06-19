@@ -8,6 +8,7 @@
 //! lookup — no re-export needed.
 
 pub mod apply_put;
+pub mod apply_put_index;
 pub mod delete;
 pub mod get;
 pub mod insert;

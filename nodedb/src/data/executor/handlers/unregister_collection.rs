@@ -94,6 +94,7 @@ impl CoreLoop {
             tenant_id, collection, purge_lsn, "starting collection purge"
         );
         let tid = TenantId::new(tenant_id);
+        let db = task.request.database_id;
         let coll = collection.to_string();
 
         // ── Persistent engines (redb-backed, collection-scoped range drop) ──
@@ -168,9 +169,9 @@ impl CoreLoop {
 
         // Columnar engine state (per-core, tuple-keyed).
         self.columnar_engines
-            .retain(|(t, c), _| !(*t == tid && c == &coll));
+            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
         self.columnar_flushed_segments
-            .retain(|(t, c), _| !(*t == tid && c == &coll));
+            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
 
         // Sparse vector indexes (tuple key: tenant, collection, field).
         self.sparse_vector_indexes
