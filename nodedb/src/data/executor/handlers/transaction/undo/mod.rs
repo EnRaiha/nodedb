@@ -118,7 +118,7 @@ pub(in crate::data::executor) enum UndoEntry {
     },
     /// Undo a timeseries ingest by truncating the in-memory columnar memtable.
     TimeseriesIngest {
-        collection_key: (TenantId, String),
+        collection_key: (nodedb_types::DatabaseId, TenantId, String),
         row_count_before: u64,
     },
 }

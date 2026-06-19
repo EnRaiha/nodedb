@@ -82,7 +82,7 @@ impl CoreLoop {
             }
         }
 
-        let key = (tid, collection.to_string());
+        let key = (task.request.database_id, tid, collection.to_string());
 
         // ── LSN-based deduplication (last-flushed skip) ──────────────────────
         // Skip memtable re-apply if the record was already flushed to disk.
@@ -189,7 +189,7 @@ impl CoreLoop {
         wal_lsn: Option<u64>,
         now_ms: i64,
     ) -> Response {
-        let key = (tid, collection.to_string());
+        let key = (task.request.database_id, tid, collection.to_string());
         let input = match std::str::from_utf8(payload) {
             Ok(s) => s,
             Err(e) => {
@@ -265,7 +265,7 @@ impl CoreLoop {
         if let Some(mt) = self.columnar_memtables.get(&key)
             && (mt.memory_bytes() >= 64 * 1024 * 1024 || governor_pressure)
         {
-            self.flush_ts_collection(tid, collection, now_ms);
+            self.flush_ts_collection(tid, task.request.database_id, collection, now_ms);
         }
 
         let Some(mt) = self.columnar_memtables.get_mut(&key) else {
@@ -295,7 +295,7 @@ impl CoreLoop {
                 rejected,
                 "ILP batch rows rejected by hard limit, flushing and retrying"
             );
-            self.flush_ts_collection(tid, collection, now_ms);
+            self.flush_ts_collection(tid, task.request.database_id, collection, now_ms);
             if let Some(mt) = self.columnar_memtables.get_mut(&key) {
                 let mut retry_keys = HashMap::new();
                 let retry_lines = &lines[accepted..];
@@ -322,7 +322,7 @@ impl CoreLoop {
             );
         };
         if mt.memory_bytes() >= 64 * 1024 * 1024 {
-            self.flush_ts_collection(tid, collection, now_ms);
+            self.flush_ts_collection(tid, task.request.database_id, collection, now_ms);
         }
 
         // Track WAL LSN and last ingest time for dedup + idle flush.

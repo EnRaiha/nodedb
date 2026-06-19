@@ -68,7 +68,7 @@ impl CoreLoop {
         system_as_of_ms: Option<i64>,
     ) -> crate::bridge::envelope::Response {
         let tid = task.request.tenant_id;
-        let engine_key = (tid, collection.to_string());
+        let engine_key = (task.request.database_id, tid, collection.to_string());
 
         // Cursor: (segment_id, row_index).  segment_id == 0 → memtable phase.
         let (start_segment, start_row) = parse_cursor_ts(cursor);
@@ -131,10 +131,13 @@ impl CoreLoop {
                 .enumerate()
                 .map(|(i, (_start_ts, entry))| {
                     let part_id = i + 1; // 1-based (usize)
-                    let dir = self
-                        .data_dir
-                        .join("ts")
-                        .join(collection)
+                    let dir =
+                        crate::data::executor::handlers::timeseries::paths::ts_collection_dir(
+                            &self.data_dir,
+                            task.request.database_id.as_u64(),
+                            tid.as_u64(),
+                            collection,
+                        )
                         .join(&entry.dir_name);
                     (part_id, dir)
                 })

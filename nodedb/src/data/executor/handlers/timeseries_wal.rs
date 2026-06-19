@@ -58,7 +58,7 @@ impl CoreLoop {
     /// Ensure a timeseries memtable exists for the given collection, creating if needed.
     fn ensure_columnar_memtable(
         &mut self,
-        key: (crate::types::TenantId, String),
+        key: (DatabaseId, crate::types::TenantId, String),
         schema: ColumnarSchema,
     ) {
         self.columnar_memtables
@@ -78,7 +78,7 @@ impl CoreLoop {
         if let Ok(batch) =
             zerompk::from_msgpack::<nodedb_types::timeseries::TimeseriesWalBatch>(payload)
         {
-            let key = (tid, collection.to_string());
+            let key = (db_id, tid, collection.to_string());
             self.ensure_columnar_memtable(key.clone(), ColumnarSchema::metric_default());
 
             let Some(mt) = self.columnar_memtables.get_mut(&key) else {
@@ -262,7 +262,7 @@ impl CoreLoop {
             let tid_id = crate::types::TenantId::new(tenant_id);
             let db_id = DatabaseId::new(record.header.database_id);
             let collection = raw_collection.as_str();
-            let key = (tid_id, raw_collection.clone());
+            let key = (db_id, tid_id, raw_collection.clone());
 
             let record_lsn = record.header.lsn;
 

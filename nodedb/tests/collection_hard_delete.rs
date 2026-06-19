@@ -176,7 +176,7 @@ fn reclaim_handlers_are_idempotent_on_missing_files() {
     let vector = reclaim::vector::reclaim_vector_checkpoints(base, TENANT, "x");
     let spatial = reclaim::spatial::reclaim_spatial_checkpoints(base, TENANT, "x");
     let sparse = reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, TENANT, "x");
-    let ts = reclaim::timeseries::reclaim_timeseries_partitions(base, TENANT, "x");
+    let ts = reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x");
 
     assert_eq!(vector.files_unlinked, 0);
     assert_eq!(spatial.files_unlinked, 0);
@@ -187,7 +187,7 @@ fn reclaim_handlers_are_idempotent_on_missing_files() {
     let _ = reclaim::vector::reclaim_vector_checkpoints(base, TENANT, "x");
     let _ = reclaim::spatial::reclaim_spatial_checkpoints(base, TENANT, "x");
     let _ = reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, TENANT, "x");
-    let _ = reclaim::timeseries::reclaim_timeseries_partitions(base, TENANT, "x");
+    let _ = reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x");
 }
 
 /// The reclaim handlers don't touch other tenants' or other

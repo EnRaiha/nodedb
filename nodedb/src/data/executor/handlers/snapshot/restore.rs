@@ -256,15 +256,51 @@ impl CoreLoop {
                 format: "msgpack".into(),
                 detail: e.to_string(),
             })?;
+        // Snapshot keys are backward-compatible:
+        //   * new format: "{database_id}:{tenant_id}:{collection}"
+        //   * legacy format (pre-scoping): "{tenant_id}:{collection}" →
+        //     database_id defaults to `DatabaseId::DEFAULT` (0).
+        // Re-emit a canonical db-scoped key so restored data lands in the
+        // right database namespace regardless of the snapshot's age.
+        let (database_id, tenant_id, collection) = parse_timeseries_snapshot_key(key);
+        let scoped_key = format!("{database_id}:{tenant_id}:{collection}");
         // Store column data in sparse engine keyed by scoped collection.
         // Timeseries engine will rebuild memtable from these on access.
         for (col_name, col_data) in columns {
-            let restore_key = format!("{key}:{col_name}");
+            let restore_key = format!("{scoped_key}:{col_name}");
             if let Err(e) = self.sparse.put_raw(&restore_key, &col_data) {
                 warn!(restore_key, error = %e, "failed to restore timeseries column");
             }
         }
         Ok(())
+    }
+}
+
+/// Parse a timeseries snapshot key into `(database_id, tenant_id, collection)`.
+///
+/// Backward-compatible with pre-scoping snapshots:
+///   * 3+ parts → `database:tenant:collection` (collection may itself contain
+///     ':' — only the first two ':' are structural).
+///   * 2 parts → legacy `tenant:collection`; database defaults to 0
+///     (`DatabaseId::DEFAULT`).
+///   * 1 part → bare collection; database and tenant default to 0.
+fn parse_timeseries_snapshot_key(key: &str) -> (u64, u64, String) {
+    let mut it = key.splitn(3, ':');
+    let first = it.next().unwrap_or("");
+    let second = it.next();
+    let third = it.next();
+    match (second, third) {
+        (Some(tenant), Some(collection)) => {
+            let db = first.parse::<u64>().unwrap_or(0);
+            let tid = tenant.parse::<u64>().unwrap_or(0);
+            (db, tid, collection.to_string())
+        }
+        (Some(collection), None) => {
+            // Legacy 2-part key: "{tenant}:{collection}".
+            let tid = first.parse::<u64>().unwrap_or(0);
+            (0, tid, collection.to_string())
+        }
+        _ => (0, 0, first.to_string()),
     }
 }
 

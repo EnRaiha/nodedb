@@ -10,20 +10,43 @@ use crate::types::{DatabaseId, TenantId};
 impl CoreLoop {
     /// Ensure the partition registry is loaded for a timeseries collection.
     ///
-    /// On first access, scans the `ts/{collection}/` directory for existing
+    /// On first access, scans the scoped segment directory for existing
     /// partition directories and populates the registry from partition metadata.
+    /// Also triggers the lazy legacy-layout migration (see
+    /// [`super::paths::migrate_legacy_ts_dir`]): if a pre-scoping
+    /// `ts/{collection}` directory exists it is renamed into the new
+    /// `ts/{db}/{tid}/{collection}` location by the owning tenant.
     pub(in crate::data::executor) fn ensure_ts_registry(
         &mut self,
         tid: TenantId,
+        database_id: DatabaseId,
         collection: &str,
-    ) {
-        let key = (tid, collection.to_string());
+    ) -> crate::Result<()> {
+        let key = (database_id, tid, collection.to_string());
         if self.ts_registries.contains_key(&key) {
-            return;
+            return Ok(());
         }
-        let ts_dir = self.data_dir.join("ts").join(collection);
+        // Lazy one-time migration of any pre-scoping `ts/{collection}` dir into
+        // the db/tenant-scoped layout, performed by the owning tenant before
+        // the directory is scanned.
+        super::paths::migrate_legacy_ts_dir(
+            &self.data_dir,
+            database_id.as_u64(),
+            tid.as_u64(),
+            collection,
+        )
+        .map_err(|e| crate::Error::Storage {
+            engine: "timeseries".into(),
+            detail: format!("ts dir migration: {e}"),
+        })?;
+        let ts_dir = super::paths::ts_collection_dir(
+            &self.data_dir,
+            database_id.as_u64(),
+            tid.as_u64(),
+            collection,
+        );
         if !ts_dir.exists() {
-            return;
+            return Ok(());
         }
 
         let mut registry = PartitionRegistry::new(
@@ -62,6 +85,7 @@ impl CoreLoop {
             );
         }
         self.ts_registries.insert(key, registry);
+        Ok(())
     }
 
     /// Flush a timeseries collection's memtable to L1 segments.
@@ -72,10 +96,11 @@ impl CoreLoop {
     pub(in crate::data::executor) fn flush_ts_collection(
         &mut self,
         tid: TenantId,
+        database_id: DatabaseId,
         collection: &str,
         now_ms: i64,
     ) {
-        let key = (tid, collection.to_string());
+        let key = (database_id, tid, collection.to_string());
         let Some(mt) = self.columnar_memtables.get_mut(&key) else {
             return;
         };
@@ -95,7 +120,12 @@ impl CoreLoop {
         self.columnar_memtable_mem.remove(&key);
 
         // Write to L1 segments.
-        let segment_dir = self.data_dir.join(format!("ts/{collection}"));
+        let segment_dir = super::paths::ts_collection_dir(
+            &self.data_dir,
+            database_id.as_u64(),
+            tid.as_u64(),
+            collection,
+        );
         let writer = ColumnarSegmentWriter::new(&segment_dir);
         let partition_name = format!("ts-{}_{}", drain.min_ts, drain.max_ts);
 
@@ -169,7 +199,7 @@ impl CoreLoop {
             Some(g) => g.clone(),
             None => return,
         };
-        let key = (tid, collection.to_string());
+        let key = (db_id, tid, collection.to_string());
         let bytes = match self.columnar_memtables.get(&key) {
             Some(mt) => mt.memory_bytes(),
             None => {

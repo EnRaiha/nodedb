@@ -3,31 +3,29 @@
 //! Timeseries engine reclaim — remove per-collection partition
 //! directories.
 //!
-//! Partition layout (see `dispatch/other.rs::EnforceTimeseriesRetention`
-//! and `engine/timeseries/partition_registry.rs`):
-//! `{data_dir}/ts/{collection}/<partition-N>/...`.
-//! The existing path scheme is only keyed by collection name (not
-//! tenant) — a known cross-tenant-collision risk tracked separately.
-//! This reclaim walks the full partition directory and removes it
-//! recursively; we include a `tenant_id` argument so the call-site
-//! surface is consistent across every engine, but the unlink today
-//! depends only on `collection`.
+//! Partition layout (see `dispatch/meta_retention/handlers.rs` and
+//! `engine/timeseries/partition_registry.rs`):
+//! `{data_dir}/ts/{database_id}/{tenant_id}/{collection}/<partition-N>/...`.
+//! The directory is scoped by database + tenant, so reclaim removes only
+//! the requested collection's partitions for the owning (db, tenant).
 
 use std::path::Path;
 
 use tracing::{debug, warn};
 
 use super::ReclaimStats;
+use crate::data::executor::handlers::timeseries::paths::ts_collection_dir;
 
 /// Recursively remove the partition directory for `collection`.
 /// Returns the total bytes freed across every regular file below it.
 /// Idempotent: a missing directory counts as zero.
 pub fn reclaim_timeseries_partitions(
     data_dir: &Path,
-    _tenant_id: u64,
+    database_id: u64,
+    tenant_id: u64,
     collection: &str,
 ) -> ReclaimStats {
-    let partition_dir = data_dir.join("ts").join(collection);
+    let partition_dir = ts_collection_dir(data_dir, database_id, tenant_id, collection);
     if !partition_dir.exists() {
         return ReclaimStats::default();
     }
@@ -86,7 +84,7 @@ mod tests {
     fn removes_partition_dir_and_tallies_bytes() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        let coll_dir = base.join("ts").join("metrics");
+        let coll_dir = ts_collection_dir(base, 0, 1, "metrics");
         std::fs::create_dir_all(coll_dir.join("p-001")).unwrap();
         std::fs::write(coll_dir.join("p-001").join("data.bin"), b"abcd").unwrap();
         std::fs::write(coll_dir.join("p-001").join("meta.bin"), b"ef").unwrap();
@@ -94,21 +92,21 @@ mod tests {
         std::fs::write(coll_dir.join("p-002").join("data.bin"), b"g").unwrap();
 
         // Different collection — must not be touched.
-        let other = base.join("ts").join("events");
+        let other = ts_collection_dir(base, 0, 1, "events");
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("x.bin"), b"keep").unwrap();
 
-        let stats = reclaim_timeseries_partitions(base, 1, "metrics");
+        let stats = reclaim_timeseries_partitions(base, 0, 1, "metrics");
         assert_eq!(stats.files_unlinked, 3);
         assert_eq!(stats.bytes_freed, 4 + 2 + 1);
-        assert!(!base.join("ts").join("metrics").exists());
+        assert!(!ts_collection_dir(base, 0, 1, "metrics").exists());
         assert!(other.join("x.bin").exists());
     }
 
     #[test]
     fn missing_dir_is_noop() {
         let tmp = TempDir::new().unwrap();
-        let s = reclaim_timeseries_partitions(tmp.path(), 1, "nope");
+        let s = reclaim_timeseries_partitions(tmp.path(), 0, 1, "nope");
         assert_eq!(s.files_unlinked, 0);
     }
 }

@@ -23,8 +23,6 @@ impl CoreLoop {
             tenant_id, "creating full tenant snapshot"
         );
         let mut snapshot = TenantDataSnapshot::default();
-        // Used by out-of-scope maps (timeseries) that still use string-prefix keys.
-        let _prefix = format!("{tenant_id}:");
 
         // 1. Sparse engine: documents + indexes. Keys carry the leading
         // `{database_id}:` component; restore re-inserts them verbatim.
@@ -110,13 +108,13 @@ impl CoreLoop {
         }
 
         // 6. Timeseries memtables: serialize column data.
-        // Snapshot format preserves "{tenant_id}:{collection}" string keys.
+        // Snapshot format encodes "{database_id}:{tenant_id}:{collection}" keys.
         let tid_id = crate::types::TenantId::new(tenant_id);
-        for ((t, coll), mt) in &self.columnar_memtables {
+        for ((d, t, coll), mt) in &self.columnar_memtables {
             if *t != tid_id {
                 continue;
             }
-            let key_str = format!("{tenant_id}:{coll}");
+            let key_str = format!("{}:{}:{}", d.as_u64(), t.as_u64(), coll);
             match zerompk::to_msgpack_vec(&mt.export_snapshot()) {
                 Ok(bytes) => snapshot.timeseries.push((key_str, bytes)),
                 Err(e) => {

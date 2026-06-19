@@ -45,7 +45,6 @@ impl CoreLoop {
             };
 
         let tid = task.request.tenant_id;
-        let engine_key = (tid, collection.to_string());
         let columnar_key = (task.request.database_id, tid, collection.to_string());
 
         let Some(engine) = self.columnar_engines.get(&columnar_key) else {
@@ -53,9 +52,9 @@ impl CoreLoop {
             // collection (data lives in columnar_memtables / ts_registries).
             let has_ts_memtable = self
                 .columnar_memtables
-                .get(&engine_key)
+                .get(&columnar_key)
                 .is_some_and(|mt| !mt.is_empty());
-            let has_ts_partitions = self.ts_registries.contains_key(&engine_key);
+            let has_ts_partitions = self.ts_registries.contains_key(&columnar_key);
 
             if has_ts_memtable || has_ts_partitions {
                 return self.execute_ts_materialize_scan(

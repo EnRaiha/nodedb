@@ -27,7 +27,6 @@ impl CoreLoop {
         tenant_id: u64,
     ) -> Response {
         info!(core = self.core_id, tenant_id, "starting tenant purge");
-        let _prefix = format!("{tenant_id}:");
 
         // 1. Sparse engine: documents + secondary indexes (persistent, redb).
         // A tenant lives in exactly one database, so the purge is scoped by
@@ -93,11 +92,16 @@ impl CoreLoop {
         let ts_removed = {
             let tid_key = TenantId::new(tenant_id);
             let before = self.columnar_memtables.len();
-            self.columnar_memtables.retain(|(t, _), _| *t != tid_key);
-            self.columnar_memtable_mem.retain(|(t, _), _| *t != tid_key);
-            self.ts_registries.retain(|(t, _), _| *t != tid_key);
-            self.ts_max_ingested_lsn.retain(|(t, _), _| *t != tid_key);
-            self.ts_last_value_caches.retain(|(t, _), _| *t != tid_key);
+            // Tenant-wide purge: a tenant lives in exactly one database, so the
+            // database component of the key is ignored — match on tenant only.
+            self.columnar_memtables.retain(|(_, t, _), _| *t != tid_key);
+            self.columnar_memtable_mem
+                .retain(|(_, t, _), _| *t != tid_key);
+            self.ts_registries.retain(|(_, t, _), _| *t != tid_key);
+            self.ts_max_ingested_lsn
+                .retain(|(_, t, _), _| *t != tid_key);
+            self.ts_last_value_caches
+                .retain(|(_, t, _), _| *t != tid_key);
             before - self.columnar_memtables.len()
         };
 

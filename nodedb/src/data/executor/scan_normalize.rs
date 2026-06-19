@@ -173,13 +173,12 @@ impl CoreLoop {
         collection: &str,
         limit: usize,
     ) -> Vec<(String, Vec<u8>)> {
-        let engine_key = (crate::types::TenantId::new(tid), collection.to_string());
         let columnar_key = (
             nodedb_types::DatabaseId::new(database_id),
             crate::types::TenantId::new(tid),
             collection.to_string(),
         );
-        if let Some(mt) = self.columnar_memtables.get(&engine_key) {
+        if let Some(mt) = self.columnar_memtables.get(&columnar_key) {
             let schema = mt.schema();
             let row_count = (mt.row_count() as usize).min(limit);
             let col_meta: Vec<_> = schema

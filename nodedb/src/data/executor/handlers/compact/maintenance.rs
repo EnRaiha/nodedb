@@ -51,15 +51,19 @@ impl CoreLoop {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0);
-                        let collections: Vec<(crate::types::TenantId, String)> = self
+                        let collections: Vec<(
+                            nodedb_types::DatabaseId,
+                            crate::types::TenantId,
+                            String,
+                        )> = self
                             .columnar_memtables
                             .iter()
                             .filter(|(_, mt)| !mt.is_empty())
                             .map(|(k, _)| k.clone())
                             .collect();
                         let mut flushed = 0usize;
-                        for (tid, collection) in &collections {
-                            self.flush_ts_collection(*tid, collection, now_ms);
+                        for (db, tid, collection) in &collections {
+                            self.flush_ts_collection(*tid, *db, collection, now_ms);
                             flushed += 1;
                         }
                         if flushed > 0 {

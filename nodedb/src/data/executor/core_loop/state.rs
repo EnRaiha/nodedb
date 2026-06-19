@@ -200,9 +200,11 @@ pub struct CoreLoop {
     pub(in crate::data::executor) doc_cache: DocCache,
 
     /// Per-collection columnar timeseries memtables (!Send, per-core owned).
-    /// Key: (TenantId, collection).
-    pub(in crate::data::executor) columnar_memtables:
-        HashMap<(TenantId, String), crate::engine::timeseries::columnar_memtable::ColumnarMemtable>,
+    /// Key: (DatabaseId, TenantId, collection).
+    pub(in crate::data::executor) columnar_memtables: HashMap<
+        (DatabaseId, TenantId, String),
+        crate::engine::timeseries::columnar_memtable::ColumnarMemtable,
+    >,
 
     /// Live engine-memory reservation for each columnar timeseries memtable's
     /// resident footprint. Recharged via `recharge_ts_memtable_budget` after
@@ -210,9 +212,9 @@ pub struct CoreLoop {
     /// `memory_bytes()`) and dropped when `flush_ts_collection` drains the
     /// memtable — so the flush release balances the reservation instead of
     /// releasing bytes that were never reserved.
-    /// Key: (TenantId, collection).
+    /// Key: (DatabaseId, TenantId, collection).
     pub(in crate::data::executor) columnar_memtable_mem:
-        HashMap<(TenantId, String), nodedb_mem::ReservationToken>,
+        HashMap<(DatabaseId, TenantId, String), nodedb_mem::ReservationToken>,
 
     /// Per-collection columnar mutation engines for plain/spatial profiles.
     /// Uses `nodedb-columnar`'s `MutationEngine` with full INSERT/UPDATE/DELETE.
@@ -231,8 +233,8 @@ pub struct CoreLoop {
     /// Per-collection max WAL LSN that has been ingested into the memtable.
     /// Used by the WAL catch-up deduplication: if a catch-up record's LSN
     /// is <= this value, the Data Plane skips it (already ingested).
-    /// Key: (TenantId, collection).
-    pub(in crate::data::executor) ts_max_ingested_lsn: HashMap<(TenantId, String), u64>,
+    /// Key: (DatabaseId, TenantId, collection).
+    pub(in crate::data::executor) ts_max_ingested_lsn: HashMap<(DatabaseId, TenantId, String), u64>,
 
     /// Last time any timeseries ingest was processed on this core.
     /// Used by idle flush: if no ingest for 5 seconds, `maybe_run_maintenance`
@@ -240,14 +242,16 @@ pub struct CoreLoop {
     pub(in crate::data::executor) last_ts_ingest: Option<std::time::Instant>,
 
     /// Per-collection last-value caches for O(1) recent value lookup.
-    /// Key: (TenantId, collection).
-    pub(in crate::data::executor) ts_last_value_caches:
-        HashMap<(TenantId, String), crate::engine::timeseries::last_value_cache::LastValueCache>,
+    /// Key: (DatabaseId, TenantId, collection).
+    pub(in crate::data::executor) ts_last_value_caches: HashMap<
+        (DatabaseId, TenantId, String),
+        crate::engine::timeseries::last_value_cache::LastValueCache,
+    >,
 
     /// Per-collection timeseries partition registries for this core.
-    /// Key: (TenantId, collection).
+    /// Key: (DatabaseId, TenantId, collection).
     pub(in crate::data::executor) ts_registries: HashMap<
-        (TenantId, String),
+        (DatabaseId, TenantId, String),
         crate::engine::timeseries::partition_registry::PartitionRegistry,
     >,
 

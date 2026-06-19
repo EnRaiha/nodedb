@@ -165,7 +165,7 @@ impl CoreLoop {
         wal_lsn: Option<u64>,
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
-        let collection_key = (tid, collection.to_string());
+        let collection_key = (task.request.database_id, tid, collection.to_string());
 
         let row_count_before = self
             .columnar_memtables

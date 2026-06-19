@@ -153,8 +153,12 @@ impl CoreLoop {
 
     /// Test accessor: row count in a columnar memtable.
     #[cfg(test)]
-    pub fn columnar_memtable_row_count(&self, tid: u64, collection: &str) -> u64 {
-        let key = (TenantId::new(tid), collection.to_string());
+    pub fn columnar_memtable_row_count(&self, database_id: u64, tid: u64, collection: &str) -> u64 {
+        let key = (
+            nodedb_types::DatabaseId::new(database_id),
+            TenantId::new(tid),
+            collection.to_string(),
+        );
         self.columnar_memtables
             .get(&key)
             .map(|mt| mt.row_count())
@@ -163,8 +167,12 @@ impl CoreLoop {
 
     /// Test accessor: total row count across all partitions in a timeseries registry.
     #[cfg(test)]
-    pub fn ts_registry_row_count(&self, tid: u64, collection: &str) -> u64 {
-        let key = (TenantId::new(tid), collection.to_string());
+    pub fn ts_registry_row_count(&self, database_id: u64, tid: u64, collection: &str) -> u64 {
+        let key = (
+            nodedb_types::DatabaseId::new(database_id),
+            TenantId::new(tid),
+            collection.to_string(),
+        );
         self.ts_registries
             .get(&key)
             .map(|reg| {

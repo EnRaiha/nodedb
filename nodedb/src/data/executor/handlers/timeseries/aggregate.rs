@@ -31,7 +31,7 @@ impl CoreLoop {
         gap_fill: &str,
         needed_columns: &[String],
     ) -> Response {
-        let key = (tid, collection.to_string());
+        let key = (task.request.database_id, tid, collection.to_string());
         let num_aggs = aggregates.len();
 
         // Phase 1: Aggregate memtable (on TPC core).
@@ -58,9 +58,14 @@ impl CoreLoop {
 
             if !entries.is_empty() {
                 let data_dir = &self.data_dir;
+                let db_id = task.request.database_id.as_u64();
+                let tenant = tid.as_u64();
                 let partition_dirs: Vec<std::path::PathBuf> = entries
                     .iter()
-                    .map(|e| data_dir.join("ts").join(collection).join(&e.dir_name))
+                    .map(|e| {
+                        super::paths::ts_collection_dir(data_dir, db_id, tenant, collection)
+                            .join(&e.dir_name)
+                    })
                     .filter(|p| p.exists())
                     .collect();
 

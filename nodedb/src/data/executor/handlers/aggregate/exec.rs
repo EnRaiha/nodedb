@@ -142,7 +142,11 @@ impl CoreLoop {
 
         let scan_limit = self.query_tuning.aggregate_scan_cap;
 
-        let mt_key = (crate::types::TenantId::new(tid), collection.to_string());
+        let mt_key = (
+            task.request.database_id,
+            crate::types::TenantId::new(tid),
+            collection.to_string(),
+        );
         let columnar_mt = self
             .columnar_memtables
             .get(&mt_key)

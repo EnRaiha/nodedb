@@ -85,11 +85,20 @@ impl CoreLoop {
         let now_ms = now_ms();
         let cutoff = now_ms - max_age_ms;
         let mut deleted = 0usize;
-        let ts_base = self.data_dir.join("ts").join(collection);
+        let ts_base = crate::data::executor::handlers::timeseries::paths::ts_collection_dir(
+            &self.data_dir,
+            task.request.database_id.as_u64(),
+            task.request.tenant_id.as_u64(),
+            collection,
+        );
 
         let bitemporal = self.is_bitemporal(task.request.tenant_id.as_u64(), collection);
 
-        let ts_key = (task.request.tenant_id, collection.to_string());
+        let ts_key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
         if let Some(registry) = self.ts_registries.get_mut(&ts_key) {
             let expired: Vec<(i64, String)> = registry
                 .iter()
@@ -181,7 +190,11 @@ impl CoreLoop {
         task: &ExecutionTask,
         collection: &str,
     ) -> Response {
-        let lvc_key = (task.request.tenant_id, collection.to_string());
+        let lvc_key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
         let entries: Vec<(u64, i64, f64)> =
             if let Some(lvc) = self.ts_last_value_caches.get(&lvc_key) {
                 lvc.all().map(|(id, e)| (id, e.ts, e.value)).collect()
@@ -206,7 +219,11 @@ impl CoreLoop {
         collection: &str,
         series_id: u64,
     ) -> Response {
-        let lvc_key = (task.request.tenant_id, collection.to_string());
+        let lvc_key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
         let entry: Option<(i64, f64)> = self
             .ts_last_value_caches
             .get(&lvc_key)
@@ -393,7 +410,7 @@ impl CoreLoop {
         cutoff_system_ms: i64,
     ) -> Response {
         let tid = TenantId::new(tenant_id);
-        let key = (tid, collection.to_string());
+        let key = (task.request.database_id, tid, collection.to_string());
 
         // Timeseries profile: reuse partition-level retention with
         // max_age derived from the cutoff.

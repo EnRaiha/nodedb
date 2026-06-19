@@ -145,7 +145,7 @@ impl CoreLoop {
 
         // Timeseries engine.
         let ts_removed = {
-            let key = (tid, coll.clone());
+            let key = (db, tid, coll.clone());
             let mut r = 0;
             if self.columnar_memtables.remove(&key).is_some() {
                 r += 1;
@@ -222,6 +222,7 @@ impl CoreLoop {
         ));
         l1_stats.merge(reclaim::timeseries::reclaim_timeseries_partitions(
             &self.data_dir,
+            db.as_u64(),
             tenant_id,
             collection,
         ));

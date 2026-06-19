@@ -8,6 +8,7 @@ pub mod flush;
 pub mod ingest;
 pub mod ingest_formats;
 mod msgpack_decode;
+pub mod paths;
 pub mod raw_scan;
 
 pub(in crate::data::executor) use ingest::TimeseriesIngestExec;
@@ -71,7 +72,14 @@ impl CoreLoop {
         let system_as_of_ms = system_time.as_of_ms();
 
         // Lazy-load partition registry from disk if not yet loaded.
-        self.ensure_ts_registry(tid, collection);
+        if let Err(e) = self.ensure_ts_registry(tid, task.request.database_id, collection) {
+            return self.response_error(
+                task,
+                crate::bridge::envelope::ErrorCode::Internal {
+                    detail: e.to_string(),
+                },
+            );
+        }
 
         let mut filter_predicates: Vec<crate::bridge::scan_filter::ScanFilter> =
             if filters.is_empty() {
@@ -186,7 +194,7 @@ impl CoreLoop {
         collection: &str,
         time_range: (i64, i64),
     ) -> Response {
-        let key = (tid, collection.to_string());
+        let key = (task.request.database_id, tid, collection.to_string());
         let mut total: u64 = 0;
         if let Some(mt) = self.columnar_memtables.get(&key) {
             total += mt.row_count();

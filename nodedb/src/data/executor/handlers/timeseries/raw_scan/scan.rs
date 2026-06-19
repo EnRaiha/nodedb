@@ -67,7 +67,7 @@ impl CoreLoop {
             Err(resp) => return resp,
         };
 
-        let key = (tid, collection.to_string());
+        let key = (task.request.database_id, tid, collection.to_string());
         let mut results: Vec<rmpv::Value> = Vec::new();
 
         // 1. Read from memtable.
@@ -138,9 +138,16 @@ impl CoreLoop {
 
             if !entries.is_empty() {
                 let data_dir = &self.data_dir;
+                let db_id = task.request.database_id.as_u64();
+                let tenant = tid.as_u64();
                 let partition_dirs: Vec<std::path::PathBuf> = entries
                     .iter()
-                    .map(|e| data_dir.join("ts").join(collection).join(&e.dir_name))
+                    .map(|e| {
+                        crate::data::executor::handlers::timeseries::paths::ts_collection_dir(
+                            data_dir, db_id, tenant, collection,
+                        )
+                        .join(&e.dir_name)
+                    })
                     .filter(|p| p.exists())
                     .collect();
 

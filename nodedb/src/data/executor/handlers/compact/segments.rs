@@ -34,34 +34,26 @@ impl CoreLoop {
 
         // Snapshot bitemporal flags per collection up front so the
         // mutable-borrow loop below can query them without re-borrowing `self`.
-        let bitemporal_flags: std::collections::HashMap<(crate::types::TenantId, String), bool> =
-            self.ts_registries
-                .keys()
-                .map(|(tid, col)| {
-                    let flag = self.is_bitemporal(tid.as_u64(), col);
-                    ((*tid, col.clone()), flag)
-                })
-                .collect();
-
-        // Snapshot tenant→database map and the budget tracker handle so the
-        // mutable iteration below can acquire leases without re-borrowing `self`.
-        let tenant_db: std::collections::HashMap<crate::types::TenantId, DatabaseId> = self
+        let bitemporal_flags: std::collections::HashMap<
+            (DatabaseId, crate::types::TenantId, String),
+            bool,
+        > = self
             .ts_registries
             .keys()
-            .map(|(tid, _)| {
-                let db = self
-                    .tenant_database_map
-                    .get(tid)
-                    .copied()
-                    .unwrap_or(DatabaseId::DEFAULT);
-                (*tid, db)
+            .map(|(db, tid, col)| {
+                let flag = self.is_bitemporal(tid.as_u64(), col);
+                ((*db, *tid, col.clone()), flag)
             })
             .collect();
+
         let budget = self.maintenance_budget.clone();
         let core_id = self.core_id;
 
-        for ((tid, collection), registry) in &mut self.ts_registries {
-            let db = tenant_db.get(tid).copied().unwrap_or(DatabaseId::DEFAULT);
+        for ((db, tid, collection), registry) in &mut self.ts_registries {
+            // The owning database is now part of the registry key, so the
+            // maintenance-budget lease scopes directly to it — no tenant→db
+            // lookup needed.
+            let db = *db;
 
             // Per-(tenant, collection) budget gate. Lease lives across the
             // mark/purge work below — its drop records elapsed wall-clock
@@ -88,7 +80,7 @@ impl CoreLoop {
             };
 
             let bitemporal = bitemporal_flags
-                .get(&(*tid, collection.clone()))
+                .get(&(db, *tid, collection.clone()))
                 .copied()
                 .unwrap_or(false);
 
