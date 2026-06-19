@@ -43,6 +43,7 @@ impl<'a> DocumentEngine<'a> {
             let sys_from = wall_now_ms();
             self.sparse
                 .versioned_put(crate::engine::sparse::btree_versioned::VersionedPut {
+                    database_id: self.database_id,
                     tenant: self.tenant_id,
                     coll: collection,
                     doc_id,
@@ -52,8 +53,13 @@ impl<'a> DocumentEngine<'a> {
                     body: msgpack_bytes,
                 })?;
         } else {
-            self.sparse
-                .put(self.tenant_id, collection, doc_id, msgpack_bytes)?;
+            self.sparse.put(
+                self.database_id,
+                self.tenant_id,
+                collection,
+                doc_id,
+                msgpack_bytes,
+            )?;
         }
 
         if let Some(config) = self.configs.get(collection)
@@ -66,6 +72,7 @@ impl<'a> DocumentEngine<'a> {
                     if bitemporal {
                         let sys_from = wall_now_ms();
                         self.sparse.versioned_index_put(
+                            self.database_id,
                             self.tenant_id,
                             collection,
                             &index_path.path,
@@ -75,6 +82,7 @@ impl<'a> DocumentEngine<'a> {
                         )?;
                     } else {
                         self.sparse.index_put(
+                            self.database_id,
                             self.tenant_id,
                             collection,
                             &index_path.path,

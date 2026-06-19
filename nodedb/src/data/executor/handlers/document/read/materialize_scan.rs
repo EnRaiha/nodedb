@@ -40,8 +40,12 @@ impl CoreLoop {
             Err(resp) => return resp,
         };
 
-        let prefix = format!("{tid}:{collection}:");
-        let prefix_end = format!("{tid}:{collection}:\u{ffff}");
+        let prefix = crate::engine::sparse::btree::coll_prefix(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+        );
+        let prefix_end = format!("{prefix}\u{ffff}");
 
         // Cursor is the last doc_id_hex seen; resume AFTER it.
         let range_start = if cursor.is_empty() {

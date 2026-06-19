@@ -118,10 +118,15 @@ impl CoreLoop {
         debug!(core = self.core_id, %collection, %field, limit, "range scan");
 
         // Try index-backed range scan first.
-        let results = match self
-            .sparse
-            .range_scan(tid, collection, field, lower, upper, limit)
-        {
+        let results = match self.sparse.range_scan(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            field,
+            lower,
+            upper,
+            limit,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "sparse range scan failed");

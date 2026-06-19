@@ -63,12 +63,14 @@ impl CoreLoop {
 
         let bitemporal = self.is_bitemporal(tid, collection);
         let is_temporal_read = system_as_of_ms.is_some() || valid_at_ms.is_some();
+        let database_id = task.request.database_id.as_u64();
 
         // Fetch data from cache or storage. Temporal reads bypass the
         // doc cache (cache holds current state) and read the versioned
         // table directly via Ceiling at the cutoff.
         let data = if is_temporal_read {
             match self.sparse.versioned_get_as_of(
+                database_id,
                 tid,
                 collection,
                 row_key,
@@ -87,7 +89,6 @@ impl CoreLoop {
                 }
             }
         } else {
-            let database_id = task.request.database_id.as_u64();
             let cached = self
                 .doc_cache
                 .get(database_id, tid, collection, row_key)
@@ -96,9 +97,10 @@ impl CoreLoop {
                 data
             } else {
                 let res = if bitemporal {
-                    self.sparse.versioned_get_current(tid, collection, row_key)
+                    self.sparse
+                        .versioned_get_current(database_id, tid, collection, row_key)
                 } else {
-                    self.sparse.get(tid, collection, row_key)
+                    self.sparse.get(database_id, tid, collection, row_key)
                 };
                 match res {
                     Ok(Some(data)) => {

@@ -46,7 +46,12 @@ impl CoreLoop {
                 // Control Plane after this returns.
                 let count = self
                     .sparse
-                    .scan_documents(tid, collection, usize::MAX)
+                    .scan_documents(
+                        task.request.database_id.as_u64(),
+                        tid,
+                        collection,
+                        usize::MAX,
+                    )
                     .map(|docs| docs.len() as u64)
                     .unwrap_or(0);
 
@@ -112,7 +117,11 @@ impl CoreLoop {
         };
 
         // Scan all existing documents.
-        let docs = match self.sparse.scan_documents(tid, collection, usize::MAX) {
+        let database_id = task.request.database_id.as_u64();
+        let docs = match self
+            .sparse
+            .scan_documents(database_id, tid, collection, usize::MAX)
+        {
             Ok(d) => d,
             Err(e) => {
                 return self.response_error(
@@ -131,7 +140,10 @@ impl CoreLoop {
         for (doc_id, doc_bytes) in &docs {
             match super::super::strict_format::bytes_to_binary_tuple(doc_bytes, &schema) {
                 Ok(tuple_bytes) => {
-                    if let Err(e) = self.sparse.put(tid, collection, doc_id, &tuple_bytes) {
+                    if let Err(e) =
+                        self.sparse
+                            .put(database_id, tid, collection, doc_id, &tuple_bytes)
+                    {
                         tracing::warn!(doc_id, error = %e, "failed to write converted doc");
                         errors += 1;
                         continue;

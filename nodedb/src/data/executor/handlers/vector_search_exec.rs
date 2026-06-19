@@ -24,6 +24,7 @@ impl CoreLoop {
     #[inline]
     fn attach_body(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         attach: bool,
@@ -33,7 +34,7 @@ impl CoreLoop {
             return hit;
         }
         let hex = format!("{:08x}", hit.id);
-        if let Ok(Some(bytes)) = self.sparse.get(tid, collection, &hex) {
+        if let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, &hex) {
             hit.body = Some(bytes);
         }
         hit
@@ -271,7 +272,15 @@ impl CoreLoop {
         let hits: Vec<_> = results
             .iter()
             .map(|r| build_search_hit(Some(collection_ref), r.id, r.distance))
-            .map(|hit| self.attach_body(tid, collection, attach, hit))
+            .map(|hit| {
+                self.attach_body(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    attach,
+                    hit,
+                )
+            })
             .take(if rls_filters.is_empty() {
                 top_k
             } else {
@@ -323,7 +332,9 @@ impl CoreLoop {
             // CP-side translator runs the predicate; DP only attaches body.
             hits = hits
                 .into_iter()
-                .map(|h| self.attach_body(tid, collection, true, h))
+                .map(|h| {
+                    self.attach_body(task.request.database_id.as_u64(), tid, collection, true, h)
+                })
                 .collect();
         } else {
             hits.truncate(top_k);
@@ -407,7 +418,15 @@ impl CoreLoop {
             let hits: Vec<_> = results
                 .iter()
                 .map(|r| build_search_hit(doc_source, r.id, r.distance))
-                .map(|hit| self.attach_body(tid, collection, !rls_filters.is_empty(), hit))
+                .map(|hit| {
+                    self.attach_body(
+                        task.request.database_id.as_u64(),
+                        tid,
+                        collection,
+                        !rls_filters.is_empty(),
+                        hit,
+                    )
+                })
                 .take(fetch_k)
                 .collect();
             if let Some(ref m) = self.metrics {
@@ -454,7 +473,13 @@ impl CoreLoop {
                         .next()
                 });
                 let hit = build_search_hit(source, local_id, f.rrf_score as f32);
-                Some(self.attach_body(tid, collection, !rls_filters.is_empty(), hit))
+                Some(self.attach_body(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    !rls_filters.is_empty(),
+                    hit,
+                ))
             })
             .collect();
         if let Some(ref m) = self.metrics {

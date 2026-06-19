@@ -58,10 +58,11 @@ impl CoreLoop {
         // `{tenant}:{collection}:` prefix. Cheap O(N) over the
         // collection's rows — for millions of rows this is a handful
         // of redb btree seeks + iteration.
-        total_bytes = total_bytes.saturating_add(
-            self.sparse
-                .approx_bytes_for_collection(tenant_id, collection),
-        );
+        total_bytes = total_bytes.saturating_add(self.sparse.approx_bytes_for_collection(
+            database_id,
+            tenant_id,
+            collection,
+        ));
 
         // Inverted index postings share the sparse redb and don't
         // offer a cheap per-collection byte count today; covered by

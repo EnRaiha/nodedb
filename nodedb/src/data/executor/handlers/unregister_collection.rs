@@ -99,11 +99,15 @@ impl CoreLoop {
         // ── Persistent engines (redb-backed, collection-scoped range drop) ──
 
         // Sparse engine: documents + secondary indexes.
+        let database_id = task.request.database_id.as_u64();
         let (docs_removed, idxs_removed) = retry_reclaim(
             "sparse.delete_all_for_collection",
             tenant_id,
             collection,
-            || self.sparse.delete_all_for_collection(tenant_id, collection),
+            || {
+                self.sparse
+                    .delete_all_for_collection(database_id, tenant_id, collection)
+            },
         )
         .unwrap_or((0, 0));
 

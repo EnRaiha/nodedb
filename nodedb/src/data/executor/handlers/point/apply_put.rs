@@ -138,12 +138,13 @@ impl CoreLoop {
         // version at `sys_from = now()`. Non-bitemporal collections use
         // the legacy overwrite path, returning the old bytes redb replaced.
         let prior = if bitemporal {
-            let current = self
-                .sparse
-                .versioned_get_current(tid, collection, document_id)?;
+            let current =
+                self.sparse
+                    .versioned_get_current(database_id, tid, collection, document_id)?;
             self.sparse.versioned_put_in_txn(
                 txn,
                 crate::engine::sparse::btree_versioned::VersionedPut {
+                    database_id,
                     tenant: tid,
                     coll: collection,
                     doc_id: document_id,
@@ -156,7 +157,7 @@ impl CoreLoop {
             current
         } else {
             self.sparse
-                .put_in_txn(txn, tid, collection, document_id, &stored)?
+                .put_in_txn(txn, database_id, tid, collection, document_id, &stored)?
         };
 
         // Text indexing and stats use the original JSON input, not the stored
@@ -182,9 +183,9 @@ impl CoreLoop {
                 }
             }
 
-            if let Err(e) = self
-                .stats_store
-                .observe_document_in_txn(txn, tid, collection, &doc)
+            if let Err(e) =
+                self.stats_store
+                    .observe_document_in_txn(txn, database_id, tid, collection, &doc)
             {
                 warn!(core = self.core_id, %collection, error = %e, "column stats update failed");
             }
@@ -216,7 +217,15 @@ impl CoreLoop {
             && let Some(doc) = super::super::super::doc_format::decode_document(value)
         {
             let paths = config.index_paths.clone();
-            check_unique_constraints(&self.sparse, tid, collection, &doc, document_id, &paths)?;
+            check_unique_constraints(
+                &self.sparse,
+                database_id,
+                tid,
+                collection,
+                &doc,
+                document_id,
+                &paths,
+            )?;
             if bitemporal {
                 let sys_from = self.bitemporal_now_ms();
                 for path in &paths {
@@ -237,6 +246,7 @@ impl CoreLoop {
                         };
                         self.sparse.versioned_index_put_in_txn(
                             txn,
+                            database_id,
                             tid,
                             collection,
                             &path.path,
@@ -249,6 +259,7 @@ impl CoreLoop {
             } else {
                 self.apply_secondary_indexes_in_txn(
                     txn,
+                    database_id,
                     tid,
                     collection,
                     &doc,
@@ -444,8 +455,10 @@ impl CoreLoop {
 /// transaction is still clean — rejection does not roll anything back.
 /// Same-id re-puts (idempotent overwrites) are allowed through; we only
 /// reject when another row owns the value.
+#[allow(clippy::too_many_arguments)]
 fn check_unique_constraints(
     sparse: &crate::engine::sparse::btree::SparseEngine,
+    database_id: u64,
     tid: u64,
     collection: &str,
     doc: &serde_json::Value,
@@ -454,7 +467,7 @@ fn check_unique_constraints(
 ) -> crate::Result<()> {
     use crate::engine::document::store::extract_index_values;
 
-    let doc_engine = crate::engine::document::store::DocumentEngine::new(sparse, tid);
+    let doc_engine = crate::engine::document::store::DocumentEngine::new(sparse, database_id, tid);
     for path in paths {
         if !path.unique {
             continue;

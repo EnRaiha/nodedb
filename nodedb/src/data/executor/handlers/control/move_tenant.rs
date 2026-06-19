@@ -26,10 +26,13 @@ impl CoreLoop {
         new_collection: &str,
     ) -> Response {
         // Sparse engine (document schemaless + document strict).
-        if let Err(e) = self
-            .sparse
-            .rename_collection(tenant_id, old_collection, new_collection)
-        {
+        if let Err(e) = self.sparse.rename_collection(
+            old_database_id,
+            new_database_id,
+            tenant_id,
+            old_collection,
+            new_collection,
+        ) {
             return self.response_error(
                 task,
                 ErrorCode::Internal {

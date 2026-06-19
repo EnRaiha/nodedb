@@ -7,12 +7,20 @@ use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use tracing::{debug, info};
 
 /// Table definition for the primary document store.
-/// Key: "{tenant_id}:{collection}:{document_id}" → Value: document bytes.
-pub(crate) const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
+/// Key: "{database_id}:{tenant_id}:{collection}:{document_id}" → Value: document bytes.
+pub(crate) const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents_v2");
 
 /// Table definition for secondary indexes.
-/// Key: "{tenant_id}:{collection}:{field}:{value}:{document_id}" → Value: empty (existence index).
-pub(super) const INDEXES: TableDefinition<&str, &[u8]> = TableDefinition::new("indexes");
+/// Key: "{database_id}:{tenant_id}:{collection}:{field}:{value}:{document_id}" → Value: empty (existence index).
+pub(super) const INDEXES: TableDefinition<&str, &[u8]> = TableDefinition::new("indexes_v2");
+
+/// Legacy (pre-database-scoping) document table. Keys lacked the leading
+/// `{database_id}:` component. Retained read-only so [`super::migrate`] can
+/// rewrite its rows into [`DOCUMENTS`]; never written by live paths.
+pub(super) const DOCUMENTS_LEGACY: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
+
+/// Legacy (pre-database-scoping) index table. See [`DOCUMENTS_LEGACY`].
+pub(super) const INDEXES_LEGACY: TableDefinition<&str, &[u8]> = TableDefinition::new("indexes");
 
 /// Map a redb error into our crate error with context.
 pub(super) fn redb_err<E: std::fmt::Display>(ctx: &str, e: E) -> crate::Error {
@@ -22,16 +30,39 @@ pub(super) fn redb_err<E: std::fmt::Display>(ctx: &str, e: E) -> crate::Error {
     }
 }
 
+/// The `"{database_id}:{tenant_id}:{collection}:"` prefix shared by every
+/// document / secondary-index key in the current (non-versioned) tables.
+/// Centralised so encode, prefix-scan, range-bound, and rename sites can't
+/// drift apart. The trailing `:` makes it a clean lower bound for a
+/// prefix scan; the matching upper bound appends `\u{ffff}`.
+pub(crate) fn coll_prefix(database_id: u64, tenant_id: u64, collection: &str) -> String {
+    format!("{database_id}:{tenant_id}:{collection}:")
+}
+
+/// Lower bound for a `(database_id, tenant_id)` whole-tenant prefix scan.
+pub(super) fn tenant_prefix(database_id: u64, tenant_id: u64) -> String {
+    format!("{database_id}:{tenant_id}:")
+}
+
 std::thread_local! {
     static KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(256));
 }
 
-/// Build a tenant-scoped composite key `"{tenant}:{a}:{b}"` using thread-local buffer.
-fn with_tenant_key<R>(tenant_id: u64, a: &str, b: &str, f: impl FnOnce(&str) -> R) -> R {
+/// Build a database/tenant-scoped composite key `"{db}:{tenant}:{a}:{b}"`
+/// using a thread-local buffer.
+fn with_tenant_key<R>(
+    database_id: u64,
+    tenant_id: u64,
+    a: &str,
+    b: &str,
+    f: impl FnOnce(&str) -> R,
+) -> R {
     KEY_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
         buf.clear();
         use std::fmt::Write;
+        let _ = write!(buf, "{database_id}");
+        buf.push(':');
         let _ = write!(buf, "{tenant_id}");
         buf.push(':');
         buf.push_str(a);
@@ -41,8 +72,9 @@ fn with_tenant_key<R>(tenant_id: u64, a: &str, b: &str, f: impl FnOnce(&str) -> 
     })
 }
 
-/// Build a tenant-scoped index key `"{tenant}:{a}:{b}:{c}:{d}"`.
+/// Build a database/tenant-scoped index key `"{db}:{tenant}:{a}:{b}:{c}:{d}"`.
 pub(super) fn with_tenant_key4<R>(
+    database_id: u64,
     tenant_id: u64,
     a: &str,
     b: &str,
@@ -54,6 +86,8 @@ pub(super) fn with_tenant_key4<R>(
         let mut buf = buf.borrow_mut();
         buf.clear();
         use std::fmt::Write;
+        let _ = write!(buf, "{database_id}");
+        buf.push(':');
         let _ = write!(buf, "{tenant_id}");
         buf.push(':');
         buf.push_str(a);
@@ -108,12 +142,13 @@ impl SparseEngine {
     /// reflects the actual mutation — there is no separate probe.
     pub fn put(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         document_id: &str,
         value: &[u8],
     ) -> crate::Result<Option<Vec<u8>>> {
-        with_tenant_key(tenant_id, collection, document_id, |key| {
+        with_tenant_key(database_id, tenant_id, collection, document_id, |key| {
             let write_txn = self
                 .db
                 .begin_write()
@@ -139,12 +174,13 @@ impl SparseEngine {
     pub fn put_in_txn(
         &self,
         txn: &WriteTransaction,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         document_id: &str,
         value: &[u8],
     ) -> crate::Result<Option<Vec<u8>>> {
-        with_tenant_key(tenant_id, collection, document_id, |key| {
+        with_tenant_key(database_id, tenant_id, collection, document_id, |key| {
             let mut table = txn
                 .open_table(DOCUMENTS)
                 .map_err(|e| redb_err("open table", e))?;
@@ -167,11 +203,12 @@ impl SparseEngine {
     pub fn exists_in_txn(
         &self,
         txn: &WriteTransaction,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         document_id: &str,
     ) -> crate::Result<bool> {
-        with_tenant_key(tenant_id, collection, document_id, |key| {
+        with_tenant_key(database_id, tenant_id, collection, document_id, |key| {
             let table = txn
                 .open_table(DOCUMENTS)
                 .map_err(|e| redb_err("open table", e))?;
@@ -186,6 +223,7 @@ impl SparseEngine {
     /// Batch insert or update multiple documents in a single redb transaction.
     pub fn batch_put(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         documents: &[(&str, &[u8])],
@@ -205,6 +243,7 @@ impl SparseEngine {
 
             for (document_id, value) in documents {
                 with_tenant_key(
+                    database_id,
                     tenant_id,
                     collection,
                     document_id,
@@ -228,11 +267,12 @@ impl SparseEngine {
     /// Point lookup: retrieve a document by collection + document_id (tenant-scoped).
     pub fn get(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         document_id: &str,
     ) -> crate::Result<Option<Vec<u8>>> {
-        with_tenant_key(tenant_id, collection, document_id, |key| {
+        with_tenant_key(database_id, tenant_id, collection, document_id, |key| {
             let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
             let table = read_txn
                 .open_table(DOCUMENTS)
@@ -252,9 +292,14 @@ impl SparseEngine {
     /// transaction. Best-effort: redb key overhead + secondary-index
     /// bytes are not counted. Used by the
     /// `_system.dropped_collections.size_bytes_estimate` column.
-    pub fn approx_bytes_for_collection(&self, tenant_id: u64, collection: &str) -> u64 {
-        let prefix = format!("{tenant_id}:{collection}:");
-        let end = format!("{tenant_id}:{collection}:\u{ffff}");
+    pub fn approx_bytes_for_collection(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+    ) -> u64 {
+        let prefix = coll_prefix(database_id, tenant_id, collection);
+        let end = format!("{prefix}\u{ffff}");
         let read_txn = match self.db.begin_read() {
             Ok(t) => t,
             Err(_) => return 0,
@@ -283,11 +328,12 @@ impl SparseEngine {
     /// avoids a second read pass in the handler.
     pub fn delete(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         document_id: &str,
     ) -> crate::Result<Option<Vec<u8>>> {
-        with_tenant_key(tenant_id, collection, document_id, |key| {
+        with_tenant_key(database_id, tenant_id, collection, document_id, |key| {
             let write_txn = self
                 .db
                 .begin_write()
@@ -325,8 +371,10 @@ impl SparseEngine {
         &self.db
     }
 
-    /// Re-key all documents and secondary indexes for `(tenant_id, old_collection)`
-    /// to `(tenant_id, new_collection)` in a single write transaction.
+    /// Re-key all documents and secondary indexes for
+    /// `(old_database_id, tenant_id, old_collection)` to
+    /// `(new_database_id, tenant_id, new_collection)` in a single write
+    /// transaction. Supports both in-place renames and cross-database moves.
     ///
     /// Reads every row with the old prefix from both the DOCUMENTS and INDEXES
     /// tables, writes them under the new prefix, and deletes the old rows —
@@ -335,13 +383,16 @@ impl SparseEngine {
     /// Returns the count of document rows that were moved.
     pub fn rename_collection(
         &self,
+        old_database_id: u64,
+        new_database_id: u64,
         tenant_id: u64,
         old_collection: &str,
         new_collection: &str,
     ) -> crate::Result<usize> {
-        let old_prefix = format!("{tenant_id}:{old_collection}:");
-        let old_end = format!("{tenant_id}:{old_collection}:\u{ffff}");
-        let new_prefix_len = format!("{tenant_id}:{new_collection}:").len();
+        let old_prefix = coll_prefix(old_database_id, tenant_id, old_collection);
+        let old_end = format!("{old_prefix}\u{ffff}");
+        let new_prefix = coll_prefix(new_database_id, tenant_id, new_collection);
+        let new_prefix_len = new_prefix.len();
 
         // Collect document rows.
         let doc_rows: Vec<(String, Vec<u8>)> = {
@@ -356,10 +407,7 @@ impl SparseEngine {
             {
                 let (k, v) = entry.map_err(|e| redb_err("scan doc row", e))?;
                 if let Some(suffix) = k.value().strip_prefix(&old_prefix) {
-                    out.push((
-                        format!("{tenant_id}:{new_collection}:{suffix}"),
-                        v.value().to_vec(),
-                    ));
+                    out.push((format!("{new_prefix}{suffix}"), v.value().to_vec()));
                 }
             }
             out
@@ -400,10 +448,7 @@ impl SparseEngine {
             for (new_key, value) in &doc_rows {
                 docs.insert(new_key.as_str(), value.as_slice())
                     .map_err(|e| redb_err("insert doc renamed", e))?;
-                let old_key = format!(
-                    "{tenant_id}:{old_collection}:{}",
-                    &new_key[new_prefix_len..]
-                );
+                let old_key = format!("{old_prefix}{}", &new_key[new_prefix_len..]);
                 docs.remove(old_key.as_str())
                     .map_err(|e| redb_err("remove old doc", e))?;
             }
@@ -412,8 +457,8 @@ impl SparseEngine {
                 .open_table(INDEXES)
                 .map_err(|e| redb_err("open indexes write", e))?;
             for suffix in &idx_rows {
-                let new_key = format!("{tenant_id}:{new_collection}:{suffix}");
-                let old_key = format!("{tenant_id}:{old_collection}:{suffix}");
+                let new_key = format!("{new_prefix}{suffix}");
+                let old_key = format!("{old_prefix}{suffix}");
                 idxs.insert(new_key.as_str(), &[] as &[u8])
                     .map_err(|e| redb_err("insert idx renamed", e))?;
                 idxs.remove(old_key.as_str())
@@ -445,23 +490,41 @@ mod tests {
     #[test]
     fn put_and_get() {
         let (engine, _dir) = open_temp();
-        engine.put(1, "users", "u1", b"alice").unwrap();
-        engine.put(1, "users", "u2", b"bob").unwrap();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(0, 1, "users", "u2", b"bob").unwrap();
         assert_eq!(
-            engine.get(1, "users", "u1").unwrap(),
+            engine.get(0, 1, "users", "u1").unwrap(),
             Some(b"alice".to_vec())
         );
-        assert_eq!(engine.get(1, "users", "u2").unwrap(), Some(b"bob".to_vec()));
-        assert_eq!(engine.get(1, "users", "u3").unwrap(), None);
+        assert_eq!(
+            engine.get(0, 1, "users", "u2").unwrap(),
+            Some(b"bob".to_vec())
+        );
+        assert_eq!(engine.get(0, 1, "users", "u3").unwrap(), None);
+    }
+
+    #[test]
+    fn databases_are_isolated() {
+        let (engine, _dir) = open_temp();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(7, 1, "users", "u1", b"alice-db7").unwrap();
+        assert_eq!(
+            engine.get(0, 1, "users", "u1").unwrap(),
+            Some(b"alice".to_vec())
+        );
+        assert_eq!(
+            engine.get(7, 1, "users", "u1").unwrap(),
+            Some(b"alice-db7".to_vec())
+        );
     }
 
     #[test]
     fn put_overwrites() {
         let (engine, _dir) = open_temp();
-        engine.put(1, "users", "u1", b"alice").unwrap();
-        engine.put(1, "users", "u1", b"ALICE").unwrap();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(0, 1, "users", "u1", b"ALICE").unwrap();
         assert_eq!(
-            engine.get(1, "users", "u1").unwrap(),
+            engine.get(0, 1, "users", "u1").unwrap(),
             Some(b"ALICE".to_vec())
         );
     }
@@ -469,24 +532,24 @@ mod tests {
     #[test]
     fn delete_removes() {
         let (engine, _dir) = open_temp();
-        engine.put(1, "users", "u1", b"alice").unwrap();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
         assert_eq!(
-            engine.delete(1, "users", "u1").unwrap(),
+            engine.delete(0, 1, "users", "u1").unwrap(),
             Some(b"alice".to_vec())
         );
-        assert_eq!(engine.get(1, "users", "u1").unwrap(), None);
-        assert_eq!(engine.delete(1, "users", "u1").unwrap(), None);
+        assert_eq!(engine.get(0, 1, "users", "u1").unwrap(), None);
+        assert_eq!(engine.delete(0, 1, "users", "u1").unwrap(), None);
     }
 
     #[test]
     fn range_scan_with_index() {
         let (engine, _dir) = open_temp();
-        engine.index_put(1, "users", "age", "025", "u1").unwrap();
-        engine.index_put(1, "users", "age", "030", "u2").unwrap();
-        engine.index_put(1, "users", "age", "035", "u3").unwrap();
-        engine.index_put(1, "users", "age", "040", "u4").unwrap();
+        engine.index_put(0, 1, "users", "age", "025", "u1").unwrap();
+        engine.index_put(0, 1, "users", "age", "030", "u2").unwrap();
+        engine.index_put(0, 1, "users", "age", "035", "u3").unwrap();
+        engine.index_put(0, 1, "users", "age", "040", "u4").unwrap();
         let results = engine
-            .range_scan(1, "users", "age", Some(b"025"), Some(b"036"), 10)
+            .range_scan(0, 1, "users", "age", Some(b"025"), Some(b"036"), 10)
             .unwrap();
         assert_eq!(results.len(), 3);
     }
@@ -494,14 +557,14 @@ mod tests {
     #[test]
     fn collections_are_isolated() {
         let (engine, _dir) = open_temp();
-        engine.put(1, "users", "u1", b"alice").unwrap();
-        engine.put(1, "orders", "u1", b"order-1").unwrap();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(0, 1, "orders", "u1", b"order-1").unwrap();
         assert_eq!(
-            engine.get(1, "users", "u1").unwrap(),
+            engine.get(0, 1, "users", "u1").unwrap(),
             Some(b"alice".to_vec())
         );
         assert_eq!(
-            engine.get(1, "orders", "u1").unwrap(),
+            engine.get(0, 1, "orders", "u1").unwrap(),
             Some(b"order-1".to_vec())
         );
     }
@@ -510,20 +573,20 @@ mod tests {
     fn delete_index_entries_for_field() {
         let (engine, _dir) = open_temp();
         engine
-            .index_put(1, "users", "email", "alice@example.com", "u1")
+            .index_put(0, 1, "users", "email", "alice@example.com", "u1")
             .unwrap();
         engine
-            .index_put(1, "users", "email", "bob@example.com", "u2")
+            .index_put(0, 1, "users", "email", "bob@example.com", "u2")
             .unwrap();
-        engine.index_put(1, "users", "age", "30", "u1").unwrap();
-        engine.index_put(1, "users", "age", "25", "u2").unwrap();
+        engine.index_put(0, 1, "users", "age", "30", "u1").unwrap();
+        engine.index_put(0, 1, "users", "age", "25", "u2").unwrap();
         let removed = engine
-            .delete_index_entries_for_field(1, "users", "email")
+            .delete_index_entries_for_field(0, 1, "users", "email")
             .unwrap();
         assert_eq!(removed, 2);
-        let age_entries = engine.scan_index_groups(1, "users", "age").unwrap();
+        let age_entries = engine.scan_index_groups(0, 1, "users", "age").unwrap();
         assert_eq!(age_entries.len(), 2);
-        let email_entries = engine.scan_index_groups(1, "users", "email").unwrap();
+        let email_entries = engine.scan_index_groups(0, 1, "users", "email").unwrap();
         assert!(email_entries.is_empty());
     }
 }

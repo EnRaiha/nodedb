@@ -22,6 +22,7 @@ use nodedb_physical::physical_plan::PeriodLockConfig;
 /// period is closed/locked.
 pub fn check_period_lock(
     sparse: &SparseEngine,
+    database_id: u64,
     tid: u64,
     collection: &str,
     doc_bytes: &[u8],
@@ -37,7 +38,7 @@ pub fn check_period_lock(
 
     // Look up the period status in the reference collection.
     let ref_doc = sparse
-        .get(tid, &config.ref_table, &period_key)
+        .get(database_id, tid, &config.ref_table, &period_key)
         .map_err(|e| ErrorCode::Internal {
             detail: format!("period lock: failed to read {}: {e}", config.ref_table),
         })?;

@@ -50,7 +50,7 @@ pub(super) fn apply_action(
         MergeActionOp::DoNothing => Ok(false),
         MergeActionOp::Delete => {
             core.sparse
-                .delete(tid, collection, doc_id)
+                .delete(database_id, tid, collection, doc_id)
                 .map_err(|e| crate::Error::Storage {
                     engine: "sparse".into(),
                     detail: format!("merge delete {doc_id}: {e}"),
@@ -86,7 +86,7 @@ pub(super) fn apply_action(
             };
 
             core.sparse
-                .put(tid, collection, doc_id, &updated_bytes)
+                .put(database_id, tid, collection, doc_id, &updated_bytes)
                 .map_err(|e| crate::Error::Storage {
                     engine: "sparse".into(),
                     detail: format!("merge update {doc_id}: {e}"),
@@ -106,6 +106,7 @@ pub(super) fn apply_action(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_insert_action(
     core: &mut CoreLoop,
+    database_id: u64,
     tid: u64,
     collection: &str,
     source_doc: &serde_json::Value,
@@ -155,7 +156,7 @@ pub(super) fn apply_insert_action(
             };
 
             core.sparse
-                .put(tid, collection, &doc_id, &encoded)
+                .put(database_id, tid, collection, &doc_id, &encoded)
                 .map_err(|e| crate::Error::Storage {
                     engine: "sparse".into(),
                     detail: format!("merge insert {doc_id}: {e}"),

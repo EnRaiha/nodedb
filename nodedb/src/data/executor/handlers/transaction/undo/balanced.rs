@@ -19,6 +19,7 @@ impl CoreLoop {
     /// and validates that debits == credits per group_key.
     pub(in crate::data::executor::handlers::transaction) fn check_balanced_constraints(
         &self,
+        database_id: u64,
         tid: u64,
         undo_log: &[UndoEntry],
     ) -> Result<(), ErrorCode> {
@@ -31,7 +32,7 @@ impl CoreLoop {
                 old_value: None,
                 ..
             } = entry
-                && let Ok(Some(stored)) = self.sparse.get(tid, collection, document_id)
+                && let Ok(Some(stored)) = self.sparse.get(database_id, tid, collection, document_id)
             {
                 inserts_by_collection
                     .entry(collection.clone())

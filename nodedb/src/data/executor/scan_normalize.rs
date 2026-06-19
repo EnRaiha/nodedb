@@ -47,7 +47,7 @@ impl CoreLoop {
         }
 
         // 3. Sparse/document engine (schemaless + strict)
-        self.scan_sparse(tid, collection, limit)
+        self.scan_sparse(did, tid, collection, limit)
     }
 
     /// Row-at-a-time scan: invokes `f(id, raw_msgpack_bytes)` for every row
@@ -129,7 +129,7 @@ impl CoreLoop {
             }
         });
         self.sparse
-            .scan_documents_for_each(tid, collection, usize::MAX, |id, raw| {
+            .scan_documents_for_each(did, tid, collection, usize::MAX, |id, raw| {
                 let (id_s, mp) = sparse_row_to_doc(id, raw, strict_schema.as_ref());
                 f(&id_s, &mp)
             })?;
@@ -311,11 +311,12 @@ impl CoreLoop {
     /// Handles both schemaless (msgpack) and strict (Binary Tuple) formats.
     pub(super) fn scan_sparse(
         &self,
+        did: u64,
         tid: u64,
         collection: &str,
         limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        let docs = self.sparse.scan_documents(tid, collection, limit)?;
+        let docs = self.sparse.scan_documents(did, tid, collection, limit)?;
 
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
         let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
@@ -477,9 +478,9 @@ mod tests {
         let raw_a = b"{\"x\":1}";
         let raw_b = b"{\"x\":2}";
         let raw_c = b"{\"x\":3}";
-        core.sparse.put(tid, coll, "a", raw_a).unwrap();
-        core.sparse.put(tid, coll, "b", raw_b).unwrap();
-        core.sparse.put(tid, coll, "c", raw_c).unwrap();
+        core.sparse.put(0, tid, coll, "a", raw_a).unwrap();
+        core.sparse.put(0, tid, coll, "b", raw_b).unwrap();
+        core.sparse.put(0, tid, coll, "c", raw_c).unwrap();
 
         // Collect via `scan_collection` (the reference output).
         let mut expected = core.scan_collection(0, tid, coll, usize::MAX).unwrap();
@@ -575,10 +576,10 @@ mod tests {
 
         // Insert in non-alphabetical order so insertion order != sorted order.
         // If either scan path sorts internally the assertion will catch the divergence.
-        core.sparse.put(tid, coll, "d", b"{\"v\":4}").unwrap();
-        core.sparse.put(tid, coll, "a", b"{\"v\":1}").unwrap();
-        core.sparse.put(tid, coll, "c", b"{\"v\":3}").unwrap();
-        core.sparse.put(tid, coll, "b", b"{\"v\":2}").unwrap();
+        core.sparse.put(0, tid, coll, "d", b"{\"v\":4}").unwrap();
+        core.sparse.put(0, tid, coll, "a", b"{\"v\":1}").unwrap();
+        core.sparse.put(0, tid, coll, "c", b"{\"v\":3}").unwrap();
+        core.sparse.put(0, tid, coll, "b", b"{\"v\":2}").unwrap();
 
         // Reference output — NOT sorted.
         let expected = core.scan_collection(0, tid, coll, usize::MAX).unwrap();
@@ -694,8 +695,8 @@ mod tests {
 
         let tid: u64 = 1;
         let coll = "err_test";
-        core.sparse.put(tid, coll, "a", b"{\"v\":1}").unwrap();
-        core.sparse.put(tid, coll, "b", b"{\"v\":2}").unwrap();
+        core.sparse.put(0, tid, coll, "a", b"{\"v\":1}").unwrap();
+        core.sparse.put(0, tid, coll, "b", b"{\"v\":2}").unwrap();
 
         let mut calls = 0usize;
         let result = core.scan_collection_for_each(0, tid, coll, |_id, _bytes| {

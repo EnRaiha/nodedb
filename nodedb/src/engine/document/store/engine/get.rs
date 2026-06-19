@@ -9,10 +9,15 @@ impl<'a> DocumentEngine<'a> {
     /// Get a document and deserialize from MessagePack to JSON.
     pub fn get(&self, collection: &str, doc_id: &str) -> crate::Result<Option<serde_json::Value>> {
         let bytes_opt = if self.is_bitemporal(collection) {
-            self.sparse
-                .versioned_get_current(self.tenant_id, collection, doc_id)?
+            self.sparse.versioned_get_current(
+                self.database_id,
+                self.tenant_id,
+                collection,
+                doc_id,
+            )?
         } else {
-            self.sparse.get(self.tenant_id, collection, doc_id)?
+            self.sparse
+                .get(self.database_id, self.tenant_id, collection, doc_id)?
         };
         match bytes_opt {
             Some(bytes) => {
@@ -32,9 +37,10 @@ impl<'a> DocumentEngine<'a> {
     pub fn get_raw(&self, collection: &str, doc_id: &str) -> crate::Result<Option<Vec<u8>>> {
         if self.is_bitemporal(collection) {
             self.sparse
-                .versioned_get_current(self.tenant_id, collection, doc_id)
+                .versioned_get_current(self.database_id, self.tenant_id, collection, doc_id)
         } else {
-            self.sparse.get(self.tenant_id, collection, doc_id)
+            self.sparse
+                .get(self.database_id, self.tenant_id, collection, doc_id)
         }
     }
 }

@@ -71,10 +71,12 @@ impl CoreLoop {
         } else {
             0
         };
+        let database_id = task.request.database_id.as_u64();
         let get_result = if bitemporal {
-            self.sparse.versioned_get_current(tid, collection, row_key)
+            self.sparse
+                .versioned_get_current(database_id, tid, collection, row_key)
         } else {
-            self.sparse.get(tid, collection, row_key)
+            self.sparse.get(database_id, tid, collection, row_key)
         };
         match get_result {
             Ok(Some(current_bytes)) => {
@@ -237,6 +239,7 @@ impl CoreLoop {
                 let write_result = if bitemporal {
                     self.sparse
                         .versioned_put(crate::engine::sparse::btree_versioned::VersionedPut {
+                            database_id,
                             tenant: tid,
                             coll: collection,
                             doc_id: row_key,
@@ -247,7 +250,8 @@ impl CoreLoop {
                         })
                         .map(|()| None::<Vec<u8>>)
                 } else {
-                    self.sparse.put(tid, collection, row_key, &updated_bytes)
+                    self.sparse
+                        .put(database_id, tid, collection, row_key, &updated_bytes)
                 };
                 match write_result {
                     Ok(_prior) => {

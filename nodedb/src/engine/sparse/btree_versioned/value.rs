@@ -61,6 +61,7 @@ pub fn decode_value(bytes: &[u8]) -> crate::Result<DecodedValue<'_>> {
 /// Arguments for `SparseEngine::versioned_put`. Packed to keep the
 /// signature under clippy's 7-arg limit without an `#[allow]`.
 pub struct VersionedPut<'a> {
+    pub database_id: u64,
     pub tenant: u64,
     pub coll: &'a str,
     pub doc_id: &'a str,

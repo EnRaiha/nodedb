@@ -99,7 +99,7 @@ fn expired_task_returns_deadline_exceeded() {
 fn watermark_in_response() {
     let (mut core, mut req_tx, mut resp_rx, _dir) = make_core();
     core.advance_watermark(Lsn::new(99));
-    core.sparse.put(1, "x", "y", b"data").unwrap();
+    core.sparse.put(0, 1, "x", "y", b"data").unwrap();
     req_tx
         .try_push(BridgeRequest {
             inner: make_request(PhysicalPlan::Document(DocumentOp::PointGet {
@@ -193,7 +193,11 @@ fn point_put_stores_schemaless_docs_as_canonical_msgpack_maps() {
     // The handler hex-encodes the surrogate to compute the substrate
     // row key; this fixture used `Surrogate::ZERO`, which renders to
     // "00000000".
-    let stored = core.sparse.get(1, "orders", "00000000").unwrap().unwrap();
+    let stored = core
+        .sparse
+        .get(0, 1, "orders", "00000000")
+        .unwrap()
+        .unwrap();
     assert!(nodedb_query::msgpack_scan::map_header(&stored, 0).is_some());
     assert!(nodedb_query::msgpack_scan::extract_field(&stored, 0, "user_id").is_some());
     assert!(nodedb_query::msgpack_scan::extract_field(&stored, 0, "item").is_some());

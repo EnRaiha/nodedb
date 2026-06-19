@@ -4,7 +4,7 @@
 
 use tracing::debug;
 
-use super::btree::{DOCUMENTS, INDEXES, SparseEngine, redb_err};
+use super::btree::{DOCUMENTS, INDEXES, SparseEngine, coll_prefix, redb_err, tenant_prefix};
 
 impl SparseEngine {
     /// Scan documents in a collection (reads DOCUMENTS table, not INDEXES).
@@ -13,12 +13,13 @@ impl SparseEngine {
     /// collection, up to `limit`. Use for full table scans and post-scan filtering.
     pub fn scan_documents(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        let prefix = format!("{tenant_id}:{collection}:");
-        let end = format!("{tenant_id}:{collection}:\u{ffff}");
+        let prefix = coll_prefix(database_id, tenant_id, collection);
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn
@@ -36,7 +37,7 @@ impl SparseEngine {
             }
             let entry = entry.map_err(|e| redb_err("doc entry", e))?;
             let key = entry.0.value().to_string();
-            // Extract document_id from key format "{tenant}:{collection}:{doc_id}"
+            // Extract document_id from key format "{database_id}:{tenant}:{collection}:{doc_id}"
             let doc_id = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
             let value = entry.1.value().to_vec();
             results.push((doc_id, value));
@@ -62,6 +63,7 @@ impl SparseEngine {
     // consumed by `scan_collection_for_each` streaming routing
     pub fn scan_documents_for_each<F>(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         limit: usize,
@@ -70,8 +72,8 @@ impl SparseEngine {
     where
         F: FnMut(&str, &[u8]) -> crate::Result<()>,
     {
-        let prefix = format!("{tenant_id}:{collection}:");
-        let end = format!("{tenant_id}:{collection}:\u{ffff}");
+        let prefix = coll_prefix(database_id, tenant_id, collection);
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn
@@ -89,7 +91,7 @@ impl SparseEngine {
             }
             let entry = entry.map_err(|e| redb_err("doc entry", e))?;
             let key = entry.0.value().to_string();
-            // Extract document_id from key format "{tenant}:{collection}:{doc_id}"
+            // Extract document_id from key format "{database_id}:{tenant}:{collection}:{doc_id}"
             let doc_id = key.strip_prefix(&prefix).unwrap_or(&key);
             let value = entry.1.value();
             f(doc_id, value)?;
@@ -109,6 +111,7 @@ impl SparseEngine {
     /// Returns the total number of documents processed.
     pub fn scan_documents_chunked<F>(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         total_limit: usize,
@@ -118,8 +121,8 @@ impl SparseEngine {
     where
         F: FnMut(&[(String, Vec<u8>)]),
     {
-        let prefix = format!("{tenant_id}:{collection}:");
-        let end = format!("{tenant_id}:{collection}:\u{ffff}");
+        let prefix = coll_prefix(database_id, tenant_id, collection);
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn
@@ -162,17 +165,21 @@ impl SparseEngine {
     /// Scan index entries grouped by value for a field.
     ///
     /// Returns `(value, count)` pairs by scanning the INDEXES table for
-    /// `{tenant}:{collection}:{field}:*` entries and counting documents
+    /// `{database_id}:{tenant}:{collection}:{field}:*` entries and counting documents
     /// per value. Used for index-backed `GROUP BY field` + `COUNT(*)`
     /// queries — no document table access needed at all.
     pub fn scan_index_groups(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field: &str,
     ) -> crate::Result<Vec<(String, usize)>> {
-        let prefix = format!("{tenant_id}:{collection}:{field}:");
-        let end = format!("{tenant_id}:{collection}:{field}:\u{ffff}");
+        let prefix = format!(
+            "{}{field}:",
+            coll_prefix(database_id, tenant_id, collection)
+        );
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn
@@ -213,13 +220,17 @@ impl SparseEngine {
     /// then count per-facet-field using this method.
     pub fn scan_index_groups_filtered(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field: &str,
         doc_ids: &std::collections::HashSet<String>,
     ) -> crate::Result<Vec<(String, usize)>> {
-        let prefix = format!("{tenant_id}:{collection}:{field}:");
-        let end = format!("{tenant_id}:{collection}:{field}:\u{ffff}");
+        let prefix = format!(
+            "{}{field}:",
+            coll_prefix(database_id, tenant_id, collection)
+        );
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn
@@ -269,13 +280,14 @@ impl SparseEngine {
     /// document should be included in results.
     pub fn scan_documents_filtered(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         limit: usize,
         predicate: &dyn Fn(&[u8]) -> bool,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        let prefix = format!("{tenant_id}:{collection}:");
-        let end = format!("{tenant_id}:{collection}:\u{ffff}");
+        let prefix = coll_prefix(database_id, tenant_id, collection);
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn
@@ -384,30 +396,39 @@ impl SparseEngine {
 
     // ── Tenant-wide scan (for BACKUP/RESTORE) ──────────────────────
 
-    /// Scan ALL documents for a tenant across all collections.
+    /// Scan ALL documents for a tenant across all collections in a database.
     ///
-    /// Returns `(full_key, value_bytes)` pairs. The key includes the tenant
-    /// prefix: `"{tenant_id}:{collection}:{doc_id}"`.
-    pub fn scan_all_for_tenant(&self, tenant_id: u64) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        self.scan_table_for_tenant(DOCUMENTS, tenant_id, "tenant scan")
+    /// Returns `(full_key, value_bytes)` pairs. The key includes the
+    /// database/tenant prefix: `"{database_id}:{tenant_id}:{collection}:{doc_id}"`.
+    pub fn scan_all_for_tenant(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+    ) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        self.scan_table_for_tenant(DOCUMENTS, database_id, tenant_id, "tenant scan")
     }
 
-    /// Scan ALL index entries for a tenant.
+    /// Scan ALL index entries for a tenant in a database.
     ///
     /// Returns `(full_key, value_bytes)` pairs from the INDEXES table.
-    pub fn scan_indexes_for_tenant(&self, tenant_id: u64) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        self.scan_table_for_tenant(INDEXES, tenant_id, "index scan")
+    pub fn scan_indexes_for_tenant(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+    ) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        self.scan_table_for_tenant(INDEXES, database_id, tenant_id, "index scan")
     }
 
-    /// Shared scan logic for any redb table with tenant-prefixed keys.
+    /// Shared scan logic for any redb table with database/tenant-prefixed keys.
     fn scan_table_for_tenant(
         &self,
         table_def: redb::TableDefinition<&str, &[u8]>,
+        database_id: u64,
         tenant_id: u64,
         label: &str,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        let prefix = format!("{tenant_id}:");
-        let end = format!("{tenant_id}:\u{ffff}");
+        let prefix = tenant_prefix(database_id, tenant_id);
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn
@@ -458,15 +479,15 @@ mod tests {
     #[test]
     fn for_each_matches_scan_documents() {
         let (engine, _dir) = open_temp();
-        engine.put(1, "users", "u1", b"alice").unwrap();
-        engine.put(1, "users", "u2", b"bob").unwrap();
-        engine.put(1, "users", "u3", b"carol").unwrap();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(0, 1, "users", "u2", b"bob").unwrap();
+        engine.put(0, 1, "users", "u3", b"carol").unwrap();
 
-        let materialized = engine.scan_documents(1, "users", usize::MAX).unwrap();
+        let materialized = engine.scan_documents(0, 1, "users", usize::MAX).unwrap();
 
         let mut streamed: Vec<(String, Vec<u8>)> = Vec::new();
         engine
-            .scan_documents_for_each(1, "users", usize::MAX, |doc_id, bytes| {
+            .scan_documents_for_each(0, 1, "users", usize::MAX, |doc_id, bytes| {
                 streamed.push((doc_id.to_string(), bytes.to_vec()));
                 Ok(())
             })
@@ -479,15 +500,15 @@ mod tests {
     #[test]
     fn for_each_respects_limit() {
         let (engine, _dir) = open_temp();
-        engine.put(1, "users", "u1", b"alice").unwrap();
-        engine.put(1, "users", "u2", b"bob").unwrap();
-        engine.put(1, "users", "u3", b"carol").unwrap();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(0, 1, "users", "u2", b"bob").unwrap();
+        engine.put(0, 1, "users", "u3", b"carol").unwrap();
 
-        let materialized = engine.scan_documents(1, "users", 2).unwrap();
+        let materialized = engine.scan_documents(0, 1, "users", 2).unwrap();
 
         let mut streamed: Vec<(String, Vec<u8>)> = Vec::new();
         engine
-            .scan_documents_for_each(1, "users", 2, |doc_id, bytes| {
+            .scan_documents_for_each(0, 1, "users", 2, |doc_id, bytes| {
                 streamed.push((doc_id.to_string(), bytes.to_vec()));
                 Ok(())
             })
@@ -500,16 +521,17 @@ mod tests {
     #[test]
     fn for_each_propagates_callback_error() {
         let (engine, _dir) = open_temp();
-        engine.put(1, "users", "u1", b"alice").unwrap();
-        engine.put(1, "users", "u2", b"bob").unwrap();
+        engine.put(0, 1, "users", "u1", b"alice").unwrap();
+        engine.put(0, 1, "users", "u2", b"bob").unwrap();
 
         let mut seen = 0usize;
-        let result = engine.scan_documents_for_each(1, "users", usize::MAX, |_doc_id, _bytes| {
-            seen += 1;
-            Err(crate::Error::Internal {
-                detail: "stop".to_string(),
-            })
-        });
+        let result =
+            engine.scan_documents_for_each(0, 1, "users", usize::MAX, |_doc_id, _bytes| {
+                seen += 1;
+                Err(crate::Error::Internal {
+                    detail: "stop".to_string(),
+                })
+            });
 
         assert!(result.is_err());
         // Stops at the first row — does not visit every row.

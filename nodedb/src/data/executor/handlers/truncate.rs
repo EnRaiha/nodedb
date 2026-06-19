@@ -24,7 +24,12 @@ impl CoreLoop {
         debug!(core = self.core_id, %collection, "truncate");
 
         // Collect all document IDs in this collection.
-        let all_ids = match self.scan_matching_documents(tid, collection, &[]) {
+        let all_ids = match self.scan_matching_documents(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            &[],
+        ) {
             Ok(ids) => ids,
             Err(e) => {
                 return self.response_error(
@@ -37,11 +42,12 @@ impl CoreLoop {
         };
 
         // Delete each document with full cascade.
+        let database_id = task.request.database_id.as_u64();
         let mut truncated = 0u64;
         for doc_id in &all_ids {
             if self
                 .sparse
-                .delete(tid, collection, doc_id)
+                .delete(database_id, tid, collection, doc_id)
                 .ok()
                 .flatten()
                 .is_some()
@@ -58,9 +64,9 @@ impl CoreLoop {
                 {
                     warn!(core = self.core_id, %collection, %doc_id, error = %e, "truncate: inverted removal failed");
                 }
-                if let Err(e) = self
-                    .sparse
-                    .delete_indexes_for_document(tid, collection, doc_id)
+                if let Err(e) =
+                    self.sparse
+                        .delete_indexes_for_document(database_id, tid, collection, doc_id)
                 {
                     warn!(core = self.core_id, %collection, %doc_id, error = %e, "truncate: index cascade failed");
                 }
@@ -112,7 +118,10 @@ impl CoreLoop {
         collection: &str,
         field: &str,
     ) -> Response {
-        match self.stats_store.get(tid, collection, field) {
+        match self
+            .stats_store
+            .get(task.request.database_id.as_u64(), tid, collection, field)
+        {
             Ok(Some(stats)) => {
                 let result = serde_json::json!({
                     "collection": collection,

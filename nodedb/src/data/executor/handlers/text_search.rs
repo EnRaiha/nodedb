@@ -71,6 +71,7 @@ impl CoreLoop {
 
         let strict_schema = self.strict_schema_for(tenant_id, collection);
         let rows = self.hydrate_text_hits(
+            task.request.database_id.as_u64(),
             tid,
             collection,
             results.iter().map(|r| (r.doc_id, r.score, r.fuzzy)),
@@ -110,8 +111,10 @@ impl CoreLoop {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn hydrate_text_hits<I>(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         hits: I,
@@ -128,7 +131,7 @@ impl CoreLoop {
                 break;
             }
             let hex_key = crate::engine::document::store::surrogate_to_doc_id(surrogate);
-            let bytes_opt = match self.sparse.get(tid, collection, &hex_key) {
+            let bytes_opt = match self.sparse.get(database_id, tid, collection, &hex_key) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(
@@ -212,6 +215,7 @@ impl CoreLoop {
 
         let strict_schema = self.strict_schema_for(tenant_id, collection);
         let rows = self.hydrate_text_hits(
+            task.request.database_id.as_u64(),
             tid,
             collection,
             results.iter().map(|r| (r.doc_id, r.score, false)),
@@ -291,9 +295,12 @@ impl CoreLoop {
         });
 
         // Scan all documents and inject the score field.
-        let scan_result = self
-            .sparse
-            .scan_documents(tid, collection, BM25_SCAN_MAX_HITS);
+        let scan_result = self.sparse.scan_documents(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            BM25_SCAN_MAX_HITS,
+        );
         let docs = match scan_result {
             Ok(d) => d,
             Err(e) => {
@@ -492,7 +499,12 @@ impl CoreLoop {
                 if rls_filters.is_empty() {
                     return true;
                 }
-                match self.sparse.get(tid, collection, &f.document_id) {
+                match self.sparse.get(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    &f.document_id,
+                ) {
                     Ok(Some(bytes)) => {
                         super::rls_eval::rls_check_msgpack_bytes(rls_filters, &bytes)
                     }

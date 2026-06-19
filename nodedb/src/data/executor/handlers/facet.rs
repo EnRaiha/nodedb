@@ -50,7 +50,12 @@ impl CoreLoop {
             }
         };
 
-        let matching_ids = match self.scan_matching_documents(tid, collection, &filters) {
+        let matching_ids = match self.scan_matching_documents(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            &filters,
+        ) {
             Ok(ids) => ids,
             Err(e) => {
                 return self.response_error(
@@ -73,8 +78,14 @@ impl CoreLoop {
         };
 
         for field in fields {
-            let counts =
-                self.count_facet_field(tid, collection, field, &matching_set, &matching_ids);
+            let counts = self.count_facet_field(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                field,
+                &matching_set,
+                &matching_ids,
+            );
             let facet_values: Vec<serde_json::Value> = counts
                 .into_iter()
                 .take(effective_limit)
@@ -109,6 +120,7 @@ impl CoreLoop {
     /// document-scan counting (O(matching_docs)).
     fn count_facet_field(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         field: &str,
@@ -116,10 +128,13 @@ impl CoreLoop {
         matching_ids: &[String],
     ) -> Vec<(String, usize)> {
         // Fast path: index-backed counting with filtered doc set.
-        if let Ok(groups) =
-            self.sparse
-                .scan_index_groups_filtered(tid, collection, field, matching_set)
-            && !groups.is_empty()
+        if let Ok(groups) = self.sparse.scan_index_groups_filtered(
+            database_id,
+            tid,
+            collection,
+            field,
+            matching_set,
+        ) && !groups.is_empty()
         {
             return groups;
         }
@@ -127,7 +142,7 @@ impl CoreLoop {
         // Fallback: scan matching documents, extract field from msgpack, count.
         let mut counts: HashMap<String, usize> = HashMap::new();
         for doc_id in matching_ids {
-            if let Ok(Some(bytes)) = self.sparse.get(tid, collection, doc_id) {
+            if let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, doc_id) {
                 let mp = super::super::doc_format::json_to_msgpack(&bytes);
                 if let Some((start, end)) = nodedb_query::msgpack_scan::extract_field(&mp, 0, field)
                 {

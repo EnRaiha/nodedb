@@ -64,8 +64,12 @@ impl CoreLoop {
         );
 
         // Phase 1: Build source join map.
-        let source_map = match self.build_merge_source_map(tid, source_collection, source_join_col)
-        {
+        let source_map = match self.build_merge_source_map(
+            task.request.database_id.as_u64(),
+            tid,
+            source_collection,
+            source_join_col,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 return self.response_error(
@@ -93,8 +97,12 @@ impl CoreLoop {
         });
 
         // Collect all target doc IDs and their documents.
-        let prefix = format!("{tid}:{target_collection}:");
-        let end = format!("{tid}:{target_collection}:\u{ffff}");
+        let prefix = crate::engine::sparse::btree::coll_prefix(
+            task.request.database_id.as_u64(),
+            tid,
+            target_collection,
+        );
+        let end = format!("{prefix}\u{ffff}");
 
         let target_docs: Vec<(String, Vec<u8>)> = {
             let read_txn = match self
@@ -241,6 +249,7 @@ impl CoreLoop {
             if let Some(arm) = find_arm(clauses, MergeClauseKindOp::NotMatched, src_doc) {
                 match apply_insert_action(
                     self,
+                    task.request.database_id.as_u64(),
                     tid,
                     target_collection,
                     src_doc,
@@ -276,12 +285,13 @@ impl CoreLoop {
     /// Scan source collection and build join map: `join_val → document`.
     fn build_merge_source_map(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         join_col: &str,
     ) -> crate::Result<std::collections::HashMap<String, serde_json::Value>> {
-        let prefix = format!("{tid}:{collection}:");
-        let end = format!("{tid}:{collection}:\u{ffff}");
+        let prefix = crate::engine::sparse::btree::coll_prefix(database_id, tid, collection);
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self
             .sparse

@@ -80,7 +80,7 @@ impl CoreLoop {
                 let row_key = crate::engine::document::store::surrogate_to_doc_id(*surrogate);
                 let exists = self
                     .sparse
-                    .get(tid, collection, &row_key)
+                    .get(DatabaseId::DEFAULT.as_u64(), tid, collection, &row_key)
                     .ok()
                     .flatten()
                     .is_some();

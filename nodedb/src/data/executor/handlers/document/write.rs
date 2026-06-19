@@ -46,7 +46,10 @@ impl CoreLoop {
                 "document batch insert without parallel surrogates: FTS indexing skipped"
             );
         }
-        match self.sparse.batch_put(tid, collection, &refs) {
+        match self
+            .sparse
+            .batch_put(task.request.database_id.as_u64(), tid, collection, &refs)
+        {
             Ok(()) => {
                 // Auto-index text fields for full-text search (same as PointPut).
                 // Also extract secondary indexes for any registered collection config.
@@ -80,7 +83,14 @@ impl CoreLoop {
                         }
 
                         // Secondary index extraction.
-                        self.apply_secondary_indexes(tid, collection, &doc, doc_id, &index_paths);
+                        self.apply_secondary_indexes(
+                            task.request.database_id.as_u64(),
+                            tid,
+                            collection,
+                            &doc,
+                            doc_id,
+                            &index_paths,
+                        );
                     }
                 }
 
@@ -176,7 +186,11 @@ impl CoreLoop {
             "document index lookup"
         );
 
-        let doc_engine = crate::engine::document::store::DocumentEngine::new(&self.sparse, tid);
+        let doc_engine = crate::engine::document::store::DocumentEngine::new(
+            &self.sparse,
+            task.request.database_id.as_u64(),
+            tid,
+        );
         match doc_engine.index_lookup(collection, path, value) {
             Ok(doc_ids) => {
                 let payload = serde_json::json!(doc_ids);
@@ -234,7 +248,11 @@ impl CoreLoop {
             "document indexed fetch"
         );
 
-        let doc_engine = crate::engine::document::store::DocumentEngine::new(&self.sparse, tid);
+        let doc_engine = crate::engine::document::store::DocumentEngine::new(
+            &self.sparse,
+            task.request.database_id.as_u64(),
+            tid,
+        );
         let doc_ids = match doc_engine.index_lookup(collection, path, value) {
             Ok(ids) => ids,
             Err(e) => {
@@ -263,7 +281,10 @@ impl CoreLoop {
 
         let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
         for doc_id in doc_ids.iter().skip(offset).take(limit) {
-            match self.sparse.get(tid, collection, doc_id) {
+            match self
+                .sparse
+                .get(task.request.database_id.as_u64(), tid, collection, doc_id)
+            {
                 Ok(Some(bytes)) => {
                     let payload = if let Some(ref schema) = strict_schema {
                         match super::super::super::strict_format::binary_tuple_to_msgpack(
@@ -361,7 +382,12 @@ impl CoreLoop {
         // cap matches the Data Plane's other collection-wide scans; rows
         // beyond this are handled by a future chunked backfill (see
         // `scan_documents_chunked`).
-        let docs = match self.sparse.scan_documents(tid, collection, 1_000_000) {
+        let docs = match self.sparse.scan_documents(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            1_000_000,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 return self.response_error(
@@ -427,10 +453,15 @@ impl CoreLoop {
                 if unique {
                     seen.insert(stored.clone(), doc_id.clone());
                 }
-                if let Err(e) = self
-                    .sparse
-                    .index_put_in_txn(&txn, tid, collection, path, &stored, doc_id)
-                {
+                if let Err(e) = self.sparse.index_put_in_txn(
+                    &txn,
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    path,
+                    &stored,
+                    doc_id,
+                ) {
                     return self.response_error(
                         task,
                         crate::bridge::envelope::ErrorCode::Internal {
@@ -471,10 +502,12 @@ impl CoreLoop {
             "drop document index"
         );
 
-        match self
-            .sparse
-            .delete_index_entries_for_field(tid, collection, field)
-        {
+        match self.sparse.delete_index_entries_for_field(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            field,
+        ) {
             Ok(removed) => {
                 match super::super::super::response_codec::encode_count("removed", removed) {
                     Ok(bytes) => self.response_with_payload(task, bytes),

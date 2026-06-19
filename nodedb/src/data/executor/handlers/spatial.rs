@@ -438,7 +438,9 @@ mod tests {
         });
         let msgpack = nodedb_types::json_to_msgpack(&geojson).unwrap();
 
-        core.sparse.put(tid, collection, &doc_id, &msgpack).unwrap();
+        core.sparse
+            .put(0, tid, collection, &doc_id, &msgpack)
+            .unwrap();
 
         // Manually populate the R-tree and the doc-map.
         let geom: nodedb_types::geometry::Geometry =

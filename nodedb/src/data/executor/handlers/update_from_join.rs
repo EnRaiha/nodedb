@@ -60,7 +60,12 @@ impl CoreLoop {
 
         // Phase 1: Scan source collection, build join map:
         //   source_join_value (as string) → serde_json::Value (the source document).
-        let source_map = match self.build_source_join_map(tid, source_collection, source_join_col) {
+        let source_map = match self.build_source_join_map(
+            task.request.database_id.as_u64(),
+            tid,
+            source_collection,
+            source_join_col,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 return self.response_error(
@@ -119,8 +124,12 @@ impl CoreLoop {
         });
 
         // Scan target documents and apply updates for those that match.
-        let prefix = format!("{tid}:{target_collection}:");
-        let end = format!("{tid}:{target_collection}:\u{ffff}");
+        let prefix = crate::engine::sparse::btree::coll_prefix(
+            task.request.database_id.as_u64(),
+            tid,
+            target_collection,
+        );
+        let end = format!("{prefix}\u{ffff}");
 
         let target_doc_ids: Vec<String> = {
             let read_txn = match self
@@ -191,7 +200,12 @@ impl CoreLoop {
         };
 
         for doc_id in &target_doc_ids {
-            let current_bytes = match self.sparse.get(tid, target_collection, doc_id) {
+            let current_bytes = match self.sparse.get(
+                task.request.database_id.as_u64(),
+                tid,
+                target_collection,
+                doc_id,
+            ) {
                 Ok(Some(b)) => b,
                 Ok(None) => continue,
                 Err(_) => continue,
@@ -289,7 +303,13 @@ impl CoreLoop {
 
             if self
                 .sparse
-                .put(tid, target_collection, doc_id, &updated_bytes)
+                .put(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    target_collection,
+                    doc_id,
+                    &updated_bytes,
+                )
                 .is_ok()
             {
                 self.doc_cache.put(
@@ -336,12 +356,13 @@ impl CoreLoop {
     /// Scan the source collection and build a `HashMap<join_key_string, document>`.
     fn build_source_join_map(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         join_col: &str,
     ) -> crate::Result<std::collections::HashMap<String, serde_json::Value>> {
-        let prefix = format!("{tid}:{collection}:");
-        let end = format!("{tid}:{collection}:\u{ffff}");
+        let prefix = crate::engine::sparse::btree::coll_prefix(database_id, tid, collection);
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self
             .sparse

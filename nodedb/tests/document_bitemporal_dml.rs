@@ -21,7 +21,7 @@ fn open() -> (SparseEngine, tempfile::TempDir) {
 }
 
 fn register(sparse: &SparseEngine) -> DocumentEngine<'_> {
-    let mut e = DocumentEngine::new(sparse, 1);
+    let mut e = DocumentEngine::new(sparse, 0, 1);
     e.register_collection(CollectionConfig::new("c").with_bitemporal(true));
     e
 }
@@ -48,7 +48,7 @@ fn update_via_put_creates_new_version_and_preserves_old() {
 
     // History at t_mid still sees v=1.
     let body = sparse
-        .versioned_get_as_of(1, "c", "k", Some(t_mid), None)
+        .versioned_get_as_of(0, 1, "c", "k", Some(t_mid), None)
         .unwrap()
         .expect("historical version");
     let rmpv_val = rmpv::decode::read_value(&mut body.as_slice()).unwrap();
@@ -74,7 +74,7 @@ fn delete_appends_tombstone_but_prior_version_still_visible_as_of() {
 
     // Historical read at t_before_delete: still Alice.
     let body = sparse
-        .versioned_get_as_of(1, "c", "k", Some(t_before_delete), None)
+        .versioned_get_as_of(0, 1, "c", "k", Some(t_before_delete), None)
         .unwrap()
         .expect("pre-delete version still reachable");
     let rmpv_val = rmpv::decode::read_value(&mut body.as_slice()).unwrap();
@@ -94,7 +94,7 @@ fn ten_sequential_updates_produce_ten_reachable_versions() {
     }
     for (cutoff, expected) in &cutoffs {
         let body = sparse
-            .versioned_get_as_of(1, "c", "k", Some(*cutoff), None)
+            .versioned_get_as_of(0, 1, "c", "k", Some(*cutoff), None)
             .unwrap()
             .unwrap_or_else(|| panic!("missing version at cutoff {cutoff}"));
         let rmpv_val = rmpv::decode::read_value(&mut body.as_slice()).unwrap();
@@ -106,7 +106,7 @@ fn ten_sequential_updates_produce_ten_reachable_versions() {
 #[test]
 fn secondary_index_reflects_each_version_independently() {
     let (sparse, _d) = open();
-    let mut engine = DocumentEngine::new(&sparse, 1);
+    let mut engine = DocumentEngine::new(&sparse, 0, 1);
     engine.register_collection(
         CollectionConfig::new("c")
             .with_bitemporal(true)
@@ -125,25 +125,25 @@ fn secondary_index_reflects_each_version_independently() {
 
     // Past: "a@x.com" → u1 at t_mid.
     let ids_a_mid = sparse
-        .versioned_index_lookup_as_of(1, "c", "$.email", "a@x.com", Some(t_mid))
+        .versioned_index_lookup_as_of(0, 1, "c", "$.email", "a@x.com", Some(t_mid))
         .unwrap();
     assert_eq!(ids_a_mid, vec!["u1"]);
 
     // Current: "b@x.com" → u1.
     let ids_b_now = sparse
-        .versioned_index_lookup_as_of(1, "c", "$.email", "b@x.com", None)
+        .versioned_index_lookup_as_of(0, 1, "c", "$.email", "b@x.com", None)
         .unwrap();
     assert_eq!(ids_b_now, vec!["u1"]);
 
     // After delete → no current entry for b@x.com either.
     engine.delete("c", "u1").unwrap();
     let ids_b_after = sparse
-        .versioned_index_lookup_as_of(1, "c", "$.email", "b@x.com", None)
+        .versioned_index_lookup_as_of(0, 1, "c", "$.email", "b@x.com", None)
         .unwrap();
     assert!(ids_b_after.is_empty(), "tombstone hides current lookup");
     // But historical lookup at t_mid still surfaces a@x.com → u1.
     let ids_a_still = sparse
-        .versioned_index_lookup_as_of(1, "c", "$.email", "a@x.com", Some(t_mid))
+        .versioned_index_lookup_as_of(0, 1, "c", "$.email", "a@x.com", Some(t_mid))
         .unwrap();
     assert_eq!(ids_a_still, vec!["u1"]);
 }

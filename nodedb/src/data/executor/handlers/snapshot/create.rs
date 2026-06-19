@@ -26,8 +26,10 @@ impl CoreLoop {
         // Used by out-of-scope maps (timeseries) that still use string-prefix keys.
         let _prefix = format!("{tenant_id}:");
 
-        // 1. Sparse engine: documents + indexes.
-        match self.sparse.scan_all_for_tenant(tenant_id) {
+        // 1. Sparse engine: documents + indexes. Keys carry the leading
+        // `{database_id}:` component; restore re-inserts them verbatim.
+        let database_id = task.request.database_id.as_u64();
+        match self.sparse.scan_all_for_tenant(database_id, tenant_id) {
             Ok(docs) => snapshot.documents = docs,
             Err(e) => {
                 return self.response_error(
@@ -38,7 +40,7 @@ impl CoreLoop {
                 );
             }
         }
-        match self.sparse.scan_indexes_for_tenant(tenant_id) {
+        match self.sparse.scan_indexes_for_tenant(database_id, tenant_id) {
             Ok(idx) => snapshot.indexes = idx,
             Err(e) => {
                 return self.response_error(

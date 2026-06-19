@@ -116,6 +116,7 @@ impl CoreLoop {
     /// instead — a nested `begin_write` deadlocks redb's single-writer lock.
     pub(in crate::data::executor) fn apply_secondary_indexes(
         &mut self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         doc: &serde_json::Value,
@@ -135,10 +136,14 @@ impl CoreLoop {
             );
             for v in values {
                 let stored = maybe_lowercase(&v, index_path.case_insensitive);
-                if let Err(e) =
-                    self.sparse
-                        .index_put(tid, collection, &index_path.path, &stored, doc_id)
-                {
+                if let Err(e) = self.sparse.index_put(
+                    database_id,
+                    tid,
+                    collection,
+                    &index_path.path,
+                    &stored,
+                    doc_id,
+                ) {
                     tracing::warn!(
                         core = self.core_id,
                         %collection,
@@ -158,9 +163,11 @@ impl CoreLoop {
     /// the document + index entries commit atomically with the caller's
     /// `WriteTransaction`. Required from `apply_point_put`, which opens
     /// the outer txn in `execute_point_put`.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn apply_secondary_indexes_in_txn(
         &mut self,
         txn: &redb::WriteTransaction,
+        database_id: u64,
         tid: u64,
         collection: &str,
         doc: &serde_json::Value,
@@ -182,6 +189,7 @@ impl CoreLoop {
                 let stored = maybe_lowercase(&v, index_path.case_insensitive);
                 if let Err(e) = self.sparse.index_put_in_txn(
                     txn,
+                    database_id,
                     tid,
                     collection,
                     &index_path.path,

@@ -108,7 +108,12 @@ impl CoreLoop {
         // Strict (Binary Tuple) collections need JSON-level filter evaluation
         // because `matches_binary` operates on MessagePack, not Binary Tuples.
         let scan_result = if filter_predicates.is_empty() {
-            let sparse_result = self.sparse.scan_documents(tid, collection, fetch_limit);
+            let sparse_result = self.sparse.scan_documents(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                fetch_limit,
+            );
             match &sparse_result {
                 Ok(docs) if docs.is_empty() => {
                     let fallback = self.scan_collection(
@@ -132,15 +137,19 @@ impl CoreLoop {
                 _ => sparse_result,
             }
         } else if let Some(ref schema) = strict_schema {
-            self.sparse
-                .scan_documents_filtered(tid, collection, fetch_limit, &|value: &[u8]| {
-                    match strict_format::binary_tuple_to_msgpack(value, schema) {
-                        Some(mp) => filter_predicates.iter().all(|f| f.matches_binary(&mp)),
-                        None => false,
-                    }
-                })
+            self.sparse.scan_documents_filtered(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                fetch_limit,
+                &|value: &[u8]| match strict_format::binary_tuple_to_msgpack(value, schema) {
+                    Some(mp) => filter_predicates.iter().all(|f| f.matches_binary(&mp)),
+                    None => false,
+                },
+            )
         } else {
             let sparse_result = self.sparse.scan_documents_filtered(
+                task.request.database_id.as_u64(),
                 tid,
                 collection,
                 fetch_limit,

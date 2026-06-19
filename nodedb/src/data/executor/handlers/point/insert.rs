@@ -48,11 +48,13 @@ impl CoreLoop {
         // the row key, which is how the primary key is encoded for strict
         // and schemaless collections alike (see `dml::convert_insert`).
         let bitemporal = self.is_bitemporal(tid, collection);
+        let database_id = task.request.database_id.as_u64();
         let exists_result = if bitemporal {
             self.sparse
-                .versioned_exists_current_in_txn(&txn, tid, collection, row_key)
+                .versioned_exists_current_in_txn(&txn, database_id, tid, collection, row_key)
         } else {
-            self.sparse.exists_in_txn(&txn, tid, collection, row_key)
+            self.sparse
+                .exists_in_txn(&txn, database_id, tid, collection, row_key)
         };
         match exists_result {
             Ok(true) => {

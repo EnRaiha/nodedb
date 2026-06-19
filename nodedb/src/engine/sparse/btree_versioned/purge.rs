@@ -18,12 +18,14 @@ impl SparseEngine {
     /// Returns `(docs_deleted, index_entries_deleted)`.
     pub fn purge_superseded_document_versions(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         cutoff_system_ms: i64,
     ) -> crate::Result<(usize, usize)> {
-        let doc_victims = self.collect_doc_victims(tenant, coll, cutoff_system_ms)?;
-        let idx_victims = self.collect_index_victims(tenant, coll, cutoff_system_ms)?;
+        let doc_victims = self.collect_doc_victims(database_id, tenant, coll, cutoff_system_ms)?;
+        let idx_victims =
+            self.collect_index_victims(database_id, tenant, coll, cutoff_system_ms)?;
 
         if doc_victims.is_empty() && idx_victims.is_empty() {
             return Ok((0, 0));
@@ -55,12 +57,13 @@ impl SparseEngine {
 
     fn collect_doc_victims(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         cutoff_system_ms: i64,
     ) -> crate::Result<Vec<String>> {
-        let lo = coll_prefix(tenant, coll);
-        let hi = coll_prefix_end(tenant, coll);
+        let lo = coll_prefix(database_id, tenant, coll);
+        let hi = coll_prefix_end(database_id, tenant, coll);
         let txn = self
             .db
             .begin_read()
@@ -112,12 +115,13 @@ impl SparseEngine {
 
     fn collect_index_victims(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         cutoff_system_ms: i64,
     ) -> crate::Result<Vec<String>> {
-        let lo = coll_prefix(tenant, coll);
-        let hi = coll_prefix_end(tenant, coll);
+        let lo = coll_prefix(database_id, tenant, coll);
+        let hi = coll_prefix_end(database_id, tenant, coll);
         let txn = self
             .db
             .begin_read()
@@ -178,6 +182,7 @@ mod tests {
 
     fn put_version(eng: &SparseEngine, doc_id: &str, sys_from: i64) {
         eng.versioned_put(VersionedPut {
+            database_id: 1,
             tenant: 1,
             coll: "c",
             doc_id,
@@ -190,8 +195,8 @@ mod tests {
     }
 
     fn count_doc_versions(eng: &SparseEngine, doc_id: &str) -> usize {
-        let lo = super::super::key::doc_prefix(1, "c", doc_id);
-        let hi = super::super::key::doc_prefix_end(1, "c", doc_id);
+        let lo = super::super::key::doc_prefix(1, 1, "c", doc_id);
+        let hi = super::super::key::doc_prefix_end(1, 1, "c", doc_id);
         let txn = eng.db.begin_read().unwrap();
         let t = txn.open_table(DOCUMENTS_VERSIONED).unwrap();
         t.range(lo.as_str()..hi.as_str()).unwrap().count()
@@ -205,7 +210,9 @@ mod tests {
         put_version(&eng, "d1", 300);
         assert_eq!(count_doc_versions(&eng, "d1"), 3);
 
-        let (docs, _idx) = eng.purge_superseded_document_versions(1, "c", 150).unwrap();
+        let (docs, _idx) = eng
+            .purge_superseded_document_versions(1, 1, "c", 150)
+            .unwrap();
         assert_eq!(docs, 1, "only v@100 is below cutoff AND superseded");
         assert_eq!(count_doc_versions(&eng, "d1"), 2);
     }
@@ -216,7 +223,7 @@ mod tests {
         put_version(&eng, "d1", 100);
         // Only one version: it's the latest, never deleted.
         let (docs, _idx) = eng
-            .purge_superseded_document_versions(1, "c", 10_000)
+            .purge_superseded_document_versions(1, 1, "c", 10_000)
             .unwrap();
         assert_eq!(docs, 0);
         assert_eq!(count_doc_versions(&eng, "d1"), 1);
@@ -231,7 +238,9 @@ mod tests {
             put_version(&eng, id, 200);
             put_version(&eng, id, 300);
         }
-        let (docs, _) = eng.purge_superseded_document_versions(1, "c", 150).unwrap();
+        let (docs, _) = eng
+            .purge_superseded_document_versions(1, 1, "c", 150)
+            .unwrap();
         assert_eq!(docs, 2, "one victim per doc");
         assert_eq!(count_doc_versions(&eng, "d1"), 2);
         assert_eq!(count_doc_versions(&eng, "d2"), 2);
@@ -243,8 +252,12 @@ mod tests {
         put_version(&eng, "d1", 100);
         put_version(&eng, "d1", 200);
         put_version(&eng, "d1", 300);
-        let (a, _) = eng.purge_superseded_document_versions(1, "c", 150).unwrap();
-        let (b, _) = eng.purge_superseded_document_versions(1, "c", 150).unwrap();
+        let (a, _) = eng
+            .purge_superseded_document_versions(1, 1, "c", 150)
+            .unwrap();
+        let (b, _) = eng
+            .purge_superseded_document_versions(1, 1, "c", 150)
+            .unwrap();
         assert_eq!(a, 1);
         assert_eq!(b, 0);
     }
@@ -256,6 +269,7 @@ mod tests {
         put_version(&eng, "d1", 100);
         put_version(&eng, "d1", 200);
         eng.versioned_put(VersionedPut {
+            database_id: 1,
             tenant: 1,
             coll: "other",
             doc_id: "d1",
@@ -266,6 +280,7 @@ mod tests {
         })
         .unwrap();
         eng.versioned_put(VersionedPut {
+            database_id: 1,
             tenant: 1,
             coll: "other",
             doc_id: "d1",
@@ -276,6 +291,7 @@ mod tests {
         })
         .unwrap();
         eng.versioned_put(VersionedPut {
+            database_id: 1,
             tenant: 2,
             coll: "c",
             doc_id: "d1",
@@ -286,6 +302,7 @@ mod tests {
         })
         .unwrap();
         eng.versioned_put(VersionedPut {
+            database_id: 1,
             tenant: 2,
             coll: "c",
             doc_id: "d1",
@@ -296,11 +313,13 @@ mod tests {
         })
         .unwrap();
 
-        let (docs, _) = eng.purge_superseded_document_versions(1, "c", 150).unwrap();
+        let (docs, _) = eng
+            .purge_superseded_document_versions(1, 1, "c", 150)
+            .unwrap();
         assert_eq!(docs, 1);
         // The other collection and tenant still have all their versions.
-        let lo_other = super::super::key::doc_prefix(1, "other", "d1");
-        let hi_other = super::super::key::doc_prefix_end(1, "other", "d1");
+        let lo_other = super::super::key::doc_prefix(1, 1, "other", "d1");
+        let hi_other = super::super::key::doc_prefix_end(1, 1, "other", "d1");
         let txn = eng.db.begin_read().unwrap();
         let t = txn.open_table(DOCUMENTS_VERSIONED).unwrap();
         assert_eq!(
@@ -309,8 +328,8 @@ mod tests {
                 .count(),
             2
         );
-        let lo_t2 = super::super::key::doc_prefix(2, "c", "d1");
-        let hi_t2 = super::super::key::doc_prefix_end(2, "c", "d1");
+        let lo_t2 = super::super::key::doc_prefix(1, 2, "c", "d1");
+        let hi_t2 = super::super::key::doc_prefix_end(1, 2, "c", "d1");
         assert_eq!(t.range(lo_t2.as_str()..hi_t2.as_str()).unwrap().count(), 2);
     }
 }

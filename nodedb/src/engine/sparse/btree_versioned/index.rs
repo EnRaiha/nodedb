@@ -2,7 +2,7 @@
 
 //! Versioned secondary-index operations.
 //!
-//! Index key: `"{tenant}:{coll}:{field}:{value}:{doc_id}\x00{sys_from:020}"`.
+//! Index key: `"{database_id}:{tenant}:{coll}:{field}:{value}:{doc_id}\x00{sys_from:020}"`.
 //! Value: single byte (`0x00` live, `0xFF` tombstone).
 
 use redb::TableDefinition;
@@ -11,8 +11,10 @@ use super::key::format_sys_from;
 use super::value::{TAG_LIVE, TAG_TOMBSTONE};
 use crate::engine::sparse::btree::{SparseEngine, redb_err};
 
+/// Keys carry the leading `{database_id}:` component; the pre-scoping
+/// `indexes_versioned` table is migration-only (see `super::super::migrate`).
 pub(crate) const INDEXES_VERSIONED: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("indexes_versioned");
+    TableDefinition::new("indexes_versioned_v2");
 
 impl SparseEngine {
     /// Bootstrap: ensure the versioned index table exists.
@@ -35,6 +37,7 @@ impl SparseEngine {
     pub fn versioned_index_put_in_txn(
         &self,
         txn: &redb::WriteTransaction,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         field: &str,
@@ -48,7 +51,7 @@ impl SparseEngine {
             });
         }
         let key = format!(
-            "{tenant}:{coll}:{field}:{value}:{doc_id}\x00{}",
+            "{database_id}:{tenant}:{coll}:{field}:{value}:{doc_id}\x00{}",
             format_sys_from(sys_from_ms)
         );
         let mut t = txn
@@ -64,6 +67,7 @@ impl SparseEngine {
     pub fn versioned_index_tombstone_in_txn(
         &self,
         txn: &redb::WriteTransaction,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         field: &str,
@@ -72,7 +76,7 @@ impl SparseEngine {
         sys_from_ms: i64,
     ) -> crate::Result<()> {
         let key = format!(
-            "{tenant}:{coll}:{field}:{value}:{doc_id}\x00{}",
+            "{database_id}:{tenant}:{coll}:{field}:{value}:{doc_id}\x00{}",
             format_sys_from(sys_from_ms)
         );
         let mut t = txn
@@ -84,8 +88,10 @@ impl SparseEngine {
     }
 
     /// Append a versioned secondary index entry in its own transaction.
+    #[allow(clippy::too_many_arguments)]
     pub fn versioned_index_put(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         field: &str,
@@ -97,15 +103,26 @@ impl SparseEngine {
             .db
             .begin_write()
             .map_err(|e| redb_err("write txn", e))?;
-        self.versioned_index_put_in_txn(&txn, tenant, coll, field, value, doc_id, sys_from_ms)?;
+        self.versioned_index_put_in_txn(
+            &txn,
+            database_id,
+            tenant,
+            coll,
+            field,
+            value,
+            doc_id,
+            sys_from_ms,
+        )?;
         txn.commit().map_err(|e| redb_err("commit", e))?;
         Ok(())
     }
 
     /// Append a tombstone entry for an index value that's been removed,
     /// in its own transaction.
+    #[allow(clippy::too_many_arguments)]
     pub fn versioned_index_tombstone(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         field: &str,
@@ -119,6 +136,7 @@ impl SparseEngine {
             .map_err(|e| redb_err("write txn", e))?;
         self.versioned_index_tombstone_in_txn(
             &txn,
+            database_id,
             tenant,
             coll,
             field,
@@ -134,15 +152,16 @@ impl SparseEngine {
     /// Returns only doc_ids whose newest entry ≤ cutoff is live.
     pub fn versioned_index_lookup_as_of(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         field: &str,
         value: &str,
         sys_cutoff_ms: Option<i64>,
     ) -> crate::Result<Vec<String>> {
-        let lo = format!("{tenant}:{coll}:{field}:{value}:");
+        let lo = format!("{database_id}:{tenant}:{coll}:{field}:{value}:");
         // `:` = 0x3A, next byte `;` = 0x3B gives a clean exclusive bound.
-        let hi = format!("{tenant}:{coll}:{field}:{value};");
+        let hi = format!("{database_id}:{tenant}:{coll}:{field}:{value};");
         let cutoff_key = sys_cutoff_ms.map(format_sys_from);
 
         let txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;

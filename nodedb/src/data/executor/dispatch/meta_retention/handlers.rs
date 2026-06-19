@@ -267,6 +267,7 @@ impl CoreLoop {
         cutoff_system_ms: i64,
     ) -> Response {
         match self.sparse.purge_superseded_document_versions(
+            task.request.database_id.as_u64(),
             tenant_id,
             collection,
             cutoff_system_ms,

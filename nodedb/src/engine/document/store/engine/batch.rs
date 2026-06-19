@@ -24,14 +24,16 @@ pub(super) fn wall_now_ms() -> i64 {
 
 pub struct DocumentEngine<'a> {
     pub(super) sparse: &'a SparseEngine,
+    pub(super) database_id: u64,
     pub(super) tenant_id: u64,
     pub(super) configs: HashMap<String, CollectionConfig>,
 }
 
 impl<'a> DocumentEngine<'a> {
-    pub fn new(sparse: &'a SparseEngine, tenant_id: u64) -> Self {
+    pub fn new(sparse: &'a SparseEngine, database_id: u64, tenant_id: u64) -> Self {
         Self {
             sparse,
+            database_id,
             tenant_id,
             configs: HashMap::new(),
         }
@@ -48,8 +50,12 @@ impl<'a> DocumentEngine<'a> {
 
     /// Drop all secondary index entries for a field across the entire collection.
     pub fn drop_field_index(&self, collection: &str, field: &str) -> crate::Result<usize> {
-        self.sparse
-            .delete_index_entries_for_field(self.tenant_id, collection, field)
+        self.sparse.delete_index_entries_for_field(
+            self.database_id,
+            self.tenant_id,
+            collection,
+            field,
+        )
     }
 
     /// Lookup documents by a secondary index value.
@@ -61,6 +67,7 @@ impl<'a> DocumentEngine<'a> {
     ) -> crate::Result<Vec<String>> {
         let prefix_with_value = format!("{value}:");
         let results = self.sparse.range_scan(
+            self.database_id,
             self.tenant_id,
             collection,
             path,
@@ -72,7 +79,10 @@ impl<'a> DocumentEngine<'a> {
         let mut doc_ids = Vec::new();
         for (key, _) in results {
             if let Some(doc_id) = key.rsplit(':').next() {
-                let expected_prefix = format!("{}:{collection}:{path}:{value}:", self.tenant_id);
+                let expected_prefix = format!(
+                    "{}:{}:{collection}:{path}:{value}:",
+                    self.database_id, self.tenant_id
+                );
                 if key.starts_with(&expected_prefix) {
                     doc_ids.push(doc_id.to_string());
                 }

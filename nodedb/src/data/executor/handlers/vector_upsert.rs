@@ -182,7 +182,13 @@ impl CoreLoop {
         // the full document path is bypassed.
         if !payload.is_empty() {
             let row_key = format!("{:08x}", surrogate.as_u32());
-            if let Err(e) = self.sparse.put(tid, collection, &row_key, payload) {
+            if let Err(e) = self.sparse.put(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                &row_key,
+                payload,
+            ) {
                 // Roll back Steps 3 + 4 so the HNSW node and bitmap entries
                 // do not survive a failed payload persist. Without this,
                 // the orphan node would be returned by future searches

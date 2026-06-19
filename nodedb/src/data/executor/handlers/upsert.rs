@@ -61,10 +61,12 @@ impl CoreLoop {
         // non-tombstone); non-bitemporal collections use the legacy point
         // lookup.
         let bitemporal = self.is_bitemporal(tid, collection);
+        let database_id = task.request.database_id.as_u64();
         let existing = if bitemporal {
-            self.sparse.versioned_get_current(tid, collection, row_key)
+            self.sparse
+                .versioned_get_current(database_id, tid, collection, row_key)
         } else {
-            self.sparse.get(tid, collection, row_key)
+            self.sparse.get(database_id, tid, collection, row_key)
         };
 
         match existing {
@@ -180,6 +182,7 @@ impl CoreLoop {
                 let write_result = if bitemporal {
                     self.sparse
                         .versioned_put(crate::engine::sparse::btree_versioned::VersionedPut {
+                            database_id,
                             tenant: tid,
                             coll: collection,
                             doc_id: row_key,
@@ -190,7 +193,8 @@ impl CoreLoop {
                         })
                         .map(|()| None::<Vec<u8>>)
                 } else {
-                    self.sparse.put(tid, collection, row_key, &stored_bytes)
+                    self.sparse
+                        .put(database_id, tid, collection, row_key, &stored_bytes)
                 };
                 match write_result {
                     Ok(_prior) => {

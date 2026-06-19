@@ -30,7 +30,10 @@ impl CoreLoop {
         let _prefix = format!("{tenant_id}:");
 
         // 1. Sparse engine: documents + secondary indexes (persistent, redb).
-        let (docs, idxs) = match self.sparse.delete_all_for_tenant(tenant_id) {
+        // A tenant lives in exactly one database, so the purge is scoped by
+        // (database_id, tenant_id).
+        let database_id = task.request.database_id.as_u64();
+        let (docs, idxs) = match self.sparse.delete_all_for_tenant(database_id, tenant_id) {
             Ok(counts) => counts,
             Err(e) => {
                 warn!(tenant_id, error = %e, "sparse purge failed");

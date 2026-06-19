@@ -27,6 +27,7 @@ use nodedb_physical::physical_plan::MaterializedSumBinding;
 /// Returns a list of (collection, doc_id, old_value) for rollback tracking.
 pub fn apply_materialized_sums(
     sparse: &SparseEngine,
+    database_id: u64,
     tid: u64,
     bindings: &[MaterializedSumBinding],
     source_doc: &serde_json::Value,
@@ -34,7 +35,7 @@ pub fn apply_materialized_sums(
     let mut writes = Vec::new();
 
     for binding in bindings {
-        let write = apply_single_binding(sparse, tid, binding, source_doc)?;
+        let write = apply_single_binding(sparse, database_id, tid, binding, source_doc)?;
         if let Some(w) = write {
             writes.push(w);
         }
@@ -57,6 +58,7 @@ pub struct TargetWrite {
 /// Apply a single materialized sum binding.
 fn apply_single_binding(
     sparse: &SparseEngine,
+    database_id: u64,
     tid: u64,
     binding: &MaterializedSumBinding,
     source_doc: &serde_json::Value,
@@ -87,7 +89,7 @@ fn apply_single_binding(
 
     // 3. Read the target document.
     let old_bytes = sparse
-        .get(tid, &binding.target_collection, join_key)
+        .get(database_id, tid, &binding.target_collection, join_key)
         .map_err(|e| ErrorCode::Internal {
             detail: format!(
                 "materialized_sum: failed to read {}/{}: {e}",
@@ -131,7 +133,13 @@ fn apply_single_binding(
     // 5. Write back.
     let new_bytes = super::super::doc_format::encode_to_msgpack(&target_doc);
     sparse
-        .put(tid, &binding.target_collection, join_key, &new_bytes)
+        .put(
+            database_id,
+            tid,
+            &binding.target_collection,
+            join_key,
+            &new_bytes,
+        )
         .map_err(|e| ErrorCode::Internal {
             detail: format!(
                 "materialized_sum: failed to write {}/{}: {e}",

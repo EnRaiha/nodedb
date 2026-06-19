@@ -140,7 +140,13 @@ impl CoreLoop {
             }
         };
 
-        if let Err(e) = self.sparse.put(tid, collection, &doc_id, &msgpack) {
+        if let Err(e) = self.sparse.put(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            &doc_id,
+            &msgpack,
+        ) {
             error!(
                 core = self.core_id,
                 %collection,
@@ -227,7 +233,10 @@ impl CoreLoop {
             }
         }
 
-        if let Err(e) = self.sparse.delete(tid, collection, &doc_id) {
+        if let Err(e) =
+            self.sparse
+                .delete(task.request.database_id.as_u64(), tid, collection, &doc_id)
+        {
             error!(
                 core = self.core_id,
                 %collection,

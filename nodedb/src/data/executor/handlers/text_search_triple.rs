@@ -154,7 +154,12 @@ impl CoreLoop {
                 if rls_filters.is_empty() {
                     return true;
                 }
-                match self.sparse.get(tid, collection, &f.document_id) {
+                match self.sparse.get(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    &f.document_id,
+                ) {
                     Ok(Some(bytes)) => {
                         super::rls_eval::rls_check_msgpack_bytes(rls_filters, &bytes)
                     }

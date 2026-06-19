@@ -31,12 +31,23 @@ impl CoreLoop {
             } => {
                 let result = if let Some(old) = old_value {
                     self.sparse
-                        .put(tid, &collection, &document_id, &old)
+                        .put(
+                            crate::types::DatabaseId::DEFAULT.as_u64(),
+                            tid,
+                            &collection,
+                            &document_id,
+                            &old,
+                        )
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 } else {
                     self.sparse
-                        .delete(tid, &collection, &document_id)
+                        .delete(
+                            crate::types::DatabaseId::DEFAULT.as_u64(),
+                            tid,
+                            &collection,
+                            &document_id,
+                        )
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 };
@@ -69,7 +80,13 @@ impl CoreLoop {
                 old_value,
             } => self
                 .sparse
-                .put(tid, &collection, &document_id, &old_value)
+                .put(
+                    crate::types::DatabaseId::DEFAULT.as_u64(),
+                    tid,
+                    &collection,
+                    &document_id,
+                    &old_value,
+                )
                 .map(|_| ())
                 .map_err(|e| {
                     error!(

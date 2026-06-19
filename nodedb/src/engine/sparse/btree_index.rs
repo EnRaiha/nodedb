@@ -2,13 +2,13 @@
 
 //! Secondary index operations for the sparse engine.
 //!
-//! Index key format: `"{tenant_id}:{collection}:{field}:{value}:{document_id}"`.
+//! Index key format: `"{database_id}:{tenant_id}:{collection}:{field}:{value}:{document_id}"`.
 //! Extracted from `btree.rs` — document CRUD stays there, index ops live here.
 
 use redb::ReadableTable;
 use tracing::{debug, info};
 
-use super::btree::{DOCUMENTS, INDEXES, SparseEngine, redb_err};
+use super::btree::{DOCUMENTS, INDEXES, SparseEngine, coll_prefix, redb_err};
 
 impl SparseEngine {
     /// Delete all secondary index entries for a document.
@@ -17,12 +17,13 @@ impl SparseEngine {
     /// removes them. Called during document deletion cascade.
     pub fn delete_indexes_for_document(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         document_id: &str,
     ) -> crate::Result<()> {
-        let prefix = format!("{tenant_id}:{collection}:");
-        let end = format!("{tenant_id}:{collection}:\u{ffff}");
+        let prefix = coll_prefix(database_id, tenant_id, collection);
+        let end = format!("{prefix}\u{ffff}");
         let suffix = format!(":{document_id}");
 
         let write_txn = self
@@ -65,12 +66,16 @@ impl SparseEngine {
     /// Delete all secondary index entries for a specific field in a collection.
     pub fn delete_index_entries_for_field(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field: &str,
     ) -> crate::Result<usize> {
-        let prefix = format!("{tenant_id}:{collection}:{field}:");
-        let end = format!("{tenant_id}:{collection}:{field}:\u{ffff}");
+        let prefix = format!(
+            "{}{field}:",
+            coll_prefix(database_id, tenant_id, collection)
+        );
+        let end = format!("{prefix}\u{ffff}");
 
         let write_txn = self
             .db
@@ -116,11 +121,12 @@ impl SparseEngine {
     /// `execute_unregister_collection` when a collection is hard-dropped.
     pub fn delete_all_for_collection(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
     ) -> crate::Result<(usize, usize)> {
-        let prefix = format!("{tenant_id}:{collection}:");
-        let end = format!("{tenant_id}:{collection}:\u{ffff}");
+        let prefix = coll_prefix(database_id, tenant_id, collection);
+        let end = format!("{prefix}\u{ffff}");
 
         let write_txn = self
             .db
@@ -177,10 +183,16 @@ impl SparseEngine {
         Ok((docs_removed, idx_removed))
     }
 
-    /// Delete ALL documents and indexes for a tenant across all collections.
-    pub fn delete_all_for_tenant(&self, tenant_id: u64) -> crate::Result<(usize, usize)> {
-        let prefix = format!("{tenant_id}:");
-        let end = format!("{tenant_id}:\u{ffff}");
+    /// Delete ALL documents and indexes for a tenant across all collections
+    /// within a single database. A tenant lives in exactly one database, so
+    /// the purge is scoped by `(database_id, tenant_id)`.
+    pub fn delete_all_for_tenant(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+    ) -> crate::Result<(usize, usize)> {
+        let prefix = super::btree::tenant_prefix(database_id, tenant_id);
+        let end = format!("{prefix}\u{ffff}");
 
         let write_txn = self
             .db
@@ -238,8 +250,10 @@ impl SparseEngine {
     }
 
     /// Range scan on secondary index entries.
+    #[allow(clippy::too_many_arguments)]
     pub fn range_scan(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field: &str,
@@ -247,7 +261,10 @@ impl SparseEngine {
         upper: Option<&[u8]>,
         limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        let prefix = format!("{tenant_id}:{collection}:{field}:");
+        let prefix = format!(
+            "{}{field}:",
+            coll_prefix(database_id, tenant_id, collection)
+        );
 
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn
@@ -294,64 +311,87 @@ impl SparseEngine {
     /// active writer so a nested `begin_write` here deadlocks.
     pub fn index_put(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field: &str,
         value: &str,
         document_id: &str,
     ) -> crate::Result<()> {
-        super::btree::with_tenant_key4(tenant_id, collection, field, value, document_id, |key| {
-            let write_txn = self
-                .db
-                .begin_write()
-                .map_err(|e| redb_err("write txn", e))?;
-            {
-                let mut table = write_txn
-                    .open_table(INDEXES)
-                    .map_err(|e| redb_err("open table", e))?;
-                table
-                    .insert(key, [].as_slice())
-                    .map_err(|e| redb_err("index insert", e))?;
-            }
-            write_txn.commit().map_err(|e| redb_err("commit", e))?;
-            Ok(())
-        })
+        super::btree::with_tenant_key4(
+            database_id,
+            tenant_id,
+            collection,
+            field,
+            value,
+            document_id,
+            |key| {
+                let write_txn = self
+                    .db
+                    .begin_write()
+                    .map_err(|e| redb_err("write txn", e))?;
+                {
+                    let mut table = write_txn
+                        .open_table(INDEXES)
+                        .map_err(|e| redb_err("open table", e))?;
+                    table
+                        .insert(key, [].as_slice())
+                        .map_err(|e| redb_err("index insert", e))?;
+                }
+                write_txn.commit().map_err(|e| redb_err("commit", e))?;
+                Ok(())
+            },
+        )
     }
 
     /// Insert a secondary index entry into an already-open write txn.
     ///
     /// Use from the PointPut / BatchInsert apply path so document + index
     /// writes commit atomically in the same redb transaction.
+    #[allow(clippy::too_many_arguments)]
     pub fn index_put_in_txn(
         &self,
         txn: &redb::WriteTransaction,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field: &str,
         value: &str,
         document_id: &str,
     ) -> crate::Result<()> {
-        super::btree::with_tenant_key4(tenant_id, collection, field, value, document_id, |key| {
-            let mut table = txn
-                .open_table(INDEXES)
-                .map_err(|e| redb_err("open table", e))?;
-            table
-                .insert(key, [].as_slice())
-                .map_err(|e| redb_err("index insert", e))?;
-            Ok(())
-        })
+        super::btree::with_tenant_key4(
+            database_id,
+            tenant_id,
+            collection,
+            field,
+            value,
+            document_id,
+            |key| {
+                let mut table = txn
+                    .open_table(INDEXES)
+                    .map_err(|e| redb_err("open table", e))?;
+                table
+                    .insert(key, [].as_slice())
+                    .map_err(|e| redb_err("index insert", e))?;
+                Ok(())
+            },
+        )
     }
 
     /// Index-only scan: return `(doc_id, field_value)` pairs without touching DOCUMENTS.
     pub fn scan_index_values(
         &self,
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field: &str,
         limit: usize,
     ) -> crate::Result<Vec<(String, String)>> {
-        let prefix = format!("{tenant_id}:{collection}:{field}:");
-        let end = format!("{tenant_id}:{collection}:{field}:\u{ffff}");
+        let prefix = format!(
+            "{}{field}:",
+            coll_prefix(database_id, tenant_id, collection)
+        );
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn

@@ -73,6 +73,7 @@ impl CoreLoop {
         // ascending system-time order; we then page within that window.
         let scan_limit = offset.saturating_add(limit);
         let rows = match self.sparse.versioned_scan_all(
+            task.request.database_id.as_u64(),
             tid,
             collection,
             valid_at_ms,

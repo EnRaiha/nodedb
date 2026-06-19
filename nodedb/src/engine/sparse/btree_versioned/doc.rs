@@ -14,8 +14,10 @@ use crate::engine::sparse::btree::{SparseEngine, redb_err};
 
 /// Versioned document table. Distinct from `super::super::btree::DOCUMENTS`
 /// so bitemporal and current-only collections coexist without migration.
+/// Keys carry the leading `{database_id}:` component; the pre-scoping
+/// `documents_versioned` table is migration-only (see `super::super::migrate`).
 pub(crate) const DOCUMENTS_VERSIONED: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("documents_versioned");
+    TableDefinition::new("documents_versioned_v2");
 
 impl SparseEngine {
     /// Bootstrap: ensure the versioned document table exists. Called by
@@ -37,7 +39,7 @@ impl SparseEngine {
     /// Append one version. Always creates a new key; never overwrites an
     /// earlier version at the same `sys_from_ms`.
     pub fn versioned_put(&self, p: VersionedPut<'_>) -> crate::Result<()> {
-        let key = versioned_doc_key(p.tenant, p.coll, p.doc_id, p.sys_from_ms)?;
+        let key = versioned_doc_key(p.database_id, p.tenant, p.coll, p.doc_id, p.sys_from_ms)?;
         let val = encode_value(TAG_LIVE, p.valid_from_ms, p.valid_until_ms, p.body);
         let txn = self
             .db
@@ -64,7 +66,7 @@ impl SparseEngine {
         txn: &redb::WriteTransaction,
         p: VersionedPut<'_>,
     ) -> crate::Result<()> {
-        let key = versioned_doc_key(p.tenant, p.coll, p.doc_id, p.sys_from_ms)?;
+        let key = versioned_doc_key(p.database_id, p.tenant, p.coll, p.doc_id, p.sys_from_ms)?;
         let val = encode_value(TAG_LIVE, p.valid_from_ms, p.valid_until_ms, p.body);
         let mut t = txn
             .open_table(DOCUMENTS_VERSIONED)
@@ -77,12 +79,13 @@ impl SparseEngine {
     /// Append a tombstone version.
     pub fn versioned_tombstone(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         doc_id: &str,
         sys_from_ms: i64,
     ) -> crate::Result<()> {
-        let key = versioned_doc_key(tenant, coll, doc_id, sys_from_ms)?;
+        let key = versioned_doc_key(database_id, tenant, coll, doc_id, sys_from_ms)?;
         let val = encode_value(TAG_TOMBSTONE, 0, 0, &[]);
         let txn = self
             .db
@@ -103,12 +106,13 @@ impl SparseEngine {
     pub fn versioned_tombstone_in_txn(
         &self,
         txn: &redb::WriteTransaction,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         doc_id: &str,
         sys_from_ms: i64,
     ) -> crate::Result<()> {
-        let key = versioned_doc_key(tenant, coll, doc_id, sys_from_ms)?;
+        let key = versioned_doc_key(database_id, tenant, coll, doc_id, sys_from_ms)?;
         let val = encode_value(TAG_TOMBSTONE, 0, 0, &[]);
         let mut t = txn
             .open_table(DOCUMENTS_VERSIONED)
@@ -126,12 +130,13 @@ impl SparseEngine {
     pub fn versioned_exists_current_in_txn(
         &self,
         txn: &redb::WriteTransaction,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         doc_id: &str,
     ) -> crate::Result<bool> {
-        let lo = doc_prefix(tenant, coll, doc_id);
-        let hi = doc_prefix_end(tenant, coll, doc_id);
+        let lo = doc_prefix(database_id, tenant, coll, doc_id);
+        let hi = doc_prefix_end(database_id, tenant, coll, doc_id);
         let t = txn
             .open_table(DOCUMENTS_VERSIONED)
             .map_err(|e| redb_err("open table", e))?;
@@ -155,12 +160,13 @@ impl SparseEngine {
     /// personal data.
     pub fn versioned_gdpr_erase(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         doc_id: &str,
     ) -> crate::Result<usize> {
-        let lo = doc_prefix(tenant, coll, doc_id);
-        let hi = doc_prefix_end(tenant, coll, doc_id);
+        let lo = doc_prefix(database_id, tenant, coll, doc_id);
+        let hi = doc_prefix_end(database_id, tenant, coll, doc_id);
         let txn = self
             .db
             .begin_write()
@@ -191,16 +197,17 @@ impl SparseEngine {
     /// a tombstone / GDPR-erased (both hide the row from normal reads).
     pub fn versioned_get_as_of(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         doc_id: &str,
         sys_cutoff_ms: Option<i64>,
         valid_at_ms: Option<i64>,
     ) -> crate::Result<Option<Vec<u8>>> {
-        let lo = doc_prefix(tenant, coll, doc_id);
+        let lo = doc_prefix(database_id, tenant, coll, doc_id);
         let hi = match sys_cutoff_ms {
-            Some(ms) => versioned_doc_key(tenant, coll, doc_id, ms)?,
-            None => doc_prefix_end(tenant, coll, doc_id),
+            Some(ms) => versioned_doc_key(database_id, tenant, coll, doc_id, ms)?,
+            None => doc_prefix_end(database_id, tenant, coll, doc_id),
         };
         let txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let t = txn
@@ -242,11 +249,12 @@ impl SparseEngine {
     /// Current-state read = `versioned_get_as_of(None, None)`.
     pub fn versioned_get_current(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         doc_id: &str,
     ) -> crate::Result<Option<Vec<u8>>> {
-        self.versioned_get_as_of(tenant, coll, doc_id, None, None)
+        self.versioned_get_as_of(database_id, tenant, coll, doc_id, None, None)
     }
 
     /// Scan every doc_id in a collection at the requested cutoff.
@@ -256,8 +264,10 @@ impl SparseEngine {
     /// before it counts toward `limit`, so a selective filter never causes the
     /// scan to early-stop with fewer matching rows than exist. Pass `&|_| true`
     /// for an unfiltered scan.
+    #[allow(clippy::too_many_arguments)]
     pub fn versioned_scan_as_of(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         sys_cutoff_ms: Option<i64>,
@@ -265,8 +275,8 @@ impl SparseEngine {
         limit: usize,
         predicate: &dyn Fn(&[u8]) -> bool,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        let lo = coll_prefix(tenant, coll);
-        let hi = coll_prefix_end(tenant, coll);
+        let lo = coll_prefix(database_id, tenant, coll);
+        let hi = coll_prefix_end(database_id, tenant, coll);
         let cutoff_key = sys_cutoff_ms.map(format_sys_from);
         let txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let t = txn
@@ -339,14 +349,15 @@ impl SparseEngine {
     /// an unfiltered scan.
     pub fn versioned_scan_all(
         &self,
+        database_id: u64,
         tenant: u64,
         coll: &str,
         valid_at_ms: Option<i64>,
         limit: usize,
         predicate: &dyn Fn(&[u8]) -> bool,
     ) -> crate::Result<Vec<(String, i64, Vec<u8>)>> {
-        let lo = coll_prefix(tenant, coll);
-        let hi = coll_prefix_end(tenant, coll);
+        let lo = coll_prefix(database_id, tenant, coll);
+        let hi = coll_prefix_end(database_id, tenant, coll);
         let txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let t = txn
             .open_table(DOCUMENTS_VERSIONED)

@@ -35,15 +35,24 @@ impl CoreLoop {
         // still cascaded below — they track "what exists now" regardless
         // of bitemporal history.
         let bitemporal = self.is_bitemporal(tid, collection);
+        let database_id = task.request.database_id.as_u64();
         let delete_result: crate::Result<Option<Vec<u8>>> = if bitemporal {
-            let prior = self.sparse.versioned_get_current(tid, collection, row_key);
+            let prior = self
+                .sparse
+                .versioned_get_current(database_id, tid, collection, row_key);
             match prior {
                 Ok(Some(body)) => {
                     let sys_from = self.bitemporal_now_ms();
                     let res: crate::Result<()> = (|| {
                         let txn = self.sparse.begin_write()?;
-                        self.sparse
-                            .versioned_tombstone_in_txn(&txn, tid, collection, row_key, sys_from)?;
+                        self.sparse.versioned_tombstone_in_txn(
+                            &txn,
+                            database_id,
+                            tid,
+                            collection,
+                            row_key,
+                            sys_from,
+                        )?;
                         // Index tombstones: reflect every current value so
                         // `index_lookup_as_of` at or after `sys_from` skips
                         // this doc_id.
@@ -63,7 +72,13 @@ impl CoreLoop {
                                         v
                                     };
                                     self.sparse.versioned_index_tombstone_in_txn(
-                                        &txn, tid, collection, &path.path, &value, row_key,
+                                        &txn,
+                                        database_id,
+                                        tid,
+                                        collection,
+                                        &path.path,
+                                        &value,
+                                        row_key,
                                         sys_from,
                                     )?;
                                 }
@@ -81,7 +96,7 @@ impl CoreLoop {
                 Err(e) => Err(e),
             }
         } else {
-            self.sparse.delete(tid, collection, row_key)
+            self.sparse.delete(database_id, tid, collection, row_key)
         };
 
         match delete_result {
@@ -102,9 +117,9 @@ impl CoreLoop {
                 // Cascade 2: Remove secondary index entries for this document.
                 // Secondary indexes use key format "{tenant}:{collection}:{field}:{value}:{doc_id}".
                 // We scan and delete all entries ending with this doc_id.
-                if let Err(e) = self
-                    .sparse
-                    .delete_indexes_for_document(tid, collection, row_key)
+                if let Err(e) =
+                    self.sparse
+                        .delete_indexes_for_document(database_id, tid, collection, row_key)
                 {
                     warn!(core = self.core_id, %collection, %document_id, error = %e, "secondary index cascade failed");
                 }

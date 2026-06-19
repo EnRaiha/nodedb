@@ -78,6 +78,7 @@ fn document_strict_end_to_end_purge() {
 
     for sys in [100i64, 200, 300] {
         eng.versioned_put(VersionedPut {
+            database_id: 0,
             tenant: 1,
             coll: "users",
             doc_id: "u1",
@@ -90,13 +91,14 @@ fn document_strict_end_to_end_purge() {
     }
 
     let (docs, idx) = eng
-        .purge_superseded_document_versions(1, "users", 150)
+        .purge_superseded_document_versions(0, 1, "users", 150)
         .unwrap();
     assert_eq!(docs, 1, "v@100 is dropped, v@200 + v@300 preserved");
     assert_eq!(idx, 0, "no secondary index versions written in this test");
 
     // Preserve the latest even when every version is below cutoff.
     eng.versioned_put(VersionedPut {
+        database_id: 0,
         tenant: 1,
         coll: "orphan",
         doc_id: "o1",
@@ -107,7 +109,7 @@ fn document_strict_end_to_end_purge() {
     })
     .unwrap();
     let (docs, _) = eng
-        .purge_superseded_document_versions(1, "orphan", 10_000_000)
+        .purge_superseded_document_versions(0, 1, "orphan", 10_000_000)
         .unwrap();
     assert_eq!(docs, 0, "single version is the latest — never deleted");
 }

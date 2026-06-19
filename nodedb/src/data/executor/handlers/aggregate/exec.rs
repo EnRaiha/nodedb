@@ -109,8 +109,12 @@ impl CoreLoop {
             && aggregates[0].function == "count"
         {
             let field = &group_by[0];
-            if let Ok(groups) = self.sparse.scan_index_groups(tid, collection, field)
-                && !groups.is_empty()
+            if let Ok(groups) = self.sparse.scan_index_groups(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                field,
+            ) && !groups.is_empty()
             {
                 let mut payload_buf = Vec::with_capacity(groups.len() * 64);
                 let row_count = groups.len().min(limit);

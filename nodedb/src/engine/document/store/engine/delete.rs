@@ -12,15 +12,23 @@ use crate::engine::document::store::extract::extract_index_values_rmpv;
 impl<'a> DocumentEngine<'a> {
     pub fn delete(&self, collection: &str, doc_id: &str) -> crate::Result<bool> {
         if self.is_bitemporal(collection) {
-            let prior_body =
-                self.sparse
-                    .versioned_get_current(self.tenant_id, collection, doc_id)?;
+            let prior_body = self.sparse.versioned_get_current(
+                self.database_id,
+                self.tenant_id,
+                collection,
+                doc_id,
+            )?;
             let Some(body) = prior_body else {
                 return Ok(false);
             };
             let sys_from = wall_now_ms();
-            self.sparse
-                .versioned_tombstone(self.tenant_id, collection, doc_id, sys_from)?;
+            self.sparse.versioned_tombstone(
+                self.database_id,
+                self.tenant_id,
+                collection,
+                doc_id,
+                sys_from,
+            )?;
             if let Some(config) = self.configs.get(collection)
                 && let Ok(rmpv_val) = rmpv::decode::read_value(&mut &body[..])
             {
@@ -29,6 +37,7 @@ impl<'a> DocumentEngine<'a> {
                         extract_index_values_rmpv(&rmpv_val, &index_path.path, index_path.is_array)
                     {
                         self.sparse.versioned_index_tombstone(
+                            self.database_id,
                             self.tenant_id,
                             collection,
                             &index_path.path,
@@ -41,11 +50,15 @@ impl<'a> DocumentEngine<'a> {
             }
             return Ok(true);
         }
-        self.sparse
-            .delete_indexes_for_document(self.tenant_id, collection, doc_id)?;
+        self.sparse.delete_indexes_for_document(
+            self.database_id,
+            self.tenant_id,
+            collection,
+            doc_id,
+        )?;
         Ok(self
             .sparse
-            .delete(self.tenant_id, collection, doc_id)?
+            .delete(self.database_id, self.tenant_id, collection, doc_id)?
             .is_some())
     }
 }

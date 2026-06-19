@@ -132,7 +132,9 @@ impl CoreLoop {
         }
 
         // Pre-commit: BALANCED constraint check across all inserts in this transaction.
-        if let Err(error_code) = self.check_balanced_constraints(tid, &undo_log) {
+        if let Err(error_code) =
+            self.check_balanced_constraints(task.request.database_id.as_u64(), tid, &undo_log)
+        {
             warn!(
                 core = self.core_id,
                 "BALANCED constraint violated, rolling back {} operations",

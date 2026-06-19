@@ -14,7 +14,7 @@ fn make_engine() -> (SparseEngine, tempfile::TempDir) {
 #[test]
 fn put_and_get_document() {
     let (sparse, _dir) = make_engine();
-    let doc_engine = DocumentEngine::new(&sparse, 1);
+    let doc_engine = DocumentEngine::new(&sparse, 0, 1);
 
     let doc = serde_json::json!({
         "name": "Alice",
@@ -33,14 +33,14 @@ fn put_and_get_document() {
 #[test]
 fn get_nonexistent_returns_none() {
     let (sparse, _dir) = make_engine();
-    let doc_engine = DocumentEngine::new(&sparse, 1);
+    let doc_engine = DocumentEngine::new(&sparse, 0, 1);
     assert!(doc_engine.get("users", "missing").unwrap().is_none());
 }
 
 #[test]
 fn delete_document() {
     let (sparse, _dir) = make_engine();
-    let doc_engine = DocumentEngine::new(&sparse, 1);
+    let doc_engine = DocumentEngine::new(&sparse, 0, 1);
 
     let doc = serde_json::json!({"name": "Bob"});
     doc_engine.put("users", "u1", &doc).unwrap();
@@ -51,7 +51,7 @@ fn delete_document() {
 #[test]
 fn overwrite_document() {
     let (sparse, _dir) = make_engine();
-    let doc_engine = DocumentEngine::new(&sparse, 1);
+    let doc_engine = DocumentEngine::new(&sparse, 0, 1);
 
     doc_engine
         .put("users", "u1", &serde_json::json!({"v": 1}))
@@ -67,7 +67,7 @@ fn overwrite_document() {
 #[test]
 fn secondary_index_extraction() {
     let (sparse, _dir) = make_engine();
-    let mut doc_engine = DocumentEngine::new(&sparse, 1);
+    let mut doc_engine = DocumentEngine::new(&sparse, 0, 1);
 
     doc_engine.register_collection(CollectionConfig::new("users").with_index("$.email"));
 
@@ -95,7 +95,7 @@ fn secondary_index_extraction() {
 #[test]
 fn array_index_extraction() {
     let (sparse, _dir) = make_engine();
-    let mut doc_engine = DocumentEngine::new(&sparse, 1);
+    let mut doc_engine = DocumentEngine::new(&sparse, 0, 1);
 
     doc_engine.register_collection(CollectionConfig::new("users").with_index("$.tags[]"));
 
@@ -119,7 +119,7 @@ fn array_index_extraction() {
 #[test]
 fn nested_field_index() {
     let (sparse, _dir) = make_engine();
-    let mut doc_engine = DocumentEngine::new(&sparse, 1);
+    let mut doc_engine = DocumentEngine::new(&sparse, 0, 1);
 
     doc_engine.register_collection(CollectionConfig::new("docs").with_index("$.metadata.lang"));
 
@@ -140,7 +140,7 @@ fn nested_field_index() {
 #[test]
 fn raw_msgpack_roundtrip() {
     let (sparse, _dir) = make_engine();
-    let doc_engine = DocumentEngine::new(&sparse, 1);
+    let doc_engine = DocumentEngine::new(&sparse, 0, 1);
 
     let doc = serde_json::json!({"key": "value", "num": 42});
     let rmpv_val = json_to_msgpack(&doc);
@@ -160,7 +160,7 @@ fn raw_msgpack_roundtrip() {
 #[test]
 fn collections_are_isolated() {
     let (sparse, _dir) = make_engine();
-    let doc_engine = DocumentEngine::new(&sparse, 1);
+    let doc_engine = DocumentEngine::new(&sparse, 0, 1);
 
     doc_engine
         .put("users", "id1", &serde_json::json!({"type": "user"}))
@@ -178,7 +178,7 @@ fn collections_are_isolated() {
 #[test]
 fn put_raw_with_index_extraction() {
     let (sparse, _dir) = make_engine();
-    let mut doc_engine = DocumentEngine::new(&sparse, 1);
+    let mut doc_engine = DocumentEngine::new(&sparse, 0, 1);
 
     doc_engine.register_collection(CollectionConfig::new("items").with_index("$.category"));
 

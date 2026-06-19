@@ -115,10 +115,14 @@ impl CoreLoop {
 
         if let Some(surrogate) = surrogate_opt {
             let row_key = format!("{:08x}", surrogate.as_u32());
-            let fields = match self.sparse.get(tid, collection, &row_key) {
-                Ok(Some(bytes)) => decode_payload_lowercased(&bytes).ok(),
-                _ => None,
-            };
+            let fields =
+                match self
+                    .sparse
+                    .get(task.request.database_id.as_u64(), tid, collection, &row_key)
+                {
+                    Ok(Some(bytes)) => decode_payload_lowercased(&bytes).ok(),
+                    _ => None,
+                };
             if let Some(fields) = fields
                 && let Some(coll) = self.vector_collections.get_mut(&index_key)
             {

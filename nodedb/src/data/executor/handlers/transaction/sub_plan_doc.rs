@@ -32,13 +32,25 @@ impl CoreLoop {
     ) -> Result<Response, ErrorCode> {
         let row_key = crate::engine::document::store::surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
-        let old_value = self.sparse.get(tid, collection, row_key).ok().flatten();
+        let database_id = dummy_task.request.database_id.as_u64();
+        let old_value = self
+            .sparse
+            .get(database_id, tid, collection, row_key)
+            .ok()
+            .flatten();
 
         let config_key = (TenantId::new(tid), collection.to_string());
         if let Some(config) = self.doc_configs.get(&config_key) {
             append_only::check_point_put(collection, &config.enforcement, &old_value)?;
             if let Some(ref pl) = config.enforcement.period_lock {
-                period_lock::check_period_lock(&self.sparse, tid, collection, value, pl)?;
+                period_lock::check_period_lock(
+                    &self.sparse,
+                    database_id,
+                    tid,
+                    collection,
+                    value,
+                    pl,
+                )?;
             }
             if old_value.is_some() {
                 let old_json = old_value
@@ -101,7 +113,10 @@ impl CoreLoop {
         } else {
             encode_for_storage(value)?
         };
-        match self.sparse.put(tid, collection, row_key, &stored) {
+        match self
+            .sparse
+            .put(database_id, tid, collection, row_key, &stored)
+        {
             Ok(_prior) => {
                 if let Some(doc) = doc_format::decode_document(value) {
                     let text_content = extract_indexable_text(&doc);
@@ -129,6 +144,7 @@ impl CoreLoop {
                 {
                     let target_writes = materialized_sum::apply_materialized_sums(
                         &self.sparse,
+                        database_id,
                         tid,
                         &config.enforcement.materialized_sum_sources,
                         &src_doc,
@@ -166,29 +182,41 @@ impl CoreLoop {
         let row_key = row_key.as_str();
         let _ = document_id;
         let config_key = (TenantId::new(tid), collection.to_string());
-        let old_value = self.sparse.get(tid, collection, row_key).ok().flatten();
+        let database_id = dummy_task.request.database_id.as_u64();
+        let old_value = self
+            .sparse
+            .get(database_id, tid, collection, row_key)
+            .ok()
+            .flatten();
         if let Some(config) = self.doc_configs.get(&config_key) {
             append_only::check_point_delete(collection, &config.enforcement)?;
             if let Some(ref pl) = config.enforcement.period_lock
                 && let Some(ref old_bytes) = old_value
             {
-                period_lock::check_period_lock(&self.sparse, tid, collection, old_bytes, pl)?;
+                period_lock::check_period_lock(
+                    &self.sparse,
+                    database_id,
+                    tid,
+                    collection,
+                    old_bytes,
+                    pl,
+                )?;
             }
             let created_at = old_value
                 .as_ref()
                 .and_then(|b| retention::extract_created_at_secs(b));
             retention::check_delete_allowed(collection, &config.enforcement, created_at)?;
         }
-        match self.sparse.delete(tid, collection, row_key) {
+        match self.sparse.delete(database_id, tid, collection, row_key) {
             Ok(_) => {
                 if let Some(s) = crate::engine::document::store::doc_id_to_surrogate(row_key) {
                     let _ = self
                         .inverted
                         .remove_document(TenantId::new(tid), collection, s);
                 }
-                let _ = self
-                    .sparse
-                    .delete_indexes_for_document(tid, collection, row_key);
+                let _ =
+                    self.sparse
+                        .delete_indexes_for_document(database_id, tid, collection, row_key);
                 let edges_removed = self.csr_partition_mut(tid).remove_node_edges(row_key);
                 if edges_removed > 0 {
                     let cascade_ord = self.hlc.next_ordinal();

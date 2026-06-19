@@ -22,7 +22,7 @@ fn open() -> (SparseEngine, tempfile::TempDir) {
 #[test]
 fn bitemporal_put_and_current_get_roundtrip() {
     let (sparse, _d) = open();
-    let mut engine = DocumentEngine::new(&sparse, 1);
+    let mut engine = DocumentEngine::new(&sparse, 0, 1);
     engine.register_collection(CollectionConfig::new("users").with_bitemporal(true));
 
     engine
@@ -36,7 +36,7 @@ fn bitemporal_put_and_current_get_roundtrip() {
 #[test]
 fn bitemporal_delete_appends_tombstone_so_current_get_is_none() {
     let (sparse, _d) = open();
-    let mut engine = DocumentEngine::new(&sparse, 1);
+    let mut engine = DocumentEngine::new(&sparse, 0, 1);
     engine.register_collection(CollectionConfig::new("c").with_bitemporal(true));
 
     engine.put("c", "a", &serde_json::json!({"v": 1})).unwrap();
@@ -52,7 +52,7 @@ fn bitemporal_delete_appends_tombstone_so_current_get_is_none() {
 #[test]
 fn bitemporal_multiple_puts_retain_history_via_versioned_get_as_of() {
     let (sparse, _d) = open();
-    let mut engine = DocumentEngine::new(&sparse, 1);
+    let mut engine = DocumentEngine::new(&sparse, 0, 1);
     engine.register_collection(CollectionConfig::new("c").with_bitemporal(true));
 
     // Three puts create three versions. The versioned API is the way
@@ -65,7 +65,7 @@ fn bitemporal_multiple_puts_retain_history_via_versioned_get_as_of() {
 
     // A cutoff before the second write should surface v=1.
     let body = sparse
-        .versioned_get_as_of(1, "c", "k", Some(t_mid), None)
+        .versioned_get_as_of(0, 1, "c", "k", Some(t_mid), None)
         .unwrap()
         .expect("version at cutoff");
     let val: serde_json::Value = {
@@ -82,14 +82,14 @@ fn bitemporal_multiple_puts_retain_history_via_versioned_get_as_of() {
 #[test]
 fn non_bitemporal_collection_uses_legacy_storage() {
     let (sparse, _d) = open();
-    let mut engine = DocumentEngine::new(&sparse, 1);
+    let mut engine = DocumentEngine::new(&sparse, 0, 1);
     engine.register_collection(CollectionConfig::new("c"));
     engine.put("c", "k", &serde_json::json!({"v": 1})).unwrap();
 
     // The versioned table must be empty for this collection because
     // writes went to the legacy path.
     let bitemporal_rows = sparse
-        .versioned_scan_as_of(1, "c", None, None, 100, &|_: &[u8]| true)
+        .versioned_scan_as_of(0, 1, "c", None, None, 100, &|_: &[u8]| true)
         .unwrap();
     assert!(
         bitemporal_rows.is_empty(),

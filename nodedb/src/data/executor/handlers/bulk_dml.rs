@@ -22,12 +22,13 @@ impl CoreLoop {
     /// Returns document IDs of all matching documents.
     pub(in crate::data::executor) fn scan_matching_documents(
         &self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         filters: &[ScanFilter],
     ) -> crate::Result<Vec<String>> {
-        let prefix = format!("{tid}:{collection}:");
-        let end = format!("{tid}:{collection}:\u{ffff}");
+        let prefix = crate::engine::sparse::btree::coll_prefix(database_id, tid, collection);
+        let end = format!("{prefix}\u{ffff}");
 
         let read_txn = self
             .sparse
@@ -143,7 +144,12 @@ impl CoreLoop {
             }
         };
 
-        let matching_ids = match self.scan_matching_documents(tid, collection, &filters) {
+        let matching_ids = match self.scan_matching_documents(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            &filters,
+        ) {
             Ok(ids) => ids,
             Err(e) => {
                 return self.response_error(
@@ -188,7 +194,10 @@ impl CoreLoop {
         };
 
         for doc_id in &matching_ids {
-            match self.sparse.get(tid, collection, doc_id) {
+            match self
+                .sparse
+                .get(task.request.database_id.as_u64(), tid, collection, doc_id)
+            {
                 Ok(Some(current_bytes)) => {
                     // Decode current value — format depends on storage mode.
                     let mut doc = if let Some(ref schema) = strict_schema {
@@ -265,7 +274,13 @@ impl CoreLoop {
                     };
                     if self
                         .sparse
-                        .put(tid, collection, doc_id, &updated_bytes)
+                        .put(
+                            task.request.database_id.as_u64(),
+                            tid,
+                            collection,
+                            doc_id,
+                            &updated_bytes,
+                        )
                         .is_ok()
                     {
                         self.doc_cache.put(
@@ -351,7 +366,12 @@ impl CoreLoop {
             }
         };
 
-        let matching_ids = match self.scan_matching_documents(tid, collection, &filters) {
+        let matching_ids = match self.scan_matching_documents(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            &filters,
+        ) {
             Ok(ids) => ids,
             Err(e) => {
                 return self.response_error(
@@ -387,7 +407,7 @@ impl CoreLoop {
             // Capture pre-deletion snapshot if RETURNING was requested.
             let pre_delete_doc: Option<serde_json::Value> = if returning.is_some() {
                 self.sparse
-                    .get(tid, collection, doc_id)
+                    .get(task.request.database_id.as_u64(), tid, collection, doc_id)
                     .ok()
                     .flatten()
                     .and_then(|bytes| {
@@ -401,7 +421,7 @@ impl CoreLoop {
 
             if self
                 .sparse
-                .delete(tid, collection, doc_id)
+                .delete(task.request.database_id.as_u64(), tid, collection, doc_id)
                 .ok()
                 .flatten()
                 .is_some()
@@ -423,10 +443,12 @@ impl CoreLoop {
                     }
                 }
                 // Cascade: secondary indexes.
-                if let Err(e) = self
-                    .sparse
-                    .delete_indexes_for_document(tid, collection, doc_id)
-                {
+                if let Err(e) = self.sparse.delete_indexes_for_document(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    doc_id,
+                ) {
                     warn!(core = self.core_id, %collection, %doc_id, error = %e, "bulk delete: secondary index cascade failed");
                 }
                 // Cascade: graph edges.
