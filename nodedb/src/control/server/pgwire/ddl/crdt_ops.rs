@@ -48,6 +48,7 @@ fn parse_function_args(sql: &str) -> Vec<String> {
 pub async fn crdt_state(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let args = parse_function_args(sql);
@@ -71,6 +72,7 @@ pub async fn crdt_state(
     let result = super::sync_dispatch::dispatch_async(
         state,
         tenant_id,
+        database_id,
         collection,
         plan,
         Duration::from_secs(state.tuning.network.default_deadline_secs),
@@ -144,6 +146,7 @@ pub async fn crdt_apply(
     super::sync_dispatch::dispatch_async(
         state,
         tenant_id,
+        database_id,
         collection,
         plan,
         Duration::from_secs(state.tuning.network.default_deadline_secs),

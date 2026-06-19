@@ -18,26 +18,36 @@ use nodedb_physical::physical_plan::{MetaOp, PhysicalPlan};
 
 use crate::control::server::pgwire::ddl::sync_dispatch;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 use nodedb_types::NodeDbError;
 
 /// Run the snapshot phase: produce a backup snapshot for `tenant_id` via
 /// a local Data Plane dispatch.
 ///
+/// `source_db_id` is the database the tenant is being moved FROM — the
+/// snapshot captures its live data, so the dispatch routes to that database.
+///
 /// Returns the raw snapshot bytes on success.
 pub async fn run(
     state: &SharedState,
     tenant_id: TenantId,
+    source_db_id: DatabaseId,
     timeout: Duration,
 ) -> Result<Bytes, NodeDbError> {
     let plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
         tenant_id: tenant_id.as_u64(),
     });
-    let raw = sync_dispatch::dispatch_async(state, tenant_id, "__system", plan, timeout)
-        .await
-        .map_err(|e| {
-            NodeDbError::move_tenant_snapshot_failed(tenant_id.as_u64().to_string(), format!("{e}"))
-        })?;
+    // Route to the source database: the snapshot reads the tenant's live
+    // data from the database it is being moved out of.
+    let raw =
+        sync_dispatch::dispatch_async(state, tenant_id, source_db_id, "__system", plan, timeout)
+            .await
+            .map_err(|e| {
+                NodeDbError::move_tenant_snapshot_failed(
+                    tenant_id.as_u64().to_string(),
+                    format!("{e}"),
+                )
+            })?;
     Ok(Bytes::from(raw))
 }
 

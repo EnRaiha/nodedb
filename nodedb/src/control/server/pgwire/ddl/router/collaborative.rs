@@ -5,6 +5,7 @@ use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 pub(super) async fn dispatch(
     state: &SharedState,
@@ -12,6 +13,7 @@ pub(super) async fn dispatch(
     sql: &str,
     upper: &str,
     parts: &[&str],
+    database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     // Pub/Sub: SUBSCRIBE TO (legacy).
     if upper.starts_with("SUBSCRIBE TO ") {
@@ -84,8 +86,13 @@ pub(super) async fn dispatch(
     // ── Version History ──────────────────────────────────────────────
     if upper.starts_with("CREATE CHECKPOINT ") {
         return Some(
-            super::super::version_history::checkpoint::create_checkpoint(state, identity, sql)
-                .await,
+            super::super::version_history::checkpoint::create_checkpoint(
+                state,
+                identity,
+                database_id,
+                sql,
+            )
+            .await,
         );
     }
     if upper.starts_with("DROP CHECKPOINT ") {
@@ -100,21 +107,41 @@ pub(super) async fn dispatch(
     }
     if upper.contains("AT VERSION") && upper.starts_with("SELECT") {
         return Some(
-            super::super::version_history::at_version::select_at_version(state, identity, sql)
-                .await,
+            super::super::version_history::at_version::select_at_version(
+                state,
+                identity,
+                database_id,
+                sql,
+            )
+            .await,
         );
     }
     if upper.starts_with("SELECT DIFF(") || upper.starts_with("SELECT DIFF (") {
-        return Some(super::super::version_history::diff::select_diff(state, identity, sql).await);
+        return Some(
+            super::super::version_history::diff::select_diff(state, identity, database_id, sql)
+                .await,
+        );
     }
     if upper.starts_with("RESTORE ") && upper.contains("SET VERSION") {
         return Some(
-            super::super::version_history::restore::restore_version(state, identity, sql).await,
+            super::super::version_history::restore::restore_version(
+                state,
+                identity,
+                database_id,
+                sql,
+            )
+            .await,
         );
     }
     if upper.starts_with("COMPACT HISTORY ON ") {
         return Some(
-            super::super::version_history::compact::compact_history(state, identity, sql).await,
+            super::super::version_history::compact::compact_history(
+                state,
+                identity,
+                database_id,
+                sql,
+            )
+            .await,
         );
     }
 

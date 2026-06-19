@@ -143,7 +143,7 @@ pub async fn dispatch_typed(
             .await,
         ),
         NodedbStatement::Graph(GraphStmt::GraphRagFusion { collection, params }) => {
-            Some(rag_fusion::rag_fusion(state, identity, collection, params).await)
+            Some(rag_fusion::rag_fusion(state, identity, database_id, collection, params).await)
         }
         NodedbStatement::Graph(GraphStmt::ShowGraphStats {
             collection,

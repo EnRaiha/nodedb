@@ -21,6 +21,7 @@ use pgwire::error::PgWireResult;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::MetaOp;
 
 use super::super::types::{int8_field, sqlstate_error, text_field};
@@ -29,6 +30,7 @@ use super::super::types::{int8_field, sqlstate_error, text_field};
 pub async fn query_last_values(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: &str,
 ) -> PgWireResult<Vec<Response>> {
     let tenant_id = identity.tenant_id;
@@ -39,6 +41,7 @@ pub async fn query_last_values(
     let payload = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
+        database_id,
         collection,
         plan,
         Duration::from_secs(5),
@@ -79,6 +82,7 @@ pub async fn query_last_values(
 pub async fn query_last_value(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: &str,
     series_id: u64,
 ) -> PgWireResult<Vec<Response>> {
@@ -91,6 +95,7 @@ pub async fn query_last_value(
     let payload = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
+        database_id,
         collection,
         plan,
         Duration::from_secs(5),

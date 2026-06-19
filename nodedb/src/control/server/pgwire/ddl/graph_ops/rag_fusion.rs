@@ -25,6 +25,7 @@ use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::{GraphTraversalOptions, MAX_GRAPH_TRAVERSAL_DEPTH};
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::GraphOp;
 
 const FUSION_VECTOR_TOP_K_CAP: usize = 10_000;
@@ -33,6 +34,7 @@ const FUSION_TOP_CAP: usize = 10_000;
 pub async fn rag_fusion(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: String,
     params: FusionParams,
 ) -> PgWireResult<Vec<Response>> {
@@ -110,6 +112,7 @@ pub async fn rag_fusion(
     let payload = sync_dispatch::dispatch_async(
         state,
         identity.tenant_id,
+        database_id,
         &collection,
         plan,
         Duration::from_secs(state.tuning.network.default_deadline_secs),

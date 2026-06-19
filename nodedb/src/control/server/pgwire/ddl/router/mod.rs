@@ -61,7 +61,7 @@ pub async fn dispatch(
     let upper = sql.to_uppercase();
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
-    if let Some(r) = auth::dispatch(state, identity, sql, &upper, &parts).await {
+    if let Some(r) = auth::dispatch(state, identity, sql, &upper, &parts, database_id).await {
         return Some(r);
     }
 
@@ -81,11 +81,13 @@ pub async fn dispatch(
         return Some(r);
     }
 
-    if let Some(r) = collaborative::dispatch(state, identity, sql, &upper, &parts).await {
+    if let Some(r) =
+        collaborative::dispatch(state, identity, sql, &upper, &parts, database_id).await
+    {
         return Some(r);
     }
 
-    if let Some(r) = admin::dispatch(state, identity, sql, &upper, &parts).await {
+    if let Some(r) = admin::dispatch(state, identity, sql, &upper, &parts, database_id).await {
         return Some(r);
     }
 

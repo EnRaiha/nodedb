@@ -16,6 +16,7 @@ use crate::control::server::pgwire::ddl::sync_dispatch;
 use crate::control::server::pgwire::types::{int8_field, sqlstate_error, text_field};
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::{AggregateInfo, ContinuousAggregateDef};
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::MetaOp;
 
 /// `SHOW CONTINUOUS AGGREGATES [FOR <source>]`.
@@ -29,6 +30,7 @@ use nodedb_physical::physical_plan::MetaOp;
 pub async fn show_continuous_aggregates(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> PgWireResult<Vec<Response>> {
     let source_filter = if parts.len() >= 5 && parts[3].to_uppercase() == "FOR" {
@@ -51,6 +53,7 @@ pub async fn show_continuous_aggregates(
     let runtime_infos: Vec<AggregateInfo> = match sync_dispatch::dispatch_async(
         state,
         tenant_id,
+        database_id,
         "__system",
         PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
         Duration::from_secs(5),

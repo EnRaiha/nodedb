@@ -12,7 +12,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::{ContinuousAggregateDef, RefreshPolicy};
 use crate::engine::timeseries::retention_policy::types::RetentionPolicyDef;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::MetaOp;
 
 /// Register continuous aggregates for all downsample tiers in a retention policy.
@@ -69,6 +69,8 @@ pub async fn register_tiers(
         crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
             state,
             tenant_id,
+            // TODO(A8-followup): retention_policy_registry not yet keyed by database.
+            DatabaseId::DEFAULT,
             &source,
             plan,
             Duration::from_secs(5),
@@ -111,6 +113,8 @@ pub async fn unregister_tiers(
         crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
             state,
             tenant_id,
+            // TODO(A8-followup): retention_policy_registry not yet keyed by database.
+            DatabaseId::DEFAULT,
             route_collection,
             plan,
             Duration::from_secs(5),

@@ -127,7 +127,7 @@ pub async fn handle_move_tenant(
         .map_err(|e| sqlstate_error("XX000", &format!("journal update: {e}")))?;
 
     // ── Phase 3: Snapshot ─────────────────────────────────────────────────────
-    let snapshot_result = snapshot::run(state, tenant_id, SNAPSHOT_TIMEOUT).await;
+    let snapshot_result = snapshot::run(state, tenant_id, source_db_id, SNAPSHOT_TIMEOUT).await;
     let snapshot_bytes = match snapshot_result {
         Ok(bytes) => bytes,
         Err(ref e) => {

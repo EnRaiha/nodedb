@@ -39,6 +39,9 @@ pub struct CreateContinuousAggregateRequest<'a> {
     pub aggregate_exprs_raw: &'a str,
     pub group_by: &'a [String],
     pub with_clause_raw: &'a str,
+    /// Session database the continuous aggregate is created in. Scopes
+    /// catalog lookups and Data-Plane dispatch routing.
+    pub database_id: DatabaseId,
 }
 
 /// Handle `CREATE CONTINUOUS AGGREGATE`.
@@ -54,6 +57,7 @@ pub async fn create_continuous_aggregate(
         aggregate_exprs_raw,
         group_by,
         with_clause_raw,
+        database_id,
     } = *req;
     // Reconstruct minimal SQL for parse_create_sql reuse.
     // This avoids duplicating the complex AggregateExpr parsing logic.
@@ -89,7 +93,7 @@ pub async fn create_continuous_aggregate(
     // Validate source collection exists and is timeseries.
     let tenant_id = identity.tenant_id;
     if let Some(catalog) = state.credentials.catalog() {
-        match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &def.source) {
+        match catalog.get_collection(database_id, tenant_id.as_u64(), &def.source) {
             Ok(Some(coll)) if coll.collection_type.is_timeseries() => {}
             Ok(Some(_)) => {
                 return Err(sqlstate_error(
@@ -150,7 +154,7 @@ pub async fn create_continuous_aggregate(
     // of the same name already exists.
     let target_exists = match state.credentials.catalog() {
         Some(catalog) => matches!(
-            catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &def.name),
+            catalog.get_collection(database_id, tenant_id.as_u64(), &def.name),
             Ok(Some(c)) if c.is_active
         ),
         None => false,
@@ -189,7 +193,7 @@ pub async fn create_continuous_aggregate(
             primary: nodedb_types::PrimaryEngine::Document,
             vector_primary: None,
             partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
-            database_id: nodedb_types::DatabaseId::DEFAULT,
+            database_id,
             cloned_from: None,
             clone_status: nodedb_types::CloneStatus::default(),
         };
@@ -207,9 +211,16 @@ pub async fn create_continuous_aggregate(
     // immediately, matching the cluster behaviour.
     if log_index == 0 {
         let plan = PhysicalPlan::Meta(MetaOp::RegisterContinuousAggregate { def: def.clone() });
-        sync_dispatch::dispatch_async(state, tenant_id, &def.source, plan, Duration::from_secs(5))
-            .await
-            .map_err(|e| sqlstate_error("XX000", &format!("dispatch failed: {e}")))?;
+        sync_dispatch::dispatch_async(
+            state,
+            tenant_id,
+            database_id,
+            &def.source,
+            plan,
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|e| sqlstate_error("XX000", &format!("dispatch failed: {e}")))?;
     }
 
     tracing::info!(

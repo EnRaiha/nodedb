@@ -25,6 +25,7 @@ use super::super::types::sqlstate_error;
 pub async fn convert_collection(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let (collection, target_type, explicit_columns) = parse_convert_sql(sql)?;
@@ -36,7 +37,7 @@ pub async fn convert_collection(
     };
 
     let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
+        .get_collection(database_id, tenant_id.as_u64(), &collection)
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
         .ok_or_else(|| {
             sqlstate_error(
@@ -80,6 +81,7 @@ pub async fn convert_collection(
     super::sync_dispatch::dispatch_async(
         state,
         tenant_id,
+        database_id,
         &collection,
         plan,
         Duration::from_secs(60),
@@ -138,7 +140,7 @@ pub async fn convert_collection(
     }
 
     catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+        .put_collection(database_id, &coll)
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
     tracing::info!(

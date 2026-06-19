@@ -10,6 +10,7 @@ use pgwire::error::PgWireResult;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
 use super::super::super::types::sqlstate_error;
@@ -22,6 +23,7 @@ use super::super::super::types::sqlstate_error;
 pub async fn compact_history(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let (collection, doc_id, checkpoint_name) = parse_compact(sql)?;
@@ -46,9 +48,16 @@ pub async fn compact_history(
         target_version_json: record.version_vector_json.clone(),
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    super::super::sync_dispatch::dispatch_async(state, tenant_id, &collection, plan, timeout)
-        .await
-        .map_err(|e| sqlstate_error("XX000", &format!("compact dispatch: {e}")))?;
+    super::super::sync_dispatch::dispatch_async(
+        state,
+        tenant_id,
+        database_id,
+        &collection,
+        plan,
+        timeout,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &format!("compact dispatch: {e}")))?;
 
     // Delete checkpoints created before the cutoff.
     let deleted = catalog

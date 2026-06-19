@@ -12,6 +12,7 @@ use pgwire::error::PgWireResult;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
 use super::super::super::types::{int8_field, sqlstate_error, text_field};
@@ -27,6 +28,7 @@ use super::super::super::types::{int8_field, sqlstate_error, text_field};
 pub async fn select_diff(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let args = parse_diff_args(sql)?;
@@ -57,10 +59,16 @@ pub async fn select_diff(
         from_version_json: from_vv,
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let delta_bytes =
-        super::super::sync_dispatch::dispatch_async(state, tenant_id, collection, plan, timeout)
-            .await
-            .map_err(|e| sqlstate_error("XX000", &format!("dispatch: {e}")))?;
+    let delta_bytes = super::super::sync_dispatch::dispatch_async(
+        state,
+        tenant_id,
+        database_id,
+        collection,
+        plan,
+        timeout,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &format!("dispatch: {e}")))?;
 
     let schema = Arc::new(vec![
         text_field("from_version"),

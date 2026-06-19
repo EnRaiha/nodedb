@@ -90,6 +90,7 @@ async fn flush_ilp_batch_inner(
     tenant_id: TenantId,
     batch: &str,
 ) -> crate::Result<u64> {
+    // ILP protocol carries no database selector; all ops target DatabaseId::DEFAULT.
     // Fast path: extract collection from first line.
     let collection = batch
         .lines()

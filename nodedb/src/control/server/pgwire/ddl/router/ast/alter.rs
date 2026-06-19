@@ -18,10 +18,12 @@ use crate::control::server::pgwire::ddl::collection::{
 use crate::control::server::pgwire::ddl::conflict_policy::alter_set_on_conflict;
 use crate::control::server::pgwire::ddl::ownership::alter_collection_owner;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 pub(super) async fn dispatch_alter_collection(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     operation: &AlterCollectionOp,
 ) -> PgWireResult<Vec<Response>> {
@@ -92,6 +94,8 @@ pub(super) async fn dispatch_alter_collection(
         AlterCollectionOp::SetOnConflict {
             policy,
             constraint_kind,
-        } => alter_set_on_conflict(state, identity, name, policy, constraint_kind).await,
+        } => {
+            alter_set_on_conflict(state, identity, database_id, name, policy, constraint_kind).await
+        }
     }
 }

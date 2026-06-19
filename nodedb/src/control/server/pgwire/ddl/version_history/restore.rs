@@ -10,6 +10,7 @@ use pgwire::error::PgWireResult;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
 use super::super::super::types::sqlstate_error;
@@ -21,6 +22,7 @@ use super::super::super::types::sqlstate_error;
 pub async fn restore_version(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let (collection, checkpoint_name, doc_id) = parse_restore(sql)?;
@@ -36,12 +38,7 @@ pub async fn restore_version(
 
     let surrogate = state
         .surrogate_assigner
-        .assign(
-            crate::types::DatabaseId::DEFAULT,
-            tenant_id,
-            &collection,
-            doc_id.as_bytes(),
-        )
+        .assign(database_id, tenant_id, &collection, doc_id.as_bytes())
         .map_err(|e| sqlstate_error("XX000", &format!("surrogate assign: {e}")))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
@@ -51,9 +48,16 @@ pub async fn restore_version(
         surrogate,
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    super::super::sync_dispatch::dispatch_async(state, tenant_id, &collection, plan, timeout)
-        .await
-        .map_err(|e| sqlstate_error("XX000", &format!("restore dispatch: {e}")))?;
+    super::super::sync_dispatch::dispatch_async(
+        state,
+        tenant_id,
+        database_id,
+        &collection,
+        plan,
+        timeout,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &format!("restore dispatch: {e}")))?;
 
     state
         .audit

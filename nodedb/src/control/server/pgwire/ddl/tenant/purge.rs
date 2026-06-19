@@ -14,12 +14,14 @@ use pgwire::error::PgWireResult;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::types::sqlstate_error;
 
 pub async fn purge_tenant(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> PgWireResult<Vec<Response>> {
     if !identity.is_superuser {
@@ -75,6 +77,7 @@ pub async fn purge_tenant(
     match super::super::sync_dispatch::dispatch_async(
         state,
         tenant_id,
+        database_id,
         "__system",
         plan,
         std::time::Duration::from_secs(300),

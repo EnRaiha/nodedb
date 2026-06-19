@@ -129,16 +129,24 @@ async fn dispatch_rename_ops(
             new_collection: new_collection.clone(),
         });
 
-        sync_dispatch::dispatch_async(state, tenant_id, "__system", plan, RENAME_DISPATCH_TIMEOUT)
-            .await
-            .map_err(|e| {
-                NodeDbError::move_tenant_cutover_failed(
-                    tenant_id.as_u64().to_string(),
-                    format!(
-                        "rename_collection dispatch ({old_collection} -> {new_collection}): {e}"
-                    ),
-                )
-            })?;
+        // Route to the destination database: cutover materializes the
+        // re-keyed namespace under target_db_id, so the rename dispatch
+        // targets the shard owning the new db-qualified storage.
+        sync_dispatch::dispatch_async(
+            state,
+            tenant_id,
+            target_db_id,
+            "__system",
+            plan,
+            RENAME_DISPATCH_TIMEOUT,
+        )
+        .await
+        .map_err(|e| {
+            NodeDbError::move_tenant_cutover_failed(
+                tenant_id.as_u64().to_string(),
+                format!("rename_collection dispatch ({old_collection} -> {new_collection}): {e}"),
+            )
+        })?;
     }
     Ok(())
 }

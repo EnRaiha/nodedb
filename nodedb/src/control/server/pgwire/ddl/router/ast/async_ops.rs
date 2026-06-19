@@ -141,6 +141,7 @@ pub(super) async fn try_dispatch_async(
                     aggregate_exprs_raw,
                     group_by,
                     with_clause_raw,
+                    database_id,
                 },
             )
             .await,
@@ -260,19 +261,19 @@ pub(super) async fn try_dispatch_async(
         }
 
         NodedbStatement::Collection(CollectionStmt::AlterCollection { name, operation }) => {
-            Some(dispatch_alter_collection(state, identity, name, operation).await)
+            Some(dispatch_alter_collection(state, identity, database_id, name, operation).await)
         }
 
         NodedbStatement::Policy(PolicyStmt::ShowConflictPolicy { collection }) => {
-            Some(show_conflict_policy(state, identity, collection).await)
+            Some(show_conflict_policy(state, identity, database_id, collection).await)
         }
 
         NodedbStatement::Policy(PolicyStmt::CreateSynonymGroup { name, terms }) => {
-            Some(create_synonym_group(state, identity, name, terms).await)
+            Some(create_synonym_group(state, identity, database_id, name, terms).await)
         }
 
         NodedbStatement::Policy(PolicyStmt::DropSynonymGroup { name, if_exists }) => {
-            Some(drop_synonym_group(state, identity, name, *if_exists).await)
+            Some(drop_synonym_group(state, identity, database_id, name, *if_exists).await)
         }
 
         NodedbStatement::Policy(PolicyStmt::ShowSynonymGroups) => {

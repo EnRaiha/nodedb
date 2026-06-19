@@ -24,6 +24,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::StoredSynonymGroup;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::MetaOp;
 
 use super::super::types::{require_tenant_admin, sqlstate_error, text_field};
@@ -33,6 +34,7 @@ use super::sync_dispatch::dispatch_async;
 pub async fn create_synonym_group(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     terms: &[String],
 ) -> PgWireResult<Vec<Response>> {
@@ -96,9 +98,16 @@ pub async fn create_synonym_group(
     });
 
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    dispatch_async(state, tenant_id, SYNONYM_SENTINEL_COLLECTION, plan, timeout)
-        .await
-        .map_err(|e| sqlstate_error("XX000", &format!("data plane dispatch: {e}")))?;
+    dispatch_async(
+        state,
+        tenant_id,
+        database_id,
+        SYNONYM_SENTINEL_COLLECTION,
+        plan,
+        timeout,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &format!("data plane dispatch: {e}")))?;
 
     Ok(vec![Response::Execution(Tag::new("CREATE SYNONYM GROUP"))])
 }
@@ -107,6 +116,7 @@ pub async fn create_synonym_group(
 pub async fn drop_synonym_group(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     if_exists: bool,
 ) -> PgWireResult<Vec<Response>> {
@@ -154,9 +164,16 @@ pub async fn drop_synonym_group(
     });
 
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    dispatch_async(state, tenant_id, SYNONYM_SENTINEL_COLLECTION, plan, timeout)
-        .await
-        .map_err(|e| sqlstate_error("XX000", &format!("data plane dispatch: {e}")))?;
+    dispatch_async(
+        state,
+        tenant_id,
+        database_id,
+        SYNONYM_SENTINEL_COLLECTION,
+        plan,
+        timeout,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &format!("data plane dispatch: {e}")))?;
 
     Ok(vec![Response::Execution(Tag::new("DROP SYNONYM GROUP"))])
 }

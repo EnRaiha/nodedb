@@ -88,7 +88,17 @@ async fn take_shape_snapshot_async(
                 upper: None,
                 limit: 10_000,
             });
-            match dispatch_async(shared, tid, collection, plan, Duration::from_secs(10)).await {
+            // A5 (deferred): shape snapshot has no session database.
+            match dispatch_async(
+                shared,
+                tid,
+                crate::types::DatabaseId::DEFAULT,
+                collection,
+                plan,
+                Duration::from_secs(10),
+            )
+            .await
+            {
                 Ok(payload) => filter_snapshot_by_predicate(payload, predicate, &shape.shape_id),
                 Err(e) => {
                     warn!(

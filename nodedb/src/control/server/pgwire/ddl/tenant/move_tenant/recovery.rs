@@ -114,7 +114,8 @@ pub async fn resume_or_compensate(
             }
 
             // Cutover proposal did not apply. Re-run the snapshot and cutover.
-            let snapshot_result = snapshot::run(state, tenant_id, SNAPSHOT_TIMEOUT).await;
+            let snapshot_result =
+                snapshot::run(state, tenant_id, source_db_id, SNAPSHOT_TIMEOUT).await;
             let snapshot_bytes = match snapshot_result {
                 Ok(b) => b,
                 Err(ref e) => {
@@ -243,7 +244,8 @@ pub async fn recover_all(state: &SharedState) {
                     );
                 } else {
                     // Re-attempt cutover.
-                    if let Ok(snap_bytes) = snapshot::run(state, tenant_id, SNAPSHOT_TIMEOUT).await
+                    if let Ok(snap_bytes) =
+                        snapshot::run(state, tenant_id, source_db_id, SNAPSHOT_TIMEOUT).await
                     {
                         let _ = cutover::run(
                             state,

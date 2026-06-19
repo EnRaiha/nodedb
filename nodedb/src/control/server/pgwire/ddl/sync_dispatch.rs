@@ -17,6 +17,7 @@ use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
 pub async fn dispatch_async(
     state: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     collection: &str,
     plan: PhysicalPlan,
     timeout: Duration,
@@ -24,6 +25,7 @@ pub async fn dispatch_async(
     dispatch_async_with_source(
         state,
         tenant_id,
+        database_id,
         collection,
         plan,
         timeout,
@@ -40,6 +42,7 @@ pub async fn dispatch_async(
 pub async fn dispatch_async_with_source(
     state: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     collection: &str,
     plan: PhysicalPlan,
     timeout: Duration,
@@ -48,6 +51,7 @@ pub async fn dispatch_async_with_source(
     let resp = dispatch_async_response_with_source(
         state,
         tenant_id,
+        database_id,
         collection,
         plan,
         timeout,
@@ -94,18 +98,19 @@ pub async fn dispatch_async_with_source(
 pub(crate) async fn dispatch_async_response_with_source(
     state: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     collection: &str,
     plan: PhysicalPlan,
     timeout: Duration,
     event_source: crate::event::EventSource,
 ) -> crate::Result<Response> {
-    let vshard_id = VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection);
+    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
     let request_id = state.next_request_id();
 
     let request = Request {
         request_id,
         tenant_id,
-        database_id: DatabaseId::DEFAULT,
+        database_id,
         vshard_id,
         plan,
         deadline: Instant::now() + timeout,

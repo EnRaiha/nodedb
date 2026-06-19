@@ -31,6 +31,7 @@ pub(super) async fn dispatch_kv(
     session: &RespSession,
     plan: PhysicalPlan,
 ) -> crate::Result<Response> {
+    // RESP protocol carries no database selector; all ops target DatabaseId::DEFAULT.
     match state.gateway.as_ref() {
         Some(gw) => {
             let gw_ctx = QueryContext {

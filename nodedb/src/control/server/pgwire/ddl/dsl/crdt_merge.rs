@@ -57,6 +57,7 @@ pub async fn crdt_merge(
     let source_bytes = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
+        database_id,
         collection,
         source_plan,
         Duration::from_secs(state.tuning.network.default_deadline_secs),
@@ -88,6 +89,7 @@ pub async fn crdt_merge(
     crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
+        database_id,
         collection,
         apply_plan,
         Duration::from_secs(state.tuning.network.default_deadline_secs),

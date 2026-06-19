@@ -5,6 +5,7 @@ use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 pub(super) async fn dispatch(
     state: &SharedState,
@@ -12,6 +13,7 @@ pub(super) async fn dispatch(
     _sql: &str,
     upper: &str,
     parts: &[&str],
+    database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     // User management.
     // CREATE USER and ALTER USER are fully dispatched via typed AST (ast.rs).
@@ -56,7 +58,7 @@ pub(super) async fn dispatch(
         return Some(super::super::tenant::drop_tenant(state, identity, parts));
     }
     if upper.starts_with("PURGE TENANT ") {
-        return Some(super::super::tenant::purge_tenant(state, identity, parts).await);
+        return Some(super::super::tenant::purge_tenant(state, identity, database_id, parts).await);
     }
     if upper.starts_with("SHOW TENANT USAGE") {
         return Some(super::super::tenant::show_tenant_usage(

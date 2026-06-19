@@ -196,6 +196,7 @@ pub async fn dispatch_sync_bytes(
     timeout: Duration,
     event_source: EventSource,
 ) -> crate::Result<Vec<u8>> {
+    // A5 (deferred): sync inbound envelope carries no session database yet.
     let vshard_id = VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection);
 
     if let Some(proposer) = state.async_raft_proposer.get()
@@ -208,6 +209,8 @@ pub async fn dispatch_sync_bytes(
         crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async_response_with_source(
             state,
             tenant_id,
+            // A5 (deferred): sync inbound envelope carries no session database yet.
+            DatabaseId::DEFAULT,
             collection,
             plan,
             timeout,

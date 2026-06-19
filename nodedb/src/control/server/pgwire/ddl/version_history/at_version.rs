@@ -12,6 +12,7 @@ use pgwire::error::PgWireResult;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
 use super::super::super::types::{sqlstate_error, text_field};
@@ -20,6 +21,7 @@ use super::super::super::types::{sqlstate_error, text_field};
 pub async fn select_at_version(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let (collection, checkpoint_name, doc_id) = parse_at_version(sql)?;
@@ -41,10 +43,16 @@ pub async fn select_at_version(
         version_vector_json: vv_json,
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let payload =
-        super::super::sync_dispatch::dispatch_async(state, tenant_id, &collection, plan, timeout)
-            .await
-            .map_err(|e| sqlstate_error("XX000", &format!("dispatch: {e}")))?;
+    let payload = super::super::sync_dispatch::dispatch_async(
+        state,
+        tenant_id,
+        database_id,
+        &collection,
+        plan,
+        timeout,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &format!("dispatch: {e}")))?;
 
     let text = String::from_utf8_lossy(&payload).into_owned();
 

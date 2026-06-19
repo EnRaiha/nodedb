@@ -12,6 +12,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::ddl::{catalog_propose, sync_dispatch};
 use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::MetaOp;
 
 /// `DROP CONTINUOUS AGGREGATE <name>`.
@@ -21,6 +22,7 @@ use nodedb_physical::physical_plan::MetaOp;
 pub async fn drop_continuous_aggregate(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> PgWireResult<Vec<Response>> {
     if parts.len() < 4 {
@@ -44,9 +46,16 @@ pub async fn drop_continuous_aggregate(
     // aggregate immediately.
     if log_index == 0 {
         let plan = PhysicalPlan::Meta(MetaOp::UnregisterContinuousAggregate { name: name.clone() });
-        sync_dispatch::dispatch_async(state, tenant_id, &name, plan, Duration::from_secs(5))
-            .await
-            .map_err(|e| sqlstate_error("XX000", &format!("dispatch failed: {e}")))?;
+        sync_dispatch::dispatch_async(
+            state,
+            tenant_id,
+            database_id,
+            &name,
+            plan,
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|e| sqlstate_error("XX000", &format!("dispatch failed: {e}")))?;
     }
 
     tracing::info!(name, "continuous aggregate dropped");

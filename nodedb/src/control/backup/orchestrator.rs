@@ -191,6 +191,8 @@ async fn snapshot_self(
     sync_dispatch::dispatch_async(
         state,
         TenantId::new(tenant_id),
+        // TODO(A8-followup): backup/restore not yet multi-database.
+        DatabaseId::DEFAULT,
         "__system",
         plan.clone(),
         NODE_SNAPSHOT_TIMEOUT,

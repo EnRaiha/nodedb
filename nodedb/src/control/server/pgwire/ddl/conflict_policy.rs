@@ -18,6 +18,7 @@ use nodedb_sql::ddl_ast::alter_ops::{ConflictPolicyKind, ConstraintKindKeyword};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
 use super::super::types::{sqlstate_error, text_field};
@@ -32,6 +33,7 @@ use super::sync_dispatch::dispatch_async;
 pub async fn alter_set_on_conflict(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: &str,
     policy_kind: &ConflictPolicyKind,
     constraint_kind: &ConstraintKindKeyword,
@@ -43,7 +45,7 @@ pub async fn alter_set_on_conflict(
     let get_plan = PhysicalPlan::Crdt(CrdtOp::GetPolicy {
         collection: collection.to_string(),
     });
-    let policy_bytes = dispatch_async(state, tenant_id, collection, get_plan, timeout)
+    let policy_bytes = dispatch_async(state, tenant_id, database_id, collection, get_plan, timeout)
         .await
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
@@ -61,7 +63,7 @@ pub async fn alter_set_on_conflict(
         collection: collection.to_string(),
         policy_json,
     });
-    dispatch_async(state, tenant_id, collection, set_plan, timeout)
+    dispatch_async(state, tenant_id, database_id, collection, set_plan, timeout)
         .await
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
@@ -84,6 +86,7 @@ pub async fn alter_set_on_conflict(
 pub async fn show_conflict_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: &str,
 ) -> PgWireResult<Vec<Response>> {
     let tenant_id = identity.tenant_id;
@@ -92,7 +95,7 @@ pub async fn show_conflict_policy(
     let plan = PhysicalPlan::Crdt(CrdtOp::GetPolicy {
         collection: collection.to_string(),
     });
-    let policy_bytes = dispatch_async(state, tenant_id, collection, plan, timeout)
+    let policy_bytes = dispatch_async(state, tenant_id, database_id, collection, plan, timeout)
         .await
         .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 

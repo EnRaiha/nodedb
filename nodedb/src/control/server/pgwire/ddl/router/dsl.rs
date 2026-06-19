@@ -62,7 +62,7 @@ pub(super) async fn dispatch(
     // so it shares the same response shape as the canonical form. Only the
     // FUSION variant stays here — it has no canonical SELECT lowering.
     if upper.starts_with("SEARCH ") && upper.contains("USING FUSION") {
-        return Some(super::super::dsl::search_fusion(state, identity, sql).await);
+        return Some(super::super::dsl::search_fusion(state, identity, database_id, sql).await);
     }
 
     // DSL: CREATE VECTOR INDEX / CREATE FULLTEXT INDEX.
@@ -91,7 +91,7 @@ pub(super) async fn dispatch(
 
     // CRDT operations via SQL-like syntax (async).
     if upper.starts_with("SELECT CRDT_STATE(") || upper.starts_with("SELECT CRDT_STATE (") {
-        return Some(super::super::crdt_ops::crdt_state(state, identity, sql).await);
+        return Some(super::super::crdt_ops::crdt_state(state, identity, database_id, sql).await);
     }
     if upper.starts_with("SELECT CRDT_APPLY(") || upper.starts_with("SELECT CRDT_APPLY (") {
         return Some(super::super::crdt_ops::crdt_apply(state, identity, database_id, sql).await);

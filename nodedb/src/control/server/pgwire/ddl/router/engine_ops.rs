@@ -192,7 +192,13 @@ pub(super) async fn dispatch(
         // SELECT LAST_VALUES('collection_name')
         if let Some(collection) = super::helpers::extract_quoted_arg(sql, "LAST_VALUES(") {
             return Some(
-                super::super::last_value::query_last_values(state, identity, &collection).await,
+                super::super::last_value::query_last_values(
+                    state,
+                    identity,
+                    database_id,
+                    &collection,
+                )
+                .await,
             );
         }
     }
@@ -200,8 +206,14 @@ pub(super) async fn dispatch(
         // SELECT LAST_VALUE('collection_name', series_id)
         if let Some((collection, series_id)) = super::helpers::extract_lv_args(sql) {
             return Some(
-                super::super::last_value::query_last_value(state, identity, &collection, series_id)
-                    .await,
+                super::super::last_value::query_last_value(
+                    state,
+                    identity,
+                    database_id,
+                    &collection,
+                    series_id,
+                )
+                .await,
             );
         }
     }
