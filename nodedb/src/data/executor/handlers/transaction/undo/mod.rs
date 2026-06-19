@@ -30,12 +30,12 @@ pub(in crate::data::executor) enum UndoEntry {
     },
     /// Undo a VectorInsert by soft-deleting the inserted vector.
     InsertVector {
-        index_key: (TenantId, String),
+        index_key: (nodedb_types::DatabaseId, TenantId, String),
         vector_id: u32,
     },
     /// Undo a VectorDelete by un-deleting (clearing tombstone).
     DeleteVector {
-        index_key: (TenantId, String),
+        index_key: (nodedb_types::DatabaseId, TenantId, String),
         vector_id: u32,
     },
     /// Undo an EdgePut by deleting the edge (or restoring old properties).

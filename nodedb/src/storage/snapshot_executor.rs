@@ -213,7 +213,10 @@ fn restore_vector_checkpoints(
 
     let mut total_vectors = 0u64;
     for idx in hnsw_indexes {
-        let key = format!("{}:{}:emb", idx.tenant_id, idx.collection);
+        let key = format!(
+            "{}:{}:{}:emb",
+            idx.database_id, idx.tenant_id, idx.collection
+        );
         let ckpt_path = ckpt_dir.join(format!("{key}.ckpt"));
         let tmp_path = ckpt_dir.join(format!("{key}.ckpt.tmp"));
         nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &idx.checkpoint_bytes)

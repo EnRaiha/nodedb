@@ -60,18 +60,18 @@ impl CoreLoop {
         }
 
         // 3. Vector collections: export raw vectors + doc_id_map.
-        // The snapshot format stores keys as `"{tid}:{coll_key}"` strings for
-        // disk/wire compatibility — convert the tuple key at the boundary.
+        // The snapshot format stores keys as `"{db}:{tid}:{coll_key}"` strings
+        // for disk/wire compatibility — convert the tuple key at the boundary.
         let tid_obj = crate::types::TenantId::new(tenant_id);
         for (key, collection) in &self.vector_collections {
-            if key.0 != tid_obj {
+            if key.1 != tid_obj {
                 continue;
             }
             let vectors = collection.export_snapshot();
-            let key_str = format!("{tenant_id}:{}", key.1);
+            let key_str = format!("{}:{}:{}", key.0.as_u64(), key.1.as_u64(), key.2);
             match zerompk::to_msgpack_vec(&vectors) {
                 Ok(bytes) => snapshot.vectors.push((key_str, bytes)),
-                Err(e) => warn!(key = &key.1, error = %e, "snapshot: vector serialization failed"),
+                Err(e) => warn!(key = &key.2, error = %e, "snapshot: vector serialization failed"),
             }
         }
 

@@ -60,7 +60,8 @@ impl CoreLoop {
             );
         }
 
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
 
         // Validate dimension compatibility before taking mutable reference.
         if let Some(existing) = self.vector_collections.get(&index_key)
@@ -145,7 +146,8 @@ impl CoreLoop {
             "multi-vector delete"
         );
 
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
         let Some(coll) = self.vector_collections.get_mut(&index_key) else {
             return self.response_error(task, ErrorCode::NotFound);
         };
@@ -199,7 +201,8 @@ impl CoreLoop {
             }
         };
 
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
         let Some(coll) = self.vector_collections.get(&index_key) else {
             return self.response_error(task, ErrorCode::NotFound);
         };

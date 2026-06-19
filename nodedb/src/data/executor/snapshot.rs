@@ -47,8 +47,9 @@ impl CoreLoop {
                     return None;
                 }
                 Some(HnswSnapshot {
-                    tenant_id: key.0.as_u64(),
-                    collection: key.1.clone(),
+                    database_id: key.0.as_u64(),
+                    tenant_id: key.1.as_u64(),
+                    collection: key.2.clone(),
                     checkpoint_bytes,
                 })
             })

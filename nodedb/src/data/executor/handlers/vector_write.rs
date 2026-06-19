@@ -12,6 +12,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::vector_upsert::decode_payload_lowercased;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
+use nodedb_types::DatabaseId;
 
 impl CoreLoop {
     /// Execute batch vector insert (always to the default/unnamed field).
@@ -25,8 +26,9 @@ impl CoreLoop {
         surrogates: &[Surrogate],
     ) -> Response {
         debug!(core = self.core_id, %collection, dim, count = vectors.len(), "vector batch insert");
-        let index_key = CoreLoop::vector_index_key(tid, collection, "");
-        match self.get_or_create_vector_index(tid, collection, dim, "") {
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, "");
+        match self.get_or_create_vector_index(database_id, tid, collection, dim, "") {
             Ok(collection_ref) => {
                 for (i, vector) in vectors.iter().enumerate() {
                     if vector.len() != dim {
@@ -80,15 +82,17 @@ impl CoreLoop {
         // an empty field segment; vector-primary collections use
         // `"{collection}:{field}"`. Try the legacy key first, then scan
         // for any field-suffixed key under the same (tenant, collection).
+        let database_id = task.request.database_id.as_u64();
         let tenant = TenantId::new(tid);
-        let plain_key = (tenant, collection.to_string());
+        let db = DatabaseId::new(database_id);
+        let plain_key = (db, tenant, collection.to_string());
         let prefix = format!("{collection}:");
         let resolved_key = if self.vector_collections.contains_key(&plain_key) {
             Some(plain_key)
         } else {
             self.vector_collections
                 .keys()
-                .find(|(t, c)| *t == tenant && c.starts_with(&prefix))
+                .find(|(d, t, c)| *d == db && *t == tenant && c.starts_with(&prefix))
                 .cloned()
         };
         let Some(index_key) = resolved_key else {

@@ -26,7 +26,7 @@ impl CoreLoop {
         collection: &str,
     ) -> Response {
         let tid = TenantId::new(tenant_id);
-        let key = (tid, collection.to_string());
+        let key = (task.request.database_id, tid, collection.to_string());
         let mut total_bytes: u64 = 0;
 
         // KV engine: sum slot-value byte lengths in the live hash

@@ -132,7 +132,7 @@ impl CoreLoop {
 
         // Vector engine.
         let vec_removed = {
-            let key = (tid, coll.clone());
+            let key = (db, tid, coll.clone());
             let mut r = 0;
             if self.vector_collections.remove(&key).is_some() {
                 r += 1;
@@ -207,6 +207,7 @@ impl CoreLoop {
         let mut l1_stats = reclaim::ReclaimStats::default();
         l1_stats.merge(reclaim::vector::reclaim_vector_checkpoints(
             &self.data_dir,
+            db.as_u64(),
             tenant_id,
             collection,
         ));

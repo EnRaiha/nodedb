@@ -173,7 +173,7 @@ fn reclaim_handlers_are_idempotent_on_missing_files() {
 
     // All four reclaim helpers must return default stats on a fresh
     // empty data dir.
-    let vector = reclaim::vector::reclaim_vector_checkpoints(base, TENANT, "x");
+    let vector = reclaim::vector::reclaim_vector_checkpoints(base, 0, TENANT, "x");
     let spatial = reclaim::spatial::reclaim_spatial_checkpoints(base, 0, TENANT, "x");
     let sparse = reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, TENANT, "x");
     let ts = reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x");
@@ -184,7 +184,7 @@ fn reclaim_handlers_are_idempotent_on_missing_files() {
     assert_eq!(ts.files_unlinked, 0);
 
     // Re-running must still succeed (no "already deleted" error).
-    let _ = reclaim::vector::reclaim_vector_checkpoints(base, TENANT, "x");
+    let _ = reclaim::vector::reclaim_vector_checkpoints(base, 0, TENANT, "x");
     let _ = reclaim::spatial::reclaim_spatial_checkpoints(base, 0, TENANT, "x");
     let _ = reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, TENANT, "x");
     let _ = reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x");
@@ -199,16 +199,16 @@ fn reclaim_is_scoped_to_tenant_and_collection() {
     let base = tmp.path();
     let vec_dir = base.join("vector-ckpt");
     std::fs::create_dir_all(&vec_dir).unwrap();
-    std::fs::write(vec_dir.join("1:users.ckpt"), b"a").unwrap();
-    std::fs::write(vec_dir.join("1:orders.ckpt"), b"b").unwrap();
-    std::fs::write(vec_dir.join("2:users.ckpt"), b"c").unwrap();
+    std::fs::write(vec_dir.join("0:1:users.ckpt"), b"a").unwrap();
+    std::fs::write(vec_dir.join("0:1:orders.ckpt"), b"b").unwrap();
+    std::fs::write(vec_dir.join("0:2:users.ckpt"), b"c").unwrap();
 
-    let stats = reclaim::vector::reclaim_vector_checkpoints(base, 1, "users");
+    let stats = reclaim::vector::reclaim_vector_checkpoints(base, 0, 1, "users");
     assert_eq!(stats.files_unlinked, 1);
-    assert!(!vec_dir.join("1:users.ckpt").exists());
+    assert!(!vec_dir.join("0:1:users.ckpt").exists());
     // Siblings untouched.
-    assert!(vec_dir.join("1:orders.ckpt").exists());
-    assert!(vec_dir.join("2:users.ckpt").exists());
+    assert!(vec_dir.join("0:1:orders.ckpt").exists());
+    assert!(vec_dir.join("0:2:users.ckpt").exists());
 }
 
 fn _cat_ref_witness(_cat: &SystemCatalog) {}

@@ -4,21 +4,41 @@
 //!
 //! Contains HNSW build completion polling and checkpoint load/save operations.
 
+use nodedb_types::DatabaseId;
+
 use super::core_loop::CoreLoop;
 
-/// Parse a `"{tid}:{coll_key}"` string (used in `BuildComplete.key` and on-disk
-/// checkpoint filenames) back into the `(TenantId, String)` tuple map key.
+/// Parse a `"{db}:{tid}:{coll_key}"` string (the current `BuildComplete.key`
+/// and on-disk checkpoint filename form, produced by
+/// `vector_checkpoint_filename`) back into the `(DatabaseId, TenantId, String)`
+/// tuple map key.
 ///
-/// If the string has no `':'` separator the entire string is used as the
-/// collection key with tenant 0 (should not happen in practice).
-fn parse_build_key(s: &str) -> (crate::types::TenantId, String) {
-    match s.split_once(':') {
-        Some((tid_str, coll_key)) => {
-            let tid = tid_str.parse::<u64>().unwrap_or(0);
-            (crate::types::TenantId::new(tid), coll_key.to_string())
-        }
-        None => (crate::types::TenantId::new(0_u64), s.to_string()),
-    }
+/// Returns `None` when the string is not in the new format — i.e. it does not
+/// have at least three `:`-separated components whose first two parse as `u64`
+/// (db, tid). `coll_key` is the verbatim remainder and may itself contain `:`
+/// (e.g. `collection:field`). Callers handle `None` by attempting a legacy
+/// parse and/or skipping.
+fn parse_build_key(s: &str) -> Option<(DatabaseId, crate::types::TenantId, String)> {
+    let mut it = s.splitn(3, ':');
+    let db_str = it.next()?;
+    let tid_str = it.next()?;
+    let coll_key = it.next()?;
+    let db = db_str.parse::<u64>().ok()?;
+    let tid = tid_str.parse::<u64>().ok()?;
+    Some((
+        DatabaseId::new(db),
+        crate::types::TenantId::new(tid),
+        coll_key.to_string(),
+    ))
+}
+
+/// Parse a legacy `"{tid}:{coll_key}"` checkpoint filename (pre-database
+/// scoping). Returns `None` unless the first component parses as a `u64`
+/// tenant id and a collection key remainder is present.
+fn parse_legacy_build_key(s: &str) -> Option<(crate::types::TenantId, String)> {
+    let (tid_str, coll_key) = s.split_once(':')?;
+    let tid = tid_str.parse::<u64>().ok()?;
+    Some((crate::types::TenantId::new(tid), coll_key.to_string()))
 }
 
 impl CoreLoop {
@@ -27,14 +47,21 @@ impl CoreLoop {
     ///
     /// Called at the top of `tick()` before draining new requests.
     ///
-    /// `BuildComplete.key` is the old-style `"{tid}:{coll}"` string (produced
-    /// by `VectorCollection::seal` which still takes `&str`). Parse it back to
-    /// the tuple key to look up the map.
+    /// `BuildComplete.key` is the `"{db}:{tid}:{coll}"` string produced by
+    /// `VectorCollection::seal` (fed the `vector_checkpoint_filename` of the
+    /// index key). Parse it back to the tuple key to look up the map.
     pub fn poll_build_completions(&mut self) {
         let Some(rx) = &self.build_rx else { return };
         while let Ok(complete) = rx.try_recv() {
-            // Parse the string key `"{tid}:{coll_key}"` back into the tuple.
-            let tuple_key = parse_build_key(&complete.key);
+            // Parse the string key `"{db}:{tid}:{coll_key}"` back into the tuple.
+            let Some(tuple_key) = parse_build_key(&complete.key) else {
+                tracing::warn!(
+                    core = self.core_id,
+                    key = %complete.key,
+                    "HNSW build completion has unparseable key; dropping"
+                );
+                continue;
+            };
             if let Some(coll) = self.vector_collections.get_mut(&tuple_key) {
                 coll.complete_build(complete.segment_id, complete.index);
                 tracing::info!(
@@ -78,8 +105,8 @@ impl CoreLoop {
             if bytes.is_empty() {
                 continue;
             }
-            // Checkpoint filename uses the old-style `"{tid}:{coll}"` form so
-            // existing on-disk checkpoint files remain valid across upgrades.
+            // Checkpoint filename is `"{db}:{tid}:{coll}"`; legacy
+            // `"{tid}:{coll}"` files are migrated on load.
             let filename = CoreLoop::vector_checkpoint_filename(key);
             let ckpt_path = ckpt_dir.join(format!("{filename}.ckpt"));
             let tmp_path = ckpt_dir.join(format!("{filename}.ckpt.tmp"));
@@ -121,7 +148,9 @@ impl CoreLoop {
                 continue;
             }
 
-            // Checkpoint filenames are `"{tid}:{coll}.ckpt"` — parse back to tuple.
+            // Checkpoint filenames are `"{db}:{tid}:{coll}.ckpt"` in the current
+            // format. Legacy files are `"{tid}:{coll}.ckpt"` — load those under
+            // `DatabaseId::DEFAULT` and migrate the file to the new stem.
             let filename = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -130,9 +159,52 @@ impl CoreLoop {
             if filename.is_empty() {
                 continue;
             }
-            let tuple_key = parse_build_key(&filename);
+            let tuple_key = match parse_build_key(&filename) {
+                Some(k) => k,
+                None => match parse_legacy_build_key(&filename) {
+                    Some((tid, coll_key)) => {
+                        // Legacy file: adopt under the default database and
+                        // atomically rename to the new `{DEFAULT}:{tid}:{coll}`
+                        // stem so subsequent loads take the fast path. A rename
+                        // failure is non-fatal — the in-memory load below still
+                        // succeeds; we only warn and continue.
+                        let new_stem = CoreLoop::vector_checkpoint_filename(&(
+                            DatabaseId::DEFAULT,
+                            tid,
+                            coll_key.clone(),
+                        ));
+                        let new_path = ckpt_dir.join(format!("{new_stem}.ckpt"));
+                        if new_path != path
+                            && let Err(e) = std::fs::rename(&path, &new_path)
+                        {
+                            tracing::warn!(
+                                core = self.core_id,
+                                old = %path.display(),
+                                new = %new_path.display(),
+                                error = %e,
+                                "legacy vector checkpoint rename failed; loaded in-memory anyway"
+                            );
+                        }
+                        (DatabaseId::DEFAULT, tid, coll_key)
+                    }
+                    None => {
+                        tracing::warn!(
+                            core = self.core_id,
+                            key = %filename,
+                            "unparseable vector checkpoint filename; skipping (WAL replay rebuilds)"
+                        );
+                        continue;
+                    }
+                },
+            };
 
-            let Ok(bytes) = nodedb_wal::segment::read_checkpoint_dontneed(&path) else {
+            // Re-derive the path: a legacy file may have just been renamed.
+            let read_path = ckpt_dir.join(format!(
+                "{}.ckpt",
+                CoreLoop::vector_checkpoint_filename(&tuple_key)
+            ));
+            let read_path = if read_path.exists() { read_path } else { path };
+            let Ok(bytes) = nodedb_wal::segment::read_checkpoint_dontneed(&read_path) else {
                 continue;
             };
             let kek = self.vector_checkpoint_kek.as_ref();

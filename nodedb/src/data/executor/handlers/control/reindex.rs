@@ -36,6 +36,7 @@ use crate::types::TenantId;
 
 /// An in-flight concurrent rebuild tracked on the `CoreLoop`.
 pub struct PendingReindex {
+    pub database_id: nodedb_types::DatabaseId,
     pub tenant_id: TenantId,
     pub collection_key: String,
     rx: mpsc::Receiver<crate::Result<RebuildOutput>>,
@@ -114,6 +115,7 @@ impl CoreLoop {
         // self.pending_reindex at the same time.
         enum Outcome {
             Done {
+                database_id: nodedb_types::DatabaseId,
                 tenant_id: nodedb_types::TenantId,
                 collection_key: String,
                 output: RebuildOutput,
@@ -130,6 +132,7 @@ impl CoreLoop {
         for pending in self.pending_reindex.drain(..) {
             match pending.rx.try_recv() {
                 Ok(Ok(output)) => outcomes.push(Outcome::Done {
+                    database_id: pending.database_id,
                     tenant_id: pending.tenant_id,
                     collection_key: pending.collection_key,
                     output,
@@ -150,13 +153,14 @@ impl CoreLoop {
         for outcome in outcomes {
             match outcome {
                 Outcome::Done {
+                    database_id,
                     tenant_id,
                     collection_key,
                     output,
                 } => {
                     match output {
                         RebuildOutput::Hnsw { bytes } => {
-                            apply_hnsw(self, &tenant_id, &collection_key, bytes);
+                            apply_hnsw(self, &database_id, &tenant_id, &collection_key, bytes);
                         }
                         RebuildOutput::Csr { bytes } => {
                             apply_csr(self, &tenant_id, &collection_key, bytes);
@@ -195,9 +199,10 @@ impl CoreLoop {
         collection_key: &str,
     ) -> Response {
         // HNSW: compact tombstones from sealed segments.
-        if let Some(coll) = self
-            .vector_collections
-            .get_mut(&(tenant_id, collection_key.to_string()))
+        let db = task.request.database_id;
+        if let Some(coll) =
+            self.vector_collections
+                .get_mut(&(db, tenant_id, collection_key.to_string()))
         {
             let removed = coll.compact_tombstones();
             info!(
@@ -224,24 +229,27 @@ impl CoreLoop {
 
     fn start_hnsw_rebuild(
         &mut self,
-        _task: &ExecutionTask,
+        task: &ExecutionTask,
         tenant_id: TenantId,
         collection_key: &str,
     ) -> crate::Result<()> {
         // Vector collections are stored under two key forms depending on how
         // they were inserted:
-        //   - Bare:             (tenant, "coll")             — BatchInsert / native
-        //   - Field-qualified:  (tenant, "coll:field_name")  — SQL INSERT, DirectUpsert
+        //   - Bare:             (db, tenant, "coll")             — BatchInsert / native
+        //   - Field-qualified:  (db, tenant, "coll:field_name")  — SQL INSERT, DirectUpsert
         //
         // Collect all matching keys so field-indexed collections (the common
         // case from SQL DDL) are rebuilt correctly.
+        let db = task.request.database_id;
         let field_prefix = format!("{collection_key}:");
 
-        let matching_keys: Vec<(TenantId, String)> = self
+        let matching_keys: Vec<(nodedb_types::DatabaseId, TenantId, String)> = self
             .vector_collections
             .keys()
-            .filter(|(t, k)| {
-                *t == tenant_id && (k.as_str() == collection_key || k.starts_with(&field_prefix))
+            .filter(|(d, t, k)| {
+                *d == db
+                    && *t == tenant_id
+                    && (k.as_str() == collection_key || k.starts_with(&field_prefix))
             })
             .cloned()
             .collect();
@@ -284,8 +292,9 @@ impl CoreLoop {
             });
 
             self.pending_reindex.push(PendingReindex {
+                database_id: db,
                 tenant_id,
-                collection_key: key.1,
+                collection_key: key.2,
                 rx,
             });
         }
@@ -294,12 +303,13 @@ impl CoreLoop {
 
     fn start_fts_rebuild(
         &mut self,
-        _task: &ExecutionTask,
+        task: &ExecutionTask,
         tenant_id: TenantId,
         collection_key: &str,
     ) -> crate::Result<()> {
         use nodedb_fts::backend::FtsBackend;
 
+        let database_id = task.request.database_id;
         let tid = tenant_id.as_u64();
         let backend = self.inverted.backend();
 
@@ -365,6 +375,7 @@ impl CoreLoop {
         });
 
         self.pending_reindex.push(PendingReindex {
+            database_id,
             tenant_id,
             collection_key: collection_key.to_string(),
             rx,
@@ -374,10 +385,11 @@ impl CoreLoop {
 
     fn start_csr_rebuild(
         &mut self,
-        _task: &ExecutionTask,
+        task: &ExecutionTask,
         tenant_id: TenantId,
         collection_key: &str,
     ) -> crate::Result<()> {
+        let database_id = task.request.database_id;
         let partition = match self.csr.partition(tenant_id) {
             Some(p) => p,
             None => return Ok(()), // nothing to rebuild
@@ -397,6 +409,7 @@ impl CoreLoop {
         });
 
         self.pending_reindex.push(PendingReindex {
+            database_id,
             tenant_id,
             collection_key: collection_key.to_string(),
             rx,

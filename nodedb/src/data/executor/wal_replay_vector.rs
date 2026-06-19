@@ -86,6 +86,7 @@ impl CoreLoop {
             }
 
             let tenant_id = record.header.tenant_id;
+            let database_id = record.header.database_id;
             let record_lsn = record.header.lsn;
 
             if is_vector_params {
@@ -116,7 +117,12 @@ impl CoreLoop {
                         skipped += 1;
                         continue;
                     }
-                    let index_key = CoreLoop::vector_index_key(tenant_id, &collection, &field_name);
+                    let index_key = CoreLoop::vector_index_key(
+                        database_id,
+                        tenant_id,
+                        &collection,
+                        &field_name,
+                    );
                     use crate::engine::vector::distance::DistanceMetric;
                     let metric_enum = match metric.as_str() {
                         "l2" | "euclidean" => DistanceMetric::L2,
@@ -194,12 +200,12 @@ impl CoreLoop {
                     // maps straight through to `pk_bytes` for fidelity.
                     let pk_bytes = doc_id.as_ref().map(|d| d.as_bytes().to_vec());
                     let vshard = crate::types::VShardId::from_collection_in_database(
-                        DatabaseId::DEFAULT,
+                        DatabaseId::new(database_id),
                         &collection,
                     );
                     let task = Self::replay_vector_task(
                         nodedb_types::TenantId::new(tenant_id),
-                        DatabaseId::DEFAULT,
+                        DatabaseId::new(database_id),
                         vshard,
                         PhysicalPlan::Vector(nodedb_physical::physical_plan::VectorOp::Insert {
                             collection: collection.clone(),
@@ -253,7 +259,12 @@ impl CoreLoop {
                         );
                         continue;
                     }
-                    let index_key = CoreLoop::vector_index_key(tenant_id, &collection, &field_name);
+                    let index_key = CoreLoop::vector_index_key(
+                        database_id,
+                        tenant_id,
+                        &collection,
+                        &field_name,
+                    );
                     let params = self
                         .vector_params
                         .get(&index_key)
@@ -304,7 +315,8 @@ impl CoreLoop {
                         );
                         continue;
                     }
-                    let index_key = CoreLoop::vector_index_key(tenant_id, &collection, "");
+                    let index_key =
+                        CoreLoop::vector_index_key(database_id, tenant_id, &collection, "");
                     let params = self
                         .vector_params
                         .get(&index_key)
@@ -340,7 +352,8 @@ impl CoreLoop {
                         skipped += 1;
                         continue;
                     }
-                    let index_key = CoreLoop::vector_index_key(tenant_id, &collection, "");
+                    let index_key =
+                        CoreLoop::vector_index_key(database_id, tenant_id, &collection, "");
                     let params = self
                         .vector_params
                         .get(&index_key)
@@ -388,12 +401,12 @@ impl CoreLoop {
                     }
                     let surrogate = nodedb_types::Surrogate::new(surrogate_u32);
                     let vshard = crate::types::VShardId::from_collection_in_database(
-                        DatabaseId::DEFAULT,
+                        DatabaseId::new(database_id),
                         &collection,
                     );
                     let task = Self::replay_vector_task(
                         nodedb_types::TenantId::new(tenant_id),
-                        DatabaseId::DEFAULT,
+                        DatabaseId::new(database_id),
                         vshard,
                         PhysicalPlan::Vector(
                             nodedb_physical::physical_plan::VectorOp::DeleteBySurrogate {
@@ -437,7 +450,8 @@ impl CoreLoop {
                             skipped += 1;
                             continue;
                         }
-                        let index_key = CoreLoop::vector_index_key(tenant_id, &collection, "");
+                        let index_key =
+                            CoreLoop::vector_index_key(database_id, tenant_id, &collection, "");
                         if let Some(index) = self.vector_collections.get_mut(&index_key) {
                             index.delete(vector_id);
                             deleted += 1;

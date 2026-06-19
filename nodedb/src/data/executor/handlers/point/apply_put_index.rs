@@ -68,6 +68,7 @@ impl CoreLoop {
     /// `vector_params`, into the corresponding `VectorCollection`.
     pub(in crate::data::executor) fn apply_point_put_vector_indexes(
         &mut self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         value: &[u8],
@@ -128,7 +129,8 @@ impl CoreLoop {
                             })
                             .collect();
                         if floats.len() == *dim as usize {
-                            let index_key = Self::vector_index_key(tid, collection, field_name);
+                            let index_key =
+                                Self::vector_index_key(database_id, tid, collection, field_name);
                             let params = self
                                 .vector_params
                                 .get(&index_key)
@@ -151,20 +153,26 @@ impl CoreLoop {
         // Schemaless vector indexing: if no strict schema but vector_params exist
         // for this collection, extract matching fields and index them.
         if vector_fields.is_empty() {
-            // Named-field keys have the shape `(TenantId, "{collection}:{field}")`.
-            // The bare (no-field) key is `(TenantId, "{collection}")`.
+            // Named-field keys have the shape `(DatabaseId, TenantId, "{collection}:{field}")`.
+            // The bare (no-field) key is `(DatabaseId, TenantId, "{collection}")`.
+            let db_key = nodedb_types::DatabaseId::new(database_id);
             let tid_key = crate::types::TenantId::new(tid);
             let field_prefix = format!("{collection}:");
-            let bare_key = (tid_key, collection.to_string());
+            let bare_key = (db_key, tid_key, collection.to_string());
 
-            // Collect all vector_params entries for this tenant+collection.
+            // Collect all vector_params entries for this database+tenant+collection.
             // Each entry maps to a (params_map_key, field_name) pair.
-            let mut schemaless_keys: Vec<((crate::types::TenantId, String), String)> = self
+            let mut schemaless_keys: Vec<(
+                (nodedb_types::DatabaseId, crate::types::TenantId, String),
+                String,
+            )> = self
                 .vector_params
                 .keys()
-                .filter(|(t, coll_key)| *t == bare_key.0 && coll_key.starts_with(&field_prefix))
+                .filter(|(d, t, coll_key)| {
+                    *d == bare_key.0 && *t == bare_key.1 && coll_key.starts_with(&field_prefix)
+                })
                 .map(|k| {
-                    let field = k.1[field_prefix.len()..].to_string();
+                    let field = k.2[field_prefix.len()..].to_string();
                     (k.clone(), field)
                 })
                 .collect();
@@ -199,7 +207,8 @@ impl CoreLoop {
                                 .cloned()
                                 .unwrap_or_default();
                             // Use field-qualified key so search can find it.
-                            let store_key = Self::vector_index_key(tid, collection, field_name);
+                            let store_key =
+                                Self::vector_index_key(database_id, tid, collection, field_name);
                             let coll =
                                 self.vector_collections.entry(store_key).or_insert_with(|| {
                                     nodedb_vector::VectorCollection::new(floats.len(), params)

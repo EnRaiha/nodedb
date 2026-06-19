@@ -132,7 +132,12 @@ impl CoreLoop {
                 pk_bytes: _,
                 provenance: _,
             }) => {
-                let index_key = Self::vector_index_key(tid, collection, field_name);
+                let index_key = Self::vector_index_key(
+                    dummy_task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    field_name,
+                );
                 let params = self
                     .vector_params
                     .get(&index_key)
@@ -168,7 +173,12 @@ impl CoreLoop {
                 collection,
                 vector_id,
             }) => {
-                let index_key = Self::vector_index_key(tid, collection, "");
+                let index_key = Self::vector_index_key(
+                    dummy_task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    "",
+                );
                 if let Some(index) = self.vector_collections.get_mut(&index_key)
                     && index.delete(*vector_id)
                 {

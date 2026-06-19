@@ -3,10 +3,11 @@
 //! Vector engine reclaim — unlink per-collection HNSW checkpoint files.
 //!
 //! Checkpoint layout (see `vector_checkpoint.rs::checkpoint_vector_indexes`):
-//! `{data_dir}/vector-ckpt/{tid}:{coll}.ckpt` for the bare collection,
-//! plus one `{tid}:{coll}:{field}.ckpt` per named-field index. We
-//! unlink any file whose stem is `{tid}:{coll}` or begins with
-//! `{tid}:{coll}:`.
+//! `{data_dir}/vector-ckpt/{db}:{tid}:{coll}.ckpt` for the bare collection,
+//! plus one `{db}:{tid}:{coll}:{field}.ckpt` per named-field index. We
+//! unlink any file whose stem is `{db}:{tid}:{coll}` or begins with
+//! `{db}:{tid}:{coll}:`. The prefix mirrors
+//! `vector_checkpoint_filename` so the two never drift.
 
 use std::path::Path;
 
@@ -14,10 +15,11 @@ use tracing::{debug, warn};
 
 use super::ReclaimStats;
 
-/// Unlink every vector checkpoint file for `(tenant_id, collection)`.
+/// Unlink every vector checkpoint file for `(database_id, tenant_id, collection)`.
 /// Returns stats; idempotent (missing files count as 0).
 pub fn reclaim_vector_checkpoints(
     data_dir: &Path,
+    database_id: u64,
     tenant_id: u64,
     collection: &str,
 ) -> ReclaimStats {
@@ -25,8 +27,8 @@ pub fn reclaim_vector_checkpoints(
     if !ckpt_dir.exists() {
         return ReclaimStats::default();
     }
-    let prefix_exact = format!("{tenant_id}:{collection}");
-    let prefix_field = format!("{tenant_id}:{collection}:");
+    let prefix_exact = format!("{database_id}:{tenant_id}:{collection}");
+    let prefix_field = format!("{database_id}:{tenant_id}:{collection}:");
 
     let mut stats = ReclaimStats::default();
     let entries = match std::fs::read_dir(&ckpt_dir) {
@@ -93,26 +95,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
         let ckpt = base.join("vector-ckpt");
-        write(&ckpt.join("1:users.ckpt"), b"x");
-        write(&ckpt.join("1:users:email.ckpt"), b"xy");
-        write(&ckpt.join("1:users:name.ckpt.tmp"), b"xyz");
+        write(&ckpt.join("0:1:users.ckpt"), b"x");
+        write(&ckpt.join("0:1:users:email.ckpt"), b"xy");
+        write(&ckpt.join("0:1:users:name.ckpt.tmp"), b"xyz");
         // Other collection: must not touch.
-        write(&ckpt.join("1:orders.ckpt"), b"keep");
+        write(&ckpt.join("0:1:orders.ckpt"), b"keep");
         // Different tenant: must not touch.
-        write(&ckpt.join("2:users.ckpt"), b"keep2");
+        write(&ckpt.join("0:2:users.ckpt"), b"keep2");
+        // Different database: must not touch.
+        write(&ckpt.join("1:1:users.ckpt"), b"keepdb");
 
-        let stats = reclaim_vector_checkpoints(base, 1, "users");
+        let stats = reclaim_vector_checkpoints(base, 0, 1, "users");
         assert_eq!(stats.files_unlinked, 3);
         assert_eq!(stats.bytes_freed, 1 + 2 + 3);
-        assert!(ckpt.join("1:orders.ckpt").exists());
-        assert!(ckpt.join("2:users.ckpt").exists());
-        assert!(!ckpt.join("1:users.ckpt").exists());
+        assert!(ckpt.join("0:1:orders.ckpt").exists());
+        assert!(ckpt.join("0:2:users.ckpt").exists());
+        assert!(ckpt.join("1:1:users.ckpt").exists());
+        assert!(!ckpt.join("0:1:users.ckpt").exists());
     }
 
     #[test]
     fn empty_dir_is_noop() {
         let tmp = TempDir::new().unwrap();
-        let stats = reclaim_vector_checkpoints(tmp.path(), 1, "x");
+        let stats = reclaim_vector_checkpoints(tmp.path(), 0, 1, "x");
         assert_eq!(stats.files_unlinked, 0);
     }
 
@@ -121,9 +126,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ckpt = tmp.path().join("vector-ckpt");
         // Prefix overlap but distinct collection name.
-        write(&ckpt.join("1:users_archive.ckpt"), b"keep");
-        let stats = reclaim_vector_checkpoints(tmp.path(), 1, "users");
+        write(&ckpt.join("0:1:users_archive.ckpt"), b"keep");
+        let stats = reclaim_vector_checkpoints(tmp.path(), 0, 1, "users");
         assert_eq!(stats.files_unlinked, 0);
-        assert!(ckpt.join("1:users_archive.ckpt").exists());
+        assert!(ckpt.join("0:1:users_archive.ckpt").exists());
     }
 }

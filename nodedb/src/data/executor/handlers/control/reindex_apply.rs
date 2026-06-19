@@ -105,6 +105,7 @@ pub(super) fn rebuild_csr_thread(snapshot_bytes: Vec<u8>) -> crate::Result<Rebui
 
 pub(super) fn apply_hnsw(
     core: &mut CoreLoop,
+    database_id: &nodedb_types::DatabaseId,
     tenant_id: &TenantId,
     collection_key: &str,
     bytes: Vec<u8>,
@@ -134,7 +135,7 @@ pub(super) fn apply_hnsw(
         }
     };
 
-    let key = (*tenant_id, collection_key.to_string());
+    let key = (*database_id, *tenant_id, collection_key.to_string());
     if let Some(coll) = core.vector_collections.get_mut(&key) {
         let new_seg = SealedSegment {
             index,

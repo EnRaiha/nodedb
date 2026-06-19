@@ -270,7 +270,7 @@ impl CoreLoop {
         }
 
         self.apply_point_put_spatial(database_id, tid, collection, document_id, value);
-        self.apply_point_put_vector_indexes(tid, collection, value);
+        self.apply_point_put_vector_indexes(database_id, tid, collection, value);
 
         Ok(prior)
     }

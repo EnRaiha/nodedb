@@ -63,9 +63,9 @@ impl CoreLoop {
             }
 
             // Restore vector collections.
-            // Snapshot keys are `"{tid}:{coll_key}"` strings. Strip the
-            // `"{tid}:"` prefix to get the collection key for the tuple map.
-            let tid_prefix = format!("{tenant_id}:");
+            // Snapshot keys are `"{db}:{tid}:{coll_key}"` (new format) or, for
+            // legacy snapshots, `"{tid}:{coll_key}"`. Parse the leading numeric
+            // components back-compatibly; `coll_key` may itself contain `:`.
             for (key, bytes) in &snap.vectors {
                 let vectors: Vec<(u32, Vec<f32>, Option<nodedb_types::Surrogate>)> =
                     match zerompk::from_msgpack(bytes) {
@@ -76,8 +76,8 @@ impl CoreLoop {
                         }
                     };
                 let count = vectors.len() as u64;
-                let coll_key = key.strip_prefix(&tid_prefix).unwrap_or(key.as_str());
-                self.restore_vector_collection(tenant_id, coll_key, vectors);
+                let (database_id, coll_key) = parse_vector_snapshot_key(key, tenant_id);
+                self.restore_vector_collection(database_id, tenant_id, coll_key, vectors);
                 vectors_written += count;
             }
 
@@ -174,6 +174,7 @@ impl CoreLoop {
 
     fn restore_vector_collection(
         &mut self,
+        database_id: u64,
         tenant_id: u64,
         coll_key: &str,
         vectors: Vec<(u32, Vec<f32>, Option<nodedb_types::Surrogate>)>,
@@ -182,7 +183,11 @@ impl CoreLoop {
             return;
         }
         let dim = vectors[0].1.len();
-        let map_key = (crate::types::TenantId::new(tenant_id), coll_key.to_string());
+        let map_key = (
+            nodedb_types::DatabaseId::new(database_id),
+            crate::types::TenantId::new(tenant_id),
+            coll_key.to_string(),
+        );
         let params = self
             .vector_params
             .get(&map_key)
@@ -302,6 +307,35 @@ fn parse_timeseries_snapshot_key(key: &str) -> (u64, u64, String) {
         }
         _ => (0, 0, first.to_string()),
     }
+}
+
+/// Parse a vector snapshot key into `(database_id, collection_key)`.
+///
+/// Backward-compatible with pre-scoping snapshots:
+///   * 3 parts where the first two are BOTH numeric → `db:tenant:coll_key`
+///     (new format; `coll_key` may itself contain ':').
+///   * otherwise → legacy `tenant:coll_key`; strip the leading numeric tenant
+///     component and default the database to 0 (`DatabaseId::DEFAULT`).
+///
+/// `coll_key` is returned as a borrowed slice of `key` so the caller can pass
+/// it straight into `restore_vector_collection` without an allocation.
+fn parse_vector_snapshot_key(key: &str, tenant_id: u64) -> (u64, &str) {
+    let mut it = key.splitn(3, ':');
+    let first = it.next().unwrap_or("");
+    let second = it.next();
+    let third = it.next();
+    if let (Some(second), Some(_)) = (second, third)
+        && let (Ok(db), Ok(_tid)) = (first.parse::<u64>(), second.parse::<u64>())
+    {
+        // New format: "{db}:{tid}:{coll_key}".
+        let prefix_len = first.len() + 1 + second.len() + 1;
+        return (db, &key[prefix_len..]);
+    }
+    // Legacy 2-part key "{tid}:{coll_key}" (or a bare key); strip the tenant
+    // prefix if present and default the database to 0.
+    let tid_prefix = format!("{tenant_id}:");
+    let coll_key = key.strip_prefix(&tid_prefix).unwrap_or(key);
+    (0, coll_key)
 }
 
 /// Recover the database id encoded in a db-qualified collection name.

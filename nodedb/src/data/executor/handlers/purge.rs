@@ -81,10 +81,10 @@ impl CoreLoop {
         let vec_removed = {
             let tid_key = TenantId::new(tenant_id);
             let before = self.vector_collections.len();
-            self.vector_collections.retain(|(t, _), _| *t != tid_key);
-            self.vector_params.retain(|(t, _), _| *t != tid_key);
-            self.index_configs.retain(|(t, _), _| *t != tid_key);
-            self.ivf_indexes.retain(|(t, _), _| *t != tid_key);
+            self.vector_collections.retain(|(_, t, _), _| *t != tid_key);
+            self.vector_params.retain(|(_, t, _), _| *t != tid_key);
+            self.index_configs.retain(|(_, t, _), _| *t != tid_key);
+            self.ivf_indexes.retain(|(_, t, _), _| *t != tid_key);
             before - self.vector_collections.len()
         };
 

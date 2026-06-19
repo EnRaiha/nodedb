@@ -22,10 +22,11 @@ impl CoreLoop {
         collection: &str,
         field_name: &str,
     ) -> Response {
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
         debug!(
             core = self.core_id,
-            key = &index_key.1,
+            key = &index_key.2,
             "vector query stats"
         );
 
@@ -96,8 +97,9 @@ impl CoreLoop {
         collection: &str,
         field_name: &str,
     ) -> Response {
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
-        debug!(core = self.core_id, key = &index_key.1, "vector seal");
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
+        debug!(core = self.core_id, key = &index_key.2, "vector seal");
 
         let Some(coll) = self.vector_collections.get_mut(&index_key) else {
             return self.response_error(task, ErrorCode::NotFound);
@@ -106,7 +108,7 @@ impl CoreLoop {
         if coll.growing_is_empty() {
             info!(
                 core = self.core_id,
-                key = &index_key.1,
+                key = &index_key.2,
                 "seal: growing segment empty, nothing to seal"
             );
             return self.response_ok(task);
@@ -136,10 +138,11 @@ impl CoreLoop {
         collection: &str,
         field_name: &str,
     ) -> Response {
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
         debug!(
             core = self.core_id,
-            key = &index_key.1,
+            key = &index_key.2,
             "vector compact index"
         );
 
@@ -150,7 +153,7 @@ impl CoreLoop {
         let removed = coll.compact();
         info!(
             core = self.core_id,
-            key = &index_key.1,
+            key = &index_key.2,
             removed,
             "vector index compaction complete"
         );
@@ -187,10 +190,11 @@ impl CoreLoop {
     ) -> Response {
         use crate::engine::vector::hnsw::{HnswIndex, HnswParams};
 
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
         debug!(
             core = self.core_id,
-            key = &index_key.1,
+            key = &index_key.2,
             m,
             m0,
             ef_construction,
@@ -238,7 +242,7 @@ impl CoreLoop {
             if new_index.len() != expected_count {
                 warn!(
                     core = self.core_id,
-                    key = &index_key.1,
+                    key = &index_key.2,
                     expected = expected_count,
                     actual = new_index.len(),
                     "rebuild: vector count mismatch, skipping segment"
@@ -253,7 +257,7 @@ impl CoreLoop {
 
         info!(
             core = self.core_id,
-            key = &index_key.1,
+            key = &index_key.2,
             rebuilt_count,
             m = new_params.m,
             ef = new_params.ef_construction,

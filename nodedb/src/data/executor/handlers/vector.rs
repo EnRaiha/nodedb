@@ -13,6 +13,7 @@ use crate::data::executor::sync_gate::{SyncAdmit, ack_status_from_admit};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::vector::collection::VectorCollection;
 use crate::types::TenantId;
+use nodedb_types::DatabaseId;
 
 /// Parameters for configuring vector index settings.
 pub(in crate::data::executor) struct SetVectorParamsInput<'a> {
@@ -60,12 +61,13 @@ impl CoreLoop {
     /// Get or create a vector collection, validating dimension compatibility.
     pub(in crate::data::executor) fn get_or_create_vector_index(
         &mut self,
+        database_id: u64,
         tid: u64,
         collection: &str,
         dim: usize,
         field_name: &str,
     ) -> Result<&mut VectorCollection, ErrorCode> {
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
         if let Some(existing) = self.vector_collections.get(&index_key)
             && existing.dim() != dim
         {
@@ -188,7 +190,8 @@ impl CoreLoop {
                 },
             );
         }
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
 
         // Check if this collection uses IVF-PQ index.
         if let Some(cfg) = self.index_configs.get(&index_key)
@@ -199,7 +202,7 @@ impl CoreLoop {
         }
 
         // Default: HNSW (with or without PQ).
-        match self.get_or_create_vector_index(tid, collection, dim, field_name) {
+        match self.get_or_create_vector_index(database_id, tid, collection, dim, field_name) {
             Ok(collection_ref) => {
                 collection_ref.insert_with_surrogate(vector.to_vec(), surrogate);
                 let seal_key = CoreLoop::vector_checkpoint_filename(&index_key);
@@ -221,7 +224,7 @@ impl CoreLoop {
     fn ivf_insert(
         &mut self,
         task: &ExecutionTask,
-        index_key: &(TenantId, String),
+        index_key: &(DatabaseId, TenantId, String),
         vector: &[f32],
         dim: usize,
         surrogate: Surrogate,
@@ -238,7 +241,7 @@ impl CoreLoop {
                 let params = cfg.to_ivf_params();
                 debug!(
                     core = self.core_id,
-                    key = %index_key.1,
+                    key = %index_key.2,
                     "creating IVF-PQ index"
                 );
                 crate::engine::vector::ivf::IvfPqIndex::new(dim, params)
@@ -339,9 +342,11 @@ impl CoreLoop {
         surrogate: Surrogate,
         field_name: &str,
     ) -> Response {
+        let database_id = task.request.database_id.as_u64();
         let tenant = TenantId::new(tid);
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
-        let fallback_key = (tenant, collection.to_string());
+        let db = DatabaseId::new(database_id);
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
+        let fallback_key = (db, tenant, collection.to_string());
 
         let resolved_key = if self.vector_collections.contains_key(&index_key) {
             Some(index_key)

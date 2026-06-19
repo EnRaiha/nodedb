@@ -71,9 +71,10 @@ pub struct CoreLoop {
     pub(in crate::data::executor) crdt_engines: HashMap<TenantId, TenantCrdtEngine>,
 
     /// Per-collection vector collections, lazily initialized on first insert.
-    /// Key: `(TenantId, collection_key)` where `collection_key` is `collection`
-    /// or `"{collection}:{field_name}"` for named fields.
-    pub(in crate::data::executor) vector_collections: HashMap<(TenantId, String), VectorCollection>,
+    /// Key: `(DatabaseId, TenantId, collection_key)` where `collection_key` is
+    /// `collection` or `"{collection}:{field_name}"` for named fields.
+    pub(in crate::data::executor) vector_collections:
+        HashMap<(DatabaseId, TenantId, String), VectorCollection>,
 
     /// Background HNSW builder: send requests.
     pub(in crate::data::executor) build_tx: Option<crate::engine::vector::builder::BuildSender>,
@@ -83,9 +84,9 @@ pub struct CoreLoop {
 
     /// Per-collection HNSW parameters set via DDL. If a collection has no
     /// entry here, `HnswParams::default()` is used on first insert.
-    /// Key: `(TenantId, collection_key)` — same shape as `vector_collections`.
+    /// Key: `(DatabaseId, TenantId, collection_key)` — same shape as `vector_collections`.
     pub(in crate::data::executor) vector_params:
-        HashMap<(TenantId, String), crate::engine::vector::hnsw::HnswParams>,
+        HashMap<(DatabaseId, TenantId, String), crate::engine::vector::hnsw::HnswParams>,
 
     /// redb-backed graph edge storage for this core.
     pub(in crate::data::executor) edge_store: EdgeStore,
@@ -178,14 +179,14 @@ pub struct CoreLoop {
 
     /// Per-collection full index config (includes index_type, PQ params, IVF params).
     /// Stored alongside vector_params for collections that use non-default index types.
-    /// Key: `(TenantId, collection_key)` — same shape as `vector_collections`.
+    /// Key: `(DatabaseId, TenantId, collection_key)` — same shape as `vector_collections`.
     pub(in crate::data::executor) index_configs:
-        HashMap<(TenantId, String), crate::engine::vector::index_config::IndexConfig>,
+        HashMap<(DatabaseId, TenantId, String), crate::engine::vector::index_config::IndexConfig>,
 
     /// IVF-PQ indexes for collections configured with `index_type = "ivf_pq"`.
-    /// Key: `(TenantId, collection_key)` — same shape as `vector_collections`.
+    /// Key: `(DatabaseId, TenantId, collection_key)` — same shape as `vector_collections`.
     pub(in crate::data::executor) ivf_indexes:
-        HashMap<(TenantId, String), crate::engine::vector::ivf::IvfPqIndex>,
+        HashMap<(DatabaseId, TenantId, String), crate::engine::vector::ivf::IvfPqIndex>,
 
     /// Per-collection sparse vector inverted indexes, keyed by (TenantId, collection, field).
     /// The field is `"_sparse"` when no named field is specified.

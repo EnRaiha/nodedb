@@ -24,6 +24,10 @@
     zerompk::FromMessagePack,
 )]
 pub struct HnswSnapshot {
+    /// Database owner. `#[serde(default)]` → legacy snapshots decode as
+    /// `DatabaseId::DEFAULT` (0).
+    #[serde(default)]
+    pub database_id: u64,
     /// Tenant owner.
     #[serde(default)]
     pub tenant_id: u64,
@@ -207,6 +211,7 @@ mod tests {
                 value: b"{}".to_vec(),
             }],
             hnsw_indexes: vec![HnswSnapshot {
+                database_id: 0,
                 tenant_id: 1,
                 collection: "embeddings".into(),
                 checkpoint_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
@@ -238,6 +243,7 @@ mod tests {
         let ckpt = vec![0x01u8, 0x02, 0x03, 0x04, 0x05];
         let snap = CoreSnapshot {
             hnsw_indexes: vec![HnswSnapshot {
+                database_id: 0,
                 tenant_id: 1,
                 collection: "test".into(),
                 checkpoint_bytes: ckpt.clone(),

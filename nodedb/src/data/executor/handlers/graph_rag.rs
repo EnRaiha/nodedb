@@ -141,7 +141,12 @@ impl CoreLoop {
         vector_top_k: usize,
         vector_field: &str,
     ) -> Result<VectorNodeScores, Response> {
-        let index_key = CoreLoop::vector_index_key(tenant_id, collection, vector_field);
+        let index_key = CoreLoop::vector_index_key(
+            task.request.database_id.as_u64(),
+            tenant_id,
+            collection,
+            vector_field,
+        );
         let Some(index) = self.vector_collections.get(&index_key) else {
             return Err(self.response_error(task, ErrorCode::NotFound));
         };

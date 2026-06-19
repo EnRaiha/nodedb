@@ -203,6 +203,7 @@ async fn snapshot_bytes_roundtrip_write_and_restore() {
         sparse_indexes: vec![],
         edges: vec![],
         hnsw_indexes: vec![HnswSnapshot {
+            database_id: 0,
             tenant_id: 1,
             collection: "embeddings".into(),
             checkpoint_bytes: hnsw_bytes.clone(),
@@ -280,7 +281,7 @@ async fn snapshot_bytes_roundtrip_write_and_restore() {
 
     // ── Verify HNSW checkpoint file ──────────────────────────────────────────
     let ckpt_dir = data_dir.join("vector-ckpt");
-    let hnsw_ckpt = ckpt_dir.join("1:embeddings:emb.ckpt");
+    let hnsw_ckpt = ckpt_dir.join("0:1:embeddings:emb.ckpt");
     assert!(
         hnsw_ckpt.exists(),
         "HNSW checkpoint file must exist after restore"

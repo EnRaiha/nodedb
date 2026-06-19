@@ -105,7 +105,8 @@ impl CoreLoop {
             Err(resp) => return resp,
         };
 
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
 
         // Check for IVF-PQ index first.
         if let Some(ivf) = self.ivf_indexes.get(&index_key) {
@@ -129,7 +130,7 @@ impl CoreLoop {
         // searched via a field-specific SQL query (e.g. vector_distance(embedding, ...)).
         let effective_key =
             if !self.vector_collections.contains_key(&index_key) && !field_name.is_empty() {
-                let fallback_key = CoreLoop::vector_index_key(tid, collection, "");
+                let fallback_key = CoreLoop::vector_index_key(database_id, tid, collection, "");
                 if self.vector_collections.contains_key(&fallback_key) {
                     fallback_key
                 } else {
@@ -301,7 +302,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         tid: u64,
         collection: &str,
-        index_key: &(crate::types::TenantId, String),
+        index_key: &(nodedb_types::DatabaseId, crate::types::TenantId, String),
         ivf: &crate::engine::vector::ivf::IvfPqIndex,
         query_vector: &[f32],
         top_k: usize,
@@ -365,8 +366,10 @@ impl CoreLoop {
         } = params;
         debug!(core = self.core_id, %collection, top_k, "vector multi-search");
 
+        let database_id = task.request.database_id.as_u64();
+        let db = nodedb_types::DatabaseId::new(database_id);
         let tenant_id = crate::types::TenantId::new(tid);
-        let plain_key = CoreLoop::vector_index_key(tid, collection, "");
+        let plain_key = CoreLoop::vector_index_key(database_id, tid, collection, "");
         // A named-field key looks like `"{collection}:{field_name}"` in the String part.
         let field_prefix = format!("{collection}:");
 
@@ -381,10 +384,10 @@ impl CoreLoop {
         let mut all_results: Vec<Vec<crate::engine::vector::hnsw::SearchResult>> = Vec::new();
 
         for (key, coll) in &self.vector_collections {
-            if key.0 != tenant_id {
+            if key.0 != db || key.1 != tenant_id {
                 continue;
             }
-            if key == &plain_key || key.1.starts_with(&field_prefix) {
+            if key == &plain_key || key.2.starts_with(&field_prefix) {
                 if coll.is_empty() || coll.dim() != query_vector.len() {
                     continue;
                 }
@@ -467,7 +470,9 @@ impl CoreLoop {
                     self.vector_collections
                         .iter()
                         .filter(|(k, _)| {
-                            k.0 == tenant_id && (k == &&plain_key || k.1.starts_with(&field_prefix))
+                            k.0 == db
+                                && k.1 == tenant_id
+                                && (k == &&plain_key || k.2.starts_with(&field_prefix))
                         })
                         .map(|(_, c)| c)
                         .next()

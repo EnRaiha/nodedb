@@ -63,7 +63,8 @@ impl CoreLoop {
         );
 
         let dim = vector.len();
-        let index_key = CoreLoop::vector_index_key(tid, collection, field);
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field);
 
         // Step 1: validate dimension and storage dtype against any existing
         // index. The dtype is a creation-time choice baked into segment
@@ -155,7 +156,7 @@ impl CoreLoop {
         } else {
             None
         };
-        let coll = match self.get_or_create_vector_index(tid, collection, dim, field) {
+        let coll = match self.get_or_create_vector_index(database_id, tid, collection, dim, field) {
             Ok(c) => c,
             Err(e) => return self.response_error(task, e),
         };

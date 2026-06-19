@@ -31,7 +31,8 @@ impl CoreLoop {
             ivf_nprobe,
         } = params;
         debug!(core = self.core_id, %collection, field = field_name, m, ef_construction, %metric, %index_type, "set vector params");
-        let index_key = CoreLoop::vector_index_key(tid, collection, field_name);
+        let database_id = task.request.database_id.as_u64();
+        let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
 
         if self.vector_collections.contains_key(&index_key) {
             return self.response_error(

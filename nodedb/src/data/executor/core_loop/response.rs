@@ -5,6 +5,7 @@ use nodedb_crdt::constraint::ConstraintSet;
 use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
 use crate::engine::crdt::tenant_state::TenantCrdtEngine;
 use crate::types::TenantId;
+use nodedb_types::DatabaseId;
 
 use super::super::task::ExecutionTask;
 use super::CoreLoop;
@@ -73,33 +74,40 @@ impl CoreLoop {
     /// Build the map key for the four vector in-memory maps
     /// (`vector_collections`, `vector_params`, `index_configs`, `ivf_indexes`).
     ///
-    /// Returns `(TenantId, collection_key)` where `collection_key` is:
+    /// Returns `(DatabaseId, TenantId, collection_key)` where `collection_key` is:
     /// - `collection` when `field_name` is empty, or
     /// - `"{collection}:{field_name}"` when a named field is specified.
     ///
     /// This replaces the old `format!("{tid}:{collection}")` string key with a
-    /// structured tuple so tenant scoping is structural rather than lexical.
+    /// structured tuple so database + tenant scoping is structural rather than
+    /// lexical.
     pub(in crate::data::executor) fn vector_index_key(
+        database_id: u64,
         tenant_id: u64,
         collection: &str,
         field_name: &str,
-    ) -> (TenantId, String) {
+    ) -> (DatabaseId, TenantId, String) {
         let coll_key = if field_name.is_empty() {
             collection.to_string()
         } else {
             format!("{collection}:{field_name}")
         };
-        (TenantId::new(tenant_id), coll_key)
+        (
+            DatabaseId::new(database_id),
+            TenantId::new(tenant_id),
+            coll_key,
+        )
     }
 
     /// Checkpoint filename for a vector collection key.
     ///
-    /// Produces the same `"{tid}:{coll}"` string that was used before the
-    /// tuple-key migration so existing on-disk checkpoint files remain valid.
+    /// Produces a `"{db}:{tid}:{coll}"` string. The `coll` component may itself
+    /// contain `:` (it is `collection` or `collection:field`) — that is fine
+    /// because parsing uses `splitn(3, ':')` and treats the remainder verbatim.
     pub(in crate::data::executor) fn vector_checkpoint_filename(
-        key: &(TenantId, String),
+        key: &(DatabaseId, TenantId, String),
     ) -> String {
-        format!("{}:{}", key.0.as_u64(), key.1)
+        format!("{}:{}:{}", key.0.as_u64(), key.1.as_u64(), key.2)
     }
 
     pub(in crate::data::executor) fn get_crdt_engine(

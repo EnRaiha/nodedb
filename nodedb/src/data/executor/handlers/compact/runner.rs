@@ -54,8 +54,7 @@ impl CoreLoop {
         // Collect keys first to avoid borrow conflict on `self`.
         let vector_keys: Vec<_> = self.vector_collections.keys().cloned().collect();
         for key in vector_keys {
-            let tid = key.0;
-            let db = self.database_for_tenant(tid);
+            let db = key.0;
 
             // Budget gate. The lease, if any, MUST be bound to a `let` so it
             // lives across `collection.compact()` below — its `Drop` impl is
@@ -67,7 +66,7 @@ impl CoreLoop {
                     tracing::debug!(
                         core = self.core_id,
                         db = db.as_u64(),
-                        collection = &key.1,
+                        collection = &key.2,
                         "vector compaction deferred: database over maintenance budget"
                     );
                     continue;
@@ -108,7 +107,7 @@ impl CoreLoop {
             if removed > 0 {
                 info!(
                     core = self.core_id,
-                    collection = &key.1,
+                    collection = &key.2,
                     removed,
                     ratio = format!("{ratio:.2}"),
                     "vector compaction: tombstones removed"
