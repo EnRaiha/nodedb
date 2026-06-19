@@ -13,11 +13,10 @@ use super::value::{
 use crate::engine::sparse::btree::{SparseEngine, redb_err};
 
 /// Versioned document table. Distinct from `super::super::btree::DOCUMENTS`
-/// so bitemporal and current-only collections coexist without migration.
-/// Keys carry the leading `{database_id}:` component; the pre-scoping
-/// `documents_versioned` table is migration-only (see `super::super::migrate`).
+/// so bitemporal and current-only collections coexist. Keys carry the leading
+/// `{database_id}:` component.
 pub(crate) const DOCUMENTS_VERSIONED: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("documents_versioned_v2");
+    TableDefinition::new("documents_versioned");
 
 impl SparseEngine {
     /// Bootstrap: ensure the versioned document table exists. Called by

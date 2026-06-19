@@ -4,4 +4,4 @@ pub mod read;
 pub mod table;
 pub mod update;
 
-pub use table::{CollectionStats, GRAPH_STATS, GRAPH_STATS_LEGACY};
+pub use table::{CollectionStats, GRAPH_STATS};

@@ -16,8 +16,7 @@ use super::core_loop::CoreLoop;
 /// Returns `None` when the string is not in the new format — i.e. it does not
 /// have at least three `:`-separated components whose first two parse as `u64`
 /// (db, tid). `coll_key` is the verbatim remainder and may itself contain `:`
-/// (e.g. `collection:field`). Callers handle `None` by attempting a legacy
-/// parse and/or skipping.
+/// (e.g. `collection:field`). Callers handle `None` by skipping.
 fn parse_build_key(s: &str) -> Option<(DatabaseId, crate::types::TenantId, String)> {
     let mut it = s.splitn(3, ':');
     let db_str = it.next()?;
@@ -30,15 +29,6 @@ fn parse_build_key(s: &str) -> Option<(DatabaseId, crate::types::TenantId, Strin
         crate::types::TenantId::new(tid),
         coll_key.to_string(),
     ))
-}
-
-/// Parse a legacy `"{tid}:{coll_key}"` checkpoint filename (pre-database
-/// scoping). Returns `None` unless the first component parses as a `u64`
-/// tenant id and a collection key remainder is present.
-fn parse_legacy_build_key(s: &str) -> Option<(crate::types::TenantId, String)> {
-    let (tid_str, coll_key) = s.split_once(':')?;
-    let tid = tid_str.parse::<u64>().ok()?;
-    Some((crate::types::TenantId::new(tid), coll_key.to_string()))
 }
 
 impl CoreLoop {
@@ -105,8 +95,7 @@ impl CoreLoop {
             if bytes.is_empty() {
                 continue;
             }
-            // Checkpoint filename is `"{db}:{tid}:{coll}"`; legacy
-            // `"{tid}:{coll}"` files are migrated on load.
+            // Checkpoint filename is `"{db}:{tid}:{coll}"`.
             let filename = CoreLoop::vector_checkpoint_filename(key);
             let ckpt_path = ckpt_dir.join(format!("{filename}.ckpt"));
             let tmp_path = ckpt_dir.join(format!("{filename}.ckpt.tmp"));
@@ -148,9 +137,7 @@ impl CoreLoop {
                 continue;
             }
 
-            // Checkpoint filenames are `"{db}:{tid}:{coll}.ckpt"` in the current
-            // format. Legacy files are `"{tid}:{coll}.ckpt"` — load those under
-            // `DatabaseId::DEFAULT` and migrate the file to the new stem.
+            // Checkpoint filenames are `"{db}:{tid}:{coll}.ckpt"`.
             let filename = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -159,52 +146,16 @@ impl CoreLoop {
             if filename.is_empty() {
                 continue;
             }
-            let tuple_key = match parse_build_key(&filename) {
-                Some(k) => k,
-                None => match parse_legacy_build_key(&filename) {
-                    Some((tid, coll_key)) => {
-                        // Legacy file: adopt under the default database and
-                        // atomically rename to the new `{DEFAULT}:{tid}:{coll}`
-                        // stem so subsequent loads take the fast path. A rename
-                        // failure is non-fatal — the in-memory load below still
-                        // succeeds; we only warn and continue.
-                        let new_stem = CoreLoop::vector_checkpoint_filename(&(
-                            DatabaseId::DEFAULT,
-                            tid,
-                            coll_key.clone(),
-                        ));
-                        let new_path = ckpt_dir.join(format!("{new_stem}.ckpt"));
-                        if new_path != path
-                            && let Err(e) = std::fs::rename(&path, &new_path)
-                        {
-                            tracing::warn!(
-                                core = self.core_id,
-                                old = %path.display(),
-                                new = %new_path.display(),
-                                error = %e,
-                                "legacy vector checkpoint rename failed; loaded in-memory anyway"
-                            );
-                        }
-                        (DatabaseId::DEFAULT, tid, coll_key)
-                    }
-                    None => {
-                        tracing::warn!(
-                            core = self.core_id,
-                            key = %filename,
-                            "unparseable vector checkpoint filename; skipping (WAL replay rebuilds)"
-                        );
-                        continue;
-                    }
-                },
+            let Some(tuple_key) = parse_build_key(&filename) else {
+                tracing::warn!(
+                    core = self.core_id,
+                    key = %filename,
+                    "unparseable vector checkpoint filename; skipping (WAL replay rebuilds)"
+                );
+                continue;
             };
 
-            // Re-derive the path: a legacy file may have just been renamed.
-            let read_path = ckpt_dir.join(format!(
-                "{}.ckpt",
-                CoreLoop::vector_checkpoint_filename(&tuple_key)
-            ));
-            let read_path = if read_path.exists() { read_path } else { path };
-            let Ok(bytes) = nodedb_wal::segment::read_checkpoint_dontneed(&read_path) else {
+            let Ok(bytes) = nodedb_wal::segment::read_checkpoint_dontneed(&path) else {
                 continue;
             };
             let kek = self.vector_checkpoint_kek.as_ref();

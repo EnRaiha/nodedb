@@ -19,11 +19,6 @@ use redb::TableDefinition;
 /// Key: `(db_u64, tid_u64, "<collection>\x00<kind>[\x00<discriminator>]")`
 /// Value: zerompk-encoded payload (SummaryRow | LabelRow | NodeRow).
 pub const GRAPH_STATS: TableDefinition<(u64, u64, &str), &[u8]> =
-    TableDefinition::new("graph_stats_v2");
-
-/// Legacy (pre-database-scoping) `(tid, key)` stats table. Read only by the
-/// `migrate_edges_v2` rewrite; never touched by live paths.
-pub const GRAPH_STATS_LEGACY: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("graph_stats");
 
 // ── Row payload types ─────────────────────────────────────────────────────────

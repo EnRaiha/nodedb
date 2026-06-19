@@ -71,11 +71,6 @@ impl CoreLoop {
     }
 
     /// Load sparse vector index checkpoints from disk on startup.
-    ///
-    /// Legacy single-underscore filenames (`{tid}_{coll}_{field}`, pre-db
-    /// scoping — produced by the old `:`→`_` sanitizer) are loaded under
-    /// [`DatabaseId::DEFAULT`] and rewritten in the new `{db}_{tid}_...` format
-    /// so the migration runs exactly once.
     pub fn load_sparse_vector_checkpoints(&mut self) {
         let ckpt_dir = self.data_dir.join("sparse-vector-ckpt");
         if !ckpt_dir.exists() {
@@ -103,22 +98,17 @@ impl CoreLoop {
                 continue;
             }
 
-            // Parse the filename stem into a logical key. Try the new 4-part
-            // scheme first; fall back to the legacy 3-part scheme.
-            let (map_key, needs_migration) = match parse_sparse_vector_key(&stem) {
-                Some(k) => (k, false),
-                None => match parse_legacy_sparse_vector_key(&stem) {
-                    Some(k) => (k, true),
-                    None => {
-                        tracing::warn!(
-                            core = self.core_id,
-                            %stem,
-                            "failed to parse sparse vector checkpoint key (ambiguous legacy file); \
-                             skipping"
-                        );
-                        continue;
-                    }
-                },
+            // Parse the filename stem into a logical key.
+            let map_key = match parse_sparse_vector_key(&stem) {
+                Some(k) => k,
+                None => {
+                    tracing::warn!(
+                        core = self.core_id,
+                        %stem,
+                        "failed to parse sparse vector checkpoint key; skipping"
+                    );
+                    continue;
+                }
             };
 
             let Ok(bytes) = nodedb_wal::segment::read_checkpoint_dontneed(&path) else {
@@ -137,16 +127,7 @@ impl CoreLoop {
                 dims = index.dim_count(),
                 "loaded sparse vector checkpoint"
             );
-            let (db, tid, coll, field) = map_key;
-            // One-time migration: rewrite legacy filenames in the new format so
-            // the next startup parses them via the 4-part path. The in-memory
-            // load already succeeded, so a rename failure is logged and
-            // tolerated (it retries next startup).
-            if needs_migration {
-                migrate_legacy_file(self.core_id, &ckpt_dir, &stem, db, tid, &coll, &field);
-            }
-            self.sparse_vector_indexes
-                .insert((db, tid, coll, field), index);
+            self.sparse_vector_indexes.insert(map_key, index);
             loaded += 1;
         }
 
@@ -195,56 +176,6 @@ fn parse_sparse_vector_key(stem: &str) -> Option<(DatabaseId, TenantId, String, 
     Some((DatabaseId::new(db), TenantId::new(tid), coll, field))
 }
 
-/// Parse a LEGACY stem `{tid}_{coll}_{field}` (pre-db scoping, the old `:`→`_`
-/// sanitized scheme) into a key under [`DatabaseId::DEFAULT`]. Requires EXACTLY
-/// 3 parts with a numeric tid. Components are returned verbatim (legacy files
-/// were not percent-encoded). Matches the common no-underscore-in-name case;
-/// genuinely ambiguous names fall through to a warn at the call site.
-fn parse_legacy_sparse_vector_key(stem: &str) -> Option<(DatabaseId, TenantId, String, String)> {
-    let parts: Vec<&str> = stem.split('_').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let tid: u64 = parts[0].parse().ok()?;
-    Some((
-        DatabaseId::DEFAULT,
-        TenantId::new(tid),
-        parts[1].to_string(),
-        parts[2].to_string(),
-    ))
-}
-
-/// Atomically rename a legacy `.ckpt` file to the new stem. Failures are logged
-/// and tolerated (the in-memory load already succeeded).
-fn migrate_legacy_file(
-    core_id: usize,
-    ckpt_dir: &std::path::Path,
-    old_stem: &str,
-    db: DatabaseId,
-    tid: TenantId,
-    coll: &str,
-    field: &str,
-) {
-    let new_stem = sparse_vector_checkpoint_stem(db.as_u64(), tid.as_u64(), coll, field);
-    if new_stem == old_stem {
-        return;
-    }
-    let old_path = ckpt_dir.join(format!("{old_stem}.ckpt"));
-    if !old_path.exists() {
-        return;
-    }
-    let new_path = ckpt_dir.join(format!("{new_stem}.ckpt"));
-    if let Err(e) = std::fs::rename(&old_path, &new_path) {
-        tracing::warn!(
-            core = core_id,
-            %old_stem,
-            %new_stem,
-            error = %e,
-            "sparse vector checkpoint legacy migration rename failed; will retry next startup"
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,23 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_3part_parses_under_default_db() {
-        let parsed = parse_legacy_sparse_vector_key("5_docs_title").expect("legacy parse");
-        assert_eq!(parsed.0, DatabaseId::DEFAULT);
-        assert_eq!(parsed.1, TenantId::new(5));
-        assert_eq!(parsed.2, "docs");
-        assert_eq!(parsed.3, "title");
-    }
-
-    #[test]
-    fn new_format_takes_precedence_over_legacy() {
-        let stem = sparse_vector_checkpoint_stem(1, 2, "c", "f");
-        assert!(parse_sparse_vector_key(&stem).is_some());
-    }
-
-    #[test]
     fn non_numeric_stem_is_none() {
         assert!(parse_sparse_vector_key("a_b_c_d").is_none());
-        assert!(parse_legacy_sparse_vector_key("a_b_c").is_none());
     }
 }

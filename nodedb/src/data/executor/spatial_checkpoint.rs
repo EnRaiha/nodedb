@@ -102,10 +102,6 @@ impl CoreLoop {
     ///
     /// When `spatial_checkpoint_kek` is set, plaintext checkpoint files are
     /// rejected and encrypted files are decrypted before loading.
-    ///
-    /// Legacy single-underscore filenames (`{tid}_{coll}_{field}`, pre-db
-    /// scoping) are loaded under [`DatabaseId::DEFAULT`] and rewritten in the
-    /// new `{db}_{tid}_...` format so the migration runs exactly once.
     pub fn load_spatial_checkpoints(&mut self) {
         let ckpt_dir = self.data_dir.join("spatial-ckpt");
         if !ckpt_dir.exists() {
@@ -133,22 +129,18 @@ impl CoreLoop {
                 continue;
             }
 
-            // Parse the filename stem into a logical key. Try the new 4-part
-            // scheme first; fall back to the legacy 3-part scheme.
-            let (map_key, needs_migration) = match parse_spatial_key(&stem) {
-                Some(k) => (k, false),
-                None => match parse_legacy_spatial_key(&stem) {
-                    Some(k) => (k, true),
-                    None => {
-                        tracing::warn!(
-                            core = self.core_id,
-                            %stem,
-                            "failed to parse spatial checkpoint key (ambiguous legacy file); \
-                             skipping (WAL replay rebuilds it)"
-                        );
-                        continue;
-                    }
-                },
+            // Parse the filename stem into a logical key.
+            let map_key = match parse_spatial_key(&stem) {
+                Some(k) => k,
+                None => {
+                    tracing::warn!(
+                        core = self.core_id,
+                        %stem,
+                        "failed to parse spatial checkpoint key; \
+                         skipping (WAL replay rebuilds it)"
+                    );
+                    continue;
+                }
             };
 
             let Ok(bytes) = nodedb_wal::segment::read_checkpoint_dontneed(&path) else {
@@ -188,14 +180,6 @@ impl CoreLoop {
                     self.spatial_doc_map
                         .insert((db, tid, coll.clone(), field.clone(), entry_id), doc_id);
                 }
-            }
-
-            // One-time migration: rewrite legacy filenames in the new format
-            // so the next startup parses them via the 4-part path. The
-            // in-memory load already succeeded, so a rename failure is logged
-            // and tolerated (it retries next startup).
-            if needs_migration {
-                migrate_legacy_files(self.core_id, &ckpt_dir, &stem, db, tid, &coll, &field);
             }
         }
 
@@ -240,60 +224,6 @@ fn parse_spatial_key(stem: &str) -> Option<(DatabaseId, TenantId, String, String
     Some((DatabaseId::new(db), TenantId::new(tid), coll, field))
 }
 
-/// Parse a LEGACY stem `{tid}_{coll}_{field}` (pre-db scoping, the old
-/// `:`→`_` sanitized scheme) into a key under [`DatabaseId::DEFAULT`].
-/// Requires EXACTLY 3 parts with a numeric tid. Components are returned
-/// verbatim (legacy files were not percent-encoded). Matches the common
-/// no-underscore-in-name case; genuinely ambiguous names fall through to a
-/// warn at the call site.
-fn parse_legacy_spatial_key(stem: &str) -> Option<(DatabaseId, TenantId, String, String)> {
-    let parts: Vec<&str> = stem.split('_').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let tid: u64 = parts[0].parse().ok()?;
-    Some((
-        DatabaseId::DEFAULT,
-        TenantId::new(tid),
-        parts[1].to_string(),
-        parts[2].to_string(),
-    ))
-}
-
-/// Atomically rename a legacy `.ckpt`/`.docmap` pair to the new stem.
-/// Failures are logged and tolerated (the in-memory load already succeeded).
-fn migrate_legacy_files(
-    core_id: usize,
-    ckpt_dir: &std::path::Path,
-    old_stem: &str,
-    db: DatabaseId,
-    tid: TenantId,
-    coll: &str,
-    field: &str,
-) {
-    let new_stem = checkpoint_stem(db, tid, coll, field);
-    if new_stem == old_stem {
-        return;
-    }
-    for ext in ["ckpt", "docmap"] {
-        let old_path = ckpt_dir.join(format!("{old_stem}.{ext}"));
-        if !old_path.exists() {
-            continue;
-        }
-        let new_path = ckpt_dir.join(format!("{new_stem}.{ext}"));
-        if let Err(e) = std::fs::rename(&old_path, &new_path) {
-            tracing::warn!(
-                core = core_id,
-                %old_stem,
-                %new_stem,
-                ext,
-                error = %e,
-                "spatial checkpoint legacy migration rename failed; will retry next startup"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,24 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_3part_parses_under_default_db() {
-        let parsed = parse_legacy_spatial_key("5_places_geom").expect("legacy parse");
-        assert_eq!(parsed.0, DatabaseId::DEFAULT);
-        assert_eq!(parsed.1, TenantId::new(5));
-        assert_eq!(parsed.2, "places");
-        assert_eq!(parsed.3, "geom");
-    }
-
-    #[test]
-    fn new_format_takes_precedence_over_legacy() {
-        // A 4-part numeric-db/tid stem is parsed as new, not legacy.
-        let stem = checkpoint_stem(DatabaseId::new(1), TenantId::new(2), "c", "f");
-        assert!(parse_spatial_key(&stem).is_some());
-    }
-
-    #[test]
     fn non_numeric_stem_is_none() {
         assert!(parse_spatial_key("a_b_c_d").is_none());
-        assert!(parse_legacy_spatial_key("a_b_c").is_none());
     }
 }

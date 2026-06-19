@@ -60,21 +60,8 @@ impl CoreLoop {
         let sparse_path = data_dir.join(format!("sparse/core-{core_id}.redb"));
         let sparse = SparseEngine::open(&sparse_path)?;
 
-        // Database-scoping migrations: rewrite legacy un-scoped keys into the
-        // database-scoped v2 tables under DatabaseId::DEFAULT. Idempotent and a
-        // no-op once migrated, so safe to run once per core at startup before
-        // any request is served.
-        sparse.migrate_documents_v2()?;
-        sparse.migrate_indexes_v2()?;
-        sparse.migrate_documents_versioned_v2()?;
-        sparse.migrate_indexes_versioned_v2()?;
-
         let graph_path = data_dir.join(format!("graph/core-{core_id}.redb"));
         let edge_store = EdgeStore::open(&graph_path)?;
-        // Database-scoping migration: rewrite legacy un-scoped edge / reverse /
-        // stats rows into the database-scoped v2 tables under
-        // DatabaseId::DEFAULT. Idempotent and a no-op once migrated.
-        edge_store.migrate_edges_v2()?;
         let csr = crate::engine::graph::csr::rebuild::rebuild_sharded_from_store(&edge_store)?;
 
         // Inverted index shares the sparse engine's redb database.
@@ -82,7 +69,6 @@ impl CoreLoop {
 
         // Column statistics store shares the sparse engine's redb database.
         let stats_store = crate::engine::sparse::stats::StatsStore::open(sparse.db().clone())?;
-        stats_store.migrate_column_stats_v2()?;
 
         let array_root = data_dir.join(format!("array/core-{core_id}"));
         let array_engine = ArrayEngine::new(ArrayEngineConfig::new(array_root)).map_err(|e| {

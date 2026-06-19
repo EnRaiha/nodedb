@@ -11,10 +11,9 @@ use super::key::format_sys_from;
 use super::value::{TAG_LIVE, TAG_TOMBSTONE};
 use crate::engine::sparse::btree::{SparseEngine, redb_err};
 
-/// Keys carry the leading `{database_id}:` component; the pre-scoping
-/// `indexes_versioned` table is migration-only (see `super::super::migrate`).
+/// Keys carry the leading `{database_id}:` component.
 pub(crate) const INDEXES_VERSIONED: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("indexes_versioned_v2");
+    TableDefinition::new("indexes_versioned");
 
 impl SparseEngine {
     /// Bootstrap: ensure the versioned index table exists.

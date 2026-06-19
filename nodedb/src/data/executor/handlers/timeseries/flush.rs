@@ -12,10 +12,6 @@ impl CoreLoop {
     ///
     /// On first access, scans the scoped segment directory for existing
     /// partition directories and populates the registry from partition metadata.
-    /// Also triggers the lazy legacy-layout migration (see
-    /// [`super::paths::migrate_legacy_ts_dir`]): if a pre-scoping
-    /// `ts/{collection}` directory exists it is renamed into the new
-    /// `ts/{db}/{tid}/{collection}` location by the owning tenant.
     pub(in crate::data::executor) fn ensure_ts_registry(
         &mut self,
         tid: TenantId,
@@ -26,19 +22,6 @@ impl CoreLoop {
         if self.ts_registries.contains_key(&key) {
             return Ok(());
         }
-        // Lazy one-time migration of any pre-scoping `ts/{collection}` dir into
-        // the db/tenant-scoped layout, performed by the owning tenant before
-        // the directory is scanned.
-        super::paths::migrate_legacy_ts_dir(
-            &self.data_dir,
-            database_id.as_u64(),
-            tid.as_u64(),
-            collection,
-        )
-        .map_err(|e| crate::Error::Storage {
-            engine: "timeseries".into(),
-            detail: format!("ts dir migration: {e}"),
-        })?;
         let ts_dir = super::paths::ts_collection_dir(
             &self.data_dir,
             database_id.as_u64(),

@@ -8,17 +8,12 @@
 
 use std::sync::Arc;
 
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 /// Redb table for column statistics.
 /// Key: "{database_id}:{tenant}:{collection}:{field}" → Value: serialized ColumnStats.
-const COLUMN_STATS: TableDefinition<&str, &[u8]> = TableDefinition::new("column_stats_v2");
-
-/// Legacy (pre-database-scoping) column-stats table. Keys lacked the leading
-/// `{database_id}:` component. Read-only; rewritten into [`COLUMN_STATS`] by
-/// [`StatsStore::migrate_column_stats_v2`].
-const COLUMN_STATS_LEGACY: TableDefinition<&str, &[u8]> = TableDefinition::new("column_stats");
+const COLUMN_STATS: TableDefinition<&str, &[u8]> = TableDefinition::new("column_stats");
 
 /// Statistics for a single column in a collection.
 #[derive(
@@ -332,83 +327,6 @@ impl StatsStore {
         }
 
         Ok(())
-    }
-
-    /// Rewrite legacy un-scoped `column_stats` rows into the database-scoped
-    /// `column_stats_v2` table, prepending `DatabaseId::DEFAULT` (0) to each
-    /// key. Idempotent: a no-op once the v2 table is non-empty and a no-op
-    /// when the legacy table is absent/empty (fresh boot). redb has no
-    /// `drop_table`, so the legacy rows are left in place (orphaned, harmless).
-    pub fn migrate_column_stats_v2(&self) -> crate::Result<()> {
-        fn stats_err<E: std::fmt::Display>(ctx: &str, e: E) -> crate::Error {
-            crate::Error::Storage {
-                engine: "stats".into(),
-                detail: format!("{ctx}: {e}"),
-            }
-        }
-
-        // Gather legacy rows.
-        let legacy: Vec<(String, Vec<u8>)> = {
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| stats_err("migrate_column_stats_v2 read txn", e))?;
-            match txn.open_table(COLUMN_STATS_LEGACY) {
-                Ok(table) => {
-                    let iter = table
-                        .range::<&str>(..)
-                        .map_err(|e| stats_err("migrate_column_stats_v2 iter", e))?;
-                    let mut rows = Vec::new();
-                    for entry in iter {
-                        let (k, v) =
-                            entry.map_err(|e| stats_err("migrate_column_stats_v2 row", e))?;
-                        rows.push((k.value().to_string(), v.value().to_vec()));
-                    }
-                    rows
-                }
-                Err(_) => Vec::new(),
-            }
-        };
-
-        if legacy.is_empty() {
-            return Ok(());
-        }
-
-        // Skip if v2 already populated.
-        let v2_empty = {
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| stats_err("migrate_column_stats_v2 check txn", e))?;
-            match txn.open_table(COLUMN_STATS) {
-                Ok(table) => table
-                    .is_empty()
-                    .map_err(|e| stats_err("migrate_column_stats_v2 is_empty", e))?,
-                Err(_) => true,
-            }
-        };
-        if !v2_empty {
-            return Ok(());
-        }
-
-        let db_id = nodedb_types::DatabaseId::DEFAULT.as_u64();
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| stats_err("migrate_column_stats_v2 write txn", e))?;
-        {
-            let mut table = txn
-                .open_table(COLUMN_STATS)
-                .map_err(|e| stats_err("migrate_column_stats_v2 open v2", e))?;
-            for (old_key, value) in &legacy {
-                let new_key = format!("{db_id}:{old_key}");
-                table
-                    .insert(new_key.as_str(), value.as_slice())
-                    .map_err(|e| stats_err("migrate_column_stats_v2 insert", e))?;
-            }
-        }
-        txn.commit()
-            .map_err(|e| stats_err("migrate_column_stats_v2 commit", e))
     }
 }
 

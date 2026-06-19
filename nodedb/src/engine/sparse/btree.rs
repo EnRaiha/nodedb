@@ -8,19 +8,11 @@ use tracing::{debug, info};
 
 /// Table definition for the primary document store.
 /// Key: "{database_id}:{tenant_id}:{collection}:{document_id}" → Value: document bytes.
-pub(crate) const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents_v2");
+pub(crate) const DOCUMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
 
 /// Table definition for secondary indexes.
 /// Key: "{database_id}:{tenant_id}:{collection}:{field}:{value}:{document_id}" → Value: empty (existence index).
-pub(super) const INDEXES: TableDefinition<&str, &[u8]> = TableDefinition::new("indexes_v2");
-
-/// Legacy (pre-database-scoping) document table. Keys lacked the leading
-/// `{database_id}:` component. Retained read-only so [`super::migrate`] can
-/// rewrite its rows into [`DOCUMENTS`]; never written by live paths.
-pub(super) const DOCUMENTS_LEGACY: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
-
-/// Legacy (pre-database-scoping) index table. See [`DOCUMENTS_LEGACY`].
-pub(super) const INDEXES_LEGACY: TableDefinition<&str, &[u8]> = TableDefinition::new("indexes");
+pub(super) const INDEXES: TableDefinition<&str, &[u8]> = TableDefinition::new("indexes");
 
 /// Map a redb error into our crate error with context.
 pub(super) fn redb_err<E: std::fmt::Display>(ctx: &str, e: E) -> crate::Error {
