@@ -111,6 +111,13 @@ impl QueryContext {
             shuffle_num_parts: self
                 .shuffle_num_parts
                 .load(std::sync::atomic::Ordering::Relaxed) as usize,
+            force_shuffle_agg: self
+                .force_shuffle_agg
+                .load(std::sync::atomic::Ordering::Relaxed),
+            shuffle_agg_num_parts: self
+                .shuffle_agg_num_parts
+                .load(std::sync::atomic::Ordering::Relaxed)
+                as usize,
             broadcast_threshold_bytes: self
                 .broadcast_threshold_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -246,6 +253,13 @@ impl QueryContext {
             shuffle_num_parts: self
                 .shuffle_num_parts
                 .load(std::sync::atomic::Ordering::Relaxed) as usize,
+            force_shuffle_agg: self
+                .force_shuffle_agg
+                .load(std::sync::atomic::Ordering::Relaxed),
+            shuffle_agg_num_parts: self
+                .shuffle_agg_num_parts
+                .load(std::sync::atomic::Ordering::Relaxed)
+                as usize,
             broadcast_threshold_bytes: self
                 .broadcast_threshold_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),

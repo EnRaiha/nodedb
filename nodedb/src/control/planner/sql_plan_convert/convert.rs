@@ -87,6 +87,18 @@ pub struct ConvertContext {
     /// emit time. Sourced from session var `nodedb.shuffle_num_parts`; defaults
     /// to the cluster's data-node count when unset.
     pub shuffle_num_parts: usize,
+    /// Permanent operator override (session var `nodedb.force_shuffle_agg`):
+    /// when `true` AND the node is in cluster mode, a GROUP BY aggregate over a
+    /// sharded source is emitted as a whole-aggregate `Exchange{ShuffleAggregate}`
+    /// (the input left as a bare per-shard scan) instead of the default
+    /// Gather-merge plan. This is the manual hint layer; the automatic
+    /// cost-model default is a separate follow-up. Ignored in single-node mode
+    /// (no peers to shuffle across — the Gather path is correct and cheaper).
+    pub force_shuffle_agg: bool,
+    /// Target partition count for a forced shuffle aggregate. Sourced from
+    /// session var `nodedb.shuffle_agg_num_parts`; `0` defaults to the cluster's
+    /// data-node count at resolve time when unset.
+    pub shuffle_agg_num_parts: usize,
     /// Broadcast-vs-shuffle cost threshold in bytes. When BOTH join sides have
     /// ANALYZE statistics and each side's estimated size exceeds this value
     /// (i.e. neither side is small enough to broadcast cheaply), the planner

@@ -262,6 +262,31 @@ impl NodeDbPgHandler {
                 ),
             ))));
         }
+        // Validate the distributed shuffle-aggregate override knobs eagerly so a
+        // bad value is rejected at SET time, not silently stored.
+        // `force_shuffle_agg` is a boolean; `shuffle_agg_num_parts` is a
+        // non-negative integer (`0` = let the planner default to the cluster
+        // data-node count). Mirrors the force_shuffle_join knobs above.
+        if key == "nodedb.force_shuffle_agg" && parse_bool_session_value(&value).is_none() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "22023".to_owned(),
+                format!(
+                    "invalid value for nodedb.force_shuffle_agg: '{value}'. \
+                     Valid: on, off, true, false, 1, 0"
+                ),
+            ))));
+        }
+        if key == "nodedb.shuffle_agg_num_parts" && value.parse::<u32>().is_err() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "22023".to_owned(),
+                format!(
+                    "invalid value for nodedb.shuffle_agg_num_parts: '{value}'. \
+                     Must be a non-negative integer (0 = cluster default)"
+                ),
+            ))));
+        }
         if key == "nodedb.broadcast_threshold_bytes" && value.parse::<usize>().is_err() {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),

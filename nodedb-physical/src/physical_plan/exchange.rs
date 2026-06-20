@@ -66,4 +66,10 @@ pub enum ExchangeMode {
         keys: Vec<(String, String)>,
         num_parts: usize,
     },
+    /// Cross-node distributed hash-repartition shuffle-AGGREGATE, wrapping a
+    /// complete `QueryOp::Aggregate` at the plan root. `keys` are the GROUP BY
+    /// column names (single-side, unlike `Shuffle`'s join-key pairs). `num_parts`
+    /// (0 = default to cluster data-node count). Resolved on the coordinator by
+    /// `super::shuffle_aggregate`.
+    ShuffleAggregate { keys: Vec<String>, num_parts: usize },
 }

@@ -247,23 +247,71 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
         .map(|set| set.iter().map(|&i| i as u32).collect())
         .collect();
 
+    // Distributed shuffle-aggregate eligibility (FORCE path only; the cost-model
+    // auto-emit is a separate later unit). A whole-aggregate shuffle is only
+    // *correct* when there is NO global ORDER BY and NO explicit LIMIT: each part
+    // finalizes its disjoint groups independently and the coordinator concatenates
+    // them, so a global sort or take-N (which spans groups across parts) would be
+    // applied per-part and yield a wrong answer. Such queries MUST keep the
+    // default plan — `convert.rs` wraps the bare Aggregate in `Gather{
+    // as_aggregate}`, where the single owning node applies the global sort/limit
+    // correctly. HAVING is per-group (disjoint across parts) so it is allowed.
+    //
+    // The no-LIMIT sentinel for an aggregate is `10000` (the planner default
+    // applied when no `LIMIT` clause is present; an explicit `LIMIT n` overwrites
+    // it — see `nodedb-sql` `apply_limit`), so `limit == 10000` means "no explicit
+    // LIMIT". `grouping_sets` (ROLLUP / CUBE) cannot be shuffled either: the
+    // partial-state producer keys on the base GROUP BY columns only. Only honored
+    // in cluster mode (single-node has no peers to shuffle across).
+    let shuffle_agg_eligible = ctx.cluster_enabled
+        && !group_strs.is_empty()
+        && bridge_sort_keys.is_empty()
+        && limit == 10000
+        && bridge_grouping_sets.is_empty()
+        && ctx.force_shuffle_agg;
+
+    // Clone the group keys for the Exchange.keys field only when the shuffle
+    // path is actually taken; in the non-eligible branch no copy is needed.
+    let exchange_keys = if shuffle_agg_eligible {
+        group_strs.clone()
+    } else {
+        Vec::new()
+    };
+    let aggregate = PhysicalPlan::Query(QueryOp::Aggregate {
+        collection,
+        input: None,
+        group_by: group_strs,
+        aggregates: agg_specs,
+        filters: filter_bytes,
+        having: having_bytes,
+        limit,
+        sub_group_by: Vec::new(),
+        sub_aggregates: Vec::new(),
+        grouping_sets: bridge_grouping_sets,
+        sort_keys: bridge_sort_keys,
+    });
+
+    let plan = if shuffle_agg_eligible {
+        // `num_parts == 0` is the "unset" sentinel: the operator left
+        // `nodedb.shuffle_agg_num_parts` unset, so the coordinator resolver
+        // defaults it to the cluster data-node count (the convert layer has no
+        // view of the routing table). A non-zero value is used verbatim.
+        PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+            child: Box::new(aggregate),
+            mode: ExchangeMode::ShuffleAggregate {
+                keys: exchange_keys,
+                num_parts: ctx.shuffle_agg_num_parts,
+            },
+        }))
+    } else {
+        aggregate
+    };
+
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,
         database_id: ctx.database_id,
-        plan: PhysicalPlan::Query(QueryOp::Aggregate {
-            collection,
-            input: None,
-            group_by: group_strs,
-            aggregates: agg_specs,
-            filters: filter_bytes,
-            having: having_bytes,
-            limit,
-            sub_group_by: Vec::new(),
-            sub_aggregates: Vec::new(),
-            grouping_sets: bridge_grouping_sets,
-            sort_keys: bridge_sort_keys,
-        }),
+        plan,
         post_set_op: PostSetOp::None,
     }])
 }

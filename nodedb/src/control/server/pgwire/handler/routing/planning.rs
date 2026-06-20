@@ -118,6 +118,24 @@ impl NodeDbPgHandler {
         self.query_ctx
             .set_force_shuffle_join(force_shuffle_join, shuffle_num_parts);
 
+        // Propagate the distributed shuffle-aggregate override from the session
+        // parameter bag (set via `SET nodedb.force_shuffle_agg = on` and,
+        // optionally, `SET nodedb.shuffle_agg_num_parts = N`). The values were
+        // validated at SET time, so a parse miss here defaults to "off" / 0.
+        let force_shuffle_agg = self
+            .sessions
+            .get_parameter(addr, "nodedb.force_shuffle_agg")
+            .as_deref()
+            .and_then(super::super::session_cmds::parse_bool_session_value)
+            .unwrap_or(false);
+        let shuffle_agg_num_parts = self
+            .sessions
+            .get_parameter(addr, "nodedb.shuffle_agg_num_parts")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        self.query_ctx
+            .set_force_shuffle_agg(force_shuffle_agg, shuffle_agg_num_parts);
+
         // Resolve the auto-shuffle cost threshold: the session override
         // `nodedb.broadcast_threshold_bytes` when set, otherwise the node's
         // configured `[tuning.cluster_transport] broadcast_threshold_bytes`.
@@ -166,7 +184,7 @@ impl NodeDbPgHandler {
         // different join-strategy assumption would otherwise be served (and a
         // strategy-specific plan must not be cached for a later default query).
         // Skipping read AND put keeps the cache strategy-knob-free.
-        let bypass_cache = force_shuffle_join || threshold_overridden;
+        let bypass_cache = force_shuffle_join || force_shuffle_agg || threshold_overridden;
         let cached_tasks = if bypass_cache {
             None
         } else {

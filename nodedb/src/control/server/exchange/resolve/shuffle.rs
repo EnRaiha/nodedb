@@ -32,8 +32,8 @@ use futures::future::join_all;
 
 use nodedb_cluster::rpc_codec::DescriptorVersionEntry;
 use nodedb_cluster::{
-    JoinKeyPair, METADATA_GROUP_ID, PartNodeEntry, RaftRpc, RoutingTable, ShuffleConsumeRequest,
-    ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse,
+    JoinKeyPair, PartNodeEntry, RaftRpc, ShuffleConsumeRequest, ShuffleConsumeResponse,
+    ShuffleProduceRequest, ShuffleProduceResponse,
 };
 use nodedb_physical::physical_plan::wire as plan_wire;
 use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
@@ -42,9 +42,10 @@ use crate::control::server::exchange::full_scan::full_scan_plan_for_collection;
 use crate::control::server::exchange::gather::outcome_to_response;
 use crate::control::server::payload_merge::merge_msgpack_arrays;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
 
 use super::exchange::Resolved;
+use super::peers::{distinct_data_node_count, producer_nodes, register_peers_from_topology};
 
 /// Orchestrate a distributed shuffle hash join.
 ///
@@ -355,75 +356,6 @@ async fn send_consume(
             detail: format!("shuffle consume RPC for part {part} to node {node} failed: {e}"),
         }),
     }
-}
-
-/// Register each target node's address with the transport from the live cluster
-/// topology (idempotent). Makes the shuffle fan-out robust to a peer the
-/// transport has not warmed yet — without it `send_rpc` to an unregistered (but
-/// topology-known) node fails with `NodeUnreachable`. Self IS registered too:
-/// when this coordinator also owns one of the join sides it dispatches that
-/// producer/consumer to itself via `send_rpc`, which loops back through the local
-/// QUIC endpoint and runs the same handler (an extra local hop, functionally
-/// correct). Missing topology / address for a node is left alone so the
-/// subsequent `send_rpc` surfaces the typed `NodeUnreachable` rather than this
-/// silently masking it.
-fn register_peers_from_topology(
-    state: &SharedState,
-    transport: &nodedb_cluster::NexarTransport,
-    nodes: &BTreeSet<u64>,
-) {
-    let Some(topology) = state.cluster_topology.as_ref() else {
-        return;
-    };
-    let topo = topology.read().unwrap_or_else(|p| p.into_inner());
-    for &node in nodes {
-        if let Some(info) = topo.get_node(node)
-            && let Some(addr) = info.socket_addr()
-        {
-            transport.register_peer(node, addr);
-        }
-    }
-}
-
-/// Producer nodes that own `collection`'s data: resolve its vShard → owning
-/// group → leader. A user collection is single-vShard-homed, so this is one
-/// node; returned as a deduped sorted vec for generality.
-fn producer_nodes(
-    routing: &RoutingTable,
-    database_id: DatabaseId,
-    collection: &str,
-) -> crate::Result<Vec<u64>> {
-    let vshard = VShardId::from_collection_in_database(database_id, collection).as_u32();
-    let group = routing
-        .group_for_vshard(vshard)
-        .map_err(|e| crate::Error::Internal {
-            detail: format!("shuffle join: no group for vshard {vshard} ({collection}): {e}"),
-        })?;
-    let leader = routing
-        .group_info(group)
-        .map(|g| g.leader)
-        .filter(|&l| l != 0)
-        .ok_or_else(|| crate::Error::Internal {
-            detail: format!("shuffle join: no leader for group {group} ({collection})"),
-        })?;
-    Ok(vec![leader])
-}
-
-/// Count distinct data-group leaders (the cluster's data-node count), excluding
-/// the metadata group, which owns no vShards.
-fn distinct_data_node_count(routing: &RoutingTable) -> usize {
-    let mut nodes: BTreeSet<u64> = BTreeSet::new();
-    for group_id in routing.group_ids() {
-        if group_id == METADATA_GROUP_ID {
-            continue;
-        }
-        if let Some(info) = routing.group_info(group_id)
-            && info.leader != 0
-        {
-            nodes.insert(info.leader);
-        }
-    }
-    nodes.len()
 }
 
 /// Build a full-collection scan plan for `collection`, erroring if the catalog

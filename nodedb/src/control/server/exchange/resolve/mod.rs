@@ -23,10 +23,17 @@
 //!      `shuffle`: allocate a shuffle id, fan producers to each side's owner
 //!      nodes, then consumers to the part-owners, and merge the joined rows
 //!      into a `Resolved::Gathered` response (real cross-node grace hash join).
+//!    - `ShuffleAggregate{keys, num_parts}` at the plan root wrapping a
+//!      `QueryOp::Aggregate` → `shuffle_aggregate`: allocate a shuffle id, fan
+//!      partial-state producers to the source collection's owner node, then fan
+//!      per-part consumers (one per partition), and concatenate + global-cap the
+//!      finalized rows into a `Resolved::Gathered` response (distributed GROUP BY).
 //!    - No Exchange / no empty ProviderScan → `Resolved::Plan` unchanged.
 
 pub mod exchange;
 mod materialize;
+mod peers;
 mod shuffle;
+mod shuffle_aggregate;
 
 pub use exchange::{Resolved, resolve_and_materialize, resolve_exchange_in_plan};

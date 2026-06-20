@@ -147,6 +147,8 @@ mod tests {
             max_vector_dim: 0,
             force_shuffle_join: false,
             shuffle_num_parts: 0,
+            force_shuffle_agg: false,
+            shuffle_agg_num_parts: 0,
             broadcast_threshold_bytes: 8 * 1024 * 1024,
             database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: crate::types::TenantId::new(0),

@@ -65,6 +65,18 @@ pub struct QueryContext {
     /// `nodedb.shuffle_num_parts`). `0` means "unset — let the emit default to
     /// the cluster data-node count". Updated alongside `force_shuffle_join`.
     shuffle_num_parts: std::sync::atomic::AtomicU32,
+    /// Per-request force-shuffle-aggregate override (session var
+    /// `nodedb.force_shuffle_agg`). Updated by connection handlers via
+    /// `set_force_shuffle_agg` before each plan call; forwarded into
+    /// `ConvertContext`. When `true` AND the node is in cluster mode, a GROUP BY
+    /// aggregate over a sharded source is emitted as a whole-aggregate
+    /// `Exchange{ShuffleAggregate}` instead of the default Gather plan. An atomic
+    /// mirrors `force_shuffle_join` (same `&self` plan-call contract).
+    force_shuffle_agg: std::sync::atomic::AtomicBool,
+    /// Per-request forced-shuffle-aggregate partition count (session var
+    /// `nodedb.shuffle_agg_num_parts`). `0` means "unset — let the emit default
+    /// to the cluster data-node count". Updated alongside `force_shuffle_agg`.
+    shuffle_agg_num_parts: std::sync::atomic::AtomicU32,
     /// Broadcast-vs-shuffle cost threshold in bytes (session var
     /// `nodedb.broadcast_threshold_bytes`, defaulting to the node's
     /// `[tuning.cluster_transport] broadcast_threshold_bytes`). Connection
@@ -90,6 +102,8 @@ impl QueryContext {
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),
             force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
             shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
+            force_shuffle_agg: std::sync::atomic::AtomicBool::new(false),
+            shuffle_agg_num_parts: std::sync::atomic::AtomicU32::new(0),
             broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
                 default_broadcast_threshold_bytes(),
             ),
@@ -153,6 +167,8 @@ impl QueryContext {
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),
             force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
             shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
+            force_shuffle_agg: std::sync::atomic::AtomicBool::new(false),
+            shuffle_agg_num_parts: std::sync::atomic::AtomicU32::new(0),
             broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
                 state.tuning.cluster_transport.broadcast_threshold_bytes,
             ),
@@ -182,6 +198,21 @@ impl QueryContext {
         self.force_shuffle_join
             .store(force, std::sync::atomic::Ordering::Relaxed);
         self.shuffle_num_parts
+            .store(num_parts, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the force-shuffle-aggregate override for the next plan call.
+    ///
+    /// Called by connection handlers after reading the session var
+    /// `nodedb.force_shuffle_agg` (and `nodedb.shuffle_agg_num_parts`).
+    /// `num_parts == 0` means "unset — the emit defaults to the cluster
+    /// data-node count". Relaxed ordering suffices: written before planning
+    /// begins, read only within that same call (same contract as
+    /// `set_force_shuffle_join`).
+    pub fn set_force_shuffle_agg(&self, force: bool, num_parts: u32) {
+        self.force_shuffle_agg
+            .store(force, std::sync::atomic::Ordering::Relaxed);
+        self.shuffle_agg_num_parts
             .store(num_parts, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -240,6 +271,8 @@ impl QueryContext {
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),
             force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
             shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
+            force_shuffle_agg: std::sync::atomic::AtomicBool::new(false),
+            shuffle_agg_num_parts: std::sync::atomic::AtomicU32::new(0),
             broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
                 default_broadcast_threshold_bytes(),
             ),

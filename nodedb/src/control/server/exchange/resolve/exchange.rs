@@ -199,6 +199,27 @@ async fn resolve_exchange(
             .await
         }
 
+        // Root-level ShuffleAggregate: orchestrate a real cross-node distributed
+        // GROUP BY shuffle. The child must be a `QueryOp::Aggregate` (shuffle
+        // wraps a complete aggregate); `super::shuffle_aggregate` validates that,
+        // fans the partial-state producers + per-part consumers, and returns the
+        // merged finalized rows as `Resolved::Gathered`.
+        PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+            child,
+            mode: ExchangeMode::ShuffleAggregate { keys, num_parts },
+        })) => {
+            super::shuffle_aggregate::resolve_shuffle_aggregate(
+                state,
+                database_id,
+                tenant_id,
+                *child,
+                keys,
+                num_parts,
+                trace_id,
+            )
+            .await
+        }
+
         // HashJoin: resolve Broadcast children embedded in left_input / right_input.
         PhysicalPlan::Query(QueryOp::HashJoin {
             left_collection,
@@ -329,6 +350,20 @@ async fn resolve_join_input(
         })) => Err(crate::Error::Internal {
             detail: "ExchangeMode::Shuffle is only valid wrapping a complete hash join, \
                      not as a join input"
+                .into(),
+        }),
+
+        // Exchange{ShuffleAggregate} inside a join input is never a shape the
+        // emit produces: a shuffle-aggregate wraps a WHOLE root aggregate, so it
+        // cannot appear as one join's input. Reject with a clear message rather
+        // than speculatively implementing an unreachable nesting (mirrors the
+        // Shuffle rejection above).
+        PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+            mode: ExchangeMode::ShuffleAggregate { .. },
+            ..
+        })) => Err(crate::Error::Internal {
+            detail: "ExchangeMode::ShuffleAggregate is only valid wrapping a complete root \
+                     aggregate, not as a join input"
                 .into(),
         }),
 
