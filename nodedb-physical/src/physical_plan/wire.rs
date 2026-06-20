@@ -27,9 +27,10 @@ pub enum WireError {
 ///   (carry node-local staged-file paths; built locally by the part-owner's
 ///   consume hook and dispatched only to that same node's Data Plane).
 ///
-/// `QueryOp::PartialAggregateState` is wire-SHIPPABLE — it carries only a
-/// collection name and is dispatched to a remote producer's Data Plane — so it
-/// is intentionally NOT rejected here.
+/// `QueryOp::PartialAggregateState` is wire-SHIPPABLE — it carries a collection
+/// name plus an optional `input` sub-plan (a wire-shippable `ProviderScan`) and
+/// is dispatched to a remote producer's Data Plane — so it is intentionally NOT
+/// rejected here.
 pub fn encode(plan: &PhysicalPlan) -> Result<Vec<u8>, WireError> {
     if matches!(plan, PhysicalPlan::ClusterArray(_)) {
         return Err(WireError::InvalidPlan(

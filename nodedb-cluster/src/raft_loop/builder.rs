@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Builder-chain methods for [`RaftLoop`].
+//!
+//! Every `with_*` method is a consumed-self builder that sets one optional
+//! field and returns `Self` (or a new `RaftLoop` with a different generic when
+//! the type changes, as with `with_plan_executor`).  They live here rather
+//! than in [`super::loop_core`] so that the struct definition, constructor,
+//! and runtime methods stay under the file-size limit.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::applied_watcher::GroupAppliedWatchers;
+use crate::catalog::ClusterCatalog;
+use crate::forward::PlanExecutor;
+use crate::metadata_group::applier::MetadataApplier;
+
+use super::hooks::{
+    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
+};
+use super::loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};
+
+impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
+    /// Install a custom plan executor (for cluster mode — C-β path).
+    pub fn with_plan_executor<P2: PlanExecutor>(self, executor: Arc<P2>) -> RaftLoop<A, P2> {
+        RaftLoop {
+            node_id: self.node_id,
+            multi_raft: self.multi_raft,
+            transport: self.transport,
+            topology: self.topology,
+            applier: self.applier,
+            metadata_applier: self.metadata_applier,
+            plan_executor: executor,
+            tick_interval: self.tick_interval,
+            vshard_handler: self.vshard_handler,
+            catalog: self.catalog,
+            shutdown_watch: self.shutdown_watch,
+            ready_watch: self.ready_watch,
+            loop_metrics: self.loop_metrics,
+            group_watchers: self.group_watchers,
+            prev_metadata_leader: self.prev_metadata_leader,
+            snapshot_quarantine_hook: self.snapshot_quarantine_hook,
+            shuffle_receiver: self.shuffle_receiver,
+            shuffle_producer: self.shuffle_producer,
+            shuffle_consumer: self.shuffle_consumer,
+            shuffle_aggregator: self.shuffle_aggregator,
+            partial_snapshots: self.partial_snapshots,
+            data_dir: self.data_dir,
+            snapshot_chunk_bytes: self.snapshot_chunk_bytes,
+            orphan_partial_max_age_secs: self.orphan_partial_max_age_secs,
+        }
+    }
+
+    /// Replace the per-group apply watcher registry.
+    ///
+    /// The host crate calls this with the same `Arc` it stores on
+    /// `SharedState` so proposers and consistent-read paths share
+    /// one registry with the tick loop's bump points. Defaults to a
+    /// fresh empty registry when not set.
+    pub fn with_group_watchers(mut self, watchers: Arc<GroupAppliedWatchers>) -> Self {
+        self.group_watchers = watchers;
+        self
+    }
+
+    /// Attach the snapshot quarantine hook (builder chain variant).
+    ///
+    /// The supplied implementation is called by the `InstallSnapshotRequest`
+    /// handler to check for, record, and short-circuit quarantined chunks.
+    pub fn with_snapshot_quarantine_hook(mut self, hook: Arc<dyn SnapshotQuarantineHook>) -> Self {
+        self.snapshot_quarantine_hook = Some(hook);
+        self
+    }
+
+    /// Attach the cross-node streaming-shuffle receiver (E1, builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s
+    /// `ShuffleReceiverRegistry`) is called by the `ShufflePush` transport
+    /// read-loop to create inboxes, deposit chunks, and record the per-part
+    /// build barrier.
+    pub fn with_shuffle_receiver(mut self, receiver: Arc<dyn ShuffleReceiver>) -> Self {
+        self.shuffle_receiver = Some(receiver);
+        self
+    }
+
+    /// Attach the cross-node shuffle PRODUCER (E4a, builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s local streaming executor
+    /// and receiver registry) is called by the `ShuffleProduce` transport handler
+    /// to run the local scan, hash-partition its rows, and fan them out to the
+    /// part-owners.
+    pub fn with_shuffle_producer(mut self, producer: Arc<dyn ShuffleProducer>) -> Self {
+        self.shuffle_producer = Some(producer);
+        self
+    }
+
+    /// Attach the cross-node shuffle CONSUMER (E4b, builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s shuffle registry +
+    /// local executor) is called by the `ShuffleConsume` transport handler to
+    /// wait for the part's staged sides to finalize and run the node-local grace
+    /// join.
+    pub fn with_shuffle_consumer(mut self, consumer: Arc<dyn ShuffleConsumer>) -> Self {
+        self.shuffle_consumer = Some(consumer);
+        self
+    }
+
+    /// Attach the cross-node distributed GROUP BY shuffle CONSUMER (E5b, builder
+    /// chain).
+    ///
+    /// SINGLE-SIDED aggregate sibling of [`with_shuffle_consumer`](Self::with_shuffle_consumer).
+    /// The supplied implementation (backed by `nodedb`'s shuffle registry + local
+    /// executor) is called by the `ShuffleAggregateConsume` transport handler to
+    /// wait for the part's single staged side to finalize and run the node-local
+    /// partial-state merge + finalize.
+    pub fn with_shuffle_aggregator(mut self, aggregator: Arc<dyn ShuffleAggregator>) -> Self {
+        self.shuffle_aggregator = Some(aggregator);
+        self
+    }
+
+    /// Set the data directory for partial-snapshot persistence and GC.
+    ///
+    /// When set, the `InstallSnapshotRequest` handler writes chunks to
+    /// `<data_dir>/recv_snapshots/<group_id>.partial` and the GC sweeper
+    /// removes stale partials on startup. When `None` (the default, used by
+    /// unit tests), disk writes are skipped — the receiver operates in-memory
+    /// only with empty chunk data.
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
+    }
+
+    /// Override the snapshot chunk byte size (default: 4 MiB).
+    pub fn with_snapshot_chunk_bytes(mut self, chunk_bytes: u64) -> Self {
+        self.snapshot_chunk_bytes = chunk_bytes;
+        self
+    }
+
+    /// Override the orphan-partial max age for the GC sweeper (default: 300 s).
+    pub fn with_orphan_partial_max_age_secs(mut self, secs: u64) -> Self {
+        self.orphan_partial_max_age_secs = secs;
+        self
+    }
+
+    /// Set a handler for incoming VShardEnvelope messages.
+    pub fn with_vshard_handler(mut self, handler: VShardEnvelopeHandler) -> Self {
+        self.vshard_handler = Some(handler);
+        self
+    }
+
+    /// Install the metadata applier used for group-0 commits.
+    ///
+    /// The host crate (nodedb) calls this with a production applier that
+    /// wraps an in-memory `MetadataCache` and additionally persists to
+    /// redb / broadcasts catalog change events. The default
+    /// [`NoopMetadataApplier`] is kept only for tests that don't care.
+    pub fn with_metadata_applier(mut self, applier: Arc<dyn MetadataApplier>) -> Self {
+        self.metadata_applier = applier;
+        self
+    }
+
+    pub fn with_tick_interval(mut self, interval: Duration) -> Self {
+        self.tick_interval = interval;
+        self
+    }
+
+    /// Attach a cluster catalog — used by the join flow to persist the
+    /// updated topology + routing after a conf-change commits.
+    pub fn with_catalog(mut self, catalog: Arc<ClusterCatalog>) -> Self {
+        // Seed the local cluster-epoch high-water mark from the catalog
+        // on attach, so the value emitted in the very first outbound
+        // RPC reflects whatever the previous incarnation persisted. A
+        // failure to load is treated as a fresh catalog (epoch 0); a
+        // genuine catalog read error would have surfaced from earlier
+        // catalog operations on this same handle.
+        if let Err(e) = crate::cluster_epoch::init_local_cluster_epoch_from_catalog(&catalog) {
+            tracing::warn!(error = %e, "failed to load persisted cluster_epoch; defaulting to 0");
+        }
+        self.catalog = Some(catalog);
+        self
+    }
+}

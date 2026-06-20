@@ -113,7 +113,7 @@ pub use migration_executor::{
 };
 pub use multi_raft::{GroupStatus, MultiRaft};
 pub use raft_loop::{
-    CommitApplier, RaftLoop, ShuffleConsumer, ShuffleProducer, ShuffleReceiver,
+    CommitApplier, RaftLoop, ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver,
     SnapshotQuarantineHook, VShardEnvelopeHandler,
 };
 pub use reachability::{
@@ -128,9 +128,10 @@ pub use rebalancer::{
 pub use routing::RoutingTable;
 pub use routing_liveness::{NodeIdResolver, RoutingLivenessHook};
 pub use rpc_codec::{
-    JoinKeyPair, MacKey, PartNodeEntry, RaftRpc, ShuffleConsumeRequest, ShuffleConsumeResponse,
+    JoinKeyPair, MacKey, PartNodeEntry, RaftRpc, ShuffleAggregateConsumeRequest,
+    ShuffleAggregateConsumeResponse, ShuffleConsumeRequest, ShuffleConsumeResponse,
     ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk, ShufflePushEnd,
-    ShufflePushRequest, TypedClusterError,
+    ShufflePushRequest, SortKey, TypedClusterError,
 };
 pub use topology::{ClusterTopology, NodeInfo, NodeState};
 pub use transport::{

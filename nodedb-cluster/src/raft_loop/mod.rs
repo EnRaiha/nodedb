@@ -15,6 +15,7 @@
 //!   peer, propose `AddLearner` on every group, wait for commit,
 //!   broadcast topology, persist catalog, build the wire response.
 
+mod builder;
 pub mod handle_rpc;
 pub mod hooks;
 pub mod join;
@@ -22,5 +23,7 @@ pub mod loop_core;
 pub mod proposals;
 pub mod tick;
 
-pub use hooks::{ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook};
+pub use hooks::{
+    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
+};
 pub use loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};

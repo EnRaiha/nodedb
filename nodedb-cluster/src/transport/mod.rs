@@ -9,6 +9,7 @@ pub mod peer_identity_verifier;
 pub mod pinned_verifier;
 pub mod rpc_handler;
 pub mod server;
+mod stream_dispatch;
 
 pub use auth_context::AuthContext;
 

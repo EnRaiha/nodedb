@@ -30,33 +30,48 @@ use nodedb_types::Value;
 pub(in crate::data::executor) const AGG_STATE_FIELD: &str = "__agg_state";
 
 impl CoreLoop {
-    /// Execute a `PartialAggregateState` producer: scan + accumulate the named
-    /// collection, then emit one serialized partial-state row per group.
+    /// Execute a `PartialAggregateState` producer: acquire the source documents
+    /// (the `input` sub-plan's rows when present, else a per-shard scan of the
+    /// named `collection`), accumulate them, then emit one serialized
+    /// partial-state row per group.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_partial_aggregate_state(
         &mut self,
         task: &ExecutionTask,
         tid: u64,
         collection: &str,
+        input: Option<&nodedb_physical::physical_plan::PhysicalPlan>,
         group_by: &[String],
         aggregates: &[AggregateSpec],
         filters: &[u8],
     ) -> Response {
-        // Same per-shard scan cap the streaming aggregate path uses.
-        let scan_limit = self.query_tuning.aggregate_scan_cap;
-        let docs = match self.scan_collection(
-            task.request.database_id.as_u64(),
-            tid,
-            collection,
-            scan_limit,
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+        // Input-sourced producer (catalog): the rows come from executing the
+        // sub-plan (a coordinator-materialized `ProviderScan`), not from a
+        // per-shard collection scan. Decode the sub-plan rows the SAME way
+        // `execute_aggregate` does — an empty / undecodable payload aggregates
+        // over zero rows, matching a per-shard scan that matched nothing.
+        let docs = if let Some(sub_plan) = input {
+            let sub_response = self.execute_plan(task, sub_plan);
+            crate::data::executor::response_codec::decode_response_to_docs(&sub_response)
+                .unwrap_or_default()
+        } else {
+            // Same per-shard scan cap the streaming aggregate path uses.
+            let scan_limit = self.query_tuning.aggregate_scan_cap;
+            match self.scan_collection(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                scan_limit,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    );
+                }
             }
         };
 

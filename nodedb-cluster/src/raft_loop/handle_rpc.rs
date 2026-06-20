@@ -11,8 +11,9 @@ use crate::error::{ClusterError, Result};
 use crate::forward::{ChunkSink, PlanExecutor};
 use crate::health;
 use crate::rpc_codec::{
-    ExecuteRequest, RaftRpc, ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest,
-    ShufflePushRequest, TypedClusterError,
+    ExecuteRequest, RaftRpc, ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse,
+    ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest,
+    TypedClusterError,
 };
 use crate::transport::RaftRpcHandler;
 
@@ -435,6 +436,29 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                 error: Some(TypedClusterError::Internal {
                     code: 0,
                     message: "shuffle consumer not configured (no ShuffleConsumer installed)"
+                        .into(),
+                }),
+            },
+        }
+    }
+
+    // Cross-node distributed GROUP BY shuffle CONSUMER trigger (E5b) — delegate
+    // to the host-crate `ShuffleAggregator`. The single-sided aggregate sibling
+    // of `on_shuffle_consume`. When no aggregator is installed (cluster-only
+    // tests / single-node), return a typed "not configured" error (empty rows)
+    // so the coordinator learns the trigger could not run rather than silently
+    // receiving zero aggregate rows.
+    async fn on_shuffle_aggregate(
+        &self,
+        req: ShuffleAggregateConsumeRequest,
+    ) -> ShuffleAggregateConsumeResponse {
+        match &self.shuffle_aggregator {
+            Some(aggregator) => aggregator.on_shuffle_aggregate(req).await,
+            None => ShuffleAggregateConsumeResponse {
+                rows: Vec::new(),
+                error: Some(TypedClusterError::Internal {
+                    code: 0,
+                    message: "shuffle aggregator not configured (no ShuffleAggregator installed)"
                         .into(),
                 }),
             },

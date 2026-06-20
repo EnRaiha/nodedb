@@ -66,6 +66,15 @@ pub const RPC_SHUFFLE_PRODUCE_RESP: u8 = 29;
 /// One-shot request/response — no streaming.
 pub const RPC_SHUFFLE_CONSUME_REQ: u8 = 30;
 pub const RPC_SHUFFLE_CONSUME_RESP: u8 = 31;
+/// Cross-node distributed GROUP BY shuffle CONSUMER trigger (E5b). A coordinator
+/// sends a `RPC_SHUFFLE_AGG_CONSUME_REQ` to a part-owner node; that node waits
+/// for its part's single staged producer side (side 0) to finalize, merges the
+/// staged partial `GroupState`s, finalizes / HAVING-filters / sorts / LIMITs, and
+/// replies with exactly one `RPC_SHUFFLE_AGG_CONSUME_RESP` carrying the result
+/// rows (or a typed error). One-shot request/response — no streaming. The
+/// single-sided aggregate sibling of `RPC_SHUFFLE_CONSUME_*`.
+pub const RPC_SHUFFLE_AGG_CONSUME_REQ: u8 = 32;
+pub const RPC_SHUFFLE_AGG_CONSUME_RESP: u8 = 33;
 
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared

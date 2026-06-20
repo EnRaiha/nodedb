@@ -40,8 +40,7 @@ use tracing::{debug, warn};
 use crate::error::{ClusterError, Result};
 use crate::forward::ChunkSink;
 use crate::rpc_codec::{
-    self, ExecuteStreamChunk, ExecuteStreamEnd, MAX_RPC_PAYLOAD_SIZE, RaftRpc,
-    ShuffleConsumeResponse, ShuffleProduceResponse, auth_envelope,
+    self, ExecuteStreamChunk, ExecuteStreamEnd, MAX_RPC_PAYLOAD_SIZE, RaftRpc, auth_envelope,
 };
 use crate::transport::auth_context::AuthContext;
 use crate::transport::peer_identity_store::PeerIdentityStore;
@@ -50,6 +49,8 @@ use crate::transport::peer_identity_verifier::{
 };
 use crate::transport::rpc_handler::RaftRpcHandler;
 use crate::wire_version::handshake_io::{local_version_range, perform_version_handshake_server};
+
+use super::stream_dispatch;
 
 /// Transport-local [`ChunkSink`] that writes one `RPC_EXECUTE_STREAM_CHUNK`
 /// envelope per chunk to a QUIC send stream.
@@ -390,70 +391,17 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
             }
         }
 
-        // 4d. Cross-node shuffle PRODUCER trigger (E4a): a `ShuffleProduceRequest`
-        //     is a ONE-SHOT request/response (NOT a stream from the coordinator).
-        //     The producer runs a local scan, fans the hash-partitioned rows out
-        //     to the part-owners on its OWN outbound `ShufflePush` streams, then
-        //     replies with exactly one `ShuffleProduceResponse` carrying terminal
-        //     success or a typed error so the coordinator can await completion.
-        //     The reply is written on this same bidi stream's send half (mirroring
-        //     the one-shot `handle_rpc` reply below), then `finish()`ed.
-        if let RaftRpc::ShuffleProduceRequest(req) = request {
-            let error = handler.on_shuffle_produce(req).await;
-            let resp_rpc = RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error });
-            let resp_inner = rpc_codec::encode(&resp_rpc)?;
-            let resp_seq = auth.peer_seq_out.next();
-            let mut resp_envelope =
-                Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
-            auth_envelope::write_envelope(
-                auth.local_node_id,
-                resp_seq,
-                &resp_inner,
-                &auth.mac_key,
-                &mut resp_envelope,
-            )?;
-            send.write_all(&resp_envelope)
-                .await
-                .map_err(|e| ClusterError::Transport {
-                    detail: format!("write shuffle produce response: {e}"),
-                })?;
-            send.finish().map_err(|e| ClusterError::Transport {
-                detail: format!("finish shuffle produce response: {e}"),
-            })?;
-            return Ok::<(), ClusterError>(());
-        }
-
-        // 4e. Cross-node shuffle CONSUMER trigger (E4b): a `ShuffleConsumeRequest`
-        //     is a ONE-SHOT request/response. The part-owner waits for both staged
-        //     sides of its part to finalize, runs the node-local grace join, and
-        //     replies with exactly one `ShuffleConsumeResponse` carrying the join
-        //     rows (or a typed error). The reply is written on this same bidi
-        //     stream's send half (mirroring the produce arm above), then
-        //     `finish()`ed.
-        if let RaftRpc::ShuffleConsumeRequest(req) = request {
-            let resp: ShuffleConsumeResponse = handler.on_shuffle_consume(req).await;
-            let resp_rpc = RaftRpc::ShuffleConsumeResponse(resp);
-            let resp_inner = rpc_codec::encode(&resp_rpc)?;
-            let resp_seq = auth.peer_seq_out.next();
-            let mut resp_envelope =
-                Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
-            auth_envelope::write_envelope(
-                auth.local_node_id,
-                resp_seq,
-                &resp_inner,
-                &auth.mac_key,
-                &mut resp_envelope,
-            )?;
-            send.write_all(&resp_envelope)
-                .await
-                .map_err(|e| ClusterError::Transport {
-                    detail: format!("write shuffle consume response: {e}"),
-                })?;
-            send.finish().map_err(|e| ClusterError::Transport {
-                detail: format!("finish shuffle consume response: {e}"),
-            })?;
-            return Ok::<(), ClusterError>(());
-        }
+        // 4d/4e/4f. One-shot shuffle RPCs (ShuffleProduce / ShuffleConsume /
+        //     ShuffleAggregateConsume). Each is a single request/response — no
+        //     additional frames on `recv`. Handled in a shared helper to keep
+        //     this function under the file-size limit.
+        let request =
+            match stream_dispatch::try_handle_oneshot_rpc(&*handler, request, &mut send, &auth)
+                .await?
+            {
+                None => return Ok::<(), ClusterError>(()),
+                Some(req) => req,
+            };
 
         let response = handler.handle_rpc(request).await?;
 

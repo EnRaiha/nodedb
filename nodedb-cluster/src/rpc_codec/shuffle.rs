@@ -183,6 +183,74 @@ pub struct ShuffleConsumeResponse {
     pub error: Option<TypedClusterError>,
 }
 
+/// One post-aggregation sort key of a [`ShuffleAggregateConsumeRequest`]'s
+/// `sort_keys` list: a column name plus its sort direction. A named struct
+/// (rather than a `(String, bool)` tuple) so rkyv can derive its codec, mirroring
+/// how [`JoinKeyPair`] wraps an `on` tuple.
+///
+/// Cross-version safety: new optional fields should be added as `Option<T>`.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct SortKey {
+    /// Sort column name.
+    pub column: String,
+    /// `true` = ascending, `false` = descending.
+    pub ascending: bool,
+}
+
+/// Cross-node distributed GROUP BY shuffle CONSUMER trigger (E5b).
+///
+/// Single-sided sibling of [`ShuffleConsumeRequest`]: a coordinator sends this to
+/// a part-owner node to make it complete one part of a distributed GROUP BY
+/// shuffle — wait for the part's ONE staged side (side `0`) to finalize, merge
+/// the staged partial `GroupState`s, finalize / HAVING-filter / sort / LIMIT, and
+/// reply with the result rows. The part-owner replies with exactly one
+/// [`ShuffleAggregateConsumeResponse`].
+///
+/// Unlike the join consumer this waits for only the single producer side (`0`);
+/// there is no probe side. The `group_by` / `aggregates_bytes` / `having` /
+/// `limit` / `sort_keys` fields are the owned aggregate spec the consumer
+/// reconstructs into a node-local `ShuffleAggregateConsume` plan. `tenant_id` /
+/// `database_id` / `deadline_remaining_ms` / `trace_id` mirror
+/// [`ExecuteRequest`](super::execute::ExecuteRequest) so the local dispatch
+/// prologue is reused.
+///
+/// Cross-version safety: new optional fields should be added as `Option<T>`.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ShuffleAggregateConsumeRequest {
+    pub shuffle_id: u64,
+    /// The part this node owns and must complete.
+    pub part: u32,
+    /// GROUP BY columns (the key the partial states were grouped on).
+    pub group_by: Vec<String>,
+    /// Opaque zerompk-encoded `Vec<AggregateSpec>` (nodedb-cluster does not
+    /// inspect it; the host-crate hook decodes it — mirrors how `plan_bytes`
+    /// stays opaque to the transport).
+    pub aggregates_bytes: Vec<u8>,
+    /// Msgpack HAVING predicate blob (empty = no HAVING).
+    pub having: Vec<u8>,
+    /// Output row cap after sort. `u64::MAX` = no explicit LIMIT.
+    pub limit: u64,
+    /// Post-aggregation sort keys.
+    pub sort_keys: Vec<SortKey>,
+    pub tenant_id: u64,
+    pub database_id: u64,
+    pub deadline_remaining_ms: u64,
+    pub trace_id: [u8; 16],
+}
+
+/// Terminal reply to a [`ShuffleAggregateConsumeRequest`].
+///
+/// `error: None` carries the finalized GROUP BY result rows in `rows` (a msgpack
+/// array of rows — the same shape every aggregate path emits). `error: Some(e)`
+/// means the consume failed (missing inbox, finalize timeout, producer terminal
+/// error, or merge/finalize error); `rows` is empty in that case.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ShuffleAggregateConsumeResponse {
+    /// Msgpack array of finalized aggregate rows. Empty on error.
+    pub rows: Vec<u8>,
+    pub error: Option<TypedClusterError>,
+}
+
 // ── Codec ────────────────────────────────────────────────────────────────────
 
 macro_rules! to_bytes {
@@ -290,6 +358,34 @@ pub(super) fn decode_shuffle_consume_resp(payload: &[u8]) -> Result<RaftRpc> {
         payload,
         ShuffleConsumeResponse,
         "ShuffleConsumeResponse"
+    )?))
+}
+
+pub(super) fn encode_shuffle_agg_consume_req(
+    msg: &ShuffleAggregateConsumeRequest,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    write_frame(RPC_SHUFFLE_AGG_CONSUME_REQ, &to_bytes!(msg)?, out)
+}
+pub(super) fn encode_shuffle_agg_consume_resp(
+    msg: &ShuffleAggregateConsumeResponse,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    write_frame(RPC_SHUFFLE_AGG_CONSUME_RESP, &to_bytes!(msg)?, out)
+}
+
+pub(super) fn decode_shuffle_agg_consume_req(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::ShuffleAggregateConsumeRequest(from_bytes!(
+        payload,
+        ShuffleAggregateConsumeRequest,
+        "ShuffleAggregateConsumeRequest"
+    )?))
+}
+pub(super) fn decode_shuffle_agg_consume_resp(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::ShuffleAggregateConsumeResponse(from_bytes!(
+        payload,
+        ShuffleAggregateConsumeResponse,
+        "ShuffleAggregateConsumeResponse"
     )?))
 }
 
@@ -613,6 +709,120 @@ mod tests {
         match decoded.error {
             Some(TypedClusterError::DeadlineExceeded { elapsed_ms }) => {
                 assert_eq!(elapsed_ms, 8000);
+            }
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
+        }
+    }
+
+    fn roundtrip_agg_consume_req(
+        req: ShuffleAggregateConsumeRequest,
+    ) -> ShuffleAggregateConsumeRequest {
+        let rpc = RaftRpc::ShuffleAggregateConsumeRequest(req);
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::ShuffleAggregateConsumeRequest(r) => r,
+            other => panic!("expected ShuffleAggregateConsumeRequest, got {other:?}"),
+        }
+    }
+
+    fn roundtrip_agg_consume_resp(
+        resp: ShuffleAggregateConsumeResponse,
+    ) -> ShuffleAggregateConsumeResponse {
+        let rpc = RaftRpc::ShuffleAggregateConsumeResponse(resp);
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::ShuffleAggregateConsumeResponse(r) => r,
+            other => panic!("expected ShuffleAggregateConsumeResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_shuffle_agg_consume_request() {
+        let req = ShuffleAggregateConsumeRequest {
+            shuffle_id: 0x0FED_CBA9_8765_4321,
+            part: 2,
+            group_by: vec!["k".into(), "region".into()],
+            aggregates_bytes: vec![0x91, 0x01, 0x02],
+            having: vec![0xC0],
+            limit: 4321,
+            sort_keys: vec![
+                SortKey {
+                    column: "k".into(),
+                    ascending: true,
+                },
+                SortKey {
+                    column: "total".into(),
+                    ascending: false,
+                },
+            ],
+            tenant_id: 9,
+            database_id: 4,
+            deadline_remaining_ms: 8000,
+            trace_id: [3u8; 16],
+        };
+        let decoded = roundtrip_agg_consume_req(req.clone());
+        assert_eq!(decoded.shuffle_id, req.shuffle_id);
+        assert_eq!(decoded.part, 2);
+        assert_eq!(
+            decoded.group_by,
+            vec!["k".to_string(), "region".to_string()]
+        );
+        assert_eq!(decoded.aggregates_bytes, vec![0x91, 0x01, 0x02]);
+        assert_eq!(decoded.having, vec![0xC0]);
+        assert_eq!(decoded.limit, 4321);
+        assert_eq!(decoded.sort_keys.len(), 2);
+        assert_eq!(decoded.sort_keys[0].column, "k");
+        assert!(decoded.sort_keys[0].ascending);
+        assert_eq!(decoded.sort_keys[1].column, "total");
+        assert!(!decoded.sort_keys[1].ascending);
+        assert_eq!(decoded.tenant_id, 9);
+        assert_eq!(decoded.database_id, 4);
+        assert_eq!(decoded.deadline_remaining_ms, 8000);
+        assert_eq!(decoded.trace_id, [3u8; 16]);
+    }
+
+    #[test]
+    fn roundtrip_shuffle_agg_consume_request_empty() {
+        let req = ShuffleAggregateConsumeRequest {
+            shuffle_id: 1,
+            part: 0,
+            group_by: vec![],
+            aggregates_bytes: vec![],
+            having: vec![],
+            limit: u64::MAX,
+            sort_keys: vec![],
+            tenant_id: 0,
+            database_id: 0,
+            deadline_remaining_ms: 1000,
+            trace_id: [0u8; 16],
+        };
+        let decoded = roundtrip_agg_consume_req(req);
+        assert!(decoded.group_by.is_empty());
+        assert!(decoded.aggregates_bytes.is_empty());
+        assert!(decoded.sort_keys.is_empty());
+        assert_eq!(decoded.limit, u64::MAX);
+    }
+
+    #[test]
+    fn roundtrip_shuffle_agg_consume_response_rows() {
+        let decoded = roundtrip_agg_consume_resp(ShuffleAggregateConsumeResponse {
+            rows: vec![0x92, 0x01, 0x02],
+            error: None,
+        });
+        assert_eq!(decoded.rows, vec![0x92, 0x01, 0x02]);
+        assert!(decoded.error.is_none());
+    }
+
+    #[test]
+    fn roundtrip_shuffle_agg_consume_response_error() {
+        let decoded = roundtrip_agg_consume_resp(ShuffleAggregateConsumeResponse {
+            rows: vec![],
+            error: Some(TypedClusterError::DeadlineExceeded { elapsed_ms: 9000 }),
+        });
+        assert!(decoded.rows.is_empty());
+        match decoded.error {
+            Some(TypedClusterError::DeadlineExceeded { elapsed_ms }) => {
+                assert_eq!(elapsed_ms, 9000);
             }
             other => panic!("expected DeadlineExceeded, got {other:?}"),
         }

@@ -567,6 +567,16 @@ mod tests {
                     error: None,
                 }
             }
+
+            async fn on_shuffle_aggregate(
+                &self,
+                _req: crate::rpc_codec::ShuffleAggregateConsumeRequest,
+            ) -> crate::rpc_codec::ShuffleAggregateConsumeResponse {
+                crate::rpc_codec::ShuffleAggregateConsumeResponse {
+                    rows: Vec::new(),
+                    error: None,
+                }
+            }
         }
 
         let handler = Arc::new(JoinHandler {

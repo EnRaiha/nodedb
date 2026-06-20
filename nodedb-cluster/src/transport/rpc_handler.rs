@@ -6,8 +6,9 @@
 use crate::error::Result;
 use crate::forward::ChunkSink;
 use crate::rpc_codec::{
-    ExecuteRequest, RaftRpc, ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest,
-    ShufflePushRequest, TypedClusterError,
+    ExecuteRequest, RaftRpc, ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse,
+    ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest,
+    TypedClusterError,
 };
 
 /// Trait for handling incoming Raft RPCs.
@@ -81,4 +82,17 @@ pub trait RaftRpcHandler: Send + Sync + 'static {
         &self,
         req: ShuffleConsumeRequest,
     ) -> impl std::future::Future<Output = ShuffleConsumeResponse> + Send;
+
+    /// Cross-node distributed GROUP BY shuffle CONSUMER trigger (E5b). The
+    /// single-sided aggregate sibling of [`on_shuffle_consume`](Self::on_shuffle_consume).
+    /// Complete the part carried by `req`: wait for the part's single staged
+    /// producer side (side 0) of `(shuffle_id, part)` to finalize, merge +
+    /// finalize the partial `GroupState`s, and return the aggregate rows. The
+    /// transport writes exactly one `ShuffleAggregateConsumeResponse` carrying the
+    /// rows (or a typed error) back to the coordinator. Never hangs — the finalize
+    /// wait is bounded by `req.deadline_remaining_ms`.
+    fn on_shuffle_aggregate(
+        &self,
+        req: ShuffleAggregateConsumeRequest,
+    ) -> impl std::future::Future<Output = ShuffleAggregateConsumeResponse> + Send;
 }

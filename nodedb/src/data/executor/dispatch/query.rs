@@ -245,11 +245,18 @@ impl CoreLoop {
 
             QueryOp::PartialAggregateState {
                 collection,
+                input,
                 group_by,
                 aggregates,
                 filters,
             } => self.execute_partial_aggregate_state(
-                task, tid, collection, group_by, aggregates, filters,
+                task,
+                tid,
+                collection,
+                input.as_deref(),
+                group_by,
+                aggregates,
+                filters,
             ),
 
             QueryOp::ShuffleAggregateConsume {

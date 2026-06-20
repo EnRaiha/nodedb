@@ -165,6 +165,12 @@ pub fn start_raft(
     let shuffle_consumer: Arc<dyn nodedb_cluster::ShuffleConsumer> =
         Arc::new(crate::control::server::shuffle::RegistryShuffleConsumer::new(shared.clone()));
 
+    // Cross-node distributed GROUP BY shuffle CONSUMER (E5b): SINGLE-SIDED
+    // aggregate sibling of the consumer — merges + finalizes the part's single
+    // staged producer side when a `ShuffleAggregateConsume` trigger arrives.
+    let shuffle_aggregator: Arc<dyn nodedb_cluster::ShuffleAggregator> =
+        Arc::new(crate::control::server::shuffle::RegistryShuffleAggregator::new(shared.clone()));
+
     let raft_loop = Arc::new(
         nodedb_cluster::RaftLoop::new(
             multi_raft,
@@ -181,6 +187,7 @@ pub fn start_raft(
         .with_shuffle_receiver(shuffle_receiver)
         .with_shuffle_producer(shuffle_producer)
         .with_shuffle_consumer(shuffle_consumer)
+        .with_shuffle_aggregator(shuffle_aggregator)
         .with_data_dir(_data_dir.to_path_buf())
         .with_snapshot_chunk_bytes(snapshot_chunk_bytes)
         .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs),

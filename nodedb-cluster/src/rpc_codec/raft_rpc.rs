@@ -16,8 +16,9 @@ use super::execute::{ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, Execut
 use super::header::HEADER_SIZE;
 use super::metadata::{MetadataProposeRequest, MetadataProposeResponse};
 use super::shuffle::{
-    ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse,
-    ShufflePushChunk, ShufflePushEnd, ShufflePushRequest,
+    ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk,
+    ShufflePushEnd, ShufflePushRequest,
 };
 use super::{cluster_mgmt, data_propose, execute, metadata, raft_msgs, shuffle, vshard};
 use crate::error::{ClusterError, Result};
@@ -75,6 +76,14 @@ pub enum RaftRpc {
     // replies with one `ShuffleConsumeResponse` carrying the join rows.
     ShuffleConsumeRequest(ShuffleConsumeRequest),
     ShuffleConsumeResponse(ShuffleConsumeResponse),
+    // Cross-node distributed GROUP BY shuffle CONSUMER trigger (E5b). The
+    // single-sided aggregate sibling of `ShuffleConsume*`: the coordinator sends
+    // a `ShuffleAggregateConsumeRequest` to a part-owner; that node waits for its
+    // part's single staged producer side to finalize, merges + finalizes the
+    // partial GroupStates, and replies with one `ShuffleAggregateConsumeResponse`
+    // carrying the aggregate rows.
+    ShuffleAggregateConsumeRequest(ShuffleAggregateConsumeRequest),
+    ShuffleAggregateConsumeResponse(ShuffleAggregateConsumeResponse),
     // Data-group proposal forwarding (groups 1+)
     DataProposeRequest(DataProposeRequest),
     DataProposeResponse(DataProposeResponse),
@@ -111,6 +120,12 @@ pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
         RaftRpc::ShuffleProduceResponse(m) => shuffle::encode_shuffle_produce_resp(m, &mut out),
         RaftRpc::ShuffleConsumeRequest(m) => shuffle::encode_shuffle_consume_req(m, &mut out),
         RaftRpc::ShuffleConsumeResponse(m) => shuffle::encode_shuffle_consume_resp(m, &mut out),
+        RaftRpc::ShuffleAggregateConsumeRequest(m) => {
+            shuffle::encode_shuffle_agg_consume_req(m, &mut out)
+        }
+        RaftRpc::ShuffleAggregateConsumeResponse(m) => {
+            shuffle::encode_shuffle_agg_consume_resp(m, &mut out)
+        }
         RaftRpc::DataProposeRequest(m) => data_propose::encode_data_propose_req(m, &mut out),
         RaftRpc::DataProposeResponse(m) => data_propose::encode_data_propose_resp(m, &mut out),
     }?;
@@ -183,6 +198,8 @@ pub fn decode(data: &[u8]) -> Result<RaftRpc> {
         RPC_SHUFFLE_PRODUCE_RESP => shuffle::decode_shuffle_produce_resp(payload),
         RPC_SHUFFLE_CONSUME_REQ => shuffle::decode_shuffle_consume_req(payload),
         RPC_SHUFFLE_CONSUME_RESP => shuffle::decode_shuffle_consume_resp(payload),
+        RPC_SHUFFLE_AGG_CONSUME_REQ => shuffle::decode_shuffle_agg_consume_req(payload),
+        RPC_SHUFFLE_AGG_CONSUME_RESP => shuffle::decode_shuffle_agg_consume_resp(payload),
         RPC_DATA_PROPOSE_REQ => data_propose::decode_data_propose_req(payload),
         RPC_DATA_PROPOSE_RESP => data_propose::decode_data_propose_resp(payload),
         _ => Err(ClusterError::Codec {

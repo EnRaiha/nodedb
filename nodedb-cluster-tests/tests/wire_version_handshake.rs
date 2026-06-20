@@ -90,6 +90,16 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_shuffle_aggregate(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ShuffleAggregateConsumeRequest,
+    ) -> nodedb_cluster::rpc_codec::ShuffleAggregateConsumeResponse {
+        nodedb_cluster::rpc_codec::ShuffleAggregateConsumeResponse {
+            rows: Vec::new(),
+            error: None,
+        }
+    }
 }
 
 /// Handler that records whether it was ever invoked.
@@ -165,6 +175,20 @@ impl RaftRpcHandler for SentinelHandler {
             error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
                 code: 0,
                 message: "sentinel: unexpected consume dispatch".into(),
+            }),
+        }
+    }
+
+    async fn on_shuffle_aggregate(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ShuffleAggregateConsumeRequest,
+    ) -> nodedb_cluster::rpc_codec::ShuffleAggregateConsumeResponse {
+        self.invoked.store(true, Ordering::SeqCst);
+        nodedb_cluster::rpc_codec::ShuffleAggregateConsumeResponse {
+            rows: Vec::new(),
+            error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
+                code: 0,
+                message: "sentinel: unexpected aggregate dispatch".into(),
             }),
         }
     }

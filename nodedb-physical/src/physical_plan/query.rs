@@ -149,10 +149,17 @@ pub enum QueryOp {
     /// partial states (from every producer shard/node) and finalizes them.
     ///
     /// This op carries NO node-local paths — it reads only the named collection
-    /// — so it is wire-shippable: a coordinator embeds it in a producer plan and
-    /// dispatches it to a remote node's Data Plane.
+    /// (or its `input` sub-plan) — so it is wire-shippable: a coordinator embeds
+    /// it in a producer plan and dispatches it to a remote node's Data Plane.
     PartialAggregateState {
         collection: String,
+        /// Optional sub-plan whose decoded rows are aggregated instead of
+        /// scanning `collection` per-shard. Mirrors [`QueryOp::Aggregate`]'s
+        /// `input`: `Some` runs the producer over the sub-plan's rows (e.g. a
+        /// coordinator-materialized `ProviderScan`), `None` scans the named
+        /// `collection`. `collection` stays populated either way.
+        #[serde(default)]
+        input: Option<Box<crate::physical_plan::PhysicalPlan>>,
         group_by: Vec<String>,
         aggregates: Vec<AggregateSpec>,
         filters: Vec<u8>,

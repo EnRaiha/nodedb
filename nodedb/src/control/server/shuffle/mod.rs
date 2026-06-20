@@ -4,6 +4,7 @@
 //! cluster-hook adapters (receiver E3b + producer E4a), the one-shot producer
 //! send helper, and the produce-side hash-partition fan-out sink.
 
+pub mod aggregator_hook;
 pub mod consumer_hook;
 pub mod fanout;
 pub mod frame_explode;
@@ -12,6 +13,7 @@ pub mod producer;
 pub mod producer_hook;
 pub mod receiver;
 
+pub use aggregator_hook::RegistryShuffleAggregator;
 pub use consumer_hook::RegistryShuffleConsumer;
 pub use fanout::ShuffleFanoutSink;
 pub use inbox::{ShuffleInbox, ShuffleKey, ShuffleReceiverRegistry};

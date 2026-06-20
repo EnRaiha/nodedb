@@ -148,3 +148,39 @@ pub trait ShuffleConsumer: Send + Sync + 'static {
         req: crate::rpc_codec::ShuffleConsumeRequest,
     ) -> crate::rpc_codec::ShuffleConsumeResponse;
 }
+
+/// Hook for the cross-node distributed GROUP BY shuffle CONSUMER (E5b).
+///
+/// SINGLE-SIDED aggregate sibling of [`ShuffleConsumer`]: `nodedb-cluster` cannot
+/// depend on `nodedb` (circular), so the aggregate-consume logic — wait for the
+/// part's ONE staged producer side (side 0) to finalize, resolve its local
+/// staged-file path, merge + finalize the partial `GroupState`s through the Data
+/// Plane, and return the result rows — lives in `nodedb` behind this `Send +
+/// Sync` hook. The transport read-loop calls
+/// [`on_shuffle_aggregate`](Self::on_shuffle_aggregate) when a
+/// `ShuffleAggregateConsumeRequest` arrives and writes the returned
+/// [`ShuffleAggregateConsumeResponse`](crate::rpc_codec::ShuffleAggregateConsumeResponse)
+/// back to the coordinator.
+///
+/// Cluster-only tests leave the `RaftLoop` field `None`; a
+/// `ShuffleAggregateConsume` request against a node with no aggregator installed
+/// returns a typed "not configured" error.
+///
+/// The hook is **async** because the consume path awaits the single-side finalize
+/// signal (bounded by the request deadline) on the Tokio transport reactor before
+/// dispatching the merge. The merge + finalize itself runs on the Data Plane via
+/// the host crate's local executor / SPSC bridge; this hook never touches storage
+/// or io_uring directly. Unlike [`ShuffleConsumer`] it waits for only the single
+/// producer side (`0`) — there is no probe side.
+#[async_trait::async_trait]
+pub trait ShuffleAggregator: Send + Sync + 'static {
+    /// Complete one part of a distributed GROUP BY shuffle: wait for the part's
+    /// single staged producer side to finalize, merge + finalize the partial
+    /// `GroupState`s, and return the aggregate rows (or a typed error on missing
+    /// inbox / finalize timeout / producer terminal error / merge failure). Never
+    /// hangs — the finalize wait is deadline-bounded.
+    async fn on_shuffle_aggregate(
+        &self,
+        req: crate::rpc_codec::ShuffleAggregateConsumeRequest,
+    ) -> crate::rpc_codec::ShuffleAggregateConsumeResponse;
+}
