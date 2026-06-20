@@ -10,11 +10,12 @@
 //! - `Broadcast` gathers the child plan to the coordinator so that its result
 //!   can be embedded as an inline input into a sibling operator (e.g. the
 //!   build side of a `HashJoin`).
-//! - `Shuffle` is a reserved seam for a future distributed hash-repartition
-//!   stage. The coordinator resolver returns an error if it encounters this
-//!   variant — real distributed shuffle (partition function, spill, memory
-//!   budget, cross-node transport) is a dedicated follow-on effort and is not
-//!   implemented here.
+//! - `Shuffle` wraps a complete `HashJoin` at the plan root and drives a
+//!   cross-node hash-repartition grace join: the coordinator resolver fans
+//!   per-side scan producers to each collection's owner, repartitions rows on
+//!   the join keys to part-owners, runs the node-local grace join on each part,
+//!   and merges the results. It is coordinator-resolved and NEVER reaches a
+//!   core.
 
 /// Data-movement node; coordinator-resolved, never reaches a core.
 #[derive(
@@ -53,12 +54,14 @@ pub enum ExchangeMode {
     /// as an inline input into a sibling operator (e.g. the build side of a
     /// `HashJoin`).
     Broadcast,
-    /// Reserved seam for a future distributed hash-repartition stage.
+    /// Cross-node distributed hash-repartition grace join, wrapping a complete
+    /// `HashJoin` at the plan root.
     ///
-    /// `keys` are `(collection_field, partition_key_alias)` pairs that define
-    /// the hash partitioning. `num_parts` is the target partition count.
-    /// The coordinator resolver returns an error if this variant is
-    /// encountered — real distributed shuffle is not yet implemented.
+    /// `keys` are the `(left_field, right_field)` equi-join pairs: the left
+    /// column partitions the probe side and the right column the build side so
+    /// matching rows co-locate on the same part. `num_parts` is the target
+    /// partition count (`0` = let the coordinator default to the cluster
+    /// data-node count). Resolved on the coordinator by `super::shuffle`.
     Shuffle {
         keys: Vec<(String, String)>,
         num_parts: usize,

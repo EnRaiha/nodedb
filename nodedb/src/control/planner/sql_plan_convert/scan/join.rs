@@ -149,31 +149,74 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
 
     let vshard = VShardId::from_collection_in_database(p.ctx.database_id, &left_collection);
 
+    // Force-shuffle eligibility (permanent operator override; the automatic
+    // cost-model default is a separate follow-up). A whole-join shuffle is only
+    // valid when BOTH sides are plain sharded user collections scanned by name
+    // — i.e. both `*_input` slots are `None` (no embedded catalog `ProviderScan`
+    // and no nested-join sub-plan) — and the join is a real equi-join
+    // (`on_keys` non-empty). Anything else (nested joins, catalog sides,
+    // cross/keyless joins) keeps the default broadcast/local plan unchanged.
+    //
+    // The override is honored only in cluster mode: single-node has no peers to
+    // repartition across, so the local broadcast plan is both correct and
+    // cheaper. The two inputs are left as BARE name scans (`left_input` /
+    // `right_input` stay `None`); the coordinator resolver builds the per-side
+    // scan fragments from the collection names and drives the producers.
+    let shuffle_eligible = p.ctx.force_shuffle_join
+        && p.ctx.cluster_enabled
+        && !on_keys.is_empty()
+        && left_input.is_none()
+        && right_input.is_none();
+
+    // Shuffle hash keys mirror the resolver's per-side split: the LEFT column of
+    // each `on` pair partitions the probe side, the RIGHT column the build side
+    // (carried as `(left, right)` so the resolver does not re-derive them).
+    let shuffle_keys = on_keys.clone();
+
+    let hash_join = PhysicalPlan::Query(QueryOp::HashJoin {
+        left_collection,
+        right_collection,
+        left_alias,
+        right_alias,
+        on: on_keys,
+        join_type: effective_join_type,
+        // `QueryOp::HashJoin.limit` stays `usize`: `usize::MAX` is the
+        // sentinel for "no SQL LIMIT". The handler distinguishes this from
+        // an explicit limit and bounds a no-LIMIT join by the memory byte
+        // budget (surfacing `ResourcesExhausted`) rather than truncating.
+        limit: limit.unwrap_or(usize::MAX),
+        post_group_by: Vec::new(),
+        post_aggregates: Vec::new(),
+        projection: join_projection,
+        post_filters: filter_bytes,
+        left_input,
+        right_input,
+        left_bitmap,
+        right_bitmap,
+    });
+
+    let plan = if shuffle_eligible {
+        // `num_parts == 0` is the "unset" sentinel: the operator left
+        // `nodedb.shuffle_num_parts` unset, so the coordinator resolver defaults
+        // it to the cluster data-node count (the convert layer has no view of
+        // the routing table). A non-zero value is the operator's explicit
+        // partition count and is used verbatim.
+        PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+            child: Box::new(hash_join),
+            mode: ExchangeMode::Shuffle {
+                keys: shuffle_keys,
+                num_parts: p.ctx.shuffle_num_parts,
+            },
+        }))
+    } else {
+        hash_join
+    };
+
     Ok(vec![PhysicalTask {
         tenant_id,
         vshard_id: vshard,
         database_id: p.ctx.database_id,
-        plan: PhysicalPlan::Query(QueryOp::HashJoin {
-            left_collection,
-            right_collection,
-            left_alias,
-            right_alias,
-            on: on_keys,
-            join_type: effective_join_type,
-            // `QueryOp::HashJoin.limit` stays `usize`: `usize::MAX` is the
-            // sentinel for "no SQL LIMIT". The handler distinguishes this from
-            // an explicit limit and bounds a no-LIMIT join by the memory byte
-            // budget (surfacing `ResourcesExhausted`) rather than truncating.
-            limit: limit.unwrap_or(usize::MAX),
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
-            projection: join_projection,
-            post_filters: filter_bytes,
-            left_input,
-            right_input,
-            left_bitmap,
-            right_bitmap,
-        }),
+        plan,
         post_set_op: PostSetOp::None,
     }])
 }

@@ -53,6 +53,17 @@ pub struct QueryContext {
     /// `VectorPrimaryInsert` conversion can reject oversized vectors without
     /// an extra `TenantIsolation` lock inside the planner hot path.
     max_vector_dim: std::sync::atomic::AtomicU32,
+    /// Per-request force-shuffle-join override (session var
+    /// `nodedb.force_shuffle_join`). Updated by connection handlers via
+    /// `set_force_shuffle_join` before each plan call; forwarded into
+    /// `ConvertContext`. An atomic mirrors `max_vector_dim`: `&self` plan calls
+    /// read it without an exclusive borrow, and handlers do not pipeline
+    /// concurrent plans on one connection.
+    force_shuffle_join: std::sync::atomic::AtomicBool,
+    /// Per-request forced-shuffle partition count (session var
+    /// `nodedb.shuffle_num_parts`). `0` means "unset — let the emit default to
+    /// the cluster data-node count". Updated alongside `force_shuffle_join`.
+    shuffle_num_parts: std::sync::atomic::AtomicU32,
 }
 
 impl QueryContext {
@@ -67,6 +78,8 @@ impl QueryContext {
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),
+            force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
+            shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -118,6 +131,8 @@ impl QueryContext {
             // reused across tenants on the same connection without carrying
             // stale quota values.
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),
+            force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
+            shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -131,6 +146,20 @@ impl QueryContext {
     pub fn set_max_vector_dim(&self, dim: u32) {
         self.max_vector_dim
             .store(dim, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the force-shuffle-join override for the next plan call.
+    ///
+    /// Called by connection handlers after reading the session var
+    /// `nodedb.force_shuffle_join` (and `nodedb.shuffle_num_parts`). `num_parts
+    /// == 0` means "unset — the emit defaults to the cluster data-node count".
+    /// Relaxed ordering suffices: written before planning begins, read only
+    /// within that same call (same contract as `set_max_vector_dim`).
+    pub fn set_force_shuffle_join(&self, force: bool, num_parts: u32) {
+        self.force_shuffle_join
+            .store(force, std::sync::atomic::Ordering::Relaxed);
+        self.shuffle_num_parts
+            .store(num_parts, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Override the default rounding mode for `ROUND()`.
@@ -162,6 +191,8 @@ impl QueryContext {
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),
+            force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
+            shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -257,6 +288,12 @@ impl QueryContext {
             max_vector_dim: self
                 .max_vector_dim
                 .load(std::sync::atomic::Ordering::Relaxed),
+            force_shuffle_join: self
+                .force_shuffle_join
+                .load(std::sync::atomic::Ordering::Relaxed),
+            shuffle_num_parts: self
+                .shuffle_num_parts
+                .load(std::sync::atomic::Ordering::Relaxed) as usize,
             database_id,
             tenant_id,
         };
@@ -381,6 +418,12 @@ impl QueryContext {
             max_vector_dim: self
                 .max_vector_dim
                 .load(std::sync::atomic::Ordering::Relaxed),
+            force_shuffle_join: self
+                .force_shuffle_join
+                .load(std::sync::atomic::Ordering::Relaxed),
+            shuffle_num_parts: self
+                .shuffle_num_parts
+                .load(std::sync::atomic::Ordering::Relaxed) as usize,
             database_id,
             tenant_id,
         };

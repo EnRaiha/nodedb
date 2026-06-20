@@ -268,6 +268,13 @@ pub struct SharedState {
     pub raft_propose_leader_change_retries: AtomicU64,
     /// Per-node monotonic request ID allocator. Starts at 1 (0 is sentinel).
     pub request_id_counter: AtomicU64,
+    /// Per-node monotonic distributed-shuffle ID allocator. Starts at 1 (0 is
+    /// a sentinel). Each coordinator-driven shuffle join (`ExchangeMode::Shuffle`)
+    /// allocates one `shuffle_id` here; it scopes the producer fan-out inboxes
+    /// and the consumer barriers on every part-owner node. Kept distinct from
+    /// `request_id_counter` so the shuffle keyspace never collides with the
+    /// SPSC request keyspace.
+    pub shuffle_id_counter: AtomicU64,
     /// System-wide metrics (Prometheus format).
     pub system_metrics: Option<Arc<crate::control::metrics::SystemMetrics>>,
     /// Per-database quota usage counters for Prometheus scraping.

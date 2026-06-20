@@ -247,6 +247,8 @@ mod tests {
             cluster_enabled,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,
+            force_shuffle_join: false,
+            shuffle_num_parts: 0,
             database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: crate::types::TenantId::new(0),
         };

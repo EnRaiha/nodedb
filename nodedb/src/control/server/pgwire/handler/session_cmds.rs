@@ -2,15 +2,24 @@
 
 //! Session parameter commands: SET, SHOW, SHOW ALL, EXPLAIN.
 
-use std::sync::Arc;
-
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
+use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 
-use super::super::types::{error_to_sqlstate, sqlstate_error, text_field};
+use super::super::types::sqlstate_error;
 use super::core::NodeDbPgHandler;
+
+/// Parse a PostgreSQL-style boolean session value. Returns `None` for any
+/// value that is not a recognized boolean spelling, so the SET handler can
+/// reject it with `22023` rather than silently storing garbage.
+pub(crate) fn parse_bool_session_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "t" | "yes" | "y" | "1" => Some(true),
+        "off" | "false" | "f" | "no" | "n" | "0" => Some(false),
+        _ => None,
+    }
+}
 
 /// Outcome of classifying a `SET TRANSACTION` / `SET SESSION CHARACTERISTICS` command.
 enum TransactionCmd {
@@ -228,6 +237,32 @@ impl NodeDbPgHandler {
             ))));
         }
 
+        // Validate the distributed shuffle-join override knobs eagerly so a bad
+        // value is rejected at SET time, not silently stored. `force_shuffle_join`
+        // is a boolean (`on`/`off`/`true`/`false`/`1`/`0`); `shuffle_num_parts`
+        // is a non-negative integer (`0` = let the planner default to the
+        // cluster data-node count).
+        if key == "nodedb.force_shuffle_join" && parse_bool_session_value(&value).is_none() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "22023".to_owned(),
+                format!(
+                    "invalid value for nodedb.force_shuffle_join: '{value}'. \
+                     Valid: on, off, true, false, 1, 0"
+                ),
+            ))));
+        }
+        if key == "nodedb.shuffle_num_parts" && value.parse::<u32>().is_err() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "22023".to_owned(),
+                format!(
+                    "invalid value for nodedb.shuffle_num_parts: '{value}'. \
+                     Must be a non-negative integer (0 = cluster default)"
+                ),
+            ))));
+        }
+
         // Eager validation for `nodedb.auth_session`: drive the resolve path
         // now so rate-limit / audit / fingerprint checks fire on each SET
         // rather than being deferred to the next query. A probing client
@@ -408,241 +443,6 @@ impl NodeDbPgHandler {
         }
         self.sessions.set_effective_tenant_id(addr, None);
         Ok(vec![Response::Execution(Tag::new("RESET"))])
-    }
-
-    /// Handle SHOW commands: return session parameter values.
-    pub(super) fn handle_show(
-        &self,
-        identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
-        sql: &str,
-    ) -> PgWireResult<Vec<Response>> {
-        use super::super::session::{is_known_pg_runtime_parameter, parse_show_command};
-
-        let param = match parse_show_command(sql) {
-            Some(p) => p,
-            None => {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "42601".to_owned(),
-                    "syntax error: SHOW <parameter> or SHOW ALL".to_owned(),
-                ))));
-            }
-        };
-
-        if param == "all" {
-            return self.handle_show_all(addr);
-        }
-
-        // `SHOW TENANT` (singular) reports the session's *effective* tenant —
-        // the override installed via `SET TENANT = ...` if any, otherwise the
-        // identity-bound tenant. Returns a single row with `tenant_id` and
-        // `tenant_name` so a session that switched can confirm where its
-        // writes will land. `SHOW TENANTS` (plural) is a separate DDL.
-        if param == "tenant" {
-            let effective = self
-                .sessions
-                .get_effective_tenant_id(addr)
-                .unwrap_or(identity.tenant_id);
-            let name = self
-                .state
-                .credentials
-                .catalog()
-                .as_ref()
-                .and_then(|c| c.load_all_tenants().ok())
-                .and_then(|tenants| {
-                    tenants
-                        .into_iter()
-                        .find(|t| t.tenant_id == effective.as_u64())
-                        .map(|t| t.name)
-                })
-                .unwrap_or_default();
-            let schema = Arc::new(vec![text_field("tenant_id"), text_field("tenant_name")]);
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            encoder.encode_field(&effective.as_u64().to_string())?;
-            encoder.encode_field(&name)?;
-            let row = encoder.take_row();
-            return Ok(vec![Response::Query(QueryResponse::new(
-                schema,
-                futures::stream::iter(vec![Ok(row)]),
-            ))]);
-        }
-
-        // Resolve the value from the runtime-parameter sources in order:
-        // built-in PG runtime constants first, then a value explicitly set
-        // by `SET` in this session. If neither matches and the parameter
-        // is not on the known-parameter allowlist, return `42704`
-        // (`undefined_object`) — the same SQLSTATE PostgreSQL uses when
-        // a client requests an unrecognised runtime parameter. This
-        // prevents administrative commands like `SHOW DATABASES`,
-        // `SHOW ROLES`, `SHOW STATS`, `SHOW METRICS`, `SHOW MEMORY`
-        // from being silently swallowed as if they were unset session
-        // parameters; those commands are routed through the DDL / AST
-        // router before this handler is reached.
-        let builtin = match param.as_str() {
-            "server_version" => Some(format!("NodeDB {}", crate::version::VERSION)),
-            "server_encoding" => Some("UTF8".into()),
-            _ => None,
-        };
-        let session_value = self.sessions.get_parameter(addr, &param);
-
-        let value = match (builtin, session_value) {
-            (Some(v), _) => v,
-            (None, Some(v)) => v,
-            (None, None) => {
-                if !is_known_pg_runtime_parameter(&param) {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "42704".to_owned(),
-                        format!("unrecognized configuration parameter \"{param}\""),
-                    ))));
-                }
-                String::new()
-            }
-        };
-
-        let schema = Arc::new(vec![text_field(&param)]);
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        encoder.encode_field(&value)?;
-        let row = encoder.take_row();
-        Ok(vec![Response::Query(QueryResponse::new(
-            schema,
-            futures::stream::iter(vec![Ok(row)]),
-        ))])
-    }
-
-    /// SHOW ALL — return all session parameters.
-    pub(super) fn handle_show_all(
-        &self,
-        addr: &std::net::SocketAddr,
-    ) -> PgWireResult<Vec<Response>> {
-        let schema = Arc::new(vec![text_field("name"), text_field("setting")]);
-
-        let params = self.sessions.all_parameters(addr);
-        let mut rows = Vec::with_capacity(params.len());
-        let mut encoder = DataRowEncoder::new(schema.clone());
-
-        for (key, value) in &params {
-            encoder.encode_field(key)?;
-            encoder.encode_field(value)?;
-            rows.push(Ok(encoder.take_row()));
-        }
-
-        Ok(vec![Response::Query(QueryResponse::new(
-            schema,
-            futures::stream::iter(rows),
-        ))])
-    }
-
-    /// Handle EXPLAIN: plan the inner SQL and return the plan description.
-    pub(super) async fn handle_explain(
-        &self,
-        identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
-        sql: &str,
-    ) -> PgWireResult<Vec<Response>> {
-        let upper = sql.to_uppercase();
-        let is_analyze = upper.starts_with("EXPLAIN ANALYZE ");
-
-        let inner_sql = if is_analyze {
-            sql[16..].trim()
-        } else if upper.starts_with("EXPLAIN ") {
-            sql[8..].trim()
-        } else {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "42601".to_owned(),
-                "syntax error in EXPLAIN".to_owned(),
-            ))));
-        };
-
-        let database_id = self
-            .sessions
-            .get_current_database(addr)
-            .unwrap_or(crate::types::DatabaseId::DEFAULT);
-        if super::super::ddl::dispatch(&self.state, identity, inner_sql, database_id)
-            .await
-            .is_some()
-        {
-            let schema = Arc::new(vec![text_field("QUERY PLAN")]);
-            let plan_text = format!(
-                "DDL: {}",
-                inner_sql
-                    .split_whitespace()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            encoder.encode_field(&plan_text)?;
-            let row = encoder.take_row();
-            return Ok(vec![Response::Query(QueryResponse::new(
-                schema,
-                futures::stream::iter(vec![Ok(row)]),
-            ))]);
-        }
-
-        let tenant_id = identity.tenant_id;
-        let auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
-        let perm_cache = self.state.permission_cache.read().await;
-        let sec = crate::control::planner::context::PlanSecurityContext {
-            identity,
-            auth: &auth_ctx,
-            rls_store: &self.state.rls,
-            permissions: &self.state.permissions,
-            roles: &self.state.roles,
-            permission_cache: Some(&*perm_cache),
-        };
-        let tasks = self
-            .query_ctx
-            .plan_sql_with_rls(inner_sql, tenant_id, database_id, &sec)
-            .await
-            .map_err(|e| {
-                let (severity, code, message) = error_to_sqlstate(&e);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?;
-
-        let schema = Arc::new(vec![text_field("QUERY PLAN")]);
-        let mut rows = Vec::new();
-        let mut encoder = DataRowEncoder::new(schema.clone());
-
-        // Prepend Calvin preamble row when tasks span multiple vShards.
-        {
-            use crate::control::planner::calvin::calvin_explain_preamble;
-            let mode = self.sessions.cross_shard_txn_mode(addr);
-            if let Some(preamble) = calvin_explain_preamble(&tasks, mode, None) {
-                encoder.encode_field(&preamble)?;
-                rows.push(Ok(encoder.take_row()));
-            }
-        }
-
-        if tasks.is_empty() {
-            encoder.encode_field(&"Empty plan (no tasks)")?;
-            rows.push(Ok(encoder.take_row()));
-        } else {
-            for (i, task) in tasks.iter().enumerate() {
-                let plan_desc = format!(
-                    "Task {}: {:?} tenant={} vshard={}",
-                    i + 1,
-                    task.plan,
-                    task.tenant_id.as_u64(),
-                    task.vshard_id.as_u32(),
-                );
-                for line in plan_desc.lines() {
-                    encoder.encode_field(&line)?;
-                    rows.push(Ok(encoder.take_row()));
-                }
-            }
-        }
-
-        Ok(vec![Response::Query(QueryResponse::new(
-            schema,
-            futures::stream::iter(rows),
-        ))])
     }
 }
 

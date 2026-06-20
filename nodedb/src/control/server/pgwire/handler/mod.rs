@@ -16,6 +16,8 @@ mod retry;
 mod returning;
 mod routing;
 mod session_cmds;
+mod session_explain;
+mod session_show;
 mod sql_exec;
 mod sql_prepared;
 mod sql_split;

@@ -42,7 +42,7 @@ use nodedb_cluster::{NexarTransport, ShufflePushRequest, ShufflePushStream, Type
 
 use super::frame_explode::explode_row_array;
 use super::inbox::ShuffleReceiverRegistry;
-use crate::data::executor::response_codec::encode_binary_rows;
+use crate::data::executor::response_codec::{encode_binary_rows, flatten_to_relational_rows};
 
 /// Per-part row-buffer flush threshold (rows). Bounds peak RAM to
 /// `num_parts × FLUSH_ROWS` rows across the whole fan-out.
@@ -147,7 +147,16 @@ impl ShuffleFanoutSink {
     /// reaches the row threshold. Bounded memory: the chunk is exploded once and
     /// only the residual per-part buffers are held.
     async fn route_chunk(&mut self, payload: Vec<u8>) -> crate::Result<()> {
-        let rows = explode_row_array(&payload)?;
+        // Normalize storage `{id, data:<value>}` scan wrappers → flat relational
+        // rows BEFORE hashing/staging — the same canonical boundary the broadcast
+        // path applies (`flatten_to_relational_rows` is the ONE place storage rows
+        // become relational). Without it `partition_hash` and the consumer's grace
+        // join would look for the join-key fields at the wrapper's top level (which
+        // holds only `id`/`data`), find nothing, mishash to a single part, and
+        // produce an empty join. Already-flat rows (computed producers) pass
+        // through unchanged.
+        let flat = flatten_to_relational_rows(&payload);
+        let rows = explode_row_array(&flat)?;
         for row in rows {
             let part =
                 (nodedb_query::partition_hash(row, &self.keys) % self.num_parts as u64) as u32;

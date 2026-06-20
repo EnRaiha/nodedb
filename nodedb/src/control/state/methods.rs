@@ -54,6 +54,19 @@ impl SharedState {
         )
     }
 
+    /// Allocate the next unique distributed-shuffle ID for this node.
+    ///
+    /// Every coordinator-driven shuffle join allocates one id here. The id
+    /// scopes the per-part producer inboxes and consumer barriers on each
+    /// part-owner node, so two concurrent shuffles never alias each other's
+    /// staged frames. Distinct from `next_request_id` so the shuffle and SPSC
+    /// request keyspaces are independent.
+    #[inline]
+    pub fn next_shuffle_id(&self) -> u64 {
+        self.shuffle_id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Convert an LSN back to wall-clock milliseconds using the anchor map.
     ///
     /// Used by the clone resolver to compute `effective_source_ms` for the

@@ -100,6 +100,24 @@ impl NodeDbPgHandler {
                 .set_max_vector_dim(tenants.quota(tenant_id).max_vector_dim);
         }
 
+        // Propagate the distributed shuffle-join override from the session
+        // parameter bag (set via `SET nodedb.force_shuffle_join = on` and,
+        // optionally, `SET nodedb.shuffle_num_parts = N`). The values were
+        // validated at SET time, so a parse miss here defaults to "off" / 0.
+        let force_shuffle_join = self
+            .sessions
+            .get_parameter(addr, "nodedb.force_shuffle_join")
+            .as_deref()
+            .and_then(super::super::session_cmds::parse_bool_session_value)
+            .unwrap_or(false);
+        let shuffle_num_parts = self
+            .sessions
+            .get_parameter(addr, "nodedb.shuffle_num_parts")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        self.query_ctx
+            .set_force_shuffle_join(force_shuffle_join, shuffle_num_parts);
+
         // Enforce general CHECK constraints for INSERT/UPDATE before planning.
         self.enforce_check_constraints_if_needed(&clean_sql, tenant_id)
             .await?;
@@ -113,8 +131,15 @@ impl NodeDbPgHandler {
             .get_current_database(addr)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
-        // Check plan cache before full planning.
-        let cached_tasks = {
+        // Check plan cache before full planning. The cache key is
+        // `(sql_hash, schema_version)` and does NOT vary by session knob, so it
+        // is bypassed entirely while the force-shuffle override is engaged: a
+        // cached broadcast plan would otherwise be served for a shuffle request
+        // (and a shuffle plan must not be cached for a later non-shuffle query).
+        // Skipping read AND put keeps the cache shuffle-free.
+        let cached_tasks = if force_shuffle_join {
+            None
+        } else {
             let state = Arc::clone(&self.state);
             let tenant = tenant_id.as_u64();
             let db = database_id;
@@ -181,8 +206,13 @@ impl NodeDbPgHandler {
             })?;
 
             let scope = self.state.acquire_plan_lease_scope(&versions);
-            self.sessions
-                .put_cached_plan(addr, &clean_sql, planned.clone(), versions);
+            // Do not cache a plan built under the force-shuffle override — the
+            // cache key does not encode the session knob, so caching it would
+            // leak a shuffle plan into later non-shuffle queries on this session.
+            if !force_shuffle_join {
+                self.sessions
+                    .put_cached_plan(addr, &clean_sql, planned.clone(), versions);
+            }
             (planned, scope)
         };
 

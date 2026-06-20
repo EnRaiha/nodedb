@@ -1,0 +1,401 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Coordinator-side distributed shuffle-JOIN orchestration (E4b-2).
+//!
+//! Resolves a root `Exchange{Shuffle}` wrapping a `QueryOp::HashJoin` into a
+//! real cross-node grace hash join by tying together the already-built producer
+//! (E4a) and consumer (E4b-1) primitives:
+//!
+//! 1. Allocate a `shuffle_id` and a partition plan (`part -> owner node`).
+//! 2. Encode each side's bare full-collection scan as `plan_bytes`.
+//! 3. Fan a `ShuffleProduceRequest` to every producer node of each side
+//!    CONCURRENTLY (build side `side=0`, probe side `side=1`). Each producer
+//!    scans locally, hash-partitions its rows on the per-side keys, and streams
+//!    them to the part-owners. Fail-fast: any producer error aborts the whole
+//!    shuffle (no partial join).
+//! 4. After ALL producers succeed, fan a `ShuffleConsumeRequest` to every
+//!    part-owner CONCURRENTLY. Each owner waits for both staged sides to
+//!    finalize, runs the node-local grace join, and replies with its rows.
+//!    Fail-fast on any consumer error.
+//! 5. Concatenate every consumer's msgpack-array rows into one merged array and
+//!    return it as a `Resolved::Gathered` response.
+//!
+//! # Plane discipline
+//!
+//! This runs on the coordinator's Control Plane (Tokio). The QUIC `send_rpc`
+//! calls are Control-Plane I/O, which is allowed here. No storage I/O, no
+//! io_uring, no Data-Plane access from this module.
+
+use std::collections::BTreeSet;
+
+use futures::future::join_all;
+
+use nodedb_cluster::rpc_codec::DescriptorVersionEntry;
+use nodedb_cluster::{
+    JoinKeyPair, METADATA_GROUP_ID, PartNodeEntry, RaftRpc, RoutingTable, ShuffleConsumeRequest,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse,
+};
+use nodedb_physical::physical_plan::wire as plan_wire;
+use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
+
+use crate::control::server::exchange::full_scan::full_scan_plan_for_collection;
+use crate::control::server::exchange::gather::outcome_to_response;
+use crate::control::server::payload_merge::merge_msgpack_arrays;
+use crate::control::state::SharedState;
+use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
+
+use super::exchange::Resolved;
+
+/// Orchestrate a distributed shuffle hash join.
+///
+/// `child` is the `QueryOp::HashJoin` the root `Exchange{Shuffle}` wraps and
+/// `num_parts` the requested partition count (`0` = default to the cluster
+/// data-node count). `_keys` is the `Exchange{Shuffle}.keys` copy of the join's
+/// equi-keys; the authoritative per-side hash keys are derived from the wrapped
+/// `HashJoin.on` directly (the two are identical by construction at emit), so
+/// `_keys` is accepted for shape symmetry but intentionally unused.
+pub async fn resolve_shuffle_join(
+    state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    child: PhysicalPlan,
+    _keys: Vec<(String, String)>,
+    num_parts: usize,
+    trace_id: TraceId,
+) -> crate::Result<Resolved> {
+    // 1. The child MUST be a HashJoin — shuffle wraps a complete hash join.
+    let PhysicalPlan::Query(QueryOp::HashJoin {
+        left_collection,
+        right_collection,
+        left_alias,
+        right_alias,
+        on,
+        join_type,
+        limit,
+        left_input,
+        right_input,
+        ..
+    }) = child
+    else {
+        return Err(crate::Error::Internal {
+            detail: "ExchangeMode::Shuffle must wrap a QueryOp::HashJoin".into(),
+        });
+    };
+
+    // Both inputs must be BARE name scans (the emit leaves them `None`). An
+    // embedded `ProviderScan` / nested-join sub-plan cannot be re-scanned
+    // per-node by the producers.
+    if left_input.is_some() || right_input.is_some() {
+        return Err(crate::Error::Internal {
+            detail: "shuffle join requires both inputs as bare collection scans \
+                     (no embedded sub-plan)"
+                .into(),
+        });
+    }
+    if on.is_empty() {
+        return Err(crate::Error::Internal {
+            detail: "shuffle join requires a non-empty equi-join key list".into(),
+        });
+    }
+
+    // 2. Cluster mode is mandatory — single-node has no peers to shuffle across.
+    let (Some(transport), Some(routing)) = (
+        state.cluster_transport.as_ref(),
+        state.cluster_routing.as_ref(),
+    ) else {
+        return Err(crate::Error::Internal {
+            detail: "distributed shuffle join requires cluster mode \
+                     (no transport / routing table on this node)"
+                .into(),
+        });
+    };
+
+    // Take a routing snapshot up front: producer/consumer node sets and the
+    // partition plan are all computed against ONE consistent view.
+    let routing_snapshot = {
+        let guard = routing.read().unwrap_or_else(|p| p.into_inner());
+        guard.clone()
+    };
+
+    // 3. Allocate the shuffle id and the partition count. `num_parts == 0`
+    //    defaults to the cluster data-node count (distinct data-group leaders);
+    //    clamp to >= 1 so the partition plan always covers at least one part.
+    let shuffle_id = state.next_shuffle_id();
+    let data_node_count = distinct_data_node_count(&routing_snapshot);
+    let effective_num_parts = if num_parts == 0 {
+        data_node_count.max(1)
+    } else {
+        num_parts
+    };
+
+    let part_map = nodedb_cluster::distributed_join::plan_shuffle_partitions(
+        &routing_snapshot,
+        effective_num_parts,
+    );
+    if part_map.len() != effective_num_parts {
+        return Err(crate::Error::Internal {
+            detail: format!(
+                "shuffle partition plan incomplete: expected {effective_num_parts} parts, \
+                 got {} (no data groups?)",
+                part_map.len()
+            ),
+        });
+    }
+    // `part_node_map` sorted by part for a stable producer-side fan-out order.
+    let part_node_map: Vec<PartNodeEntry> = {
+        let mut entries: Vec<PartNodeEntry> = part_map
+            .iter()
+            .map(|(&part, &node_id)| PartNodeEntry { part, node_id })
+            .collect();
+        entries.sort_by_key(|e| e.part);
+        entries
+    };
+
+    // 4. Per-side hash keys: the LEFT column of each `on` pair partitions the
+    //    probe (left) side, the RIGHT column the build (right) side, so matching
+    //    rows co-locate on the same part.
+    let probe_keys: Vec<String> = on.iter().map(|(l, _)| l.clone()).collect();
+    let build_keys: Vec<String> = on.iter().map(|(_, r)| r.clone()).collect();
+
+    // 5. Producer node sets per side (collections are single-vShard-homed → one
+    //    leader each, but compute generally and dedup).
+    let build_nodes = producer_nodes(&routing_snapshot, database_id, &right_collection)?;
+    let probe_nodes = producer_nodes(&routing_snapshot, database_id, &left_collection)?;
+    let build_producer_count = build_nodes.len() as u32;
+    let probe_producer_count = probe_nodes.len() as u32;
+    if build_producer_count == 0 || probe_producer_count == 0 {
+        return Err(crate::Error::Internal {
+            detail: "shuffle join: a join side resolved to zero producer nodes".into(),
+        });
+    }
+
+    // 6. Encode each side's bare full-collection scan. The producer cannot scan
+    //    by name across nodes, so a missing catalog entry is a hard error here
+    //    (unlike the broadcast-gather path's graceful name-scan fallback).
+    let build_scan = require_scan_plan(state, database_id, tenant_id, &right_collection)?;
+    let probe_scan = require_scan_plan(state, database_id, tenant_id, &left_collection)?;
+    let build_plan_bytes = plan_wire::encode(&build_scan).map_err(|e| crate::Error::Internal {
+        detail: format!("shuffle join: encode build scan: {e}"),
+    })?;
+    let probe_plan_bytes = plan_wire::encode(&probe_scan).map_err(|e| crate::Error::Internal {
+        detail: format!("shuffle join: encode probe scan: {e}"),
+    })?;
+
+    // Deadline budget shared by produce + consume (no finer per-query deadline is
+    // reachable on this resolver path; use the configured network default).
+    let deadline_remaining_ms = state
+        .tuning
+        .network
+        .default_deadline_secs
+        .saturating_mul(1000)
+        .max(1);
+    let num_parts_u32 = u32::try_from(effective_num_parts).map_err(|_| crate::Error::Internal {
+        detail: format!("shuffle join: num_parts {effective_num_parts} exceeds u32"),
+    })?;
+
+    // 7. Dispatch ALL producers CONCURRENTLY (build side=0, probe side=1).
+    let mut produce_futures = Vec::with_capacity(build_nodes.len() + probe_nodes.len());
+    for &node in &build_nodes {
+        let req = ShuffleProduceRequest {
+            shuffle_id,
+            side: 0,
+            num_parts: num_parts_u32,
+            producer_count: build_producer_count,
+            keys: build_keys.clone(),
+            part_node_map: part_node_map.clone(),
+            plan_bytes: build_plan_bytes.clone(),
+            tenant_id: tenant_id.as_u64(),
+            database_id: database_id.as_u64(),
+            deadline_remaining_ms,
+            trace_id: trace_id.0,
+            descriptor_versions: Vec::<DescriptorVersionEntry>::new(),
+        };
+        produce_futures.push(send_produce(transport, node, req));
+    }
+    for &node in &probe_nodes {
+        let req = ShuffleProduceRequest {
+            shuffle_id,
+            side: 1,
+            num_parts: num_parts_u32,
+            producer_count: probe_producer_count,
+            keys: probe_keys.clone(),
+            part_node_map: part_node_map.clone(),
+            plan_bytes: probe_plan_bytes.clone(),
+            tenant_id: tenant_id.as_u64(),
+            database_id: database_id.as_u64(),
+            deadline_remaining_ms,
+            trace_id: trace_id.0,
+            descriptor_versions: Vec::<DescriptorVersionEntry>::new(),
+        };
+        produce_futures.push(send_produce(transport, node, req));
+    }
+    // Await ALL producers; any error fails the whole shuffle (no partial join).
+    for result in join_all(produce_futures).await {
+        result?;
+    }
+
+    // 8. After ALL producers succeed, dispatch consumers CONCURRENTLY — one per
+    //    part, to that part's owner. The consumer waits for both build (side 0)
+    //    and probe (side 1) barriers; the per-side producer_count it waits on is
+    //    carried by the producers' own ShufflePush frames (not by this request),
+    //    so ShuffleConsumeRequest has no producer_count field.
+    let on_pairs: Vec<JoinKeyPair> = on
+        .iter()
+        .map(|(l, r)| JoinKeyPair {
+            left: l.clone(),
+            right: r.clone(),
+        })
+        .collect();
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    let probe_qualifier = left_alias.unwrap_or_default();
+    let index_qualifier = right_alias.unwrap_or_default();
+
+    let mut consume_futures = Vec::with_capacity(part_node_map.len());
+    for entry in &part_node_map {
+        let req = ShuffleConsumeRequest {
+            shuffle_id,
+            part: entry.part,
+            on: on_pairs.clone(),
+            join_type: join_type.clone(),
+            limit: limit_u64,
+            probe_qualifier: probe_qualifier.clone(),
+            index_qualifier: index_qualifier.clone(),
+            tenant_id: tenant_id.as_u64(),
+            database_id: database_id.as_u64(),
+            deadline_remaining_ms,
+            trace_id: trace_id.0,
+        };
+        consume_futures.push(send_consume(transport, entry.node_id, req));
+    }
+    // Await ALL consumers; any error fails the whole shuffle.
+    let mut per_part_rows: Vec<Vec<u8>> = Vec::with_capacity(consume_futures.len());
+    for result in join_all(consume_futures).await {
+        per_part_rows.push(result?);
+    }
+
+    // 9. Merge every part-owner's msgpack-array rows into one array (reuse the
+    //    shared gather merge helper — never hand-roll msgpack framing).
+    let merged = merge_msgpack_arrays(&per_part_rows);
+
+    // The per-node consumer registries self-clean their inboxes once the part's
+    // staged sides are consumed; there is no coordinator-side cleanup hook to
+    // call here. No leak: each `(shuffle_id, part, side)` inbox is dropped by
+    // the part-owner after its consume completes.
+    Ok(Resolved::Gathered(outcome_to_response(merged, Lsn::ZERO)))
+}
+
+/// Send one `ShuffleProduceRequest` and map the reply / RPC error to a typed
+/// coordinator error. Fail-fast: a producer-reported terminal error aborts.
+async fn send_produce(
+    transport: &nodedb_cluster::NexarTransport,
+    node: u64,
+    req: ShuffleProduceRequest,
+) -> crate::Result<()> {
+    match transport
+        .send_rpc(node, RaftRpc::ShuffleProduceRequest(req))
+        .await
+    {
+        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: None })) => Ok(()),
+        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e) })) => {
+            Err(crate::Error::Internal {
+                detail: format!("shuffle produce failed on node {node}: {e:?}"),
+            })
+        }
+        Ok(other) => Err(crate::Error::Internal {
+            detail: format!("shuffle produce: unexpected reply from node {node}: {other:?}"),
+        }),
+        Err(e) => Err(crate::Error::Internal {
+            detail: format!("shuffle produce RPC to node {node} failed: {e}"),
+        }),
+    }
+}
+
+/// Send one `ShuffleConsumeRequest`, returning that part's msgpack-array rows or
+/// a typed error. Fail-fast: a consumer-reported error aborts.
+async fn send_consume(
+    transport: &nodedb_cluster::NexarTransport,
+    node: u64,
+    req: ShuffleConsumeRequest,
+) -> crate::Result<Vec<u8>> {
+    let part = req.part;
+    match transport
+        .send_rpc(node, RaftRpc::ShuffleConsumeRequest(req))
+        .await
+    {
+        Ok(RaftRpc::ShuffleConsumeResponse(ShuffleConsumeResponse { rows, error: None })) => {
+            Ok(rows)
+        }
+        Ok(RaftRpc::ShuffleConsumeResponse(ShuffleConsumeResponse { error: Some(e), .. })) => {
+            Err(crate::Error::Internal {
+                detail: format!("shuffle consume failed for part {part} on node {node}: {e:?}"),
+            })
+        }
+        Ok(other) => Err(crate::Error::Internal {
+            detail: format!(
+                "shuffle consume: unexpected reply for part {part} from node {node}: {other:?}"
+            ),
+        }),
+        Err(e) => Err(crate::Error::Internal {
+            detail: format!("shuffle consume RPC for part {part} to node {node} failed: {e}"),
+        }),
+    }
+}
+
+/// Producer nodes that own `collection`'s data: resolve its vShard → owning
+/// group → leader. A user collection is single-vShard-homed, so this is one
+/// node; returned as a deduped sorted vec for generality.
+fn producer_nodes(
+    routing: &RoutingTable,
+    database_id: DatabaseId,
+    collection: &str,
+) -> crate::Result<Vec<u64>> {
+    let vshard = VShardId::from_collection_in_database(database_id, collection).as_u32();
+    let group = routing
+        .group_for_vshard(vshard)
+        .map_err(|e| crate::Error::Internal {
+            detail: format!("shuffle join: no group for vshard {vshard} ({collection}): {e}"),
+        })?;
+    let leader = routing
+        .group_info(group)
+        .map(|g| g.leader)
+        .filter(|&l| l != 0)
+        .ok_or_else(|| crate::Error::Internal {
+            detail: format!("shuffle join: no leader for group {group} ({collection})"),
+        })?;
+    Ok(vec![leader])
+}
+
+/// Count distinct data-group leaders (the cluster's data-node count), excluding
+/// the metadata group, which owns no vShards.
+fn distinct_data_node_count(routing: &RoutingTable) -> usize {
+    let mut nodes: BTreeSet<u64> = BTreeSet::new();
+    for group_id in routing.group_ids() {
+        if group_id == METADATA_GROUP_ID {
+            continue;
+        }
+        if let Some(info) = routing.group_info(group_id)
+            && info.leader != 0
+        {
+            nodes.insert(info.leader);
+        }
+    }
+    nodes.len()
+}
+
+/// Build a full-collection scan plan for `collection`, erroring if the catalog
+/// has no record for it (the shuffle producer cannot scan by name across nodes,
+/// so a missing entry is fatal — unlike the broadcast path's name-scan fallback).
+fn require_scan_plan(
+    state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
+    full_scan_plan_for_collection(state, database_id, tenant_id, collection)?.ok_or_else(|| {
+        crate::Error::Internal {
+            detail: format!(
+                "shuffle join: no catalog entry for collection '{collection}' on coordinator"
+            ),
+        }
+    })
+}

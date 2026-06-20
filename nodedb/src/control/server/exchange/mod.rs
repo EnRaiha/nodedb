@@ -8,6 +8,7 @@
 //! `streamable` provides the shared streaming-eligibility predicate used by the
 //! lazy query sinks (pgwire fast path, native protocol, HTTP-NDJSON).
 
+pub mod full_scan;
 pub mod gather;
 pub mod resolve;
 pub mod streamable;

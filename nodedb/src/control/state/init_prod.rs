@@ -437,6 +437,7 @@ impl SharedState {
             connections_accepted: AtomicU64::new(0),
             raft_propose_leader_change_retries: AtomicU64::new(0),
             request_id_counter: AtomicU64::new(1),
+            shuffle_id_counter: AtomicU64::new(1),
             // Use the pre-created Arc so the CdcRouter (above) and this
             // metrics endpoint share the same SystemMetrics registry.
             system_metrics: Some(Arc::clone(&system_metrics)),

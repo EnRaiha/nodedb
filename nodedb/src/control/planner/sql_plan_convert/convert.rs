@@ -75,6 +75,18 @@ pub struct ConvertContext {
     /// `assign`/`lookup` so two tenants with the same primary key in a
     /// same-named collection resolve to distinct surrogates.
     pub tenant_id: crate::types::TenantId,
+    /// Permanent operator override (session var `nodedb.force_shuffle_join`):
+    /// when `true` AND the node is in cluster mode, an equi hash join over two
+    /// sharded sources is emitted as a whole-join `Exchange{Shuffle}` (both
+    /// inputs left as bare scans) instead of the default broadcast-build-side
+    /// plan. This is the manual hint layer; the automatic cost-model default is
+    /// a separate follow-up. Ignored in single-node mode (no peers to shuffle
+    /// across — the broadcast/local path is correct and cheaper).
+    pub force_shuffle_join: bool,
+    /// Target partition count for a forced shuffle join. Clamped to `>= 1` at
+    /// emit time. Sourced from session var `nodedb.shuffle_num_parts`; defaults
+    /// to the cluster's data-node count when unset.
+    pub shuffle_num_parts: usize,
 }
 
 impl ConvertContext {

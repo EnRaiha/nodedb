@@ -8,13 +8,13 @@
 //!   gather child to coordinator, encode as a merged msgpack array, and
 //!   embed as `ProviderScan{provider: None, rows}`.  The modified join is
 //!   self-contained and returned as `Resolved::Plan`.
-//! - `Shuffle{..}` → typed error (reserved seam, not implemented).
+//! - Root `Shuffle{keys, num_parts}` wrapping a `HashJoin` → orchestrate a
+//!   cross-node grace hash join (`super::shuffle`) and return the merged rows
+//!   as `Resolved::Gathered`. `Shuffle` as a join INPUT is a typed error (it
+//!   only ever wraps a complete join).
 //! - No Exchange / no empty ProviderScan → `Resolved::Plan` unchanged.
 
-use nodedb_physical::physical_plan::{
-    ColumnarOp, DocumentOp, ExchangeMode, ExchangeOp, KvOp, PhysicalPlan, QueryOp, TimeseriesOp,
-};
-use nodedb_types::{CollectionType, ColumnarProfile, DocumentMode, SystemTimeScope};
+use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
 
 use crate::bridge::envelope::Response;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -89,7 +89,9 @@ pub async fn resolve_exchange_in_plan(
 /// - Root-level `Gather` → gather all vShards, return `Resolved::Gathered`.
 /// - `Broadcast` nested inside a `HashJoin` input → gather the child, embed
 ///   the `merged_array` as `ProviderScan{None, rows}`, return `Resolved::Plan`.
-/// - `Shuffle` → typed error.
+/// - Root-level `Shuffle` wrapping a `HashJoin` → orchestrate a cross-node
+///   grace hash join, return `Resolved::Gathered`. `Shuffle` as a join input is
+///   a typed error.
 /// - Anything else → `Resolved::Plan` unchanged.
 async fn resolve_exchange(
     state: &SharedState,
@@ -177,13 +179,25 @@ async fn resolve_exchange(
             )))
         }
 
-        // Shuffle: reserved seam, not implemented.
+        // Root-level Shuffle: orchestrate a real cross-node grace hash join.
+        // The child must be a `QueryOp::HashJoin` (shuffle wraps a complete hash
+        // join); `super::shuffle` validates that, fans producers + consumers,
+        // and returns the merged join rows as `Resolved::Gathered`.
         PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
-            mode: ExchangeMode::Shuffle { .. },
-            ..
-        })) => Err(crate::Error::Internal {
-            detail: "distributed shuffle is not yet implemented".into(),
-        }),
+            child,
+            mode: ExchangeMode::Shuffle { keys, num_parts },
+        })) => {
+            super::shuffle::resolve_shuffle_join(
+                state,
+                database_id,
+                tenant_id,
+                *child,
+                keys,
+                num_parts,
+                trace_id,
+            )
+            .await
+        }
 
         // HashJoin: resolve Broadcast children embedded in left_input / right_input.
         PhysicalPlan::Query(QueryOp::HashJoin {
@@ -305,12 +319,17 @@ async fn resolve_join_input(
             Ok(Some(Box::new(provider_scan)))
         }
 
-        // Exchange{Shuffle} inside a join input: error.
+        // Exchange{Shuffle} inside a join input is never a shape the emit
+        // produces: a shuffle wraps a WHOLE hash join (the root arm), so it
+        // cannot appear as one join's input. Reject with a clear message rather
+        // than speculatively implementing an unreachable nesting.
         PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
             mode: ExchangeMode::Shuffle { .. },
             ..
         })) => Err(crate::Error::Internal {
-            detail: "distributed shuffle in join input is not yet implemented".into(),
+            detail: "ExchangeMode::Shuffle is only valid wrapping a complete hash join, \
+                     not as a join input"
+                .into(),
         }),
 
         // Exchange{Gather} inside a join input: unusual but execute and embed.
@@ -362,105 +381,28 @@ async fn gather_join_build_side(
     collection: &str,
     trace_id: TraceId,
 ) -> crate::Result<Option<Box<PhysicalPlan>>> {
-    // Catalog lookup: identity-free, scoped by database_id + tenant_id. The
-    // collection name carried in the HashJoin is the same (possibly
-    // db-qualified) name used as the scan-plan collection and the catalog key,
-    // matching the gateway's `collect_version_set` lookup convention.
-    let catalog_ref = state.credentials.catalog();
-    let Some(catalog) = catalog_ref.as_ref() else {
-        // No catalog on this node: fall back to name-scan.
-        return Ok(None);
-    };
-    let stored = match catalog.get_collection(database_id, tenant_id.as_u64(), collection)? {
-        Some(s) => s,
-        // Unknown collection: fall back to name-scan (do not error).
-        None => return Ok(None),
-    };
-
-    // The build side of a hash join must be COMPLETE — every build row is needed
-    // for correct match output, so the gather scan is unbounded (no row cap). A
-    // fixed cap would silently drop join matches for larger collections. This is
-    // allocation-safe: the scan path sizes its buffer as `with_capacity(limit
-    // .min(256))` and bounds output with `take(limit)` (see `btree_scan.rs`), and
-    // `fetch_limit` uses `saturating_mul`, so `usize::MAX` returns all rows
-    // without pre-allocating or overflowing.
+    // Build a minimal, unfiltered, unprojected full-collection scan for the
+    // engine via the shared builder. `Ok(None)` (no catalog / unknown
+    // collection) keeps the existing graceful name-scan fallback — never an
+    // error. The build side of a hash join must be COMPLETE (every build row is
+    // needed for correct match output); the shared builder uses an unbounded
+    // scan, which is allocation-safe (see `full_scan`).
     //
     // (Memory for a very large build relation is the inherent cost of a hash
     // join; spill-to-disk is a future optimization, not a reason to truncate. The
     // probe side's local name-scan and the converter's 10k default for unbounded
     // SELECTs remain separately capped — that engine-wide unbounded-scan limit is
     // its own effort and is the remaining truncation source, TRACKED.)
-    const COMPLETE_BUILD_SIDE: usize = usize::MAX;
-
-    // Build a minimal, unfiltered, unprojected full-collection scan for the
-    // engine. This matches the executor's by-name build-side scan semantics
-    // (`scan_collection`), which applies no build-side filter today. Match the
-    // engine EXHAUSTIVELY — `CollectionType` (and its nested profiles/modes) is
-    // the closed set of catalog-creatable engines, so every variant is handled
-    // and there is no name-scan fallback for "unsupported engine". The Array
-    // engine is intentionally absent: it is not a `CollectionType` variant
-    // (Array uses its own `CREATE ARRAY` DDL and never appears as a
-    // `StoredCollection` here), so it cannot reach this path.
-    let scan_plan = match &stored.collection_type {
-        CollectionType::Document(DocumentMode::Schemaless)
-        | CollectionType::Document(DocumentMode::Strict(_)) => {
-            PhysicalPlan::Document(DocumentOp::Scan {
-                collection: collection.into(),
-                limit: COMPLETE_BUILD_SIDE,
-                offset: 0,
-                sort_keys: Vec::new(),
-                filters: Vec::new(),
-                distinct: false,
-                projection: Vec::new(),
-                computed_columns: Vec::new(),
-                window_functions: Vec::new(),
-                system_time: SystemTimeScope::Current,
-                valid_at_ms: None,
-                prefilter: None,
-            })
-        }
-        CollectionType::KeyValue(_) => PhysicalPlan::Kv(KvOp::Scan {
-            collection: collection.into(),
-            cursor: Vec::new(),
-            count: COMPLETE_BUILD_SIDE,
-            filters: Vec::new(),
-            match_pattern: None,
-            sort_keys: Vec::new(),
-            surrogate_ceiling: None,
-        }),
-        CollectionType::Columnar(ColumnarProfile::Plain)
-        | CollectionType::Columnar(ColumnarProfile::Spatial { .. }) => {
-            PhysicalPlan::Columnar(ColumnarOp::Scan {
-                collection: collection.into(),
-                projection: Vec::new(),
-                limit: COMPLETE_BUILD_SIDE,
-                filters: Vec::new(),
-                rls_filters: Vec::new(),
-                sort_keys: Vec::new(),
-                system_time: SystemTimeScope::Current,
-                valid_at_ms: None,
-                prefilter: None,
-                computed_columns: Vec::new(),
-            })
-        }
-        CollectionType::Columnar(ColumnarProfile::Timeseries { .. }) => {
-            PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-                collection: collection.into(),
-                // (0, i64::MAX) = no time filter — scan all rows.
-                time_range: (0, i64::MAX),
-                projection: Vec::new(),
-                limit: COMPLETE_BUILD_SIDE,
-                filters: Vec::new(),
-                bucket_interval_ms: 0,
-                group_by: Vec::new(),
-                aggregates: Vec::new(),
-                gap_fill: String::new(),
-                computed_columns: Vec::new(),
-                rls_filters: Vec::new(),
-                system_time: SystemTimeScope::Current,
-                valid_at_ms: None,
-            })
-        }
+    let Some(scan_plan) =
+        crate::control::server::exchange::full_scan::full_scan_plan_for_collection(
+            state,
+            database_id,
+            tenant_id,
+            collection,
+        )?
+    else {
+        // No catalog on this node, or unknown collection: fall back to name-scan.
+        return Ok(None);
     };
 
     // `Box::pin` breaks the async-fn recursion cycle: `gather_all_vshards`

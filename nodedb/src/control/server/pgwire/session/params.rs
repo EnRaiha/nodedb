@@ -124,6 +124,8 @@ pub const KNOWN_PG_RUNTIME_PARAMETERS: &[&str] = &[
     // NodeDB-specific session knobs settable via SET.
     "nodedb.consistency",
     "nodedb.tenant_id",
+    "nodedb.force_shuffle_join",
+    "nodedb.shuffle_num_parts",
     "rounding_mode",
 ];
 
@@ -170,6 +172,11 @@ pub const SETTABLE_RUNTIME_PARAMETERS: &[&str] = &[
     "nodedb.cross_shard_mode",
     "nodedb.tenant_id",
     "nodedb.auth_session",
+    // Distributed shuffle-join override (permanent operator hint; the automatic
+    // cost-model default is a separate effort). Read by the routing planner via
+    // the session parameter bag.
+    "nodedb.force_shuffle_join",
+    "nodedb.shuffle_num_parts",
     // Unprefixed NodeDB session knob — Calvin cross-shard mode (paired
     // SHOW cross_shard_txn). Read by the routing planner via the session
     // parameter bag.

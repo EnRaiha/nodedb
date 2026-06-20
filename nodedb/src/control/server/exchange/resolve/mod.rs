@@ -19,10 +19,14 @@
 //!      gather child to coordinator, encode as a merged msgpack array, and
 //!      embed as `ProviderScan{provider: None, rows}`.  The modified join is
 //!      self-contained and returned as `Resolved::Plan`.
-//!    - `Shuffle{..}` → typed error (reserved seam, not implemented).
+//!    - `Shuffle{keys, num_parts}` at the plan root wrapping a `HashJoin` →
+//!      `shuffle`: allocate a shuffle id, fan producers to each side's owner
+//!      nodes, then consumers to the part-owners, and merge the joined rows
+//!      into a `Resolved::Gathered` response (real cross-node grace hash join).
 //!    - No Exchange / no empty ProviderScan → `Resolved::Plan` unchanged.
 
 pub mod exchange;
 mod materialize;
+mod shuffle;
 
 pub use exchange::{Resolved, resolve_and_materialize, resolve_exchange_in_plan};
