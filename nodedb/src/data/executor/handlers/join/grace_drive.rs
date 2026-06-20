@@ -2,10 +2,14 @@
 
 //! Memory-bounded build-side driver for the grace-hash join.
 //!
-//! This module owns the streaming build/probe completion that
-//! `execute_hash_join` uses ONLY when both join sides are plain local scans
-//! (no Exchange sub-plan, no bitmap prefilter) and the join is NOT a cross /
-//! keyless join. It streams the build (right) side row-at-a-time, tracking byte
+//! This module owns the core grace-hash machinery ([`CoreLoop::drive_grace_build`],
+//! [`CoreLoop::finish_grace_join`], [`GraceSources`], [`LocalJoinSides`]) shared
+//! by the local-join and shuffle-join entry points, plus the local-join entry
+//! point [`CoreLoop::try_grace_hash_join`] that `execute_hash_join` calls ONLY
+//! when both join sides are plain local scans (no Exchange sub-plan, no bitmap
+//! prefilter) and the join is NOT a cross / keyless join.
+//!
+//! `try_grace_hash_join` streams the build (right) side row-at-a-time, tracking byte
 //! total against the SAME budget the materializing path uses
 //! (`scan_bytes_exceeded`: id + value bytes, strict `>`). Two outcomes:
 //!
@@ -50,7 +54,6 @@
 
 use super::grace_partitioner::GraceSpec;
 use super::grace_spill::PartitionedSpiller;
-use super::hash::{HashIndex, ProbeParams, emit_unmatched_right_into, probe_rows_into};
 use super::params::JoinParams;
 use super::row_source::RowSource;
 use crate::bridge::envelope::{ErrorCode, Response};
@@ -59,6 +62,43 @@ use crate::data::executor::handlers::scan_budget::budget_exceeded;
 
 /// Fixed partition count for the grace-hash spill path. See module docs.
 const GRACE_PARTITIONS: usize = 64;
+
+/// The two row origins a grace-hash join consumes: the BUILD (right) side and
+/// the PROBE (left) side, each as a [`RowSource`].
+///
+/// Bundling them keeps the grace entry points under the argument-count limit
+/// while making the build/probe origin explicit. The local-join caller fills
+/// both with [`RowSource::LocalScan`]; the cross-node shuffle-join consumer
+/// fills both with [`RowSource::ShuffleStream`]. The grace ALGORITHM is identical
+/// either way — only the input origin changes.
+///
+/// The probe source is consumed at one of two mutually-exclusive driver sites
+/// (the spill-probe path OR the streamed-probe path, depending on whether the
+/// build side spilled), each of which reads it through `for_each(&self)` — so it
+/// is borrowed, never moved, and a single owned `probe` field suffices. Both
+/// `RowSource` variants are cheap to clone should a future caller need a second
+/// independent pass.
+pub(super) struct GraceSources {
+    /// BUILD (right) side rows.
+    pub(super) build: RowSource,
+    /// PROBE (left) side rows.
+    pub(super) probe: RowSource,
+}
+
+/// The two local collections (and their optional aliases) a both-sides-local
+/// hash join scans. Bundled so [`CoreLoop::try_grace_hash_join`] stays within
+/// the argument-count limit; the alias falls back to the collection name when
+/// absent.
+pub(super) struct LocalJoinSides<'a> {
+    /// PROBE (left) collection.
+    pub(super) left_collection: &'a str,
+    /// BUILD (right) collection.
+    pub(super) right_collection: &'a str,
+    /// Optional probe-side column qualifier (defaults to `left_collection`).
+    pub(super) left_alias: Option<&'a str>,
+    /// Optional build-side column qualifier (defaults to `right_collection`).
+    pub(super) right_alias: Option<&'a str>,
+}
 
 /// Per-side streaming accumulation state. Starts `Buffering`; transitions to
 /// `Spilling` exactly once, when the running byte total crosses `budget`.
@@ -91,17 +131,19 @@ impl CoreLoop {
     /// the in-memory path applies: a no-LIMIT join whose output exceeds the byte
     /// budget surfaces a deterministic `ResourcesExhausted` rather than silently
     /// truncating.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn try_grace_hash_join(
         &self,
         join: &JoinParams<'_>,
         tid: u64,
-        left_collection: &str,
-        right_collection: &str,
-        left_alias: Option<&str>,
-        right_alias: Option<&str>,
+        sides: LocalJoinSides<'_>,
         budget: usize,
     ) -> Option<Response> {
+        let LocalJoinSides {
+            left_collection,
+            right_collection,
+            left_alias,
+            right_alias,
+        } = sides;
         let probe_collection = left_alias.unwrap_or(left_collection);
         let index_collection = right_alias.unwrap_or(right_collection);
 
@@ -117,6 +159,24 @@ impl CoreLoop {
         if join.join_type == "cross" || build_keys.is_empty() || probe_keys.is_empty() {
             return None;
         }
+
+        // Local-join origin: both sides scan local collections. Byte-identical
+        // to the previous inline `RowSource::LocalScan` construction at each
+        // grace-driver site — only the construction point moved here so the
+        // driver is parameterized over `RowSource` values.
+        let did = join.task.request.database_id.as_u64();
+        let sources = GraceSources {
+            build: RowSource::LocalScan {
+                database_id: did,
+                tenant_id: tid,
+                collection: right_collection.to_string(),
+            },
+            probe: RowSource::LocalScan {
+                database_id: did,
+                tenant_id: tid,
+                collection: left_collection.to_string(),
+            },
+        };
 
         // Identical output-bound derivation to the in-memory path: an explicit
         // user LIMIT is honored exactly (no budget check); a no-LIMIT join is
@@ -149,16 +209,36 @@ impl CoreLoop {
         };
 
         let unique_join_id = join.task.request_id().as_u64();
-        let did = join.task.request.database_id.as_u64();
-        let mut results = match self.drive_grace_build(
-            did,
-            tid,
-            left_collection,
-            right_collection,
+        Some(self.finish_grace_join(
+            join,
+            sources,
             &spec,
             budget,
             unique_join_id,
-        ) {
+            enforce_output_budget,
+        ))
+    }
+
+    /// Shared completion tail for every grace-hash join, regardless of input
+    /// origin (local-collection scans or staged shuffle files).
+    ///
+    /// Drives the build + probe via [`Self::drive_grace_build`] over `sources`,
+    /// then applies the EXACT same output-budget guard, `filter_and_project`,
+    /// and `encode_binary_rows` the local path always applied — so the response
+    /// shape is byte-identical whether the rows came from local scans or a
+    /// cross-node shuffle. Errors are mapped deterministically:
+    /// [`crate::Error::MemoryExhausted`] (over-budget skew) →
+    /// `ResourcesExhausted`; any other driver error → `Internal`.
+    pub(super) fn finish_grace_join(
+        &self,
+        join: &JoinParams<'_>,
+        sources: GraceSources,
+        spec: &GraceSpec<'_>,
+        budget: usize,
+        unique_join_id: u64,
+        enforce_output_budget: bool,
+    ) -> Response {
+        let mut results = match self.drive_grace_build(sources, spec, budget, unique_join_id) {
             Ok(rows) => rows,
             // A depth-cap skew error is "over budget" semantics — identical to
             // what the in-memory path surfaces — so it must map to
@@ -167,60 +247,61 @@ impl CoreLoop {
             // the variant here so the wire code is correct regardless of where
             // the error was minted.) Any other error stays `Internal`.
             Err(crate::Error::MemoryExhausted { .. }) => {
-                return Some(self.response_error(join.task, ErrorCode::ResourcesExhausted));
+                return self.response_error(join.task, ErrorCode::ResourcesExhausted);
             }
             Err(e) => {
-                return Some(self.response_error(
+                return self.response_error(
                     join.task,
                     ErrorCode::Internal {
                         detail: e.to_string(),
                     },
-                ));
+                );
             }
         };
 
         // Same output-budget enforcement as the in-memory path: a no-LIMIT join
         // whose output fills the budget ceiling surfaces a deterministic error
         // rather than dropping rows.
-        if enforce_output_budget && results.len() >= probe_limit {
-            return Some(self.response_error(join.task, ErrorCode::ResourcesExhausted));
+        if enforce_output_budget && results.len() >= spec.limit {
+            return self.response_error(join.task, ErrorCode::ResourcesExhausted);
         }
 
         if let Err(e) = join.filter_and_project(&mut results) {
-            return Some(self.response_error(
+            return self.response_error(
                 join.task,
                 ErrorCode::Internal {
                     detail: e.to_string(),
                 },
-            ));
+            );
         }
 
         let payload = crate::data::executor::response_codec::encode_binary_rows(&results);
-        Some(self.response_with_payload(join.task, payload))
+        self.response_with_payload(join.task, payload)
     }
 
-    /// Drive the memory-bounded build + probe for a both-sides-local,
-    /// non-cross hash join. Always runs the join to completion and returns
-    /// the encoded-ready join rows.
+    /// Drive the memory-bounded build + probe for a non-cross hash join over
+    /// the supplied [`GraceSources`]. Always runs the join to completion and
+    /// returns the encoded-ready join rows.
     ///
-    /// Streams the build (right) collection, buffering until the per-query byte
+    /// The build/probe origins are whatever the caller passes: local-collection
+    /// scans (local join) or staged shuffle files (cross-node shuffle-join
+    /// consumer). The algorithm is identical for both — only the input origin
+    /// differs.
+    ///
+    /// Streams the build (right) source, buffering until the per-query byte
     /// budget is crossed.
     ///
     /// - **Not crossed** (build fits budget, or `budget == 0` = unlimited): keep
-    ///   the buffered build rows, build an in-memory [`HashIndex`], and stream
-    ///   the probe (left) collection against it in bounded ≤budget batches via
-    ///   [`probe_rows_into`], sharing one `results` Vec and one `index_matched`
-    ///   Vec across batches; a final [`emit_unmatched_right_into`] sweep handles
+    ///   the buffered build rows, build an in-memory `HashIndex`, and stream the
+    ///   probe (left) source against it in bounded ≤budget batches (see
+    ///   [`Self::stream_probe_against_index`]), sharing one `results` Vec and one
+    ///   `index_matched` Vec across batches; a final unmatched-right sweep handles
     ///   RIGHT/FULL unmatched build rows. The probe is never fully materialized.
     /// - **Crossed**: switch to a [`PartitionedSpiller`], stream the probe into
     ///   it, complete the join, and remove the per-join spill directory.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn drive_grace_build(
         &self,
-        did: u64,
-        tid: u64,
-        left_collection: &str,
-        right_collection: &str,
+        sources: GraceSources,
         spec: &GraceSpec<'_>,
         budget: usize,
         unique_join_id: u64,
@@ -245,15 +326,19 @@ impl CoreLoop {
             bytes: 0,
         };
 
+        // Split the sources: the build pass below consumes `build_source`, and
+        // exactly one of the two mutually-exclusive completion arms
+        // (streamed-probe-against-index vs. spill-probe) borrows `probe_source`
+        // via `for_each(&self)`. Destructuring keeps both owned for the duration.
+        let GraceSources {
+            build: build_source,
+            probe: probe_source,
+        } = sources;
+
         // Stream the BUILD (right) side. The closure transitions the state from
         // Buffering to Spilling exactly once, the first time the running byte
         // total crosses `budget` (matching `scan_bytes_exceeded`: id + value
         // bytes, strict `>`).
-        let build_source = RowSource::LocalScan {
-            database_id: did,
-            tenant_id: tid,
-            collection: right_collection.to_string(),
-        };
         build_source.for_each(self, |id, bytes| {
             // Append this row to the active side. When a buffering side crosses
             // budget, `mem::take` the buffered rows out (leaving the buffer empty)
@@ -320,7 +405,7 @@ impl CoreLoop {
                 // in-memory path: same build row set/order, same `probe_rows_into`
                 // emission, same global limit / index_matched accumulation; only
                 // WHEN each probe row is processed differs, never the order.
-                self.stream_probe_against_index(did, tid, left_collection, &docs, spec, budget)
+                self.stream_probe_against_index(&probe_source, &docs, spec, budget)
             }
             BuildState::Spilling(mut spiller) => {
                 // Stream the PROBE (left) side directly into the spiller — never
@@ -328,12 +413,7 @@ impl CoreLoop {
                 // error we still remove the spill dir below by routing through the
                 // shared cleanup tail.
                 let probe_result = (|| -> crate::Result<Vec<Vec<u8>>> {
-                    let spill_probe_source = RowSource::LocalScan {
-                        database_id: did,
-                        tenant_id: tid,
-                        collection: left_collection.to_string(),
-                    };
-                    spill_probe_source.for_each(self, |_id, bytes| spiller.push_probe(bytes))?;
+                    probe_source.for_each(self, |_id, bytes| spiller.push_probe(bytes))?;
                     spiller.finish_and_probe()
                 })();
 
@@ -354,128 +434,5 @@ impl CoreLoop {
                 probe_result
             }
         }
-    }
-
-    /// Stream the probe (left) side against an in-memory `HashIndex` built over
-    /// the buffered, under-budget build rows, in bounded ≤budget batches.
-    ///
-    /// Only ONE probe batch is resident at a time: rows accumulate into `batch`
-    /// (tracking the same `id + value` byte total as the build side, `budget != 0`
-    /// gated, strict `>`) until the running total crosses `budget`, at which
-    /// point the batch is fed through [`probe_rows_into`] and cleared. The final
-    /// partial batch is flushed after the stream ends. `results` and
-    /// `index_matched` are shared across all batches so the global output limit
-    /// (`spec.limit`) and RIGHT/FULL match tracking accumulate correctly; a final
-    /// [`emit_unmatched_right_into`] sweep (gated on `emit_unmatched_right`)
-    /// emits unmatched build rows.
-    ///
-    /// A `budget` of 0 (unlimited) never crosses, so the whole probe side flushes
-    /// as a single final batch — still bounded only by the in-memory build index,
-    /// matching the unlimited in-memory path.
-    fn stream_probe_against_index(
-        &self,
-        did: u64,
-        tid: u64,
-        left_collection: &str,
-        build_docs: &[(String, Vec<u8>)],
-        spec: &GraceSpec<'_>,
-        budget: usize,
-    ) -> crate::Result<Vec<Vec<u8>>> {
-        let index = HashIndex::build(build_docs, spec.build_keys);
-
-        let is_right = spec.join_type == "right" || spec.join_type == "full";
-        let mut index_matched: Vec<bool> = if is_right {
-            vec![false; build_docs.len()]
-        } else {
-            Vec::new()
-        };
-        let mut results: Vec<Vec<u8>> = Vec::new();
-
-        // One ≤budget probe batch resident at a time.
-        let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut batch_bytes: usize = 0;
-
-        // Process the accumulated batch through the shared emission loop, then
-        // clear it for reuse. Honors `spec.limit` against the SHARED results.
-        let flush = |batch: &mut Vec<(String, Vec<u8>)>,
-                     batch_bytes: &mut usize,
-                     results: &mut Vec<Vec<u8>>,
-                     index_matched: &mut [bool]| {
-            if batch.is_empty() {
-                return;
-            }
-            probe_rows_into(
-                &ProbeParams {
-                    probe_docs: batch,
-                    index: &index,
-                    index_docs: build_docs,
-                    probe_keys: spec.probe_keys,
-                    join_type: spec.join_type,
-                    limit: spec.limit,
-                    probe_collection: spec.probe_collection,
-                    index_collection: spec.index_collection,
-                    emit_unmatched_right: spec.emit_unmatched_right,
-                },
-                results,
-                index_matched,
-            );
-            batch.clear();
-            *batch_bytes = 0;
-        };
-
-        let stream_probe_source = RowSource::LocalScan {
-            database_id: did,
-            tenant_id: tid,
-            collection: left_collection.to_string(),
-        };
-        stream_probe_source.for_each(self, |id, bytes| {
-            batch_bytes = batch_bytes
-                .saturating_add(bytes.len())
-                .saturating_add(id.len());
-            // Only the value bytes are fed to probe_rows_into; the id is never
-            // used for matching, so avoid the allocation.
-            batch.push((String::new(), bytes.to_vec()));
-            // budget == 0 → unlimited → never flush mid-stream (matches the
-            // build-side accounting and the unlimited in-memory path).
-            if budget_exceeded(batch_bytes, budget) {
-                flush(
-                    &mut batch,
-                    &mut batch_bytes,
-                    &mut results,
-                    &mut index_matched,
-                );
-            }
-            Ok(())
-        })?;
-
-        // Flush the final partial batch.
-        flush(
-            &mut batch,
-            &mut batch_bytes,
-            &mut results,
-            &mut index_matched,
-        );
-
-        // RIGHT/FULL: emit unmatched index-side rows ONCE, after all probe
-        // batches. The in-memory path runs this same sweep via probe_hash_index.
-        if is_right && spec.emit_unmatched_right {
-            emit_unmatched_right_into(
-                &ProbeParams {
-                    probe_docs: &[],
-                    index: &index,
-                    index_docs: build_docs,
-                    probe_keys: spec.probe_keys,
-                    join_type: spec.join_type,
-                    limit: spec.limit,
-                    probe_collection: spec.probe_collection,
-                    index_collection: spec.index_collection,
-                    emit_unmatched_right: spec.emit_unmatched_right,
-                },
-                &mut results,
-                &index_matched,
-            );
-        }
-
-        Ok(results)
     }
 }

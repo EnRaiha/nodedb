@@ -5,6 +5,7 @@
 mod budget_guard;
 mod grace_drive;
 pub(super) mod grace_partitioner;
+mod grace_probe;
 mod grace_repartition;
 mod grace_spill;
 pub mod hash;
@@ -13,6 +14,7 @@ pub mod lateral;
 pub mod nested_loop;
 pub mod params;
 mod row_source;
+mod shuffle_join;
 pub mod sort_merge;
 mod spill;
 mod support;

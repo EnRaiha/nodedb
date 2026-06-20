@@ -94,10 +94,12 @@ impl CoreLoop {
             && let Some(resp) = self.try_grace_hash_join(
                 &join,
                 tid,
-                left_collection,
-                right_collection,
-                left_alias,
-                right_alias,
+                crate::data::executor::handlers::join::grace_drive::LocalJoinSides {
+                    left_collection,
+                    right_collection,
+                    left_alias,
+                    right_alias,
+                },
                 budget,
             )
         {
