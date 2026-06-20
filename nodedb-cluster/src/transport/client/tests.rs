@@ -104,6 +104,16 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_shuffle_aggregate(
+        &self,
+        _req: crate::rpc_codec::ShuffleAggregateConsumeRequest,
+    ) -> crate::rpc_codec::ShuffleAggregateConsumeResponse {
+        crate::rpc_codec::ShuffleAggregateConsumeResponse {
+            rows: Vec::new(),
+            error: None,
+        }
+    }
 }
 
 fn make_transport(node_id: u64) -> NexarTransport {
