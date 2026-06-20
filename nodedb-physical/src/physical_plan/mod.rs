@@ -230,6 +230,7 @@ impl PhysicalPlan {
             PhysicalPlan::Document(DocumentOp::Scan { .. })
                 | PhysicalPlan::Columnar(ColumnarOp::Scan { .. })
                 | PhysicalPlan::Query(QueryOp::PartialAggregate { .. })
+                | PhysicalPlan::Query(QueryOp::PartialAggregateState { .. })
                 | PhysicalPlan::Graph(GraphOp::Hop { .. })
                 | PhysicalPlan::Graph(GraphOp::Neighbors { .. })
                 | PhysicalPlan::Graph(GraphOp::NeighborsMulti { .. })

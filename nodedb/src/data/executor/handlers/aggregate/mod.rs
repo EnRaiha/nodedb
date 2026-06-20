@@ -10,10 +10,14 @@
 //!
 //! Split by concern so each file stays under the project's hard size limit:
 //! `exec` (dispatch + fast paths), `streaming` (the spill-backed group-by
-//! accumulation), `cache_key` (result-cache key derivation), and `rows`
-//! (post-aggregate alias renaming and ORDER BY sorting).
+//! accumulation, itself split into accumulate / finalize / over_docs phases),
+//! `cache_key` (result-cache key derivation), `rows` (post-aggregate alias
+//! renaming and ORDER BY sorting), `state_emit` (the distributed-shuffle
+//! partial-state producer), and `shuffle_merge` (the partial-state consumer).
 
 mod cache_key;
 mod exec;
 mod rows;
+mod shuffle_merge;
+mod state_emit;
 mod streaming;

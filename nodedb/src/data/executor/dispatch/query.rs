@@ -243,6 +243,26 @@ impl CoreLoop {
                 &[],
             ),
 
+            QueryOp::PartialAggregateState {
+                collection,
+                group_by,
+                aggregates,
+                filters,
+            } => self.execute_partial_aggregate_state(
+                task, tid, collection, group_by, aggregates, filters,
+            ),
+
+            QueryOp::ShuffleAggregateConsume {
+                state_path,
+                group_by,
+                aggregates,
+                having,
+                limit,
+                sort_keys,
+            } => self.execute_shuffle_aggregate(
+                task, state_path, group_by, aggregates, having, *limit, sort_keys,
+            ),
+
             QueryOp::LateralTopK {
                 outer_plan,
                 outer_alias,

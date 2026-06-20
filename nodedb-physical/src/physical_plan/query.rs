@@ -133,6 +133,31 @@ pub enum QueryOp {
         filters: Vec<u8>,
     },
 
+    /// Partial aggregate STATE producer (distributed GROUP BY shuffle, map side).
+    ///
+    /// Accumulates exactly like [`QueryOp::PartialAggregate`] — scan the named
+    /// `collection`, apply `filters`, build per-group `GroupState` accumulators
+    /// keyed on `group_by` — but DOES NOT finalize. Instead it emits one row
+    /// PER GROUP of the flat shape:
+    ///
+    /// ```text
+    /// { <group_by[0]>: value_0, ..., "__agg_state": <bytes> }
+    /// ```
+    ///
+    /// where `__agg_state` is the serialized partial `GroupState` for that
+    /// group. A downstream [`QueryOp::ShuffleAggregateConsume`] merges these
+    /// partial states (from every producer shard/node) and finalizes them.
+    ///
+    /// This op carries NO node-local paths — it reads only the named collection
+    /// — so it is wire-shippable: a coordinator embeds it in a producer plan and
+    /// dispatches it to a remote node's Data Plane.
+    PartialAggregateState {
+        collection: String,
+        group_by: Vec<String>,
+        aggregates: Vec<AggregateSpec>,
+        filters: Vec<u8>,
+    },
+
     /// Hash join: build hash map on right, probe with left.
     ///
     /// `left_input`/`right_input` carry a resolved child plan (an Exchange
@@ -200,6 +225,37 @@ pub enum QueryOp {
         probe_qualifier: String,
         /// Column qualifier (prefix) for build-side (right/index) columns.
         index_qualifier: String,
+    },
+
+    /// Distributed GROUP BY shuffle CONSUMER (reduce side): merge the staged
+    /// partial `GroupState`s produced by [`QueryOp::PartialAggregateState`]
+    /// producers, then finalize, HAVING-filter, sort, and LIMIT.
+    ///
+    /// `state_path` is a node-local frame file written by the shuffle receive
+    /// path: a sequence of `[u32 LE len][row-bytes]` frames, one msgpack row per
+    /// frame, each row the flat `{<group_by cols>, "__agg_state": <bytes>}` shape
+    /// a `PartialAggregateState` producer emits. The handler rebuilds each
+    /// group key (byte-identically to the accumulate path), decodes
+    /// `__agg_state`, and `merge_from`s into a consolidated per-group map before
+    /// running the same finalize tail as a normal aggregate.
+    ///
+    /// Like [`QueryOp::ShuffleJoinConsume`], this variant carries a node-local
+    /// path and is BUILT LOCALLY by the consume hook for dispatch to the SAME
+    /// node's Data Plane — it must NEVER be serialized cross-node (the wire
+    /// encoder rejects it; see `physical_plan::wire::encode`).
+    ShuffleAggregateConsume {
+        /// Local absolute path to the staged partial-state frame file.
+        state_path: String,
+        /// GROUP BY columns (the key the partial states were grouped on).
+        group_by: Vec<String>,
+        /// Aggregate specs (must match the producers' specs, in order).
+        aggregates: Vec<AggregateSpec>,
+        /// HAVING predicates applied post-merge (serialized `Vec<ScanFilter>`).
+        having: Vec<u8>,
+        /// Output row cap after sort. `usize::MAX` = no explicit LIMIT.
+        limit: usize,
+        /// Post-aggregation sort keys: `(column_name, ascending)`.
+        sort_keys: Vec<(String, bool)>,
     },
 
     /// Nested loop join: fallback for non-equi joins.

@@ -23,9 +23,13 @@ pub enum WireError {
 /// Returns an error for plans that are node-local by construction and must
 /// never be shipped over the QUIC wire:
 /// - `ClusterArray` variants (handled on the Control Plane); and
-/// - `QueryOp::ShuffleJoinConsume` (carries node-local staged-file paths; it is
-///   built locally by the part-owner's consume hook and dispatched only to that
-///   same node's Data Plane).
+/// - `QueryOp::ShuffleJoinConsume` and `QueryOp::ShuffleAggregateConsume`
+///   (carry node-local staged-file paths; built locally by the part-owner's
+///   consume hook and dispatched only to that same node's Data Plane).
+///
+/// `QueryOp::PartialAggregateState` is wire-SHIPPABLE — it carries only a
+/// collection name and is dispatched to a remote producer's Data Plane — so it
+/// is intentionally NOT rejected here.
 pub fn encode(plan: &PhysicalPlan) -> Result<Vec<u8>, WireError> {
     if matches!(plan, PhysicalPlan::ClusterArray(_)) {
         return Err(WireError::InvalidPlan(
@@ -38,6 +42,14 @@ pub fn encode(plan: &PhysicalPlan) -> Result<Vec<u8>, WireError> {
     ) {
         return Err(WireError::InvalidPlan(
             "ShuffleJoinConsume plans carry node-local paths and must not be sent over the wire",
+        ));
+    }
+    if matches!(
+        plan,
+        PhysicalPlan::Query(QueryOp::ShuffleAggregateConsume { .. })
+    ) {
+        return Err(WireError::InvalidPlan(
+            "ShuffleAggregateConsume plans carry node-local paths and must not be sent over the wire",
         ));
     }
     zerompk::to_msgpack_vec(plan).map_err(|e| WireError::Codec(format!("encode: {e}")))
@@ -57,6 +69,22 @@ pub fn encode_batch(plans: &Vec<PhysicalPlan>) -> Result<Vec<u8>, WireError> {
         if matches!(plan, PhysicalPlan::ClusterArray(_)) {
             return Err(WireError::InvalidPlan(
                 "ClusterArray plans must not be shipped via the sequencer",
+            ));
+        }
+        if matches!(
+            plan,
+            PhysicalPlan::Query(QueryOp::ShuffleJoinConsume { .. })
+        ) {
+            return Err(WireError::InvalidPlan(
+                "ShuffleJoinConsume plans carry node-local paths and must not be shipped via the sequencer",
+            ));
+        }
+        if matches!(
+            plan,
+            PhysicalPlan::Query(QueryOp::ShuffleAggregateConsume { .. })
+        ) {
+            return Err(WireError::InvalidPlan(
+                "ShuffleAggregateConsume plans carry node-local paths and must not be shipped via the sequencer",
             ));
         }
     }

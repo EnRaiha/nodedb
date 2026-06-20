@@ -62,6 +62,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             QueryOp::Aggregate { .. }
             | QueryOp::HashJoin { .. }
             | QueryOp::PartialAggregate { .. }
+            | QueryOp::PartialAggregateState { .. }
             | QueryOp::NestedLoopJoin { .. }
             | QueryOp::SortMergeJoin { .. }
             | QueryOp::RecursiveScan { .. }
@@ -70,6 +71,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | QueryOp::LateralTopK { .. }
             | QueryOp::LateralLoop { .. }
             | QueryOp::ShuffleJoinConsume { .. }
+            | QueryOp::ShuffleAggregateConsume { .. }
             | QueryOp::ProviderScan { .. },
         ) => Permission::Read,
 

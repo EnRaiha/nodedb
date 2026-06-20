@@ -58,13 +58,13 @@ enum FrameBackend {
 ///
 /// One row is resident at a time; the file is never read whole — this is the
 /// property that keeps re-partitioning memory-bounded.
-pub(super) struct FrameStreamReader {
+pub(in crate::data::executor) struct FrameStreamReader {
     backend: FrameBackend,
 }
 
 impl FrameStreamReader {
     /// Open `path` for streaming frame reads.
-    pub(super) fn open(path: &Path) -> crate::Result<Self> {
+    pub(in crate::data::executor) fn open(path: &Path) -> crate::Result<Self> {
         let backend = match UringSeqReader::open_default(path) {
             Some(r) => FrameBackend::Uring(Box::new(r)),
             None => FrameBackend::Std(BufReader::new(std::fs::File::open(path).map_err(|e| {
@@ -96,7 +96,7 @@ impl FrameStreamReader {
     /// A frame that begins but does not complete (header present but body short,
     /// or a partial header after the first byte) is CORRUPTION and returns
     /// `Err` — never a silent drop (mirrors `RunReader::next_row`).
-    pub(super) fn next_row(&mut self) -> crate::Result<Option<Vec<u8>>> {
+    pub(in crate::data::executor) fn next_row(&mut self) -> crate::Result<Option<Vec<u8>>> {
         let mut len_buf = [0u8; 4];
         // Clean EOF exactly on a frame boundary → no more rows.
         if !Self::read_full(&mut self.backend, &mut len_buf)? {

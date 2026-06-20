@@ -319,6 +319,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
             match op {
                 Aggregate { collection, .. }
                 | PartialAggregate { collection, .. }
+                | PartialAggregateState { collection, .. }
                 | FacetCounts { collection, .. }
                 | RecursiveScan { collection, .. } => out.push(collection.clone()),
 
@@ -362,9 +363,10 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 // ProviderScan is a catalog/constant source — no user collection.
                 ProviderScan { .. } => {}
 
-                // ShuffleJoinConsume reads node-local staged files keyed by
-                // path, not by a catalog collection — no version contribution.
-                ShuffleJoinConsume { .. } => {}
+                // ShuffleJoinConsume / ShuffleAggregateConsume read node-local
+                // staged files keyed by path, not by a catalog collection — no
+                // version contribution.
+                ShuffleJoinConsume { .. } | ShuffleAggregateConsume { .. } => {}
 
                 // No user-collection field.
                 RecursiveValue { .. } => {}
