@@ -155,6 +155,11 @@ pub fn start_raft(
         )),
     );
 
+    // Cross-node shuffle PRODUCER (E4a): runs a local scan through the streaming
+    // executor + fan-out sink when a `ShuffleProduce` trigger arrives.
+    let shuffle_producer: Arc<dyn nodedb_cluster::ShuffleProducer> =
+        Arc::new(crate::control::server::shuffle::RegistryShuffleProducer::new(shared.clone()));
+
     let raft_loop = Arc::new(
         nodedb_cluster::RaftLoop::new(
             multi_raft,
@@ -169,6 +174,7 @@ pub fn start_raft(
         .with_group_watchers(handle.group_watchers.clone())
         .with_snapshot_quarantine_hook(quarantine_hook)
         .with_shuffle_receiver(shuffle_receiver)
+        .with_shuffle_producer(shuffle_producer)
         .with_data_dir(_data_dir.to_path_buf())
         .with_snapshot_chunk_bytes(snapshot_chunk_bytes)
         .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs),

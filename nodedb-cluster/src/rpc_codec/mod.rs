@@ -39,4 +39,7 @@ pub use mac::{MAC_LEN, MacKey};
 pub use metadata::{MetadataProposeRequest, MetadataProposeResponse};
 pub use peer_seq::{PeerSeqSender, PeerSeqWindow, REPLAY_WINDOW};
 pub use raft_rpc::{RaftRpc, decode, encode, frame_size};
-pub use shuffle::{ShufflePushChunk, ShufflePushEnd, ShufflePushRequest};
+pub use shuffle::{
+    PartNodeEntry, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk, ShufflePushEnd,
+    ShufflePushRequest,
+};

@@ -15,7 +15,7 @@ use crate::error::{ClusterError, Result};
 use crate::transport::auth_context::AuthContext;
 use crate::transport::config;
 use crate::transport::credentials::{self, TransportCredentials};
-use crate::transport::server::{NoopIdentityStore, PeerIdentityStore};
+use crate::transport::peer_identity_store::{NoopIdentityStore, PeerIdentityStore};
 
 /// QUIC-based Raft transport with retry and circuit breaker.
 ///

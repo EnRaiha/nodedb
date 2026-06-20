@@ -15,7 +15,10 @@ use super::discriminants::*;
 use super::execute::{ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, ExecuteStreamEnd};
 use super::header::HEADER_SIZE;
 use super::metadata::{MetadataProposeRequest, MetadataProposeResponse};
-use super::shuffle::{ShufflePushChunk, ShufflePushEnd, ShufflePushRequest};
+use super::shuffle::{
+    ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk, ShufflePushEnd,
+    ShufflePushRequest,
+};
 use super::{cluster_mgmt, data_propose, execute, metadata, raft_msgs, shuffle, vshard};
 use crate::error::{ClusterError, Result};
 use crate::wire_version::{unwrap_bytes_versioned, wrap_bytes_versioned};
@@ -60,6 +63,12 @@ pub enum RaftRpc {
     ShufflePushRequest(ShufflePushRequest),
     ShufflePushChunk(ShufflePushChunk),
     ShufflePushEnd(ShufflePushEnd),
+    // Cross-node shuffle PRODUCER trigger (E4a). The coordinator sends a
+    // `ShuffleProduceRequest`; the producer node runs a local scan, fans the
+    // hash-partitioned rows out as `ShufflePush` streams, and replies with one
+    // terminal `ShuffleProduceResponse`.
+    ShuffleProduceRequest(ShuffleProduceRequest),
+    ShuffleProduceResponse(ShuffleProduceResponse),
     // Data-group proposal forwarding (groups 1+)
     DataProposeRequest(DataProposeRequest),
     DataProposeResponse(DataProposeResponse),
@@ -92,6 +101,8 @@ pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
         RaftRpc::ShufflePushRequest(m) => shuffle::encode_shuffle_push_req(m, &mut out),
         RaftRpc::ShufflePushChunk(m) => shuffle::encode_shuffle_push_chunk(m, &mut out),
         RaftRpc::ShufflePushEnd(m) => shuffle::encode_shuffle_push_end(m, &mut out),
+        RaftRpc::ShuffleProduceRequest(m) => shuffle::encode_shuffle_produce_req(m, &mut out),
+        RaftRpc::ShuffleProduceResponse(m) => shuffle::encode_shuffle_produce_resp(m, &mut out),
         RaftRpc::DataProposeRequest(m) => data_propose::encode_data_propose_req(m, &mut out),
         RaftRpc::DataProposeResponse(m) => data_propose::encode_data_propose_resp(m, &mut out),
     }?;
@@ -160,6 +171,8 @@ pub fn decode(data: &[u8]) -> Result<RaftRpc> {
         RPC_SHUFFLE_PUSH_REQ => shuffle::decode_shuffle_push_req(payload),
         RPC_SHUFFLE_PUSH_CHUNK => shuffle::decode_shuffle_push_chunk(payload),
         RPC_SHUFFLE_PUSH_END => shuffle::decode_shuffle_push_end(payload),
+        RPC_SHUFFLE_PRODUCE_REQ => shuffle::decode_shuffle_produce_req(payload),
+        RPC_SHUFFLE_PRODUCE_RESP => shuffle::decode_shuffle_produce_resp(payload),
         RPC_DATA_PROPOSE_REQ => data_propose::decode_data_propose_req(payload),
         RPC_DATA_PROPOSE_RESP => data_propose::decode_data_propose_resp(payload),
         _ => Err(ClusterError::Codec {

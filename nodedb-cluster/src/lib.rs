@@ -113,7 +113,8 @@ pub use migration_executor::{
 };
 pub use multi_raft::{GroupStatus, MultiRaft};
 pub use raft_loop::{
-    CommitApplier, RaftLoop, ShuffleReceiver, SnapshotQuarantineHook, VShardEnvelopeHandler,
+    CommitApplier, RaftLoop, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
+    VShardEnvelopeHandler,
 };
 pub use reachability::{
     NoopProber, ReachabilityDriver, ReachabilityDriverConfig, ReachabilityProber, TransportProber,
@@ -127,12 +128,13 @@ pub use rebalancer::{
 pub use routing::RoutingTable;
 pub use routing_liveness::{NodeIdResolver, RoutingLivenessHook};
 pub use rpc_codec::{
-    MacKey, RaftRpc, ShufflePushChunk, ShufflePushEnd, ShufflePushRequest, TypedClusterError,
+    MacKey, PartNodeEntry, RaftRpc, ShuffleProduceRequest, ShuffleProduceResponse,
+    ShufflePushChunk, ShufflePushEnd, ShufflePushRequest, TypedClusterError,
 };
 pub use topology::{ClusterTopology, NodeInfo, NodeState};
 pub use transport::{
     IDENTITY_MISMATCH_QUIC_ERROR, NexarTransport, NoopIdentityStore, PeerIdentityStore,
-    PinnedClientVerifier, PinnedServerVerifier, RaftRpcHandler, TlsCredentials,
+    PinnedClientVerifier, PinnedServerVerifier, RaftRpcHandler, ShufflePushStream, TlsCredentials,
     TransportCredentials, TransportPeerSnapshot, VerifyMethod, VerifyOutcome, ca_fingerprint,
     ca_fingerprint_hex, generate_node_credentials, generate_node_credentials_multi_san,
     insecure_transport_count, issue_leaf_for_sans, load_crls_from_pem,

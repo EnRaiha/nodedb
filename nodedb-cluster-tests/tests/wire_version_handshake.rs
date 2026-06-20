@@ -73,6 +73,13 @@ impl RaftRpcHandler for EchoHandler {
         _error: Option<nodedb_cluster::rpc_codec::TypedClusterError>,
     ) {
     }
+
+    async fn on_shuffle_produce(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ShuffleProduceRequest,
+    ) -> Option<nodedb_cluster::rpc_codec::TypedClusterError> {
+        None
+    }
 }
 
 /// Handler that records whether it was ever invoked.
@@ -125,6 +132,17 @@ impl RaftRpcHandler for SentinelHandler {
         _error: Option<nodedb_cluster::rpc_codec::TypedClusterError>,
     ) {
         self.invoked.store(true, Ordering::SeqCst);
+    }
+
+    async fn on_shuffle_produce(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ShuffleProduceRequest,
+    ) -> Option<nodedb_cluster::rpc_codec::TypedClusterError> {
+        self.invoked.store(true, Ordering::SeqCst);
+        Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
+            code: 0,
+            message: "sentinel: unexpected produce dispatch".into(),
+        })
     }
 }
 

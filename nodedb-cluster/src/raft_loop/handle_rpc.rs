@@ -10,7 +10,9 @@
 use crate::error::{ClusterError, Result};
 use crate::forward::{ChunkSink, PlanExecutor};
 use crate::health;
-use crate::rpc_codec::{ExecuteRequest, RaftRpc, ShufflePushRequest, TypedClusterError};
+use crate::rpc_codec::{
+    ExecuteRequest, RaftRpc, ShuffleProduceRequest, ShufflePushRequest, TypedClusterError,
+};
 use crate::transport::RaftRpcHandler;
 
 use super::loop_core::{CommitApplier, RaftLoop};
@@ -402,6 +404,20 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
     ) {
         if let Some(recv) = &self.shuffle_receiver {
             recv.on_shuffle_end(shuffle_id, part, side, error).await;
+        }
+    }
+
+    // Cross-node shuffle PRODUCER trigger (E4a) — delegate to the host-crate
+    // `ShuffleProducer`. When no producer is installed (cluster-only tests /
+    // single-node), return a typed "not configured" error so the coordinator
+    // learns the trigger could not run rather than silently succeeding.
+    async fn on_shuffle_produce(&self, req: ShuffleProduceRequest) -> Option<TypedClusterError> {
+        match &self.shuffle_producer {
+            Some(producer) => producer.on_shuffle_produce(req).await,
+            None => Some(TypedClusterError::Internal {
+                code: 0,
+                message: "shuffle producer not configured (no ShuffleProducer installed)".into(),
+            }),
         }
     }
 }

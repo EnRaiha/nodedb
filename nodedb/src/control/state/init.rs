@@ -376,10 +376,8 @@ impl SharedState {
                 // test-unique temp subdir to keep concurrent test inboxes
                 // isolated.
                 crate::control::server::shuffle::ShuffleReceiverRegistry::new(
-                    std::env::temp_dir().join(format!(
-                        "nodedb-shuffle-{}-{test_id}",
-                        std::process::id(),
-                    )),
+                    std::env::temp_dir()
+                        .join(format!("nodedb-shuffle-{}-{test_id}", std::process::id(),)),
                 ),
             ),
             shutdown: Arc::clone(&shutdown),

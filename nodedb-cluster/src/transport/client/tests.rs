@@ -17,7 +17,7 @@ use nodedb_raft::transport::RaftTransport;
 use crate::error::{ClusterError, Result};
 use crate::rpc_codec::RaftRpc;
 use crate::transport::credentials::TransportCredentials;
-use crate::transport::server::RaftRpcHandler;
+use crate::transport::rpc_handler::RaftRpcHandler;
 
 use super::NexarTransport;
 
@@ -86,6 +86,13 @@ impl RaftRpcHandler for EchoHandler {
         _side: u8,
         _error: Option<crate::rpc_codec::TypedClusterError>,
     ) {
+    }
+
+    async fn on_shuffle_produce(
+        &self,
+        _req: crate::rpc_codec::ShuffleProduceRequest,
+    ) -> Option<crate::rpc_codec::TypedClusterError> {
+        None
     }
 }
 

@@ -14,12 +14,15 @@ use std::net::SocketAddr;
 use futures::Stream;
 use tracing::debug;
 
+use std::sync::Arc;
+
 use crate::circuit_breaker::RetryPolicy;
 use crate::error::{ClusterError, Result};
 use crate::rpc_codec::{
     self, RaftRpc, ShufflePushChunk, ShufflePushEnd, ShufflePushRequest, TypedClusterError,
     auth_envelope,
 };
+use crate::transport::auth_context::AuthContext;
 use crate::transport::config::SNI_HOSTNAME;
 use crate::transport::server;
 use crate::wire_version::handshake_io::perform_version_handshake_client;
@@ -231,42 +234,26 @@ impl NexarTransport {
         req: ShufflePushRequest,
         batches: Vec<Vec<u8>>,
     ) -> Result<()> {
-        let conn = self.get_or_connect(target).await?;
-        let (mut send, _recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
-            detail: format!("open_bi (shuffle push) to node {target}: {e}"),
-        })?;
-
-        // Opening frame.
-        let req_envelope = self.wrap_outbound(&RaftRpc::ShufflePushRequest(req))?;
-        send.write_all(&req_envelope)
-            .await
-            .map_err(|e| ClusterError::Transport {
-                detail: format!("write shuffle push request to node {target}: {e}"),
-            })?;
-
-        // One chunk frame per pre-batched payload.
+        // Reimplemented on top of the incremental [`ShufflePushStream`] handle so
+        // the one-shot path and the E4a fanout sink share ONE wire encoder: open
+        // → push each pre-batched payload → finish with a clean EOF.
+        let mut stream = ShufflePushStream::open(self, target, req).await?;
         for payload in batches {
-            let chunk_envelope =
-                self.wrap_outbound(&RaftRpc::ShufflePushChunk(ShufflePushChunk { payload }))?;
-            send.write_all(&chunk_envelope)
-                .await
-                .map_err(|e| ClusterError::Transport {
-                    detail: format!("write shuffle push chunk to node {target}: {e}"),
-                })?;
+            stream.push_chunk(payload).await?;
         }
+        stream.finish(None).await
+    }
 
-        // Terminal clean-EOF frame, then finish the send half.
-        let end_envelope =
-            self.wrap_outbound(&RaftRpc::ShufflePushEnd(ShufflePushEnd { error: None }))?;
-        send.write_all(&end_envelope)
-            .await
-            .map_err(|e| ClusterError::Transport {
-                detail: format!("write shuffle push end to node {target}: {e}"),
-            })?;
-        send.finish().map_err(|e| ClusterError::Transport {
-            detail: format!("finish shuffle push to node {target}: {e}"),
-        })?;
-        Ok(())
+    /// Open an incremental shuffle-push stream to `target`.
+    ///
+    /// Thin convenience wrapper around [`ShufflePushStream::open`] for callers
+    /// that hold `&self` (the E4a fanout sink opens one per part).
+    pub async fn open_shuffle_push_stream(
+        &self,
+        target: u64,
+        req: ShufflePushRequest,
+    ) -> Result<ShufflePushStream> {
+        ShufflePushStream::open(self, target, req).await
     }
 
     /// Single-attempt RPC send (no retry, no circuit breaker).
@@ -346,6 +333,96 @@ impl NexarTransport {
         }
         rpc_codec::decode(inner_frame)
     }
+}
+
+/// An incremental producer → receiver shuffle-push stream (E4a).
+///
+/// The one-shot [`NexarTransport::send_shuffle_push`] writes every chunk up
+/// front; the E4a fanout sink instead opens one of these per target part and
+/// pushes chunks as the local scan produces rows, finishing the stream (clean
+/// EOF or terminal error) only once the scan ends. It owns its `quinn::SendStream`
+/// and an `Arc` clone of the transport's [`AuthContext`] so each frame is wrapped
+/// with a fresh outbound `seq` exactly like the one-shot path — no borrow of the
+/// transport is held for the stream's lifetime.
+///
+/// Each `write_all` is awaited inline, so QUIC flow control back-pressures the
+/// producer when the receiver falls behind — bounded memory, never a buffered
+/// whole side.
+pub struct ShufflePushStream {
+    send: quinn::SendStream,
+    auth: Arc<AuthContext>,
+    target: u64,
+}
+
+impl ShufflePushStream {
+    /// Open a bidi stream to `target` and write the opening
+    /// [`ShufflePushRequest`] envelope. The send half stays open for subsequent
+    /// [`push_chunk`](Self::push_chunk) calls; the receiver deposits frames and
+    /// never writes back.
+    pub async fn open(
+        transport: &NexarTransport,
+        target: u64,
+        req: ShufflePushRequest,
+    ) -> Result<Self> {
+        let conn = transport.get_or_connect(target).await?;
+        let (mut send, _recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
+            detail: format!("open_bi (shuffle push) to node {target}: {e}"),
+        })?;
+
+        let auth = Arc::clone(transport.auth());
+        let req_envelope = wrap_with_auth(&auth, &RaftRpc::ShufflePushRequest(req))?;
+        send.write_all(&req_envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write shuffle push request to node {target}: {e}"),
+            })?;
+
+        Ok(Self { send, auth, target })
+    }
+
+    /// Write one [`ShufflePushChunk`] envelope (a standalone msgpack row array).
+    pub async fn push_chunk(&mut self, payload: Vec<u8>) -> Result<()> {
+        let chunk_envelope = wrap_with_auth(
+            &self.auth,
+            &RaftRpc::ShufflePushChunk(ShufflePushChunk { payload }),
+        )?;
+        self.send
+            .write_all(&chunk_envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write shuffle push chunk to node {}: {e}", self.target),
+            })
+    }
+
+    /// Write the terminal [`ShufflePushEnd`] envelope (`error: None` for a clean
+    /// EOF, `Some(e)` to fail the receiver fast) and finish the send half.
+    pub async fn finish(mut self, error: Option<TypedClusterError>) -> Result<()> {
+        let end_envelope = wrap_with_auth(
+            &self.auth,
+            &RaftRpc::ShufflePushEnd(ShufflePushEnd { error }),
+        )?;
+        self.send
+            .write_all(&end_envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write shuffle push end to node {}: {e}", self.target),
+            })?;
+        self.send.finish().map_err(|e| ClusterError::Transport {
+            detail: format!("finish shuffle push to node {}: {e}", self.target),
+        })?;
+        Ok(())
+    }
+}
+
+/// Encode `rpc` and wrap it in an authenticated envelope with a fresh outbound
+/// `seq` — the standalone form of [`NexarTransport::wrap_outbound`] for the
+/// owned-[`AuthContext`] [`ShufflePushStream`].
+fn wrap_with_auth(auth: &AuthContext, rpc: &RaftRpc) -> Result<Vec<u8>> {
+    let inner = rpc_codec::encode(rpc)?;
+    let seq = auth.peer_seq_out.next();
+    let mut out = Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + inner.len());
+    auth_envelope::write_envelope(auth.local_node_id, seq, &inner, &auth.mac_key, &mut out)?;
+    Ok(out)
 }
 
 /// Map a terminal [`TypedClusterError`] carried by `ExecuteStreamEnd` into a

@@ -49,6 +49,15 @@ pub const RPC_EXECUTE_STREAM_END: u8 = 24;
 pub const RPC_SHUFFLE_PUSH_REQ: u8 = 25;
 pub const RPC_SHUFFLE_PUSH_CHUNK: u8 = 26;
 pub const RPC_SHUFFLE_PUSH_END: u8 = 27;
+/// Cross-node shuffle PRODUCER trigger (E4a). A coordinator sends a
+/// `RPC_SHUFFLE_PRODUCE_REQ` to a producer node; that node executes a local
+/// scan fragment, hash-partitions each output row, and fans the rows out to the
+/// per-part owners as `RPC_SHUFFLE_PUSH_*` streams (looping back into its own
+/// receiver registry for parts it owns). The producer replies with exactly one
+/// `RPC_SHUFFLE_PRODUCE_RESP` carrying terminal success or a typed error — it
+/// does NOT stream the scanned rows back to the coordinator.
+pub const RPC_SHUFFLE_PRODUCE_REQ: u8 = 28;
+pub const RPC_SHUFFLE_PRODUCE_RESP: u8 = 29;
 
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared

@@ -107,6 +107,13 @@ impl RaftRpcHandler for EchoHandler {
         _error: Option<nodedb_cluster::rpc_codec::TypedClusterError>,
     ) {
     }
+
+    async fn on_shuffle_produce(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ShuffleProduceRequest,
+    ) -> Option<nodedb_cluster::rpc_codec::TypedClusterError> {
+        None
+    }
 }
 
 fn sample_append(term: u64) -> AppendEntriesRequest {

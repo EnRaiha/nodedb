@@ -4343,6 +4343,7 @@ dependencies = [
  "nodedb-bridge",
  "nodedb-cluster",
  "nodedb-physical",
+ "nodedb-query",
  "nodedb-raft",
  "nodedb-test-support",
  "nodedb-types",

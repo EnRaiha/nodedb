@@ -41,8 +41,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nodedb_cluster::TypedClusterError;
-use nodedb_query::msgpack_scan;
 use tokio::io::AsyncWriteExt;
+
+use super::frame_explode::explode_row_array;
 
 /// Key for one shuffle receiver inbox: `(shuffle_id, part, side)`.
 ///
@@ -226,39 +227,6 @@ impl ShuffleInbox {
     pub fn take_error(&self) -> Option<TypedClusterError> {
         self.error.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
-}
-
-/// Explode a flat msgpack row array (the `encode_binary_rows` format) into
-/// individual row byte slices — one element per join row.
-///
-/// Mirrors the Data Plane's `decode_flat_row_array` (`provider_scan.rs`), reusing
-/// the shared `nodedb_query::msgpack_scan` reader so the slices are byte-identical
-/// to what `RowSource::ShuffleStream` later reads. An empty payload yields zero
-/// rows; a present-but-malformed header / truncated element is a hard error
-/// rather than a silent partial decode.
-fn explode_row_array(bytes: &[u8]) -> crate::Result<Vec<&[u8]>> {
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some((count, mut pos)) = msgpack_scan::array_header(bytes, 0) else {
-        return Err(crate::Error::Storage {
-            engine: "shuffle-stage".into(),
-            detail: "malformed shuffle chunk: expected a msgpack array header".into(),
-        });
-    };
-    let mut rows = Vec::with_capacity(count);
-    for i in 0..count {
-        let start = pos;
-        let Some(end) = msgpack_scan::skip_value(bytes, pos) else {
-            return Err(crate::Error::Storage {
-                engine: "shuffle-stage".into(),
-                detail: format!("malformed shuffle chunk: truncated row {i} of {count}"),
-            });
-        };
-        rows.push(&bytes[start..end]);
-        pos = end;
-    }
-    Ok(rows)
 }
 
 /// Registry of [`ShuffleInbox`]es keyed by `(shuffle_id, part, side)`.

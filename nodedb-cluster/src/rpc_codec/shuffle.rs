@@ -12,7 +12,7 @@
 //! Discriminants 25/26/27 are permanently assigned to these variants.
 
 use super::discriminants::*;
-use super::execute::TypedClusterError;
+use super::execute::{DescriptorVersionEntry, TypedClusterError};
 use super::header::write_frame;
 use super::raft_rpc::RaftRpc;
 use crate::error::{ClusterError, Result};
@@ -57,6 +57,67 @@ pub struct ShufflePushChunk {
 /// [`ExecuteStreamEnd`](super::execute::ExecuteStreamEnd).
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ShufflePushEnd {
+    pub error: Option<TypedClusterError>,
+}
+
+/// One `part -> owning node id` mapping entry of a [`ShuffleProduceRequest`]'s
+/// `part_node_map`. The coordinator computes this routing table; the producer
+/// node uses it to direct each hash-partitioned row's `(part)` to its owner
+/// (looping back for parts it owns itself).
+///
+/// Cross-version safety: new optional fields should be added as `Option<T>`.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct PartNodeEntry {
+    pub part: u32,
+    pub node_id: u64,
+}
+
+/// Cross-node shuffle PRODUCER trigger (E4a).
+///
+/// A coordinator sends this to a producer node to make it execute a LOCAL scan
+/// fragment (`plan_bytes`), hash-partition each output row on `keys`, and fan the
+/// rows out to the per-part owners (`part_node_map`) as `ShufflePush` streams —
+/// one `ShufflePushEnd` to EVERY part for this `side` so each receiver's per-part
+/// barrier reaches `producer_count`. The producer replies with exactly one
+/// [`ShuffleProduceResponse`]; it never streams the scanned rows back.
+///
+/// `side` is `0` for the build side and `1` for the probe side of a hash join.
+///
+/// The `plan_bytes` / `tenant_id` / `database_id` / `deadline_remaining_ms` /
+/// `trace_id` / `descriptor_versions` fields mirror
+/// [`ExecuteRequest`](super::execute::ExecuteRequest) so the producer can reuse
+/// the existing local streaming-execution prologue verbatim.
+///
+/// Cross-version safety: new optional fields should be added as `Option<T>`.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ShuffleProduceRequest {
+    pub shuffle_id: u64,
+    /// `0` = build side, `1` = probe side — the local side this producer scans.
+    pub side: u8,
+    pub num_parts: u32,
+    /// How many producers will `End` each `(part, side)`; forwarded into every
+    /// emitted `ShufflePushRequest` so receivers size their build barrier.
+    pub producer_count: u32,
+    /// Local-side join field names; each output row is hashed on these.
+    pub keys: Vec<String>,
+    /// `part -> owning node id` (coordinator-computed, sorted by `part`).
+    pub part_node_map: Vec<PartNodeEntry>,
+    /// Encoded `PhysicalPlan` of the local scan fragment to execute.
+    pub plan_bytes: Vec<u8>,
+    pub tenant_id: u64,
+    pub database_id: u64,
+    pub deadline_remaining_ms: u64,
+    pub trace_id: [u8; 16],
+    pub descriptor_versions: Vec<DescriptorVersionEntry>,
+}
+
+/// Terminal reply to a [`ShuffleProduceRequest`].
+///
+/// `error: None` means the producer fanned out every row and `End`ed every part
+/// cleanly. `error: Some(e)` means the local scan failed; the producer has
+/// already `End`ed every part with the same error so each receiver fails fast.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ShuffleProduceResponse {
     pub error: Option<TypedClusterError>,
 }
 
@@ -111,6 +172,34 @@ pub(super) fn decode_shuffle_push_end(payload: &[u8]) -> Result<RaftRpc> {
         payload,
         ShufflePushEnd,
         "ShufflePushEnd"
+    )?))
+}
+
+pub(super) fn encode_shuffle_produce_req(
+    msg: &ShuffleProduceRequest,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    write_frame(RPC_SHUFFLE_PRODUCE_REQ, &to_bytes!(msg)?, out)
+}
+pub(super) fn encode_shuffle_produce_resp(
+    msg: &ShuffleProduceResponse,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    write_frame(RPC_SHUFFLE_PRODUCE_RESP, &to_bytes!(msg)?, out)
+}
+
+pub(super) fn decode_shuffle_produce_req(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::ShuffleProduceRequest(from_bytes!(
+        payload,
+        ShuffleProduceRequest,
+        "ShuffleProduceRequest"
+    )?))
+}
+pub(super) fn decode_shuffle_produce_resp(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::ShuffleProduceResponse(from_bytes!(
+        payload,
+        ShuffleProduceResponse,
+        "ShuffleProduceResponse"
     )?))
 }
 
@@ -210,6 +299,124 @@ mod tests {
             Some(TypedClusterError::Internal { code, message }) => {
                 assert_eq!(code, 0xABCD);
                 assert!(message.contains("shuffle producer"));
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    fn roundtrip_produce_req(req: ShuffleProduceRequest) -> ShuffleProduceRequest {
+        let rpc = RaftRpc::ShuffleProduceRequest(req);
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::ShuffleProduceRequest(r) => r,
+            other => panic!("expected ShuffleProduceRequest, got {other:?}"),
+        }
+    }
+
+    fn roundtrip_produce_resp(resp: ShuffleProduceResponse) -> ShuffleProduceResponse {
+        let rpc = RaftRpc::ShuffleProduceResponse(resp);
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::ShuffleProduceResponse(r) => r,
+            other => panic!("expected ShuffleProduceResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_shuffle_produce_request() {
+        let req = ShuffleProduceRequest {
+            shuffle_id: 0x1234_5678_9ABC_DEF0,
+            side: 1,
+            num_parts: 4,
+            producer_count: 2,
+            keys: vec!["k".into(), "tenant.id".into()],
+            part_node_map: vec![
+                PartNodeEntry {
+                    part: 0,
+                    node_id: 7,
+                },
+                PartNodeEntry {
+                    part: 1,
+                    node_id: 9,
+                },
+                PartNodeEntry {
+                    part: 2,
+                    node_id: 7,
+                },
+                PartNodeEntry {
+                    part: 3,
+                    node_id: 9,
+                },
+            ],
+            plan_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            tenant_id: 42,
+            database_id: 3,
+            deadline_remaining_ms: 7000,
+            trace_id: [5u8; 16],
+            descriptor_versions: vec![DescriptorVersionEntry {
+                collection: "orders".into(),
+                version: 11,
+            }],
+        };
+        let decoded = roundtrip_produce_req(req.clone());
+        assert_eq!(decoded.shuffle_id, req.shuffle_id);
+        assert_eq!(decoded.side, 1);
+        assert_eq!(decoded.num_parts, 4);
+        assert_eq!(decoded.producer_count, 2);
+        assert_eq!(decoded.keys, vec!["k".to_string(), "tenant.id".to_string()]);
+        assert_eq!(decoded.part_node_map.len(), 4);
+        assert_eq!(decoded.part_node_map[2].part, 2);
+        assert_eq!(decoded.part_node_map[2].node_id, 7);
+        assert_eq!(decoded.plan_bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(decoded.tenant_id, 42);
+        assert_eq!(decoded.database_id, 3);
+        assert_eq!(decoded.deadline_remaining_ms, 7000);
+        assert_eq!(decoded.trace_id, [5u8; 16]);
+        assert_eq!(decoded.descriptor_versions.len(), 1);
+        assert_eq!(decoded.descriptor_versions[0].collection, "orders");
+        assert_eq!(decoded.descriptor_versions[0].version, 11);
+    }
+
+    #[test]
+    fn roundtrip_shuffle_produce_request_empty_keys_and_map() {
+        let req = ShuffleProduceRequest {
+            shuffle_id: 1,
+            side: 0,
+            num_parts: 1,
+            producer_count: 1,
+            keys: vec![],
+            part_node_map: vec![],
+            plan_bytes: vec![],
+            tenant_id: 0,
+            database_id: 0,
+            deadline_remaining_ms: 1000,
+            trace_id: [0u8; 16],
+            descriptor_versions: vec![],
+        };
+        let decoded = roundtrip_produce_req(req);
+        assert!(decoded.keys.is_empty());
+        assert!(decoded.part_node_map.is_empty());
+        assert!(decoded.descriptor_versions.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_shuffle_produce_response_clean() {
+        let decoded = roundtrip_produce_resp(ShuffleProduceResponse { error: None });
+        assert!(decoded.error.is_none());
+    }
+
+    #[test]
+    fn roundtrip_shuffle_produce_response_error() {
+        let decoded = roundtrip_produce_resp(ShuffleProduceResponse {
+            error: Some(TypedClusterError::Internal {
+                code: 0x55,
+                message: "produce scan failed".into(),
+            }),
+        });
+        match decoded.error {
+            Some(TypedClusterError::Internal { code, message }) => {
+                assert_eq!(code, 0x55);
+                assert!(message.contains("produce scan"));
             }
             other => panic!("expected Internal, got {other:?}"),
         }

@@ -9,8 +9,8 @@ use std::time::Duration;
 use nodedb_types::config::tuning::ClusterTransportTuning;
 
 use crate::error::{ClusterError, Result};
+use crate::transport::peer_identity_store::PeerIdentityStore;
 use crate::transport::pinned_verifier::{PinnedClientVerifier, PinnedServerVerifier};
-use crate::transport::server::PeerIdentityStore;
 
 /// Install rustls' `ring` CryptoProvider exactly once per process.
 ///

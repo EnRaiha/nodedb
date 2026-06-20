@@ -116,6 +116,36 @@ pub trait ShuffleReceiver: Send + Sync + 'static {
     );
 }
 
+/// Hook for the cross-node shuffle PRODUCER (E4a).
+///
+/// Sibling of [`ShuffleReceiver`]: `nodedb-cluster` cannot depend on `nodedb`
+/// (circular), so the produce logic — decode the local scan plan, run it through
+/// the local streaming executor, hash-partition each output row, and fan the
+/// rows out to the per-part owners (looping back into the local receiver
+/// registry for self-owned parts) — lives in `nodedb` behind this `Send + Sync`
+/// hook. The transport read-loop calls [`on_shuffle_produce`](Self::on_shuffle_produce)
+/// when a `ShuffleProduceRequest` arrives and writes the returned outcome back as
+/// a `ShuffleProduceResponse`.
+///
+/// Cluster-only tests leave the `RaftLoop` field `None`; a `ShuffleProduce`
+/// request against a node with no producer installed returns a typed
+/// "not configured" error.
+///
+/// The hook is **async** because the produce path drives QUIC fan-out streams
+/// and the local streaming executor on the Tokio transport reactor. QUIC is fine
+/// here (Control Plane); the local scan itself is dispatched to the Data Plane
+/// through the existing SPSC bridge by the host-crate implementation.
+#[async_trait::async_trait]
+pub trait ShuffleProducer: Send + Sync + 'static {
+    /// Run the local scan fragment, hash-partition its rows, and fan them out to
+    /// the part-owners. Returns `None` on a clean produce or `Some(err)` on a
+    /// terminal scan failure (after every part has been `End`ed with the error).
+    async fn on_shuffle_produce(
+        &self,
+        req: crate::rpc_codec::ShuffleProduceRequest,
+    ) -> Option<crate::rpc_codec::TypedClusterError>;
+}
+
 /// Type-erased async handler for incoming `VShardEnvelope` messages.
 ///
 /// Receives raw envelope bytes, returns response bytes. Set by the main binary
@@ -219,6 +249,14 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// any incoming `ShufflePush` stream return a typed "not configured" error.
     pub(super) shuffle_receiver: Option<Arc<dyn ShuffleReceiver>>,
 
+    /// Optional cross-node shuffle PRODUCER (E4a).
+    ///
+    /// When set (by the `nodedb` binary via `with_shuffle_producer`), an incoming
+    /// `ShuffleProduceRequest` runs the local scan + hash-partition fan-out
+    /// through it. Cluster-only tests leave this `None`, which makes any incoming
+    /// `ShuffleProduce` request return a typed "not configured" error.
+    pub(super) shuffle_producer: Option<Arc<dyn ShuffleProducer>>,
+
     /// In-progress partial snapshot receives, keyed by `group_id`.
     ///
     /// Each entry tracks the `.partial` file, running CRC, and expected next
@@ -267,6 +305,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             prev_metadata_leader: std::sync::atomic::AtomicBool::new(false),
             snapshot_quarantine_hook: None,
             shuffle_receiver: None,
+            shuffle_producer: None,
             partial_snapshots: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             data_dir: None,
             snapshot_chunk_bytes: 4 * 1024 * 1024,
@@ -303,6 +342,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             prev_metadata_leader: self.prev_metadata_leader,
             snapshot_quarantine_hook: self.snapshot_quarantine_hook,
             shuffle_receiver: self.shuffle_receiver,
+            shuffle_producer: self.shuffle_producer,
             partial_snapshots: self.partial_snapshots,
             data_dir: self.data_dir,
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
@@ -338,6 +378,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// build barrier.
     pub fn with_shuffle_receiver(mut self, receiver: Arc<dyn ShuffleReceiver>) -> Self {
         self.shuffle_receiver = Some(receiver);
+        self
+    }
+
+    /// Attach the cross-node shuffle PRODUCER (E4a, builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s local streaming executor
+    /// and receiver registry) is called by the `ShuffleProduce` transport handler
+    /// to run the local scan, hash-partition its rows, and fan them out to the
+    /// part-owners.
+    pub fn with_shuffle_producer(mut self, producer: Arc<dyn ShuffleProducer>) -> Self {
+        self.shuffle_producer = Some(producer);
         self
     }
 

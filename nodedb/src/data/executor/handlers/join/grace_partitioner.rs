@@ -19,9 +19,7 @@
 //! non-matching rows are harmless: the per-partition `probe_hash_index` still
 //! memcmp-rejects them exactly as the un-partitioned path does.
 
-use std::hash::Hasher;
-
-use super::hash::{HashIndex, ProbeParams, extract_join_key_range, probe_hash_index};
+use super::hash::{HashIndex, ProbeParams, probe_hash_index};
 
 /// Immutable configuration for a grace-hash join — the join-key fields on each
 /// side, the join type, the output limit, the collection/alias prefixes used to
@@ -59,7 +57,10 @@ pub(super) struct GraceSpec<'a> {
 /// must NOT change, since the spiller's top-level partition routing depends on
 /// it being stable across calls.
 pub(super) fn partition_hash<S: AsRef<str>>(doc: &[u8], keys: &[S]) -> u64 {
-    partition_hash_seeded(doc, keys, 0)
+    // Delegate to the shared `nodedb-query` routing hash so the node-local grace
+    // join and the cross-node shuffle producer compute byte-identical partitions
+    // (build/probe co-location is a correctness invariant, not an optimization).
+    nodedb_query::partition_hash(doc, keys)
 }
 
 /// Seeded variant of [`partition_hash`] used for RECURSIVE re-partitioning of a
@@ -78,17 +79,7 @@ pub(super) fn partition_hash<S: AsRef<str>>(doc: &[u8], keys: &[S]) -> u64 {
 /// The seed is written first so that the same `(seed, keys)` pair on the build
 /// and probe sides produces matching routing.
 pub(super) fn partition_hash_seeded<S: AsRef<str>>(doc: &[u8], keys: &[S], seed: u64) -> u64 {
-    let mut hasher = std::hash::DefaultHasher::new();
-    hasher.write_u64(seed);
-    for key in keys {
-        if let Some((start, end)) = extract_join_key_range(doc, key.as_ref()) {
-            hasher.write(&doc[start..end]);
-        } else {
-            // Missing field — hash the same NIL sentinel `hash_join_key` uses.
-            hasher.write_u8(0xc0);
-        }
-    }
-    hasher.finish()
+    nodedb_query::partition_hash_seeded(doc, keys, seed)
 }
 
 /// In-memory grace join: partition both inputs by `partition_hash`, then run

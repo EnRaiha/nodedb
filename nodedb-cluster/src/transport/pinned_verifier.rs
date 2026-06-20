@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use tracing::{debug, warn};
 
+use crate::transport::peer_identity_store::PeerIdentityStore;
 use crate::transport::peer_identity_verifier::{spiffe_id_from_cert_der, spki_pin_from_cert_der};
-use crate::transport::server::PeerIdentityStore;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Inbound verifier (server-side client-cert check)
@@ -239,8 +239,8 @@ mod tests {
 
     use super::*;
     use crate::topology::{NodeInfo, NodeState};
+    use crate::transport::peer_identity_store::PeerIdentityStore;
     use crate::transport::peer_identity_verifier::spki_pin_from_cert_der;
-    use crate::transport::server::PeerIdentityStore;
 
     // ── Test identity store ──────────────────────────────────────────────────
 
@@ -411,7 +411,7 @@ mod tests {
     /// CA by using the `NoopIdentityStore` path.
     #[test]
     fn pinned_client_verifier_noop_store_bootstrap_window() {
-        use crate::transport::server::NoopIdentityStore;
+        use crate::transport::peer_identity_store::NoopIdentityStore;
 
         // With NoopIdentityStore both find_by_spki and find_by_spiffe return None,
         // so check_cert_pin always returns Ok (bootstrap window).

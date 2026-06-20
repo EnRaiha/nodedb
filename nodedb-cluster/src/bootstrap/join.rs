@@ -550,6 +550,13 @@ mod tests {
                 _error: Option<crate::rpc_codec::TypedClusterError>,
             ) {
             }
+
+            async fn on_shuffle_produce(
+                &self,
+                _req: crate::rpc_codec::ShuffleProduceRequest,
+            ) -> Option<crate::rpc_codec::TypedClusterError> {
+                None
+            }
         }
 
         let handler = Arc::new(JoinHandler {

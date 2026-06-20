@@ -22,5 +22,6 @@ pub mod proposals;
 pub mod tick;
 
 pub use loop_core::{
-    CommitApplier, RaftLoop, ShuffleReceiver, SnapshotQuarantineHook, VShardEnvelopeHandler,
+    CommitApplier, RaftLoop, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
+    VShardEnvelopeHandler,
 };

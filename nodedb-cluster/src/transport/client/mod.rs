@@ -15,6 +15,7 @@ pub mod send;
 pub mod serve;
 pub mod transport;
 
+pub use send::ShufflePushStream;
 pub use transport::{NexarTransport, TransportPeerSnapshot};
 
 #[cfg(test)]

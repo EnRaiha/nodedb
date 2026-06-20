@@ -40,123 +40,16 @@ use tracing::{debug, warn};
 use crate::error::{ClusterError, Result};
 use crate::forward::ChunkSink;
 use crate::rpc_codec::{
-    self, ExecuteRequest, ExecuteStreamChunk, ExecuteStreamEnd, MAX_RPC_PAYLOAD_SIZE, RaftRpc,
-    ShufflePushRequest, TypedClusterError, auth_envelope,
+    self, ExecuteStreamChunk, ExecuteStreamEnd, MAX_RPC_PAYLOAD_SIZE, RaftRpc,
+    ShuffleProduceResponse, auth_envelope,
 };
-use crate::topology::NodeInfo;
 use crate::transport::auth_context::AuthContext;
+use crate::transport::peer_identity_store::PeerIdentityStore;
 use crate::transport::peer_identity_verifier::{
     IDENTITY_MISMATCH_QUIC_ERROR, VerifyOutcome, verify_peer_identity,
 };
+use crate::transport::rpc_handler::RaftRpcHandler;
 use crate::wire_version::handshake_io::{local_version_range, perform_version_handshake_server};
-
-/// Topology-decoupled lookup for per-node identity pins.
-///
-/// The server needs to check the TLS peer cert against the pinned
-/// `NodeInfo` for the MAC-verified `from_node_id`, but it must not
-/// take a direct dependency on `ClusterState` or `ClusterTopology`
-/// (which would create a circular crate dependency and would be hard
-/// to test).  Implementors wrap whatever topology store they have.
-///
-/// The `NoopIdentityStore` below is used in insecure-transport mode
-/// and in unit tests that do not exercise the identity layer.
-///
-/// The `find_by_spki` and `find_by_spiffe` methods are called by the
-/// TLS-layer [`PinnedClientVerifier`] and [`PinnedServerVerifier`]
-/// during the QUIC handshake (before `node_id` is known from the MAC
-/// envelope). They search the topology by the cert's identity rather
-/// than by node_id.
-///
-/// [`PinnedClientVerifier`]: crate::transport::config::PinnedClientVerifier
-/// [`PinnedServerVerifier`]: crate::transport::config::PinnedServerVerifier
-pub trait PeerIdentityStore: Send + Sync + 'static {
-    /// Return the `NodeInfo` for the given node_id, or `None` if
-    /// the node is not in the topology (treat as bootstrap window).
-    fn get_node_info(&self, node_id: u64) -> Option<NodeInfo>;
-
-    /// Return the `NodeInfo` for the node whose pinned SPKI fingerprint
-    /// matches `spki`, or `None` if no node in the topology has that pin.
-    ///
-    /// Used by the TLS-layer verifiers during the handshake (before the
-    /// MAC envelope reveals `node_id`).
-    fn find_by_spki(&self, spki: &[u8; 32]) -> Option<NodeInfo>;
-
-    /// Return the `NodeInfo` for the node whose pinned SPIFFE id matches
-    /// `spiffe_id`, or `None` if no node has that id.
-    ///
-    /// Used by the TLS-layer verifiers during the handshake.
-    fn find_by_spiffe(&self, spiffe_id: &str) -> Option<NodeInfo>;
-}
-
-/// Always returns `None`, accepting every peer as a bootstrap window.
-///
-/// Used when mTLS is disabled (insecure transport) or in unit tests
-/// that focus on HMAC / codec layers rather than identity binding.
-pub struct NoopIdentityStore;
-
-impl PeerIdentityStore for NoopIdentityStore {
-    fn get_node_info(&self, _node_id: u64) -> Option<NodeInfo> {
-        None
-    }
-
-    fn find_by_spki(&self, _spki: &[u8; 32]) -> Option<NodeInfo> {
-        None
-    }
-
-    fn find_by_spiffe(&self, _spiffe_id: &str) -> Option<NodeInfo> {
-        None
-    }
-}
-
-/// Trait for handling incoming Raft RPCs.
-///
-/// Implementors receive a request [`RaftRpc`] and return the corresponding
-/// response variant. The transport calls this for each incoming bidi stream.
-pub trait RaftRpcHandler: Send + Sync + 'static {
-    fn handle_rpc(&self, rpc: RaftRpc)
-    -> impl std::future::Future<Output = Result<RaftRpc>> + Send;
-
-    /// Handle a streaming `ExecuteStreamRequest`: execute the plan and push
-    /// each result frame to `sink`. Returns `None` on a clean EOF or
-    /// `Some(err)` on a terminal failure. The transport writes one
-    /// `RPC_EXECUTE_STREAM_END` envelope carrying this outcome after the call
-    /// returns. See [`crate::forward::PlanExecutor::execute_plan_streaming`].
-    fn handle_rpc_streaming(
-        &self,
-        req: ExecuteRequest,
-        sink: impl ChunkSink,
-    ) -> impl std::future::Future<Output = Option<TypedClusterError>> + Send;
-
-    /// Cross-node streaming shuffle (E1) — opening frame of a `ShufflePush`
-    /// stream. Lazily creates the receiver inbox for `(shuffle_id, part, side)`
-    /// carrying `producer_count` and `num_parts`.
-    fn on_shuffle_request(
-        &self,
-        req: ShufflePushRequest,
-    ) -> impl std::future::Future<Output = ()> + Send;
-
-    /// Deposit one shuffle chunk payload into the receiver inbox. Bounded —
-    /// the implementation blocks while the inbox buffer is full so QUIC flow
-    /// control back-pressures the producer.
-    fn on_shuffle_chunk(
-        &self,
-        shuffle_id: u64,
-        part: u32,
-        side: u8,
-        payload: Vec<u8>,
-    ) -> impl std::future::Future<Output = Result<()>> + Send;
-
-    /// Terminal frame for one producer of a `ShufflePush` stream: record the
-    /// `End` (advancing the per-part build barrier) and capture any terminal
-    /// error.
-    fn on_shuffle_end(
-        &self,
-        shuffle_id: u64,
-        part: u32,
-        side: u8,
-        error: Option<TypedClusterError>,
-    ) -> impl std::future::Future<Output = ()> + Send;
-}
 
 /// Transport-local [`ChunkSink`] that writes one `RPC_EXECUTE_STREAM_CHUNK`
 /// envelope per chunk to a QUIC send stream.
@@ -495,6 +388,39 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
                     }
                 }
             }
+        }
+
+        // 4d. Cross-node shuffle PRODUCER trigger (E4a): a `ShuffleProduceRequest`
+        //     is a ONE-SHOT request/response (NOT a stream from the coordinator).
+        //     The producer runs a local scan, fans the hash-partitioned rows out
+        //     to the part-owners on its OWN outbound `ShufflePush` streams, then
+        //     replies with exactly one `ShuffleProduceResponse` carrying terminal
+        //     success or a typed error so the coordinator can await completion.
+        //     The reply is written on this same bidi stream's send half (mirroring
+        //     the one-shot `handle_rpc` reply below), then `finish()`ed.
+        if let RaftRpc::ShuffleProduceRequest(req) = request {
+            let error = handler.on_shuffle_produce(req).await;
+            let resp_rpc = RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error });
+            let resp_inner = rpc_codec::encode(&resp_rpc)?;
+            let resp_seq = auth.peer_seq_out.next();
+            let mut resp_envelope =
+                Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
+            auth_envelope::write_envelope(
+                auth.local_node_id,
+                resp_seq,
+                &resp_inner,
+                &auth.mac_key,
+                &mut resp_envelope,
+            )?;
+            send.write_all(&resp_envelope)
+                .await
+                .map_err(|e| ClusterError::Transport {
+                    detail: format!("write shuffle produce response: {e}"),
+                })?;
+            send.finish().map_err(|e| ClusterError::Transport {
+                detail: format!("finish shuffle produce response: {e}"),
+            })?;
+            return Ok::<(), ClusterError>(());
         }
 
         let response = handler.handle_rpc(request).await?;

@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::error::Result;
-use crate::transport::server::{self, NoopIdentityStore, PeerIdentityStore, RaftRpcHandler};
+use crate::transport::peer_identity_store::{NoopIdentityStore, PeerIdentityStore};
+use crate::transport::rpc_handler::RaftRpcHandler;
+use crate::transport::server;
 
 use super::transport::NexarTransport;
 
