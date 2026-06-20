@@ -134,6 +134,16 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_assign_surrogate(
+        &self,
+        _req: nodedb_cluster::rpc_codec::AssignSurrogateRequest,
+    ) -> nodedb_cluster::rpc_codec::AssignSurrogateResponse {
+        nodedb_cluster::rpc_codec::AssignSurrogateResponse {
+            surrogate: 0,
+            error: None,
+        }
+    }
 }
 
 fn sample_append(term: u64) -> AppendEntriesRequest {

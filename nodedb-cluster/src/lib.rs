@@ -113,8 +113,8 @@ pub use migration_executor::{
 };
 pub use multi_raft::{GroupStatus, MultiRaft};
 pub use raft_loop::{
-    CommitApplier, RaftLoop, ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver,
-    SnapshotQuarantineHook, VShardEnvelopeHandler,
+    AssignRemoteSurrogate, CommitApplier, RaftLoop, ShuffleAggregator, ShuffleConsumer,
+    ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook, VShardEnvelopeHandler,
 };
 pub use reachability::{
     NoopProber, ReachabilityDriver, ReachabilityDriverConfig, ReachabilityProber, TransportProber,
@@ -128,10 +128,10 @@ pub use rebalancer::{
 pub use routing::RoutingTable;
 pub use routing_liveness::{NodeIdResolver, RoutingLivenessHook};
 pub use rpc_codec::{
-    JoinKeyPair, MacKey, PartNodeEntry, RaftRpc, ShuffleAggregateConsumeRequest,
-    ShuffleAggregateConsumeResponse, ShuffleConsumeRequest, ShuffleConsumeResponse,
-    ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk, ShufflePushEnd,
-    ShufflePushRequest, SortKey, TypedClusterError,
+    AssignSurrogateRequest, AssignSurrogateResponse, JoinKeyPair, MacKey, PartNodeEntry, RaftRpc,
+    ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk,
+    ShufflePushEnd, ShufflePushRequest, SortKey, TypedClusterError,
 };
 pub use topology::{ClusterTopology, NodeInfo, NodeState};
 pub use transport::{

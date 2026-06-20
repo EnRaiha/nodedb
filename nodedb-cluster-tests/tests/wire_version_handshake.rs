@@ -100,6 +100,16 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_assign_surrogate(
+        &self,
+        _req: nodedb_cluster::rpc_codec::AssignSurrogateRequest,
+    ) -> nodedb_cluster::rpc_codec::AssignSurrogateResponse {
+        nodedb_cluster::rpc_codec::AssignSurrogateResponse {
+            surrogate: 0,
+            error: None,
+        }
+    }
 }
 
 /// Handler that records whether it was ever invoked.
@@ -189,6 +199,20 @@ impl RaftRpcHandler for SentinelHandler {
             error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
                 code: 0,
                 message: "sentinel: unexpected aggregate dispatch".into(),
+            }),
+        }
+    }
+
+    async fn on_assign_surrogate(
+        &self,
+        _req: nodedb_cluster::rpc_codec::AssignSurrogateRequest,
+    ) -> nodedb_cluster::rpc_codec::AssignSurrogateResponse {
+        self.invoked.store(true, Ordering::SeqCst);
+        nodedb_cluster::rpc_codec::AssignSurrogateResponse {
+            surrogate: 0,
+            error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
+                code: 0,
+                message: "sentinel: unexpected assign-surrogate dispatch".into(),
             }),
         }
     }

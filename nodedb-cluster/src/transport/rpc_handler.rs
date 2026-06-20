@@ -6,9 +6,9 @@
 use crate::error::Result;
 use crate::forward::ChunkSink;
 use crate::rpc_codec::{
-    ExecuteRequest, RaftRpc, ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse,
-    ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest,
-    TypedClusterError,
+    AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
+    ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, TypedClusterError,
 };
 
 /// Trait for handling incoming Raft RPCs.
@@ -95,4 +95,15 @@ pub trait RaftRpcHandler: Send + Sync + 'static {
         &self,
         req: ShuffleAggregateConsumeRequest,
     ) -> impl std::future::Future<Output = ShuffleAggregateConsumeResponse> + Send;
+
+    /// Routed-surrogate-exchange (F1b). This node is the LEADER of the home
+    /// vShard for the `(collection, pk)` endpoint key carried by `req`:
+    /// assign-or-return the AUTHORITATIVE global surrogate (a LOCAL assign on the
+    /// leader yields the authoritative, first-wins, idempotent value) and return
+    /// it. The transport writes exactly one [`AssignSurrogateResponse`] carrying
+    /// the surrogate (or a typed error) back to the coordinator.
+    fn on_assign_surrogate(
+        &self,
+        req: AssignSurrogateRequest,
+    ) -> impl std::future::Future<Output = AssignSurrogateResponse> + Send;
 }

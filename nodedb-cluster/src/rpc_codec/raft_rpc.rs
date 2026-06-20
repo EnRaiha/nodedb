@@ -20,7 +20,8 @@ use super::shuffle::{
     ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk,
     ShufflePushEnd, ShufflePushRequest,
 };
-use super::{cluster_mgmt, data_propose, execute, metadata, raft_msgs, shuffle, vshard};
+use super::surrogate::{AssignSurrogateRequest, AssignSurrogateResponse};
+use super::{cluster_mgmt, data_propose, execute, metadata, raft_msgs, shuffle, surrogate, vshard};
 use crate::error::{ClusterError, Result};
 use crate::wire_version::{unwrap_bytes_versioned, wrap_bytes_versioned};
 
@@ -84,6 +85,13 @@ pub enum RaftRpc {
     // carrying the aggregate rows.
     ShuffleAggregateConsumeRequest(ShuffleAggregateConsumeRequest),
     ShuffleAggregateConsumeResponse(ShuffleAggregateConsumeResponse),
+    // Routed-surrogate-exchange (F1b). A coordinator planning a cross-shard
+    // graph edge sends an `AssignSurrogateRequest` to the home vShard's leader;
+    // that leader assign-or-returns the authoritative surrogate for the
+    // `(collection, pk)` endpoint key and replies with one
+    // `AssignSurrogateResponse`.
+    AssignSurrogateRequest(AssignSurrogateRequest),
+    AssignSurrogateResponse(AssignSurrogateResponse),
     // Data-group proposal forwarding (groups 1+)
     DataProposeRequest(DataProposeRequest),
     DataProposeResponse(DataProposeResponse),
@@ -126,6 +134,8 @@ pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
         RaftRpc::ShuffleAggregateConsumeResponse(m) => {
             shuffle::encode_shuffle_agg_consume_resp(m, &mut out)
         }
+        RaftRpc::AssignSurrogateRequest(m) => surrogate::encode_assign_surrogate_req(m, &mut out),
+        RaftRpc::AssignSurrogateResponse(m) => surrogate::encode_assign_surrogate_resp(m, &mut out),
         RaftRpc::DataProposeRequest(m) => data_propose::encode_data_propose_req(m, &mut out),
         RaftRpc::DataProposeResponse(m) => data_propose::encode_data_propose_resp(m, &mut out),
     }?;
@@ -200,6 +210,8 @@ pub fn decode(data: &[u8]) -> Result<RaftRpc> {
         RPC_SHUFFLE_CONSUME_RESP => shuffle::decode_shuffle_consume_resp(payload),
         RPC_SHUFFLE_AGG_CONSUME_REQ => shuffle::decode_shuffle_agg_consume_req(payload),
         RPC_SHUFFLE_AGG_CONSUME_RESP => shuffle::decode_shuffle_agg_consume_resp(payload),
+        RPC_ASSIGN_SURROGATE_REQ => surrogate::decode_assign_surrogate_req(payload),
+        RPC_ASSIGN_SURROGATE_RESP => surrogate::decode_assign_surrogate_resp(payload),
         RPC_DATA_PROPOSE_REQ => data_propose::decode_data_propose_req(payload),
         RPC_DATA_PROPOSE_RESP => data_propose::decode_data_propose_resp(payload),
         _ => Err(ClusterError::Codec {

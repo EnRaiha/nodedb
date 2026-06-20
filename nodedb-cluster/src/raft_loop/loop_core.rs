@@ -25,7 +25,8 @@ use crate::topology::ClusterTopology;
 use crate::transport::NexarTransport;
 
 use super::hooks::{
-    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
+    AssignRemoteSurrogate, ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver,
+    SnapshotQuarantineHook,
 };
 
 /// Default tick interval (10ms — fast enough for sub-second elections).
@@ -174,6 +175,16 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// `ShuffleAggregateConsume` request return a typed "not configured" error.
     pub(super) shuffle_aggregator: Option<Arc<dyn ShuffleAggregator>>,
 
+    /// Optional routed-surrogate-exchange assigner (F1b).
+    ///
+    /// When set (by the `nodedb` binary via `with_assign_remote_surrogate`), an
+    /// incoming `AssignSurrogateRequest` runs a LOCAL `SurrogateAssigner::assign`
+    /// for the endpoint key through it (this node IS the home vShard leader, so a
+    /// local assign yields the authoritative value). Cluster-only tests leave
+    /// this `None`, which makes any incoming `AssignSurrogate` request return a
+    /// typed "not configured" error.
+    pub(super) assign_remote_surrogate: Option<Arc<dyn AssignRemoteSurrogate>>,
+
     /// In-progress partial snapshot receives, keyed by `group_id`.
     ///
     /// Each entry tracks the `.partial` file, running CRC, and expected next
@@ -225,6 +236,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             shuffle_producer: None,
             shuffle_consumer: None,
             shuffle_aggregator: None,
+            assign_remote_surrogate: None,
             partial_snapshots: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             data_dir: None,
             snapshot_chunk_bytes: 4 * 1024 * 1024,

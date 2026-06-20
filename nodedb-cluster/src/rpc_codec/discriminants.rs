@@ -75,6 +75,14 @@ pub const RPC_SHUFFLE_CONSUME_RESP: u8 = 31;
 /// single-sided aggregate sibling of `RPC_SHUFFLE_CONSUME_*`.
 pub const RPC_SHUFFLE_AGG_CONSUME_REQ: u8 = 32;
 pub const RPC_SHUFFLE_AGG_CONSUME_RESP: u8 = 33;
+/// Routed-surrogate-exchange (F1b). A coordinator planning a cross-shard graph
+/// edge sends a `RPC_ASSIGN_SURROGATE_REQ` to the LEADER of the endpoint key's
+/// home vShard; that leader assign-or-returns the AUTHORITATIVE global surrogate
+/// for `(collection, pk)` (a LOCAL assign on the leader yields the authoritative
+/// value) and replies with exactly one `RPC_ASSIGN_SURROGATE_RESP` carrying the
+/// surrogate (or a typed error). One-shot request/response — no streaming.
+pub const RPC_ASSIGN_SURROGATE_REQ: u8 = 34;
+pub const RPC_ASSIGN_SURROGATE_RESP: u8 = 35;
 
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared

@@ -171,6 +171,15 @@ pub fn start_raft(
     let shuffle_aggregator: Arc<dyn nodedb_cluster::ShuffleAggregator> =
         Arc::new(crate::control::server::shuffle::RegistryShuffleAggregator::new(shared.clone()));
 
+    // Routed-surrogate-exchange (F1b): when this node is the home vShard's leader
+    // for a `(collection, pk)` endpoint key, assign-or-return the authoritative
+    // surrogate via a LOCAL `SurrogateAssigner::assign`.
+    let assign_remote_surrogate: Arc<dyn nodedb_cluster::AssignRemoteSurrogate> = Arc::new(
+        crate::control::server::surrogate_exchange::RegistryAssignRemoteSurrogate::new(
+            shared.clone(),
+        ),
+    );
+
     let raft_loop = Arc::new(
         nodedb_cluster::RaftLoop::new(
             multi_raft,
@@ -188,6 +197,7 @@ pub fn start_raft(
         .with_shuffle_producer(shuffle_producer)
         .with_shuffle_consumer(shuffle_consumer)
         .with_shuffle_aggregator(shuffle_aggregator)
+        .with_assign_remote_surrogate(assign_remote_surrogate)
         .with_data_dir(_data_dir.to_path_buf())
         .with_snapshot_chunk_bytes(snapshot_chunk_bytes)
         .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs),

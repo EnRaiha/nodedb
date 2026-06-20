@@ -114,6 +114,16 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_assign_surrogate(
+        &self,
+        _req: crate::rpc_codec::AssignSurrogateRequest,
+    ) -> crate::rpc_codec::AssignSurrogateResponse {
+        crate::rpc_codec::AssignSurrogateResponse {
+            surrogate: 0,
+            error: None,
+        }
+    }
 }
 
 fn make_transport(node_id: u64) -> NexarTransport {

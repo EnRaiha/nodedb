@@ -67,7 +67,7 @@ pub(super) fn distinct_data_node_count(routing: &RoutingTable) -> usize {
 /// correct). Missing topology / address for a node is left alone so the
 /// subsequent `send_rpc` surfaces the typed `NodeUnreachable` rather than this
 /// silently masking it.
-pub(super) fn register_peers_from_topology(
+pub(crate) fn register_peers_from_topology(
     state: &SharedState,
     transport: &nodedb_cluster::NexarTransport,
     nodes: &BTreeSet<u64>,

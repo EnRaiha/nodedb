@@ -14,8 +14,8 @@
 
 use crate::error::{ClusterError, Result};
 use crate::rpc_codec::{
-    self, RaftRpc, ShuffleAggregateConsumeResponse, ShuffleConsumeResponse, ShuffleProduceResponse,
-    auth_envelope,
+    self, AssignSurrogateResponse, RaftRpc, ShuffleAggregateConsumeResponse,
+    ShuffleConsumeResponse, ShuffleProduceResponse, auth_envelope,
 };
 use crate::transport::auth_context::AuthContext;
 use crate::transport::rpc_handler::RaftRpcHandler;
@@ -132,6 +132,38 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
             })?;
         send.finish().map_err(|e| ClusterError::Transport {
             detail: format!("finish shuffle aggregate consume response: {e}"),
+        })?;
+        return Ok(None);
+    }
+
+    // 4g. Routed-surrogate-exchange (F1b): an `AssignSurrogateRequest` is a
+    //     ONE-SHOT request/response. This node is the home vShard's leader; it
+    //     assign-or-returns the authoritative surrogate for the `(collection,
+    //     pk)` endpoint key and replies with exactly one
+    //     `AssignSurrogateResponse` carrying the surrogate (or a typed error).
+    //     The reply is written on this same bidi stream's send half (mirroring
+    //     the consume arms above), then `finish()`ed.
+    if let RaftRpc::AssignSurrogateRequest(req) = request {
+        let resp: AssignSurrogateResponse = handler.on_assign_surrogate(req).await;
+        let resp_rpc = RaftRpc::AssignSurrogateResponse(resp);
+        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_seq = auth.peer_seq_out.next();
+        let mut resp_envelope =
+            Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
+        auth_envelope::write_envelope(
+            auth.local_node_id,
+            resp_seq,
+            &resp_inner,
+            &auth.mac_key,
+            &mut resp_envelope,
+        )?;
+        send.write_all(&resp_envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write assign surrogate response: {e}"),
+            })?;
+        send.finish().map_err(|e| ClusterError::Transport {
+            detail: format!("finish assign surrogate response: {e}"),
         })?;
         return Ok(None);
     }

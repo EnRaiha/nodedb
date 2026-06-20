@@ -184,3 +184,39 @@ pub trait ShuffleAggregator: Send + Sync + 'static {
         req: crate::rpc_codec::ShuffleAggregateConsumeRequest,
     ) -> crate::rpc_codec::ShuffleAggregateConsumeResponse;
 }
+
+/// Hook for routed-surrogate-exchange (F1b).
+///
+/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the assign logic —
+/// run a LOCAL `SurrogateAssigner::assign` for the `(collection, pk)` endpoint
+/// key carried by the request — lives in `nodedb` behind this `Send + Sync` hook.
+/// The transport read-loop calls [`on_assign_surrogate`](Self::on_assign_surrogate)
+/// when an `AssignSurrogateRequest` arrives at the home vShard's LEADER and writes
+/// the returned [`AssignSurrogateResponse`](crate::rpc_codec::AssignSurrogateResponse)
+/// back to the coordinator.
+///
+/// Because the handler runs on the home node (the vShard leader), a LOCAL assign
+/// yields the AUTHORITATIVE surrogate: the first call allocates it and every later
+/// call for the same key returns the same value (idempotent, first-wins). The
+/// coordinator routes here precisely so the value it carries is the one the home
+/// node will store under.
+///
+/// Cluster-only tests leave the `RaftLoop` field `None`; an `AssignSurrogate`
+/// request against a node with no assigner installed returns a typed "not
+/// configured" error.
+///
+/// The hook is **async** for signature symmetry with the other one-shot hooks;
+/// the host-crate implementation performs a synchronous local assign (the
+/// `SurrogateAssigner` is a sync `Send + Sync` facade) and never touches
+/// io_uring or the Data Plane directly.
+#[async_trait::async_trait]
+pub trait AssignRemoteSurrogate: Send + Sync + 'static {
+    /// Assign-or-return the authoritative surrogate for the `(collection, pk)`
+    /// endpoint key carried by `req`. Returns an [`AssignSurrogateResponse`] with
+    /// the surrogate on success or a typed error on failure (never a silent
+    /// drop).
+    async fn on_assign_surrogate(
+        &self,
+        req: crate::rpc_codec::AssignSurrogateRequest,
+    ) -> crate::rpc_codec::AssignSurrogateResponse;
+}

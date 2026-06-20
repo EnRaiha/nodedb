@@ -11,9 +11,9 @@ use crate::error::{ClusterError, Result};
 use crate::forward::{ChunkSink, PlanExecutor};
 use crate::health;
 use crate::rpc_codec::{
-    ExecuteRequest, RaftRpc, ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse,
-    ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest,
-    TypedClusterError,
+    AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
+    ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, TypedClusterError,
 };
 use crate::transport::RaftRpcHandler;
 
@@ -459,6 +459,27 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                 error: Some(TypedClusterError::Internal {
                     code: 0,
                     message: "shuffle aggregator not configured (no ShuffleAggregator installed)"
+                        .into(),
+                }),
+            },
+        }
+    }
+
+    // Routed-surrogate-exchange (F1b) — delegate to the host-crate
+    // `AssignRemoteSurrogate`. This node is the home vShard's leader; a LOCAL
+    // assign through it yields the authoritative surrogate. When no assigner is
+    // installed (cluster-only tests / single-node), return a typed "not
+    // configured" error (surrogate 0) so the coordinator learns the request could
+    // not run rather than silently receiving a bogus zero surrogate.
+    async fn on_assign_surrogate(&self, req: AssignSurrogateRequest) -> AssignSurrogateResponse {
+        match &self.assign_remote_surrogate {
+            Some(assigner) => assigner.on_assign_surrogate(req).await,
+            None => AssignSurrogateResponse {
+                surrogate: 0,
+                error: Some(TypedClusterError::Internal {
+                    code: 0,
+                    message: "assign-remote-surrogate not configured \
+                              (no AssignRemoteSurrogate installed)"
                         .into(),
                 }),
             },

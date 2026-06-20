@@ -20,6 +20,7 @@ pub mod peer_seq;
 pub mod raft_msgs;
 pub mod raft_rpc;
 pub mod shuffle;
+pub mod surrogate;
 pub mod vshard;
 
 pub use auth_envelope::{
@@ -44,3 +45,4 @@ pub use shuffle::{
     ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse,
     ShufflePushChunk, ShufflePushEnd, ShufflePushRequest, SortKey,
 };
+pub use surrogate::{AssignSurrogateRequest, AssignSurrogateResponse};

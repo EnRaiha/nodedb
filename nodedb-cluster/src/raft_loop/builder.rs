@@ -17,7 +17,8 @@ use crate::forward::PlanExecutor;
 use crate::metadata_group::applier::MetadataApplier;
 
 use super::hooks::{
-    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
+    AssignRemoteSurrogate, ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver,
+    SnapshotQuarantineHook,
 };
 use super::loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};
 
@@ -45,6 +46,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             shuffle_producer: self.shuffle_producer,
             shuffle_consumer: self.shuffle_consumer,
             shuffle_aggregator: self.shuffle_aggregator,
+            assign_remote_surrogate: self.assign_remote_surrogate,
             partial_snapshots: self.partial_snapshots,
             data_dir: self.data_dir,
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
@@ -115,6 +117,21 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// partial-state merge + finalize.
     pub fn with_shuffle_aggregator(mut self, aggregator: Arc<dyn ShuffleAggregator>) -> Self {
         self.shuffle_aggregator = Some(aggregator);
+        self
+    }
+
+    /// Attach the routed-surrogate-exchange assigner (F1b, builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s `SurrogateAssigner`) is
+    /// called by the `AssignSurrogate` transport handler when this node is the
+    /// home vShard's leader: it runs a LOCAL assign for the endpoint key, which
+    /// yields the authoritative (first-wins, idempotent) surrogate the coordinator
+    /// must use.
+    pub fn with_assign_remote_surrogate(
+        mut self,
+        assigner: Arc<dyn AssignRemoteSurrogate>,
+    ) -> Self {
+        self.assign_remote_surrogate = Some(assigner);
         self
     }
 

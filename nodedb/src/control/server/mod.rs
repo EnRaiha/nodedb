@@ -19,6 +19,7 @@ pub mod result_stream;
 pub mod session;
 pub mod session_auth;
 pub mod shuffle;
+pub mod surrogate_exchange;
 pub mod sync;
 pub mod tls_reload;
 pub mod wal_dispatch;
