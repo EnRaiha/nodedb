@@ -171,6 +171,37 @@ pub enum QueryOp {
         right_bitmap: Option<Box<crate::physical_plan::PhysicalPlan>>,
     },
 
+    /// Cross-node shuffle-join CONSUMER (E4b): run the node-local grace-hash
+    /// join over two already-staged shuffle frame files.
+    ///
+    /// This variant is BUILT LOCALLY by the part-owner node's consume hook with
+    /// resolved local absolute paths and dispatched to the SAME node's Data
+    /// Plane. It carries node-local filesystem paths (as plain strings) and must
+    /// NEVER be serialized cross-node — the wire encoder rejects it for exactly
+    /// this reason (see `physical_plan::wire::encode`).
+    ///
+    /// The owned fields mirror the borrowed `JoinParams` the Data-Plane handler
+    /// (`execute_shuffle_join`) reconstructs: `on` (equi-join key pairs),
+    /// `join_type`, `limit`, and the two column qualifiers. `build_path` /
+    /// `probe_path` are the staged build (right) and probe (left) frame files.
+    ShuffleJoinConsume {
+        /// Local absolute path to the staged BUILD (right) side frame file.
+        build_path: String,
+        /// Local absolute path to the staged PROBE (left) side frame file.
+        probe_path: String,
+        /// Equi-join key pairs `(left_key, right_key)`.
+        on: Vec<(String, String)>,
+        /// Join type (`inner` / `left` / `right` / `full`). `cross`/keyless is
+        /// rejected by the handler.
+        join_type: String,
+        /// Output row cap. `usize::MAX` = no explicit LIMIT (budget-bounded).
+        limit: usize,
+        /// Column qualifier (prefix) for probe-side (left) columns.
+        probe_qualifier: String,
+        /// Column qualifier (prefix) for build-side (right/index) columns.
+        index_qualifier: String,
+    },
+
     /// Nested loop join: fallback for non-equi joins.
     NestedLoopJoin {
         left_collection: String,

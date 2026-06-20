@@ -5,7 +5,7 @@
 //! MessagePack encoding via zerompk. Used by the cluster layer to ship
 //! physical plans over the wire as part of `ExecuteRequest` RPC.
 
-use super::PhysicalPlan;
+use super::{PhysicalPlan, QueryOp};
 
 /// Errors produced by the wire encode/decode helpers. Self-contained so this
 /// module can move into the shared `nodedb-physical` crate without dragging
@@ -20,12 +20,24 @@ pub enum WireError {
 
 /// Encode a `PhysicalPlan` to MessagePack bytes.
 ///
-/// Returns an error for `ClusterArray` variants, which are handled on the
-/// Control Plane and must never be shipped over the QUIC wire.
+/// Returns an error for plans that are node-local by construction and must
+/// never be shipped over the QUIC wire:
+/// - `ClusterArray` variants (handled on the Control Plane); and
+/// - `QueryOp::ShuffleJoinConsume` (carries node-local staged-file paths; it is
+///   built locally by the part-owner's consume hook and dispatched only to that
+///   same node's Data Plane).
 pub fn encode(plan: &PhysicalPlan) -> Result<Vec<u8>, WireError> {
     if matches!(plan, PhysicalPlan::ClusterArray(_)) {
         return Err(WireError::InvalidPlan(
             "ClusterArray plans must not be sent over the wire",
+        ));
+    }
+    if matches!(
+        plan,
+        PhysicalPlan::Query(QueryOp::ShuffleJoinConsume { .. })
+    ) {
+        return Err(WireError::InvalidPlan(
+            "ShuffleJoinConsume plans carry node-local paths and must not be sent over the wire",
         ));
     }
     zerompk::to_msgpack_vec(plan).map_err(|e| WireError::Codec(format!("encode: {e}")))

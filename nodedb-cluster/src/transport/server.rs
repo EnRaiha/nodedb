@@ -41,7 +41,7 @@ use crate::error::{ClusterError, Result};
 use crate::forward::ChunkSink;
 use crate::rpc_codec::{
     self, ExecuteStreamChunk, ExecuteStreamEnd, MAX_RPC_PAYLOAD_SIZE, RaftRpc,
-    ShuffleProduceResponse, auth_envelope,
+    ShuffleConsumeResponse, ShuffleProduceResponse, auth_envelope,
 };
 use crate::transport::auth_context::AuthContext;
 use crate::transport::peer_identity_store::PeerIdentityStore;
@@ -419,6 +419,38 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
                 })?;
             send.finish().map_err(|e| ClusterError::Transport {
                 detail: format!("finish shuffle produce response: {e}"),
+            })?;
+            return Ok::<(), ClusterError>(());
+        }
+
+        // 4e. Cross-node shuffle CONSUMER trigger (E4b): a `ShuffleConsumeRequest`
+        //     is a ONE-SHOT request/response. The part-owner waits for both staged
+        //     sides of its part to finalize, runs the node-local grace join, and
+        //     replies with exactly one `ShuffleConsumeResponse` carrying the join
+        //     rows (or a typed error). The reply is written on this same bidi
+        //     stream's send half (mirroring the produce arm above), then
+        //     `finish()`ed.
+        if let RaftRpc::ShuffleConsumeRequest(req) = request {
+            let resp: ShuffleConsumeResponse = handler.on_shuffle_consume(req).await;
+            let resp_rpc = RaftRpc::ShuffleConsumeResponse(resp);
+            let resp_inner = rpc_codec::encode(&resp_rpc)?;
+            let resp_seq = auth.peer_seq_out.next();
+            let mut resp_envelope =
+                Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
+            auth_envelope::write_envelope(
+                auth.local_node_id,
+                resp_seq,
+                &resp_inner,
+                &auth.mac_key,
+                &mut resp_envelope,
+            )?;
+            send.write_all(&resp_envelope)
+                .await
+                .map_err(|e| ClusterError::Transport {
+                    detail: format!("write shuffle consume response: {e}"),
+                })?;
+            send.finish().map_err(|e| ClusterError::Transport {
+                detail: format!("finish shuffle consume response: {e}"),
             })?;
             return Ok::<(), ClusterError>(());
         }

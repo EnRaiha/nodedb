@@ -11,7 +11,8 @@ use crate::error::{ClusterError, Result};
 use crate::forward::{ChunkSink, PlanExecutor};
 use crate::health;
 use crate::rpc_codec::{
-    ExecuteRequest, RaftRpc, ShuffleProduceRequest, ShufflePushRequest, TypedClusterError,
+    ExecuteRequest, RaftRpc, ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest,
+    ShufflePushRequest, TypedClusterError,
 };
 use crate::transport::RaftRpcHandler;
 
@@ -418,6 +419,25 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                 code: 0,
                 message: "shuffle producer not configured (no ShuffleProducer installed)".into(),
             }),
+        }
+    }
+
+    // Cross-node shuffle CONSUMER trigger (E4b) — delegate to the host-crate
+    // `ShuffleConsumer`. When no consumer is installed (cluster-only tests /
+    // single-node), return a typed "not configured" error (empty rows) so the
+    // coordinator learns the trigger could not run rather than silently
+    // receiving zero join rows.
+    async fn on_shuffle_consume(&self, req: ShuffleConsumeRequest) -> ShuffleConsumeResponse {
+        match &self.shuffle_consumer {
+            Some(consumer) => consumer.on_shuffle_consume(req).await,
+            None => ShuffleConsumeResponse {
+                rows: Vec::new(),
+                error: Some(TypedClusterError::Internal {
+                    code: 0,
+                    message: "shuffle consumer not configured (no ShuffleConsumer installed)"
+                        .into(),
+                }),
+            },
         }
     }
 }

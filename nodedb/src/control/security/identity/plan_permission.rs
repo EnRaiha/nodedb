@@ -69,6 +69,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | QueryOp::FacetCounts { .. }
             | QueryOp::LateralTopK { .. }
             | QueryOp::LateralLoop { .. }
+            | QueryOp::ShuffleJoinConsume { .. }
             | QueryOp::ProviderScan { .. },
         ) => Permission::Read,
 

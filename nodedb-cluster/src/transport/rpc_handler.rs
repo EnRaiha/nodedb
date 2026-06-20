@@ -6,7 +6,8 @@
 use crate::error::Result;
 use crate::forward::ChunkSink;
 use crate::rpc_codec::{
-    ExecuteRequest, RaftRpc, ShuffleProduceRequest, ShufflePushRequest, TypedClusterError,
+    ExecuteRequest, RaftRpc, ShuffleConsumeRequest, ShuffleConsumeResponse, ShuffleProduceRequest,
+    ShufflePushRequest, TypedClusterError,
 };
 
 /// Trait for handling incoming Raft RPCs.
@@ -69,4 +70,15 @@ pub trait RaftRpcHandler: Send + Sync + 'static {
         &self,
         req: ShuffleProduceRequest,
     ) -> impl std::future::Future<Output = Option<TypedClusterError>> + Send;
+
+    /// Cross-node shuffle CONSUMER trigger (E4b). Complete the part carried by
+    /// `req`: wait for both staged sides of `(shuffle_id, part)` to finalize, run
+    /// the node-local grace-hash join over them, and return the joined rows. The
+    /// transport writes exactly one `ShuffleConsumeResponse` carrying the rows
+    /// (or a typed error) back to the coordinator. Never hangs — the finalize
+    /// wait is bounded by `req.deadline_remaining_ms`.
+    fn on_shuffle_consume(
+        &self,
+        req: ShuffleConsumeRequest,
+    ) -> impl std::future::Future<Output = ShuffleConsumeResponse> + Send;
 }

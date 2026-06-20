@@ -43,7 +43,6 @@ use crate::data::executor::core_loop::CoreLoop;
 /// argument-count limit. The `*_qualifier` fields are the prefixes the grace
 /// emission code uses to namespace columns from each side (the same role
 /// `probe_collection` / `index_collection` play on the local path).
-#[allow(dead_code)] // consumer (E4 planner / cross-node dispatch) lands next; tested now
 pub(in crate::data::executor) struct ShuffleJoinInputs {
     /// Staged file holding the BUILD (right) side rows.
     pub build_path: PathBuf,
@@ -77,7 +76,6 @@ impl CoreLoop {
     /// caller MUST only route equi-joins through this entry point; a keyless
     /// `join.on` surfaces a deterministic `Internal` error rather than silently
     /// producing wrong results.
-    #[allow(dead_code)] // consumer (E4 planner / cross-node dispatch) lands next; tested now
     pub(in crate::data::executor) fn execute_shuffle_join(
         &self,
         join: &JoinParams<'_>,

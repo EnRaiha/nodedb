@@ -20,6 +20,9 @@ mod spill;
 mod support;
 
 pub(crate) use params::{HashJoinParams, JoinParams, NestedLoopJoinParams, SortMergeJoinParams};
+// Node-local shuffle-join completion inputs — reconstructed in the Data-Plane
+// `QueryOp::ShuffleJoinConsume` dispatch arm (E4b).
+pub(in crate::data::executor) use shuffle_join::ShuffleJoinInputs;
 
 // `merge_join_docs_binary` is exercised directly by an integration test, so it
 // stays crate-public. The rest are join-internal helpers (private re-export,

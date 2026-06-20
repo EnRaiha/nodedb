@@ -58,6 +58,14 @@ pub const RPC_SHUFFLE_PUSH_END: u8 = 27;
 /// does NOT stream the scanned rows back to the coordinator.
 pub const RPC_SHUFFLE_PRODUCE_REQ: u8 = 28;
 pub const RPC_SHUFFLE_PRODUCE_RESP: u8 = 29;
+/// Cross-node shuffle CONSUMER trigger (E4b). A coordinator sends a
+/// `RPC_SHUFFLE_CONSUME_REQ` to a part-owner node; that node waits for both
+/// staged sides of its `(shuffle_id, part)` to finalize, runs the node-local
+/// grace-hash join over them, and replies with exactly one
+/// `RPC_SHUFFLE_CONSUME_RESP` carrying the join-result rows (or a typed error).
+/// One-shot request/response — no streaming.
+pub const RPC_SHUFFLE_CONSUME_REQ: u8 = 30;
+pub const RPC_SHUFFLE_CONSUME_RESP: u8 = 31;
 
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared

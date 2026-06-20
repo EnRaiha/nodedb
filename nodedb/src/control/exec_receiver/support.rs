@@ -72,6 +72,7 @@ pub(super) fn plan_contains_exchange(plan: &PhysicalPlan) -> bool {
             // Remaining query ops carry no nested PhysicalPlan child.
             QueryOp::ProviderScan { .. }
             | QueryOp::PartialAggregate { .. }
+            | QueryOp::ShuffleJoinConsume { .. }
             | QueryOp::NestedLoopJoin { .. }
             | QueryOp::SortMergeJoin { .. }
             | QueryOp::FacetCounts { .. }

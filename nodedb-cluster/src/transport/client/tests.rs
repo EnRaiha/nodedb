@@ -94,6 +94,16 @@ impl RaftRpcHandler for EchoHandler {
     ) -> Option<crate::rpc_codec::TypedClusterError> {
         None
     }
+
+    async fn on_shuffle_consume(
+        &self,
+        _req: crate::rpc_codec::ShuffleConsumeRequest,
+    ) -> crate::rpc_codec::ShuffleConsumeResponse {
+        crate::rpc_codec::ShuffleConsumeResponse {
+            rows: Vec::new(),
+            error: None,
+        }
+    }
 }
 
 fn make_transport(node_id: u64) -> NexarTransport {

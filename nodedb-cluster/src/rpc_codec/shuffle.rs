@@ -121,6 +121,68 @@ pub struct ShuffleProduceResponse {
     pub error: Option<TypedClusterError>,
 }
 
+/// One `(left_key, right_key)` equi-join pair of a [`ShuffleConsumeRequest`]'s
+/// `on` list. The part-owner reconstructs the borrowed join spec from these.
+///
+/// Cross-version safety: new optional fields should be added as `Option<T>`.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct JoinKeyPair {
+    /// Probe-side (left) join field name.
+    pub left: String,
+    /// Build-side (right) join field name.
+    pub right: String,
+}
+
+/// Cross-node shuffle CONSUMER trigger (E4b).
+///
+/// A coordinator sends this to a part-owner node to make it complete one part of
+/// a distributed shuffle join: wait for BOTH staged sides of `(shuffle_id, part)`
+/// to finalize, run the node-local grace-hash join over them, and reply with the
+/// join-result rows. The part-owner replies with exactly one
+/// [`ShuffleConsumeResponse`].
+///
+/// The `on` / `join_type` / `limit` / `probe_qualifier` / `index_qualifier`
+/// fields are the owned join spec the consumer reconstructs into a borrowed
+/// `JoinParams` for the node-local grace join. `tenant_id` / `database_id` /
+/// `deadline_remaining_ms` / `trace_id` mirror
+/// [`ExecuteRequest`](super::execute::ExecuteRequest) so the local dispatch
+/// prologue is reused.
+///
+/// Cross-version safety: new optional fields should be added as `Option<T>`.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ShuffleConsumeRequest {
+    pub shuffle_id: u64,
+    /// The part this node owns and must complete.
+    pub part: u32,
+    /// Equi-join key pairs `(left_key, right_key)`.
+    pub on: Vec<JoinKeyPair>,
+    /// Join type (`inner` / `left` / `right` / `full`).
+    pub join_type: String,
+    /// Output row cap. `u64::MAX` = no explicit LIMIT (budget-bounded).
+    pub limit: u64,
+    /// Column qualifier (prefix) for probe-side (left) columns.
+    pub probe_qualifier: String,
+    /// Column qualifier (prefix) for build-side (right/index) columns.
+    pub index_qualifier: String,
+    pub tenant_id: u64,
+    pub database_id: u64,
+    pub deadline_remaining_ms: u64,
+    pub trace_id: [u8; 16],
+}
+
+/// Terminal reply to a [`ShuffleConsumeRequest`].
+///
+/// `error: None` carries the join-result rows in `rows` (a msgpack array of
+/// joined rows — the same `encode_binary_rows` shape every join path emits).
+/// `error: Some(e)` means the consume failed (missing inbox, finalize timeout,
+/// producer terminal error, or join error); `rows` is empty in that case.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ShuffleConsumeResponse {
+    /// Msgpack array of join-result rows. Empty on error.
+    pub rows: Vec<u8>,
+    pub error: Option<TypedClusterError>,
+}
+
 // ── Codec ────────────────────────────────────────────────────────────────────
 
 macro_rules! to_bytes {
@@ -200,6 +262,34 @@ pub(super) fn decode_shuffle_produce_resp(payload: &[u8]) -> Result<RaftRpc> {
         payload,
         ShuffleProduceResponse,
         "ShuffleProduceResponse"
+    )?))
+}
+
+pub(super) fn encode_shuffle_consume_req(
+    msg: &ShuffleConsumeRequest,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    write_frame(RPC_SHUFFLE_CONSUME_REQ, &to_bytes!(msg)?, out)
+}
+pub(super) fn encode_shuffle_consume_resp(
+    msg: &ShuffleConsumeResponse,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    write_frame(RPC_SHUFFLE_CONSUME_RESP, &to_bytes!(msg)?, out)
+}
+
+pub(super) fn decode_shuffle_consume_req(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::ShuffleConsumeRequest(from_bytes!(
+        payload,
+        ShuffleConsumeRequest,
+        "ShuffleConsumeRequest"
+    )?))
+}
+pub(super) fn decode_shuffle_consume_resp(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::ShuffleConsumeResponse(from_bytes!(
+        payload,
+        ShuffleConsumeResponse,
+        "ShuffleConsumeResponse"
     )?))
 }
 
@@ -419,6 +509,112 @@ mod tests {
                 assert!(message.contains("produce scan"));
             }
             other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    fn roundtrip_consume_req(req: ShuffleConsumeRequest) -> ShuffleConsumeRequest {
+        let rpc = RaftRpc::ShuffleConsumeRequest(req);
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::ShuffleConsumeRequest(r) => r,
+            other => panic!("expected ShuffleConsumeRequest, got {other:?}"),
+        }
+    }
+
+    fn roundtrip_consume_resp(resp: ShuffleConsumeResponse) -> ShuffleConsumeResponse {
+        let rpc = RaftRpc::ShuffleConsumeResponse(resp);
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::ShuffleConsumeResponse(r) => r,
+            other => panic!("expected ShuffleConsumeResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_shuffle_consume_request() {
+        let req = ShuffleConsumeRequest {
+            shuffle_id: 0x0FED_CBA9_8765_4321,
+            part: 3,
+            on: vec![
+                JoinKeyPair {
+                    left: "lk".into(),
+                    right: "rk".into(),
+                },
+                JoinKeyPair {
+                    left: "tenant".into(),
+                    right: "tenant_id".into(),
+                },
+            ],
+            join_type: "inner".into(),
+            limit: 1234,
+            probe_qualifier: "l".into(),
+            index_qualifier: "r".into(),
+            tenant_id: 9,
+            database_id: 4,
+            deadline_remaining_ms: 8000,
+            trace_id: [3u8; 16],
+        };
+        let decoded = roundtrip_consume_req(req.clone());
+        assert_eq!(decoded.shuffle_id, req.shuffle_id);
+        assert_eq!(decoded.part, 3);
+        assert_eq!(decoded.on.len(), 2);
+        assert_eq!(decoded.on[0].left, "lk");
+        assert_eq!(decoded.on[0].right, "rk");
+        assert_eq!(decoded.on[1].left, "tenant");
+        assert_eq!(decoded.on[1].right, "tenant_id");
+        assert_eq!(decoded.join_type, "inner");
+        assert_eq!(decoded.limit, 1234);
+        assert_eq!(decoded.probe_qualifier, "l");
+        assert_eq!(decoded.index_qualifier, "r");
+        assert_eq!(decoded.tenant_id, 9);
+        assert_eq!(decoded.database_id, 4);
+        assert_eq!(decoded.deadline_remaining_ms, 8000);
+        assert_eq!(decoded.trace_id, [3u8; 16]);
+    }
+
+    #[test]
+    fn roundtrip_shuffle_consume_request_empty_keys() {
+        let req = ShuffleConsumeRequest {
+            shuffle_id: 1,
+            part: 0,
+            on: vec![],
+            join_type: "left".into(),
+            limit: u64::MAX,
+            probe_qualifier: String::new(),
+            index_qualifier: String::new(),
+            tenant_id: 0,
+            database_id: 0,
+            deadline_remaining_ms: 1000,
+            trace_id: [0u8; 16],
+        };
+        let decoded = roundtrip_consume_req(req);
+        assert!(decoded.on.is_empty());
+        assert_eq!(decoded.limit, u64::MAX);
+        assert_eq!(decoded.join_type, "left");
+    }
+
+    #[test]
+    fn roundtrip_shuffle_consume_response_rows() {
+        let decoded = roundtrip_consume_resp(ShuffleConsumeResponse {
+            rows: vec![0x92, 0x01, 0x02],
+            error: None,
+        });
+        assert_eq!(decoded.rows, vec![0x92, 0x01, 0x02]);
+        assert!(decoded.error.is_none());
+    }
+
+    #[test]
+    fn roundtrip_shuffle_consume_response_error() {
+        let decoded = roundtrip_consume_resp(ShuffleConsumeResponse {
+            rows: vec![],
+            error: Some(TypedClusterError::DeadlineExceeded { elapsed_ms: 8000 }),
+        });
+        assert!(decoded.rows.is_empty());
+        match decoded.error {
+            Some(TypedClusterError::DeadlineExceeded { elapsed_ms }) => {
+                assert_eq!(elapsed_ms, 8000);
+            }
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
         }
     }
 }

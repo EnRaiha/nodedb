@@ -115,6 +115,9 @@ pub fn plan_contains_cluster_partitioned_leaf(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Query(QueryOp::ProviderScan { .. })
         | PhysicalPlan::Query(QueryOp::PartialAggregate { .. })
+        // ShuffleJoinConsume consumes node-local staged files: a terminal local
+        // op, never a cluster-partitioned scan to fan out.
+        | PhysicalPlan::Query(QueryOp::ShuffleJoinConsume { .. })
         | PhysicalPlan::Query(QueryOp::NestedLoopJoin { .. })
         | PhysicalPlan::Query(QueryOp::SortMergeJoin { .. })
         | PhysicalPlan::Query(QueryOp::FacetCounts { .. })

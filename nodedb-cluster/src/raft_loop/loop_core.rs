@@ -24,6 +24,8 @@ use crate::multi_raft::MultiRaft;
 use crate::topology::ClusterTopology;
 use crate::transport::NexarTransport;
 
+use super::hooks::{ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook};
+
 /// Default tick interval (10ms — fast enough for sub-second elections).
 ///
 /// Matches `ClusterTransportTuning::raft_tick_interval_ms` default.
@@ -38,112 +40,6 @@ pub trait CommitApplier: Send + Sync + 'static {
     ///
     /// Returns the index of the last successfully applied entry.
     fn apply_committed(&self, group_id: u64, entries: &[LogEntry]) -> u64;
-}
-
-/// Hook for quarantine integration on the Raft snapshot receive path.
-///
-/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the host crate
-/// (`nodedb`) supplies an implementation backed by its `QuarantineRegistry`.
-/// Cluster-only tests leave the field `None`, which skips all quarantine
-/// accounting.
-///
-/// All methods take `(group_id, last_included_index)` as the snapshot identity.
-pub trait SnapshotQuarantineHook: Send + Sync + 'static {
-    /// Returns `true` if the chunk identified by `(group_id, index)` is
-    /// already in the quarantined state and should be rejected immediately
-    /// without attempting to decode it.
-    fn is_quarantined(&self, group_id: u64, last_included_index: u64) -> bool;
-
-    /// Called after a successful decode — resets the strike counter so a
-    /// single transient CRC error is not held against a healthy peer.
-    fn record_success(&self, group_id: u64, last_included_index: u64);
-
-    /// Called on a CRC-class decode failure.
-    ///
-    /// Returns `true` when the segment has just been quarantined (second
-    /// consecutive failure), and `false` on the first strike (caller should
-    /// surface the framing error and allow the peer to retry).
-    fn record_failure(&self, group_id: u64, last_included_index: u64, error: &str) -> bool;
-}
-
-/// Hook for the cross-node streaming-shuffle receiver registry (E1).
-///
-/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the receiver
-/// registry — which is owned by `nodedb`'s `SharedState` and consumed by the
-/// `!Send` Data Plane in a later unit — lives behind this `Send + Sync` hook.
-/// The transport read-loop drives a `ShufflePush` stream and calls these
-/// methods; the host crate's implementation deposits payloads into the
-/// per-`(shuffle_id, part, side)` inbox and advances the per-part build
-/// barrier.
-///
-/// Cluster-only tests leave the `RaftLoop` field `None`; a `ShufflePush` stream
-/// against a node with no receiver installed returns a typed error.
-///
-/// The hook is **async** because the host-crate implementation stages arriving
-/// rows to a Control-Plane scratch file (E3b: receive-to-spill) and must NOT
-/// block the transport reactor thread on a synchronous `std::fs` write. The
-/// awaited `tokio::fs` write inside `on_shuffle_chunk` is what lets QUIC flow
-/// control back-pressure the producer — the chunk is staged inline, never
-/// detached into a spawned task.
-#[async_trait::async_trait]
-pub trait ShuffleReceiver: Send + Sync + 'static {
-    /// First frame of a stream: lazily create the inbox for
-    /// `(shuffle_id, part, side)` (carrying `producer_count` and `num_parts`)
-    /// or reuse the existing one.
-    async fn on_shuffle_request(&self, shuffle_id: u64, part: u32, side: u8, producer_count: u32);
-
-    /// Stage one chunk payload to the inbox's scratch file (bounded — the
-    /// awaited file write back-pressures the producer via QUIC flow control).
-    /// Returns a typed error on a malformed chunk array or an I/O failure
-    /// (never a silent drop).
-    async fn on_shuffle_chunk(
-        &self,
-        shuffle_id: u64,
-        part: u32,
-        side: u8,
-        payload: Vec<u8>,
-    ) -> Result<()>;
-
-    /// Terminal frame for one producer: record the `End` (advancing the
-    /// barrier), flush + sync the staging file when the barrier completes, and
-    /// capture any terminal error.
-    async fn on_shuffle_end(
-        &self,
-        shuffle_id: u64,
-        part: u32,
-        side: u8,
-        error: Option<crate::rpc_codec::TypedClusterError>,
-    );
-}
-
-/// Hook for the cross-node shuffle PRODUCER (E4a).
-///
-/// Sibling of [`ShuffleReceiver`]: `nodedb-cluster` cannot depend on `nodedb`
-/// (circular), so the produce logic — decode the local scan plan, run it through
-/// the local streaming executor, hash-partition each output row, and fan the
-/// rows out to the per-part owners (looping back into the local receiver
-/// registry for self-owned parts) — lives in `nodedb` behind this `Send + Sync`
-/// hook. The transport read-loop calls [`on_shuffle_produce`](Self::on_shuffle_produce)
-/// when a `ShuffleProduceRequest` arrives and writes the returned outcome back as
-/// a `ShuffleProduceResponse`.
-///
-/// Cluster-only tests leave the `RaftLoop` field `None`; a `ShuffleProduce`
-/// request against a node with no producer installed returns a typed
-/// "not configured" error.
-///
-/// The hook is **async** because the produce path drives QUIC fan-out streams
-/// and the local streaming executor on the Tokio transport reactor. QUIC is fine
-/// here (Control Plane); the local scan itself is dispatched to the Data Plane
-/// through the existing SPSC bridge by the host-crate implementation.
-#[async_trait::async_trait]
-pub trait ShuffleProducer: Send + Sync + 'static {
-    /// Run the local scan fragment, hash-partition its rows, and fan them out to
-    /// the part-owners. Returns `None` on a clean produce or `Some(err)` on a
-    /// terminal scan failure (after every part has been `End`ed with the error).
-    async fn on_shuffle_produce(
-        &self,
-        req: crate::rpc_codec::ShuffleProduceRequest,
-    ) -> Option<crate::rpc_codec::TypedClusterError>;
 }
 
 /// Type-erased async handler for incoming `VShardEnvelope` messages.
@@ -257,6 +153,15 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// `ShuffleProduce` request return a typed "not configured" error.
     pub(super) shuffle_producer: Option<Arc<dyn ShuffleProducer>>,
 
+    /// Optional cross-node shuffle CONSUMER (E4b).
+    ///
+    /// When set (by the `nodedb` binary via `with_shuffle_consumer`), an incoming
+    /// `ShuffleConsumeRequest` runs the node-local grace join over the part's
+    /// staged sides through it. Cluster-only tests leave this `None`, which makes
+    /// any incoming `ShuffleConsume` request return a typed "not configured"
+    /// error.
+    pub(super) shuffle_consumer: Option<Arc<dyn ShuffleConsumer>>,
+
     /// In-progress partial snapshot receives, keyed by `group_id`.
     ///
     /// Each entry tracks the `.partial` file, running CRC, and expected next
@@ -306,6 +211,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             snapshot_quarantine_hook: None,
             shuffle_receiver: None,
             shuffle_producer: None,
+            shuffle_consumer: None,
             partial_snapshots: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             data_dir: None,
             snapshot_chunk_bytes: 4 * 1024 * 1024,
@@ -343,6 +249,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             snapshot_quarantine_hook: self.snapshot_quarantine_hook,
             shuffle_receiver: self.shuffle_receiver,
             shuffle_producer: self.shuffle_producer,
+            shuffle_consumer: self.shuffle_consumer,
             partial_snapshots: self.partial_snapshots,
             data_dir: self.data_dir,
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
@@ -389,6 +296,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// part-owners.
     pub fn with_shuffle_producer(mut self, producer: Arc<dyn ShuffleProducer>) -> Self {
         self.shuffle_producer = Some(producer);
+        self
+    }
+
+    /// Attach the cross-node shuffle CONSUMER (E4b, builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s shuffle registry +
+    /// local executor) is called by the `ShuffleConsume` transport handler to
+    /// wait for the part's staged sides to finalize and run the node-local grace
+    /// join.
+    pub fn with_shuffle_consumer(mut self, consumer: Arc<dyn ShuffleConsumer>) -> Self {
+        self.shuffle_consumer = Some(consumer);
         self
     }
 

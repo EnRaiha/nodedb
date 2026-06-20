@@ -557,6 +557,16 @@ mod tests {
             ) -> Option<crate::rpc_codec::TypedClusterError> {
                 None
             }
+
+            async fn on_shuffle_consume(
+                &self,
+                _req: crate::rpc_codec::ShuffleConsumeRequest,
+            ) -> crate::rpc_codec::ShuffleConsumeResponse {
+                crate::rpc_codec::ShuffleConsumeResponse {
+                    rows: Vec::new(),
+                    error: None,
+                }
+            }
         }
 
         let handler = Arc::new(JoinHandler {

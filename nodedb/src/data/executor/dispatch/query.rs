@@ -7,7 +7,7 @@ use nodedb_physical::physical_plan::QueryOp;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::join::{
-    HashJoinParams, JoinParams, NestedLoopJoinParams, SortMergeJoinParams,
+    HashJoinParams, JoinParams, NestedLoopJoinParams, ShuffleJoinInputs, SortMergeJoinParams,
     lateral::{LateralLoopParams, LateralTopKParams},
 };
 use crate::data::executor::task::ExecutionTask;
@@ -103,6 +103,42 @@ impl CoreLoop {
                 left_bitmap: left_bitmap.as_deref(),
                 right_bitmap: right_bitmap.as_deref(),
             }),
+
+            QueryOp::ShuffleJoinConsume {
+                build_path,
+                probe_path,
+                on,
+                join_type,
+                limit,
+                probe_qualifier,
+                index_qualifier,
+            } => {
+                // Reconstruct the borrowed `JoinParams` from the owned plan
+                // fields. `projection` / `post_filter_bytes` are empty: a
+                // shuffle-join consumer runs the bare grace join over the two
+                // staged sides and emits the joined rows; any post-projection /
+                // post-filter is applied by the coordinator on the gathered
+                // union, not per-part. `on` / `join_type` borrow straight from
+                // the plan.
+                let join = JoinParams {
+                    task,
+                    on,
+                    join_type,
+                    limit: *limit,
+                    projection: &[],
+                    post_filter_bytes: &[],
+                };
+                let inputs = ShuffleJoinInputs {
+                    build_path: std::path::PathBuf::from(build_path),
+                    probe_path: std::path::PathBuf::from(probe_path),
+                    probe_qualifier: probe_qualifier.clone(),
+                    index_qualifier: index_qualifier.clone(),
+                };
+                // Same memory budget source the local hash-join path uses
+                // (`execute_hash_join`): the per-query scan-result byte budget.
+                let budget = self.query_tuning.max_scan_result_bytes;
+                self.execute_shuffle_join(&join, inputs, budget)
+            }
 
             QueryOp::NestedLoopJoin {
                 left_collection,

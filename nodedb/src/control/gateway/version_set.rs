@@ -362,6 +362,10 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 // ProviderScan is a catalog/constant source — no user collection.
                 ProviderScan { .. } => {}
 
+                // ShuffleJoinConsume reads node-local staged files keyed by
+                // path, not by a catalog collection — no version contribution.
+                ShuffleJoinConsume { .. } => {}
+
                 // No user-collection field.
                 RecursiveValue { .. } => {}
             }

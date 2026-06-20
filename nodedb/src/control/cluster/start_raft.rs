@@ -160,6 +160,11 @@ pub fn start_raft(
     let shuffle_producer: Arc<dyn nodedb_cluster::ShuffleProducer> =
         Arc::new(crate::control::server::shuffle::RegistryShuffleProducer::new(shared.clone()));
 
+    // Cross-node shuffle CONSUMER (E4b): runs the node-local grace join over the
+    // part's staged sides when a `ShuffleConsume` trigger arrives.
+    let shuffle_consumer: Arc<dyn nodedb_cluster::ShuffleConsumer> =
+        Arc::new(crate::control::server::shuffle::RegistryShuffleConsumer::new(shared.clone()));
+
     let raft_loop = Arc::new(
         nodedb_cluster::RaftLoop::new(
             multi_raft,
@@ -175,6 +180,7 @@ pub fn start_raft(
         .with_snapshot_quarantine_hook(quarantine_hook)
         .with_shuffle_receiver(shuffle_receiver)
         .with_shuffle_producer(shuffle_producer)
+        .with_shuffle_consumer(shuffle_consumer)
         .with_data_dir(_data_dir.to_path_buf())
         .with_snapshot_chunk_bytes(snapshot_chunk_bytes)
         .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs),

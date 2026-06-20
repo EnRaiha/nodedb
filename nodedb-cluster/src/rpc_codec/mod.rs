@@ -40,6 +40,7 @@ pub use metadata::{MetadataProposeRequest, MetadataProposeResponse};
 pub use peer_seq::{PeerSeqSender, PeerSeqWindow, REPLAY_WINDOW};
 pub use raft_rpc::{RaftRpc, decode, encode, frame_size};
 pub use shuffle::{
-    PartNodeEntry, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk, ShufflePushEnd,
+    JoinKeyPair, PartNodeEntry, ShuffleConsumeRequest, ShuffleConsumeResponse,
+    ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk, ShufflePushEnd,
     ShufflePushRequest,
 };
