@@ -86,7 +86,29 @@ pub struct QueryContext {
     /// it. An atomic mirrors the other per-request knobs so `&self` plan calls
     /// read it without an exclusive borrow.
     broadcast_threshold_bytes: std::sync::atomic::AtomicUsize,
+    /// Gather-vs-shuffle cost threshold in distinct-group units (session var
+    /// `nodedb.shuffle_agg_threshold`, defaulting to
+    /// [`DEFAULT_SHUFFLE_AGG_THRESHOLD`]). When a GROUP BY's estimated group
+    /// cardinality (from ANALYZE `distinct_count`) exceeds this value, the
+    /// planner auto-selects a whole-aggregate shuffle even without
+    /// `nodedb.force_shuffle_agg`. Connection handlers resolve the effective
+    /// value (session override OR the default) and write it via
+    /// `set_shuffle_agg_threshold` before each plan call; forwarded into
+    /// `ConvertContext` where the auto-shuffle cost model reads it. An atomic
+    /// mirrors `broadcast_threshold_bytes` so `&self` plan calls read it without
+    /// an exclusive borrow.
+    shuffle_agg_threshold: std::sync::atomic::AtomicUsize,
 }
+
+/// Default Gather-vs-shuffle aggregate threshold, in distinct-group units.
+///
+/// A GROUP BY whose estimated group cardinality exceeds this many distinct
+/// groups is auto-shuffled (the coordinator Gather-merge of that many partial
+/// rows is the bottleneck); below it, the aggregate stays on the cheaper Gather
+/// path. Used when no `SharedState` tuning is available (legacy `new()` /
+/// `with_catalog()` fixtures) and as the effective value when the session var
+/// `nodedb.shuffle_agg_threshold` is unset.
+pub const DEFAULT_SHUFFLE_AGG_THRESHOLD: usize = 10_000;
 
 impl QueryContext {
     /// Create a new query context without catalog integration.
@@ -106,6 +128,9 @@ impl QueryContext {
             shuffle_agg_num_parts: std::sync::atomic::AtomicU32::new(0),
             broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
                 default_broadcast_threshold_bytes(),
+            ),
+            shuffle_agg_threshold: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_SHUFFLE_AGG_THRESHOLD,
             ),
         }
     }
@@ -131,9 +156,10 @@ impl QueryContext {
         // set_max_vector_dim before each planning call.
         ctx.max_vector_dim
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        // Seed the auto-shuffle cost threshold from the node's configured
-        // default. Connection handlers re-resolve it per request (session
-        // override OR this default) via `set_broadcast_threshold_bytes`.
+        // Seed the broadcast-vs-shuffle byte threshold from the node's
+        // configured tuning default. Connection handlers re-resolve it per
+        // request (session override OR this default) via
+        // `set_broadcast_threshold_bytes`.
         ctx.broadcast_threshold_bytes.store(
             state.tuning.cluster_transport.broadcast_threshold_bytes,
             std::sync::atomic::Ordering::Relaxed,
@@ -171,6 +197,9 @@ impl QueryContext {
             shuffle_agg_num_parts: std::sync::atomic::AtomicU32::new(0),
             broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
                 state.tuning.cluster_transport.broadcast_threshold_bytes,
+            ),
+            shuffle_agg_threshold: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_SHUFFLE_AGG_THRESHOLD,
             ),
         }
     }
@@ -232,6 +261,21 @@ impl QueryContext {
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Set the Gather-vs-shuffle aggregate cost threshold (distinct-group count)
+    /// for the next plan call.
+    ///
+    /// Called by connection handlers with the effective value — the session
+    /// override `nodedb.shuffle_agg_threshold` when set, otherwise
+    /// [`DEFAULT_SHUFFLE_AGG_THRESHOLD`]. Passing the resolved value (rather than
+    /// only the override) means a session that sets and later unsets the knob
+    /// correctly reverts to the default. Relaxed ordering suffices: written
+    /// before planning begins, read only within that same call (same contract as
+    /// `set_broadcast_threshold_bytes`).
+    pub fn set_shuffle_agg_threshold(&self, groups: usize) {
+        self.shuffle_agg_threshold
+            .store(groups, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The node's default broadcast threshold, used when no `SharedState` tuning
     /// is available (legacy `new()` / `with_catalog()` fixtures). Mirrors
     /// `ClusterTransportTuning::default().broadcast_threshold_bytes`.
@@ -275,6 +319,9 @@ impl QueryContext {
             shuffle_agg_num_parts: std::sync::atomic::AtomicU32::new(0),
             broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
                 default_broadcast_threshold_bytes(),
+            ),
+            shuffle_agg_threshold: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_SHUFFLE_AGG_THRESHOLD,
             ),
         }
     }

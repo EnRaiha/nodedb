@@ -298,6 +298,18 @@ impl NodeDbPgHandler {
                 ),
             ))));
         }
+        if key == "nodedb.shuffle_agg_threshold" && value.parse::<usize>().is_err() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "22023".to_owned(),
+                format!(
+                    "invalid value for nodedb.shuffle_agg_threshold: '{value}'. \
+                     Must be a non-negative integer (distinct-group count; the GROUP \
+                     BY is auto-shuffled when its estimated group cardinality exceeds \
+                     this value)"
+                ),
+            ))));
+        }
 
         // Eager validation for `nodedb.auth_session`: drive the resolve path
         // now so rate-limit / audit / fingerprint checks fire on each SET

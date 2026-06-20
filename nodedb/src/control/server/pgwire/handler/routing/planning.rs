@@ -154,6 +154,20 @@ impl NodeDbPgHandler {
         self.query_ctx
             .set_broadcast_threshold_bytes(broadcast_threshold_bytes);
 
+        // Resolve the auto-shuffle-aggregate cost threshold (distinct-group
+        // units): the session override `nodedb.shuffle_agg_threshold` when set,
+        // otherwise the planner default. Passing the resolved value (not just the
+        // override) makes a SET then RESET correctly revert to the default for
+        // this session. Mirrors `broadcast_threshold_bytes` above.
+        let session_agg_threshold = self
+            .sessions
+            .get_parameter(addr, "nodedb.shuffle_agg_threshold")
+            .and_then(|v| v.parse::<usize>().ok());
+        let shuffle_agg_threshold = session_agg_threshold
+            .unwrap_or(crate::control::planner::context::query::DEFAULT_SHUFFLE_AGG_THRESHOLD);
+        self.query_ctx
+            .set_shuffle_agg_threshold(shuffle_agg_threshold);
+
         // Enforce general CHECK constraints for INSERT/UPDATE before planning.
         self.enforce_check_constraints_if_needed(&clean_sql, tenant_id)
             .await?;
@@ -177,6 +191,16 @@ impl NodeDbPgHandler {
         // force-shuffle: bypass read AND put.
         let threshold_overridden = session_threshold.is_some_and(|t| t != tuning_threshold);
 
+        // A session-level `nodedb.shuffle_agg_threshold` override changes the
+        // auto-shuffle-aggregate decision the same way the broadcast threshold
+        // does, and the cache key encodes neither knob. Any explicit session
+        // override that differs from the default makes a cached plan's strategy
+        // assumption unsafe to share, so treat it exactly like the broadcast
+        // override: bypass read AND put.
+        let agg_threshold_overridden = session_agg_threshold.is_some_and(|t| {
+            t != crate::control::planner::context::query::DEFAULT_SHUFFLE_AGG_THRESHOLD
+        });
+
         // Check plan cache before full planning. The cache key is
         // `(sql_hash, schema_version)` and does NOT vary by session knob, so it
         // is bypassed entirely while the force-shuffle override OR a non-default
@@ -184,7 +208,10 @@ impl NodeDbPgHandler {
         // different join-strategy assumption would otherwise be served (and a
         // strategy-specific plan must not be cached for a later default query).
         // Skipping read AND put keeps the cache strategy-knob-free.
-        let bypass_cache = force_shuffle_join || force_shuffle_agg || threshold_overridden;
+        let bypass_cache = force_shuffle_join
+            || force_shuffle_agg
+            || threshold_overridden
+            || agg_threshold_overridden;
         let cached_tasks = if bypass_cache {
             None
         } else {

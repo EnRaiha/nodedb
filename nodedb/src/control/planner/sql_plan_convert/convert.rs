@@ -107,6 +107,15 @@ pub struct ConvertContext {
     /// per-session via `nodedb.broadcast_threshold_bytes` for operator control
     /// and test determinism. See `nodedb_cluster::distributed_join::select_strategy`.
     pub broadcast_threshold_bytes: usize,
+    /// Gather-vs-shuffle cost threshold in distinct-group units. When a GROUP BY
+    /// aggregate over a sharded source has ANALYZE statistics and its estimated
+    /// group cardinality (the product of the GROUP BY columns' `distinct_count`,
+    /// capped at the collection row count) exceeds this value, the planner
+    /// auto-selects a whole-aggregate shuffle (parallelizing the finalize across
+    /// part-owners) instead of the default coordinator Gather-merge. Defaults to
+    /// `DEFAULT_SHUFFLE_AGG_THRESHOLD`; overridable per-session via
+    /// `nodedb.shuffle_agg_threshold` for operator control and test determinism.
+    pub shuffle_agg_threshold: usize,
 }
 
 impl ConvertContext {

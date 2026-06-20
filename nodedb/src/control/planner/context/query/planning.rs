@@ -121,6 +121,9 @@ impl QueryContext {
             broadcast_threshold_bytes: self
                 .broadcast_threshold_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
+            shuffle_agg_threshold: self
+                .shuffle_agg_threshold
+                .load(std::sync::atomic::Ordering::Relaxed),
             database_id,
             tenant_id,
         };
@@ -262,6 +265,9 @@ impl QueryContext {
                 as usize,
             broadcast_threshold_bytes: self
                 .broadcast_threshold_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            shuffle_agg_threshold: self
+                .shuffle_agg_threshold
                 .load(std::sync::atomic::Ordering::Relaxed),
             database_id,
             tenant_id,

@@ -129,6 +129,7 @@ pub const KNOWN_PG_RUNTIME_PARAMETERS: &[&str] = &[
     "nodedb.force_shuffle_agg",
     "nodedb.shuffle_agg_num_parts",
     "nodedb.broadcast_threshold_bytes",
+    "nodedb.shuffle_agg_threshold",
     "rounding_mode",
 ];
 
@@ -189,6 +190,10 @@ pub const SETTABLE_RUNTIME_PARAMETERS: &[&str] = &[
     // node's `[tuning.cluster_transport] broadcast_threshold_bytes`. When both
     // join sides' analyzed sizes exceed this, the planner auto-selects shuffle.
     "nodedb.broadcast_threshold_bytes",
+    // Auto-shuffle-aggregate cost threshold (distinct-group count). When a GROUP
+    // BY's estimated group cardinality (from ANALYZE distinct_count) exceeds
+    // this, the planner auto-selects a whole-aggregate shuffle.
+    "nodedb.shuffle_agg_threshold",
     // Unprefixed NodeDB session knob — Calvin cross-shard mode (paired
     // SHOW cross_shard_txn). Read by the routing planner via the session
     // parameter bag.

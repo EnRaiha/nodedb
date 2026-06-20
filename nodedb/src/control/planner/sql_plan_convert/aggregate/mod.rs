@@ -8,6 +8,7 @@
 //! join-side embedding), and `projection` (projection / computed-column /
 //! window-function serialization).
 
+mod cost;
 mod plan;
 mod projection;
 mod spec;
