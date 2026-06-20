@@ -42,6 +42,7 @@ mod tests {
         EngineKeySet::Edge {
             collection: collection.to_owned(),
             edges: SortedVec::new(edges),
+            home_vshards: SortedVec::new(Vec::new()),
         }
     }
 

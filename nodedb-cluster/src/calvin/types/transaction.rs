@@ -44,11 +44,15 @@ impl ReadWriteSet {
 
     /// Derive the set of vShards participating in this read/write set.
     ///
-    /// For Document/Vector/Edge entries the vshard is derived from the
+    /// For Document/Vector/KV entries the vshard is derived from the
     /// collection name (collection-level routing, consistent with the
-    /// per-vshard Raft groups that own each collection). For KV entries
-    /// the vshard is also derived from the collection name because KV
-    /// collections are assigned a single vshard at creation time.
+    /// per-vshard Raft groups that own each collection). KV collections
+    /// are also assigned a single vshard at creation time.
+    ///
+    /// For Edge entries the participating vShards are the edge's
+    /// `home_vshards` (the `from_key(src)` / `from_key(dst)` key-hashed
+    /// homes), NOT the collection name: a graph edge is dual-homed across
+    /// its two endpoint vShards so it can be written atomically to both.
     ///
     /// This derivation is re-run on decode rather than serialized, so the
     /// serialized bytes remain deterministic regardless of how `VShardId`
@@ -57,10 +61,26 @@ impl ReadWriteSet {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
         for engine_set in &self.0 {
-            let vshard =
-                VShardId::from_collection_in_database(DatabaseId::DEFAULT, engine_set.collection());
-            if seen.insert(vshard.as_u32()) {
-                result.push(vshard);
+            match engine_set {
+                EngineKeySet::Edge { home_vshards, .. } => {
+                    for &home in home_vshards.as_slice() {
+                        let vshard = VShardId::new(home);
+                        if seen.insert(vshard.as_u32()) {
+                            result.push(vshard);
+                        }
+                    }
+                }
+                EngineKeySet::Document { .. }
+                | EngineKeySet::Vector { .. }
+                | EngineKeySet::Kv { .. } => {
+                    let vshard = VShardId::from_collection_in_database(
+                        DatabaseId::DEFAULT,
+                        engine_set.collection(),
+                    );
+                    if seen.insert(vshard.as_u32()) {
+                        result.push(vshard);
+                    }
+                }
             }
         }
         result.sort_by_key(|v| v.as_u32());
@@ -200,5 +220,82 @@ impl TxClass {
             vshards.sort_by_key(|v| v.as_u32());
         }
         self.participating_vshards = vshards;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::primitives::SortedVec;
+    use super::*;
+
+    /// Find two distinct string keys whose `from_key` vShards differ.
+    fn two_distinct_key_vshards() -> (String, String, u32, u32) {
+        let mut first: Option<(String, u32)> = None;
+        for i in 0u32..2048 {
+            let key = format!("node_{i}");
+            let v = VShardId::from_key(key.as_bytes()).as_u32();
+            if let Some((ref fkey, fv)) = first {
+                if fv != v {
+                    return (fkey.clone(), key, fv, v);
+                }
+            } else {
+                first = Some((key, v));
+            }
+        }
+        panic!("could not find two distinct-vshard keys in 2048 tries");
+    }
+
+    #[test]
+    fn edge_keyset_participating_vshards_are_key_homed() {
+        // An edge whose endpoints hash to two DISTINCT from_key vShards must
+        // contribute exactly those two homes — NOT the collection's vShard.
+        let (src_key, dst_key, src_v, dst_v) = two_distinct_key_vshards();
+        assert_ne!(src_v, dst_v);
+
+        // Pick a collection name whose collection-homed vShard differs from
+        // both endpoint homes, to prove routing ignores the collection.
+        let coll_v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, "follows").as_u32();
+
+        let ws = ReadWriteSet::new(vec![EngineKeySet::Edge {
+            collection: "follows".to_owned(),
+            edges: SortedVec::new(vec![(1u32, 2u32)]),
+            home_vshards: SortedVec::new(vec![src_v, dst_v]),
+        }]);
+
+        let mut got: Vec<u32> = ws
+            .participating_vshards()
+            .iter()
+            .map(|v| v.as_u32())
+            .collect();
+        got.sort();
+        let mut want = vec![src_v, dst_v];
+        want.sort();
+        assert_eq!(got, want, "edge routes to its from_key homes");
+        assert!(
+            !got.contains(&coll_v) || coll_v == src_v || coll_v == dst_v,
+            "edge must NOT route by collection vShard {coll_v}"
+        );
+
+        // Sanity: the keys we hashed actually produce these homes.
+        assert_eq!(VShardId::from_key(src_key.as_bytes()).as_u32(), src_v);
+        assert_eq!(VShardId::from_key(dst_key.as_bytes()).as_u32(), dst_v);
+    }
+
+    #[test]
+    fn edge_keyset_single_home_when_endpoints_collide() {
+        // When src and dst hash to the same vShard, the deduped home set is
+        // a single vShard.
+        let only = VShardId::from_key(b"same").as_u32();
+        let ws = ReadWriteSet::new(vec![EngineKeySet::Edge {
+            collection: "follows".to_owned(),
+            edges: SortedVec::new(vec![(1u32, 2u32)]),
+            home_vshards: SortedVec::new(vec![only, only]),
+        }]);
+        let got: Vec<u32> = ws
+            .participating_vshards()
+            .iter()
+            .map(|v| v.as_u32())
+            .collect();
+        assert_eq!(got, vec![only]);
     }
 }

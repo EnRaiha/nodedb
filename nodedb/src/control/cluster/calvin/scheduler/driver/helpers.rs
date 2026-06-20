@@ -47,7 +47,9 @@ pub(super) fn expand_rw_set(txn: &SequencedTxn) -> BTreeSet<LockKey> {
                 });
             }
         }
-        EngineKeySet::Edge { collection, edges } => {
+        EngineKeySet::Edge {
+            collection, edges, ..
+        } => {
             let coll: Arc<str> = Arc::from(collection.as_str());
             for &(src, dst) in edges.iter() {
                 keys.insert(LockKey::Edge {

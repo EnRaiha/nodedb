@@ -256,7 +256,9 @@ impl CoreLoop {
                 })
                 .collect(),
 
-            EngineKeySet::Edge { collection, edges } => edges
+            EngineKeySet::Edge {
+                collection, edges, ..
+            } => edges
                 .iter()
                 .map(|&(src, dst)| {
                     // Edge reads: use a stable hash of (src, dst) as surrogate.

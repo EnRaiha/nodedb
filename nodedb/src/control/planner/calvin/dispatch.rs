@@ -183,11 +183,34 @@ pub fn build_static_tx_class(
 ) -> crate::Result<TxClass> {
     use std::collections::HashMap;
 
-    // Collect surrogates per collection for write tasks.
+    // Collect surrogates per collection for non-edge write tasks.
     let mut doc_surrogates: HashMap<String, Vec<u32>> = HashMap::new();
+    // Collect edge identity (surrogate pairs) and routing homes
+    // (from_key of src/dst string keys) per collection for graph edges.
+    let mut edge_pairs: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+    let mut edge_homes: HashMap<String, Vec<u32>> = HashMap::new();
 
     for task in tasks {
         if !is_write_plan(&task.plan) {
+            continue;
+        }
+        // Graph edges route by from_key(src)/from_key(dst), not by collection.
+        if let PhysicalPlan::Graph(GraphOp::EdgePut {
+            collection,
+            src_id,
+            dst_id,
+            src_surrogate,
+            dst_surrogate,
+            ..
+        }) = &task.plan
+        {
+            edge_pairs
+                .entry(collection.clone())
+                .or_default()
+                .push((src_surrogate.as_u32(), dst_surrogate.as_u32()));
+            let homes = edge_homes.entry(collection.clone()).or_default();
+            homes.push(VShardId::from_key(src_id.as_bytes()).as_u32());
+            homes.push(VShardId::from_key(dst_id.as_bytes()).as_u32());
             continue;
         }
         let collection = collection_name_from_plan(&task.plan);
@@ -207,6 +230,16 @@ pub fn build_static_tx_class(
             surrogates: SortedVec::new(surrogates),
         })
         .collect();
+    // Emit one Edge keyset per collection, carrying surrogate-pair identity
+    // (for locking) and from_key routing homes (for participating vShards).
+    for (collection, pairs) in edge_pairs {
+        let homes = edge_homes.remove(&collection).unwrap_or_default();
+        write_sets.push(EngineKeySet::Edge {
+            collection,
+            edges: SortedVec::new(pairs),
+            home_vshards: SortedVec::new(homes),
+        });
+    }
     // Sort by collection name for determinism.
     write_sets.sort_by(|a, b| a.collection().cmp(b.collection()));
 

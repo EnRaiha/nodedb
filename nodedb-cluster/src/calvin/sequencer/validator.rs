@@ -100,7 +100,9 @@ fn flatten_write_set(tx: &AdmittedTx, txn_index: usize) -> Vec<WriteEntry> {
                     });
                 }
             }
-            EngineKeySet::Edge { collection, edges } => {
+            EngineKeySet::Edge {
+                collection, edges, ..
+            } => {
                 for &(src, dst) in edges.as_slice() {
                     let mut key_bytes = src.to_le_bytes().to_vec();
                     key_bytes.extend_from_slice(&dst.to_le_bytes());

@@ -97,9 +97,17 @@ pub enum EngineKeySet {
         keys: SortedVec<Vec<u8>>,
     },
     /// Graph edge engine: identified by (src_surrogate, dst_surrogate) pairs.
+    ///
+    /// `edges` carries the surrogate-pair IDENTITY used for Calvin locking and
+    /// conflict detection. `home_vshards` carries the from_key ROUTING homes —
+    /// the set of `VShardId::from_key(src_str)` / `from_key(dst_str)` u32 ids
+    /// for every edge in this set. Routing (which vShards participate) is driven
+    /// by `home_vshards`, NOT by the collection name, because a graph edge is
+    /// dual-homed across its two endpoint key-hashed vShards.
     Edge {
         collection: String,
         edges: SortedVec<(u32, u32)>,
+        home_vshards: SortedVec<u32>,
     },
 }
 

@@ -64,7 +64,14 @@ impl CoreLoop {
         }
 
         let ord = self.hlc.next_ordinal();
-        let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
+        // Under a Calvin batch, `epoch_system_ms` is the deterministic epoch
+        // timestamp; outside Calvin (every path today — no Calvin edge writes
+        // yet) it is None and we fall back to the HLC-derived wall time,
+        // identical to the prior behavior.
+        let valid_from_ms = match self.epoch_system_ms {
+            Some(ms) => ms,
+            None => nodedb_types::ordinal_to_ms(ord),
+        };
         use crate::engine::graph::edge_store::EdgeRef;
         match self.edge_store.put_edge_versioned(
             EdgeRef::new(
