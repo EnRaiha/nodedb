@@ -58,37 +58,62 @@ async fn shuffle_push_delivers_chunks_and_fires_barrier() {
         num_parts: 1,
         producer_count: 1,
     };
+    // Each chunk is a 1-element msgpack array (`0x91` + one positive fixint), so
+    // each explodes into exactly one staged frame holding that element's bytes.
     let batches = vec![vec![0x91, 0x01], vec![0x91, 0x02], vec![0x91, 0x03]];
+    // The rows the receiver stages: each chunk array's single element.
+    let expected_rows = vec![vec![0x01u8], vec![0x02u8], vec![0x03u8]];
 
-    send_shuffle_push(&transport, target, req, batches.clone())
+    send_shuffle_push(&transport, target, req, batches)
         .await
         .expect("send_shuffle_push to node 1");
 
-    // The read-loop runs on the receiver's transport task; poll its registry.
+    // The read-loop runs on the receiver's transport task; poll its registry for
+    // the barrier (which also triggers `finalize` of the staged file).
     let registry = receiver.shared.shuffle_registry.clone();
     let arrived = wait_until(Duration::from_secs(10), || {
         registry
             .get((1, 0, 0))
-            .map(|ib| ib.barrier_complete() && ib.buffered_len() == 3)
+            .map(|ib| ib.barrier_complete())
             .unwrap_or(false)
     })
     .await;
     assert!(
         arrived,
-        "node 1 inbox for (1,0,0) did not receive 3 chunks + barrier within 10s"
+        "node 1 inbox for (1,0,0) did not reach the build barrier within 10s"
     );
 
     let inbox = registry.get((1, 0, 0)).expect("inbox exists");
     assert_eq!(inbox.producer_count(), 1);
     assert!(inbox.barrier_complete(), "build barrier must be complete");
     assert_eq!(inbox.ends_received(), 1);
-    // FIFO drain matches what was sent.
-    let drained = inbox.try_drain();
-    assert_eq!(drained, batches, "chunks must arrive in FIFO order");
+    // The staged frame-file holds one frame per exploded row, in arrival order.
+    let staged = read_frames(inbox.staged_path());
+    assert_eq!(
+        staged, expected_rows,
+        "staged frames must match the exploded chunk rows in order"
+    );
     // Clean EOF: no terminal error captured.
     assert!(inbox.take_error().is_none());
 
     cluster.shutdown().await;
+}
+
+/// Parse a staged `[u32 LE len][row-bytes]` frame file into per-row byte vectors
+/// (the format the Data Plane's `FrameStreamReader` consumes).
+fn read_frames(path: &std::path::Path) -> Vec<Vec<u8>> {
+    let bytes = std::fs::read(path).expect("read staged frame file");
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("len")) as usize;
+        pos += 4;
+        assert!(pos + len <= bytes.len(), "frame body truncated");
+        out.push(bytes[pos..pos + len].to_vec());
+        pos += len;
+    }
+    assert_eq!(pos, bytes.len(), "trailing bytes after last frame");
+    out
 }
 
 /// Terminal-error path: a producer that ends with `Some(error)` causes the
@@ -107,7 +132,7 @@ async fn shuffle_push_end_with_error_is_captured() {
     let registry = receiver.shared.shuffle_registry.clone();
 
     // Opening frame creates the inbox (single producer).
-    let inbox = registry.get_or_create(42, 0, 0, 1, 16);
+    let inbox = registry.get_or_create(42, 0, 0, 1);
     assert!(!inbox.barrier_complete());
 
     // Producer ends with a terminal error → captured + barrier advances.

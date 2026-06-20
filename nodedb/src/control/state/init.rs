@@ -372,7 +372,15 @@ impl SharedState {
             ),
             materialize_freeze: crate::control::clone::MaterializeFreezeRegistry::new(),
             shuffle_registry: Arc::new(
-                crate::control::server::shuffle::ShuffleReceiverRegistry::new(),
+                // Test path: no catalog data dir, so stage under a process- and
+                // test-unique temp subdir to keep concurrent test inboxes
+                // isolated.
+                crate::control::server::shuffle::ShuffleReceiverRegistry::new(
+                    std::env::temp_dir().join(format!(
+                        "nodedb-shuffle-{}-{test_id}",
+                        std::process::id(),
+                    )),
+                ),
             ),
             shutdown: Arc::clone(&shutdown),
             loop_registry: Arc::clone(&loop_registry),

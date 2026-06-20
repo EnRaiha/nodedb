@@ -121,9 +121,13 @@ pub(super) fn partition_hash_seeded<S: AsRef<str>>(doc: &[u8], keys: &[S], seed:
 /// - `HashIndex`'s internal `doc_index` is relative to the slice passed to
 ///   `build`; we pass the same partition slice as `index_docs` to
 ///   `probe_hash_index`, so the indices align.
-// Test-only reference implementation: the production grace path streams via
-// `PartitionedSpiller` (`grace_spill.rs`) / `drive_grace_build`; this owned-Vec
-// version is kept as the multiset-equivalence oracle for those tests.
+///
+/// Reference (owned-Vec, fully in-memory) grace join, used as the
+/// multiset-equivalence ORACLE by the streamed/spilling production path's tests.
+///
+/// The production grace path streams via `PartitionedSpiller`
+/// (`grace_spill.rs`) / `drive_grace_build`; this version materializes both
+/// sides and is intentionally simple so it can be trusted as the reference.
 #[allow(dead_code)]
 pub(super) fn grace_join_in_memory(
     build_docs: Vec<(String, Vec<u8>)>,

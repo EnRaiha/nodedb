@@ -11,10 +11,11 @@
 //! the local-join path uses ([`CoreLoop::drive_grace_build`] +
 //! [`CoreLoop::finish_grace_join`]). No build/probe logic is duplicated.
 //!
-//! The transport → staging wiring (writing those files from the shuffle inbox)
-//! and the cross-node test live in a SEPARATE unit. This module is validated
-//! node-locally by writing staged files directly (see the in-file tests) — it
-//! never touches the shuffle transport, the inbox, or `nodedb-cluster`.
+//! The transport → staging wiring (writing those files from the shuffle inbox,
+//! see `crate::control::server::shuffle`) and the cross-node end-to-end test
+//! live in SEPARATE units. This module is validated node-locally by writing
+//! staged files directly (see the in-file tests) — it never touches the shuffle
+//! transport, the inbox, or `nodedb-cluster`.
 //!
 //! ## Staged-file format
 //!
@@ -42,7 +43,7 @@ use crate::data::executor::core_loop::CoreLoop;
 /// argument-count limit. The `*_qualifier` fields are the prefixes the grace
 /// emission code uses to namespace columns from each side (the same role
 /// `probe_collection` / `index_collection` play on the local path).
-#[allow(dead_code)] // consumer (E3b transport→staging / E4 planner) lands next; tested now
+#[allow(dead_code)] // consumer (E4 planner / cross-node dispatch) lands next; tested now
 pub(in crate::data::executor) struct ShuffleJoinInputs {
     /// Staged file holding the BUILD (right) side rows.
     pub build_path: PathBuf,
@@ -76,7 +77,7 @@ impl CoreLoop {
     /// caller MUST only route equi-joins through this entry point; a keyless
     /// `join.on` surfaces a deterministic `Internal` error rather than silently
     /// producing wrong results.
-    #[allow(dead_code)] // consumer (E3b transport→staging / E4 planner) lands next; tested now
+    #[allow(dead_code)] // consumer (E4 planner / cross-node dispatch) lands next; tested now
     pub(in crate::data::executor) fn execute_shuffle_join(
         &self,
         join: &JoinParams<'_>,

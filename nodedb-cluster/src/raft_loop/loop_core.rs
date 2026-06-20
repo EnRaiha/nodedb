@@ -78,16 +78,25 @@ pub trait SnapshotQuarantineHook: Send + Sync + 'static {
 ///
 /// Cluster-only tests leave the `RaftLoop` field `None`; a `ShufflePush` stream
 /// against a node with no receiver installed returns a typed error.
+///
+/// The hook is **async** because the host-crate implementation stages arriving
+/// rows to a Control-Plane scratch file (E3b: receive-to-spill) and must NOT
+/// block the transport reactor thread on a synchronous `std::fs` write. The
+/// awaited `tokio::fs` write inside `on_shuffle_chunk` is what lets QUIC flow
+/// control back-pressure the producer — the chunk is staged inline, never
+/// detached into a spawned task.
+#[async_trait::async_trait]
 pub trait ShuffleReceiver: Send + Sync + 'static {
     /// First frame of a stream: lazily create the inbox for
     /// `(shuffle_id, part, side)` (carrying `producer_count` and `num_parts`)
     /// or reuse the existing one.
-    fn on_shuffle_request(&self, shuffle_id: u64, part: u32, side: u8, producer_count: u32);
+    async fn on_shuffle_request(&self, shuffle_id: u64, part: u32, side: u8, producer_count: u32);
 
-    /// Deposit one chunk payload into the inbox (bounded — blocks the caller
-    /// while the buffer is full so QUIC flow control back-pressures the
-    /// producer).
-    fn on_shuffle_chunk(
+    /// Stage one chunk payload to the inbox's scratch file (bounded — the
+    /// awaited file write back-pressures the producer via QUIC flow control).
+    /// Returns a typed error on a malformed chunk array or an I/O failure
+    /// (never a silent drop).
+    async fn on_shuffle_chunk(
         &self,
         shuffle_id: u64,
         part: u32,
@@ -96,8 +105,9 @@ pub trait ShuffleReceiver: Send + Sync + 'static {
     ) -> Result<()>;
 
     /// Terminal frame for one producer: record the `End` (advancing the
-    /// barrier) and capture any terminal error.
-    fn on_shuffle_end(
+    /// barrier), flush + sync the staging file when the barrier completes, and
+    /// capture any terminal error.
+    async fn on_shuffle_end(
         &self,
         shuffle_id: u64,
         part: u32,

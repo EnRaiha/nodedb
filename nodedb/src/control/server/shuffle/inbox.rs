@@ -1,55 +1,68 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Cross-node streaming-shuffle receiver registry + per-part inbox (E1).
+//! Cross-node streaming-shuffle receiver registry + per-part file-backed
+//! staging inbox (E3b).
+//!
+//! # Receive-to-spill (design D1)
+//!
+//! A cross-node shuffle join stages each side's rows to a LOCAL scratch file on
+//! the consumer node, then runs the existing grace-hash join over those files
+//! ([`crate::data::executor`]'s `execute_shuffle_join`). This module owns the
+//! receive-to-spill half: as `ShufflePush` chunks arrive over QUIC, each is
+//! exploded into its individual join rows and appended — one
+//! `[u32 LE len][row-bytes]` frame per row — to a per-`(shuffle_id, part, side)`
+//! staging file. That frame format is byte-identical to what the Data Plane's
+//! `FrameStreamReader` (and `RowSource::ShuffleStream`) reads, so the staged
+//! file feeds the grace join directly once the build barrier completes.
 //!
 //! # Plane discipline
 //!
-//! This registry is **Send + Sync** and lives in the Control Plane's
-//! `SharedState`. Its inbox buffer is consumed (in a later unit, E3) by the
-//! `!Send` Data Plane, which cannot await Tokio futures. The inbox therefore
-//! uses **std primitives only** — a bounded [`std::sync::Mutex`]-guarded
-//! [`VecDeque`] plus a [`std::sync::Condvar`] — never `tokio::sync::mpsc`.
-//! Producers block on the condvar when the buffer is full (bounded
-//! back-pressure, which propagates to QUIC flow control through the transport
-//! read-loop), and the Data Plane drains via [`ShuffleInbox::pop`] /
-//! [`ShuffleInbox::try_drain`].
+//! The inbox / registry are **Send + Sync** and live in the Control Plane's
+//! `SharedState`. The staging WRITE path runs on the Tokio transport reactor, so
+//! it uses [`tokio::fs`] and awaits each append — a synchronous `std::fs` write
+//! would block the reactor thread, and the awaited write is also what lets QUIC
+//! flow control back-pressure the producer. Memory stays bounded: exactly one
+//! chunk array is decoded at a time. The staged FILE is later opened by the
+//! `!Send` Data Plane through a different handle (`FrameStreamReader`), strictly
+//! after [`ShuffleInbox::finalize`] has flushed + synced it.
 //!
 //! # Build barrier
 //!
-//! Each inbox tracks how many distinct producers (`producer_count`) are
-//! expected to push to this `(shuffle_id, part, side)`. The build side of the
-//! join is complete only once an `End` frame has been received from **all** of
-//! them — see [`ShuffleInbox::record_end`] / [`ShuffleInbox::barrier_complete`].
+//! Each inbox tracks how many distinct producers (`producer_count`) are expected
+//! to push to this `(shuffle_id, part, side)`. The side is complete only once an
+//! `End` frame has been received from **all** of them — see
+//! [`ShuffleInbox::record_end`] / [`ShuffleInbox::barrier_complete`]. The inbox
+//! is flushed + synced to disk ([`ShuffleInbox::finalize`]) when the barrier
+//! fires, making the staged file durable and complete for the reader.
 
 use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 use nodedb_cluster::TypedClusterError;
+use nodedb_query::msgpack_scan;
+use tokio::io::AsyncWriteExt;
 
 /// Key for one shuffle receiver inbox: `(shuffle_id, part, side)`.
 ///
 /// `side` is `0` for the build side and `1` for the probe side of a hash join.
 pub type ShuffleKey = (u64, u32, u8);
 
-/// A bounded receiver inbox for one `(shuffle_id, part, side)`.
+/// A file-backed receiver inbox for one `(shuffle_id, part, side)`.
 ///
-/// Holds the chunk payloads pushed by all producers for this part, plus the
-/// per-part build barrier state.
+/// Arriving chunk payloads (each a standalone msgpack row array) are exploded
+/// into individual rows and appended as `[u32 LE len][row-bytes]` frames to a
+/// staging file. Also holds the per-part build-barrier state.
 pub struct ShuffleInbox {
-    /// Bounded buffer of chunk payloads (each a standalone msgpack row array).
-    /// Guarded by a std `Mutex`; producers wait on `not_full` when at capacity,
-    /// consumers are notified via `not_empty`.
-    buffer: Mutex<VecDeque<Vec<u8>>>,
-    /// Maximum number of buffered payloads before producers block.
-    capacity: usize,
-    /// Signalled when a payload is popped (a producer may resume pushing).
-    not_full: Condvar,
-    /// Signalled when a payload is pushed (a waiting consumer may resume).
-    not_empty: Condvar,
-    /// Number of producers expected to push to this part. The barrier fires
-    /// once `ends_received == producer_count`.
+    /// Deterministic staging-file path for this part (under the registry's base
+    /// dir). Lazily created on the first appended chunk.
+    path: PathBuf,
+    /// The append-mode staging-file handle, lazily opened on the first chunk and
+    /// guarded so concurrent appends from the transport read-loop serialize.
+    writer: tokio::sync::Mutex<Option<tokio::fs::File>>,
+    /// Number of producers expected to push to this part. The barrier fires once
+    /// `ends_received == producer_count`.
     producer_count: usize,
     /// Count of `End` frames received so far (one per finished producer).
     ends_received: AtomicUsize,
@@ -58,16 +71,15 @@ pub struct ShuffleInbox {
 }
 
 impl ShuffleInbox {
-    /// Create an empty inbox expecting `producer_count` producers, buffering at
-    /// most `capacity` payloads before back-pressuring producers.
+    /// Create an inbox that stages rows to `path`, expecting `producer_count`
+    /// producers before the build barrier fires.
     ///
-    /// `capacity` is clamped to at least 1 so a zero never deadlocks `push`.
-    pub fn new(producer_count: usize, capacity: usize) -> Self {
+    /// `producer_count` is clamped to at least 1 so a zero never leaves the
+    /// barrier permanently unfired.
+    pub fn new(path: PathBuf, producer_count: usize) -> Self {
         Self {
-            buffer: Mutex::new(VecDeque::new()),
-            capacity: capacity.max(1),
-            not_full: Condvar::new(),
-            not_empty: Condvar::new(),
+            path,
+            writer: tokio::sync::Mutex::new(None),
             producer_count: producer_count.max(1),
             ends_received: AtomicUsize::new(0),
             error: Mutex::new(None),
@@ -79,58 +91,114 @@ impl ShuffleInbox {
         self.producer_count
     }
 
-    /// Push one chunk payload, blocking while the buffer is at capacity.
+    /// The deterministic staging-file path for this part.
     ///
-    /// Bounded back-pressure: the calling task (the transport read-loop) blocks
-    /// on the `not_full` condvar until a consumer pops, then deposits the
-    /// payload and wakes a waiting consumer. Never allocates beyond `capacity`.
-    pub fn push(&self, payload: Vec<u8>) {
-        let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
-        while buf.len() >= self.capacity {
-            buf = self.not_full.wait(buf).unwrap_or_else(|p| p.into_inner());
-        }
-        buf.push_back(payload);
-        drop(buf);
-        self.not_empty.notify_one();
+    /// The Data Plane opens this through its own `FrameStreamReader` handle once
+    /// [`ShuffleInbox::barrier_complete`] is true and [`ShuffleInbox::finalize`]
+    /// has run.
+    pub fn staged_path(&self) -> &Path {
+        &self.path
     }
 
-    /// Pop the oldest buffered payload, or `None` if the buffer is empty.
+    /// Explode one chunk payload (a msgpack array of rows) into individual join
+    /// rows and append a `[u32 LE len][row-bytes]` frame for each to the staging
+    /// file.
     ///
-    /// Non-blocking — the E3 Data Plane consumer polls this. Wakes one producer
-    /// blocked on a full buffer.
-    pub fn pop(&self) -> Option<Vec<u8>> {
-        let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
-        let item = buf.pop_front();
-        drop(buf);
-        if item.is_some() {
-            self.not_full.notify_one();
+    /// The file is lazily opened (creating parent dirs once) on the first chunk
+    /// and reused for subsequent chunks. Appends serialize under the `writer`
+    /// mutex; bounded memory — only this one chunk's row offsets are tracked at a
+    /// time, and the awaited write back-pressures the producer through QUIC flow
+    /// control. A malformed chunk array (bad header / truncated element) or any
+    /// I/O failure is a hard error — never a silent drop.
+    pub async fn append_chunk(&self, chunk_payload: &[u8]) -> crate::Result<()> {
+        // Explode the chunk's msgpack row array into per-row byte slices using
+        // the SAME reader the Data Plane's `decode_flat_row_array` uses
+        // (`array_header` + `skip_value`), so the framing round-trips exactly
+        // what `RowSource::ShuffleStream` reads.
+        let frames = explode_row_array(chunk_payload)?;
+
+        let mut guard = self.writer.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.open_staging().await?);
         }
-        item
+        let Some(file) = guard.as_mut() else {
+            // Unreachable: just set above. Surface as a hard error rather than
+            // unwrapping.
+            return Err(crate::Error::Storage {
+                engine: "shuffle-stage".into(),
+                detail: format!(
+                    "staging writer unexpectedly absent for {}",
+                    self.path.display()
+                ),
+            });
+        };
+
+        for row in frames {
+            let len = u32::try_from(row.len()).map_err(|_| crate::Error::Storage {
+                engine: "shuffle-stage".into(),
+                detail: format!(
+                    "shuffle row exceeds u32 frame length ({} bytes) staging to {}",
+                    row.len(),
+                    self.path.display()
+                ),
+            })?;
+            file.write_all(&len.to_le_bytes()).await?;
+            file.write_all(row).await?;
+        }
+        Ok(())
     }
 
-    /// Drain and return all currently-buffered payloads in FIFO order.
+    /// Flush + sync the staging file so it is complete and durable for the Data
+    /// Plane reader. Called when the build barrier completes.
     ///
-    /// Wakes all producers blocked on a full buffer.
-    pub fn try_drain(&self) -> Vec<Vec<u8>> {
-        let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
-        let drained: Vec<Vec<u8>> = buf.drain(..).collect();
-        drop(buf);
-        if !drained.is_empty() {
-            self.not_full.notify_all();
+    /// A no-op if no chunk was ever appended (the file was never opened); the
+    /// reader treats a missing/empty staged file as zero rows.
+    pub async fn finalize(&self) -> crate::Result<()> {
+        let mut guard = self.writer.lock().await;
+        if let Some(file) = guard.as_mut() {
+            file.flush().await?;
+            file.sync_all().await?;
         }
-        drained
+        Ok(())
     }
 
-    /// Number of payloads currently buffered (not yet drained).
-    pub fn buffered_len(&self) -> usize {
-        self.buffer.lock().unwrap_or_else(|p| p.into_inner()).len()
+    /// Open the staging file fresh (create + truncate), creating its parent
+    /// directory tree once. Used lazily on the first appended chunk.
+    ///
+    /// Truncate — NOT append — is correct: the inbox opens the file ONCE and
+    /// then writes every chunk's frames sequentially through this single held
+    /// handle, so each `write_all` advances naturally. Truncating on open
+    /// guarantees a stale file left at this deterministic path by a prior
+    /// shuffle that reused the same `(shuffle_id, part, side)` (e.g. after a
+    /// crash, or a reused id) is overwritten, not appended to — otherwise the
+    /// reader would see the old rows concatenated with the new ones.
+    async fn open_staging(&self) -> crate::Result<tokio::fs::File> {
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| crate::Error::Storage {
+                    engine: "shuffle-stage".into(),
+                    detail: format!("create shuffle staging dir {}: {e}", parent.display()),
+                })?;
+        }
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .await
+            .map_err(|e| crate::Error::Storage {
+                engine: "shuffle-stage".into(),
+                detail: format!("open shuffle staging file {}: {e}", self.path.display()),
+            })
     }
 
     /// Record one producer's `End` frame.
     ///
     /// Returns `true` when this `End` completes the barrier (i.e.
     /// `ends_received == producer_count`), meaning every expected producer has
-    /// finished and the build side for this part is complete.
+    /// finished and this side is complete — the caller should then
+    /// [`ShuffleInbox::finalize`] the staging file.
     pub fn record_end(&self) -> bool {
         let prev = self.ends_received.fetch_add(1, Ordering::AcqRel);
         prev + 1 >= self.producer_count
@@ -160,48 +228,97 @@ impl ShuffleInbox {
     }
 }
 
+/// Explode a flat msgpack row array (the `encode_binary_rows` format) into
+/// individual row byte slices — one element per join row.
+///
+/// Mirrors the Data Plane's `decode_flat_row_array` (`provider_scan.rs`), reusing
+/// the shared `nodedb_query::msgpack_scan` reader so the slices are byte-identical
+/// to what `RowSource::ShuffleStream` later reads. An empty payload yields zero
+/// rows; a present-but-malformed header / truncated element is a hard error
+/// rather than a silent partial decode.
+fn explode_row_array(bytes: &[u8]) -> crate::Result<Vec<&[u8]>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some((count, mut pos)) = msgpack_scan::array_header(bytes, 0) else {
+        return Err(crate::Error::Storage {
+            engine: "shuffle-stage".into(),
+            detail: "malformed shuffle chunk: expected a msgpack array header".into(),
+        });
+    };
+    let mut rows = Vec::with_capacity(count);
+    for i in 0..count {
+        let start = pos;
+        let Some(end) = msgpack_scan::skip_value(bytes, pos) else {
+            return Err(crate::Error::Storage {
+                engine: "shuffle-stage".into(),
+                detail: format!("malformed shuffle chunk: truncated row {i} of {count}"),
+            });
+        };
+        rows.push(&bytes[start..end]);
+        pos = end;
+    }
+    Ok(rows)
+}
+
 /// Registry of [`ShuffleInbox`]es keyed by `(shuffle_id, part, side)`.
 ///
 /// Owned by `SharedState` (`Send + Sync`). The transport read-loop creates and
-/// feeds inboxes through the [`nodedb_cluster::ShuffleReceiver`] hook; the E3
-/// Data Plane drains them.
+/// feeds inboxes through the [`nodedb_cluster::ShuffleReceiver`] hook; the Data
+/// Plane reads their staged files after the build barrier fires. Owns the base
+/// staging directory under which every inbox's scratch file is laid out.
 pub struct ShuffleReceiverRegistry {
+    /// Root directory for all shuffle staging files (the node's data dir).
+    base_dir: PathBuf,
     inboxes: Mutex<HashMap<ShuffleKey, Arc<ShuffleInbox>>>,
 }
 
-impl Default for ShuffleReceiverRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ShuffleReceiverRegistry {
-    /// Create an empty registry.
-    pub fn new() -> Self {
+    /// Create an empty registry whose inboxes stage under `base_dir`.
+    pub fn new(base_dir: PathBuf) -> Self {
         Self {
+            base_dir,
             inboxes: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Directory holding all staging files for `shuffle_id`:
+    /// `base_dir/shuffle-stage/{shuffle_id}`.
+    fn shuffle_dir(&self, shuffle_id: u64) -> PathBuf {
+        self.base_dir
+            .join("shuffle-stage")
+            .join(shuffle_id.to_string())
+    }
+
+    /// Deterministic staging path for one part:
+    /// `base_dir/shuffle-stage/{shuffle_id}/{part}-{side}.frames`.
+    fn staged_path(&self, shuffle_id: u64, part: u32, side: u8) -> PathBuf {
+        self.shuffle_dir(shuffle_id)
+            .join(format!("{part}-{side}.frames"))
+    }
+
     /// Get the inbox for `(shuffle_id, part, side)`, lazily creating it on the
-    /// first frame with the carried `producer_count` and buffer `capacity`.
+    /// first frame with the carried `producer_count` and a deterministic staging
+    /// path.
     ///
     /// Idempotent: subsequent frames for the same key reuse the existing inbox
-    /// (the `producer_count` / `capacity` of the first creator win).
+    /// (the `producer_count` of the first creator wins).
     pub fn get_or_create(
         &self,
         shuffle_id: u64,
         part: u32,
         side: u8,
         producer_count: usize,
-        capacity: usize,
     ) -> Arc<ShuffleInbox> {
         let key = (shuffle_id, part, side);
         let mut map = self.inboxes.lock().unwrap_or_else(|p| p.into_inner());
-        Arc::clone(
-            map.entry(key)
-                .or_insert_with(|| Arc::new(ShuffleInbox::new(producer_count, capacity))),
-        )
+        if let Some(existing) = map.get(&key) {
+            return Arc::clone(existing);
+        }
+        let path = self.staged_path(shuffle_id, part, side);
+        let inbox = Arc::new(ShuffleInbox::new(path, producer_count));
+        map.insert(key, Arc::clone(&inbox));
+        inbox
     }
 
     /// Look up an existing inbox without creating one.
@@ -213,15 +330,27 @@ impl ShuffleReceiverRegistry {
             .map(Arc::clone)
     }
 
-    /// Remove every inbox belonging to `shuffle_id` (all parts and sides).
+    /// Remove every inbox belonging to `shuffle_id` (all parts and sides) and
+    /// best-effort delete its on-disk staging directory to release scratch.
     ///
-    /// Called when a shuffle completes or is cancelled so its buffers are
-    /// released.
+    /// Called when a shuffle completes or is cancelled. A failed directory
+    /// removal is logged and otherwise ignored — never a panic.
     pub fn unregister_shuffle(&self, shuffle_id: u64) {
         self.inboxes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|(sid, _, _), _| *sid != shuffle_id);
+        let dir = self.shuffle_dir(shuffle_id);
+        if let Err(e) = std::fs::remove_dir_all(&dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                shuffle_id,
+                dir = %dir.display(),
+                error = %e,
+                "failed to remove shuffle staging dir"
+            );
+        }
     }
 }
 
@@ -229,15 +358,111 @@ impl ShuffleReceiverRegistry {
 mod tests {
     use super::*;
 
+    fn temp_base() -> (tempfile::TempDir, ShuffleReceiverRegistry) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = ShuffleReceiverRegistry::new(dir.path().to_path_buf());
+        (dir, reg)
+    }
+
+    /// A msgpack map row built the same way the join tests build rows.
+    fn row(fields: &[(&str, serde_json::Value)]) -> Vec<u8> {
+        let mut map = serde_json::Map::new();
+        for (k, v) in fields {
+            map.insert((*k).to_string(), v.clone());
+        }
+        nodedb_types::json_to_msgpack(&serde_json::Value::Object(map)).expect("encode row")
+    }
+
+    /// Encode rows into one msgpack array — the `ShufflePushChunk` payload shape.
+    fn encode_array(rows: &[Vec<u8>]) -> Vec<u8> {
+        crate::data::executor::response_codec::encode_binary_rows(rows)
+    }
+
+    /// Parse a staged `[u32 LE len][row-bytes]` frame file — byte-for-byte the
+    /// format the Data Plane's `FrameStreamReader` consumes (which is private to
+    /// the join module, so this mirrors it locally for the unit test).
+    fn read_staged(path: &Path) -> Vec<Vec<u8>> {
+        let bytes = std::fs::read(path).expect("read staged file");
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 4 <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("len")) as usize;
+            pos += 4;
+            assert!(pos + len <= bytes.len(), "frame body truncated");
+            out.push(bytes[pos..pos + len].to_vec());
+            pos += len;
+        }
+        assert_eq!(pos, bytes.len(), "trailing bytes after last frame");
+        out
+    }
+
+    #[tokio::test]
+    async fn append_chunk_explodes_array_into_per_row_frames() {
+        let (_d, reg) = temp_base();
+        let inbox = reg.get_or_create(1, 0, 0, 1);
+        let rows = vec![
+            row(&[("k", serde_json::json!(1))]),
+            row(&[("k", serde_json::json!(2))]),
+            row(&[("k", serde_json::json!(3))]),
+        ];
+        inbox
+            .append_chunk(&encode_array(&rows))
+            .await
+            .expect("append");
+        inbox.finalize().await.expect("finalize");
+        let staged = read_staged(inbox.staged_path());
+        assert_eq!(staged, rows, "each array element becomes one frame");
+    }
+
+    #[tokio::test]
+    async fn append_chunk_is_appending_across_chunks() {
+        let (_d, reg) = temp_base();
+        let inbox = reg.get_or_create(2, 0, 1, 1);
+        let a = vec![row(&[("k", serde_json::json!("a"))])];
+        let b = vec![
+            row(&[("k", serde_json::json!("b"))]),
+            row(&[("k", serde_json::json!("c"))]),
+        ];
+        inbox.append_chunk(&encode_array(&a)).await.expect("a");
+        inbox.append_chunk(&encode_array(&b)).await.expect("b");
+        inbox.finalize().await.expect("finalize");
+        let staged = read_staged(inbox.staged_path());
+        let mut want = a.clone();
+        want.extend(b.clone());
+        assert_eq!(staged, want);
+    }
+
+    #[tokio::test]
+    async fn empty_chunk_array_stages_no_frames() {
+        let (_d, reg) = temp_base();
+        let inbox = reg.get_or_create(3, 0, 0, 1);
+        inbox.append_chunk(&encode_array(&[])).await.expect("empty");
+        inbox.finalize().await.expect("finalize");
+        let staged = read_staged(inbox.staged_path());
+        assert!(staged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_chunk_is_hard_error() {
+        let (_d, reg) = temp_base();
+        let inbox = reg.get_or_create(4, 0, 0, 1);
+        // A truncated array: header claims 1 element but no body follows.
+        let bad = vec![0x91u8];
+        let res = inbox.append_chunk(&bad).await;
+        assert!(
+            matches!(res, Err(crate::Error::Storage { .. })),
+            "a malformed chunk must surface a Storage error, never a silent drop"
+        );
+    }
+
     #[test]
     fn barrier_fires_only_after_all_producers_end() {
-        let inbox = ShuffleInbox::new(2, 8);
+        let (_d, reg) = temp_base();
+        let inbox = reg.get_or_create(5, 0, 0, 2);
         assert!(!inbox.barrier_complete());
-        // First End: not complete.
         assert!(!inbox.record_end());
         assert!(!inbox.barrier_complete());
         assert_eq!(inbox.ends_received(), 1);
-        // Second End: barrier complete.
         assert!(inbox.record_end());
         assert!(inbox.barrier_complete());
         assert_eq!(inbox.ends_received(), 2);
@@ -245,64 +470,17 @@ mod tests {
 
     #[test]
     fn single_producer_barrier_fires_on_first_end() {
-        let inbox = ShuffleInbox::new(1, 8);
+        let (_d, reg) = temp_base();
+        let inbox = reg.get_or_create(6, 0, 0, 1);
         assert!(!inbox.barrier_complete());
         assert!(inbox.record_end());
         assert!(inbox.barrier_complete());
     }
 
     #[test]
-    fn push_pop_is_fifo() {
-        let inbox = ShuffleInbox::new(1, 8);
-        inbox.push(vec![1]);
-        inbox.push(vec![2]);
-        inbox.push(vec![3]);
-        assert_eq!(inbox.buffered_len(), 3);
-        assert_eq!(inbox.pop(), Some(vec![1]));
-        assert_eq!(inbox.pop(), Some(vec![2]));
-        assert_eq!(inbox.pop(), Some(vec![3]));
-        assert_eq!(inbox.pop(), None);
-    }
-
-    #[test]
-    fn try_drain_returns_all_in_order() {
-        let inbox = ShuffleInbox::new(1, 8);
-        inbox.push(vec![10]);
-        inbox.push(vec![20]);
-        let drained = inbox.try_drain();
-        assert_eq!(drained, vec![vec![10], vec![20]]);
-        assert_eq!(inbox.buffered_len(), 0);
-        assert!(inbox.try_drain().is_empty());
-    }
-
-    #[test]
-    fn bounded_push_blocks_until_pop() {
-        // capacity 1: a second push from another thread must block until the
-        // first payload is popped, proving the bound is enforced.
-        let inbox = Arc::new(ShuffleInbox::new(1, 1));
-        inbox.push(vec![1]);
-        assert_eq!(inbox.buffered_len(), 1);
-
-        let producer = {
-            let inbox = Arc::clone(&inbox);
-            std::thread::spawn(move || {
-                inbox.push(vec![2]); // blocks until main pops
-            })
-        };
-
-        // Give the producer a chance to block on the full buffer.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(inbox.buffered_len(), 1, "buffer must stay at capacity");
-
-        // Pop frees a slot; the blocked producer can now push.
-        assert_eq!(inbox.pop(), Some(vec![1]));
-        producer.join().expect("producer thread");
-        assert_eq!(inbox.pop(), Some(vec![2]));
-    }
-
-    #[test]
     fn error_capture_first_writer_wins() {
-        let inbox = ShuffleInbox::new(1, 8);
+        let (_d, reg) = temp_base();
+        let inbox = reg.get_or_create(7, 0, 0, 1);
         assert!(inbox.take_error().is_none());
         inbox.set_error(TypedClusterError::Internal {
             code: 1,
@@ -316,40 +494,54 @@ mod tests {
             Some(TypedClusterError::Internal { code, .. }) => assert_eq!(code, 1),
             other => panic!("expected first Internal error, got {other:?}"),
         }
-        // Taken — now empty.
         assert!(inbox.take_error().is_none());
     }
 
     #[test]
     fn registry_get_or_create_is_idempotent() {
-        let reg = ShuffleReceiverRegistry::new();
-        let a = reg.get_or_create(7, 0, 0, 2, 16);
-        let b = reg.get_or_create(7, 0, 0, 99, 99);
+        let (_d, reg) = temp_base();
+        let a = reg.get_or_create(10, 0, 0, 2);
+        let b = reg.get_or_create(10, 0, 0, 99);
         assert!(Arc::ptr_eq(&a, &b), "same key must reuse the same inbox");
-        // First creator's producer_count wins.
-        assert_eq!(a.producer_count(), 2);
-        // A different key gets a distinct inbox.
-        let c = reg.get_or_create(7, 1, 0, 1, 16);
+        assert_eq!(a.producer_count(), 2, "first creator's producer_count wins");
+        let c = reg.get_or_create(10, 1, 0, 1);
         assert!(!Arc::ptr_eq(&a, &c));
     }
 
     #[test]
     fn registry_get_returns_none_for_missing() {
-        let reg = ShuffleReceiverRegistry::new();
-        assert!(reg.get((1, 0, 0)).is_none());
-        reg.get_or_create(1, 0, 0, 1, 8);
-        assert!(reg.get((1, 0, 0)).is_some());
+        let (_d, reg) = temp_base();
+        assert!(reg.get((11, 0, 0)).is_none());
+        reg.get_or_create(11, 0, 0, 1);
+        assert!(reg.get((11, 0, 0)).is_some());
     }
 
     #[test]
-    fn unregister_shuffle_removes_only_matching_id() {
-        let reg = ShuffleReceiverRegistry::new();
-        reg.get_or_create(1, 0, 0, 1, 8);
-        reg.get_or_create(1, 1, 1, 1, 8);
-        reg.get_or_create(2, 0, 0, 1, 8);
-        reg.unregister_shuffle(1);
-        assert!(reg.get((1, 0, 0)).is_none());
-        assert!(reg.get((1, 1, 1)).is_none());
-        assert!(reg.get((2, 0, 0)).is_some());
+    fn staged_path_is_deterministic_and_scoped() {
+        let (_d, reg) = temp_base();
+        let inbox = reg.get_or_create(12, 3, 1, 1);
+        let p = inbox.staged_path();
+        assert!(p.ends_with("shuffle-stage/12/3-1.frames"), "path: {p:?}");
+    }
+
+    #[tokio::test]
+    async fn unregister_removes_inboxes_and_scratch_dir() {
+        let (_d, reg) = temp_base();
+        let inbox = reg.get_or_create(13, 0, 0, 1);
+        inbox
+            .append_chunk(&encode_array(&[row(&[("k", serde_json::json!(1))])]))
+            .await
+            .expect("append");
+        inbox.finalize().await.expect("finalize");
+        let dir = inbox.staged_path().parent().unwrap().to_path_buf();
+        assert!(dir.exists(), "staging dir created");
+        reg.get_or_create(13, 1, 1, 1);
+        reg.get_or_create(14, 0, 0, 1);
+
+        reg.unregister_shuffle(13);
+        assert!(reg.get((13, 0, 0)).is_none());
+        assert!(reg.get((13, 1, 1)).is_none());
+        assert!(reg.get((14, 0, 0)).is_some());
+        assert!(!dir.exists(), "scratch dir removed for shuffle 13");
     }
 }

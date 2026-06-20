@@ -373,7 +373,8 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
     // is a no-op and a chunk surfaces a typed "not configured" error.
     async fn on_shuffle_request(&self, req: ShufflePushRequest) {
         if let Some(recv) = &self.shuffle_receiver {
-            recv.on_shuffle_request(req.shuffle_id, req.part, req.side, req.producer_count);
+            recv.on_shuffle_request(req.shuffle_id, req.part, req.side, req.producer_count)
+                .await;
         }
     }
 
@@ -385,7 +386,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
         payload: Vec<u8>,
     ) -> Result<()> {
         match &self.shuffle_receiver {
-            Some(recv) => recv.on_shuffle_chunk(shuffle_id, part, side, payload),
+            Some(recv) => recv.on_shuffle_chunk(shuffle_id, part, side, payload).await,
             None => Err(ClusterError::Transport {
                 detail: "shuffle receiver not configured (no ShuffleReceiver installed)".into(),
             }),
@@ -400,7 +401,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
         error: Option<TypedClusterError>,
     ) {
         if let Some(recv) = &self.shuffle_receiver {
-            recv.on_shuffle_end(shuffle_id, part, side, error);
+            recv.on_shuffle_end(shuffle_id, part, side, error).await;
         }
     }
 }

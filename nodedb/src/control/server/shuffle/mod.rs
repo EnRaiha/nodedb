@@ -9,4 +9,4 @@ pub mod receiver;
 
 pub use inbox::{ShuffleInbox, ShuffleKey, ShuffleReceiverRegistry};
 pub use producer::send_shuffle_push;
-pub use receiver::{DEFAULT_SHUFFLE_INBOX_CAPACITY, RegistryShuffleReceiver};
+pub use receiver::RegistryShuffleReceiver;
