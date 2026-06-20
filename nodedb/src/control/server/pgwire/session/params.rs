@@ -126,6 +126,7 @@ pub const KNOWN_PG_RUNTIME_PARAMETERS: &[&str] = &[
     "nodedb.tenant_id",
     "nodedb.force_shuffle_join",
     "nodedb.shuffle_num_parts",
+    "nodedb.broadcast_threshold_bytes",
     "rounding_mode",
 ];
 
@@ -177,6 +178,10 @@ pub const SETTABLE_RUNTIME_PARAMETERS: &[&str] = &[
     // the session parameter bag.
     "nodedb.force_shuffle_join",
     "nodedb.shuffle_num_parts",
+    // Auto-shuffle cost threshold (bytes). Operator/test override of the
+    // node's `[tuning.cluster_transport] broadcast_threshold_bytes`. When both
+    // join sides' analyzed sizes exceed this, the planner auto-selects shuffle.
+    "nodedb.broadcast_threshold_bytes",
     // Unprefixed NodeDB session knob — Calvin cross-shard mode (paired
     // SHOW cross_shard_txn). Read by the routing planner via the session
     // parameter bag.

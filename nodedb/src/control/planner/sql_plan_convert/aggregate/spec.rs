@@ -94,7 +94,9 @@ pub(in crate::control::planner::sql_plan_convert) fn join_side_collection(
     }
 }
 
-pub(super) fn extract_collection_name(plan: &SqlPlan) -> String {
+pub(in crate::control::planner::sql_plan_convert) fn extract_collection_name(
+    plan: &SqlPlan,
+) -> String {
     match plan {
         SqlPlan::Scan { collection, .. } => collection.clone(),
         SqlPlan::PointGet { collection, .. } => collection.clone(),

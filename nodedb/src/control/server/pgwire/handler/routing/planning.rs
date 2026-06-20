@@ -118,6 +118,24 @@ impl NodeDbPgHandler {
         self.query_ctx
             .set_force_shuffle_join(force_shuffle_join, shuffle_num_parts);
 
+        // Resolve the auto-shuffle cost threshold: the session override
+        // `nodedb.broadcast_threshold_bytes` when set, otherwise the node's
+        // configured `[tuning.cluster_transport] broadcast_threshold_bytes`.
+        // Passing the resolved value (not just the override) makes a SET then
+        // RESET correctly revert to the tuning default for this session.
+        let tuning_threshold = self
+            .state
+            .tuning
+            .cluster_transport
+            .broadcast_threshold_bytes;
+        let session_threshold = self
+            .sessions
+            .get_parameter(addr, "nodedb.broadcast_threshold_bytes")
+            .and_then(|v| v.parse::<usize>().ok());
+        let broadcast_threshold_bytes = session_threshold.unwrap_or(tuning_threshold);
+        self.query_ctx
+            .set_broadcast_threshold_bytes(broadcast_threshold_bytes);
+
         // Enforce general CHECK constraints for INSERT/UPDATE before planning.
         self.enforce_check_constraints_if_needed(&clean_sql, tenant_id)
             .await?;
@@ -131,13 +149,25 @@ impl NodeDbPgHandler {
             .get_current_database(addr)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
+        // A session-level `nodedb.broadcast_threshold_bytes` override changes the
+        // auto-shuffle decision the same way force-shuffle does, and the cache
+        // key encodes neither knob. The node-wide tuning default is constant
+        // across sessions, so plans cached under it stay consistent and need no
+        // bypass; only a *session override* (different from the tuning default,
+        // or any explicit SET) makes the cached plan's strategy assumption
+        // unsafe to share. Treat a present session override exactly like
+        // force-shuffle: bypass read AND put.
+        let threshold_overridden = session_threshold.is_some_and(|t| t != tuning_threshold);
+
         // Check plan cache before full planning. The cache key is
         // `(sql_hash, schema_version)` and does NOT vary by session knob, so it
-        // is bypassed entirely while the force-shuffle override is engaged: a
-        // cached broadcast plan would otherwise be served for a shuffle request
-        // (and a shuffle plan must not be cached for a later non-shuffle query).
-        // Skipping read AND put keeps the cache shuffle-free.
-        let cached_tasks = if force_shuffle_join {
+        // is bypassed entirely while the force-shuffle override OR a non-default
+        // broadcast-threshold override is engaged: a cached plan built under a
+        // different join-strategy assumption would otherwise be served (and a
+        // strategy-specific plan must not be cached for a later default query).
+        // Skipping read AND put keeps the cache strategy-knob-free.
+        let bypass_cache = force_shuffle_join || threshold_overridden;
+        let cached_tasks = if bypass_cache {
             None
         } else {
             let state = Arc::clone(&self.state);
@@ -206,10 +236,11 @@ impl NodeDbPgHandler {
             })?;
 
             let scope = self.state.acquire_plan_lease_scope(&versions);
-            // Do not cache a plan built under the force-shuffle override — the
-            // cache key does not encode the session knob, so caching it would
-            // leak a shuffle plan into later non-shuffle queries on this session.
-            if !force_shuffle_join {
+            // Do not cache a plan built under a strategy-knob override (force
+            // shuffle, or a non-default broadcast threshold) — the cache key
+            // does not encode the session knob, so caching it would leak a
+            // strategy-specific plan into later default queries on this session.
+            if !bypass_cache {
                 self.sessions
                     .put_cached_plan(addr, &clean_sql, planned.clone(), versions);
             }

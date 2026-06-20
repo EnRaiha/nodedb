@@ -70,6 +70,7 @@ fn sql_to_physical(sql: &str) -> PhysicalPlan {
         tenant_id: nodedb::types::TenantId::new(1),
         force_shuffle_join: false,
         shuffle_num_parts: 0,
+        broadcast_threshold_bytes: 8 * 1024 * 1024,
     };
     let tenant_id = nodedb::types::TenantId::new(1);
     let tasks = convert(&plans, tenant_id, &ctx).unwrap();

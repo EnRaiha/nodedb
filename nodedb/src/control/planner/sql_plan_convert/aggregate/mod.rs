@@ -20,5 +20,6 @@ pub(in crate::control::planner::sql_plan_convert) use projection::{
     serialize_window_functions,
 };
 pub(in crate::control::planner::sql_plan_convert) use spec::{
-    agg_expr_to_pair, extract_scan_alias, inline_join_side, join_side_collection,
+    agg_expr_to_pair, extract_collection_name, extract_scan_alias, inline_join_side,
+    join_side_collection,
 };

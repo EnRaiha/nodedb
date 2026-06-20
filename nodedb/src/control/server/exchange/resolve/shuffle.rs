@@ -169,6 +169,22 @@ pub async fn resolve_shuffle_join(
         });
     }
 
+    // Ensure the transport knows every target node's address before dispatching.
+    // In production the WarmPeers startup phase registers every peer from the
+    // topology, but a node that joined after that phase — or a coordinator that
+    // never had to reach a given peer — may not yet have it in the transport's
+    // address map, and `send_rpc` to an unregistered peer fails with
+    // NodeUnreachable even though the topology knows the node. Resolve each
+    // producer/consumer node's address from the live topology and register it
+    // (idempotent) up front so the fan-out below never spuriously fails.
+    {
+        let mut targets: BTreeSet<u64> = BTreeSet::new();
+        targets.extend(build_nodes.iter().copied());
+        targets.extend(probe_nodes.iter().copied());
+        targets.extend(part_node_map.iter().map(|e| e.node_id));
+        register_peers_from_topology(state, transport, &targets);
+    }
+
     // 6. Encode each side's bare full-collection scan. The producer cannot scan
     //    by name across nodes, so a missing catalog entry is a hard error here
     //    (unlike the broadcast-gather path's graceful name-scan fallback).
@@ -338,6 +354,34 @@ async fn send_consume(
         Err(e) => Err(crate::Error::Internal {
             detail: format!("shuffle consume RPC for part {part} to node {node} failed: {e}"),
         }),
+    }
+}
+
+/// Register each target node's address with the transport from the live cluster
+/// topology (idempotent). Makes the shuffle fan-out robust to a peer the
+/// transport has not warmed yet — without it `send_rpc` to an unregistered (but
+/// topology-known) node fails with `NodeUnreachable`. Self IS registered too:
+/// when this coordinator also owns one of the join sides it dispatches that
+/// producer/consumer to itself via `send_rpc`, which loops back through the local
+/// QUIC endpoint and runs the same handler (an extra local hop, functionally
+/// correct). Missing topology / address for a node is left alone so the
+/// subsequent `send_rpc` surfaces the typed `NodeUnreachable` rather than this
+/// silently masking it.
+fn register_peers_from_topology(
+    state: &SharedState,
+    transport: &nodedb_cluster::NexarTransport,
+    nodes: &BTreeSet<u64>,
+) {
+    let Some(topology) = state.cluster_topology.as_ref() else {
+        return;
+    };
+    let topo = topology.read().unwrap_or_else(|p| p.into_inner());
+    for &node in nodes {
+        if let Some(info) = topo.get_node(node)
+            && let Some(addr) = info.socket_addr()
+        {
+            transport.register_peer(node, addr);
+        }
     }
 }
 

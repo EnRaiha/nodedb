@@ -35,7 +35,10 @@ fn serialize_join_filters(
                     if base.is_empty() {
                         Vec::new()
                     } else {
-                        zerompk::from_msgpack(&base).unwrap_or_default()
+                        zerompk::from_msgpack(&base).map_err(|e| crate::Error::Serialization {
+                            format: "msgpack".into(),
+                            detail: format!("join filter deserialize: {e}"),
+                        })?
                     }
                 } else {
                     Vec::new()
@@ -90,6 +93,12 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
         super::super::aggregate::join_side_collection(left, p.ctx.database_id);
     let mut right_collection =
         super::super::aggregate::join_side_collection(right, p.ctx.database_id);
+    // RAW (non-db-qualified) names for the cost-model stats lookup: `ANALYZE`
+    // keys its persisted column stats by the bare collection name, so the
+    // shuffle cost model must look them up by the same raw name (not the
+    // db-qualified token used for storage routing).
+    let mut left_raw = super::super::aggregate::extract_collection_name(left);
+    let mut right_raw = super::super::aggregate::extract_collection_name(right);
     let mut left_alias = extract_scan_alias(left);
     let mut right_alias = extract_scan_alias(right);
     let join_projection = extract_join_projection_specs(projection);
@@ -127,6 +136,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
     let mut right_input = right_input;
     let effective_join_type = if join_type.as_str() == "right" {
         std::mem::swap(&mut left_collection, &mut right_collection);
+        std::mem::swap(&mut left_raw, &mut right_raw);
         std::mem::swap(&mut left_alias, &mut right_alias);
         std::mem::swap(&mut left_input, &mut right_input);
         on_keys = on_keys.into_iter().map(|(l, r)| (r, l)).collect();
@@ -149,24 +159,32 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
 
     let vshard = VShardId::from_collection_in_database(p.ctx.database_id, &left_collection);
 
-    // Force-shuffle eligibility (permanent operator override; the automatic
-    // cost-model default is a separate follow-up). A whole-join shuffle is only
-    // valid when BOTH sides are plain sharded user collections scanned by name
-    // — i.e. both `*_input` slots are `None` (no embedded catalog `ProviderScan`
-    // and no nested-join sub-plan) — and the join is a real equi-join
-    // (`on_keys` non-empty). Anything else (nested joins, catalog sides,
-    // cross/keyless joins) keeps the default broadcast/local plan unchanged.
+    // Shuffle eligibility. A whole-join shuffle is only *structurally* valid
+    // when BOTH sides are plain sharded user collections scanned by name — i.e.
+    // both `*_input` slots are `None` (no embedded catalog `ProviderScan` and no
+    // nested-join sub-plan) — and the join is a real equi-join (`on_keys`
+    // non-empty). Anything else (nested joins, catalog sides, cross/keyless
+    // joins) keeps the default broadcast/local plan unchanged.
     //
-    // The override is honored only in cluster mode: single-node has no peers to
+    // Shuffle is honored only in cluster mode: single-node has no peers to
     // repartition across, so the local broadcast plan is both correct and
     // cheaper. The two inputs are left as BARE name scans (`left_input` /
     // `right_input` stay `None`); the coordinator resolver builds the per-side
     // scan fragments from the collection names and drives the producers.
-    let shuffle_eligible = p.ctx.force_shuffle_join
-        && p.ctx.cluster_enabled
+    //
+    // Given structural eligibility, shuffle is selected when EITHER:
+    //   1. the operator forced it via `nodedb.force_shuffle_join` (manual
+    //      override always wins), OR
+    //   2. the ANALYZE-driven cost model picks it (both sides large enough that
+    //      neither is cheap to broadcast). Un-analyzed collections fall back to
+    //      broadcast — see `join_cost::cost_model_picks_shuffle`.
+    let structurally_shufflable = p.ctx.cluster_enabled
         && !on_keys.is_empty()
         && left_input.is_none()
         && right_input.is_none();
+    let shuffle_eligible = structurally_shufflable
+        && (p.ctx.force_shuffle_join
+            || super::join_cost::cost_model_picks_shuffle(p.ctx, &left_raw, &right_raw));
 
     // Shuffle hash keys mirror the resolver's per-side split: the LEFT column of
     // each `on` pair partitions the probe side, the RIGHT column the build side

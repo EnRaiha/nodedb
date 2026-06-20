@@ -5,7 +5,8 @@ use std::sync::Arc;
 use crate::control::security::credential::CredentialStore;
 
 use super::catalog_inputs::CatalogInputs;
-use super::security::PlanSecurityContext;
+
+mod planning;
 
 /// Query context for the Control Plane.
 ///
@@ -64,6 +65,15 @@ pub struct QueryContext {
     /// `nodedb.shuffle_num_parts`). `0` means "unset — let the emit default to
     /// the cluster data-node count". Updated alongside `force_shuffle_join`.
     shuffle_num_parts: std::sync::atomic::AtomicU32,
+    /// Broadcast-vs-shuffle cost threshold in bytes (session var
+    /// `nodedb.broadcast_threshold_bytes`, defaulting to the node's
+    /// `[tuning.cluster_transport] broadcast_threshold_bytes`). Connection
+    /// handlers resolve the effective value (session override OR tuning default)
+    /// and write it via `set_broadcast_threshold_bytes` before each plan call;
+    /// forwarded into `ConvertContext` where the auto-shuffle cost model reads
+    /// it. An atomic mirrors the other per-request knobs so `&self` plan calls
+    /// read it without an exclusive borrow.
+    broadcast_threshold_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl QueryContext {
@@ -80,6 +90,9 @@ impl QueryContext {
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),
             force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
             shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
+            broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
+                default_broadcast_threshold_bytes(),
+            ),
         }
     }
 
@@ -104,6 +117,13 @@ impl QueryContext {
         // set_max_vector_dim before each planning call.
         ctx.max_vector_dim
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Seed the auto-shuffle cost threshold from the node's configured
+        // default. Connection handlers re-resolve it per request (session
+        // override OR this default) via `set_broadcast_threshold_bytes`.
+        ctx.broadcast_threshold_bytes.store(
+            state.tuning.cluster_transport.broadcast_threshold_bytes,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         ctx
     }
 
@@ -133,6 +153,9 @@ impl QueryContext {
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),
             force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
             shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
+            broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
+                state.tuning.cluster_transport.broadcast_threshold_bytes,
+            ),
         }
     }
 
@@ -160,6 +183,30 @@ impl QueryContext {
             .store(force, std::sync::atomic::Ordering::Relaxed);
         self.shuffle_num_parts
             .store(num_parts, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the broadcast-vs-shuffle cost threshold (bytes) for the next plan
+    /// call.
+    ///
+    /// Called by connection handlers with the effective value — the session
+    /// override `nodedb.broadcast_threshold_bytes` when set, otherwise the
+    /// node's configured `[tuning.cluster_transport] broadcast_threshold_bytes`.
+    /// Passing the resolved value (rather than only the override) means a
+    /// session that sets and later unsets the knob correctly reverts to the
+    /// tuning default. Relaxed ordering suffices: written before planning
+    /// begins, read only within that same call (same contract as
+    /// `set_max_vector_dim`).
+    pub fn set_broadcast_threshold_bytes(&self, bytes: usize) {
+        self.broadcast_threshold_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The node's default broadcast threshold, used when no `SharedState` tuning
+    /// is available (legacy `new()` / `with_catalog()` fixtures). Mirrors
+    /// `ClusterTransportTuning::default().broadcast_threshold_bytes`.
+    pub fn default_broadcast_threshold(&self) -> usize {
+        self.broadcast_threshold_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Override the default rounding mode for `ROUND()`.
@@ -193,251 +240,18 @@ impl QueryContext {
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),
             force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
             shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
+            broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
+                default_broadcast_threshold_bytes(),
+            ),
         }
     }
+}
 
-    /// Parse SQL and convert to NodeDB physical plan(s).
-    ///
-    /// Uses nodedb-sql for parsing and planning, then converts to PhysicalTasks.
-    /// `database_id` scopes catalog lookups to a specific database namespace.
-    /// Pass `DatabaseId::DEFAULT` when no explicit database scope is needed
-    /// (e.g. internal queries from event triggers or scheduled jobs).
-    pub async fn plan_sql(
-        &self,
-        sql: &str,
-        tenant_id: crate::types::TenantId,
-        database_id: crate::types::DatabaseId,
-    ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-        self.plan_with_nodedb_sql(sql, tenant_id, database_id)
-            .map(|(t, _)| t)
-    }
-
-    /// Core planning via nodedb-sql: parse → plan → optimize → convert.
-    ///
-    /// Returns the compiled physical tasks and the
-    /// [`super::super::descriptor_set::DescriptorVersionSet`] recording
-    /// every descriptor the planner touched. The version set is
-    /// used as the plan-cache key AND as the input to
-    /// `SharedState::acquire_plan_lease_scope` so cache hits
-    /// and fresh plans share the same lease-acquisition path.
-    fn plan_with_nodedb_sql(
-        &self,
-        sql: &str,
-        tenant_id: crate::types::TenantId,
-        database_id: crate::types::DatabaseId,
-    ) -> crate::Result<(
-        Vec<nodedb_physical::physical_task::PhysicalTask>,
-        super::super::descriptor_set::DescriptorVersionSet,
-    )> {
-        let inputs = match &self.catalog_inputs {
-            Some(i) => i,
-            None => {
-                return Err(crate::Error::PlanError {
-                    detail: "no catalog available for SQL planning".into(),
-                });
-            }
-        };
-        // Fresh adapter per plan call: the adapter's
-        // `recorded_versions` field is per-plan state, and
-        // two concurrent plans through a shared QueryContext
-        // would otherwise interleave their recorded sets.
-        let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
-        let plans = nodedb_sql::plan_sql(sql, &catalog).map_err(|e| match e {
-            nodedb_sql::SqlError::RetryableSchemaChanged { descriptor } => {
-                crate::Error::RetryableSchemaChanged { descriptor }
-            }
-            nodedb_sql::SqlError::CollectionDeactivated {
-                name,
-                retention_expires_at_ns,
-                ..
-            } => crate::Error::CollectionDeactivated {
-                tenant_id,
-                collection: name,
-                retention_expires_at_ns,
-            },
-            other => crate::Error::PlanError {
-                detail: format!("{other}"),
-            },
-        })?;
-        // Fold catalog-dependent cast expressions (::regclass, ::regtype) to
-        // constant OID literals at plan time, before crossing the bridge.
-        // The data-plane evaluator is pure and has no catalog access.
-        let plans: Vec<_> = plans
-            .into_iter()
-            .map(|p| {
-                nodedb_sql::planner::catalog_fold::fold_catalog_exprs_in_plan(
-                    p,
-                    &catalog,
-                    database_id,
-                    tenant_id.as_u64(),
-                )
-            })
-            .collect();
-        let version_set = catalog.take_recorded_versions();
-        let ctx = super::super::sql_plan_convert::ConvertContext {
-            retention_registry: self.retention_registry.clone(),
-            array_catalog: self.array_catalog.clone(),
-            credentials: self
-                .catalog_inputs
-                .as_ref()
-                .map(|i| Arc::clone(&i.credentials)),
-            wal: self.wal.clone(),
-            surrogate_assigner: self.surrogate_assigner.clone(),
-            cluster_enabled: self.cluster_enabled,
-            bitemporal_retention_registry: self.bitemporal_retention_registry.clone(),
-            max_vector_dim: self
-                .max_vector_dim
-                .load(std::sync::atomic::Ordering::Relaxed),
-            force_shuffle_join: self
-                .force_shuffle_join
-                .load(std::sync::atomic::Ordering::Relaxed),
-            shuffle_num_parts: self
-                .shuffle_num_parts
-                .load(std::sync::atomic::Ordering::Relaxed) as usize,
-            database_id,
-            tenant_id,
-        };
-        let tasks = super::super::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
-        Ok((tasks, version_set))
-    }
-
-    /// Parse SQL, inject RLS predicates, convert to physical plan.
-    ///
-    /// This is the primary query entry point.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn plan_sql_with_rls(
-        &self,
-        sql: &str,
-        tenant_id: crate::types::TenantId,
-        database_id: crate::types::DatabaseId,
-        sec: &PlanSecurityContext<'_>,
-    ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-        self.plan_sql_with_rls_returning(sql, tenant_id, database_id, sec, false)
-            .await
-    }
-
-    /// Plan SQL with RLS injection, optionally propagating a RETURNING flag.
-    pub async fn plan_sql_with_rls_returning(
-        &self,
-        sql: &str,
-        tenant_id: crate::types::TenantId,
-        database_id: crate::types::DatabaseId,
-        sec: &PlanSecurityContext<'_>,
-        returning: bool,
-    ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-        self.plan_sql_with_rls_and_versions(sql, tenant_id, database_id, sec, returning)
-            .await
-            .map(|(tasks, _)| tasks)
-    }
-
-    /// Variant of [`plan_sql_with_rls_returning`] that also
-    /// returns the `DescriptorVersionSet` recorded during
-    /// planning. The pgwire plan cache uses the set as its
-    /// freshness witness, and the handler feeds it into
-    /// `SharedState::acquire_plan_lease_scope` to take the
-    /// refcounts that must stay non-zero through execute.
-    pub async fn plan_sql_with_rls_and_versions(
-        &self,
-        sql: &str,
-        tenant_id: crate::types::TenantId,
-        database_id: crate::types::DatabaseId,
-        sec: &PlanSecurityContext<'_>,
-        _returning: bool,
-    ) -> crate::Result<(
-        Vec<nodedb_physical::physical_task::PhysicalTask>,
-        super::super::descriptor_set::DescriptorVersionSet,
-    )> {
-        let (mut tasks, version_set) = self.plan_with_nodedb_sql(sql, tenant_id, database_id)?;
-
-        // Inject RLS predicates.
-        super::super::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
-
-        // Inject permission tree filters (hierarchical ACL).
-        if let Some(cache) = sec.permission_cache {
-            super::super::rls_injection::inject_permission_tree(&mut tasks, cache, sec.auth)?;
-        }
-
-        Ok((tasks, version_set))
-    }
-
-    /// Plan SQL with bound parameters and RLS injection.
-    ///
-    /// Used by prepared statement execution to bind parameters at the AST level
-    /// (not via SQL text substitution), then plan and inject RLS as normal.
-    pub async fn plan_sql_with_params_and_rls(
-        &self,
-        sql: &str,
-        params: &[nodedb_sql::ParamValue],
-        tenant_id: crate::types::TenantId,
-        database_id: crate::types::DatabaseId,
-        sec: &PlanSecurityContext<'_>,
-    ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-        let inputs = match &self.catalog_inputs {
-            Some(i) => i,
-            None => {
-                return Err(crate::Error::PlanError {
-                    detail: "no catalog available for SQL planning".into(),
-                });
-            }
-        };
-        // Fresh adapter per plan call: same rationale as
-        // `plan_with_nodedb_sql`. The params-and-rls path does
-        // not currently surface the recorded version set to
-        // callers (prepared statements with bound parameters go
-        // through a different cache key), but constructing the
-        // adapter fresh keeps the adapter's state per-plan and
-        // allows future extension.
-        let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
-        let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog).map_err(|e| {
-            crate::Error::PlanError {
-                detail: format!("{e}"),
-            }
-        })?;
-        let plans: Vec<_> = raw_plans
-            .into_iter()
-            .map(|p| {
-                nodedb_sql::planner::catalog_fold::fold_catalog_exprs_in_plan(
-                    p,
-                    &catalog,
-                    database_id,
-                    tenant_id.as_u64(),
-                )
-            })
-            .collect();
-        let ctx = super::super::sql_plan_convert::ConvertContext {
-            retention_registry: self.retention_registry.clone(),
-            array_catalog: self.array_catalog.clone(),
-            credentials: self
-                .catalog_inputs
-                .as_ref()
-                .map(|i| Arc::clone(&i.credentials)),
-            wal: self.wal.clone(),
-            surrogate_assigner: self.surrogate_assigner.clone(),
-            cluster_enabled: self.cluster_enabled,
-            bitemporal_retention_registry: self.bitemporal_retention_registry.clone(),
-            max_vector_dim: self
-                .max_vector_dim
-                .load(std::sync::atomic::Ordering::Relaxed),
-            force_shuffle_join: self
-                .force_shuffle_join
-                .load(std::sync::atomic::Ordering::Relaxed),
-            shuffle_num_parts: self
-                .shuffle_num_parts
-                .load(std::sync::atomic::Ordering::Relaxed) as usize,
-            database_id,
-            tenant_id,
-        };
-        let mut tasks = super::super::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
-
-        // Inject RLS predicates.
-        super::super::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
-
-        if let Some(cache) = sec.permission_cache {
-            super::super::rls_injection::inject_permission_tree(&mut tasks, cache, sec.auth)?;
-        }
-
-        Ok(tasks)
-    }
+/// The node-default broadcast threshold (bytes) for fixtures that have no
+/// `SharedState` tuning to read. Sourced from `ClusterTransportTuning::default()`
+/// so the planner default and the config default never drift.
+fn default_broadcast_threshold_bytes() -> usize {
+    nodedb_types::config::tuning::ClusterTransportTuning::default().broadcast_threshold_bytes
 }
 
 impl Default for QueryContext {

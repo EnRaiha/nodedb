@@ -7,6 +7,7 @@
 mod core;
 mod helpers;
 mod join;
+mod join_cost;
 mod recursive;
 mod search;
 mod spatial;

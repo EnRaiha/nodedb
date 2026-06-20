@@ -87,6 +87,14 @@ pub struct ConvertContext {
     /// emit time. Sourced from session var `nodedb.shuffle_num_parts`; defaults
     /// to the cluster's data-node count when unset.
     pub shuffle_num_parts: usize,
+    /// Broadcast-vs-shuffle cost threshold in bytes. When BOTH join sides have
+    /// ANALYZE statistics and each side's estimated size exceeds this value
+    /// (i.e. neither side is small enough to broadcast cheaply), the planner
+    /// auto-selects a shuffle join. Defaults to the node's configured
+    /// `[tuning.cluster_transport] broadcast_threshold_bytes`; overridable
+    /// per-session via `nodedb.broadcast_threshold_bytes` for operator control
+    /// and test determinism. See `nodedb_cluster::distributed_join::select_strategy`.
+    pub broadcast_threshold_bytes: usize,
 }
 
 impl ConvertContext {
