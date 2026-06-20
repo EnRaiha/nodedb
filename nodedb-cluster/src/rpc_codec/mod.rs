@@ -19,6 +19,7 @@ pub mod metadata;
 pub mod peer_seq;
 pub mod raft_msgs;
 pub mod raft_rpc;
+pub mod shuffle;
 pub mod vshard;
 
 pub use auth_envelope::{
@@ -38,3 +39,4 @@ pub use mac::{MAC_LEN, MacKey};
 pub use metadata::{MetadataProposeRequest, MetadataProposeResponse};
 pub use peer_seq::{PeerSeqSender, PeerSeqWindow, REPLAY_WINDOW};
 pub use raft_rpc::{RaftRpc, decode, encode, frame_size};
+pub use shuffle::{ShufflePushChunk, ShufflePushEnd, ShufflePushRequest};

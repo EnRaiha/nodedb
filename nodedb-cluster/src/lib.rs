@@ -112,7 +112,9 @@ pub use migration_executor::{
     MigrationExecutor, MigrationRequest, MigrationResult, MigrationSnapshot, MigrationTracker,
 };
 pub use multi_raft::{GroupStatus, MultiRaft};
-pub use raft_loop::{CommitApplier, RaftLoop, SnapshotQuarantineHook, VShardEnvelopeHandler};
+pub use raft_loop::{
+    CommitApplier, RaftLoop, ShuffleReceiver, SnapshotQuarantineHook, VShardEnvelopeHandler,
+};
 pub use reachability::{
     NoopProber, ReachabilityDriver, ReachabilityDriverConfig, ReachabilityProber, TransportProber,
 };
@@ -124,7 +126,9 @@ pub use rebalancer::{
 };
 pub use routing::RoutingTable;
 pub use routing_liveness::{NodeIdResolver, RoutingLivenessHook};
-pub use rpc_codec::{MacKey, RaftRpc};
+pub use rpc_codec::{
+    MacKey, RaftRpc, ShufflePushChunk, ShufflePushEnd, ShufflePushRequest, TypedClusterError,
+};
 pub use topology::{ClusterTopology, NodeInfo, NodeState};
 pub use transport::{
     IDENTITY_MISMATCH_QUIC_ERROR, NexarTransport, NoopIdentityStore, PeerIdentityStore,

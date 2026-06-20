@@ -147,6 +147,14 @@ pub fn start_raft(
         registry: Arc::clone(&shared.quarantine_registry),
     });
 
+    // Cross-node streaming-shuffle receiver (E1): bridge the cluster
+    // `ShufflePush` read-loop to the in-process registry on `SharedState`.
+    let shuffle_receiver: Arc<dyn nodedb_cluster::ShuffleReceiver> = Arc::new(
+        crate::control::server::shuffle::RegistryShuffleReceiver::new(Arc::clone(
+            &shared.shuffle_registry,
+        )),
+    );
+
     let raft_loop = Arc::new(
         nodedb_cluster::RaftLoop::new(
             multi_raft,
@@ -160,6 +168,7 @@ pub fn start_raft(
         .with_tick_interval(tick_interval)
         .with_group_watchers(handle.group_watchers.clone())
         .with_snapshot_quarantine_hook(quarantine_hook)
+        .with_shuffle_receiver(shuffle_receiver)
         .with_data_dir(_data_dir.to_path_buf())
         .with_snapshot_chunk_bytes(snapshot_chunk_bytes)
         .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs),

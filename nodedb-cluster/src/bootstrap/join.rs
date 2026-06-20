@@ -529,6 +529,27 @@ mod tests {
                     message: "streaming not supported by JoinHandler".into(),
                 })
             }
+
+            async fn on_shuffle_request(&self, _req: crate::rpc_codec::ShufflePushRequest) {}
+
+            async fn on_shuffle_chunk(
+                &self,
+                _shuffle_id: u64,
+                _part: u32,
+                _side: u8,
+                _payload: Vec<u8>,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            async fn on_shuffle_end(
+                &self,
+                _shuffle_id: u64,
+                _part: u32,
+                _side: u8,
+                _error: Option<crate::rpc_codec::TypedClusterError>,
+            ) {
+            }
         }
 
         let handler = Arc::new(JoinHandler {

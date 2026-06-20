@@ -66,6 +66,46 @@ pub trait SnapshotQuarantineHook: Send + Sync + 'static {
     fn record_failure(&self, group_id: u64, last_included_index: u64, error: &str) -> bool;
 }
 
+/// Hook for the cross-node streaming-shuffle receiver registry (E1).
+///
+/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the receiver
+/// registry — which is owned by `nodedb`'s `SharedState` and consumed by the
+/// `!Send` Data Plane in a later unit — lives behind this `Send + Sync` hook.
+/// The transport read-loop drives a `ShufflePush` stream and calls these
+/// methods; the host crate's implementation deposits payloads into the
+/// per-`(shuffle_id, part, side)` inbox and advances the per-part build
+/// barrier.
+///
+/// Cluster-only tests leave the `RaftLoop` field `None`; a `ShufflePush` stream
+/// against a node with no receiver installed returns a typed error.
+pub trait ShuffleReceiver: Send + Sync + 'static {
+    /// First frame of a stream: lazily create the inbox for
+    /// `(shuffle_id, part, side)` (carrying `producer_count` and `num_parts`)
+    /// or reuse the existing one.
+    fn on_shuffle_request(&self, shuffle_id: u64, part: u32, side: u8, producer_count: u32);
+
+    /// Deposit one chunk payload into the inbox (bounded — blocks the caller
+    /// while the buffer is full so QUIC flow control back-pressures the
+    /// producer).
+    fn on_shuffle_chunk(
+        &self,
+        shuffle_id: u64,
+        part: u32,
+        side: u8,
+        payload: Vec<u8>,
+    ) -> Result<()>;
+
+    /// Terminal frame for one producer: record the `End` (advancing the
+    /// barrier) and capture any terminal error.
+    fn on_shuffle_end(
+        &self,
+        shuffle_id: u64,
+        part: u32,
+        side: u8,
+        error: Option<crate::rpc_codec::TypedClusterError>,
+    );
+}
+
 /// Type-erased async handler for incoming `VShardEnvelope` messages.
 ///
 /// Receives raw envelope bytes, returns response bytes. Set by the main binary
@@ -161,6 +201,14 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// accounting for snapshot chunks.
     pub(super) snapshot_quarantine_hook: Option<Arc<dyn SnapshotQuarantineHook>>,
 
+    /// Optional cross-node streaming-shuffle receiver (E1).
+    ///
+    /// When set (by the `nodedb` binary via `with_shuffle_receiver`), the
+    /// `ShufflePush` transport read-loop deposits chunks and records barrier
+    /// completion through it. Cluster-only tests leave this `None`, which makes
+    /// any incoming `ShufflePush` stream return a typed "not configured" error.
+    pub(super) shuffle_receiver: Option<Arc<dyn ShuffleReceiver>>,
+
     /// In-progress partial snapshot receives, keyed by `group_id`.
     ///
     /// Each entry tracks the `.partial` file, running CRC, and expected next
@@ -208,6 +256,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             group_watchers: Arc::new(GroupAppliedWatchers::new()),
             prev_metadata_leader: std::sync::atomic::AtomicBool::new(false),
             snapshot_quarantine_hook: None,
+            shuffle_receiver: None,
             partial_snapshots: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             data_dir: None,
             snapshot_chunk_bytes: 4 * 1024 * 1024,
@@ -243,6 +292,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             group_watchers: self.group_watchers,
             prev_metadata_leader: self.prev_metadata_leader,
             snapshot_quarantine_hook: self.snapshot_quarantine_hook,
+            shuffle_receiver: self.shuffle_receiver,
             partial_snapshots: self.partial_snapshots,
             data_dir: self.data_dir,
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
@@ -267,6 +317,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// handler to check for, record, and short-circuit quarantined chunks.
     pub fn with_snapshot_quarantine_hook(mut self, hook: Arc<dyn SnapshotQuarantineHook>) -> Self {
         self.snapshot_quarantine_hook = Some(hook);
+        self
+    }
+
+    /// Attach the cross-node streaming-shuffle receiver (E1, builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s
+    /// `ShuffleReceiverRegistry`) is called by the `ShufflePush` transport
+    /// read-loop to create inboxes, deposit chunks, and record the per-part
+    /// build barrier.
+    pub fn with_shuffle_receiver(mut self, receiver: Arc<dyn ShuffleReceiver>) -> Self {
+        self.shuffle_receiver = Some(receiver);
         self
     }
 

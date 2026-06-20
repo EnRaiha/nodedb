@@ -15,7 +15,8 @@ use super::discriminants::*;
 use super::execute::{ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, ExecuteStreamEnd};
 use super::header::HEADER_SIZE;
 use super::metadata::{MetadataProposeRequest, MetadataProposeResponse};
-use super::{cluster_mgmt, data_propose, execute, metadata, raft_msgs, vshard};
+use super::shuffle::{ShufflePushChunk, ShufflePushEnd, ShufflePushRequest};
+use super::{cluster_mgmt, data_propose, execute, metadata, raft_msgs, shuffle, vshard};
 use crate::error::{ClusterError, Result};
 use crate::wire_version::{unwrap_bytes_versioned, wrap_bytes_versioned};
 
@@ -53,6 +54,12 @@ pub enum RaftRpc {
     ExecuteStreamRequest(ExecuteRequest),
     ExecuteStreamChunk(ExecuteStreamChunk),
     ExecuteStreamEnd(ExecuteStreamEnd),
+    // Cross-node streaming shuffle (E1). The request opens the stream; the
+    // chunk/end frames are pushed producer → receiver on the same QUIC stream
+    // (opposite direction from ExecuteStream, which streams the response back).
+    ShufflePushRequest(ShufflePushRequest),
+    ShufflePushChunk(ShufflePushChunk),
+    ShufflePushEnd(ShufflePushEnd),
     // Data-group proposal forwarding (groups 1+)
     DataProposeRequest(DataProposeRequest),
     DataProposeResponse(DataProposeResponse),
@@ -82,6 +89,9 @@ pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
         RaftRpc::ExecuteStreamRequest(m) => execute::encode_execute_stream_req(m, &mut out),
         RaftRpc::ExecuteStreamChunk(m) => execute::encode_execute_stream_chunk(m, &mut out),
         RaftRpc::ExecuteStreamEnd(m) => execute::encode_execute_stream_end(m, &mut out),
+        RaftRpc::ShufflePushRequest(m) => shuffle::encode_shuffle_push_req(m, &mut out),
+        RaftRpc::ShufflePushChunk(m) => shuffle::encode_shuffle_push_chunk(m, &mut out),
+        RaftRpc::ShufflePushEnd(m) => shuffle::encode_shuffle_push_end(m, &mut out),
         RaftRpc::DataProposeRequest(m) => data_propose::encode_data_propose_req(m, &mut out),
         RaftRpc::DataProposeResponse(m) => data_propose::encode_data_propose_resp(m, &mut out),
     }?;
@@ -147,6 +157,9 @@ pub fn decode(data: &[u8]) -> Result<RaftRpc> {
         RPC_EXECUTE_STREAM_REQ => execute::decode_execute_stream_req(payload),
         RPC_EXECUTE_STREAM_CHUNK => execute::decode_execute_stream_chunk(payload),
         RPC_EXECUTE_STREAM_END => execute::decode_execute_stream_end(payload),
+        RPC_SHUFFLE_PUSH_REQ => shuffle::decode_shuffle_push_req(payload),
+        RPC_SHUFFLE_PUSH_CHUNK => shuffle::decode_shuffle_push_chunk(payload),
+        RPC_SHUFFLE_PUSH_END => shuffle::decode_shuffle_push_end(payload),
         RPC_DATA_PROPOSE_REQ => data_propose::decode_data_propose_req(payload),
         RPC_DATA_PROPOSE_RESP => data_propose::decode_data_propose_resp(payload),
         _ => Err(ClusterError::Codec {

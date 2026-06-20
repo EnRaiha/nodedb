@@ -16,7 +16,10 @@ use tracing::debug;
 
 use crate::circuit_breaker::RetryPolicy;
 use crate::error::{ClusterError, Result};
-use crate::rpc_codec::{self, RaftRpc, TypedClusterError, auth_envelope};
+use crate::rpc_codec::{
+    self, RaftRpc, ShufflePushChunk, ShufflePushEnd, ShufflePushRequest, TypedClusterError,
+    auth_envelope,
+};
 use crate::transport::config::SNI_HOSTNAME;
 use crate::transport::server;
 use crate::wire_version::handshake_io::perform_version_handshake_client;
@@ -205,6 +208,65 @@ impl NexarTransport {
                 }
             }
         })
+    }
+
+    /// Open a cross-node streaming-shuffle push to `target` (E1).
+    ///
+    /// Producer → receiver direction (the mirror of [`send_rpc_stream`], which
+    /// streams a response back): opens a bidi stream on the pooled connection,
+    /// writes the [`ShufflePushRequest`] envelope, then one [`ShufflePushChunk`]
+    /// envelope per pre-batched payload, then exactly one [`ShufflePushEnd`]
+    /// (clean EOF), and `finish()`es the send half. It does **not** read a
+    /// reply — the server deposits the chunks and never writes back, so the
+    /// helper fire-and-finishes.
+    ///
+    /// Each `batches` element is a standalone msgpack array of rows (the same
+    /// convention as `RowBatch.payload`). E4 — the planner-side caller — is
+    /// responsible for computing `partition_hash(row, keys) % num_parts` and
+    /// grouping rows into per-partition batches before calling this; E1's
+    /// helper takes already-partitioned payloads.
+    pub async fn send_shuffle_push(
+        &self,
+        target: u64,
+        req: ShufflePushRequest,
+        batches: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        let conn = self.get_or_connect(target).await?;
+        let (mut send, _recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
+            detail: format!("open_bi (shuffle push) to node {target}: {e}"),
+        })?;
+
+        // Opening frame.
+        let req_envelope = self.wrap_outbound(&RaftRpc::ShufflePushRequest(req))?;
+        send.write_all(&req_envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write shuffle push request to node {target}: {e}"),
+            })?;
+
+        // One chunk frame per pre-batched payload.
+        for payload in batches {
+            let chunk_envelope =
+                self.wrap_outbound(&RaftRpc::ShufflePushChunk(ShufflePushChunk { payload }))?;
+            send.write_all(&chunk_envelope)
+                .await
+                .map_err(|e| ClusterError::Transport {
+                    detail: format!("write shuffle push chunk to node {target}: {e}"),
+                })?;
+        }
+
+        // Terminal clean-EOF frame, then finish the send half.
+        let end_envelope =
+            self.wrap_outbound(&RaftRpc::ShufflePushEnd(ShufflePushEnd { error: None }))?;
+        send.write_all(&end_envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write shuffle push end to node {target}: {e}"),
+            })?;
+        send.finish().map_err(|e| ClusterError::Transport {
+            detail: format!("finish shuffle push to node {target}: {e}"),
+        })?;
+        Ok(())
     }
 
     /// Single-attempt RPC send (no retry, no circuit breaker).

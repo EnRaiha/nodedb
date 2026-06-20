@@ -86,6 +86,27 @@ impl RaftRpcHandler for EchoHandler {
             message: "streaming not supported by test EchoHandler".into(),
         })
     }
+
+    async fn on_shuffle_request(&self, _req: nodedb_cluster::ShufflePushRequest) {}
+
+    async fn on_shuffle_chunk(
+        &self,
+        _shuffle_id: u64,
+        _part: u32,
+        _side: u8,
+        _payload: Vec<u8>,
+    ) -> nodedb_cluster::Result<()> {
+        Ok(())
+    }
+
+    async fn on_shuffle_end(
+        &self,
+        _shuffle_id: u64,
+        _part: u32,
+        _side: u8,
+        _error: Option<nodedb_cluster::rpc_codec::TypedClusterError>,
+    ) {
+    }
 }
 
 fn sample_append(term: u64) -> AppendEntriesRequest {

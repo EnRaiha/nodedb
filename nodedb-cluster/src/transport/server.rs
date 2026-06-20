@@ -41,7 +41,7 @@ use crate::error::{ClusterError, Result};
 use crate::forward::ChunkSink;
 use crate::rpc_codec::{
     self, ExecuteRequest, ExecuteStreamChunk, ExecuteStreamEnd, MAX_RPC_PAYLOAD_SIZE, RaftRpc,
-    TypedClusterError, auth_envelope,
+    ShufflePushRequest, TypedClusterError, auth_envelope,
 };
 use crate::topology::NodeInfo;
 use crate::transport::auth_context::AuthContext;
@@ -126,6 +126,36 @@ pub trait RaftRpcHandler: Send + Sync + 'static {
         req: ExecuteRequest,
         sink: impl ChunkSink,
     ) -> impl std::future::Future<Output = Option<TypedClusterError>> + Send;
+
+    /// Cross-node streaming shuffle (E1) — opening frame of a `ShufflePush`
+    /// stream. Lazily creates the receiver inbox for `(shuffle_id, part, side)`
+    /// carrying `producer_count` and `num_parts`.
+    fn on_shuffle_request(
+        &self,
+        req: ShufflePushRequest,
+    ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Deposit one shuffle chunk payload into the receiver inbox. Bounded —
+    /// the implementation blocks while the inbox buffer is full so QUIC flow
+    /// control back-pressures the producer.
+    fn on_shuffle_chunk(
+        &self,
+        shuffle_id: u64,
+        part: u32,
+        side: u8,
+        payload: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Terminal frame for one producer of a `ShufflePush` stream: record the
+    /// `End` (advancing the per-part build barrier) and capture any terminal
+    /// error.
+    fn on_shuffle_end(
+        &self,
+        shuffle_id: u64,
+        part: u32,
+        side: u8,
+        error: Option<TypedClusterError>,
+    ) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// Transport-local [`ChunkSink`] that writes one `RPC_EXECUTE_STREAM_CHUNK`
@@ -265,46 +295,53 @@ pub(crate) async fn handle_connection<H: RaftRpcHandler, S: PeerIdentityStore>(
             }
         };
 
-        let h = handler.clone();
-        let stream_shutdown = shutdown.clone();
-        let stream_auth = auth.clone();
-        let stream_id_store = identity_store.clone();
-        let stream_cert = peer_cert_der.clone();
-        let conn_clone = conn.clone();
+        let ctx = StreamContext {
+            handler: handler.clone(),
+            auth: auth.clone(),
+            identity_store: identity_store.clone(),
+            peer_cert_der: peer_cert_der.clone(),
+            conn: conn.clone(),
+            shutdown: shutdown.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(
-                h,
-                stream_auth,
-                stream_id_store,
-                stream_cert,
-                conn_clone,
-                send,
-                recv,
-                stream_shutdown,
-            )
-            .await
-            {
+            if let Err(e) = handle_stream(ctx, send, recv).await {
                 debug!(error = %e, "raft RPC stream error");
             }
         });
     }
 }
 
-/// Handle a single bidi stream: read request → dispatch → write response.
+/// Per-stream context passed to [`handle_stream`].
 ///
-/// Every long-lived await is racing a shutdown signal — see the
-/// module docstring for the rationale.
-#[allow(clippy::too_many_arguments)]
-async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
+/// Bundles the shared, connection-scoped handles so [`handle_stream`] stays
+/// under the `too_many_arguments` threshold while remaining generic over
+/// handler and identity-store types.
+struct StreamContext<H: RaftRpcHandler, S: PeerIdentityStore> {
     handler: Arc<H>,
     auth: Arc<AuthContext>,
     identity_store: Arc<S>,
     peer_cert_der: Option<Vec<u8>>,
     conn: quinn::Connection,
+    shutdown: watch::Receiver<bool>,
+}
+
+/// Handle a single bidi stream: read request → dispatch → write response.
+///
+/// Every long-lived await is racing a shutdown signal — see the
+/// module docstring for the rationale.
+async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
+    ctx: StreamContext<H, S>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    let StreamContext {
+        handler,
+        auth,
+        identity_store,
+        peer_cert_der,
+        conn,
+        mut shutdown,
+    } = ctx;
     let work = async {
         // 1. Read one envelope.
         let envelope = read_envelope(&mut recv).await?;
@@ -407,6 +444,57 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
                 detail: format!("finish stream response: {e}"),
             })?;
             return Ok::<(), ClusterError>(());
+        }
+
+        // 4c. Cross-node streaming shuffle (E1): a `ShufflePushRequest` is the
+        //     opening frame of a producer → receiver stream. The producer keeps
+        //     writing `ShufflePushChunk` envelopes on the SAME bidi stream
+        //     (this read half), terminated by exactly one `ShufflePushEnd`.
+        //     The server reads inbound frames, deposits them via the handler,
+        //     and writes NO reply — the producer fire-and-finishes (mirroring
+        //     the response-direction `send_rpc_stream`, which finishes its send
+        //     half before reading). The loop exits on the `End` frame or on a
+        //     clean stream close (`read_envelope` surfacing a transport error
+        //     after the producer's `finish()`).
+        if let RaftRpc::ShufflePushRequest(req) = request {
+            let shuffle_id = req.shuffle_id;
+            let part = req.part;
+            let side = req.side;
+            handler.on_shuffle_request(req).await;
+
+            loop {
+                let frame_envelope = match read_envelope(&mut recv).await {
+                    Ok(e) => e,
+                    // Producer closed the stream without (or after) an End.
+                    // A graceful finish surfaces here as a transport read
+                    // error; treat it as end-of-stream rather than propagating.
+                    Err(_) => return Ok::<(), ClusterError>(()),
+                };
+                let (frame_fields, frame_inner) =
+                    auth_envelope::parse_envelope(&frame_envelope, &auth.mac_key)?;
+                if frame_fields.from_node_id != auth.local_node_id {
+                    auth.peer_seq_in
+                        .accept(frame_fields.from_node_id, frame_fields.seq)?;
+                }
+                match rpc_codec::decode(frame_inner)? {
+                    RaftRpc::ShufflePushChunk(chunk) => {
+                        handler
+                            .on_shuffle_chunk(shuffle_id, part, side, chunk.payload)
+                            .await?;
+                    }
+                    RaftRpc::ShufflePushEnd(end) => {
+                        handler
+                            .on_shuffle_end(shuffle_id, part, side, end.error)
+                            .await;
+                        return Ok::<(), ClusterError>(());
+                    }
+                    other => {
+                        return Err(ClusterError::Transport {
+                            detail: format!("unexpected frame in shuffle push stream: {other:?}"),
+                        });
+                    }
+                }
+            }
         }
 
         let response = handler.handle_rpc(request).await?;

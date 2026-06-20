@@ -10,7 +10,7 @@
 use crate::error::{ClusterError, Result};
 use crate::forward::{ChunkSink, PlanExecutor};
 use crate::health;
-use crate::rpc_codec::{ExecuteRequest, RaftRpc, TypedClusterError};
+use crate::rpc_codec::{ExecuteRequest, RaftRpc, ShufflePushRequest, TypedClusterError};
 use crate::transport::RaftRpcHandler;
 
 use super::loop_core::{CommitApplier, RaftLoop};
@@ -365,6 +365,43 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
         sink: impl ChunkSink,
     ) -> Option<TypedClusterError> {
         self.plan_executor.execute_plan_streaming(req, sink).await
+    }
+
+    // Cross-node streaming shuffle (E1) — delegate to the host-crate
+    // `ShuffleReceiver` (backed by `nodedb`'s `ShuffleReceiverRegistry`). When
+    // no receiver is installed (cluster-only tests / single-node), the request
+    // is a no-op and a chunk surfaces a typed "not configured" error.
+    async fn on_shuffle_request(&self, req: ShufflePushRequest) {
+        if let Some(recv) = &self.shuffle_receiver {
+            recv.on_shuffle_request(req.shuffle_id, req.part, req.side, req.producer_count);
+        }
+    }
+
+    async fn on_shuffle_chunk(
+        &self,
+        shuffle_id: u64,
+        part: u32,
+        side: u8,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        match &self.shuffle_receiver {
+            Some(recv) => recv.on_shuffle_chunk(shuffle_id, part, side, payload),
+            None => Err(ClusterError::Transport {
+                detail: "shuffle receiver not configured (no ShuffleReceiver installed)".into(),
+            }),
+        }
+    }
+
+    async fn on_shuffle_end(
+        &self,
+        shuffle_id: u64,
+        part: u32,
+        side: u8,
+        error: Option<TypedClusterError>,
+    ) {
+        if let Some(recv) = &self.shuffle_receiver {
+            recv.on_shuffle_end(shuffle_id, part, side, error);
+        }
     }
 }
 

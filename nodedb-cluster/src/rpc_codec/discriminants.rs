@@ -41,6 +41,14 @@ pub const RPC_DATA_PROPOSE_RESP: u8 = 21;
 pub const RPC_EXECUTE_STREAM_REQ: u8 = 22;
 pub const RPC_EXECUTE_STREAM_CHUNK: u8 = 23;
 pub const RPC_EXECUTE_STREAM_END: u8 = 24;
+/// Cross-node streaming shuffle (E1). A producer opens one bidi stream per
+/// target partition and writes a `RPC_SHUFFLE_PUSH_REQ` envelope, then a
+/// sequence of `RPC_SHUFFLE_PUSH_CHUNK` envelopes terminated by exactly one
+/// `RPC_SHUFFLE_PUSH_END` envelope on the same QUIC stream. Direction is
+/// producer → receiver: chunks travel on the send half, not the response half.
+pub const RPC_SHUFFLE_PUSH_REQ: u8 = 25;
+pub const RPC_SHUFFLE_PUSH_CHUNK: u8 = 26;
+pub const RPC_SHUFFLE_PUSH_END: u8 = 27;
 
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared

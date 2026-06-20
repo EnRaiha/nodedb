@@ -371,6 +371,9 @@ impl SharedState {
                 crate::control::state::collection_to_database::CollectionToDatabase::new(),
             ),
             materialize_freeze: crate::control::clone::MaterializeFreezeRegistry::new(),
+            shuffle_registry: Arc::new(
+                crate::control::server::shuffle::ShuffleReceiverRegistry::new(),
+            ),
             shutdown: Arc::clone(&shutdown),
             loop_registry: Arc::clone(&loop_registry),
             startup: Arc::clone(&startup_gate),

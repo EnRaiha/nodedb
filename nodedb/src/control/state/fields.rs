@@ -391,4 +391,12 @@ pub struct SharedState {
     /// dependent clone; concurrent materializers on different clones of the
     /// same source nest correctly via an internal reference count.
     pub materialize_freeze: Arc<crate::control::clone::MaterializeFreezeRegistry>,
+    /// Cross-node streaming-shuffle receiver registry (E1).
+    ///
+    /// Holds one bounded inbox per `(shuffle_id, part, side)` with a per-part
+    /// build barrier. Fed by the cluster `ShufflePush` transport read-loop via
+    /// `RegistryShuffleReceiver` and drained by the Data Plane (E3). `Send +
+    /// Sync`; the inbox itself uses std primitives only (no Tokio) so the
+    /// `!Send` Data Plane can consume it.
+    pub shuffle_registry: Arc<crate::control::server::shuffle::ShuffleReceiverRegistry>,
 }

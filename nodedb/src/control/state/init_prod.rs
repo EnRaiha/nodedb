@@ -495,6 +495,9 @@ impl SharedState {
             ),
             lsn_ms_map: Arc::new(Mutex::new(nodedb_types::temporal::LsnMsMap::new())),
             materialize_freeze: crate::control::clone::MaterializeFreezeRegistry::new(),
+            shuffle_registry: Arc::new(
+                crate::control::server::shuffle::ShuffleReceiverRegistry::new(),
+            ),
             shutdown: Arc::clone(&shutdown),
             loop_registry: Arc::clone(&loop_registry),
             startup: Arc::clone(&startup_gate),
