@@ -67,9 +67,7 @@ pub async fn dispatch_typed(
             node_id,
             labels,
             remove,
-        }) => {
-            Some(edge::set_node_labels(state, identity, database_id, node_id, labels, remove).await)
-        }
+        }) => Some(edge::set_node_labels(state, identity, node_id, labels, remove).await),
         NodedbStatement::Graph(GraphStmt::GraphTraverse {
             start,
             depth,

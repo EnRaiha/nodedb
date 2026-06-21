@@ -17,7 +17,6 @@ use crate::control::planner::calvin::{build_static_tx_class, submit_calvin_route
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::server::surrogate_exchange::assign_surrogate_routed;
-use crate::control::server::{dispatch_utils, wal_dispatch};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::GraphOp;
@@ -292,7 +291,6 @@ pub async fn delete_edge(
 pub async fn set_node_labels(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    database_id: DatabaseId,
     node_id: String,
     labels: Vec<String>,
     remove: bool,
@@ -319,25 +317,25 @@ pub async fn set_node_labels(
         PhysicalPlan::Graph(GraphOp::SetNodeLabels { node_id, labels })
     };
 
-    wal_dispatch::wal_append_if_write(&state.wal, tenant_id, vshard_id, database_id, &plan)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-
-    match dispatch_utils::dispatch_to_data_plane(
+    // A node label is single-keyed on `node_id`, so it is SINGLE-HOME: route the
+    // write to the node's home vShard `from_key(node_id)` and replicate via Raft,
+    // exactly like the edge F1a single-home fast path. `dispatch_sync_response`
+    // provides WAL durability + Raft replication internally, so no separate
+    // `wal_append_if_write` is needed (and adding one would double-append the WAL
+    // record). Calvin is not involved — there is only one home vShard.
+    crate::control::server::sync::raft_dispatch::dispatch_sync_response(
         state,
         tenant_id,
-        database_id,
         vshard_id,
         plan,
         TraceId::ZERO,
+        crate::event::EventSource::User,
     )
     .await
-    {
-        Ok(_) => {
-            let tag = if remove { "UNLABEL" } else { "LABEL" };
-            Ok(vec![Response::Execution(Tag::new(tag))])
-        }
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
-    }
+    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+
+    let tag = if remove { "UNLABEL" } else { "LABEL" };
+    Ok(vec![Response::Execution(Tag::new(tag))])
 }
 
 /// Convert a parsed `PROPERTIES` clause to the JSON string stored
