@@ -13,12 +13,15 @@ use pgwire::error::PgWireResult;
 use nodedb_sql::ddl_ast::GraphProperties;
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::planner::calvin::{build_static_tx_class, submit_calvin_routed};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::types::sqlstate_error;
+use crate::control::server::surrogate_exchange::assign_surrogate_routed;
 use crate::control::server::{dispatch_utils, wal_dispatch};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::GraphOp;
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 /// Maximum byte length for an edge label string. Keeps a single `TYPE`
 /// clause from bloating the CSR label table and the msgpack wire payload.
@@ -78,18 +81,40 @@ pub async fn insert_edge(
     validate_edge_label(&label)?;
     let properties_json = properties_to_json(properties)?;
     let tenant_id = identity.tenant_id;
-    let vshard_id = VShardId::from_key(src.as_bytes());
 
-    let src_surrogate = state
-        .surrogate_assigner
-        .assign(database_id, tenant_id, &collection, src.as_bytes())
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    let dst_surrogate = state
-        .surrogate_assigner
-        .assign(database_id, tenant_id, &collection, dst.as_bytes())
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    // Dual-home routing (F1b-dualhome): an edge is reachable from BOTH endpoints
+    // (forward from src, reverse from dst), so a cross-shard edge must be written
+    // on the home vShard of src AND dst — otherwise reverse/IN traversal that
+    // scatters to `from_key(dst)` never finds it. `vsrc`/`vdst` are those two home
+    // vShards. Each endpoint's surrogate is resolved by its OWNING leader
+    // (F1b-rpc routed assign) so both homes agree on the same global identity.
+    let vsrc = VShardId::from_key(src.as_bytes());
+    let vdst = VShardId::from_key(dst.as_bytes());
 
-    let plan = PhysicalPlan::Graph(GraphOp::EdgePut {
+    let src_surrogate = assign_surrogate_routed(
+        state,
+        vsrc,
+        database_id,
+        tenant_id,
+        &collection,
+        src.as_bytes(),
+        TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    let dst_surrogate = assign_surrogate_routed(
+        state,
+        vdst,
+        database_id,
+        tenant_id,
+        &collection,
+        dst.as_bytes(),
+        TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+
+    let edge_put = GraphOp::EdgePut {
         collection,
         src_id: src,
         label,
@@ -97,18 +122,53 @@ pub async fn insert_edge(
         properties: properties_json.into_bytes(),
         src_surrogate,
         dst_surrogate,
-    });
+    };
 
-    crate::control::server::sync::raft_dispatch::dispatch_sync_response(
-        state,
-        tenant_id,
-        vshard_id,
-        plan,
-        TraceId::ZERO,
-        crate::event::EventSource::User,
-    )
-    .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    // Calvin cross-shard atomicity is only operational in cluster mode with a
+    // wired sequencer. In single-node (no cluster transport) every vShard is
+    // local, so the F1a single-home write already lands BOTH the EDGES and
+    // REVERSE_EDGES rows on this node — there is nothing to dual-home and Calvin
+    // is not available. Gating here keeps single-node edge inserts on the F1a
+    // fast path (no regression) and routes only genuine cross-shard cluster edges
+    // through Calvin.
+    let calvin_available =
+        state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
+
+    if vsrc == vdst || !calvin_available {
+        // F1a fast path (unchanged): both endpoints share one home vShard (or we
+        // are single-node), so a single-home Raft write to `vsrc` covers both
+        // forward and reverse traversal — EDGES + REVERSE_EDGES land together.
+        let plan = PhysicalPlan::Graph(edge_put);
+        crate::control::server::sync::raft_dispatch::dispatch_sync_response(
+            state,
+            tenant_id,
+            vsrc,
+            plan,
+            TraceId::ZERO,
+            crate::event::EventSource::User,
+        )
+        .await
+        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    } else {
+        // Cross-shard edge: dual-home it ATOMICALLY via Calvin. `build_static_tx_class`
+        // enumerates {vsrc, vdst} as the participating vShards (the dh-1 substrate),
+        // each running the SAME EdgePut with identical pre-resolved surrogates →
+        // EDGES on `vsrc`, REVERSE_EDGES on `vdst`, committed atomically. The
+        // submit-and-await is routed to the SEQUENCER-GROUP leader (Cv1) so the
+        // transaction is actually sequenced and acked from any coordinator.
+        let task = PhysicalTask {
+            tenant_id,
+            vshard_id: vsrc,
+            database_id,
+            plan: PhysicalPlan::Graph(edge_put),
+            post_set_op: PostSetOp::None,
+        };
+        let tx_class = build_static_tx_class(&[task], tenant_id)
+            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        submit_calvin_routed(state, tx_class)
+            .await
+            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    }
 
     Ok(vec![Response::Execution(Tag::new("INSERT EDGE"))])
 }
