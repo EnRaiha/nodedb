@@ -63,11 +63,19 @@ pub enum GraphOp {
     EdgePutBatch { edges: Vec<BatchEdge> },
 
     /// Delete a graph edge.
+    ///
+    /// Carries `src_surrogate` / `dst_surrogate` mirroring `EdgePut` so a
+    /// cross-shard delete can be dual-homed atomically via Calvin: the
+    /// surrogate pair gives the static-tx class its participant shards
+    /// (`from_key(src)` / `from_key(dst)`) AND the lock identity that
+    /// conflict-serializes against a concurrent `EdgePut` of the same edge.
     EdgeDelete {
         collection: String,
         src_id: String,
         label: String,
         dst_id: String,
+        src_surrogate: Surrogate,
+        dst_surrogate: Surrogate,
     },
 
     /// Batched edge delete: used to revert a partial `EdgePutBatch` on

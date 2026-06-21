@@ -159,11 +159,12 @@ pub(crate) fn build_edge_put(
         .ok_or_else(|| crate::Error::BadRequest {
             detail: "missing 'edge_type'".to_string(),
         })?;
-    let props = fields
-        .properties
-        .as_ref()
-        .map(|v| sonic_rs::to_string(v).unwrap_or_default())
-        .unwrap_or_default();
+    let props = match fields.properties.as_ref() {
+        Some(v) => sonic_rs::to_string(v).map_err(|e| crate::Error::BadRequest {
+            detail: format!("edge properties are not serializable to JSON: {e}"),
+        })?,
+        None => String::new(),
+    };
     let src_surrogate = ctx.state.surrogate_assigner.assign(
         ctx.database_id(),
         ctx.tenant_id(),
@@ -188,6 +189,7 @@ pub(crate) fn build_edge_put(
 }
 
 pub(crate) fn build_edge_delete(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -214,11 +216,28 @@ pub(crate) fn build_edge_delete(
         .ok_or_else(|| crate::Error::BadRequest {
             detail: "missing 'edge_type'".to_string(),
         })?;
+    // Resolve endpoint surrogates exactly as `build_edge_put` does (get-or-assign
+    // returns the existing node identities) so a cross-shard delete dual-homes
+    // and locks against a concurrent insert of the same edge.
+    let src_surrogate = ctx.state.surrogate_assigner.assign(
+        ctx.database_id(),
+        ctx.tenant_id(),
+        collection,
+        src.as_bytes(),
+    )?;
+    let dst_surrogate = ctx.state.surrogate_assigner.assign(
+        ctx.database_id(),
+        ctx.tenant_id(),
+        collection,
+        dst.as_bytes(),
+    )?;
     Ok(PhysicalPlan::Graph(GraphOp::EdgeDelete {
         collection: collection.to_string(),
         src_id: src.clone(),
         label: label.clone(),
         dst_id: dst.clone(),
+        src_surrogate,
+        dst_surrogate,
     }))
 }
 

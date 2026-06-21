@@ -174,11 +174,15 @@ pub fn to_replicated_entry(
             src_id,
             label,
             dst_id,
+            src_surrogate,
+            dst_surrogate,
         }) => ReplicatedWrite::EdgeDelete {
             collection: collection.clone(),
             src_id: src_id.clone(),
             label: label.clone(),
             dst_id: dst_id.clone(),
+            src_surrogate: src_surrogate.as_u32(),
+            dst_surrogate: dst_surrogate.as_u32(),
         },
         PhysicalPlan::Kv(KvOp::Put {
             collection,

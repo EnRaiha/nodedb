@@ -192,6 +192,8 @@ pub fn wal_append_if_write_with_creds(
             src_id,
             label,
             dst_id,
+            src_surrogate: _,
+            dst_surrogate: _,
         }) => {
             let entry =
                 zerompk::to_msgpack_vec(&(collection, src_id, label, dst_id)).map_err(|e| {

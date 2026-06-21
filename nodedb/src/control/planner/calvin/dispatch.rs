@@ -195,14 +195,27 @@ pub fn build_static_tx_class(
             continue;
         }
         // Graph edges route by from_key(src)/from_key(dst), not by collection.
-        if let PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection,
-            src_id,
-            dst_id,
-            src_surrogate,
-            dst_surrogate,
-            ..
-        }) = &task.plan
+        // EdgePut and EdgeDelete share identity fields so both produce an
+        // `EngineKeySet::Edge` — a cross-shard delete dual-homes (and locks)
+        // exactly like the matching insert.
+        if let PhysicalPlan::Graph(
+            GraphOp::EdgePut {
+                collection,
+                src_id,
+                dst_id,
+                src_surrogate,
+                dst_surrogate,
+                ..
+            }
+            | GraphOp::EdgeDelete {
+                collection,
+                src_id,
+                dst_id,
+                src_surrogate,
+                dst_surrogate,
+                ..
+            },
+        ) = &task.plan
         {
             edge_pairs
                 .entry(collection.clone())
@@ -233,7 +246,16 @@ pub fn build_static_tx_class(
     // Emit one Edge keyset per collection, carrying surrogate-pair identity
     // (for locking) and from_key routing homes (for participating vShards).
     for (collection, pairs) in edge_pairs {
-        let homes = edge_homes.remove(&collection).unwrap_or_default();
+        // `edge_pairs` and `edge_homes` are populated in lockstep in the loop
+        // above, so a collection in one is always in the other. Treat a missing
+        // homes entry as a hard error rather than silently emitting an Edge
+        // keyset with empty `home_vshards` (which would drop Calvin participant
+        // shards and misroute the cross-shard write with no diagnostic).
+        let homes = edge_homes.remove(&collection).ok_or_else(|| Error::Internal {
+            detail: format!(
+                "build_static_tx_class invariant violated: no edge_homes for collection {collection}"
+            ),
+        })?;
         write_sets.push(EngineKeySet::Edge {
             collection,
             edges: SortedVec::new(pairs),

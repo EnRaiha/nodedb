@@ -168,6 +168,8 @@ fn edge_delete_updates_csr() {
             src_id: "x".into(),
             label: "R".into(),
             dst_id: "y".into(),
+            src_surrogate: nodedb_types::Surrogate::ZERO,
+            dst_surrogate: nodedb_types::Surrogate::ZERO,
         }),
     );
 

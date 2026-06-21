@@ -177,6 +177,7 @@ pub async fn insert_edge(
 pub async fn delete_edge(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: String,
     src: String,
     dst: String,
@@ -196,25 +197,92 @@ pub async fn delete_edge(
     }
     validate_edge_label(&label)?;
     let tenant_id = identity.tenant_id;
-    let vshard_id = VShardId::from_key(src.as_bytes());
 
-    let plan = PhysicalPlan::Graph(GraphOp::EdgeDelete {
+    // Dual-home routing (F1b-dualhome): a cross-shard edge is stored forward on
+    // `from_key(src)` (EDGES + CSR) and reverse on `from_key(dst)` (REVERSE_EDGES),
+    // so a delete must tombstone BOTH homes — otherwise reverse/IN traversal that
+    // scatters to `from_key(dst)` keeps finding the deleted edge. `vsrc`/`vdst`
+    // are those two home vShards. Surrogates are resolved via the same routed
+    // get-or-assign as insert (existing node surrogates are returned), giving
+    // Calvin its participant shards and the lock identity that serializes against
+    // a concurrent EdgePut of the same edge.
+    let vsrc = VShardId::from_key(src.as_bytes());
+    let vdst = VShardId::from_key(dst.as_bytes());
+
+    let src_surrogate = assign_surrogate_routed(
+        state,
+        vsrc,
+        database_id,
+        tenant_id,
+        &collection,
+        src.as_bytes(),
+        TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    let dst_surrogate = assign_surrogate_routed(
+        state,
+        vdst,
+        database_id,
+        tenant_id,
+        &collection,
+        dst.as_bytes(),
+        TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+
+    let edge_delete = GraphOp::EdgeDelete {
         collection,
         src_id: src,
         label,
         dst_id: dst,
-    });
+        src_surrogate,
+        dst_surrogate,
+    };
 
-    crate::control::server::sync::raft_dispatch::dispatch_sync_response(
-        state,
-        tenant_id,
-        vshard_id,
-        plan,
-        TraceId::ZERO,
-        crate::event::EventSource::User,
-    )
-    .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    // Calvin cross-shard atomicity is only operational in cluster mode with a
+    // wired sequencer. In single-node every vShard is local, so the F1a
+    // single-home delete already tombstones BOTH the EDGES and REVERSE_EDGES
+    // rows on this node — nothing to dual-home and Calvin is not available.
+    let calvin_available =
+        state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
+
+    if vsrc == vdst || !calvin_available {
+        // F1a fast path (unchanged): both endpoints share one home vShard (or we
+        // are single-node), so a single-home write to `vsrc` tombstones both the
+        // forward and reverse rows together.
+        let plan = PhysicalPlan::Graph(edge_delete);
+        crate::control::server::sync::raft_dispatch::dispatch_sync_response(
+            state,
+            tenant_id,
+            vsrc,
+            plan,
+            TraceId::ZERO,
+            crate::event::EventSource::User,
+        )
+        .await
+        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    } else {
+        // Cross-shard edge: dual-home the delete ATOMICALLY via Calvin, mirroring
+        // the insert path. `build_static_tx_class` enumerates {vsrc, vdst} as the
+        // participating vShards, each running the SAME EdgeDelete with identical
+        // surrogates → forward tombstone on `vsrc`, REVERSE_EDGES tombstone on
+        // `vdst`, committed atomically and conflict-serialized against a
+        // concurrent EdgePut of the same edge.
+        let task = PhysicalTask {
+            tenant_id,
+            vshard_id: vsrc,
+            database_id,
+            plan: PhysicalPlan::Graph(edge_delete),
+            post_set_op: PostSetOp::None,
+        };
+        let tx_class = build_static_tx_class(&[task], tenant_id)
+            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        submit_calvin_routed(state, tx_class)
+            .await
+            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    }
 
     Ok(vec![Response::Execution(Tag::new("DELETE EDGE"))])
 }

@@ -343,12 +343,40 @@ fn to_physical_plan(
             src_id,
             label,
             dst_id,
-        } => PhysicalPlan::Graph(GraphOp::EdgeDelete {
-            collection: collection.clone(),
-            src_id: src_id.clone(),
-            label: label.clone(),
-            dst_id: dst_id.clone(),
-        }),
+            src_surrogate,
+            dst_surrogate,
+        } => {
+            let carried_src = nodedb_types::Surrogate::new(*src_surrogate);
+            let src_surrogate = match assigner {
+                Some(a) => a.bind(
+                    database_id,
+                    tenant_id,
+                    collection,
+                    src_id.as_bytes(),
+                    carried_src,
+                )?,
+                None => carried_src,
+            };
+            let carried_dst = nodedb_types::Surrogate::new(*dst_surrogate);
+            let dst_surrogate = match assigner {
+                Some(a) => a.bind(
+                    database_id,
+                    tenant_id,
+                    collection,
+                    dst_id.as_bytes(),
+                    carried_dst,
+                )?,
+                None => carried_dst,
+            };
+            PhysicalPlan::Graph(GraphOp::EdgeDelete {
+                collection: collection.clone(),
+                src_id: src_id.clone(),
+                label: label.clone(),
+                dst_id: dst_id.clone(),
+                src_surrogate,
+                dst_surrogate,
+            })
+        }
         ReplicatedWrite::KvPut {
             collection,
             key,

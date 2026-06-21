@@ -253,6 +253,13 @@ pub enum ReplicatedWrite {
         src_id: String,
         label: String,
         dst_id: String,
+        /// Leader-assigned global surrogate for the source node (binding key =
+        /// `src_id.as_bytes()`), carried verbatim so every replica resolves the
+        /// same identity and dual-homes the tombstone like the matching put.
+        src_surrogate: u32,
+        /// Leader-assigned global surrogate for the destination node (binding
+        /// key = `dst_id.as_bytes()`).
+        dst_surrogate: u32,
     },
     KvPut {
         collection: String,

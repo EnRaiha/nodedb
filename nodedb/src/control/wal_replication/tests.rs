@@ -93,6 +93,8 @@ fn all_write_variants_serialize() {
             src_id: "a".into(),
             label: "knows".into(),
             dst_id: "b".into(),
+            src_surrogate: 10,
+            dst_surrogate: 20,
         },
         ReplicatedWrite::ArrayOp {
             array: "genome".into(),

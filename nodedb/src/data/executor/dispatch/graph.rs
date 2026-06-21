@@ -70,6 +70,7 @@ impl CoreLoop {
                 src_id,
                 label,
                 dst_id,
+                ..
             } => self.execute_edge_delete(task, tid, collection, src_id, label, dst_id),
 
             GraphOp::EdgeDeleteBatch { edges } => self.execute_edge_delete_batch(task, tid, edges),

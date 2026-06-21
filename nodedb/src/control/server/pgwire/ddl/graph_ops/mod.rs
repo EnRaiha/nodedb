@@ -60,7 +60,9 @@ pub async fn dispatch_typed(
             src,
             dst,
             label,
-        }) => Some(edge::delete_edge(state, identity, collection, src, dst, label).await),
+        }) => {
+            Some(edge::delete_edge(state, identity, database_id, collection, src, dst, label).await)
+        }
         NodedbStatement::Graph(GraphStmt::GraphSetLabels {
             node_id,
             labels,

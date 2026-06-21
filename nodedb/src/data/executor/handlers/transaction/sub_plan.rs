@@ -245,6 +245,7 @@ impl CoreLoop {
                 src_id,
                 label,
                 dst_id,
+                ..
             }) => {
                 let old_properties = self
                     .edge_store
