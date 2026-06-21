@@ -34,7 +34,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use nodedb_cluster::calvin::types::TxClass;
-use nodedb_cluster::calvin::{SEQUENCER_GROUP_ID, TxnId};
+use nodedb_cluster::calvin::{AttemptOutcome, SEQUENCER_GROUP_ID, TxnId};
 use nodedb_cluster::{RaftRpc, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse};
 
 use crate::Error;
@@ -88,7 +88,7 @@ pub async fn submit_and_await_calvin_with_timeout(
         })?;
 
     let completion_rx = registry.register_completion(TxnId::new(epoch, position));
-    tokio::time::timeout(timeout, completion_rx)
+    let outcome = tokio::time::timeout(timeout, completion_rx)
         .await
         .map_err(|_| Error::Internal {
             detail: "timed out waiting for Calvin transaction completion".to_owned(),
@@ -96,6 +96,16 @@ pub async fn submit_and_await_calvin_with_timeout(
         .map_err(|_| Error::Internal {
             detail: "Calvin completion channel closed".to_owned(),
         })?;
+    // The static (non-dependent) Calvin path never produces an OLLP mismatch —
+    // `note_ollp_mismatch` only fires on the dependent-predicate retry path — so
+    // this branch is unreachable at runtime today. It is kept as a typed error
+    // (never a panic) so any future mismatch signal on this channel surfaces
+    // deterministically instead of crashing.
+    if outcome == AttemptOutcome::Mismatch {
+        return Err(Error::Internal {
+            detail: "OLLP mismatch outcome on non-dependent Calvin path".to_owned(),
+        });
+    }
 
     Ok(())
 }

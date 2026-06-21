@@ -17,6 +17,7 @@ use crate::control::planner::calvin::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::session::TransactionState;
 use crate::types::TenantId;
+use nodedb_cluster::calvin::{AttemptOutcome, TxnId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::super::types::error_to_sqlstate;
@@ -212,9 +213,8 @@ impl NodeDbPgHandler {
                 )))
             })?;
 
-        let completion_rx =
-            registry.register_completion(nodedb_cluster::calvin::TxnId::new(epoch, position));
-        tokio::time::timeout(timeout, completion_rx)
+        let completion_rx = registry.register_completion(TxnId::new(epoch, position));
+        let outcome = tokio::time::timeout(timeout, completion_rx)
             .await
             .map_err(|_| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -230,6 +230,18 @@ impl NodeDbPgHandler {
                     "Calvin completion channel closed".to_owned(),
                 )))
             })?;
+        // The static (non-dependent) Calvin path never produces an OLLP
+        // mismatch — `note_ollp_mismatch` only fires on the dependent-predicate
+        // retry path — so this branch is unreachable at runtime today. It is
+        // kept as a typed error (never a panic) so any future mismatch signal
+        // on this channel surfaces deterministically instead of crashing.
+        if outcome == AttemptOutcome::Mismatch {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "XX000".to_owned(),
+                "OLLP mismatch outcome on non-dependent Calvin path".to_owned(),
+            ))));
+        }
 
         // Emit one CommandComplete tag per accumulated task.
         let mut calvin_responses: Vec<Response> = Vec::with_capacity(tasks.len());
