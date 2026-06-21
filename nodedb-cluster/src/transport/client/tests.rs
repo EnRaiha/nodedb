@@ -124,6 +124,13 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_submit_calvin_txn(
+        &self,
+        _req: crate::rpc_codec::SubmitCalvinTxnRequest,
+    ) -> crate::rpc_codec::SubmitCalvinTxnResponse {
+        crate::rpc_codec::SubmitCalvinTxnResponse { error: None }
+    }
 }
 
 fn make_transport(node_id: u64) -> NexarTransport {
