@@ -260,12 +260,22 @@ async fn spawn_one_calvin_node(
     // This is the race-fix: we do this synchronously here so the 150 ms
     // election timeout cannot fire before the group is registered on
     // any node.
-    let peers: Vec<u64> = all_node_ids
-        .iter()
-        .filter(|&&id| id != node_id)
-        .copied()
-        .collect();
-    multi_raft_value.add_group(SEQUENCER_GROUP_ID, peers)?;
+    //
+    // A joining node already reconstructed the sequencer group as a learner
+    // from its `JoinResponse` during `start_cluster` above (the join path now
+    // owns sequencer membership, including learner→voter promotion). Re-adding
+    // it here would open the group's redb storage a second time and fail with a
+    // lock error, so only the bootstrap node (which has no reconstructed group)
+    // creates it explicitly — mirroring the `contains_group` guard in
+    // `start_raft`.
+    if !multi_raft_value.contains_group(SEQUENCER_GROUP_ID) {
+        let peers: Vec<u64> = all_node_ids
+            .iter()
+            .filter(|&&id| id != node_id)
+            .copied()
+            .collect();
+        multi_raft_value.add_group(SEQUENCER_GROUP_ID, peers)?;
+    }
 
     let topology = state.topology.clone();
     let metadata_cache = Arc::new(RwLock::new(MetadataCache::new()));

@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nodedb_cluster::{
     CacheApplier, ClusterCatalog, ClusterConfig, ClusterLifecycleState, ClusterLifecycleTracker,
@@ -168,6 +168,16 @@ impl TestNode {
         let catalog = Arc::new(ClusterCatalog::open(&data_dir_path.join("cluster.redb"))?);
         let listen_addr = transport.local_addr();
 
+        // A non-empty seed list means this node is a FRESH joiner (it must
+        // contact a seed, be admitted as a learner, and be promoted). An empty
+        // seed list is either the single-node bootstrap or an in-process restart
+        // from an existing catalog — in both cases the node establishes its own
+        // metadata-group voter membership (instantly as the bootstrap leader, or
+        // restored from the persisted Raft state on restart) rather than going
+        // through learner promotion. Only fresh joiners need the
+        // wait-for-metadata-voter gate below.
+        let is_fresh_join = !seed_nodes.is_empty();
+
         // Empty seeds → imply single-node bootstrap by listing only
         // our own address. Otherwise use whatever the caller supplied.
         let seeds = if seed_nodes.is_empty() {
@@ -200,12 +210,6 @@ impl TestNode {
 
         let lifecycle = ClusterLifecycleTracker::new();
         let state = start_cluster(&config, &catalog, Arc::clone(&transport), &lifecycle).await?;
-        // Match the main binary: the caller is responsible for the
-        // final `Ready` transition once the node is wired up. The
-        // node count is whatever the node observed at the moment of
-        // transition.
-        lifecycle.to_ready(state.topology.read().map(|t| t.node_count()).unwrap_or(0));
-
         // state.topology is already Arc<RwLock<ClusterTopology>>.
         let topology = state.topology.clone();
         // Real in-memory metadata cache, driven by a `CacheApplier`
@@ -263,6 +267,41 @@ impl TestNode {
         let run_handle = tokio::spawn(async move {
             raft_loop_for_run.run(shutdown_rx_run).await;
         });
+
+        // A freshly-joined node is initially a metadata-group learner. Do not
+        // expose it as ready (or return it to tests that may kill the old
+        // leader) until the already-running Raft loop has caught it up and
+        // applied its asynchronous PromoteLearner entry. This wait is
+        // deliberately after `serve` starts, so it never blocks the join RPC or
+        // learner catch-up. Bootstrap and restart nodes (empty seed list)
+        // establish their own voter membership and are skipped — gating them on
+        // promotion would wrongly fail an in-process restart that restores its
+        // voter status from the persisted catalog.
+        if is_fresh_join {
+            let voter_deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let is_metadata_voter = multi_raft
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .group_membership(nodedb_cluster::METADATA_GROUP_ID)
+                    .is_some_and(|membership| membership.voters.contains(&node_id));
+                if is_metadata_voter {
+                    break;
+                }
+                if Instant::now() >= voter_deadline {
+                    let _ = shutdown_tx.send(true);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("node {node_id} was not promoted to metadata voter within 10s"),
+                    )
+                    .into());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        let ready_node_count = topology.read().map(|t| t.node_count()).unwrap_or(0);
+        lifecycle.to_ready(ready_node_count);
 
         // Drop our own handle on the catalog — `raft_loop.catalog`
         // (set via `with_catalog` above) is now the sole owner

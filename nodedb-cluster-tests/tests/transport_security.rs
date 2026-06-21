@@ -144,6 +144,13 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_submit_calvin_txn(
+        &self,
+        _req: nodedb_cluster::rpc_codec::SubmitCalvinTxnRequest,
+    ) -> nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse {
+        nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse { error: None }
+    }
 }
 
 fn sample_append(term: u64) -> AppendEntriesRequest {

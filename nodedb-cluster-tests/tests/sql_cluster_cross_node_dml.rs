@@ -21,6 +21,8 @@ mod ddl_objects;
 mod gather_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/graph_traverse_cross_node.rs"]
 mod graph_traverse_cross_node;
+#[path = "sql_cluster_cross_node_dml_tests/graph_traverse_reverse_cross_node.rs"]
+mod graph_traverse_reverse_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/join_cross_node.rs"]
 mod join_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/schema_objects.rs"]

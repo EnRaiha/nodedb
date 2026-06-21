@@ -196,9 +196,19 @@ impl TestCluster {
                 if per_node.iter().any(|v| v.is_empty()) {
                     return false;
                 }
+                // The Calvin sequencer group is an internal Raft group that is
+                // not part of the data/metadata routing topology. Cluster
+                // readiness for data operations does not depend on it, and its
+                // leader is surfaced to the observer on a slower/independent path
+                // than the routing groups — so gating general cluster startup on
+                // it makes every test (Calvin or not) flake when the sequencer
+                // group's observed leader lags. Calvin tests gate on the
+                // sequencer separately (`wait_for_sequencer_leader`). Exclude it
+                // from the general readiness gate.
                 let group_ids: std::collections::BTreeSet<u64> = per_node
                     .iter()
                     .flat_map(|v| v.iter().map(|(gid, _)| *gid))
+                    .filter(|gid| *gid != nodedb_cluster::calvin::SEQUENCER_GROUP_ID)
                     .collect();
                 if group_ids.is_empty() {
                     return false;

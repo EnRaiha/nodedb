@@ -110,6 +110,13 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_submit_calvin_txn(
+        &self,
+        _req: nodedb_cluster::rpc_codec::SubmitCalvinTxnRequest,
+    ) -> nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse {
+        nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse { error: None }
+    }
 }
 
 /// Handler that records whether it was ever invoked.
@@ -213,6 +220,19 @@ impl RaftRpcHandler for SentinelHandler {
             error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
                 code: 0,
                 message: "sentinel: unexpected assign-surrogate dispatch".into(),
+            }),
+        }
+    }
+
+    async fn on_submit_calvin_txn(
+        &self,
+        _req: nodedb_cluster::rpc_codec::SubmitCalvinTxnRequest,
+    ) -> nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse {
+        self.invoked.store(true, Ordering::SeqCst);
+        nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse {
+            error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
+                code: 0,
+                message: "sentinel: unexpected submit-calvin-txn dispatch".into(),
             }),
         }
     }
