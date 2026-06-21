@@ -243,7 +243,9 @@ mod tests {
             term: 1,
             commit_index: 5,
             last_applied: 5,
+            last_log_index: 5,
             member_count: 3,
+            learner_count: 0,
             vshard_count: 512,
         }
     }

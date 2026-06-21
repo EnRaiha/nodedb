@@ -20,8 +20,14 @@ impl<S: LogStorage> RaftNode<S> {
             };
         }
 
-        if req.term > self.hard_state.current_term || self.role == NodeRole::Candidate {
+        if req.term > self.hard_state.current_term
+            || self.role == NodeRole::Candidate
+            || (self.role == NodeRole::Leader && req.leader_id != self.config.node_id)
+        {
             // `become_follower` preserves Learner role — see internal.rs.
+            // A leader must also step down for a competing leader's valid
+            // same-term AppendEntries. Keeping both in Leader role makes the
+            // split permanent even though each records the other leader_id.
             self.become_follower(req.term);
         }
 
@@ -265,6 +271,38 @@ mod tests {
         node.handle_append_entries(&req);
         assert_eq!(node.role(), NodeRole::Follower);
         assert_eq!(node.current_term(), 5);
+        assert_eq!(node.leader_id(), 2);
+    }
+
+    #[test]
+    fn leader_steps_down_for_competing_same_term_append_entries() {
+        let config = test_config(1, vec![2, 3]);
+        let mut node = RaftNode::new(config, MemStorage::new());
+
+        node.election_deadline = Instant::now() - Duration::from_millis(1);
+        node.tick();
+        node.handle_request_vote_response(
+            2,
+            &RequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            },
+        );
+        assert_eq!(node.role(), NodeRole::Leader);
+
+        let req = AppendEntriesRequest {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+            group_id: 1,
+        };
+        node.handle_append_entries(&req);
+
+        assert_eq!(node.role(), NodeRole::Follower);
+        assert_eq!(node.current_term(), 1);
         assert_eq!(node.leader_id(), 2);
     }
 

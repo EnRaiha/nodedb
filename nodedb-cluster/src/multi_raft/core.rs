@@ -25,8 +25,21 @@ pub struct GroupStatus {
     pub term: u64,
     pub commit_index: u64,
     pub last_applied: u64,
+    pub last_log_index: u64,
     pub member_count: usize,
+    pub learner_count: usize,
     pub vshard_count: usize,
+}
+
+/// Membership snapshot for a hosted Raft group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMembership {
+    pub group_id: u64,
+    pub leader_id: u64,
+    /// Voting members, including this node when it is a voter.
+    pub voters: Vec<u64>,
+    /// Non-voting learners, including this node when it is a learner.
+    pub learners: Vec<u64>,
 }
 
 /// Multi-Raft coordinator managing multiple Raft groups on a single node.
@@ -192,6 +205,41 @@ impl MultiRaft {
         self.groups.len()
     }
 
+    /// Whether this node hosts the given Raft group.
+    pub fn contains_group(&self, group_id: u64) -> bool {
+        self.groups.contains_key(&group_id)
+    }
+
+    /// IDs of every Raft group hosted on this node, including groups
+    /// that do not own vShards (for example the Calvin sequencer).
+    pub fn group_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.groups.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Snapshot the actual Raft membership rather than the vShard routing view.
+    pub fn group_membership(&self, group_id: u64) -> Option<GroupMembership> {
+        let node = self.groups.get(&group_id)?;
+        let mut voters = node.voters().to_vec();
+        let mut learners = node.learners().to_vec();
+        match node.role() {
+            nodedb_raft::NodeRole::Learner => learners.push(self.node_id),
+            nodedb_raft::NodeRole::Observer => {}
+            _ => voters.push(self.node_id),
+        }
+        voters.sort_unstable();
+        voters.dedup();
+        learners.sort_unstable();
+        learners.dedup();
+        Some(GroupMembership {
+            group_id,
+            leader_id: node.leader_id(),
+            voters,
+            learners,
+        })
+    }
+
     /// Mutable access to the underlying Raft groups (for testing / bootstrap).
     pub fn groups_mut(&mut self) -> &mut HashMap<u64, RaftNode<RedbLogStorage>> {
         &mut self.groups
@@ -202,11 +250,10 @@ impl MultiRaft {
         let mut statuses = Vec::with_capacity(self.groups.len());
         for (&group_id, node) in &self.groups {
             let vshard_count = self.routing.vshards_for_group(group_id).len();
-            let members = self
-                .routing
-                .group_info(group_id)
-                .map(|info| info.members.clone())
-                .unwrap_or_default();
+            let self_is_voter = !matches!(
+                node.role(),
+                nodedb_raft::NodeRole::Learner | nodedb_raft::NodeRole::Observer
+            );
 
             statuses.push(GroupStatus {
                 group_id,
@@ -215,7 +262,10 @@ impl MultiRaft {
                 term: node.current_term(),
                 commit_index: node.commit_index(),
                 last_applied: node.last_applied(),
-                member_count: members.len(),
+                last_log_index: node.last_log_index(),
+                member_count: node.voters().len() + usize::from(self_is_voter),
+                learner_count: node.learners().len()
+                    + usize::from(node.role() == nodedb_raft::NodeRole::Learner),
                 vshard_count,
             });
         }
@@ -368,5 +418,26 @@ mod tests {
         let node = mr.groups.get(&1).unwrap();
         assert_eq!(node.role(), NodeRole::Learner);
         assert_eq!(node.voters(), &[1]);
+    }
+
+    #[test]
+    fn group_membership_includes_non_routing_learner_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = RoutingTable::uniform(1, &[1], 1);
+        let mut mr = MultiRaft::new(2, rt, dir.path().to_path_buf());
+        let non_routing_group = u64::MAX - 7;
+        mr.add_group_as_learner(non_routing_group, vec![1], vec![])
+            .unwrap();
+
+        assert!(mr.group_ids().contains(&non_routing_group));
+        assert_eq!(
+            mr.group_membership(non_routing_group),
+            Some(GroupMembership {
+                group_id: non_routing_group,
+                leader_id: 0,
+                voters: vec![1],
+                learners: vec![2],
+            })
+        );
     }
 }

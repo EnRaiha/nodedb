@@ -20,6 +20,12 @@ use nodedb_raft::NodeRole;
 use super::core::MultiRaft;
 
 impl MultiRaft {
+    /// Whether a node is already admitted as a voter or learner.
+    pub fn group_contains_node(&self, group_id: u64, node_id: u64) -> Option<bool> {
+        let membership = self.group_membership(group_id)?;
+        Some(membership.voters.contains(&node_id) || membership.learners.contains(&node_id))
+    }
+
     /// Current commit index for a group, or `None` if the group is not
     /// hosted on this node.
     pub fn commit_index_for(&self, group_id: u64) -> Option<u64> {

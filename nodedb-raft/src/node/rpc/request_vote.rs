@@ -16,17 +16,6 @@ impl<S: LogStorage> RaftNode<S> {
     /// members of the voting set for this term, and granting a vote could
     /// let an incorrect quorum form.
     pub fn handle_request_vote(&mut self, req: &RequestVoteRequest) -> RequestVoteResponse {
-        match self.role {
-            NodeRole::Learner | NodeRole::Observer => {
-                // Learners and observers never grant votes.
-                return RequestVoteResponse {
-                    term: self.hard_state.current_term,
-                    vote_granted: false,
-                };
-            }
-            NodeRole::Follower | NodeRole::Candidate | NodeRole::Leader => {}
-        }
-
         if req.term > self.hard_state.current_term {
             self.become_follower(req.term);
         }
@@ -36,6 +25,18 @@ impl<S: LogStorage> RaftNode<S> {
                 term: self.hard_state.current_term,
                 vote_granted: false,
             };
+        }
+
+        match self.role {
+            NodeRole::Learner | NodeRole::Observer => {
+                // Non-voters still observe a higher term before rejecting the
+                // request, so they cannot re-enter as stale voters later.
+                return RequestVoteResponse {
+                    term: self.hard_state.current_term,
+                    vote_granted: false,
+                };
+            }
+            NodeRole::Follower | NodeRole::Candidate | NodeRole::Leader => {}
         }
 
         let voted_for = self.hard_state.voted_for;
@@ -77,6 +78,13 @@ impl<S: LogStorage> RaftNode<S> {
             return;
         }
 
+        // A delayed grant belongs only to the election term in which it was
+        // cast. Counting it in a later candidacy can manufacture a quorum and
+        // create two leaders in the same term.
+        if resp.term < self.hard_state.current_term {
+            return;
+        }
+
         if self.role != NodeRole::Candidate {
             return;
         }
@@ -96,7 +104,7 @@ impl<S: LogStorage> RaftNode<S> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::message::RequestVoteRequest;
+    use crate::message::{RequestVoteRequest, RequestVoteResponse};
     use crate::node::core::RaftNode;
     use crate::node::rpc::test_helpers::{observer_self_config, test_config};
     use crate::state::NodeRole;
@@ -147,6 +155,34 @@ mod tests {
             !resp.vote_granted,
             "learner must never grant a vote, got {resp:?}"
         );
+        assert_eq!(resp.term, 5);
+        assert_eq!(node.current_term(), 5);
+        assert_eq!(node.role(), NodeRole::Learner);
+    }
+
+    #[test]
+    fn stale_vote_grant_does_not_win_newer_election() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+
+        node.election_deadline = Instant::now() - Duration::from_millis(1);
+        node.tick();
+        assert_eq!(node.current_term(), 1);
+        assert_eq!(node.role(), NodeRole::Candidate);
+
+        // Let the first election time out and start term 2 before term 1's
+        // delayed grant arrives.
+        node.election_deadline = Instant::now() - Duration::from_millis(1);
+        node.tick();
+        assert_eq!(node.current_term(), 2);
+
+        node.handle_request_vote_response(
+            2,
+            &RequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            },
+        );
+        assert_eq!(node.role(), NodeRole::Candidate);
     }
 
     #[test]

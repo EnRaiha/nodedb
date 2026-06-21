@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use nodedb_cluster::calvin::SequencerStateMachine;
 use nodedb_cluster::distributed_array::{ArrayLocalExecutor, handle_array_shard_rpc};
@@ -71,36 +71,59 @@ pub(super) fn build_vshard_handler(
     })
 }
 
-/// Spawn a `Scheduler` task for each local vShard.
-///
-/// Reads the last applied epoch from the WAL for each vShard, wires the
-/// sequenced-tx sender into the `SequencerStateMachine`, registers a
-/// read-result sender, and tokio-spawns a `Scheduler::run` loop.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn spawn_vshard_schedulers(
-    handle: &ClusterHandle,
-    shared: &Arc<SharedState>,
-    raft_loop_handle: Arc<Mutex<nodedb_cluster::multi_raft::MultiRaft>>,
-    sequencer_state_machine: &Arc<Mutex<SequencerStateMachine>>,
-    calvin_read_result_senders: &Arc<
-        Mutex<std::collections::BTreeMap<u32, tokio::sync::mpsc::Sender<ReadResultEvent>>>,
-    >,
-    scheduler_config: &SchedulerConfig,
-) -> crate::Result<()> {
-    let mut local_vshards: Vec<u32> = {
-        let routing = handle.routing.read().unwrap_or_else(|p| p.into_inner());
-        let mut vshards = Vec::new();
-        for (group_id, info) in routing.group_members() {
-            if info.members.contains(&handle.node_id) {
-                vshards.extend(routing.vshards_for_group(*group_id));
-            }
-        }
-        vshards
-    };
-    local_vshards.sort_unstable();
-    local_vshards.dedup();
+/// Type alias for the shared per-vShard read-result sender registry.
+type ReadResultSenders =
+    Arc<Mutex<std::collections::BTreeMap<u32, tokio::sync::mpsc::Sender<ReadResultEvent>>>>;
 
-    for vshard_id in local_vshards {
+/// The vShards this node currently hosts: the union of `vshards_for_group` over
+/// every Raft group whose member set includes this node, read from the live
+/// routing table.
+fn hosted_vshards(routing: &RwLock<nodedb_cluster::RoutingTable>, node_id: u64) -> Vec<u32> {
+    let routing = routing.read().unwrap_or_else(|p| p.into_inner());
+    let mut vshards = Vec::new();
+    for (group_id, info) in routing.group_members() {
+        if info.members.contains(&node_id) {
+            vshards.extend(routing.vshards_for_group(*group_id));
+        }
+    }
+    vshards.sort_unstable();
+    vshards.dedup();
+    vshards
+}
+
+/// Idempotently ensure a Calvin `Scheduler` is running for every vShard this
+/// node currently hosts.
+///
+/// A vShard is considered already-served iff it has a registered read-result
+/// sender (the schedulers' presence registry). Only newly-hosted vShards get a
+/// fresh scheduler — this pass never double-spawns. Returns the number of NEW
+/// schedulers started.
+///
+/// This is `add-only`: it never tears down a scheduler for a vShard that has
+/// left this node. vShard removal happens via migration / decommission, which
+/// own their own teardown path; wiring scheduler removal into that lifecycle is
+/// tracked as a separate follow-up.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_vshard_schedulers(
+    node_id: u64,
+    routing: &Arc<RwLock<nodedb_cluster::RoutingTable>>,
+    shared: &Arc<SharedState>,
+    raft_loop_handle: &Arc<Mutex<nodedb_cluster::multi_raft::MultiRaft>>,
+    sequencer_state_machine: &Arc<Mutex<SequencerStateMachine>>,
+    calvin_read_result_senders: &ReadResultSenders,
+    scheduler_config: &SchedulerConfig,
+) -> crate::Result<usize> {
+    let mut spawned = 0usize;
+    for vshard_id in hosted_vshards(routing, node_id) {
+        // Already-served vShards keep their running scheduler untouched.
+        if calvin_read_result_senders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&vshard_id)
+        {
+            continue;
+        }
+
         let last_applied_epoch = read_last_applied_epoch(&shared.wal, vshard_id)?;
         let (sequenced_tx, sequenced_rx) =
             tokio::sync::mpsc::channel(scheduler_config.channel_capacity);
@@ -131,7 +154,82 @@ pub(super) fn spawn_vshard_schedulers(
         tokio::spawn(async move {
             scheduler.run(shutdown).await;
         });
+        spawned += 1;
     }
+    Ok(spawned)
+}
+
+/// Spawn Calvin `Scheduler` tasks for this node's vShards and keep the set in
+/// sync with cluster membership.
+///
+/// Scheduler ownership is derived from the routing table's group membership, but
+/// a JOINING node's membership is established AFTER `start_raft` runs (it
+/// propagates via conf-change once the node is admitted to each data group). A
+/// one-shot snapshot at startup therefore misses every vShard on a freshly
+/// joined node, leaving cross-shard Calvin transactions whose participants live
+/// there permanently un-dispatched (no completion ack → submit times out).
+///
+/// To make scheduler registration correct regardless of when membership lands —
+/// and resilient to later ownership changes — this runs an initial reconcile
+/// (covers the bootstrap node, which already sees its membership) and then
+/// spawns a background task that re-reconciles on a short interval until
+/// shutdown. Reconcile is idempotent and add-only.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_vshard_schedulers(
+    handle: &ClusterHandle,
+    shared: &Arc<SharedState>,
+    raft_loop_handle: Arc<Mutex<nodedb_cluster::multi_raft::MultiRaft>>,
+    sequencer_state_machine: &Arc<Mutex<SequencerStateMachine>>,
+    calvin_read_result_senders: &ReadResultSenders,
+    scheduler_config: &SchedulerConfig,
+) -> crate::Result<()> {
+    let node_id = handle.node_id;
+    let routing = Arc::clone(&handle.routing);
+
+    // Initial reconcile: schedulers for vShards this node already knows it hosts.
+    reconcile_vshard_schedulers(
+        node_id,
+        &routing,
+        shared,
+        &raft_loop_handle,
+        sequencer_state_machine,
+        calvin_read_result_senders,
+        scheduler_config,
+    )?;
+
+    // Background reconcile: pick up vShards whose membership lands after startup
+    // (joiner admission) or shifts later (rebalancing). The routing table has no
+    // change-notification, so a short fixed-interval reconcile is the simplest
+    // self-healing mechanism; each pass is a cheap routing read + map probe and
+    // a no-op once the set has converged.
+    let shared_task = Arc::clone(shared);
+    let sm_task = Arc::clone(sequencer_state_machine);
+    let rr_task = Arc::clone(calvin_read_result_senders);
+    let cfg_task = scheduler_config.clone();
+    let mut shutdown = shared.shutdown.subscribe();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_cancelled() => break,
+                _ = tick.tick() => {
+                    if let Err(e) = reconcile_vshard_schedulers(
+                        node_id,
+                        &routing,
+                        &shared_task,
+                        &raft_loop_handle,
+                        &sm_task,
+                        &rr_task,
+                        &cfg_task,
+                    ) {
+                        tracing::warn!(node_id, error = %e, "calvin scheduler reconcile pass failed");
+                    }
+                }
+            }
+        }
+    });
 
     Ok(())
 }

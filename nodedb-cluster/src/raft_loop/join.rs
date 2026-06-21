@@ -16,9 +16,9 @@
 //! 2. **Validate address.** Parse `req.listen_addr`. On failure, return
 //!    an error response.
 //! 3. **Idempotency / collision check.** If the node id is already in
-//!    topology with the same address and is Active, rebuild and return
-//!    the current response without any further Raft activity. If the
-//!    node id exists with a different address, reject.
+//!    topology with the same address, continue and reconcile any groups
+//!    missing that node (an earlier join may have failed part-way through).
+//!    If the node id exists with a different address, reject.
 //! 4. **Register transport peer.** Add the new peer address to the
 //!    local transport so the leader can immediately send AppendEntries
 //!    to the learner-to-be.
@@ -28,16 +28,16 @@
 //!    step 1 is intentionally *not* reused for the final response; a
 //!    fresh clone is taken after step 6 so the response reflects the
 //!    post-AddLearner routing state.
-//! 6. **Propose AddLearner on every group.** For each Raft group, take
+//! 6. **Propose AddLearner on each missing group.** For each Raft group
+//!    that does not already contain the node, take
 //!    the `MultiRaft` lock, propose
 //!    `ConfChange::AddLearner(new_node_id)`, and record the resulting
-//!    log index. Drop the lock between groups. If this node is not the
-//!    leader of a particular group the propose will fail with
-//!    `NotLeader` — we surface that as a failure response. (For the
-//!    3-node bootstrap case in the integration test the bootstrap seed
-//!    leads every group, so this path is exercised end-to-end.)
-//! 7. **Wait for each conf-change to commit.** Poll `commit_index_for`
-//!    on each group every 20 ms with a 5-second deadline. A
+//!    log index. Drop the lock between groups. Metadata-group admission
+//!    remains mandatory. Once that group already has three voters,
+//!    `NotLeader` on an independently led non-metadata group is deferred;
+//!    a later same-address join can reconcile the missing membership.
+//! 7. **Wait for each conf-change to apply.** Poll actual group membership
+//!    every 20 ms with a 5-second deadline. A
 //!    single-voter group (the bootstrap seed before any voters have
 //!    been added) commits instantly. Multi-voter groups wait for
 //!    quorum. On timeout, return an error response — the joining node
@@ -65,9 +65,9 @@ use crate::conf_change::{ConfChange, ConfChangeType};
 use crate::error::{ClusterError, Result};
 use crate::forward::PlanExecutor;
 use crate::health;
-use crate::multi_raft::GroupStatus;
+use crate::multi_raft::{GroupStatus, MultiRaft};
 use crate::routing::RoutingTable;
-use crate::rpc_codec::{JoinRequest, JoinResponse, LEADER_REDIRECT_PREFIX};
+use crate::rpc_codec::{JoinGroupInfo, JoinRequest, JoinResponse, LEADER_REDIRECT_PREFIX};
 
 use super::handle_rpc::{JoinDecision, TOPOLOGY_GROUP_ID, decide_join};
 use super::loop_core::{CommitApplier, RaftLoop};
@@ -79,6 +79,18 @@ const CONF_CHANGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Polling interval for the commit-wait loop.
 const CONF_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+fn groups_requiring_admission(multi_raft: &MultiRaft, node_id: u64) -> Vec<u64> {
+    multi_raft
+        .group_ids()
+        .into_iter()
+        .filter(|group_id| {
+            !multi_raft
+                .group_contains_node(*group_id, node_id)
+                .unwrap_or(false)
+        })
+        .collect()
+}
 
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// Full server-side `JoinRequest` handler. See module docs for the
@@ -129,8 +141,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
 
         // 3. Idempotency / collision check against topology.
         //    `handle_join_request` in step 5 handles the fine-grained
-        //    semantics, but we check here first so idempotent re-joins
-        //    short-circuit *before* we propose any Raft conf changes.
+        //    semantics, but we check the collision case here before doing
+        //    any Raft work. Same-address retries continue so a partial join
+        //    can reconcile groups that were missed on the first attempt.
         let existing = self
             .topology
             .read()
@@ -144,14 +157,14 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     req.node_id, existing.addr, req.listen_addr
                 ));
             }
-            // Same id + same addr → idempotent replay. Just rebuild the
-            // current response from the latest routing state without
-            // proposing any conf changes.
+            // Same id + same addr may be a fully completed rejoin, or it may
+            // be a retry after an earlier attempt inserted topology and then
+            // failed part-way through group admission. Continue through the
+            // per-group reconciliation below instead of returning early.
             debug!(
                 joining_node = req.node_id,
-                "idempotent re-join; returning current cluster state"
+                "idempotent re-join; reconciling group membership"
             );
-            return self.build_current_response(&req);
         }
 
         // 4. Register transport peer so the leader can reach it.
@@ -204,10 +217,19 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             }
         }
 
-        // 6. Propose AddLearner on every group.
-        let group_ids: Vec<u64> = {
+        // 6. Propose AddLearner on every group that does not already contain
+        //    this node. This makes retries resume a partial join instead of
+        //    treating topology insertion as proof that Raft admission finished.
+        let (group_ids, can_defer_non_metadata) = {
             let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-            mr.routing().group_ids()
+            let metadata_voters = mr
+                .group_membership(TOPOLOGY_GROUP_ID)
+                .map(|membership| membership.voters.len())
+                .unwrap_or(0);
+            (
+                groups_requiring_admission(&mr, req.node_id),
+                metadata_voters >= 3,
+            )
         };
 
         let mut pending: Vec<(u64, u64)> = Vec::with_capacity(group_ids.len()); // (group_id, log_index)
@@ -222,6 +244,34 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             };
             match propose_result {
                 Ok((_, log_index)) => pending.push((*gid, log_index)),
+                Err(ClusterError::Raft(nodedb_raft::RaftError::NotLeader { leader_hint }))
+                    if can_defer_non_metadata && *gid != TOPOLOGY_GROUP_ID =>
+                {
+                    debug!(
+                        group_id = *gid,
+                        joining_node = req.node_id,
+                        ?leader_hint,
+                        "deferred learner admission on independently led group"
+                    );
+                }
+                Err(ClusterError::Transport { detail })
+                    if can_defer_non_metadata
+                        && *gid != TOPOLOGY_GROUP_ID
+                        && detail.contains("not leader") =>
+                {
+                    // Join routing is anchored on the metadata leader, but
+                    // independent Raft groups can elect different leaders.
+                    // Do not make topology admission unavailable merely
+                    // because this node cannot propose a non-metadata group
+                    // change. A later same-address join retries only the
+                    // still-missing groups.
+                    debug!(
+                        group_id = *gid,
+                        joining_node = req.node_id,
+                        error = %detail,
+                        "deferred learner admission on independently led group"
+                    );
+                }
                 Err(ClusterError::Transport { detail }) => {
                     return reject(format!(
                         "failed to propose AddLearner on group {gid}: {detail}"
@@ -235,24 +285,14 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
 
         // 7. Wait for every conf change to actually *apply* to
         //    routing. Earlier versions of this flow polled
-        //    `commit_index_for` and relied on an unconditional
-        //    inline apply inside `propose_conf_change` — which
-        //    was racy for multi-voter groups where the commit
-        //    can be deferred until quorum replicates the log
-        //    entry. The correct semantic signal is "the new node
-        //    appears in `routing.group_info(gid).learners`",
-        //    because that's what `apply_conf_change` writes after
-        //    the commit lands. Polling this also works cleanly
-        //    for single-voter groups (the inline apply makes the
-        //    condition true on the first poll) and multi-voter
-        //    groups (the tick loop runs concurrently with this
-        //    `await`, drains `committed_entries`, and calls
-        //    `apply_conf_change` → routing update → condition
-        //    flips).
+        //    `commit_index_for` and relied on an unconditional inline apply.
+        //    The semantic signal is actual Raft membership: the node appears
+        //    as either learner or voter. This works for non-routing groups and
+        //    also tolerates promotion racing the polling interval.
         let deadline = Instant::now() + CONF_CHANGE_COMMIT_TIMEOUT;
         for (gid, log_index) in &pending {
             if let Err(err) = self
-                .wait_for_learner_applied(*gid, req.node_id, *log_index, deadline)
+                .wait_for_group_admission(*gid, req.node_id, *log_index, deadline)
                 .await
             {
                 return reject(err.to_string());
@@ -289,19 +329,16 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             groups = pending.len(),
             "join accepted; learner AddLearner commits complete"
         );
+
         self.build_current_response(&req)
     }
 
-    /// Wait for the semantic goal of "learner is now tracked in
-    /// `routing.group_info(group_id).learners`", polling every
+    /// Wait for the semantic goal of "node is now a voter or learner in
+    /// this Raft group", polling every
     /// [`CONF_CHANGE_POLL_INTERVAL`] up to `deadline`.
     ///
-    /// This is the post-apply condition that `apply_conf_change`
-    /// writes once a committed `AddLearner` entry has been
-    /// applied to the local state. Polling this rather than the
-    /// raw `commit_index` is what lets the join flow stay
-    /// correct on multi-voter groups where the commit is
-    /// deferred until quorum replicates.
+    /// Polling actual Raft membership rather than routing or raw commit index
+    /// covers both vShard groups and internal groups such as the sequencer.
     ///
     /// `log_index` is carried into the error enum for debugging
     /// only; the condition is not gated on it.
@@ -310,7 +347,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// and [`ClusterError::JoinGroupDisappeared`] so the join
     /// flow can match the cause and so the crate's central
     /// error enum owns the human-readable rendering.
-    async fn wait_for_learner_applied(
+    async fn wait_for_group_admission(
         &self,
         group_id: u64,
         learner_id: u64,
@@ -320,9 +357,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         loop {
             let applied = {
                 let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-                mr.routing()
-                    .group_info(group_id)
-                    .map(|info| info.learners.contains(&learner_id))
+                mr.group_contains_node(group_id, learner_id)
             };
             match applied {
                 Some(true) => return Ok(()),
@@ -340,8 +375,8 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     }
 
     /// Build a `JoinResponse` snapshotting the current topology
-    /// and routing. Used both by the happy-path return and by the
-    /// idempotent re-join short-circuit. The strict cluster_id
+    /// and routing. Used by both new and idempotent joins after per-group
+    /// reconciliation. The strict cluster_id
     /// check is the same as the one at the top of `join_flow` —
     /// a catalog-attached server with no stamped cluster_id is an
     /// invariant violation and we reject the join rather than
@@ -369,9 +404,20 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let routing_clone = {
+        let (routing_clone, raft_groups) = {
             let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-            mr.routing().clone()
+            let groups = mr
+                .group_ids()
+                .into_iter()
+                .filter_map(|group_id| mr.group_membership(group_id))
+                .map(|membership| JoinGroupInfo {
+                    group_id: membership.group_id,
+                    leader: membership.leader_id,
+                    members: membership.voters,
+                    learners: membership.learners,
+                })
+                .collect();
+            (mr.routing().clone(), groups)
         };
         // Re-use the pure builder from `bootstrap/handle_join.rs`.
         // `handle_join_request` is idempotent against the same
@@ -379,7 +425,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // contains the new node, so this call only rebuilds the
         // wire response.
         let mut topo = topology_clone;
-        handle_join_request(req, &mut topo, &routing_clone, cluster_id)
+        let mut response = handle_join_request(req, &mut topo, &routing_clone, cluster_id);
+        response.groups = raft_groups;
+        response
     }
 }
 
@@ -392,5 +440,39 @@ fn reject(error: String) -> JoinResponse {
         nodes: vec![],
         vshard_to_group: vec![],
         groups: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calvin::SEQUENCER_GROUP_ID;
+    use crate::routing::RoutingTable;
+
+    #[test]
+    fn partial_rejoin_only_reconciles_missing_group_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = RoutingTable::uniform(1, &[1], 1);
+        let mut multi_raft = MultiRaft::new(1, routing, dir.path().to_path_buf());
+        multi_raft.add_group(0, vec![]).unwrap();
+        multi_raft.add_group(1, vec![]).unwrap();
+        multi_raft.add_group(SEQUENCER_GROUP_ID, vec![]).unwrap();
+
+        for group_id in [0, 1] {
+            multi_raft
+                .apply_conf_change(
+                    group_id,
+                    &ConfChange {
+                        change_type: ConfChangeType::AddLearner,
+                        node_id: 2,
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            groups_requiring_admission(&multi_raft, 2),
+            vec![SEQUENCER_GROUP_ID]
+        );
     }
 }

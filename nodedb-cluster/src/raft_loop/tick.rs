@@ -344,7 +344,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // Snapshot the work list under one lock acquisition.
         let promotions: Vec<(u64, u64)> = {
             let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-            let group_ids: Vec<u64> = mr.routing().group_ids();
+            let group_ids = mr.group_ids();
             group_ids
                 .into_iter()
                 .flat_map(|gid| {

@@ -132,13 +132,17 @@ impl MultiRaft {
                 // If this is our own promotion, we also need to flip the
                 // local role from `Learner` to `Follower` so subsequent
                 // ticks run election timeouts normally.
-                let promoted = node.promote_learner(change.node_id);
-                if promoted {
-                    self.routing.promote_group_learner(group_id, change.node_id);
-                }
                 if change.node_id == self_node_id {
+                    // A learner-start node intentionally does not store itself in
+                    // `RaftConfig.learners`, so `promote_learner(self)` cannot be
+                    // the gate for updating its routing snapshot.
                     node.promote_self_to_voter();
+                } else {
+                    node.promote_learner(change.node_id);
                 }
+                // The committed conf change is authoritative. This is idempotent
+                // and also handles self-promotion on a joining replica.
+                self.routing.promote_group_learner(group_id, change.node_id);
             }
         }
 
@@ -226,30 +230,24 @@ mod tests {
 
     #[test]
     fn apply_promote_self_flips_role() {
-        // Simulate receiving PromoteLearner(self=2) after being added as
-        // a learner to group 0.
         let dir = tempfile::tempdir().unwrap();
-        let rt = RoutingTable::uniform(1, &[1, 2], 1);
+        let mut rt = RoutingTable::uniform(1, &[1], 1);
+        rt.add_group_learner(0, 2);
         let mut mr = MultiRaft::new(2, rt, dir.path().to_path_buf());
         mr.add_group_as_learner(0, vec![1], vec![]).unwrap();
 
-        // Inject ourselves into the learners list so promote_learner has
-        // something to find. (In the real flow this happens via
-        // `AddLearner` applied from the log; we short-circuit for the
-        // unit test.)
-        mr.groups.get_mut(&0).unwrap().add_learner(2);
-        // Technically `add_learner(self_id)` is a no-op guard — force
-        // config.learners manually via promoting through a faux path:
-        // re-apply AddLearner from apply_conf_change, which tolerates
-        // self-id collision.
-        //
-        // For this test, the simpler route is to construct a tiny fake
-        // and check that `promote_self_to_voter` is called on self.
-        // Since the guard in add_learner skips self, we can't stage that
-        // state cleanly. Instead we directly verify the role flip path:
-        let node = mr.groups.get_mut(&0).unwrap();
-        assert_eq!(node.role(), NodeRole::Learner);
-        node.promote_self_to_voter();
-        assert_eq!(node.role(), NodeRole::Follower);
+        mr.apply_conf_change(
+            0,
+            &ConfChange {
+                change_type: ConfChangeType::PromoteLearner,
+                node_id: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(mr.groups.get(&0).unwrap().role(), NodeRole::Follower);
+        let info = mr.routing.group_info(0).unwrap();
+        assert_eq!(info.members, vec![1, 2]);
+        assert!(info.learners.is_empty());
     }
 }

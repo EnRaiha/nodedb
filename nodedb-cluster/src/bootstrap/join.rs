@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tracing::{debug, info, warn};
 
+use crate::calvin::SEQUENCER_GROUP_ID;
 use crate::catalog::ClusterCatalog;
 use crate::error::{ClusterError, Result};
 use crate::lifecycle_state::ClusterLifecycleTracker;
@@ -281,6 +282,9 @@ fn apply_join_response(
     // 1. Reconstruct routing table.
     let mut group_members = std::collections::HashMap::new();
     for g in &resp.groups {
+        if g.group_id == SEQUENCER_GROUP_ID {
+            continue;
+        }
         group_members.insert(
             g.group_id,
             GroupInfo {
@@ -586,6 +590,13 @@ mod tests {
                     surrogate: 0,
                     error: None,
                 }
+            }
+
+            async fn on_submit_calvin_txn(
+                &self,
+                _req: crate::rpc_codec::SubmitCalvinTxnRequest,
+            ) -> crate::rpc_codec::SubmitCalvinTxnResponse {
+                crate::rpc_codec::SubmitCalvinTxnResponse { error: None }
             }
         }
 

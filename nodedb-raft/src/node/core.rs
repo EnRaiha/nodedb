@@ -137,6 +137,10 @@ impl<S: LogStorage> RaftNode<S> {
         self.volatile.last_applied
     }
 
+    pub fn last_log_index(&self) -> u64 {
+        self.log.last_index()
+    }
+
     /// Override election deadline (for testing).
     pub fn election_deadline_override(&mut self, deadline: Instant) {
         self.election_deadline = deadline;
