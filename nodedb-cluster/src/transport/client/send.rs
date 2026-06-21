@@ -10,6 +10,7 @@
 //! run through the per-peer replay window before being decoded.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use futures::Stream;
 use tracing::debug;
@@ -88,7 +89,31 @@ impl NexarTransport {
     }
 
     /// Send an RPC to a peer with retry and circuit breaker.
+    ///
+    /// The response read is bounded by the transport's default `rpc_timeout`.
+    /// For RPCs whose handler legitimately blocks far longer than a normal
+    /// request/response round-trip (e.g. a routed Calvin submit-and-await, which
+    /// the leader-side handler holds open until the transaction is sequenced AND
+    /// completion-acked), use [`send_rpc_with_read_timeout`](Self::send_rpc_with_read_timeout)
+    /// so the generic short timeout does not abort the call while the remote
+    /// handler is still legitimately working.
     pub async fn send_rpc(&self, target: u64, rpc: RaftRpc) -> Result<RaftRpc> {
+        self.send_rpc_with_read_timeout(target, rpc, self.rpc_timeout)
+            .await
+    }
+
+    /// [`send_rpc`](Self::send_rpc) with an explicit response-read timeout.
+    ///
+    /// `read_timeout` bounds the wait for the response envelope on each attempt
+    /// (the connect / handshake / write phases still use the transport's pooled
+    /// connection). Callers pass a value derived from the remote handler's own
+    /// deadline (plus a margin) so a long-running handler is not aborted early.
+    pub async fn send_rpc_with_read_timeout(
+        &self,
+        target: u64,
+        rpc: RaftRpc,
+        read_timeout: Duration,
+    ) -> Result<RaftRpc> {
         // Encode the inner RPC once (codec errors are not retryable).
         // Each retry wraps it in a fresh envelope so the seq advances
         // per attempt — a retry is a new frame, not a replayed frame.
@@ -106,7 +131,7 @@ impl NexarTransport {
             }
 
             let envelope = self.wrap_inner(&inner)?;
-            match self.try_send_once(target, &envelope).await {
+            match self.try_send_once(target, &envelope, read_timeout).await {
                 Ok(resp) => {
                     self.circuit_breaker.record_success(target);
                     return resp;
@@ -261,6 +286,7 @@ impl NexarTransport {
         &self,
         target: u64,
         envelope: &[u8],
+        read_timeout: Duration,
     ) -> std::result::Result<Result<RaftRpc>, ClusterError> {
         let conn = self.get_or_connect(target).await?;
 
@@ -278,12 +304,12 @@ impl NexarTransport {
         })?;
 
         let response_envelope =
-            tokio::time::timeout(self.rpc_timeout, server::read_envelope(&mut recv))
+            tokio::time::timeout(read_timeout, server::read_envelope(&mut recv))
                 .await
                 .map_err(|_| ClusterError::Transport {
                     detail: format!(
                         "RPC timeout ({}ms) to node {target}",
-                        self.rpc_timeout.as_millis()
+                        read_timeout.as_millis()
                     ),
                 })??;
 

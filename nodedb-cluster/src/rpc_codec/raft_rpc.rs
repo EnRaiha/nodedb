@@ -7,6 +7,7 @@ use nodedb_raft::message::{
     RequestVoteRequest, RequestVoteResponse,
 };
 
+use super::calvin_submit::{SubmitCalvinTxnRequest, SubmitCalvinTxnResponse};
 use super::cluster_mgmt::{
     JoinRequest, JoinResponse, PingRequest, PongResponse, TopologyAck, TopologyUpdate,
 };
@@ -21,7 +22,10 @@ use super::shuffle::{
     ShufflePushEnd, ShufflePushRequest,
 };
 use super::surrogate::{AssignSurrogateRequest, AssignSurrogateResponse};
-use super::{cluster_mgmt, data_propose, execute, metadata, raft_msgs, shuffle, surrogate, vshard};
+use super::{
+    calvin_submit, cluster_mgmt, data_propose, execute, metadata, raft_msgs, shuffle, surrogate,
+    vshard,
+};
 use crate::error::{ClusterError, Result};
 use crate::wire_version::{unwrap_bytes_versioned, wrap_bytes_versioned};
 
@@ -92,6 +96,13 @@ pub enum RaftRpc {
     // `AssignSurrogateResponse`.
     AssignSurrogateRequest(AssignSurrogateRequest),
     AssignSurrogateResponse(AssignSurrogateResponse),
+    // Routed Calvin-submit (Cv1). A coordinator that is NOT the sequencer-group
+    // leader sends a `SubmitCalvinTxnRequest` carrying a msgpack-encoded
+    // `TxClass` to the leader; the leader submits it to its local Calvin
+    // sequencer inbox, awaits assignment + completion, and replies with one
+    // `SubmitCalvinTxnResponse` carrying success or a typed error.
+    SubmitCalvinTxnRequest(SubmitCalvinTxnRequest),
+    SubmitCalvinTxnResponse(SubmitCalvinTxnResponse),
     // Data-group proposal forwarding (groups 1+)
     DataProposeRequest(DataProposeRequest),
     DataProposeResponse(DataProposeResponse),
@@ -136,6 +147,12 @@ pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
         }
         RaftRpc::AssignSurrogateRequest(m) => surrogate::encode_assign_surrogate_req(m, &mut out),
         RaftRpc::AssignSurrogateResponse(m) => surrogate::encode_assign_surrogate_resp(m, &mut out),
+        RaftRpc::SubmitCalvinTxnRequest(m) => {
+            calvin_submit::encode_submit_calvin_txn_req(m, &mut out)
+        }
+        RaftRpc::SubmitCalvinTxnResponse(m) => {
+            calvin_submit::encode_submit_calvin_txn_resp(m, &mut out)
+        }
         RaftRpc::DataProposeRequest(m) => data_propose::encode_data_propose_req(m, &mut out),
         RaftRpc::DataProposeResponse(m) => data_propose::encode_data_propose_resp(m, &mut out),
     }?;
@@ -212,6 +229,8 @@ pub fn decode(data: &[u8]) -> Result<RaftRpc> {
         RPC_SHUFFLE_AGG_CONSUME_RESP => shuffle::decode_shuffle_agg_consume_resp(payload),
         RPC_ASSIGN_SURROGATE_REQ => surrogate::decode_assign_surrogate_req(payload),
         RPC_ASSIGN_SURROGATE_RESP => surrogate::decode_assign_surrogate_resp(payload),
+        RPC_SUBMIT_CALVIN_TXN_REQ => calvin_submit::decode_submit_calvin_txn_req(payload),
+        RPC_SUBMIT_CALVIN_TXN_RESP => calvin_submit::decode_submit_calvin_txn_resp(payload),
         RPC_DATA_PROPOSE_REQ => data_propose::decode_data_propose_req(payload),
         RPC_DATA_PROPOSE_RESP => data_propose::decode_data_propose_resp(payload),
         _ => Err(ClusterError::Codec {

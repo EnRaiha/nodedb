@@ -9,6 +9,7 @@
 //!   - All wire types re-exported from their sub-modules.
 
 pub mod auth_envelope;
+pub mod calvin_submit;
 pub mod cluster_mgmt;
 pub mod data_propose;
 pub mod discriminants;
@@ -26,6 +27,7 @@ pub mod vshard;
 pub use auth_envelope::{
     ENVELOPE_OVERHEAD, ENVELOPE_VERSION, EnvelopeFields, parse_envelope, write_envelope,
 };
+pub use calvin_submit::{SubmitCalvinTxnRequest, SubmitCalvinTxnResponse};
 pub use cluster_mgmt::{
     JoinGroupInfo, JoinNodeInfo, JoinRequest, JoinResponse, LEADER_REDIRECT_PREFIX, PingRequest,
     PongResponse, TopologyAck, TopologyUpdate,

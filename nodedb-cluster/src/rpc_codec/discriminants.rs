@@ -84,6 +84,15 @@ pub const RPC_SHUFFLE_AGG_CONSUME_RESP: u8 = 33;
 pub const RPC_ASSIGN_SURROGATE_REQ: u8 = 34;
 pub const RPC_ASSIGN_SURROGATE_RESP: u8 = 35;
 
+/// Routed Calvin-submit (Cv1). A coordinator that is NOT the sequencer-group
+/// leader sends a `RPC_SUBMIT_CALVIN_TXN_REQ` carrying a msgpack-encoded
+/// `TxClass` to the leader; the leader submits it to its local Calvin sequencer
+/// inbox and awaits assignment + completion, replying with exactly one
+/// `RPC_SUBMIT_CALVIN_TXN_RESP` carrying success or a typed error. One-shot
+/// request/response — no streaming.
+pub const RPC_SUBMIT_CALVIN_TXN_REQ: u8 = 36;
+pub const RPC_SUBMIT_CALVIN_TXN_RESP: u8 = 37;
+
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared
 // here so external code can reference them without importing the full enum.
