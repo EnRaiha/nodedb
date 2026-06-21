@@ -131,17 +131,24 @@ impl CoreLoop {
 
         // ── In-memory, tuple-keyed state (reclaimable today) ─────────────────
 
-        // Vector engine.
+        // Vector engine. Field-vector indexes are keyed "{coll}:{field}" in the
+        // String component, so eviction must drop the plain collection key AND every
+        // field variant — not just the bare "{coll}" key (which would leak the
+        // field-keyed entries in memory on drop).
         let vec_removed = {
-            let key = (db, tid, coll.clone());
-            let mut r = 0;
-            if self.vector_collections.remove(&key).is_some() {
-                r += 1;
-            }
-            self.vector_params.remove(&key);
-            self.index_configs.remove(&key);
-            self.ivf_indexes.remove(&key);
-            r
+            let coll_prefix = format!("{coll}:");
+            let keep = |c: &String| !(c == &coll || c.starts_with(&coll_prefix));
+            let before = self.vector_collections.len();
+            self.vector_collections
+                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
+            let removed = before - self.vector_collections.len();
+            self.vector_params
+                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
+            self.index_configs
+                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
+            self.ivf_indexes
+                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
+            removed
         };
 
         // Timeseries engine.
