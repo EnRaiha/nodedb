@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod broadcast;
+pub mod calvin_submit;
 pub mod conn_stream;
 pub mod dispatch_utils;
 pub mod exchange;

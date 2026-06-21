@@ -4,6 +4,7 @@ pub mod dispatch;
 pub mod explain;
 pub mod predicate;
 pub mod preexec;
+pub mod submit;
 pub mod types;
 
 pub use dispatch::{
@@ -11,4 +12,7 @@ pub use dispatch::{
     dispatch_dependent_read, is_dependent_predicate, is_write_plan, predicate_class,
 };
 pub use explain::calvin_explain_preamble;
+pub use submit::{
+    submit_and_await_calvin, submit_and_await_calvin_with_timeout, submit_calvin_routed,
+};
 pub use types::{DispatchClass, DispatchOutcome};

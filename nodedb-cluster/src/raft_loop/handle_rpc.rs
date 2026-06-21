@@ -13,7 +13,8 @@ use crate::health;
 use crate::rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
-    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, TypedClusterError,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinTxnRequest,
+    SubmitCalvinTxnResponse, TypedClusterError,
 };
 use crate::transport::RaftRpcHandler;
 
@@ -481,6 +482,25 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                     message: "assign-remote-surrogate not configured \
                               (no AssignRemoteSurrogate installed)"
                         .into(),
+                }),
+            },
+        }
+    }
+
+    // Routed Calvin-submit (Cv1) — delegate to the host-crate `CalvinSubmit`.
+    // This node is the sequencer-group leader; submitting + awaiting through it
+    // is correct because the leader's sequencer service assigns and the leader's
+    // registry receives the replicated completion ack. When no Calvin-submit
+    // hook is installed (cluster-only tests / single-node), return a typed "not
+    // configured" error so the coordinator learns the request could not run
+    // rather than silently believing the cross-shard write committed.
+    async fn on_submit_calvin_txn(&self, req: SubmitCalvinTxnRequest) -> SubmitCalvinTxnResponse {
+        match &self.calvin_submit {
+            Some(submit) => submit.on_submit_calvin_txn(req).await,
+            None => SubmitCalvinTxnResponse {
+                error: Some(TypedClusterError::Internal {
+                    code: 0,
+                    message: "calvin-submit not configured (no CalvinSubmit installed)".into(),
                 }),
             },
         }

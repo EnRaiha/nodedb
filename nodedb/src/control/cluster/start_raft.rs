@@ -54,18 +54,23 @@ pub fn start_raft(
             detail: "start_raft called twice: cluster multi_raft already consumed".into(),
         })?;
 
-    let sequencer_peers: Vec<u64> = {
-        let topo = handle.topology.read().unwrap_or_else(|p| p.into_inner());
-        topo.all_nodes()
-            .filter(|node| node.node_id != handle.node_id && node.state.receives_log())
-            .map(|node| node.node_id)
-            .collect()
-    };
-    multi_raft
-        .add_group(SEQUENCER_GROUP_ID, sequencer_peers)
-        .map_err(|e| crate::Error::Config {
-            detail: format!("sequencer raft group add: {e}"),
-        })?;
+    // Bootstrap/restart nodes create the sequencer group here. A fresh joiner
+    // already reconstructed it as a learner from JoinResponse; replacing that
+    // group with a topology-derived voter set would fork the Raft membership.
+    if !multi_raft.contains_group(SEQUENCER_GROUP_ID) {
+        let sequencer_peers: Vec<u64> = {
+            let topo = handle.topology.read().unwrap_or_else(|p| p.into_inner());
+            topo.all_nodes()
+                .filter(|node| node.node_id != handle.node_id && node.state.receives_log())
+                .map(|node| node.node_id)
+                .collect()
+        };
+        multi_raft
+            .add_group(SEQUENCER_GROUP_ID, sequencer_peers)
+            .map_err(|e| crate::Error::Config {
+                detail: format!("sequencer raft group add: {e}"),
+            })?;
+    }
 
     // Build the propose tracker and distributed applier.
     //
@@ -180,6 +185,13 @@ pub fn start_raft(
         ),
     );
 
+    // Routed Calvin-submit (Cv1): when this node is the sequencer-group leader,
+    // submit a forwarded `TxClass` to the local Calvin sequencer inbox and await
+    // its completion. Lets a cross-shard write submitted on a NON-leader
+    // coordinator route here and actually commit.
+    let calvin_submit: Arc<dyn nodedb_cluster::CalvinSubmit> =
+        Arc::new(crate::control::server::calvin_submit::RegistryCalvinSubmit::new(shared.clone()));
+
     let raft_loop = Arc::new(
         nodedb_cluster::RaftLoop::new(
             multi_raft,
@@ -198,6 +210,7 @@ pub fn start_raft(
         .with_shuffle_consumer(shuffle_consumer)
         .with_shuffle_aggregator(shuffle_aggregator)
         .with_assign_remote_surrogate(assign_remote_surrogate)
+        .with_calvin_submit(calvin_submit)
         .with_data_dir(_data_dir.to_path_buf())
         .with_snapshot_chunk_bytes(snapshot_chunk_bytes)
         .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs),

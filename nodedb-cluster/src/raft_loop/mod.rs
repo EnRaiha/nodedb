@@ -24,7 +24,7 @@ pub mod proposals;
 pub mod tick;
 
 pub use hooks::{
-    AssignRemoteSurrogate, ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver,
-    SnapshotQuarantineHook,
+    AssignRemoteSurrogate, CalvinSubmit, ShuffleAggregator, ShuffleConsumer, ShuffleProducer,
+    ShuffleReceiver, SnapshotQuarantineHook,
 };
 pub use loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};

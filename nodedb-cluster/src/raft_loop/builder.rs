@@ -17,8 +17,8 @@ use crate::forward::PlanExecutor;
 use crate::metadata_group::applier::MetadataApplier;
 
 use super::hooks::{
-    AssignRemoteSurrogate, ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver,
-    SnapshotQuarantineHook,
+    AssignRemoteSurrogate, CalvinSubmit, ShuffleAggregator, ShuffleConsumer, ShuffleProducer,
+    ShuffleReceiver, SnapshotQuarantineHook,
 };
 use super::loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};
 
@@ -47,6 +47,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             shuffle_consumer: self.shuffle_consumer,
             shuffle_aggregator: self.shuffle_aggregator,
             assign_remote_surrogate: self.assign_remote_surrogate,
+            calvin_submit: self.calvin_submit,
             partial_snapshots: self.partial_snapshots,
             data_dir: self.data_dir,
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
@@ -132,6 +133,19 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         assigner: Arc<dyn AssignRemoteSurrogate>,
     ) -> Self {
         self.assign_remote_surrogate = Some(assigner);
+        self
+    }
+
+    /// Attach the routed Calvin-submit hook (Cv1, builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s Calvin sequencer inbox
+    /// and `CalvinCompletionRegistry`) is called by the `SubmitCalvinTxn`
+    /// transport handler when this node is the sequencer-group leader: it submits
+    /// the carried `TxClass` to the local inbox and awaits completion, so a
+    /// cross-shard write routed here from a non-leader coordinator actually
+    /// commits.
+    pub fn with_calvin_submit(mut self, submit: Arc<dyn CalvinSubmit>) -> Self {
+        self.calvin_submit = Some(submit);
         self
     }
 

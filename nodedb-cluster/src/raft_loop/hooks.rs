@@ -220,3 +220,42 @@ pub trait AssignRemoteSurrogate: Send + Sync + 'static {
         req: crate::rpc_codec::AssignSurrogateRequest,
     ) -> crate::rpc_codec::AssignSurrogateResponse;
 }
+
+/// Hook for routed Calvin-submit (Cv1).
+///
+/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the submit logic —
+/// decode the `TxClass`, submit it to THIS node's Calvin sequencer inbox, and
+/// await assignment + completion through the node-local `CalvinCompletionRegistry`
+/// — lives in `nodedb` behind this `Send + Sync` hook. The transport read-loop
+/// calls [`on_submit_calvin_txn`](Self::on_submit_calvin_txn) when a
+/// `SubmitCalvinTxnRequest` arrives at the SEQUENCER-GROUP leader and writes the
+/// returned [`SubmitCalvinTxnResponse`](crate::rpc_codec::SubmitCalvinTxnResponse)
+/// back to the coordinator.
+///
+/// Because the handler runs on the sequencer-group leader, the submit-and-await
+/// is correct: only the leader's sequencer service assigns transactions
+/// (`note_assigned`), and only the leader's registry receives BOTH the
+/// assignment and the replicated completion ack. The coordinator routes here
+/// precisely so the submit lands where it will actually be sequenced and acked.
+///
+/// Cluster-only tests leave the `RaftLoop` field `None`; a `SubmitCalvinTxn`
+/// request against a node with no Calvin-submit hook installed returns a typed
+/// "not configured" error.
+///
+/// The hook is **async** because the submit-and-await blocks on the assignment
+/// and completion oneshot channels (bounded by the request deadline) on the
+/// Tokio transport reactor. The actual transaction execution happens on the Data
+/// Plane via the sequencer service / per-vshard schedulers; this hook never
+/// touches io_uring or storage directly.
+#[async_trait::async_trait]
+pub trait CalvinSubmit: Send + Sync + 'static {
+    /// Submit the `TxClass` carried by `req` (msgpack-encoded) to this node's
+    /// Calvin sequencer inbox and await its completion. Returns a
+    /// [`SubmitCalvinTxnResponse`](crate::rpc_codec::SubmitCalvinTxnResponse)
+    /// with `error: None` on commit or a typed error on failure (never a silent
+    /// drop).
+    async fn on_submit_calvin_txn(
+        &self,
+        req: crate::rpc_codec::SubmitCalvinTxnRequest,
+    ) -> crate::rpc_codec::SubmitCalvinTxnResponse;
+}
