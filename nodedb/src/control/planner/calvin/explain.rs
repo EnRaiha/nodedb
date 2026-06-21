@@ -5,9 +5,9 @@
 //! Prepends a Calvin-specific preamble row to EXPLAIN output when the task
 //! set spans multiple vShards or when best-effort non-atomic dispatch is active.
 
+use crate::control::planner::calvin::cross_shard_mode::CrossShardTxnMode;
 use crate::control::planner::calvin::dispatch::classify_dispatch;
 use crate::control::planner::calvin::types::DispatchClass;
-use crate::control::server::pgwire::session::cross_shard_mode::CrossShardTxnMode;
 use nodedb_physical::physical_task::PhysicalTask;
 
 /// Generate the Calvin dispatch preamble row for EXPLAIN output.

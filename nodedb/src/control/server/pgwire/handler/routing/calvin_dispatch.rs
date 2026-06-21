@@ -11,12 +11,11 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::planner::calvin::preexec::run_preexec_scan;
 use crate::control::planner::calvin::{
-    DispatchClass, build_dependent_tx_class, classify_dispatch, dispatch_dependent_read,
-    is_dependent_predicate, predicate_class, submit_calvin_routed,
+    build_dependent_tx_class, dispatch_dependent_read, dispatch_tasks_to_calvin,
+    is_dependent_predicate, predicate_class,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::session::TransactionState;
-use crate::control::server::pgwire::session::cross_shard_mode::CrossShardTxnMode;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -69,88 +68,37 @@ impl NodeDbPgHandler {
         // OLLP orchestration, not just the TxClass). The dh-2 / static path is the
         // primary cross-node validation for this unit.
         if dependent_task.is_none() {
-            // Apply the same classification + guards `dispatch_calvin_or_fast`
-            // uses for the static path, but do NOT submit to the local inbox:
-            // routing must own the SINGLE submission, otherwise the leader would
-            // see the txn twice (a duplicate cross-shard write). We classify,
-            // reject cross-shard writes inside explicit transaction blocks, build
-            // the TxClass, and route the submit-and-await to the sequencer leader.
-            let class = classify_dispatch(&tasks);
-            match class {
-                DispatchClass::MultiShard { .. } => {
-                    if tx_state == TransactionState::InBlock {
-                        let (severity, code, message) =
-                            error_to_sqlstate(&crate::Error::CrossShardInExplicitTransaction);
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            severity.to_owned(),
-                            code.to_owned(),
-                            message,
-                        ))));
-                    }
-                    match cross_shard_mode {
-                        CrossShardTxnMode::Strict => {
-                            if inbox.is_none() {
-                                let (severity, code, message) =
-                                    error_to_sqlstate(&crate::Error::SequencerUnavailable);
-                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    severity.to_owned(),
-                                    code.to_owned(),
-                                    message,
-                                ))));
-                            }
-                            let tx_class = crate::control::planner::calvin::build_static_tx_class(
-                                &tasks, tenant_id,
-                            )
-                            .map_err(|e| {
-                                let (severity, code, message) = error_to_sqlstate(&e);
-                                PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    severity.to_owned(),
-                                    code.to_owned(),
-                                    message,
-                                )))
-                            })?;
+            // Static (non-OLLP) path: delegate to the protocol-neutral
+            // `dispatch_tasks_to_calvin` helper, supplying the session-derived
+            // inputs (cross-shard mode, in-block state) it needs as parameters.
+            // The helper classifies, rejects cross-shard writes inside an
+            // explicit transaction block, builds the static TxClass, and routes
+            // the SINGLE submit-and-await to the sequencer leader. On success we
+            // synthesise one command tag per task. This is a pure extraction —
+            // behaviour is identical to the inlined static branch.
+            let in_txn_block = tx_state == TransactionState::InBlock;
+            dispatch_tasks_to_calvin(
+                &self.state,
+                &tasks,
+                tenant_id,
+                cross_shard_mode,
+                in_txn_block,
+            )
+            .await
+            .map_err(|e| {
+                let (severity, code, message) = error_to_sqlstate(&e);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            })?;
 
-                            submit_calvin_routed(&self.state, tx_class)
-                                .await
-                                .map_err(|e| {
-                                    let (severity, code, message) = error_to_sqlstate(&e);
-                                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                                        severity.to_owned(),
-                                        code.to_owned(),
-                                        message,
-                                    )))
-                                })?;
-
-                            let mut calvin_responses: Vec<Response> =
-                                Vec::with_capacity(tasks.len());
-                            for task in &tasks {
-                                calvin_responses.push(calvin_execution_response(task));
-                            }
-                            return Ok(calvin_responses);
-                        }
-                        CrossShardTxnMode::BestEffortNonAtomic => {
-                            // best-effort never reaches this strict multi-shard
-                            // dispatch entry point.
-                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_owned(),
-                                "XX000".to_owned(),
-                                "unexpected non-Calvin dispatch outcome for strict \
-                                 multi-shard query"
-                                    .to_owned(),
-                            ))));
-                        }
-                    }
-                }
-                DispatchClass::SingleShard { .. } => {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "XX000".to_owned(),
-                        "unexpected non-Calvin dispatch outcome for strict \
-                         multi-shard query"
-                            .to_owned(),
-                    ))));
-                }
+            let mut calvin_responses: Vec<Response> = Vec::with_capacity(tasks.len());
+            for task in &tasks {
+                calvin_responses.push(calvin_execution_response(task));
             }
+            return Ok(calvin_responses);
         }
 
         let inbox_seq = if let Some(dep_task) = dependent_task {

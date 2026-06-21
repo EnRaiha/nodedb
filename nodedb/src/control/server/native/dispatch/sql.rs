@@ -7,6 +7,9 @@ use nodedb_types::protocol::NativeResponse;
 use nodedb_types::value::Value;
 
 use crate::bridge::envelope::{Response, Status};
+use crate::control::planner::calvin::{
+    CrossShardTxnMode, DispatchClass, classify_dispatch, dispatch_tasks_to_calvin,
+};
 use crate::control::server::pgwire::session::TransactionState;
 use crate::data::executor::response_codec;
 use nodedb_physical::physical_task::PhysicalTask;
@@ -218,6 +221,53 @@ async fn execute_planned(
 
     if tasks.is_empty() {
         return resp(NativeResponse::status_row(seq, "OK"));
+    }
+
+    // Cross-shard write parity with pgwire: classify the planned task set and,
+    // for a strict multi-shard write, route the whole batch through the Calvin
+    // sequencer so it commits atomically. Single-shard (and best-effort) keep
+    // the existing per-task gateway/SPSC dispatch loop below unchanged.
+    match classify_dispatch(&tasks) {
+        DispatchClass::SingleShard { .. } => {}
+        DispatchClass::MultiShard { .. } => {
+            // Reject a cross-shard write inside an explicit transaction block,
+            // matching pgwire's `CrossShardInExplicitTransaction` semantics.
+            // Native buffers in-block writes per task below; a multi-shard
+            // write cannot be buffered atomically, so reject up front.
+            if ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::InBlock {
+                return resp(error_to_native(
+                    seq,
+                    &crate::Error::CrossShardInExplicitTransaction,
+                ));
+            }
+
+            // Native has no per-session `cross_shard_txn` parameter wired, so it
+            // reads the same `SessionStore` accessor pgwire uses; an unset value
+            // defaults to `CrossShardTxnMode::Strict` (the documented default),
+            // so native multi-shard writes route through Calvin by default.
+            let cross_shard_mode = ctx.sessions.cross_shard_txn_mode(ctx.peer_addr);
+            if cross_shard_mode == CrossShardTxnMode::Strict {
+                return match dispatch_tasks_to_calvin(
+                    ctx.state,
+                    &tasks,
+                    ctx.tenant_id(),
+                    cross_shard_mode,
+                    false,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        // Calvin committed; report rows affected as one per task,
+                        // mirroring pgwire's one-tag-per-task synthesis.
+                        let mut r = NativeResponse::ok(seq);
+                        r.rows_affected = Some(tasks.len() as u64);
+                        resp(r)
+                    }
+                    Err(e) => resp(error_to_native(seq, &e)),
+                };
+            }
+            // BestEffortNonAtomic falls through to the per-task loop below.
+        }
     }
 
     // Streaming fast path: an eligible autocommit, single-task, unordered

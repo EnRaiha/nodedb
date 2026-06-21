@@ -14,21 +14,13 @@
 use std::net::SocketAddr;
 
 use super::store::SessionStore;
+// The mode enum is a cross-shard *transaction* concept owned by the Calvin
+// layer; this module only owns the pgwire `SET`/`SHOW` parsing/formatting and
+// the session-store accessor for it.
+pub use crate::control::planner::calvin::CrossShardTxnMode;
 
 /// Session parameter key.
 pub const PARAM_KEY: &str = "cross_shard_txn";
-
-/// The cross-shard transaction mode for this session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CrossShardTxnMode {
-    /// Full Calvin atomicity — cross-shard writes go through the sequencer.
-    /// This is the default.
-    #[default]
-    Strict,
-    /// Multi-vshard writes dispatched to each vshard independently —
-    /// **NOT atomic.** Suitable for bulk loads only.
-    BestEffortNonAtomic,
-}
 
 /// Parse a user-supplied string into a `CrossShardTxnMode`.
 ///
