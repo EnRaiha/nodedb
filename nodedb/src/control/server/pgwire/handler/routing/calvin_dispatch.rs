@@ -11,10 +11,12 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::planner::calvin::preexec::run_preexec_scan;
 use crate::control::planner::calvin::{
-    DispatchOutcome, build_dependent_tx_class, dispatch_calvin_or_fast, dispatch_dependent_read,
-    is_dependent_predicate, predicate_class,
+    DispatchClass, build_dependent_tx_class, classify_dispatch, dispatch_dependent_read,
+    is_dependent_predicate, predicate_class, submit_calvin_routed,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::session::TransactionState;
+use crate::control::server::pgwire::session::cross_shard_mode::CrossShardTxnMode;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -51,6 +53,105 @@ impl NodeDbPgHandler {
         })?;
 
         let dependent_task = tasks.iter().find(|t| is_dependent_predicate(&t.plan));
+
+        // Static (non-OLLP) Calvin path: build the TxClass and route the
+        // submit-and-await to the SEQUENCER-GROUP leader via
+        // `submit_calvin_routed`. Submitting to the LOCAL inbox here is the
+        // silent-loss bug this fix addresses: only the sequencer leader's service
+        // assigns and only its registry receives the replicated completion ack,
+        // so a submit on a non-leader coordinator never completes. Routing fixes
+        // that for cross-shard document writes from any coordinator.
+        //
+        // The OLLP (dependent-predicate) path below still submits + awaits via the
+        // local inbox/registry: its optimistic pre-execution scan + circuit-breaker
+        // retry machinery is owned by the local `OllpOrchestrator` and is NOT yet
+        // leader-routed. That is a declared follow-up (it requires forwarding the
+        // OLLP orchestration, not just the TxClass). The dh-2 / static path is the
+        // primary cross-node validation for this unit.
+        if dependent_task.is_none() {
+            // Apply the same classification + guards `dispatch_calvin_or_fast`
+            // uses for the static path, but do NOT submit to the local inbox:
+            // routing must own the SINGLE submission, otherwise the leader would
+            // see the txn twice (a duplicate cross-shard write). We classify,
+            // reject cross-shard writes inside explicit transaction blocks, build
+            // the TxClass, and route the submit-and-await to the sequencer leader.
+            let class = classify_dispatch(&tasks);
+            match class {
+                DispatchClass::MultiShard { .. } => {
+                    if tx_state == TransactionState::InBlock {
+                        let (severity, code, message) =
+                            error_to_sqlstate(&crate::Error::CrossShardInExplicitTransaction);
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            severity.to_owned(),
+                            code.to_owned(),
+                            message,
+                        ))));
+                    }
+                    match cross_shard_mode {
+                        CrossShardTxnMode::Strict => {
+                            if inbox.is_none() {
+                                let (severity, code, message) =
+                                    error_to_sqlstate(&crate::Error::SequencerUnavailable);
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    severity.to_owned(),
+                                    code.to_owned(),
+                                    message,
+                                ))));
+                            }
+                            let tx_class = crate::control::planner::calvin::build_static_tx_class(
+                                &tasks, tenant_id,
+                            )
+                            .map_err(|e| {
+                                let (severity, code, message) = error_to_sqlstate(&e);
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    severity.to_owned(),
+                                    code.to_owned(),
+                                    message,
+                                )))
+                            })?;
+
+                            submit_calvin_routed(&self.state, tx_class)
+                                .await
+                                .map_err(|e| {
+                                    let (severity, code, message) = error_to_sqlstate(&e);
+                                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                                        severity.to_owned(),
+                                        code.to_owned(),
+                                        message,
+                                    )))
+                                })?;
+
+                            let mut calvin_responses: Vec<Response> =
+                                Vec::with_capacity(tasks.len());
+                            for task in &tasks {
+                                calvin_responses.push(calvin_execution_response(task));
+                            }
+                            return Ok(calvin_responses);
+                        }
+                        CrossShardTxnMode::BestEffortNonAtomic => {
+                            // best-effort never reaches this strict multi-shard
+                            // dispatch entry point.
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "XX000".to_owned(),
+                                "unexpected non-Calvin dispatch outcome for strict \
+                                 multi-shard query"
+                                    .to_owned(),
+                            ))));
+                        }
+                    }
+                }
+                DispatchClass::SingleShard { .. } => {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "XX000".to_owned(),
+                        "unexpected non-Calvin dispatch outcome for strict \
+                         multi-shard query"
+                            .to_owned(),
+                    ))));
+                }
+            }
+        }
 
         let inbox_seq = if let Some(dep_task) = dependent_task {
             // OLLP path: run optimistic pre-execution scan, then submit
@@ -133,38 +234,14 @@ impl NodeDbPgHandler {
                 )))
             })?
         } else {
-            // Static Calvin path: all write keys are statically known.
-            let dispatch = dispatch_calvin_or_fast(
-                &tasks,
-                cross_shard_mode,
-                tx_state,
-                inbox,
-                orchestrator,
-                tenant_id,
-            )
-            .await
-            .map_err(|e| {
-                let (severity, code, message) = error_to_sqlstate(&e);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?;
-
-            match dispatch {
-                DispatchOutcome::CalvinStatic { inbox_seq }
-                | DispatchOutcome::CalvinDependent { inbox_seq } => inbox_seq,
-                DispatchOutcome::SingleShard | DispatchOutcome::BestEffortNonAtomic => {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "XX000".to_owned(),
-                        "unexpected non-Calvin dispatch outcome for strict \
-                         multi-shard query"
-                            .to_owned(),
-                    ))));
-                }
-            }
+            // Unreachable: the static (non-dependent) path returns early above
+            // via `submit_calvin_routed`. Surface a typed error rather than
+            // panicking if the invariant is ever broken by a future refactor.
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "XX000".to_owned(),
+                "internal: static Calvin path reached the OLLP await branch".to_owned(),
+            ))));
         };
 
         let assignment_rx = registry.register_submission(inbox_seq);
