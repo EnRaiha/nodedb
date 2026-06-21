@@ -210,7 +210,7 @@ async fn execute_planned(
         roles: &ctx.state.roles,
         permission_cache: Some(&*perm_cache),
     };
-    let tasks = match ctx
+    let mut tasks = match ctx
         .query_ctx
         .plan_sql_with_rls(&clean_sql, ctx.tenant_id(), database_id, &sec)
         .await
@@ -221,6 +221,21 @@ async fn execute_planned(
 
     if tasks.is_empty() {
         return resp(NativeResponse::status_row(seq, "OK"));
+    }
+
+    // Implicit graph-edge extraction (pgwire parity): a schemaless document
+    // carrying `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task so the
+    // classify/Calvin/single-shard logic below routes it like an explicit edge.
+    if let Err(e) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
+        ctx.state,
+        &mut tasks,
+        ctx.tenant_id(),
+        database_id,
+        TraceId::ZERO,
+    )
+    .await
+    {
+        return resp(error_to_native(seq, &e));
     }
 
     // Cross-shard write parity with pgwire: classify the planned task set and,

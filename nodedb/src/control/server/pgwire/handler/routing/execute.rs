@@ -110,13 +110,38 @@ impl NodeDbPgHandler {
         addr: &std::net::SocketAddr,
         params: &[nodedb_sql::ParamValue],
     ) -> PgWireResult<Vec<Response>> {
-        let (tasks, _plan_lease_scope) = self
+        let (mut tasks, _plan_lease_scope) = self
             .plan_statement_to_tasks(identity, sql, tenant_id, addr, params)
             .await?;
 
         if tasks.is_empty() {
             return Ok(vec![Response::Execution(Tag::new("OK"))]);
         }
+
+        // Implicit graph-edge extraction: a schemaless document carrying
+        // `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task, homed and
+        // surrogate-resolved per endpoint so it routes through the same
+        // classify/Calvin/single-shard path as an explicit edge.
+        let edge_database_id = self
+            .sessions
+            .get_current_database(addr)
+            .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        crate::control::planner::implicit_edges::append_implicit_edge_tasks(
+            &self.state,
+            &mut tasks,
+            tenant_id,
+            edge_database_id,
+            crate::types::TraceId::ZERO,
+        )
+        .await
+        .map_err(|e| {
+            let (severity, code, message) = error_to_sqlstate(&e);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            )))
+        })?;
 
         // Clone CoW read-path interception: for Shadowed/Materializing clones,
         // augment tasks with source-database reads and merge results.

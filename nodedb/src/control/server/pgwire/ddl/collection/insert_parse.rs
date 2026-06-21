@@ -335,10 +335,49 @@ pub(super) async fn plan_and_dispatch(
     sql: &str,
 ) -> PgWireResult<()> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-    let tasks = query_ctx
+    let mut tasks = query_ctx
         .plan_sql(sql, tenant_id, database_id)
         .await
         .map_err(|e| sqlstate_error_raw("XX000", &e.to_string()))?;
+
+    // Schemaless INSERT / UPSERT / object-literal documents carrying `_from`
+    // / `_to` mirror an implicit graph edge. Extract it here — the same as the
+    // main SQL and native surfaces — so the edge routes through the shared
+    // dispatch path (Calvin dual-home cross-shard, single-home otherwise)
+    // instead of the removed Data-Plane hook.
+    crate::control::planner::implicit_edges::append_implicit_edge_tasks(
+        state,
+        &mut tasks,
+        tenant_id,
+        database_id,
+        TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| sqlstate_error_raw("XX000", &e.to_string()))?;
+
+    // A cross-shard write (e.g. a doc + its dual-homed implicit edge, or a
+    // multi-row insert spanning vShards) must commit atomically through the
+    // Calvin sequencer when one is wired (cluster). Single-node has no sequencer,
+    // so fall through to the per-task local dispatch below — every vShard is
+    // local there, so a single-home edge is still reachable by forward traversal.
+    if state.sequencer_inbox.get().is_some()
+        && matches!(
+            crate::control::planner::calvin::classify_dispatch(&tasks),
+            crate::control::planner::calvin::DispatchClass::MultiShard { .. }
+        )
+    {
+        crate::control::planner::calvin::dispatch_tasks_to_calvin(
+            state,
+            &tasks,
+            tenant_id,
+            crate::control::planner::calvin::CrossShardTxnMode::Strict,
+            false,
+        )
+        .await
+        .map_err(|e| sqlstate_error_raw("XX000", &e.to_string()))?;
+        return Ok(());
+    }
+
     for task in tasks {
         crate::control::server::wal_dispatch::wal_append_if_write(
             &state.wal,

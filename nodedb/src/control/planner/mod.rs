@@ -5,6 +5,7 @@ pub mod calvin;
 pub mod catalog_adapter;
 pub mod context;
 pub mod descriptor_set;
+pub mod implicit_edges;
 pub mod procedural;
 pub mod rls_injection;
 pub mod sql_plan_convert;

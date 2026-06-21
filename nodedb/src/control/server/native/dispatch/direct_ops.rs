@@ -4,11 +4,15 @@
 
 use nodedb_types::protocol::{NativeResponse, OpCode, TextFields};
 
-use crate::bridge::envelope::{Payload, Response, Status};
+use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext as GatewayQueryContext;
+use crate::control::planner::calvin::{
+    CrossShardTxnMode, DispatchClass, classify_dispatch, dispatch_tasks_to_calvin,
+};
 use crate::data::executor::response_codec;
-use crate::types::{Lsn, RequestId, TraceId};
+use crate::types::{DatabaseId, Lsn, RequestId, TenantId, TraceId, VShardId};
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use crate::control::server::wal_dispatch;
 
@@ -56,27 +60,113 @@ pub(crate) async fn handle_direct_op(
         return NativeResponse::error(seq, "42501", e.to_string());
     }
 
-    // WAL append for writes (local path; gateway handles its own WAL on the
-    // target node, but we still append locally for the boot/single-node path).
-    if ctx.state.gateway.is_none()
-        && let Err(e) = wal_dispatch::wal_append_if_write(
-            &ctx.state.wal,
-            tenant_id,
-            vshard_id,
-            crate::types::DatabaseId::DEFAULT,
-            &plan,
-        )
+    // Implicit graph-edge extraction (pgwire / native-SQL parity): a schemaless
+    // document carrying `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task.
+    // The common no-edge case leaves `tasks` at length 1 and runs the existing
+    // single-dispatch path byte-identically below; an edge-bearing insert
+    // augments the vec and routes through classify/Calvin like every other
+    // write surface.
+    let mut tasks = vec![PhysicalTask {
+        tenant_id,
+        vshard_id,
+        database_id: DatabaseId::DEFAULT,
+        plan,
+        post_set_op: PostSetOp::None,
+    }];
+    if let Err(e) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
+        ctx.state,
+        &mut tasks,
+        tenant_id,
+        DatabaseId::DEFAULT,
+        TraceId::ZERO,
+    )
+    .await
     {
         return error_to_native(seq, &e);
     }
 
+    if tasks.len() == 1
+        && let Some(task) = tasks.pop()
+    {
+        // No-edge fast path — behaviorally identical to the pre-migration
+        // single-plan dispatch. The local-path WAL append now lives inside
+        // `dispatch_single_task` so it is shared with the single-shard edge loop.
+        ctx.state.tenant_request_start(tenant_id);
+        let result = dispatch_single_task(ctx, seq, tenant_id, vshard_id, task.plan).await;
+        ctx.state.tenant_request_end(tenant_id);
+        return result;
+    }
+
+    // Edge-bearing insert: route the augmented task set the same way native SQL
+    // does. A cross-shard set goes through the Calvin sequencer atomically (which
+    // owns its own replicated durability); a single-shard set dispatches each
+    // task sequentially (matching pgwire / native-SQL single-shard multi-task),
+    // returning the document task's response. Local WAL durability for the
+    // single-shard path is handled inside `dispatch_single_task`.
     ctx.state.tenant_request_start(tenant_id);
-    let result = match ctx.state.gateway.as_ref() {
+    let result = match classify_dispatch(&tasks) {
+        DispatchClass::MultiShard { .. } => {
+            match dispatch_tasks_to_calvin(
+                ctx.state,
+                &tasks,
+                tenant_id,
+                CrossShardTxnMode::Strict,
+                false,
+            )
+            .await
+            {
+                Ok(()) => {
+                    let mut r = NativeResponse::ok(seq);
+                    r.rows_affected = Some(tasks.len() as u64);
+                    r
+                }
+                Err(e) => error_to_native(seq, &e),
+            }
+        }
+        DispatchClass::SingleShard { .. } => {
+            // The document task is first; its response is the one returned to
+            // the caller. Edge tasks dispatch after it in order.
+            let mut doc_response: Option<NativeResponse> = None;
+            let mut error: Option<NativeResponse> = None;
+            for task in tasks {
+                let task_vshard = task.vshard_id;
+                let resp = dispatch_single_task(ctx, seq, tenant_id, task_vshard, task.plan).await;
+                if resp.status == nodedb_types::protocol::ResponseStatus::Error {
+                    error = Some(resp);
+                    break;
+                }
+                if doc_response.is_none() {
+                    doc_response = Some(resp);
+                }
+            }
+            error
+                .or(doc_response)
+                .unwrap_or_else(|| NativeResponse::ok(seq))
+        }
+    };
+    ctx.state.tenant_request_end(tenant_id);
+    result
+}
+
+/// Dispatch one plan via the gateway (when wired) or the local SPSC path,
+/// converting the Data-Plane response into a `NativeResponse`.
+///
+/// This is the exact single-plan dispatch the direct-op handler used before
+/// implicit-edge extraction; it is factored out so the no-edge fast path and
+/// the single-shard edge loop share one code path.
+async fn dispatch_single_task(
+    ctx: &DispatchCtx<'_>,
+    seq: u64,
+    tenant_id: TenantId,
+    vshard_id: VShardId,
+    plan: PhysicalPlan,
+) -> NativeResponse {
+    match ctx.state.gateway.as_ref() {
         Some(gw) => {
             let gw_ctx = GatewayQueryContext {
                 tenant_id,
                 trace_id: TraceId::generate(),
-                database_id: nodedb_types::id::DatabaseId::DEFAULT,
+                database_id: DatabaseId::DEFAULT,
             };
             match gw.execute(&gw_ctx, plan).await {
                 Ok(payloads) => {
@@ -89,10 +179,26 @@ pub(crate) async fn handle_direct_op(
             }
         }
         None => {
+            // Local SPSC path (single-node boot, before the gateway is wired):
+            // the gateway would otherwise own WAL durability on the target node,
+            // so we must append locally before dispatching. Doing it here covers
+            // every local dispatch — the no-edge fast path AND each task of a
+            // single-shard edge bundle — so an implicit edge written on the boot
+            // path is durable. (Cross-shard bundles route via Calvin, which owns
+            // its own replicated durability and never reaches this branch.)
+            if let Err(e) = wal_dispatch::wal_append_if_write(
+                &ctx.state.wal,
+                tenant_id,
+                vshard_id,
+                DatabaseId::DEFAULT,
+                &plan,
+            ) {
+                return error_to_native(seq, &e);
+            }
             match dispatch_utils::dispatch_to_data_plane(
                 ctx.state,
                 tenant_id,
-                crate::types::DatabaseId::DEFAULT,
+                DatabaseId::DEFAULT,
                 vshard_id,
                 plan,
                 TraceId::ZERO,
@@ -103,9 +209,7 @@ pub(crate) async fn handle_direct_op(
                 Err(e) => error_to_native(seq, &e),
             }
         }
-    };
-    ctx.state.tenant_request_end(tenant_id);
-    result
+    }
 }
 
 /// Convert gateway `Vec<Vec<u8>>` payloads into a synthetic `Response`.
