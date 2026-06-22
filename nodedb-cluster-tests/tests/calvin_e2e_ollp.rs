@@ -4,7 +4,7 @@
 //!
 //! Verifies that the sequencer path correctly handles multi-shard Calvin
 //! transactions that include an OLLP BulkUpdate plan — the same code path that
-//! the pgwire handler triggers via `dispatch_dependent_read` for cross-shard
+//! the pgwire handler triggers via `run_dependent_with_retry` for cross-shard
 //! writes that include a value-dependent predicate operation.
 //!
 //! The OLLP (Optimistic Lock-based Predicate) protocol works as follows:

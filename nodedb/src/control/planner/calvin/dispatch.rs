@@ -161,8 +161,10 @@ pub fn classify_dispatch(tasks: &[PhysicalTask]) -> DispatchClass {
                 .unwrap_or(VShardId::new(0)),
         },
         1 => DispatchClass::SingleShard {
-            vshard: last_vshard
-                .expect("invariant: vshards.len() == 1 means last_vshard was set during the loop"),
+            // SAFETY: vshards.len() == 1 guarantees the loop ran at least once
+            // and set last_vshard. The unwrap_or_else is a defensive fallback
+            // that upholds the no-panic contract for library code.
+            vshard: last_vshard.unwrap_or_else(|| VShardId::new(0)),
         },
         _ => DispatchClass::MultiShard { vshards },
     }
@@ -433,56 +435,6 @@ pub async fn dispatch_calvin_or_fast(
             }
         }
         DispatchClass::SingleShard { .. } => Ok(DispatchOutcome::SingleShard),
-    }
-}
-
-// ── dispatch_dependent_read ───────────────────────────────────────────────────
-
-/// Outer retry loop for OLLP dependent-read Calvin transactions.
-///
-/// Calls the orchestrator's `submit_with_retry`, which runs a single attempt.
-/// On `OllpError`, retries by calling `orchestrator.on_retry_required` then
-/// re-submitting, up to `ollp_max_retries`.
-pub async fn dispatch_dependent_read(
-    orchestrator: &OllpOrchestrator,
-    inbox: &Inbox,
-    predicate_class_hash: u64,
-    tenant_id: TenantId,
-    tx_builder: impl Fn() -> crate::Result<TxClass>,
-    ollp_max_retries: u8,
-) -> crate::Result<u64> {
-    use crate::control::cluster::calvin::executor::ollp::error::OllpError;
-
-    let mut retry_count: u32 = 0;
-
-    loop {
-        let result = orchestrator
-            .submit_with_retry(inbox, predicate_class_hash, tenant_id, || {
-                tx_builder().map_err(|_e| {
-                    nodedb_cluster::error::CalvinError::Sequencer(
-                        nodedb_cluster::calvin::sequencer::error::SequencerError::Unavailable,
-                    )
-                })
-            })
-            .await;
-
-        match result {
-            Ok(inbox_seq) => return Ok(inbox_seq),
-            Err(OllpError::CircuitOpen { .. })
-            | Err(OllpError::Sequencer(_))
-            | Err(OllpError::Exhausted { .. })
-            | Err(OllpError::TenantBudgetExceeded { .. }) => {
-                if retry_count >= ollp_max_retries as u32 {
-                    return Err(Error::OllpExhausted {
-                        retries: ollp_max_retries,
-                    });
-                }
-                orchestrator
-                    .on_retry_required(predicate_class_hash, retry_count)
-                    .await;
-                retry_count += 1;
-            }
-        }
     }
 }
 

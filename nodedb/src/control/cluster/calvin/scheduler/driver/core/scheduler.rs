@@ -238,12 +238,39 @@ impl Scheduler {
         self.metrics.record_executor_txn_duration_ms(elapsed_ms);
 
         // OLLP mismatch: the active executor detected predicate drift and returned
-        // OllpRetryRequired without writing. Retry via the orchestrator's backoff
-        // and circuit-breaker path if the pending txn carries predicate class info.
+        // OllpRetryRequired without writing. The retry loop is now COORDINATOR-owned
+        // (`run_dependent_with_retry`): the scheduler must NOT re-submit a stale
+        // prediction. Instead it (1) releases the aborted attempt's locks and
+        // (2) signals the coordinator's completion waiter via the registry so it
+        // can run a FRESH reconnaissance and resubmit.
         if response.status == crate::bridge::envelope::Status::Error
             && response.error_code == Some(crate::bridge::envelope::ErrorCode::OllpRetryRequired)
         {
-            self.schedule_ollp_retry(txn_id);
+            // A mismatch is a normal OLLP retry signal, not a failure: the executor
+            // correctly detected predicate drift and declined to write. Count it as
+            // a received executor response, but NOT as an executor error or infra
+            // abort — those would inflate failure metrics on every routine retry.
+            self.metrics.record_completed();
+            // (1) Release the aborted attempt's locks and clean up pending state.
+            // This fixes the lock-leak: the old `schedule_ollp_retry` re-submitted
+            // without ever releasing the aborted attempt's locks.
+            self.on_txn_complete(txn_id);
+            // (2) Signal the coordinator so it re-scans and resubmits. Without the
+            // registry the coordinator's waiter never fires and it times out.
+            if let Some(registry) = self.shared.calvin_completion_registry.get() {
+                registry.note_ollp_mismatch(nodedb_cluster::calvin::TxnId::new(
+                    txn_id.epoch,
+                    txn_id.position,
+                ));
+            } else {
+                tracing::warn!(
+                    vshard_id = self.vshard_id,
+                    epoch = txn_id.epoch,
+                    position = txn_id.position,
+                    "calvin: OLLP mismatch but completion registry unavailable; \
+                     coordinator will time out"
+                );
+            }
             return;
         }
 
@@ -315,130 +342,5 @@ impl Scheduler {
         &self,
     ) -> RequestId {
         self.shared.next_request_id()
-    }
-
-    /// Handle an OLLP retry required response.
-    ///
-    /// Looks up the pending transaction's predicate class hash and retry count.
-    /// If below the configured maximum, increments the count, spawns an async
-    /// task to run the orchestrator backoff + preexec + re-submission, and
-    /// re-queues the txn via the inbox. On exhaustion, releases locks and
-    /// records an abort.
-    ///
-    /// This method is synchronous (called from the `select!` loop body). The
-    /// async orchestrator backoff is off-loaded to a spawned task that posts
-    /// back to the completion fan-in channel on success or sends an error txn.
-    fn schedule_ollp_retry(&mut self, txn_id: TxnId) {
-        let pending = match self.pending.remove(&txn_id) {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    vshard_id = self.vshard_id,
-                    epoch = txn_id.epoch,
-                    position = txn_id.position,
-                    "ollp retry: pending txn not found — ignoring"
-                );
-                return;
-            }
-        };
-
-        let predicate_class_hash = match pending.predicate_class_hash {
-            Some(h) => h,
-            None => {
-                // No predicate class recorded — treat as hard failure.
-                tracing::warn!(
-                    vshard_id = self.vshard_id,
-                    epoch = txn_id.epoch,
-                    position = txn_id.position,
-                    "ollp retry: no predicate_class_hash on pending txn — aborting"
-                );
-                self.metrics.record_executor_error();
-                self.metrics.record_infra_abort(
-                    crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason::IO_ERROR,
-                );
-                self.metrics.record_completed();
-                self.on_txn_complete(txn_id);
-                return;
-            }
-        };
-
-        let max_retries = self
-            .shared
-            .ollp_orchestrator
-            .get()
-            .map(|o| o.ollp_max_retries() as u32)
-            .unwrap_or(5);
-
-        if pending.retry_count >= max_retries {
-            tracing::warn!(
-                vshard_id = self.vshard_id,
-                epoch = txn_id.epoch,
-                position = txn_id.position,
-                retry_count = pending.retry_count,
-                "ollp retry exhausted — aborting txn"
-            );
-            self.metrics.record_executor_error();
-            self.metrics.record_infra_abort(
-                crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason::IO_ERROR,
-            );
-            self.metrics.record_completed();
-            // Release locks for this transaction even on abort.
-            self.on_txn_complete(txn_id);
-            return;
-        }
-
-        let retry_count = pending.retry_count;
-
-        // Spawn an async task to run orchestrator backoff then re-submit.
-        // The task uses the shared state's inbox to re-queue the txn.
-        let shared = Arc::clone(&self.shared);
-        let completion_tx = self.completion_tx.clone();
-        let keys = pending.keys.clone();
-
-        tracing::debug!(
-            vshard_id = self.vshard_id,
-            epoch = txn_id.epoch,
-            position = txn_id.position,
-            retry_count,
-            "ollp retry: scheduling async retry task"
-        );
-
-        tokio::spawn(async move {
-            // Apply adaptive backoff + circuit-breaker bookkeeping.
-            if let Some(orc) = shared.ollp_orchestrator.get() {
-                orc.on_retry_required(predicate_class_hash, retry_count)
-                    .await;
-            }
-
-            // Re-submit the txn to the inbox. The sequencer will re-sequence
-            // and fan-out to the scheduler again with the same TxClass but a
-            // new epoch/position.
-            //
-            // NOTE: The plan bytes in the original TxClass still carry
-            // ollp_predicted_surrogates from the first attempt. The active
-            // executor will re-verify against the (now potentially updated)
-            // engine state on re-admission. If the predicate has changed
-            // again, another OllpRetryRequired is returned and this path
-            // fires again — up to max_retries.
-            if let Some(inbox) = shared.sequencer_inbox.get() {
-                let txn_class = pending.txn.tx_class.clone();
-                if let Err(e) = inbox.submit(txn_class) {
-                    tracing::warn!(
-                        error = %e,
-                        "ollp retry: inbox submit failed after backoff"
-                    );
-                }
-                // The response will arrive via the normal scheduler path
-                // (new epoch/position). The old txn_id is already removed
-                // from pending; the new one will be inserted on dispatch.
-            } else {
-                // No inbox — signal completion as error via the fan-in channel.
-                let _ = completion_tx.send((txn_id, pending.request_id, None)).await;
-            }
-
-            // Suppress unused variable warning for keys — kept for future
-            // lock re-acquisition on retry.
-            let _ = keys;
-        });
     }
 }

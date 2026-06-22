@@ -78,6 +78,12 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             sqlstate::DATABASE_DROPPED,
             format!("cluster in leader election; leader hint: {leader_addr}"),
         ),
+        // OLLP dependent-read retry exhaustion is client-retryable: the predicate's
+        // matching set kept drifting across fresh re-scans. Surface as a
+        // serialization failure (40001) so clients retry, not as an opaque XX000.
+        crate::Error::OllpExhausted { .. } => {
+            ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
+        }
         _ => ("ERROR", sqlstate::INTERNAL_ERROR, err.to_string()),
     }
 }

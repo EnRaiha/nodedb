@@ -4,11 +4,11 @@
 //!
 //! Before submitting a `BulkUpdate` or `BulkDelete` via the Calvin
 //! dependent-read path, the Control Plane runs this scan to collect the set of
-//! document surrogates that currently match the predicate. That set is then
-//! closed over inside the `tx_builder` closure passed to `dispatch_dependent_read`
-//! and embedded as `ollp_predicted_surrogates` in the `BulkUpdate`/`BulkDelete`
-//! plan. The active executor verifies the set at admission time and returns
-//! `ErrorCode::OllpRetryRequired` on mismatch — without writing.
+//! document surrogates that currently match the predicate. That set is passed
+//! as `initial_predicted` to `run_dependent_with_retry` and embedded as
+//! `ollp_predicted_surrogates` in the `BulkUpdate`/`BulkDelete` plan via the
+//! `submit` closure. The active executor verifies the set at admission time and
+//! returns `ErrorCode::OllpRetryRequired` on mismatch — without writing.
 //!
 //! # Determinism
 //!

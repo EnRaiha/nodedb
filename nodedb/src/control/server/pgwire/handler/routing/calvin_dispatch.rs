@@ -11,13 +11,12 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::planner::calvin::preexec::run_preexec_scan;
 use crate::control::planner::calvin::{
-    build_dependent_tx_class, dispatch_dependent_read, dispatch_tasks_to_calvin,
-    is_dependent_predicate, predicate_class,
+    build_dependent_tx_class, dispatch_tasks_to_calvin, is_dependent_predicate, predicate_class,
+    run_dependent_with_retry, submit_once,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::session::TransactionState;
 use crate::types::TenantId;
-use nodedb_cluster::calvin::{AttemptOutcome, TxnId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::super::types::error_to_sqlstate;
@@ -62,12 +61,17 @@ impl NodeDbPgHandler {
         // so a submit on a non-leader coordinator never completes. Routing fixes
         // that for cross-shard document writes from any coordinator.
         //
-        // The OLLP (dependent-predicate) path below still submits + awaits via the
-        // local inbox/registry: its optimistic pre-execution scan + circuit-breaker
-        // retry machinery is owned by the local `OllpOrchestrator` and is NOT yet
-        // leader-routed. That is a declared follow-up (it requires forwarding the
-        // OLLP orchestration, not just the TxClass). The dh-2 / static path is the
-        // primary cross-node validation for this unit.
+        // The OLLP (dependent-predicate) path below is COORDINATOR-OWNED: this
+        // handler runs `run_dependent_with_retry`, which owns the
+        // submit → await-assignment → await-completion loop and, on a post-exec
+        // predicate-drift mismatch, runs a FRESH pre-execution reconnaissance
+        // before resubmitting (the scheduler releases the aborted attempt's
+        // locks and only signals the mismatch back — it no longer re-submits a
+        // stale prediction). The submit + registry await still go through the
+        // LOCAL inbox/registry; cross-node leader-routing of the dependent
+        // submit (forwarding the OLLP orchestration, not just the TxClass) is the
+        // remaining declared follow-up. The dh-2 / static path is the primary
+        // cross-node validation for this unit.
         if dependent_task.is_none() {
             // Static (non-OLLP) path: delegate to the protocol-neutral
             // `dispatch_tasks_to_calvin` helper, supplying the session-derived
@@ -102,146 +106,117 @@ impl NodeDbPgHandler {
             return Ok(calvin_responses);
         }
 
-        let inbox_seq = if let Some(dep_task) = dependent_task {
-            // OLLP path: run optimistic pre-execution scan, then submit
-            // via dispatch_dependent_read with the predicted surrogates
-            // embedded in the plan.
-            let orc = orchestrator.ok_or_else(|| {
-                let (severity, code, message) =
-                    error_to_sqlstate(&crate::Error::SequencerUnavailable);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?;
-            let inbox = inbox.ok_or_else(|| {
-                let (severity, code, message) =
-                    error_to_sqlstate(&crate::Error::SequencerUnavailable);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?;
+        // OLLP path: the coordinator owns the retry loop. `run_dependent_with_retry`
+        // submits + awaits the assignment/completion via the local registry and, on
+        // a post-exec predicate-drift mismatch, runs a FRESH pre-execution scan
+        // (`rescan`) before resubmitting with the fresh prediction.
+        let dep_task = dependent_task.ok_or_else(|| {
+            // Unreachable: the static (non-dependent) path returns early above.
+            // Surface a typed error rather than panicking if the invariant is ever
+            // broken by a future refactor.
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "XX000".to_owned(),
+                "internal: static Calvin path reached the OLLP dispatch branch".to_owned(),
+            )))
+        })?;
 
-            let (dep_collection, dep_filter_bytes) = extract_bulk_predicate_info(&dep_task.plan);
-            let pred_class = predicate_class(&dep_collection, &dep_collection);
+        let orc = orchestrator.ok_or_else(|| {
+            let (severity, code, message) = error_to_sqlstate(&crate::Error::SequencerUnavailable);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            )))
+        })?;
+        let inbox = inbox.ok_or_else(|| {
+            let (severity, code, message) = error_to_sqlstate(&crate::Error::SequencerUnavailable);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            )))
+        })?;
 
-            let predicted = run_preexec_scan(
-                &self.state,
-                tenant_id,
-                dep_task.database_id,
-                &dep_collection,
-                dep_filter_bytes.clone(),
-            )
-            .await
-            .map_err(|e| {
-                let (severity, code, message) = error_to_sqlstate(&e);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?;
+        // Hoisted across the retry loop so both `submit` and `rescan` can borrow them.
+        let (dep_collection, dep_filter_bytes) = extract_bulk_predicate_info(&dep_task.plan);
+        let pred_class = predicate_class(&dep_collection, &dep_collection);
+        let database_id = dep_task.database_id;
 
-            let tasks_snapshot = tasks.clone();
-            let collection_clone = dep_collection.clone();
-            let predicted_clone = predicted.clone();
+        // Initial reconnaissance — the first prediction the loop submits.
+        let initial_predicted = run_preexec_scan(
+            &self.state,
+            tenant_id,
+            database_id,
+            &dep_collection,
+            dep_filter_bytes.clone(),
+        )
+        .await
+        .map_err(|e| {
+            let (severity, code, message) = error_to_sqlstate(&e);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            )))
+        })?;
 
-            dispatch_dependent_read(
-                orc,
-                inbox,
-                pred_class,
-                tenant_id,
-                || {
-                    let modified_tasks: Vec<PhysicalTask> = tasks_snapshot
+        let timeout =
+            std::time::Duration::from_secs(self.state.tuning.network.default_deadline_secs);
+        let ollp_max_retries = orc.ollp_max_retries() as u32;
+
+        // `submit`: build the TxClass with the loop-supplied prediction (NOT a
+        // frozen clone) and run a single admission attempt via `submit_once`.
+        let submit = |predicted: &[u32]| {
+            let predicted = predicted.to_vec();
+            let tasks = &tasks;
+            let dep_collection = &dep_collection;
+            async move {
+                submit_once(orc, inbox, pred_class, tenant_id, || {
+                    let modified_tasks: Vec<PhysicalTask> = tasks
                         .iter()
                         .map(|t| {
                             let mut t = t.clone();
-                            inject_ollp_surrogates(&mut t.plan, predicted_clone.clone());
+                            inject_ollp_surrogates(&mut t.plan, predicted.clone());
                             t
                         })
                         .collect();
-
-                    build_dependent_tx_class(
-                        &modified_tasks,
-                        tenant_id,
-                        &collection_clone,
-                        &predicted_clone,
-                    )
-                },
-                orc.ollp_max_retries(),
-            )
-            .await
-            .map_err(|e| {
-                let (severity, code, message) = error_to_sqlstate(&e);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?
-        } else {
-            // Unreachable: the static (non-dependent) path returns early above
-            // via `submit_calvin_routed`. Surface a typed error rather than
-            // panicking if the invariant is ever broken by a future refactor.
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "XX000".to_owned(),
-                "internal: static Calvin path reached the OLLP await branch".to_owned(),
-            ))));
+                    build_dependent_tx_class(&modified_tasks, tenant_id, dep_collection, &predicted)
+                })
+                .await
+            }
         };
 
-        let assignment_rx = registry.register_submission(inbox_seq);
-        let timeout =
-            std::time::Duration::from_secs(self.state.tuning.network.default_deadline_secs);
-        let (epoch, position, _participants) = tokio::time::timeout(timeout, assignment_rx)
-            .await
-            .map_err(|_| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "57014".to_owned(),
-                    "timed out waiting for Calvin sequencer assignment".to_owned(),
-                )))
-            })?
-            .map_err(|_| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "XX000".to_owned(),
-                    "Calvin sequencer assignment channel closed".to_owned(),
-                )))
-            })?;
+        // `rescan`: FRESH reconnaissance on each post-exec mismatch.
+        let rescan = || {
+            run_preexec_scan(
+                &self.state,
+                tenant_id,
+                database_id,
+                &dep_collection,
+                dep_filter_bytes.clone(),
+            )
+        };
 
-        let completion_rx = registry.register_completion(TxnId::new(epoch, position));
-        let outcome = tokio::time::timeout(timeout, completion_rx)
-            .await
-            .map_err(|_| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "57014".to_owned(),
-                    "timed out waiting for Calvin transaction completion".to_owned(),
-                )))
-            })?
-            .map_err(|_| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "XX000".to_owned(),
-                    "Calvin completion channel closed".to_owned(),
-                )))
-            })?;
-        // The static (non-dependent) Calvin path never produces an OLLP
-        // mismatch — `note_ollp_mismatch` only fires on the dependent-predicate
-        // retry path — so this branch is unreachable at runtime today. It is
-        // kept as a typed error (never a panic) so any future mismatch signal
-        // on this channel surfaces deterministically instead of crashing.
-        if outcome == AttemptOutcome::Mismatch {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "XX000".to_owned(),
-                "OLLP mismatch outcome on non-dependent Calvin path".to_owned(),
-            ))));
-        }
+        run_dependent_with_retry(
+            registry,
+            orc,
+            pred_class,
+            timeout,
+            ollp_max_retries,
+            initial_predicted,
+            submit,
+            rescan,
+        )
+        .await
+        .map_err(|e| {
+            let (severity, code, message) = error_to_sqlstate(&e);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            )))
+        })?;
 
         // Emit one CommandComplete tag per accumulated task.
         let mut calvin_responses: Vec<Response> = Vec::with_capacity(tasks.len());

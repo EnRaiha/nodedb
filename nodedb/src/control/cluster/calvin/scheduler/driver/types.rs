@@ -32,20 +32,6 @@ pub(super) struct PendingTxn {
     pub dispatch_time: Instant,
     /// Wall-clock time at lock acquisition (for wait-latency measurement).
     pub lock_acquired_time: Instant,
-    /// Predicate class hash for OLLP dependent-read transactions.
-    ///
-    /// `None` for static-set transactions (the common path). `Some(hash)`
-    /// for transactions that were submitted via `dispatch_dependent_read` —
-    /// the hash is passed to `OllpOrchestrator::on_retry_required` on
-    /// mismatch so the circuit-breaker and backoff state are updated.
-    pub predicate_class_hash: Option<u64>,
-    /// Number of OLLP retries already attempted for this transaction.
-    ///
-    /// Starts at 0 on first submission. Incremented by the scheduler's
-    /// `handle_ollp_retry` path before each re-submission. When this
-    /// reaches the orchestrator's configured maximum the scheduler
-    /// releases locks and notifies the completion registry with an error.
-    pub retry_count: u32,
 }
 
 /// A transaction that is blocked on lock acquisition.
