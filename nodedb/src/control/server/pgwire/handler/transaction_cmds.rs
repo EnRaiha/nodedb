@@ -188,7 +188,7 @@ impl NodeDbPgHandler {
                                 self.state.tuning.network.default_deadline_secs,
                             );
                             let assignment_rx = registry.register_submission(inbox_seq);
-                            let (epoch, position, _participants) =
+                            let (epoch, position, participants) =
                                 tokio::time::timeout(timeout, assignment_rx)
                                     .await
                                     .map_err(|_| {
@@ -207,8 +207,8 @@ impl NodeDbPgHandler {
                                         )))
                                     })?;
 
-                            let completion_rx =
-                                registry.register_completion(TxnId::new(epoch, position));
+                            let completion_rx = registry
+                                .register_completion(TxnId::new(epoch, position), participants);
                             let outcome = tokio::time::timeout(timeout, completion_rx)
                                 .await
                                 .map_err(|_| {

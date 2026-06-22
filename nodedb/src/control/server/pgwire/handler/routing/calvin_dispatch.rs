@@ -9,10 +9,11 @@
 use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
+use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::planner::calvin::preexec::run_preexec_scan;
 use crate::control::planner::calvin::{
     build_dependent_tx_class, dispatch_tasks_to_calvin, is_dependent_predicate,
-    predicate_class_for_filters, run_dependent_with_retry, submit_once,
+    predicate_class_for_filters, run_dependent_with_retry, submit_calvin_routed_assign,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::session::TransactionState;
@@ -40,7 +41,6 @@ impl NodeDbPgHandler {
         let cross_shard_mode = self.sessions.cross_shard_txn_mode(addr);
         let tx_state = self.sessions.transaction_state(addr);
 
-        let inbox = self.state.sequencer_inbox.get();
         let orchestrator = self.state.ollp_orchestrator.get();
         let registry = self.state.calvin_completion_registry.get().ok_or_else(|| {
             let (severity, code, message) = error_to_sqlstate(&crate::Error::SequencerUnavailable);
@@ -67,11 +67,14 @@ impl NodeDbPgHandler {
         // predicate-drift mismatch, runs a FRESH pre-execution reconnaissance
         // before resubmitting (the scheduler releases the aborted attempt's
         // locks and only signals the mismatch back — it no longer re-submits a
-        // stale prediction). The submit + registry await still go through the
-        // LOCAL inbox/registry; cross-node leader-routing of the dependent
-        // submit (forwarding the OLLP orchestration, not just the TxClass) is the
-        // remaining declared follow-up. The dh-2 / static path is the primary
-        // cross-node validation for this unit.
+        // stale prediction). The submit step ROUTES to the sequencer-group leader
+        // via `submit_calvin_routed_assign` (returning the leader-assigned
+        // assignment) while the completion is awaited on this coordinator's local
+        // registry, which receives the replicated completion ack on every
+        // sequencer-group member. This makes the dependent path complete from a
+        // non-leader coordinator, unifying single-node and cross-node into one
+        // path, while still passing through this node's circuit-breaker / budget
+        // gate.
         if dependent_task.is_none() {
             // Static (non-OLLP) path: delegate to the protocol-neutral
             // `dispatch_tasks_to_calvin` helper, supplying the session-derived
@@ -129,15 +132,6 @@ impl NodeDbPgHandler {
                 message,
             )))
         })?;
-        let inbox = inbox.ok_or_else(|| {
-            let (severity, code, message) = error_to_sqlstate(&crate::Error::SequencerUnavailable);
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                severity.to_owned(),
-                code.to_owned(),
-                message,
-            )))
-        })?;
-
         // Hoisted across the retry loop so both `submit` and `rescan` can borrow them.
         let (dep_collection, dep_filter_bytes) = extract_bulk_predicate_info(&dep_task.plan);
         let pred_class = predicate_class_for_filters(&dep_filter_bytes, &dep_collection);
@@ -166,23 +160,49 @@ impl NodeDbPgHandler {
         let ollp_max_retries = orc.ollp_max_retries() as u32;
 
         // `submit`: build the TxClass with the loop-supplied prediction (NOT a
-        // frozen clone) and run a single admission attempt via `submit_once`.
+        // frozen clone), pass through this coordinator's circuit-breaker / tenant
+        // budget gate, then ROUTE the inbox submit to the sequencer-group leader
+        // via `submit_calvin_routed_assign` (returning the leader-assigned
+        // `RoutedAssignment`). This lets a non-leader coordinator drive the
+        // dependent (OLLP) cross-shard write to completion.
         let submit = |predicted: &[u32]| {
             let predicted = predicted.to_vec();
             let tasks = &tasks;
             let dep_collection = &dep_collection;
+            let state = &self.state;
             async move {
-                submit_once(orc, inbox, pred_class, tenant_id, || {
-                    let modified_tasks: Vec<PhysicalTask> = tasks
-                        .iter()
-                        .map(|t| {
-                            let mut t = t.clone();
-                            inject_ollp_surrogates(&mut t.plan, predicted.clone());
-                            t
+                orc.submit_with_retry_via(
+                    pred_class,
+                    tenant_id,
+                    || {
+                        let modified_tasks: Vec<PhysicalTask> = tasks
+                            .iter()
+                            .map(|t| {
+                                let mut t = t.clone();
+                                inject_ollp_surrogates(&mut t.plan, predicted.clone());
+                                t
+                            })
+                            .collect();
+                        build_dependent_tx_class(
+                            &modified_tasks,
+                            tenant_id,
+                            dep_collection,
+                            &predicted,
+                        )
+                        .map_err(|_| {
+                            nodedb_cluster::error::CalvinError::Sequencer(
+                                nodedb_cluster::calvin::sequencer::error::SequencerError::Unavailable,
+                            )
                         })
-                        .collect();
-                    build_dependent_tx_class(&modified_tasks, tenant_id, dep_collection, &predicted)
-                })
+                    },
+                    |tx_class| async move {
+                        submit_calvin_routed_assign(state, tx_class).await.map_err(|_| {
+                            OllpError::Sequencer(
+                                nodedb_cluster::calvin::sequencer::error::SequencerError::Unavailable,
+                            )
+                        })
+                    },
+                )
                 .await
             }
         };

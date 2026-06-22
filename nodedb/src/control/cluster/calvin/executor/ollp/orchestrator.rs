@@ -38,6 +38,7 @@ use super::metrics::{
     OUTCOME_SUCCEEDED, OllpMetrics,
 };
 use super::rate_bucket::RateBucket;
+use crate::control::planner::calvin::submit::RoutedAssignment;
 use nodedb_cluster::error::CalvinError;
 
 // ── OllpRetryRequired ─────────────────────────────────────────────────────────
@@ -78,26 +79,19 @@ impl OllpOrchestrator {
         }
     }
 
-    /// Submit a dependent-read transaction with OLLP retry.
+    /// Circuit-breaker + tenant-budget admission gate shared by both submit
+    /// variants.
     ///
-    /// `tx_builder` is called once per attempt to build a fresh `TxClass`
-    /// from the latest optimistic pre-execution result.
-    ///
-    /// Returns the `inbox_seq` of the successfully submitted txn, or an
-    /// `OllpError`.
-    pub async fn submit_with_retry(
+    /// Checks the per-predicate circuit state (recording the state metric),
+    /// returns `Err(OllpError::CircuitOpen)` if the circuit is open, builds
+    /// `TxClass` via `tx_builder`, and ensures the per-tenant rate bucket
+    /// exists.  On success returns the built `TxClass` ready to submit.
+    fn check_and_build(
         &self,
-        inbox: &Inbox,
         predicate_class: u64,
         tenant_id: TenantId,
         tx_builder: impl Fn() -> Result<TxClass, CalvinError>,
-    ) -> Result<u64, OllpError> {
-        // Single-attempt admission gate. Retries are driven externally by the
-        // SPSC response handler calling `on_retry_required` followed by another
-        // `submit_with_retry` call from the SQL layer with a fresh `tx_builder`
-        // closure; the budget + circuit checks below run on every attempt
-        // because they are stored on `self` and persist across calls.
-
+    ) -> Result<TxClass, OllpError> {
         // Check circuit state first — denies submission entirely when open.
         let circuit_state = {
             let mut breakers = self
@@ -153,23 +147,90 @@ impl OllpOrchestrator {
             });
         }
 
+        Ok(tx_class)
+    }
+
+    /// Record a successful submit in the circuit window and emit the success
+    /// metric.  Called by both submit variants after a successful delivery.
+    fn record_submit_success(&self, predicate_class: u64) {
+        {
+            let mut breakers = self
+                .circuit_breakers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(cb) = breakers.get_mut(&predicate_class) {
+                cb.record_success();
+            }
+        }
+        self.metrics
+            .record_retry_outcome(predicate_class, OUTCOME_SUCCEEDED);
+    }
+
+    /// Submit a dependent-read transaction with OLLP retry.
+    ///
+    /// `tx_builder` is called once per attempt to build a fresh `TxClass`
+    /// from the latest optimistic pre-execution result.
+    ///
+    /// Returns the `inbox_seq` of the successfully submitted txn, or an
+    /// `OllpError`.
+    pub async fn submit_with_retry(
+        &self,
+        inbox: &Inbox,
+        predicate_class: u64,
+        tenant_id: TenantId,
+        tx_builder: impl Fn() -> Result<TxClass, CalvinError>,
+    ) -> Result<u64, OllpError> {
+        // Single-attempt admission gate. Retries are driven externally by the
+        // SPSC response handler calling `on_retry_required` followed by another
+        // `submit_with_retry` call from the SQL layer with a fresh `tx_builder`
+        // closure; the budget + circuit checks below run on every attempt
+        // because they are stored on `self` and persist across calls.
+        let tx_class = self.check_and_build(predicate_class, tenant_id, tx_builder)?;
+
         // Submit to the inbox.
         match inbox.submit(tx_class) {
             Ok(inbox_seq) => {
-                {
-                    let mut breakers = self
-                        .circuit_breakers
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    if let Some(cb) = breakers.get_mut(&predicate_class) {
-                        cb.record_success();
-                    }
-                }
-                self.metrics
-                    .record_retry_outcome(predicate_class, OUTCOME_SUCCEEDED);
+                self.record_submit_success(predicate_class);
                 Ok(inbox_seq)
             }
             Err(e) => Err(OllpError::Sequencer(e)),
+        }
+    }
+
+    /// Submit a dependent-read transaction with OLLP retry, delegating the
+    /// actual submit step to an injected `submit_fn`.
+    ///
+    /// Sibling of [`Self::submit_with_retry`]: the circuit-breaker admission gate
+    /// and per-tenant budget bookkeeping are identical (via [`Self::check_and_build`]),
+    /// but instead of submitting to a local `Inbox` this calls `submit_fn(tx_class)`.
+    /// That lets a non-leader coordinator run the dependent path by routing the submit
+    /// to the sequencer-group leader (returning the leader-assigned
+    /// [`RoutedAssignment`]) while still passing through this node's
+    /// circuit-breaker / budget gate.
+    ///
+    /// On `Ok(assignment)` the per-predicate circuit success is recorded (same as
+    /// [`Self::submit_with_retry`]) and the assignment is returned. On `Err` the
+    /// underlying `OllpError` is returned verbatim (not re-mapped).
+    pub async fn submit_with_retry_via<F, Fut>(
+        &self,
+        predicate_class: u64,
+        tenant_id: TenantId,
+        tx_builder: impl Fn() -> Result<TxClass, CalvinError>,
+        submit_fn: F,
+    ) -> Result<RoutedAssignment, OllpError>
+    where
+        F: Fn(TxClass) -> Fut,
+        Fut: std::future::Future<Output = Result<RoutedAssignment, OllpError>>,
+    {
+        let tx_class = self.check_and_build(predicate_class, tenant_id, tx_builder)?;
+
+        // Submit via the injected routed-submit closure.
+        match submit_fn(tx_class).await {
+            Ok(assignment) => {
+                self.record_submit_success(predicate_class);
+                Ok(assignment)
+            }
+            Err(ollp_err) => Err(ollp_err),
         }
     }
 

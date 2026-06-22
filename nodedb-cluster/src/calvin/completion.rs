@@ -54,7 +54,13 @@ impl PendingCompletion {
     }
 
     fn is_complete(&self) -> bool {
-        self.acked_vshards.len() >= self.expected_participants
+        // Require a KNOWN participant count (>0). The `expected_participants == 0`
+        // default means "not yet seeded" — completion must not fire until the
+        // count is known (via `note_assigned` on the leader, or `register_completion`
+        // from the routed assignment on a remote coordinator). Without this guard a
+        // replicated ack that races ahead of seeding, or a bare `register_completion`,
+        // would spuriously report `Completed` with zero acks.
+        self.expected_participants > 0 && self.acked_vshards.len() >= self.expected_participants
     }
 }
 
@@ -105,13 +111,25 @@ impl CalvinCompletionRegistry {
             .or_insert_with(|| PendingCompletion::new(expected_participants));
     }
 
-    pub fn register_completion(&self, txn: TxnId) -> oneshot::Receiver<AttemptOutcome> {
+    /// Register interest in `txn`'s terminal outcome, seeding the authoritative
+    /// `expected_participants` from the (routed) assignment.
+    ///
+    /// Cross-node, the coordinator's registry never receives `note_assigned` —
+    /// that fires only on the sequencer leader — so the participant count arrives
+    /// here, via `RoutedAssignment.participants`. `max` upgrades the unknown (0)
+    /// default and is idempotent when `note_assigned` already seeded it single-node.
+    pub fn register_completion(
+        &self,
+        txn: TxnId,
+        expected_participants: usize,
+    ) -> oneshot::Receiver<AttemptOutcome> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = inner
             .completions
             .entry(txn)
-            .or_insert_with(|| PendingCompletion::new(0));
+            .or_insert_with(|| PendingCompletion::new(expected_participants));
+        entry.expected_participants = entry.expected_participants.max(expected_participants);
         // Mismatch takes precedence over completion: a mismatched attempt must
         // retry, never falsely report success.
         if entry.mismatched {
@@ -212,7 +230,7 @@ mod tests {
         let reg = CalvinCompletionRegistry::new();
         let txn = TxnId::new(7, 0);
         reg.note_assigned(1, txn, 2);
-        let rx = reg.register_completion(txn);
+        let rx = reg.register_completion(txn, 2);
         assert_eq!(reg.pending_completions_len(), 1);
         reg.note_completion_ack(txn, 10);
         assert_eq!(reg.pending_completions_len(), 1);
@@ -234,7 +252,7 @@ mod tests {
         reg.note_completion_ack(txn, 10);
         // Entry remains: expected=2, only 1 ack received.
         assert_eq!(reg.pending_completions_len(), 1);
-        let rx = reg.register_completion(txn);
+        let rx = reg.register_completion(txn, 2);
         assert_eq!(reg.pending_completions_len(), 1);
         reg.note_completion_ack(txn, 20);
         let outcome = rx.await.expect("completion fires once both acks arrived");
@@ -255,7 +273,7 @@ mod tests {
         // flag must persist so a later register_completion fires it.
         reg.note_ollp_mismatch(txn);
         assert_eq!(reg.pending_completions_len(), 1);
-        let rx = reg.register_completion(txn);
+        let rx = reg.register_completion(txn, 2);
         let outcome = rx.await.expect("mismatch fires");
         assert_eq!(outcome, AttemptOutcome::Mismatch);
         assert_eq!(
@@ -270,7 +288,7 @@ mod tests {
         let reg = CalvinCompletionRegistry::new();
         let txn = TxnId::new(12, 5);
         reg.note_assigned(1, txn, 2);
-        let rx = reg.register_completion(txn);
+        let rx = reg.register_completion(txn, 2);
         assert_eq!(reg.pending_completions_len(), 1);
         // Waiter already stored; the mismatch must wake it directly.
         reg.note_ollp_mismatch(txn);
@@ -284,11 +302,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_completion_seeds_participants_without_note_assigned() {
+        // Cross-node coordinator: no note_assigned ever fires on its registry, so
+        // register_completion must seed expected_participants from the assignment.
+        // Without the seed (or with the is_complete>0 guard absent) this would
+        // spuriously fire Completed with zero acks.
+        let reg = CalvinCompletionRegistry::new();
+        let txn = TxnId::new(21, 0);
+        let rx = reg.register_completion(txn, 1);
+        assert_eq!(
+            reg.pending_completions_len(),
+            1,
+            "expected=1, 0 acks → must NOT complete prematurely"
+        );
+        reg.note_completion_ack(txn, 7);
+        let outcome = rx.await.expect("completion fires after the single ack");
+        assert_eq!(outcome, AttemptOutcome::Completed);
+        assert_eq!(reg.pending_completions_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn ack_racing_ahead_of_register_does_not_prematurely_complete() {
+        // The replicated ack can reach a remote coordinator's registry BEFORE the
+        // coordinator calls register_completion. With expected_participants still
+        // unknown (0), the ack must persist without firing/evicting; the later
+        // register_completion seeds the count and then completes.
+        let reg = CalvinCompletionRegistry::new();
+        let txn = TxnId::new(22, 0);
+        reg.note_completion_ack(txn, 7);
+        assert_eq!(
+            reg.pending_completions_len(),
+            1,
+            "ack before seeding must persist, not self-complete on expected=0"
+        );
+        let rx = reg.register_completion(txn, 1);
+        let outcome = rx.await.expect("completion fires once participants seeded");
+        assert_eq!(outcome, AttemptOutcome::Completed);
+        assert_eq!(reg.pending_completions_len(), 0);
+    }
+
+    #[tokio::test]
     async fn mismatch_takes_precedence_over_pending_acks() {
         let reg = CalvinCompletionRegistry::new();
         let txn = TxnId::new(13, 2);
         reg.note_assigned(1, txn, 2);
-        let rx = reg.register_completion(txn);
+        let rx = reg.register_completion(txn, 2);
         // One ack arrives but the attempt is not yet complete (expected=2).
         reg.note_completion_ack(txn, 10);
         assert_eq!(reg.pending_completions_len(), 1);
