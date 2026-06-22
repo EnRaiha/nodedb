@@ -72,6 +72,35 @@ pub struct DistributedMatchCoordinator {
     pub max_rounds: u32,
 }
 
+impl PatternContinuation {
+    /// Construct a continuation from its raw routing-resolved fields.
+    ///
+    /// The Control Plane resolves `target_shard` (the owning vShard of the
+    /// frontier node) and `source_shard` (the vShard that emitted the frontier
+    /// entry) via its routing table, then assembles the continuation here. The
+    /// routing classification itself stays in the CP layer — `nodedb-cluster`
+    /// has no access to the routing table — but the field assembly lives with
+    /// the type so the shape cannot drift from the struct definition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_resolved(
+        target_shard: u32,
+        source_shard: u32,
+        bindings: HashMap<String, String>,
+        next_triple_idx: usize,
+        start_node: String,
+        start_binding: String,
+    ) -> Self {
+        Self {
+            target_shard,
+            source_shard,
+            bindings,
+            next_triple_idx,
+            start_node,
+            start_binding,
+        }
+    }
+}
+
 impl DistributedMatchCoordinator {
     pub fn new(max_rounds: u32) -> Self {
         Self {

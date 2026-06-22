@@ -161,9 +161,18 @@ impl CoreLoop {
     /// on top of the partial bindings, then resumes expansion from
     /// `resume_triple_idx` against this shard's CSR partition.
     ///
-    /// Phase A scope: returns ROWS ONLY — identical response format to
-    /// `execute_graph_match`. `is_remote_node` is `None`, so this resume emits
-    /// no further frontier (Phase B will wire recursive scatter).
+    /// A `MatchContinuation` ALWAYS runs cross-shard (it only exists because
+    /// another shard emitted an `UnresolvedExpansion` routed here), so its
+    /// remaining-pattern expansion MUST surface its OWN unresolved frontier:
+    /// `is_remote_node = Some(&|_| true)`. This is what makes multi-round
+    /// continuation work — deeper hops that again leave this shard's CSR are
+    /// re-emitted as frontier entries for the Control-Plane coordinator to
+    /// dispatch onward. The Control Plane filters them precisely via routing
+    /// (dropping true local leaves), exactly as it does for the round-0
+    /// `Match` frontier. No `cluster_mode` field is needed on
+    /// `MatchContinuation` — the predicate is unconditionally `true` here.
+    /// The response already envelopes `{rows, frontier}` via
+    /// `match_outcome_response`.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_graph_match_continuation(
         &self,
@@ -219,12 +228,18 @@ impl CoreLoop {
             None => return self.match_empty_partition_response(task),
         };
 
+        // A continuation only ever runs cross-shard, so it must surface its
+        // own unresolved frontier (every bound zero-degree source becomes a
+        // candidate; the Control Plane filters precisely via routing). This is
+        // what enables multi-round continuation across >1 shard boundary.
+        let all_remote = |_: &str| true;
+        let is_remote_node: Option<&dyn Fn(&str) -> bool> = Some(&all_remote);
         match crate::engine::graph::pattern::executor::execute_continuation(
             &query,
             partition,
             &self.edge_store,
-            None, // Phase A: no anchor prefilter on the resume path
-            None, // Phase A: emit no further frontier from the continuation
+            None, // no anchor prefilter on the resume path
+            is_remote_node,
             resume_triple_idx,
             seed_row,
         ) {

@@ -81,36 +81,49 @@ pub async fn match_query(
 
     let tenant_id = identity.tenant_id;
 
-    let plan = crate::bridge::envelope::PhysicalPlan::Graph(GraphOp::Match {
-        query: query_bytes,
-        frontier_bitmap: None,
-        // B1: single-node / no cross-shard orchestration. The Data Plane emits
-        // no frontier, so the unwrapped rows payload is byte-identical to the
-        // prior bare-array gather. B2 flips this to `true` to drive cross-shard
-        // continuation dispatch.
-        cluster_mode: false,
-    });
+    // Single-node mode: keep the B1 path byte-identical — broadcast the `Match`
+    // plan with `cluster_mode = false` to all local cores. The Data Plane emits
+    // no frontier, so the unwrapped rows payload is exactly the prior bare-array
+    // gather. No cross-shard orchestration is needed (and there is no routing
+    // table to consult).
+    if state.cluster_routing.is_none() {
+        let plan = crate::bridge::envelope::PhysicalPlan::Graph(GraphOp::Match {
+            query: query_bytes,
+            frontier_bitmap: None,
+            cluster_mode: false,
+        });
+        return match graph_dispatch::broadcast_match_to_all_cores(
+            state,
+            tenant_id,
+            database_id,
+            plan,
+            TraceId::ZERO,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                // Single-node frontier is always empty (cluster_mode=false);
+                // `partial` is surfaced exactly as the prior broadcast path did.
+                let _frontier = outcome.frontier;
+                let _partial = outcome.partial;
+                match_payload_to_response(&outcome.rows_payload, &column_names)
+            }
+            Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        };
+    }
 
-    // Broadcast to all cores via the MATCH-specific unwrap path: it decodes
-    // each core's `{rows, frontier}` envelope, merges the rows into the same
-    // bare msgpack array `match_payload_to_response` expects, and unions the
-    // cross-shard frontier across cores.
-    match graph_dispatch::broadcast_match_to_all_cores(
-        state,
-        tenant_id,
-        database_id,
-        plan,
-        TraceId::ZERO,
-    )
-    .await
+    // Cluster mode: scatter-all to local + every remote owner, then drive the
+    // continuation round loop across shard boundaries. `scatter_match` returns
+    // the deduped rows in the same bare-array shape and a `partial` flag set on
+    // truncation / round exhaustion.
+    let deadline_ms = crate::control::gateway::dispatcher::default_deadline_ms(state);
+    match graph_dispatch::scatter_match(state, tenant_id, database_id, query_bytes, deadline_ms)
+        .await
     {
         Ok(outcome) => {
-            // B2 consumes `outcome.frontier` to dispatch cross-shard
-            // continuations to the owning shards. In B1 it is always empty
-            // (cluster_mode=false) and intentionally unused here. `partial` is
-            // surfaced exactly as the prior broadcast path did (it was not
-            // threaded into the pgwire row stream then, and is not now).
-            let _frontier = outcome.frontier;
+            // `partial` is surfaced for parity with the broadcast path; it is
+            // not threaded into the pgwire row stream (the stream protocol has
+            // no partial-result marker), matching prior MATCH behaviour.
             let _partial = outcome.partial;
             match_payload_to_response(&outcome.rows_payload, &column_names)
         }
