@@ -200,7 +200,10 @@ impl CoreLoop {
             GraphOp::Match {
                 query,
                 frontier_bitmap,
-            } => self.execute_graph_match(task, tid, query, frontier_bitmap.as_ref()),
+                cluster_mode,
+            } => {
+                self.execute_graph_match(task, tid, query, frontier_bitmap.as_ref(), *cluster_mode)
+            }
 
             GraphOp::MatchContinuation {
                 query,

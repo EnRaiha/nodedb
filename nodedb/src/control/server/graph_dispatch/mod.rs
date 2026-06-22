@@ -21,9 +21,13 @@
 pub mod bfs;
 pub mod helpers;
 pub(crate) mod hop;
+pub mod match_broadcast;
 pub mod shortest_path;
 pub mod traverse_subgraph;
 
 pub use bfs::cross_core_bfs_with_options;
+pub use match_broadcast::{
+    MatchBroadcastOutcome, broadcast_match_to_all_cores, unwrap_match_envelope,
+};
 pub use shortest_path::cross_core_shortest_path;
 pub use traverse_subgraph::cross_core_traverse_subgraph;

@@ -339,6 +339,8 @@ pub(crate) fn build_match(fields: &TextFields, _collection: &str) -> crate::Resu
     Ok(PhysicalPlan::Graph(GraphOp::Match {
         query,
         frontier_bitmap: None,
+        // B1: native MATCH stays single-node; B2 wires cluster orchestration.
+        cluster_mode: false,
     }))
 }
 

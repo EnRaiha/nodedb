@@ -471,7 +471,6 @@ impl NativeSession {
             | OpCode::VectorMultiSearch
             | OpCode::VectorDelete
             | OpCode::GraphAlgo
-            | OpCode::GraphMatch
             | OpCode::ColumnarScan
             | OpCode::ColumnarInsert
             | OpCode::RecursiveScan
@@ -495,6 +494,10 @@ impl NativeSession {
             | OpCode::KvSortedIndexRange
             | OpCode::KvSortedIndexCount
             | OpCode::KvSortedIndexScore => dispatch::handle_direct_op(&ctx, seq, op, fields).await,
+
+            // MATCH: dedicated path that unwraps the DP `{rows, frontier}`
+            // envelope into the bare rows array the native row decoder expects.
+            OpCode::GraphMatch => dispatch::handle_graph_match(&ctx, seq, fields).await,
 
             // Batch ops: direct Data Plane dispatch.
             OpCode::VectorBatchInsert | OpCode::DocumentBatchInsert => {

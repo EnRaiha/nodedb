@@ -10,10 +10,62 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::pattern::ast::MatchQuery;
+use crate::engine::graph::pattern::executor::{BindingRow, UnresolvedExpansion, rows_to_msgpack};
+
+/// Map key carrying the binding-rows msgpack array in the MATCH envelope.
+pub(crate) const MATCH_ENVELOPE_ROWS_KEY: &str = "rows";
+/// Map key carrying the cross-shard frontier msgpack array in the MATCH envelope.
+pub(crate) const MATCH_ENVELOPE_FRONTIER_KEY: &str = "frontier";
+
+/// Encode a MATCH result into the DP→CP `{rows, frontier}` msgpack envelope.
+///
+/// `rows` are serialized exactly as [`rows_to_msgpack`] produces (an unchanged
+/// bare msgpack array) and embedded as the `rows` map value. The
+/// `unresolved_frontier` is zerompk-encoded (a msgpack array of
+/// [`UnresolvedExpansion`]) and embedded as the `frontier` map value. Both are
+/// already-valid msgpack values, so they are spliced in via `write_kv_raw`
+/// without re-encoding.
+pub(crate) fn encode_match_envelope(
+    rows: &[BindingRow],
+    frontier: &[UnresolvedExpansion],
+) -> Result<Vec<u8>, crate::Error> {
+    use nodedb_query::msgpack_scan::writer::{write_kv_raw, write_map_header};
+
+    let rows_bytes = rows_to_msgpack(rows)?;
+    let frontier_bytes =
+        zerompk::to_msgpack_vec(&frontier.to_vec()).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("match frontier serialization: {e}"),
+        })?;
+
+    let mut buf = Vec::with_capacity(rows_bytes.len() + frontier_bytes.len() + 16);
+    write_map_header(&mut buf, 2);
+    write_kv_raw(&mut buf, MATCH_ENVELOPE_ROWS_KEY, &rows_bytes);
+    write_kv_raw(&mut buf, MATCH_ENVELOPE_FRONTIER_KEY, &frontier_bytes);
+    Ok(buf)
+}
 
 impl CoreLoop {
-    /// Encode a `MatchOutcome`'s rows to MessagePack and build the appropriate
-    /// response envelope (`partial` if the outcome was truncated, normal otherwise).
+    /// Encode a `MatchOutcome` into the DP→CP MATCH envelope and build the
+    /// appropriate response (`partial` if the outcome was truncated, normal
+    /// otherwise).
+    ///
+    /// The envelope is a 2-field msgpack map carrying BOTH the binding rows
+    /// (exactly as [`rows_to_msgpack`] produces them — a bare msgpack array)
+    /// AND the cross-shard `unresolved_frontier` (a zerompk-encoded array of
+    /// [`UnresolvedExpansion`]):
+    ///
+    /// ```text
+    /// { "rows": <rows msgpack array>, "frontier": <frontier msgpack array> }
+    /// ```
+    ///
+    /// The Control Plane's `broadcast_match_to_all_cores` unwraps this map:
+    /// it merges the `rows` subfields across cores back into the SAME bare
+    /// array shape `match_payload_to_response` already expects, and unions the
+    /// `frontier` entries for cross-shard continuation dispatch (B2). On a
+    /// fully-local CSR the frontier array is empty, so single-node client
+    /// behaviour after the unwrap is byte-identical to the prior bare-array
+    /// response.
     ///
     /// Shared by [`execute_graph_match`] and [`execute_graph_match_continuation`]
     /// to avoid duplicating the encode → response tail.
@@ -22,7 +74,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         outcome: crate::engine::graph::pattern::executor::MatchOutcome,
     ) -> Response {
-        match crate::engine::graph::pattern::executor::rows_to_msgpack(&outcome.rows) {
+        match encode_match_envelope(&outcome.rows, &outcome.unresolved_frontier) {
             Ok(payload) => {
                 if outcome.truncated {
                     self.response_partial(task, payload)
@@ -39,7 +91,7 @@ impl CoreLoop {
     ///
     /// Shared by [`execute_graph_match`] and [`execute_graph_match_continuation`].
     fn match_empty_partition_response(&self, task: &ExecutionTask) -> Response {
-        match crate::engine::graph::pattern::executor::rows_to_msgpack(&[]) {
+        match encode_match_envelope(&[], &[]) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
@@ -51,6 +103,7 @@ impl CoreLoop {
         tid: u64,
         query_bytes: &[u8],
         frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+        cluster_mode: bool,
     ) -> Response {
         debug!(core = self.core_id, tid, "graph match execution");
         let database_id = task.request.database_id.as_u64();
@@ -76,12 +129,25 @@ impl CoreLoop {
             Some(p) => p,
             None => return self.match_empty_partition_response(task),
         };
+        // In cluster mode the Data Plane has no routing knowledge, so it
+        // cannot pre-filter which bound zero-degree sources are genuinely
+        // remote. It emits ALL of them as frontier candidates (predicate
+        // returns `true` for every node) and the Control Plane filters them
+        // precisely via routing in B2. In single-node mode (`false`) no
+        // predicate is supplied, so the frontier stays empty and the
+        // response is byte-identical to today.
+        let all_remote = |_: &str| true;
+        let is_remote_node: Option<&dyn Fn(&str) -> bool> = if cluster_mode {
+            Some(&all_remote)
+        } else {
+            None
+        };
         match crate::engine::graph::pattern::executor::execute(
             &query,
             partition,
             &self.edge_store,
             frontier_bitmap,
-            None, // single-node path: all nodes are local, no frontier entries
+            is_remote_node,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),

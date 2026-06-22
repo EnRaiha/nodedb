@@ -11,7 +11,7 @@ use pgwire::error::PgWireResult;
 use sonic_rs;
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::broadcast;
+use crate::control::server::graph_dispatch;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
 use crate::types::TraceId;
@@ -84,13 +84,36 @@ pub async fn match_query(
     let plan = crate::bridge::envelope::PhysicalPlan::Graph(GraphOp::Match {
         query: query_bytes,
         frontier_bitmap: None,
+        // B1: single-node / no cross-shard orchestration. The Data Plane emits
+        // no frontier, so the unwrapped rows payload is byte-identical to the
+        // prior bare-array gather. B2 flips this to `true` to drive cross-shard
+        // continuation dispatch.
+        cluster_mode: false,
     });
 
-    // Broadcast to all cores.
-    match broadcast::broadcast_to_all_cores(state, tenant_id, database_id, plan, TraceId::ZERO)
-        .await
+    // Broadcast to all cores via the MATCH-specific unwrap path: it decodes
+    // each core's `{rows, frontier}` envelope, merges the rows into the same
+    // bare msgpack array `match_payload_to_response` expects, and unions the
+    // cross-shard frontier across cores.
+    match graph_dispatch::broadcast_match_to_all_cores(
+        state,
+        tenant_id,
+        database_id,
+        plan,
+        TraceId::ZERO,
+    )
+    .await
     {
-        Ok(resp) => match_payload_to_response(&resp.payload, &column_names),
+        Ok(outcome) => {
+            // B2 consumes `outcome.frontier` to dispatch cross-shard
+            // continuations to the owning shards. In B1 it is always empty
+            // (cluster_mode=false) and intentionally unused here. `partial` is
+            // surfaced exactly as the prior broadcast path did (it was not
+            // threaded into the pgwire row stream then, and is not now).
+            let _frontier = outcome.frontier;
+            let _partial = outcome.partial;
+            match_payload_to_response(&outcome.rows_payload, &column_names)
+        }
         Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
     }
 }

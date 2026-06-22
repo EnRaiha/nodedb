@@ -190,6 +190,13 @@ pub enum GraphOp {
         /// Optional surrogate prefilter restricting which nodes are eligible
         /// as pattern anchors. `None` = no restriction.
         frontier_bitmap: Option<SurrogateBitmap>,
+        /// When `true`, the Data Plane emits every bound zero-degree source as
+        /// a cross-shard frontier candidate (it has no routing knowledge, so
+        /// the Control Plane filters them precisely in B2). When `false` (the
+        /// single-node default) no frontier is emitted and the unwrapped rows
+        /// payload is byte-identical to a non-cluster MATCH. B2 sets this true
+        /// for cluster orchestration.
+        cluster_mode: bool,
     },
 
     /// Cross-shard MATCH continuation (resume a pattern on this shard).

@@ -148,6 +148,76 @@ pub(crate) async fn handle_direct_op(
     result
 }
 
+/// Dispatch a native `GraphMatch` op, unwrapping the DP `{rows, frontier}`
+/// envelope into a bare rows array before native conversion.
+///
+/// MATCH responses are enveloped on the DP→CP hop (see
+/// `data::executor::handlers::graph_match`). The native row decoder expects a
+/// bare msgpack array, so this handler unwraps the envelope here. In B1
+/// `cluster_mode` is always `false`, so the frontier is empty and the rows
+/// payload is byte-identical to the prior bare-array native MATCH response.
+/// (B2 will consume the frontier for cross-shard continuation.)
+pub(crate) async fn handle_graph_match(
+    ctx: &DispatchCtx<'_>,
+    seq: u64,
+    fields: &TextFields,
+) -> NativeResponse {
+    let collection = fields
+        .collection
+        .as_deref()
+        .unwrap_or("default")
+        .to_lowercase();
+    let vshard_key = fields.document_id.as_deref().unwrap_or(&collection);
+    let vshard_id = ctx.vshard_for_key(vshard_key);
+    let tenant_id = ctx.tenant_id();
+
+    if let Err(e) = super::limits::check_op_limits(ctx.state, fields) {
+        return NativeResponse::error(seq, "0A000", e.to_string());
+    }
+    if let Err(e) = ctx.state.check_tenant_quota(tenant_id) {
+        return error_to_native(seq, &e);
+    }
+
+    let mut plan =
+        match super::plan_builder::build_plan(ctx, OpCode::GraphMatch, fields, &collection) {
+            Ok(p) => p,
+            Err(e) => return NativeResponse::error(seq, "42601", e.to_string()),
+        };
+    if let Err(e) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
+        tenant_id.as_u64(),
+        &mut plan,
+        &ctx.state.rls,
+        ctx.auth_context,
+    ) {
+        return NativeResponse::error(seq, "42501", e.to_string());
+    }
+
+    ctx.state.tenant_request_start(tenant_id);
+    let raw = dispatch_single_task_raw(ctx, tenant_id, vshard_id, plan).await;
+    ctx.state.tenant_request_end(tenant_id);
+
+    let resp = match raw {
+        Ok(r) => r,
+        Err(e) => return error_to_native(seq, &e),
+    };
+
+    if resp.status == Status::Error {
+        return data_plane_response_to_native(seq, &resp);
+    }
+
+    // Unwrap the `{rows, frontier}` envelope into a bare rows array. The
+    // frontier is discarded here (B2 consumes it for cross-shard dispatch).
+    let unwrapped =
+        match crate::control::server::graph_dispatch::unwrap_match_envelope(&resp.payload) {
+            Ok((rows_payload, _frontier)) => Response {
+                payload: rows_payload,
+                ..resp
+            },
+            Err(e) => return error_to_native(seq, &e),
+        };
+    data_plane_response_to_native(seq, &unwrapped)
+}
+
 /// Dispatch one plan via the gateway (when wired) or the local SPSC path,
 /// converting the Data-Plane response into a `NativeResponse`.
 ///
@@ -161,6 +231,24 @@ async fn dispatch_single_task(
     vshard_id: VShardId,
     plan: PhysicalPlan,
 ) -> NativeResponse {
+    match dispatch_single_task_raw(ctx, tenant_id, vshard_id, plan).await {
+        Ok(resp) => data_plane_response_to_native(seq, &resp),
+        Err(e) => error_to_native(seq, &e),
+    }
+}
+
+/// Dispatch one plan via the gateway (when wired) or the local SPSC path and
+/// return the raw Data-Plane [`Response`] without native conversion.
+///
+/// Factored out of [`dispatch_single_task`] so MATCH dispatch can unwrap the
+/// `{rows, frontier}` envelope before native conversion while every other
+/// direct op keeps its prior convert-in-place behaviour.
+async fn dispatch_single_task_raw(
+    ctx: &DispatchCtx<'_>,
+    tenant_id: TenantId,
+    vshard_id: VShardId,
+    plan: PhysicalPlan,
+) -> crate::Result<Response> {
     match ctx.state.gateway.as_ref() {
         Some(gw) => {
             let gw_ctx = GatewayQueryContext {
@@ -169,12 +257,10 @@ async fn dispatch_single_task(
                 database_id: DatabaseId::DEFAULT,
             };
             match gw.execute(&gw_ctx, plan).await {
-                Ok(payloads) => {
-                    data_plane_response_to_native(seq, &gateway_payloads_to_response(payloads))
-                }
+                Ok(payloads) => Ok(gateway_payloads_to_response(payloads)),
                 Err(e) => {
                     let (_code, msg) = GatewayErrorMap::to_native(&e);
-                    NativeResponse::error(seq, "XX000", msg)
+                    Err(crate::Error::Dispatch { detail: msg })
                 }
             }
         }
@@ -186,16 +272,14 @@ async fn dispatch_single_task(
             // single-shard edge bundle — so an implicit edge written on the boot
             // path is durable. (Cross-shard bundles route via Calvin, which owns
             // its own replicated durability and never reaches this branch.)
-            if let Err(e) = wal_dispatch::wal_append_if_write(
+            wal_dispatch::wal_append_if_write(
                 &ctx.state.wal,
                 tenant_id,
                 vshard_id,
                 DatabaseId::DEFAULT,
                 &plan,
-            ) {
-                return error_to_native(seq, &e);
-            }
-            match dispatch_utils::dispatch_to_data_plane(
+            )?;
+            dispatch_utils::dispatch_to_data_plane(
                 ctx.state,
                 tenant_id,
                 DatabaseId::DEFAULT,
@@ -204,10 +288,6 @@ async fn dispatch_single_task(
                 TraceId::ZERO,
             )
             .await
-            {
-                Ok(resp) => data_plane_response_to_native(seq, &resp),
-                Err(e) => error_to_native(seq, &e),
-            }
         }
     }
 }

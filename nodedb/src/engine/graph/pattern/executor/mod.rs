@@ -49,7 +49,14 @@ pub type BindingRow = HashMap<String, String>;
 ///
 /// Passing `None` for the predicate (the default for fully-local,
 /// single-node deployments) guarantees the frontier is always empty.
-#[derive(Debug, Clone)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
 pub struct UnresolvedExpansion {
     /// The source binding variable name from the triple (e.g. `"b"`).
     pub binding_var: String,
