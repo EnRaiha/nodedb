@@ -37,6 +37,13 @@ pub enum SequencerEntry {
         position: u32,
         vshard_id: u32,
     },
+    /// OLLP predicate-mismatch signal. Proposed by the per-vShard scheduler when
+    /// the active executor returns `OllpRetryRequired`. Applied on ALL sequencer-group
+    /// replicas so every node's `CalvinCompletionRegistry` fires `note_ollp_mismatch`,
+    /// waking the coordinator's retry-loop waiter wherever it is (including remote
+    /// nodes). Mirrors `CompletionAck` — no `vshard_id` because mismatch is keyed
+    /// only by `(epoch, position)` like the registry's `TxnId`.
+    OllpMismatch { epoch: u64, position: u32 },
 }
 
 #[cfg(test)]

@@ -255,22 +255,20 @@ impl Scheduler {
             // This fixes the lock-leak: the old `schedule_ollp_retry` re-submitted
             // without ever releasing the aborted attempt's locks.
             self.on_txn_complete(txn_id);
-            // (2) Signal the coordinator so it re-scans and resubmits. Without the
-            // registry the coordinator's waiter never fires and it times out.
-            if let Some(registry) = self.shared.calvin_completion_registry.get() {
-                registry.note_ollp_mismatch(nodedb_cluster::calvin::TxnId::new(
-                    txn_id.epoch,
-                    txn_id.position,
-                ));
-            } else {
-                tracing::warn!(
-                    vshard_id = self.vshard_id,
-                    epoch = txn_id.epoch,
-                    position = txn_id.position,
-                    "calvin: OLLP mismatch but completion registry unavailable; \
-                     coordinator will time out"
-                );
-            }
+            // (2) Broadcast the mismatch signal via the sequencer-group Raft so that
+            // the coordinator's CalvinCompletionRegistry fires on EVERY replica,
+            // including remote nodes. The SequencerStateMachine::apply() arm for
+            // OllpMismatch calls note_ollp_mismatch, waking the coordinator's
+            // retry-loop waiter wherever it is — mirrors how CompletionAck is
+            // delivered to remote coordinators.
+            self.propose_sequencer_entry(
+                SequencerEntry::OllpMismatch {
+                    epoch: txn_id.epoch,
+                    position: txn_id.position,
+                },
+                txn_id,
+                "OLLP mismatch signal",
+            );
             return;
         }
 
@@ -288,38 +286,15 @@ impl Scheduler {
                     "calvin: failed to write CalvinApplied WAL record"
                 );
             }
-            let ack = SequencerEntry::CompletionAck {
-                epoch: txn_id.epoch,
-                position: txn_id.position,
-                vshard_id: self.vshard_id,
-            };
-            match zerompk::to_msgpack_vec(&ack) {
-                Ok(bytes) => {
-                    if let Err(e) = self
-                        .multi_raft
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .propose_to_group(SEQUENCER_GROUP_ID, bytes)
-                    {
-                        tracing::warn!(
-                            vshard_id = self.vshard_id,
-                            epoch = txn_id.epoch,
-                            position = txn_id.position,
-                            error = %e,
-                            "calvin: failed to propose completion ack"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        vshard_id = self.vshard_id,
-                        epoch = txn_id.epoch,
-                        position = txn_id.position,
-                        error = %e,
-                        "calvin: failed to encode completion ack"
-                    );
-                }
-            }
+            self.propose_sequencer_entry(
+                SequencerEntry::CompletionAck {
+                    epoch: txn_id.epoch,
+                    position: txn_id.position,
+                    vshard_id: self.vshard_id,
+                },
+                txn_id,
+                "completion ack",
+            );
         } else {
             tracing::warn!(
                 vshard_id = self.vshard_id,
@@ -335,6 +310,41 @@ impl Scheduler {
 
         self.metrics.record_completed();
         self.on_txn_complete(txn_id);
+    }
+
+    /// Encode `entry` as MessagePack and propose it to the sequencer Raft group.
+    ///
+    /// Logs a warning on encode failure or propose failure; never panics.
+    /// `op_name` is a short human-readable label used in warning messages
+    /// (e.g. `"completion ack"`, `"OLLP mismatch signal"`).
+    fn propose_sequencer_entry(&self, entry: SequencerEntry, txn_id: TxnId, op_name: &str) {
+        match zerompk::to_msgpack_vec(&entry) {
+            Ok(bytes) => {
+                if let Err(e) = self
+                    .multi_raft
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .propose_to_group(SEQUENCER_GROUP_ID, bytes)
+                {
+                    tracing::warn!(
+                        vshard_id = self.vshard_id,
+                        epoch = txn_id.epoch,
+                        position = txn_id.position,
+                        error = %e,
+                        "calvin: failed to propose {op_name}",
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    vshard_id = self.vshard_id,
+                    epoch = txn_id.epoch,
+                    position = txn_id.position,
+                    error = %e,
+                    "calvin: failed to encode {op_name}",
+                );
+            }
+        }
     }
 
     /// Allocate a fresh request ID for a dispatch.

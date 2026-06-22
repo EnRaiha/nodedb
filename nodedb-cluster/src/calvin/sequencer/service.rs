@@ -253,6 +253,7 @@ fn entry_txn_count(entry: &SequencerEntry) -> usize {
     match entry {
         SequencerEntry::EpochBatch { batch } => batch.txns.len(),
         SequencerEntry::CompletionAck { .. } => 0,
+        SequencerEntry::OllpMismatch { .. } => 0,
     }
 }
 

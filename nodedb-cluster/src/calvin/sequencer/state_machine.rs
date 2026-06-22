@@ -191,6 +191,9 @@ impl SequencerStateMachine {
                     }
                 }
                 SequencerEntry::CompletionAck { .. } => {}
+                // Mismatch signals are coordinator-side notifications only; they
+                // carry no txn data to replay for a vshard.
+                SequencerEntry::OllpMismatch { .. } => {}
             }
         }
 
@@ -299,6 +302,12 @@ impl SequencerStateMachine {
             } => {
                 self.completion_registry
                     .note_completion_ack(crate::calvin::TxnId::new(epoch, position), vshard_id);
+            }
+            // Broadcast the OLLP predicate-mismatch signal to ALL replicas so the
+            // coordinator's registry fires wherever it lives (including remote nodes).
+            SequencerEntry::OllpMismatch { epoch, position } => {
+                self.completion_registry
+                    .note_ollp_mismatch(crate::calvin::TxnId::new(epoch, position));
             }
         }
     }
