@@ -25,8 +25,8 @@ use crate::topology::ClusterTopology;
 use crate::transport::NexarTransport;
 
 use super::hooks::{
-    AssignRemoteSurrogate, CalvinSubmit, ShuffleAggregator, ShuffleConsumer, ShuffleProducer,
-    ShuffleReceiver, SnapshotQuarantineHook,
+    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ShuffleAggregator, ShuffleConsumer,
+    ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
 };
 
 /// Default tick interval (10ms — fast enough for sub-second elections).
@@ -195,6 +195,16 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// `SubmitCalvinTxn` request return a typed "not configured" error.
     pub(super) calvin_submit: Option<Arc<dyn CalvinSubmit>>,
 
+    /// Optional routed Calvin-INBOX submit hook (Cv1).
+    ///
+    /// OLLP dependent sibling of [`calvin_submit`](Self::calvin_submit). When set
+    /// (by the `nodedb` binary via `with_calvin_submit_inbox`), an incoming
+    /// `SubmitCalvinInboxRequest` submits the carried `TxClass` to THIS node's
+    /// Calvin sequencer inbox and awaits only the ASSIGNMENT (not completion)
+    /// through it. Cluster-only tests leave this `None`, which makes any incoming
+    /// `SubmitCalvinInbox` request return a typed "not configured" error.
+    pub(super) calvin_submit_inbox: Option<Arc<dyn CalvinSubmitInbox>>,
+
     /// In-progress partial snapshot receives, keyed by `group_id`.
     ///
     /// Each entry tracks the `.partial` file, running CRC, and expected next
@@ -248,6 +258,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             shuffle_aggregator: None,
             assign_remote_surrogate: None,
             calvin_submit: None,
+            calvin_submit_inbox: None,
             partial_snapshots: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             data_dir: None,
             snapshot_chunk_bytes: 4 * 1024 * 1024,

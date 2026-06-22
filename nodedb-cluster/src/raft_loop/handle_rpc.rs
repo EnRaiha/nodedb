@@ -13,8 +13,8 @@ use crate::health;
 use crate::rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
-    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinTxnRequest,
-    SubmitCalvinTxnResponse, TypedClusterError,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinInboxRequest,
+    SubmitCalvinInboxResponse, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
 };
 use crate::transport::RaftRpcHandler;
 
@@ -501,6 +501,33 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                 error: Some(TypedClusterError::Internal {
                     code: 0,
                     message: "calvin-submit not configured (no CalvinSubmit installed)".into(),
+                }),
+            },
+        }
+    }
+
+    // Routed Calvin-INBOX submit (Cv1) — delegate to the host-crate
+    // `CalvinSubmitInbox`. The OLLP dependent sibling of `on_submit_calvin_txn`.
+    // This node is the sequencer-group leader; submitting + awaiting the
+    // assignment through it is correct because the leader's sequencer service
+    // assigns. When no Calvin-inbox hook is installed (cluster-only tests /
+    // single-node), return a typed "not configured" error so the coordinator
+    // learns the request could not run rather than silently believing the
+    // dependent transaction was assigned.
+    async fn on_submit_calvin_inbox(
+        &self,
+        req: SubmitCalvinInboxRequest,
+    ) -> SubmitCalvinInboxResponse {
+        match &self.calvin_submit_inbox {
+            Some(submit) => submit.on_submit_calvin_inbox(req).await,
+            None => SubmitCalvinInboxResponse {
+                inbox_seq: 0,
+                epoch: 0,
+                position: 0,
+                participants: 0,
+                error: Some(TypedClusterError::Internal {
+                    code: 0,
+                    message: "calvin-inbox not configured (no CalvinSubmitInbox installed)".into(),
                 }),
             },
         }

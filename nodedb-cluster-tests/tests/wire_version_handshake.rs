@@ -117,6 +117,19 @@ impl RaftRpcHandler for EchoHandler {
     ) -> nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse {
         nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse { error: None }
     }
+
+    async fn on_submit_calvin_inbox(
+        &self,
+        _req: nodedb_cluster::rpc_codec::SubmitCalvinInboxRequest,
+    ) -> nodedb_cluster::rpc_codec::SubmitCalvinInboxResponse {
+        nodedb_cluster::rpc_codec::SubmitCalvinInboxResponse {
+            inbox_seq: 0,
+            epoch: 0,
+            position: 0,
+            participants: 0,
+            error: None,
+        }
+    }
 }
 
 /// Handler that records whether it was ever invoked.
@@ -233,6 +246,23 @@ impl RaftRpcHandler for SentinelHandler {
             error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
                 code: 0,
                 message: "sentinel: unexpected submit-calvin-txn dispatch".into(),
+            }),
+        }
+    }
+
+    async fn on_submit_calvin_inbox(
+        &self,
+        _req: nodedb_cluster::rpc_codec::SubmitCalvinInboxRequest,
+    ) -> nodedb_cluster::rpc_codec::SubmitCalvinInboxResponse {
+        self.invoked.store(true, Ordering::SeqCst);
+        nodedb_cluster::rpc_codec::SubmitCalvinInboxResponse {
+            inbox_seq: 0,
+            epoch: 0,
+            position: 0,
+            participants: 0,
+            error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
+                code: 0,
+                message: "sentinel: unexpected submit-calvin-inbox dispatch".into(),
             }),
         }
     }

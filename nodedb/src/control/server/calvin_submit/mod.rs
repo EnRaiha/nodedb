@@ -6,5 +6,7 @@
 //! `crate::control::planner::calvin::submit::submit_calvin_routed`.
 
 pub mod hook;
+pub mod inbox_hook;
 
 pub use hook::RegistryCalvinSubmit;
+pub use inbox_hook::RegistryCalvinSubmitInbox;

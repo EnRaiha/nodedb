@@ -17,8 +17,8 @@ use crate::forward::PlanExecutor;
 use crate::metadata_group::applier::MetadataApplier;
 
 use super::hooks::{
-    AssignRemoteSurrogate, CalvinSubmit, ShuffleAggregator, ShuffleConsumer, ShuffleProducer,
-    ShuffleReceiver, SnapshotQuarantineHook,
+    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ShuffleAggregator, ShuffleConsumer,
+    ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
 };
 use super::loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};
 
@@ -48,6 +48,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             shuffle_aggregator: self.shuffle_aggregator,
             assign_remote_surrogate: self.assign_remote_surrogate,
             calvin_submit: self.calvin_submit,
+            calvin_submit_inbox: self.calvin_submit_inbox,
             partial_snapshots: self.partial_snapshots,
             data_dir: self.data_dir,
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
@@ -146,6 +147,21 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// commits.
     pub fn with_calvin_submit(mut self, submit: Arc<dyn CalvinSubmit>) -> Self {
         self.calvin_submit = Some(submit);
+        self
+    }
+
+    /// Attach the routed Calvin-INBOX submit hook (Cv1, builder chain).
+    ///
+    /// OLLP dependent sibling of [`with_calvin_submit`](Self::with_calvin_submit).
+    /// The supplied implementation (backed by `nodedb`'s Calvin sequencer inbox
+    /// and `CalvinCompletionRegistry`) is called by the `SubmitCalvinInbox`
+    /// transport handler when this node is the sequencer-group leader: it submits
+    /// the carried dependent `TxClass` to the local inbox and awaits only the
+    /// assignment, so a cross-shard write routed here from a non-leader
+    /// coordinator gets its assignment back immediately (the OLLP coordinator
+    /// drives it to completion itself).
+    pub fn with_calvin_submit_inbox(mut self, submit: Arc<dyn CalvinSubmitInbox>) -> Self {
+        self.calvin_submit_inbox = Some(submit);
         self
     }
 

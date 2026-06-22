@@ -57,6 +57,45 @@ pub struct SubmitCalvinTxnResponse {
     pub error: Option<TypedClusterError>,
 }
 
+/// Coordinator → sequencer-leader routed Calvin-INBOX request (Cv1).
+///
+/// The OLLP dependent sibling of [`SubmitCalvinTxnRequest`]: it submits a
+/// dependent `TxClass` to the leader's sequencer inbox and asks the leader to
+/// reply with the ASSIGNMENT (`inbox_seq` / `epoch` / `position` /
+/// `participants`) AS SOON AS it is sequenced — it does NOT await completion.
+/// Carries the same `tx_class_bytes` / `deadline_remaining_ms` / `trace_id`
+/// prologue as [`SubmitCalvinTxnRequest`] so the leader-side handler shares the
+/// same deadline / tracing shape; the leader bounds its submit-and-assign wait
+/// by `deadline_remaining_ms`.
+///
+/// Cross-version safety: new optional fields should be added as `Option<T>`.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct SubmitCalvinInboxRequest {
+    /// The `TxClass` to submit, encoded with `zerompk::to_msgpack_vec`.
+    pub tx_class_bytes: Vec<u8>,
+    /// Deadline budget remaining for the submit-and-assign on the leader (ms).
+    pub deadline_remaining_ms: u64,
+    pub trace_id: [u8; 16],
+}
+
+/// Terminal reply to a [`SubmitCalvinInboxRequest`].
+///
+/// `error: None` means the leader submitted the transaction and observed its
+/// ASSIGNMENT (the numeric fields carry the sequencer-assigned
+/// `inbox_seq` / `epoch` / `position` / `participants`); the leader did NOT
+/// await completion. `error: Some(e)` means the leader-side submit-and-assign
+/// failed (sequencer rejected the txn, assignment timed out, a channel closed,
+/// the `TxClass` failed to decode, or no Calvin-inbox hook is configured); the
+/// numeric fields are 0 in that case.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct SubmitCalvinInboxResponse {
+    pub inbox_seq: u64,
+    pub epoch: u64,
+    pub position: u32,
+    pub participants: u64,
+    pub error: Option<TypedClusterError>,
+}
+
 // ── Codec ────────────────────────────────────────────────────────────────────
 
 macro_rules! to_bytes {
@@ -104,6 +143,34 @@ pub(super) fn decode_submit_calvin_txn_resp(payload: &[u8]) -> Result<RaftRpc> {
         payload,
         SubmitCalvinTxnResponse,
         "SubmitCalvinTxnResponse"
+    )?))
+}
+
+pub(super) fn encode_submit_calvin_inbox_req(
+    msg: &SubmitCalvinInboxRequest,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    write_frame(RPC_SUBMIT_CALVIN_INBOX_REQ, &to_bytes!(msg)?, out)
+}
+pub(super) fn encode_submit_calvin_inbox_resp(
+    msg: &SubmitCalvinInboxResponse,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    write_frame(RPC_SUBMIT_CALVIN_INBOX_RESP, &to_bytes!(msg)?, out)
+}
+
+pub(super) fn decode_submit_calvin_inbox_req(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::SubmitCalvinInboxRequest(from_bytes!(
+        payload,
+        SubmitCalvinInboxRequest,
+        "SubmitCalvinInboxRequest"
+    )?))
+}
+pub(super) fn decode_submit_calvin_inbox_resp(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::SubmitCalvinInboxResponse(from_bytes!(
+        payload,
+        SubmitCalvinInboxResponse,
+        "SubmitCalvinInboxResponse"
     )?))
 }
 
@@ -172,6 +239,78 @@ mod tests {
             Some(TypedClusterError::Internal { code, message }) => {
                 assert_eq!(code, 0);
                 assert!(message.contains("calvin-submit"));
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    fn roundtrip_inbox_req(req: SubmitCalvinInboxRequest) -> SubmitCalvinInboxRequest {
+        let rpc = RaftRpc::SubmitCalvinInboxRequest(req);
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::SubmitCalvinInboxRequest(r) => r,
+            other => panic!("expected SubmitCalvinInboxRequest, got {other:?}"),
+        }
+    }
+
+    fn roundtrip_inbox_resp(resp: SubmitCalvinInboxResponse) -> SubmitCalvinInboxResponse {
+        let rpc = RaftRpc::SubmitCalvinInboxResponse(resp);
+        let encoded = super::super::encode(&rpc).unwrap();
+        match super::super::decode(&encoded).unwrap() {
+            RaftRpc::SubmitCalvinInboxResponse(r) => r,
+            other => panic!("expected SubmitCalvinInboxResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_submit_calvin_inbox_request() {
+        let req = SubmitCalvinInboxRequest {
+            tx_class_bytes: vec![0x0a, 0x0b, 0x0c],
+            deadline_remaining_ms: 15_000,
+            trace_id: [3u8; 16],
+        };
+        let decoded = roundtrip_inbox_req(req);
+        assert_eq!(decoded.tx_class_bytes, vec![0x0a, 0x0b, 0x0c]);
+        assert_eq!(decoded.deadline_remaining_ms, 15_000);
+        assert_eq!(decoded.trace_id, [3u8; 16]);
+    }
+
+    #[test]
+    fn roundtrip_submit_calvin_inbox_response_ok() {
+        let decoded = roundtrip_inbox_resp(SubmitCalvinInboxResponse {
+            inbox_seq: 42,
+            epoch: 7,
+            position: 3,
+            participants: 5,
+            error: None,
+        });
+        assert_eq!(decoded.inbox_seq, 42);
+        assert_eq!(decoded.epoch, 7);
+        assert_eq!(decoded.position, 3);
+        assert_eq!(decoded.participants, 5);
+        assert!(decoded.error.is_none());
+    }
+
+    #[test]
+    fn roundtrip_submit_calvin_inbox_response_error() {
+        let decoded = roundtrip_inbox_resp(SubmitCalvinInboxResponse {
+            inbox_seq: 0,
+            epoch: 0,
+            position: 0,
+            participants: 0,
+            error: Some(TypedClusterError::Internal {
+                code: 0,
+                message: "calvin-inbox not configured".into(),
+            }),
+        });
+        assert_eq!(decoded.inbox_seq, 0);
+        assert_eq!(decoded.epoch, 0);
+        assert_eq!(decoded.position, 0);
+        assert_eq!(decoded.participants, 0);
+        match decoded.error {
+            Some(TypedClusterError::Internal { code, message }) => {
+                assert_eq!(code, 0);
+                assert!(message.contains("calvin-inbox"));
             }
             other => panic!("expected Internal, got {other:?}"),
         }

@@ -27,7 +27,10 @@ pub mod vshard;
 pub use auth_envelope::{
     ENVELOPE_OVERHEAD, ENVELOPE_VERSION, EnvelopeFields, parse_envelope, write_envelope,
 };
-pub use calvin_submit::{SubmitCalvinTxnRequest, SubmitCalvinTxnResponse};
+pub use calvin_submit::{
+    SubmitCalvinInboxRequest, SubmitCalvinInboxResponse, SubmitCalvinTxnRequest,
+    SubmitCalvinTxnResponse,
+};
 pub use cluster_mgmt::{
     JoinGroupInfo, JoinNodeInfo, JoinRequest, JoinResponse, LEADER_REDIRECT_PREFIX, PingRequest,
     PongResponse, TopologyAck, TopologyUpdate,

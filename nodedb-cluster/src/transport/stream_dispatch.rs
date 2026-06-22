@@ -15,7 +15,8 @@
 use crate::error::{ClusterError, Result};
 use crate::rpc_codec::{
     self, AssignSurrogateResponse, RaftRpc, ShuffleAggregateConsumeResponse,
-    ShuffleConsumeResponse, ShuffleProduceResponse, SubmitCalvinTxnResponse, auth_envelope,
+    ShuffleConsumeResponse, ShuffleProduceResponse, SubmitCalvinInboxResponse,
+    SubmitCalvinTxnResponse, auth_envelope,
 };
 use crate::transport::auth_context::AuthContext;
 use crate::transport::rpc_handler::RaftRpcHandler;
@@ -196,6 +197,39 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
             })?;
         send.finish().map_err(|e| ClusterError::Transport {
             detail: format!("finish submit calvin txn response: {e}"),
+        })?;
+        return Ok(None);
+    }
+
+    // 4i. Routed Calvin-INBOX submit (Cv1): a `SubmitCalvinInboxRequest` is
+    //     a ONE-SHOT request/response and the OLLP dependent sibling of the
+    //     submit-calvin-txn arm above. This node is the SEQUENCER-GROUP leader; it
+    //     submits the carried `TxClass` to its local Calvin sequencer inbox,
+    //     awaits only the ASSIGNMENT (NOT completion), and replies with exactly
+    //     one `SubmitCalvinInboxResponse` carrying the assignment or a typed
+    //     error. The reply is written on this same bidi stream's send half
+    //     (mirroring the submit-calvin-txn arm above), then `finish()`ed.
+    if let RaftRpc::SubmitCalvinInboxRequest(req) = request {
+        let resp: SubmitCalvinInboxResponse = handler.on_submit_calvin_inbox(req).await;
+        let resp_rpc = RaftRpc::SubmitCalvinInboxResponse(resp);
+        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_seq = auth.peer_seq_out.next();
+        let mut resp_envelope =
+            Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
+        auth_envelope::write_envelope(
+            auth.local_node_id,
+            resp_seq,
+            &resp_inner,
+            &auth.mac_key,
+            &mut resp_envelope,
+        )?;
+        send.write_all(&resp_envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write submit calvin inbox response: {e}"),
+            })?;
+        send.finish().map_err(|e| ClusterError::Transport {
+            detail: format!("finish submit calvin inbox response: {e}"),
         })?;
         return Ok(None);
     }

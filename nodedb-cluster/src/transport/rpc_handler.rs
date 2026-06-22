@@ -8,8 +8,8 @@ use crate::forward::ChunkSink;
 use crate::rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
-    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinTxnRequest,
-    SubmitCalvinTxnResponse, TypedClusterError,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinInboxRequest,
+    SubmitCalvinInboxResponse, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
 };
 
 /// Trait for handling incoming Raft RPCs.
@@ -118,4 +118,16 @@ pub trait RaftRpcHandler: Send + Sync + 'static {
         &self,
         req: SubmitCalvinTxnRequest,
     ) -> impl std::future::Future<Output = SubmitCalvinTxnResponse> + Send;
+
+    /// Routed Calvin-INBOX submit (Cv1). The OLLP dependent sibling of
+    /// [`on_submit_calvin_txn`](Self::on_submit_calvin_txn). This node is the
+    /// SEQUENCER-GROUP leader: decode the `TxClass` carried by `req`, submit it to
+    /// the local Calvin sequencer inbox, and await only the ASSIGNMENT (NOT
+    /// completion). The transport writes exactly one [`SubmitCalvinInboxResponse`]
+    /// carrying the assignment (or a typed error) back to the coordinator. The
+    /// await is bounded by `req.deadline_remaining_ms`.
+    fn on_submit_calvin_inbox(
+        &self,
+        req: SubmitCalvinInboxRequest,
+    ) -> impl std::future::Future<Output = SubmitCalvinInboxResponse> + Send;
 }

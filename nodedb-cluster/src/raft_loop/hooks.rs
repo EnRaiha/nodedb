@@ -259,3 +259,44 @@ pub trait CalvinSubmit: Send + Sync + 'static {
         req: crate::rpc_codec::SubmitCalvinTxnRequest,
     ) -> crate::rpc_codec::SubmitCalvinTxnResponse;
 }
+
+/// Hook for routed Calvin-INBOX submit (Cv1).
+///
+/// OLLP dependent sibling of [`CalvinSubmit`]: `nodedb-cluster` cannot depend on
+/// `nodedb` (circular), so the submit logic — decode the `TxClass`, submit it to
+/// THIS node's Calvin sequencer inbox, and await only the ASSIGNMENT (NOT
+/// completion) through the node-local `CalvinCompletionRegistry` — lives in
+/// `nodedb` behind this `Send + Sync` hook. The transport read-loop calls
+/// [`on_submit_calvin_inbox`](Self::on_submit_calvin_inbox) when a
+/// `SubmitCalvinInboxRequest` arrives at the SEQUENCER-GROUP leader and writes the
+/// returned [`SubmitCalvinInboxResponse`](crate::rpc_codec::SubmitCalvinInboxResponse)
+/// back to the coordinator.
+///
+/// Because the handler runs on the sequencer-group leader, the submit-and-assign
+/// is correct: only the leader's sequencer service assigns transactions
+/// (`note_assigned`). Unlike [`CalvinSubmit`] it returns AS SOON AS the
+/// assignment is observed — the OLLP coordinator loop drives the dependent
+/// transaction to completion itself in a later unit, so this hook must NOT block
+/// until completion.
+///
+/// Cluster-only tests leave the `RaftLoop` field `None`; a `SubmitCalvinInbox`
+/// request against a node with no Calvin-inbox hook installed returns a typed
+/// "not configured" error.
+///
+/// The hook is **async** because the submit-and-assign blocks on the assignment
+/// oneshot channel (bounded by the request deadline) on the Tokio transport
+/// reactor. The actual transaction execution happens on the Data Plane via the
+/// sequencer service / per-vshard schedulers; this hook never touches io_uring or
+/// storage directly.
+#[async_trait::async_trait]
+pub trait CalvinSubmitInbox: Send + Sync + 'static {
+    /// Submit the `TxClass` carried by `req` (msgpack-encoded) to this node's
+    /// Calvin sequencer inbox and await its ASSIGNMENT (not completion). Returns
+    /// a [`SubmitCalvinInboxResponse`](crate::rpc_codec::SubmitCalvinInboxResponse)
+    /// with `error: None` carrying the assignment on success or a typed error on
+    /// failure (never a silent drop).
+    async fn on_submit_calvin_inbox(
+        &self,
+        req: crate::rpc_codec::SubmitCalvinInboxRequest,
+    ) -> crate::rpc_codec::SubmitCalvinInboxResponse;
+}

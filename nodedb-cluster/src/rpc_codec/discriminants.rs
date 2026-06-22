@@ -93,6 +93,18 @@ pub const RPC_ASSIGN_SURROGATE_RESP: u8 = 35;
 pub const RPC_SUBMIT_CALVIN_TXN_REQ: u8 = 36;
 pub const RPC_SUBMIT_CALVIN_TXN_RESP: u8 = 37;
 
+/// Routed Calvin-INBOX submit (Cv1). The OLLP dependent sibling of
+/// `RPC_SUBMIT_CALVIN_TXN_*`: a coordinator that is NOT the sequencer-group
+/// leader sends a `RPC_SUBMIT_CALVIN_INBOX_REQ` carrying a msgpack-encoded
+/// dependent `TxClass` to the leader; the leader submits it to its local Calvin
+/// sequencer inbox and awaits only the ASSIGNMENT (NOT completion), replying
+/// with exactly one `RPC_SUBMIT_CALVIN_INBOX_RESP` carrying the assignment
+/// (`inbox_seq` / `epoch` / `position` / `participants`) or a typed error.
+/// One-shot request/response — no streaming. Discriminants 38/39 are
+/// permanently assigned to these variants.
+pub const RPC_SUBMIT_CALVIN_INBOX_REQ: u8 = 38;
+pub const RPC_SUBMIT_CALVIN_INBOX_RESP: u8 = 39;
+
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared
 // here so external code can reference them without importing the full enum.

@@ -113,8 +113,8 @@ pub use migration_executor::{
 };
 pub use multi_raft::{GroupStatus, MultiRaft};
 pub use raft_loop::{
-    AssignRemoteSurrogate, CalvinSubmit, CommitApplier, RaftLoop, ShuffleAggregator,
-    ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
+    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, CommitApplier, RaftLoop,
+    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
     VShardEnvelopeHandler,
 };
 pub use reachability::{
@@ -132,8 +132,8 @@ pub use rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, JoinKeyPair, MacKey, PartNodeEntry, RaftRpc,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
     ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk,
-    ShufflePushEnd, ShufflePushRequest, SortKey, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse,
-    TypedClusterError,
+    ShufflePushEnd, ShufflePushRequest, SortKey, SubmitCalvinInboxRequest,
+    SubmitCalvinInboxResponse, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
 };
 pub use topology::{ClusterTopology, NodeInfo, NodeState};
 pub use transport::{

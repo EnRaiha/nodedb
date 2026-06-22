@@ -598,6 +598,19 @@ mod tests {
             ) -> crate::rpc_codec::SubmitCalvinTxnResponse {
                 crate::rpc_codec::SubmitCalvinTxnResponse { error: None }
             }
+
+            async fn on_submit_calvin_inbox(
+                &self,
+                _req: crate::rpc_codec::SubmitCalvinInboxRequest,
+            ) -> crate::rpc_codec::SubmitCalvinInboxResponse {
+                crate::rpc_codec::SubmitCalvinInboxResponse {
+                    inbox_seq: 0,
+                    epoch: 0,
+                    position: 0,
+                    participants: 0,
+                    error: None,
+                }
+            }
         }
 
         let handler = Arc::new(JoinHandler {

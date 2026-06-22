@@ -192,6 +192,15 @@ pub fn start_raft(
     let calvin_submit: Arc<dyn nodedb_cluster::CalvinSubmit> =
         Arc::new(crate::control::server::calvin_submit::RegistryCalvinSubmit::new(shared.clone()));
 
+    // Routed Calvin-INBOX submit (Cv1): the OLLP dependent sibling of the
+    // submit-and-await hook above. When this node is the sequencer-group leader,
+    // submit a forwarded dependent `TxClass` to the local Calvin sequencer inbox
+    // and return its ASSIGNMENT immediately (without awaiting completion) so a
+    // non-leader OLLP coordinator can drive the dependent transaction itself.
+    let calvin_submit_inbox: Arc<dyn nodedb_cluster::CalvinSubmitInbox> = Arc::new(
+        crate::control::server::calvin_submit::RegistryCalvinSubmitInbox::new(shared.clone()),
+    );
+
     let raft_loop = Arc::new(
         nodedb_cluster::RaftLoop::new(
             multi_raft,
@@ -211,6 +220,7 @@ pub fn start_raft(
         .with_shuffle_aggregator(shuffle_aggregator)
         .with_assign_remote_surrogate(assign_remote_surrogate)
         .with_calvin_submit(calvin_submit)
+        .with_calvin_submit_inbox(calvin_submit_inbox)
         .with_data_dir(_data_dir.to_path_buf())
         .with_snapshot_chunk_bytes(snapshot_chunk_bytes)
         .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs),
