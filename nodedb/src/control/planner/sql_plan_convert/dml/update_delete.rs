@@ -97,30 +97,7 @@ pub(in super::super) fn convert_update(
         // When the planner resolved target_keys (PK-targeted WHERE), convert
         // them to an Eq filter on the PK column so the columnar UPDATE handler
         // can match and tombstone the right row.
-        let effective_filter = if !target_keys.is_empty() && !filter_bytes.is_empty() {
-            filter_bytes
-        } else if !target_keys.is_empty() {
-            // Planner pre-resolved the PK — serialize as an Eq filter
-            // so the columnar UPDATE handler can use the same scan path
-            // as a WHERE-predicate update.
-            use crate::bridge::scan_filter::{FilterOp, ScanFilter};
-            let pk_filters: Vec<ScanFilter> = target_keys
-                .iter()
-                .map(|key| ScanFilter {
-                    field: "id".to_string(),
-                    op: FilterOp::Eq,
-                    value: nodedb_types::Value::String(sql_value_to_string(key)),
-                    clauses: Vec::new(),
-                    expr: None,
-                })
-                .collect();
-            zerompk::to_msgpack_vec(&pk_filters).map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("pk filter encode: {e}"),
-            })?
-        } else {
-            filter_bytes
-        };
+        let effective_filter = pk_effective_filter(filter_bytes, target_keys)?;
         return Ok(vec![PhysicalTask {
             tenant_id,
             vshard_id: vshard,
@@ -206,6 +183,33 @@ pub(in super::super) fn convert_delete(
         }]);
     }
 
+    // EDGE-BEARING GATE: a PK-equality delete on a schemaless-document
+    // collection that carries implicit edges must NOT lower to a static
+    // `PointDelete` — that op bypasses the dependent-predicate (OLLP) path
+    // and leaks the implicit edge. Route it as a `BulkDelete` with an
+    // equivalent filter so `execute.rs`'s edge-bearing gate sends it through
+    // the Calvin/OLLP coordinator, which derives + drift-validates the routed
+    // `EdgeDelete` (reusing all of O3a + O3a-drift). Non-edge-bearing
+    // collections keep the fast `PointDelete` path below. Reached only for
+    // document engines (the KV case returned above); strict/columnar/etc.
+    // never set `has_implicit_edges`, so the flag naturally scopes this.
+    if !target_keys.is_empty() && document_collection_is_edge_bearing(ctx, collection)? {
+        let effective_filter = delete_effective_filter(filters, target_keys)?;
+        return Ok(vec![PhysicalTask {
+            tenant_id,
+            vshard_id: vshard,
+            database_id: ctx.database_id,
+            plan: PhysicalPlan::Document(DocumentOp::BulkDelete {
+                collection: collection.into(),
+                filters: effective_filter,
+                returning: None,
+                ollp_predicted_surrogates: None,
+                ollp_predicted_edges: None,
+            }),
+            post_set_op: PostSetOp::None,
+        }]);
+    }
+
     if !target_keys.is_empty() {
         let mut tasks = Vec::new();
         for key in target_keys {
@@ -249,6 +253,70 @@ pub(in super::super) fn convert_delete(
             post_set_op: PostSetOp::None,
         }])
     }
+}
+
+/// Returns `true` when the schemaless-document `collection` (already
+/// db-qualified by the caller) carries implicit edges, mirroring the
+/// edge-bearing gate in `execute.rs`.
+///
+/// A genuine catalog READ error propagates (misrouting a delete on a real I/O
+/// fault would silently skip edge cleanup → dangling edges). An ABSENT
+/// credential store or catalog, or an absent collection row (`Ok(None)`), is
+/// treated as non-edge-bearing (`Ok(false)`).
+fn document_collection_is_edge_bearing(
+    ctx: &ConvertContext,
+    collection: &str,
+) -> crate::Result<bool> {
+    let Some(credentials) = ctx.credentials.as_ref() else {
+        return Ok(false);
+    };
+    let Some(catalog) = credentials.catalog().as_ref() else {
+        return Ok(false);
+    };
+    Ok(catalog
+        .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), collection)?
+        .map(|c| c.has_implicit_edges)
+        .unwrap_or(false))
+}
+
+/// Effective filter for a PK-pre-resolved write (shared by the columnar UPDATE
+/// path and the edge-bearing PK-equality DELETE path).
+///
+/// Prefers the user's serialized `WHERE` predicate (`filter_bytes`) verbatim.
+/// Only when it is empty AND the planner pre-resolved `target_keys` does it
+/// synthesize one `id = <key>` `Eq` filter per key. When `target_keys` is also
+/// empty (no WHERE at all) the empty `filter_bytes` is returned as-is (match
+/// all) — so callers that must NEVER match all rows (the DELETE gate) must only
+/// call this with a non-empty `target_keys`, which then guarantees a non-empty
+/// result.
+fn pk_effective_filter(filter_bytes: Vec<u8>, target_keys: &[SqlValue]) -> crate::Result<Vec<u8>> {
+    if !filter_bytes.is_empty() || target_keys.is_empty() {
+        return Ok(filter_bytes);
+    }
+    use crate::bridge::scan_filter::{FilterOp, ScanFilter};
+    let pk_filters: Vec<ScanFilter> = target_keys
+        .iter()
+        .map(|key| ScanFilter {
+            field: "id".to_string(),
+            op: FilterOp::Eq,
+            value: nodedb_types::Value::String(sql_value_to_string(key)),
+            clauses: Vec::new(),
+            expr: None,
+        })
+        .collect();
+    zerompk::to_msgpack_vec(&pk_filters).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("pk filter encode: {e}"),
+    })
+}
+
+/// Build the filter bytes for an edge-bearing PK-equality DELETE routed as a
+/// `BulkDelete`. Thin wrapper over [`pk_effective_filter`]: serializes the
+/// user's `WHERE` predicate, then defers to the shared synthesis. The DELETE
+/// gate only calls this with a non-empty `target_keys`, so the result is NEVER
+/// an empty filter (which would match ALL rows).
+fn delete_effective_filter(filters: &[Filter], target_keys: &[SqlValue]) -> crate::Result<Vec<u8>> {
+    pk_effective_filter(serialize_filters(filters)?, target_keys)
 }
 
 /// Lower a `SqlPlan::UpdateFrom` to a `DocumentOp::UpdateFromJoin` physical task.
@@ -313,4 +381,117 @@ pub(in super::super) fn convert_update_from(
         }),
         post_set_op: PostSetOp::None,
     }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::security::catalog::StoredCollection;
+    use crate::control::security::credential::CredentialStore;
+    use std::sync::Arc;
+
+    /// Build a `ConvertContext` whose credential store carries a catalog with
+    /// two collections under tenant 0 / DEFAULT database: `edges`
+    /// (`has_implicit_edges = true`) and `plain` (`false`). The returned
+    /// `TempDir` must be kept alive for the lifetime of the context (it backs
+    /// the catalog's redb file).
+    fn ctx_with_catalog() -> (ConvertContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            CredentialStore::open(&dir.path().join("system.redb")).expect("open credential store");
+        {
+            let catalog = store
+                .catalog()
+                .as_ref()
+                .expect("persistent store has a catalog");
+            let mut edges = StoredCollection::new(0, "edges", "owner");
+            edges.has_implicit_edges = true;
+            catalog
+                .put_collection(crate::types::DatabaseId::DEFAULT, &edges)
+                .expect("put edges collection");
+            let plain = StoredCollection::new(0, "plain", "owner");
+            catalog
+                .put_collection(crate::types::DatabaseId::DEFAULT, &plain)
+                .expect("put plain collection");
+        }
+
+        let ctx = ConvertContext {
+            retention_registry: None,
+            array_catalog: None,
+            credentials: Some(Arc::new(store)),
+            wal: None,
+            surrogate_assigner: None,
+            cluster_enabled: false,
+            bitemporal_retention_registry: None,
+            max_vector_dim: 0,
+            force_shuffle_join: false,
+            shuffle_num_parts: 0,
+            force_shuffle_agg: false,
+            shuffle_agg_num_parts: 0,
+            broadcast_threshold_bytes: 8 * 1024 * 1024,
+            shuffle_agg_threshold: 10_000,
+            database_id: crate::types::DatabaseId::DEFAULT,
+            tenant_id: crate::types::TenantId::new(0),
+        };
+        (ctx, dir)
+    }
+
+    #[test]
+    fn pk_delete_on_edge_bearing_collection_routes_bulk_delete() {
+        let (ctx, _dir) = ctx_with_catalog();
+        let keys = vec![SqlValue::String("edge_3".to_string())];
+        let tasks = convert_delete(
+            "edges",
+            &EngineType::DocumentSchemaless,
+            &[],
+            &keys,
+            TenantId::new(0),
+            &ctx,
+        )
+        .expect("convert_delete");
+        assert_eq!(tasks.len(), 1);
+        match &tasks[0].plan {
+            PhysicalPlan::Document(DocumentOp::BulkDelete { filters, .. }) => {
+                // Synthesized PK filter is never empty for a non-empty target_keys.
+                assert!(
+                    !filters.is_empty(),
+                    "edge-bearing PK delete must carry a non-empty filter"
+                );
+            }
+            other => panic!("expected BulkDelete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pk_delete_on_non_edge_collection_routes_point_delete() {
+        let (ctx, _dir) = ctx_with_catalog();
+        let keys = vec![SqlValue::String("row_1".to_string())];
+        let tasks = convert_delete(
+            "plain",
+            &EngineType::DocumentSchemaless,
+            &[],
+            &keys,
+            TenantId::new(0),
+            &ctx,
+        )
+        .expect("convert_delete");
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            matches!(
+                &tasks[0].plan,
+                PhysicalPlan::Document(DocumentOp::PointDelete { .. })
+            ),
+            "non-edge-bearing PK delete must remain a PointDelete"
+        );
+    }
+
+    #[test]
+    fn delete_effective_filter_never_empty_for_non_empty_keys() {
+        let keys = vec![
+            SqlValue::String("a".to_string()),
+            SqlValue::String("b".to_string()),
+        ];
+        let bytes = delete_effective_filter(&[], &keys).expect("synthesize filter");
+        assert!(!bytes.is_empty());
+    }
 }
