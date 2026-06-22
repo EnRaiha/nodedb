@@ -53,6 +53,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | GraphOp::RagFusion { .. }
             | GraphOp::Algo { .. }
             | GraphOp::Match { .. }
+            | GraphOp::MatchContinuation { .. }
             | GraphOp::TemporalNeighbors { .. }
             | GraphOp::TemporalAlgorithm { .. }
             | GraphOp::Stats { .. },

@@ -192,6 +192,29 @@ pub enum GraphOp {
         frontier_bitmap: Option<SurrogateBitmap>,
     },
 
+    /// Cross-shard MATCH continuation (resume a pattern on this shard).
+    ///
+    /// Dispatched to the shard that owns `source_node` after another shard
+    /// emitted an `UnresolvedExpansion` for it. The receiving shard resumes
+    /// the SAME (already-optimized) pattern from `resume_triple_idx`, seeded
+    /// with `partial_row` plus `source_binding -> source_node`. The query is
+    /// carried already-optimized and MUST NOT be re-optimized on resume —
+    /// `resume_triple_idx` indexes the originating shard's triple order.
+    ///
+    /// Phase A returns ROWS ONLY — identical response format to `Match`.
+    MatchContinuation {
+        /// Serialized (already-optimized) `MatchQuery` (MessagePack).
+        query: Vec<u8>,
+        /// Within-chain triple index to resume from (originating shard's order).
+        resume_triple_idx: usize,
+        /// Serialized `HashMap<String, String>` of accumulated bindings (MessagePack).
+        partial_row: Vec<u8>,
+        /// The node name on THIS shard to resume expansion from.
+        source_node: String,
+        /// The binding variable bound to `source_node`.
+        source_binding: String,
+    },
+
     /// Set node labels (bitset-based, up to 64 distinct labels).
     SetNodeLabels {
         node_id: String,

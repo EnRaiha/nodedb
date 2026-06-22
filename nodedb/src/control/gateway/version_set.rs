@@ -254,6 +254,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | Subgraph { .. }
                 | Algo { .. }
                 | Match { .. }
+                | MatchContinuation { .. }
                 | TemporalAlgorithm { .. }
                 | Stats {
                     collection: None, ..

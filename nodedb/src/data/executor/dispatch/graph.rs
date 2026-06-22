@@ -202,6 +202,22 @@ impl CoreLoop {
                 frontier_bitmap,
             } => self.execute_graph_match(task, tid, query, frontier_bitmap.as_ref()),
 
+            GraphOp::MatchContinuation {
+                query,
+                resume_triple_idx,
+                partial_row,
+                source_node,
+                source_binding,
+            } => self.execute_graph_match_continuation(
+                task,
+                tid,
+                query,
+                *resume_triple_idx,
+                partial_row,
+                source_node,
+                source_binding,
+            ),
+
             GraphOp::SetNodeLabels { node_id, labels } => {
                 let partition = self.csr_partition_mut(database_id, tid);
                 for label in labels {

@@ -5,10 +5,13 @@
 //! Takes a parsed `MatchQuery` and produces a result set of bound variable
 //! assignments. Each assignment is a row mapping variable names to node/edge IDs.
 
+mod continuation;
 mod expansion;
 mod predicates;
 
 use std::collections::HashMap;
+
+pub use continuation::execute_continuation;
 
 use super::ast::*;
 use crate::engine::graph::csr::CsrIndex;
@@ -90,7 +93,7 @@ pub(super) struct ExecutionState<'a> {
 }
 
 impl<'a> ExecutionState<'a> {
-    fn new(is_remote_node: Option<&'a dyn Fn(&str) -> bool>) -> Self {
+    pub(super) fn new(is_remote_node: Option<&'a dyn Fn(&str) -> bool>) -> Self {
         Self {
             truncated: false,
             frontier: Vec::new(),
@@ -152,25 +155,7 @@ fn execute_query<'a>(
         }
     }
 
-    for predicate in &query.where_predicates {
-        rows = predicates::apply_predicate(&rows, predicate, csr, edge_store, frontier_bitmap)?;
-    }
-
-    if let Some(limit) = query.limit {
-        rows.truncate(limit);
-    }
-
-    if !query.return_columns.is_empty() {
-        rows = predicates::project_columns(&rows, &query.return_columns);
-    }
-
-    if query.distinct {
-        let mut seen = std::collections::HashSet::new();
-        rows.retain(|row| {
-            let key = format!("{row:?}");
-            seen.insert(key)
-        });
-    }
+    let rows = continuation::finalize_rows(query, rows, csr, edge_store, frontier_bitmap)?;
 
     Ok(MatchOutcome {
         rows,
@@ -226,6 +211,9 @@ pub(super) fn execute_clause(
 }
 
 /// Execute a single pattern chain against a binding row.
+///
+/// Thin wrapper over [`continuation::run_chain_from`] that starts at triple 0
+/// with the single supplied input row — the from-scratch execution path.
 fn execute_chain(
     chain: &PatternChain,
     csr: &CsrIndex,
@@ -233,34 +221,21 @@ fn execute_chain(
     state: &mut ExecutionState,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
 ) -> Result<Vec<BindingRow>, crate::Error> {
-    let mut rows = vec![input_row.clone()];
-
-    for (triple_idx, triple) in chain.triples.iter().enumerate() {
-        let mut next_rows = Vec::new();
-        for row in &rows {
-            next_rows.extend(execute_triple(
-                triple,
-                triple_idx,
-                csr,
-                row,
-                state,
-                frontier_bitmap,
-            )?);
-        }
-        rows = next_rows;
-        if rows.is_empty() {
-            break;
-        }
-    }
-
-    Ok(rows)
+    continuation::run_chain_from(
+        chain,
+        0,
+        vec![input_row.clone()],
+        csr,
+        state,
+        frontier_bitmap,
+    )
 }
 
 /// Execute a single triple `(src)-[edge]->(dst)` against a binding row.
 ///
 /// `triple_idx` is the 0-based position of this triple within its chain;
 /// it is recorded in any `UnresolvedExpansion` emitted.
-fn execute_triple(
+pub(super) fn execute_triple(
     triple: &PatternTriple,
     triple_idx: usize,
     csr: &CsrIndex,
@@ -673,7 +648,7 @@ mod tests {
     // ── Unresolved frontier tests ─────────────────────────────────────────
 
     /// Helper: build a CsrIndex from a list of `(src, label, dst)` edges.
-    fn make_csr(
+    pub(crate) fn make_csr(
         edges: &[(&str, &str, &str)],
     ) -> (
         CsrIndex,
