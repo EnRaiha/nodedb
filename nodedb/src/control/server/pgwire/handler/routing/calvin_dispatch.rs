@@ -24,8 +24,11 @@ use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
-use super::ollp_helpers::{extract_bulk_predicate_info, inject_ollp_surrogates};
+use super::ollp_helpers::{
+    extract_bulk_predicate_info, inject_ollp_predicted_edges, inject_ollp_surrogates,
+};
 use super::planning::calvin_execution_response;
+use nodedb_physical::physical_plan::OllpPredictedEdge;
 
 impl NodeDbPgHandler {
     /// Drive Calvin strict multi-shard dispatch for the given task set.
@@ -182,10 +185,26 @@ impl NodeDbPgHandler {
                 // tx_builder, then splice them into the modified task set there.
                 //
                 // Content-drift TOCTOU (a concurrent UPDATE of a matched doc's
-                // `_from`/`_to` between recon and execution) is NOT yet detected —
-                // OLLP today validates write-set surrogates only, not referenced-
-                // field content. Closed by the follow-up content-drift validation
-                // unit.
+                // `_from`/`_to`/`_type`, or an edge appearing/disappearing among
+                // the matched docs, between recon and execution) is closed below:
+                // the recon edge set is carried into the plan as
+                // `ollp_predicted_edges` and the data plane re-derives the ACTUAL
+                // edge set from the matched docs, returning `OllpRetryRequired` on
+                // any divergence BEFORE writing. The existing retry loop then
+                // re-scans and re-derives fresh edges.
+                //
+                // `predicted_edges` mirrors the recon `edges` (which carry the
+                // surrogate of each edge doc) into the plan-carried wire type.
+                let predicted_edges: Vec<OllpPredictedEdge> = edges
+                    .iter()
+                    .map(|e| OllpPredictedEdge {
+                        surrogate: e.surrogate,
+                        from: e.from.clone(),
+                        to: e.to.clone(),
+                        label: e.label.clone(),
+                    })
+                    .collect();
+
                 let mut edge_delete_tasks: Vec<PhysicalTask> = Vec::new();
                 append_implicit_edge_delete_tasks(
                     state,
@@ -207,10 +226,14 @@ impl NodeDbPgHandler {
                             .iter()
                             .map(|t| {
                                 let mut t = t.clone();
-                                // `inject_ollp_surrogates` only touches the
-                                // original doc tasks; the edge-delete tasks are
-                                // appended AFTER, so they are untouched.
+                                // `inject_ollp_surrogates` / `_predicted_edges`
+                                // only touch the original BulkUpdate/BulkDelete
+                                // doc tasks (no-ops on any other plan); the
+                                // edge-delete tasks are appended AFTER, so they
+                                // are untouched. The tx_builder may run more than
+                                // once, so clone the predicted sets per task.
                                 inject_ollp_surrogates(&mut t.plan, surrogates.clone());
+                                inject_ollp_predicted_edges(&mut t.plan, predicted_edges.clone());
                                 t
                             })
                             .collect();

@@ -29,7 +29,7 @@
 
 use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb::bridge::scan_filter::ScanFilter;
-use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan, UpdateValue};
+use nodedb_physical::physical_plan::{DocumentOp, OllpPredictedEdge, PhysicalPlan, UpdateValue};
 
 use crate::helpers::*;
 
@@ -80,6 +80,43 @@ fn insert_active(ctx: &mut TestCtx, id: &str) {
     );
 }
 
+/// Insert an edge document with `active: true` plus `_from`/`_to` (and an
+/// optional `_type`). Such a doc both matches `filter_active()` AND is an
+/// implicit graph edge, so it participates in edge-content drift validation.
+fn insert_active_edge(ctx: &mut TestCtx, id: &str, from: &str, to: &str, etype: Option<&str>) {
+    let value = match etype {
+        Some(t) => {
+            format!(
+                r#"{{"active":true,"name":"{id}","_from":"{from}","_to":"{to}","_type":"{t}"}}"#
+            )
+        }
+        None => format!(r#"{{"active":true,"name":"{id}","_from":"{from}","_to":"{to}"}}"#),
+    };
+    send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        PhysicalPlan::Document(DocumentOp::PointPut {
+            collection: COLLECTION.into(),
+            document_id: id.into(),
+            value: value.into_bytes(),
+            surrogate: surrogate_for(id),
+            pk_bytes: id.as_bytes().to_vec(),
+        }),
+    );
+}
+
+/// Build a predicted edge from an id + endpoints, keyed on the same surrogate
+/// the data plane recomputes from the stored doc.
+fn predicted_edge(id: &str, from: &str, to: &str, label: Option<&str>) -> OllpPredictedEdge {
+    OllpPredictedEdge {
+        surrogate: surrogate_u32(id),
+        from: from.to_string(),
+        to: to.to_string(),
+        label: label.map(str::to_string),
+    }
+}
+
 /// Build a BulkUpdate plan that sets `name = "updated"` for all `active = true` docs.
 fn bulk_update_plan(predicted: Option<Vec<u32>>) -> PhysicalPlan {
     let updates = vec![(
@@ -92,6 +129,7 @@ fn bulk_update_plan(predicted: Option<Vec<u32>>) -> PhysicalPlan {
         updates,
         returning: None,
         ollp_predicted_surrogates: predicted,
+        ollp_predicted_edges: None,
     })
 }
 
@@ -102,6 +140,22 @@ fn bulk_delete_plan(predicted: Option<Vec<u32>>) -> PhysicalPlan {
         filters: filter_active(),
         returning: None,
         ollp_predicted_surrogates: predicted,
+        ollp_predicted_edges: None,
+    })
+}
+
+/// Build a BulkDelete plan carrying BOTH a predicted surrogate set and a
+/// predicted edge-content set. Used by the edge-content drift tests.
+fn bulk_delete_plan_with_edges(
+    predicted: Option<Vec<u32>>,
+    edges: Option<Vec<OllpPredictedEdge>>,
+) -> PhysicalPlan {
+    PhysicalPlan::Document(DocumentOp::BulkDelete {
+        collection: COLLECTION.into(),
+        filters: filter_active(),
+        returning: None,
+        ollp_predicted_surrogates: predicted,
+        ollp_predicted_edges: edges,
     })
 }
 
@@ -267,6 +321,166 @@ fn bulk_delete_stale_prediction_returns_ollp_retry_required() {
 
     assert_eq!(resp.status, Status::Error);
     assert_eq!(resp.error_code, Some(ErrorCode::OllpRetryRequired));
+}
+
+// ── edge-content drift (TOCTOU on _from/_to/_type) ───────────────────────────
+//
+// These tests cover the data-plane edge-content validation added to
+// `execute_bulk_delete`. The surrogate set is held CORRECT in every case so the
+// surrogate check passes — the ONLY thing under test is whether a divergence in
+// the actual edge tuples `(surrogate, _from, _to, _type)` versus the predicted
+// edge set triggers `OllpRetryRequired` before any write. The full concurrent
+// race is NOT force-tested here (no flaky timing); the detection mechanism is
+// proven by mutating the stored doc between building the prediction and
+// admission. The retry/rescan path itself is already e2e-proven by
+// `ollp_implicit_edge_delete_cleans_reverse_cross_node`.
+
+/// Matching predicted + actual edge sets → delete proceeds (no false retry).
+#[test]
+fn bulk_delete_matching_edges_proceeds() {
+    let mut ctx = make_ctx();
+    insert_active_edge(&mut ctx, "e1", "a", "b", Some("ROAD"));
+    insert_active_edge(&mut ctx, "e2", "c", "d", None);
+
+    let predicted = vec![surrogate_u32("e1"), surrogate_u32("e2")];
+    let edges = vec![
+        predicted_edge("e1", "a", "b", Some("ROAD")),
+        predicted_edge("e2", "c", "d", None),
+    ];
+
+    let resp = send_raw(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        bulk_delete_plan_with_edges(Some(predicted), Some(edges)),
+    );
+    assert_eq!(
+        resp.status,
+        Status::Ok,
+        "matching edge content should let the delete proceed"
+    );
+}
+
+/// A matched doc's `_to` was concurrently changed between recon and admission.
+/// Surrogate set is unchanged, so only the edge-content check can catch it →
+/// OllpRetryRequired WITHOUT deleting.
+#[test]
+fn bulk_delete_changed_edge_endpoint_returns_ollp_retry_required() {
+    let mut ctx = make_ctx();
+    insert_active_edge(&mut ctx, "e1", "a", "b", Some("ROAD"));
+
+    // Pre-exec captured the edge as a->b.
+    let predicted = vec![surrogate_u32("e1")];
+    let edges = vec![predicted_edge("e1", "a", "b", Some("ROAD"))];
+
+    // Concurrent UPDATE: same surrogate, but `_to` now points at "z".
+    insert_active_edge(&mut ctx, "e1", "a", "z", Some("ROAD"));
+
+    let resp = send_raw(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        bulk_delete_plan_with_edges(Some(predicted), Some(edges)),
+    );
+
+    assert_eq!(resp.status, Status::Error);
+    assert_eq!(
+        resp.error_code,
+        Some(ErrorCode::OllpRetryRequired),
+        "changed edge endpoint must trigger OllpRetryRequired, got {:?}",
+        resp.error_code
+    );
+
+    // No delete occurred: e1 is still present.
+    let payload = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        PhysicalPlan::Document(DocumentOp::PointGet {
+            collection: COLLECTION.into(),
+            document_id: "e1".into(),
+            rls_filters: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+            surrogate: surrogate_for("e1"),
+            pk_bytes: "e1".as_bytes().to_vec(),
+        }),
+    );
+    let val = payload_value(&payload);
+    assert_eq!(
+        val.get("_to").and_then(|v| v.as_str()),
+        Some("z"),
+        "edge doc must not have been deleted"
+    );
+}
+
+/// A matched doc's `_type` (label) was concurrently changed → retry.
+#[test]
+fn bulk_delete_changed_edge_label_returns_ollp_retry_required() {
+    let mut ctx = make_ctx();
+    insert_active_edge(&mut ctx, "e1", "a", "b", Some("ROAD"));
+
+    let predicted = vec![surrogate_u32("e1")];
+    let edges = vec![predicted_edge("e1", "a", "b", Some("ROAD"))];
+
+    // Concurrent UPDATE: label changed ROAD → RAIL.
+    insert_active_edge(&mut ctx, "e1", "a", "b", Some("RAIL"));
+
+    let resp = send_raw(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        bulk_delete_plan_with_edges(Some(predicted), Some(edges)),
+    );
+    assert_eq!(resp.status, Status::Error);
+    assert_eq!(resp.error_code, Some(ErrorCode::OllpRetryRequired));
+}
+
+/// A NEW edge appeared among the matched docs (a matched doc gained `_from`/`_to`
+/// after recon). Surrogate set unchanged → only edge-content check catches it.
+#[test]
+fn bulk_delete_appeared_edge_returns_ollp_retry_required() {
+    let mut ctx = make_ctx();
+    // At recon time "p1" was a plain (non-edge) active doc.
+    insert_active(&mut ctx, "p1");
+
+    let predicted = vec![surrogate_u32("p1")];
+    // Predicted edge set is EMPTY — p1 was not an edge at recon.
+    let edges: Vec<OllpPredictedEdge> = vec![];
+
+    // Concurrent UPDATE: p1 gained `_from`/`_to`, becoming an edge.
+    insert_active_edge(&mut ctx, "p1", "a", "b", None);
+
+    let resp = send_raw(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        bulk_delete_plan_with_edges(Some(predicted), Some(edges)),
+    );
+    assert_eq!(resp.status, Status::Error);
+    assert_eq!(resp.error_code, Some(ErrorCode::OllpRetryRequired));
+}
+
+/// `ollp_predicted_edges: None` → edge-content check is skipped entirely; the
+/// delete proceeds on the surrogate check alone (back-compat with non-OLLP and
+/// surrogate-only OLLP plans).
+#[test]
+fn bulk_delete_no_predicted_edges_skips_edge_check() {
+    let mut ctx = make_ctx();
+    insert_active_edge(&mut ctx, "e1", "a", "b", Some("ROAD"));
+
+    let predicted = vec![surrogate_u32("e1")];
+    let resp = send_raw(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        bulk_delete_plan_with_edges(Some(predicted), None),
+    );
+    assert_eq!(
+        resp.status,
+        Status::Ok,
+        "absent predicted edges must skip edge validation"
+    );
 }
 
 /// After OllpRetryRequired, the caller re-scans and retries with the corrected

@@ -173,6 +173,7 @@ pub(in super::super) fn convert_update(
                 updates,
                 returning: None,
                 ollp_predicted_surrogates: None,
+                ollp_predicted_edges: None,
             }),
             post_set_op: PostSetOp::None,
         }])
@@ -243,6 +244,7 @@ pub(in super::super) fn convert_delete(
                 filters: filter_bytes,
                 returning: None,
                 ollp_predicted_surrogates: None,
+                ollp_predicted_edges: None,
             }),
             post_set_op: PostSetOp::None,
         }])

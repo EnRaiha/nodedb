@@ -5,6 +5,43 @@ use nodedb_types::{Surrogate, SurrogateBitmap, SystemTimeScope};
 use super::merge_types::MergeClauseOp;
 use super::types::{EnforcementOptions, RegisteredIndex, ReturningSpec, StorageMode, UpdateValue};
 
+/// One predicted implicit graph edge carried in an OLLP `BulkDelete` plan.
+///
+/// The Control Plane recon scan surfaces, for every matched edge document
+/// (a schemaless doc carrying `_from`/`_to`), the tuple
+/// `(surrogate, _from, _to, _type)`. The data plane recomputes the SAME tuple
+/// from the actual stored docs at execution time and compares the sorted sets;
+/// any divergence (a matched doc's `_from`/`_to`/`_type` concurrently changed,
+/// or an edge appeared/disappeared among the matched docs between recon and
+/// execution) yields `OllpRetryRequired` before any write — closing the
+/// recon→execute content TOCTOU that the surrogate-set check alone misses.
+///
+/// `label` is the raw `_type` exactly as stored (or `None` when absent); the
+/// default-label substitution is NOT applied here so both sides compare the
+/// raw stored value.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct OllpPredictedEdge {
+    // Field order is the canonical sort order (derived `Ord`): both the
+    // control-plane injector and the data-plane verifier sort by
+    // `(surrogate, from, to, label)` via `sort_unstable`, so the two sides
+    // produce identical orderings and the set comparison is well-defined.
+    pub surrogate: u32,
+    pub from: String,
+    pub to: String,
+    pub label: Option<String>,
+}
+
 /// Document engine physical operations (schemaless + strict + DML).
 #[derive(
     Debug,
@@ -312,6 +349,14 @@ pub enum DocumentOp {
         /// writing. `None` on the non-OLLP (static-set) path — no verification.
         #[serde(default)]
         ollp_predicted_surrogates: Option<Vec<u32>>,
+        /// Optimistic pre-execution predicted implicit edges (OLLP path).
+        ///
+        /// Carried for symmetry/forward-use with `BulkDelete`. Edge-content
+        /// drift validation currently runs only on the `BulkDelete` path
+        /// (implicit-edge DELETE); the executor leaves this field unused for
+        /// `BulkUpdate`. `None` on the non-OLLP path.
+        #[serde(default)]
+        ollp_predicted_edges: Option<Vec<OllpPredictedEdge>>,
     },
 
     /// Bulk delete: scan + delete all matches.
@@ -329,6 +374,16 @@ pub enum DocumentOp {
         /// writing. `None` on the non-OLLP (static-set) path — no verification.
         #[serde(default)]
         ollp_predicted_surrogates: Option<Vec<u32>>,
+        /// Optimistic pre-execution predicted implicit edges (OLLP path).
+        ///
+        /// When `Some`, the executor recomputes the actual edge set
+        /// (`(surrogate, _from, _to, _type)` per matched edge doc) from the
+        /// stored docs and compares the sorted sets. On ANY divergence it
+        /// returns `OllpRetryRequired` BEFORE any write, closing the
+        /// recon→execute content TOCTOU on `_from`/`_to`/`_type`. `None` on the
+        /// non-OLLP path (no edge-content verification).
+        #[serde(default)]
+        ollp_predicted_edges: Option<Vec<OllpPredictedEdge>>,
     },
 
     /// MERGE: join-based multi-action DML (INSERT / UPDATE / DELETE per WHEN arm).

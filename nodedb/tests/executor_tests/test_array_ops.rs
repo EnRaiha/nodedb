@@ -113,6 +113,7 @@ fn array_contains_filter() {
             updates: vec![],
             returning: None,
             ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
         }),
     );
 
@@ -147,6 +148,7 @@ fn array_contains_all_filter() {
             updates: vec![],
             returning: None,
             ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
         }),
     );
 
@@ -181,6 +183,7 @@ fn array_overlap_filter() {
             updates: vec![],
             returning: None,
             ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
         }),
     );
 
@@ -302,6 +305,7 @@ fn no_match_returns_zero() {
             updates: vec![],
             returning: None,
             ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
         }),
     );
 

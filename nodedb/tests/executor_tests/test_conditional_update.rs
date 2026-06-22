@@ -115,6 +115,7 @@ fn bulk_update_returns_affected_count() {
             updates,
             returning: None,
             ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
         }),
     );
 
@@ -157,6 +158,7 @@ fn conditional_decrement_stops_at_zero() {
                 updates,
                 returning: None,
                 ollp_predicted_surrogates: None,
+                ollp_predicted_edges: None,
             }),
         );
 
@@ -201,6 +203,7 @@ fn bulk_update_zero_match_returns_zero_affected() {
             updates,
             returning: None,
             ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
         }),
     );
 
@@ -232,6 +235,7 @@ fn bulk_update_returning_returns_updated_documents() {
             updates,
             returning: None,
             ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
         }),
     );
 
@@ -262,6 +266,7 @@ fn bulk_update_returning_zero_match_returns_affected_zero() {
             updates,
             returning: None,
             ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
         }),
     );
 
@@ -368,6 +373,7 @@ fn transaction_batch_does_not_abort_on_zero_row_update() {
                     )],
                     returning: None,
                     ollp_predicted_surrogates: None,
+                    ollp_predicted_edges: None,
                 }),
                 PhysicalPlan::Document(DocumentOp::BulkUpdate {
                     collection: "products".into(),
@@ -380,6 +386,7 @@ fn transaction_batch_does_not_abort_on_zero_row_update() {
                     )],
                     returning: None,
                     ollp_predicted_surrogates: None,
+                    ollp_predicted_edges: None,
                 }),
             ],
         }),

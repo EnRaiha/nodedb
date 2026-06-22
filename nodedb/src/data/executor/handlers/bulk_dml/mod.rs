@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Bulk DML handlers: BulkUpdate, BulkDelete.
+//!
+//! These operate on document sets matching ScanFilter predicates,
+//! unlike PointUpdate/PointDelete which require `WHERE id = 'x'`.
+
+pub mod delete;
+pub mod scan;
+pub mod update;
+
+pub(in crate::data::executor) use delete::OllpPrediction;
+pub(in crate::data::executor) use update::BulkUpdateParams;

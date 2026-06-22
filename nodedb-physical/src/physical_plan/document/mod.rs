@@ -12,7 +12,7 @@ pub use enforcement_types::{
     RetentionDuration, RetentionUnit, StateTransitionDef, TransitionCheckDef, TransitionRule,
 };
 pub use merge_types::{MergeActionOp, MergeClauseKind as MergeClauseKindOp, MergeClauseOp};
-pub use op::DocumentOp;
+pub use op::{DocumentOp, OllpPredictedEdge};
 pub use types::{
     BalancedDef, EnforcementOptions, GeneratedColumnSpec, MaterializedSumBinding, PeriodLockConfig,
     RegisteredIndex, RegisteredIndexState, ReturningColumns, ReturningItem, ReturningSpec,

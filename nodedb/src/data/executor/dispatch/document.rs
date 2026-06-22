@@ -239,6 +239,10 @@ impl CoreLoop {
                 updates,
                 returning,
                 ollp_predicted_surrogates,
+                // Edge-content drift validation runs only on the BulkDelete
+                // (implicit-edge DELETE) path; carried on BulkUpdate for
+                // forward-use but intentionally unused here.
+                ollp_predicted_edges: _,
             } => self.execute_bulk_update(
                 task,
                 tid,
@@ -256,13 +260,17 @@ impl CoreLoop {
                 filters,
                 returning,
                 ollp_predicted_surrogates,
+                ollp_predicted_edges,
             } => self.execute_bulk_delete(
                 task,
                 tid,
                 collection,
                 filters,
                 returning.as_ref(),
-                ollp_predicted_surrogates.as_deref(),
+                crate::data::executor::handlers::bulk_dml::OllpPrediction {
+                    surrogates: ollp_predicted_surrogates.as_deref(),
+                    edges: ollp_predicted_edges.as_deref(),
+                },
             ),
 
             DocumentOp::Upsert {

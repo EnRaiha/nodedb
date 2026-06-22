@@ -29,8 +29,8 @@ pub use columnar::{ColumnarInsertIntent, ColumnarOp};
 pub use crdt::CrdtOp;
 pub use document::{
     BalancedDef, DocumentOp, EnforcementOptions, GeneratedColumnSpec, MaterializedSumBinding,
-    PeriodLockConfig, RegisteredIndex, RegisteredIndexState, ReturningColumns, ReturningItem,
-    ReturningSpec, StorageMode, UpdateValue,
+    OllpPredictedEdge, PeriodLockConfig, RegisteredIndex, RegisteredIndexState, ReturningColumns,
+    ReturningItem, ReturningSpec, StorageMode, UpdateValue,
 };
 pub use exchange::{ExchangeMode, ExchangeOp};
 pub use graph::{BatchEdge, GraphOp};

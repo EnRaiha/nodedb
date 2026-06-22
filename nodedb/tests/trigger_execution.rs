@@ -184,6 +184,7 @@ fn classify_bulk_delete() {
         filters: vec![],
         returning: None,
         ollp_predicted_surrogates: None,
+        ollp_predicted_edges: None,
     });
     let info = classify_dml_write(&plan).unwrap();
     assert_eq!(info.collection, "logs");

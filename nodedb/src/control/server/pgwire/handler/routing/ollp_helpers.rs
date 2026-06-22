@@ -5,7 +5,7 @@
 //! These helpers are called from `execute_planned_sql_inner` when a
 //! multi-shard strict transaction contains a value-dependent predicate.
 
-use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{DocumentOp, OllpPredictedEdge, PhysicalPlan};
 
 /// Extract the collection name and serialized filter bytes from a
 /// `BulkUpdate` or `BulkDelete` plan.
@@ -43,6 +43,37 @@ pub(super) fn inject_ollp_surrogates(plan: &mut PhysicalPlan, surrogates: Vec<u3
             ..
         }) => {
             *ollp_predicted_surrogates = Some(surrogates);
+        }
+        _ => {}
+    }
+}
+
+/// Inject `ollp_predicted_edges` into a `BulkUpdate` or `BulkDelete` plan
+/// in-place.
+///
+/// `edges` is sorted by `(surrogate, from, to, label)` before storing so the
+/// data-plane edge-content comparison is order-independent — mirroring how
+/// `inject_ollp_surrogates` relies on the surrogate set being sorted. Other
+/// plan variants are left unchanged; calling on a non-bulk plan is a no-op.
+/// Edge-content validation currently runs only on the `BulkDelete` path, but
+/// the field is set on whichever bulk variant the plan is for symmetry.
+pub(super) fn inject_ollp_predicted_edges(
+    plan: &mut PhysicalPlan,
+    mut edges: Vec<OllpPredictedEdge>,
+) {
+    // Canonical `(surrogate, from, to, label)` order via derived `Ord`, matching
+    // the data-plane verifier's sort so the set comparison is well-defined.
+    edges.sort_unstable();
+    match plan {
+        PhysicalPlan::Document(DocumentOp::BulkUpdate {
+            ollp_predicted_edges,
+            ..
+        })
+        | PhysicalPlan::Document(DocumentOp::BulkDelete {
+            ollp_predicted_edges,
+            ..
+        }) => {
+            *ollp_predicted_edges = Some(edges);
         }
         _ => {}
     }

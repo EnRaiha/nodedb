@@ -37,6 +37,12 @@ use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 /// the label the matching INSERT used.
 #[derive(Clone)]
 pub struct ScannedEdge {
+    /// Surrogate of the edge DOCUMENT (the `_from`/`_to`-carrying schemaless
+    /// doc), parsed from the row's `id`. Carried so the data plane can
+    /// validate edge CONTENT (not just the matched surrogate set) against the
+    /// actual stored docs at execution time, closing the recon→execute TOCTOU
+    /// on `_from`/`_to`/`_type`.
+    pub surrogate: u32,
     pub from: String,
     pub to: String,
     pub label: Option<String>,
@@ -191,11 +197,18 @@ fn decode_scan_json(json_str: &str) -> PreexecScan {
         && rows.is_array()
     {
         for row in rows.as_array().into_iter().flatten() {
-            if let Some(id_val) = row.get("id")
-                && let Some(id_str) = id_val.as_str()
-                && id_str.len() == 8
-                && let Ok(surrogate) = u32::from_str_radix(id_str, 16)
-            {
+            // Parse the row's surrogate ONCE and reuse it for both the
+            // surrogate set and the edge record. A row whose `id` is not a
+            // parseable 8-hex surrogate is a legacy non-surrogate document: it
+            // is excluded from the surrogate set AND cannot be a surrogate-keyed
+            // edge doc, so any edge it carries is skipped too.
+            let surrogate = row
+                .get("id")
+                .and_then(|id_val| id_val.as_str())
+                .filter(|id_str| id_str.len() == 8)
+                .and_then(|id_str| u32::from_str_radix(id_str, 16).ok());
+
+            if let Some(surrogate) = surrogate {
                 surrogates.push(surrogate);
             }
 
@@ -213,13 +226,17 @@ fn decode_scan_json(json_str: &str) -> PreexecScan {
                 .as_ref()
                 .and_then(|d| d.get("_to"))
                 .and_then(|v| v.as_str());
-            if let (Some(from), Some(to)) = (from, to) {
+            // Only record an edge when the row is BOTH a surrogate-keyed doc
+            // AND carries both endpoints — content-drift validation keys edges
+            // by surrogate, so an unparseable-id edge row is not a real edge.
+            if let (Some(surrogate), Some(from), Some(to)) = (surrogate, from, to) {
                 let label = data
                     .as_ref()
                     .and_then(|d| d.get("_type"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 edges.push(ScannedEdge {
+                    surrogate,
                     from: from.to_string(),
                     to: to.to_string(),
                     label,
@@ -266,6 +283,8 @@ mod tests {
             .expect("edge a->b present");
         assert_eq!(road.to, "b");
         assert_eq!(road.label.as_deref(), Some("ROAD"));
+        // The edge carries the document's surrogate (id "0000002a" → 42).
+        assert_eq!(road.surrogate, 42);
         let untyped = scan
             .edges
             .iter()
@@ -273,12 +292,17 @@ mod tests {
             .expect("edge c->d present");
         assert_eq!(untyped.to, "d");
         assert_eq!(untyped.label, None);
+        // id "0000000b" → 11.
+        assert_eq!(untyped.surrogate, 11);
     }
 
     #[test]
     fn decode_json_row_without_both_endpoints_is_not_an_edge() {
         // `_from` present but no `_to` → surrogate extracted, no edge recorded.
-        let json = r#"[{"id":"00000005","_from":"x"}]"#;
+        // The fixture must use the wire shape emitted by `encode_raw_document_rows`:
+        // `{"id": "..", "data": {..fields..}}`.  A top-level `_from` would test
+        // the "no `data` field" branch instead of the intended one.
+        let json = r#"[{"id":"00000005","data":{"_from":"x"}}]"#;
         let scan = decode_scan_json(json);
         assert_eq!(scan.surrogates, vec![5]);
         assert!(scan.edges.is_empty());

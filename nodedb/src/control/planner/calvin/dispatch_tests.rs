@@ -61,6 +61,7 @@ fn bulk_update_task(vshard: u32) -> PhysicalTask {
             updates: vec![],
             returning: None,
             ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
         }),
         post_set_op: PostSetOp::None,
     }

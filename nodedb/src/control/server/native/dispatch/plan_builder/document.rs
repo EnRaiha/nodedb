@@ -328,6 +328,7 @@ pub(crate) fn build_bulk_update(
         updates,
         returning: None,
         ollp_predicted_surrogates: None,
+        ollp_predicted_edges: None,
     }))
 }
 
@@ -347,6 +348,7 @@ pub(crate) fn build_bulk_delete(
         filters,
         returning: None,
         ollp_predicted_surrogates: None,
+        ollp_predicted_edges: None,
     }))
 }
 
