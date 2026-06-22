@@ -3,6 +3,7 @@
 //! Single cluster node: struct, spawn/shutdown lifecycle, and a suite
 //! of local-state inspector methods used by integration tests.
 
+pub mod graph;
 pub mod inspect;
 pub mod lifecycle;
 

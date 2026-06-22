@@ -50,24 +50,9 @@
 
 use std::time::Duration;
 
-use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
-
 mod common;
 
 use crate::common::cluster_harness::{TestCluster, wait_for};
-
-/// Observed sequencer-group leader id from a node's local Raft status, or `0` if
-/// no leader is known yet.
-fn sequencer_leader(node: &common::cluster_harness::TestClusterNode) -> u64 {
-    let Some(status_fn) = node.shared.raft_status_fn.get() else {
-        return 0;
-    };
-    status_fn()
-        .into_iter()
-        .find(|g| g.group_id == SEQUENCER_GROUP_ID)
-        .map(|g| g.leader_id)
-        .unwrap_or(0)
-}
 
 /// HOLLOW w.r.t. OLLP: this collection has no edges, so the edge-bearing routing
 /// gate does not trip and the predicate `DELETE` runs on the SingleShard fast
@@ -107,16 +92,16 @@ async fn ollp_dependent_delete_from_non_leader_coordinator_completes() {
         Duration::from_secs(15),
         Duration::from_millis(50),
         || {
-            cluster.nodes.iter().all(|n| sequencer_leader(n) != 0)
+            cluster.nodes.iter().all(|n| n.sequencer_leader() != 0)
                 && cluster
                     .nodes
                     .iter()
-                    .all(|n| sequencer_leader(n) == sequencer_leader(&cluster.nodes[0]))
+                    .all(|n| n.sequencer_leader() == cluster.nodes[0].sequencer_leader())
         },
     )
     .await;
 
-    let leader = sequencer_leader(&cluster.nodes[0]);
+    let leader = cluster.nodes[0].sequencer_leader();
     assert_ne!(leader, 0, "sequencer leader must be elected");
 
     // Insert 3 rows from node 0; two 'active', one 'inactive'.
@@ -186,37 +171,6 @@ async fn ollp_dependent_delete_from_non_leader_coordinator_completes() {
     cluster.shutdown().await;
 }
 
-/// Distinct node ids reached by a `GRAPH TRAVERSE` whose single `result` row is
-/// a JSON object with a `nodes` array of `{id}` objects.
-fn traversed_node_ids(node: &common::cluster_harness::TestClusterNode, sql: &str) -> Vec<String> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            let msgs = node.client.simple_query(sql).await.expect("graph traverse");
-            let row = msgs
-                .iter()
-                .find_map(|m| match m {
-                    tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
-                    _ => None,
-                })
-                .expect("graph traverse returned no result row");
-            let raw = row.get("result").expect("result column present");
-            let v: serde_json::Value =
-                serde_json::from_str(raw).expect("result column is valid JSON");
-            v.get("nodes")
-                .and_then(|n| n.as_array())
-                .expect("traverse result has a nodes array")
-                .iter()
-                .map(|n| {
-                    n.get("id")
-                        .and_then(|id| id.as_str())
-                        .expect("node has string id")
-                        .to_string()
-                })
-                .collect()
-        })
-    })
-}
-
 /// IMPLICIT-edge cleanup on a predicate (`BulkDelete`) OLLP delete, cross-shard.
 ///
 /// Schemaless documents carrying `_from`/`_to` auto-create a graph edge on
@@ -263,16 +217,16 @@ async fn ollp_implicit_edge_delete_cleans_reverse_cross_node() {
         Duration::from_secs(15),
         Duration::from_millis(50),
         || {
-            cluster.nodes.iter().all(|n| sequencer_leader(n) != 0)
+            cluster.nodes.iter().all(|n| n.sequencer_leader() != 0)
                 && cluster
                     .nodes
                     .iter()
-                    .all(|n| sequencer_leader(n) == sequencer_leader(&cluster.nodes[0]))
+                    .all(|n| n.sequencer_leader() == cluster.nodes[0].sequencer_leader())
         },
     )
     .await;
 
-    let leader = sequencer_leader(&cluster.nodes[0]);
+    let leader = cluster.nodes[0].sequencer_leader();
     assert_ne!(leader, 0, "sequencer leader must be elected");
 
     // src_0..src_11 -> hub as IMPLICIT edges (plain docs carrying _from/_to/_type).
@@ -301,11 +255,9 @@ async fn ollp_implicit_edge_delete_cleans_reverse_cross_node() {
             Duration::from_secs(20),
             Duration::from_millis(100),
             || {
-                traversed_node_ids(
-                    &cluster.nodes[idx],
-                    "GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
-                )
-                .len()
+                cluster.nodes[idx]
+                    .traversed_node_ids("GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in")
+                    .len()
                     > SOURCES
             },
         )
@@ -374,10 +326,8 @@ async fn ollp_implicit_edge_delete_cleans_reverse_cross_node() {
             Duration::from_secs(20),
             Duration::from_millis(100),
             || {
-                let ids = traversed_node_ids(
-                    &cluster.nodes[idx],
-                    "GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
-                );
+                let ids = cluster.nodes[idx]
+                    .traversed_node_ids("GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in");
                 // Only the start node `hub` should remain reachable.
                 ids.iter().all(|id| id == "hub")
             },
