@@ -61,11 +61,27 @@ impl ShardPageRankState {
     }
 
     /// Execute one superstep. Returns (local_delta, outbound_contributions).
+    ///
+    /// Incoming cross-shard contributions accumulated via
+    /// [`Self::add_remote_contribution`] are folded into `next_rank`
+    /// **after** the local scatter and **before** the rank swap. This
+    /// ordering is mandatory for a stateless per-superstep round trip:
+    /// the previous design applied incoming contributions in a separate
+    /// `apply_incoming_contributions` call that mutated `next_rank` after
+    /// the swap, which silently landed them in the *previous* iteration's
+    /// rank vector. Threading them through `superstep` makes a single
+    /// `superstep(...)` invocation the complete, self-contained iteration
+    /// the distributed BSP handler round-trips per step.
+    ///
+    /// `node_id_to_local` maps an incoming contribution's destination
+    /// vertex name to its local dense index; contributions whose target
+    /// is not owned by this shard are dropped.
     pub fn superstep(
         &mut self,
         damping: f64,
         global_n: usize,
         local_edge_iter: &dyn Fn(u32) -> Vec<u32>,
+        node_id_to_local: &dyn Fn(&str) -> Option<u32>,
     ) -> (f64, HashMap<u16, Vec<(String, f64)>>) {
         let n = global_n as f64;
         let teleport = (1.0 - damping) / n;
@@ -108,6 +124,14 @@ impl ShardPageRankState {
             }
         }
 
+        // Fold incoming cross-shard contributions into next_rank BEFORE the
+        // swap so they land in the iteration being computed, not the prior one.
+        for (vertex_name, contrib) in &self.incoming_contributions {
+            if let Some(local_id) = node_id_to_local(vertex_name) {
+                self.next_rank[local_id as usize] += contrib;
+            }
+        }
+
         let delta: f64 = self
             .rank
             .iter()
@@ -119,14 +143,6 @@ impl ShardPageRankState {
         self.incoming_contributions.clear();
 
         (delta, outbound)
-    }
-
-    pub fn apply_incoming_contributions(&mut self, node_id_to_local: &dyn Fn(&str) -> Option<u32>) {
-        for (vertex_name, contrib) in &self.incoming_contributions {
-            if let Some(local_id) = node_id_to_local(vertex_name) {
-                self.next_rank[local_id as usize] += contrib;
-            }
-        }
     }
 
     pub fn add_remote_contribution(&mut self, vertex_name: String, value: f64) {
@@ -170,12 +186,17 @@ mod tests {
     #[test]
     fn shard_superstep_local_only() {
         let mut state = ShardPageRankState::init(3, vec![1, 1, 1], |_| None, &|_| Vec::new());
-        let (delta, outbound) = state.superstep(0.85, 3, &|node| match node {
-            0 => vec![1],
-            1 => vec![2],
-            2 => vec![0],
-            _ => Vec::new(),
-        });
+        let (delta, outbound) = state.superstep(
+            0.85,
+            3,
+            &|node| match node {
+                0 => vec![1],
+                1 => vec![2],
+                2 => vec![0],
+                _ => Vec::new(),
+            },
+            &|_name| None,
+        );
         assert!(outbound.is_empty());
         assert!(delta >= 0.0);
         let sum: f64 = state.rank.iter().sum();

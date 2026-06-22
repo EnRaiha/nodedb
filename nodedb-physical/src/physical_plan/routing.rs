@@ -93,6 +93,7 @@ pub fn plan_contains_cluster_partitioned_leaf(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Graph(GraphOp::MatchContinuation { .. })
         | PhysicalPlan::Graph(GraphOp::TemporalNeighbors { .. })
         | PhysicalPlan::Graph(GraphOp::TemporalAlgorithm { .. })
+        | PhysicalPlan::Graph(GraphOp::BspSuperstep(_))
         | PhysicalPlan::Graph(GraphOp::Stats { .. }) => true,
 
         // Array ops are cluster-partitioned by tile-id.

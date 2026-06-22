@@ -109,7 +109,8 @@ pub(super) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Meta(MetaOp::Checkpoint)
         | PhysicalPlan::Graph(GraphOp::Algo { .. })
         | PhysicalPlan::Graph(GraphOp::Match { .. })
-        | PhysicalPlan::Graph(GraphOp::MatchContinuation { .. }) => None,
+        | PhysicalPlan::Graph(GraphOp::MatchContinuation { .. })
+        | PhysicalPlan::Graph(GraphOp::BspSuperstep(_)) => None,
         // Exchange: recurse into the child plan to extract the collection.
         PhysicalPlan::Query(QueryOp::Exchange(op)) => extract_collection(&op.child),
         // ProviderScan is a catalog/constant source — no user collection.
@@ -148,6 +149,7 @@ pub(super) fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Graph(GraphOp::Algo { .. })
         | PhysicalPlan::Graph(GraphOp::Match { .. })
         | PhysicalPlan::Graph(GraphOp::MatchContinuation { .. })
+        | PhysicalPlan::Graph(GraphOp::BspSuperstep(_))
         | PhysicalPlan::Text(TextOp::Search { .. })
         | PhysicalPlan::Text(TextOp::PhraseSearch { .. })
         | PhysicalPlan::Text(TextOp::HybridSearch { .. })

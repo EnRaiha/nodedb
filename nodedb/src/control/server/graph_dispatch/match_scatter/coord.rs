@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::bridge::envelope::Payload;
-use crate::control::gateway::router::resolve_decision;
 use crate::control::gateway::RouteDecision;
+use crate::control::gateway::router::resolve_decision;
 use crate::control::state::SharedState;
 use crate::engine::graph::pattern::executor::{UnresolvedExpansion, rows_to_msgpack};
 use crate::types::{DatabaseId, TenantId, VShardId};

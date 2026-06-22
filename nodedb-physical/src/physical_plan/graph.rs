@@ -222,6 +222,19 @@ pub enum GraphOp {
         source_binding: String,
     },
 
+    /// One distributed-PageRank BSP superstep on this shard's local CSR.
+    ///
+    /// Phase A primitive: the Control-Plane coordinator (Phase B) round-trips
+    /// this op once per superstep, threading the per-shard rank vector back in
+    /// via `rank_vec` and routing cross-shard contributions to the owning shard
+    /// via `incoming_contributions`. The handler is stateless across calls —
+    /// all per-superstep state lives in this variant and `BspSuperstepResult`.
+    ///
+    /// Boxed because the payload (params + three vectors) is large and
+    /// `PhysicalPlan` is cloned/moved across the SPSC bridge on every request;
+    /// keeping the common variants small avoids bloating the whole enum.
+    BspSuperstep(Box<BspSuperstepPlan>),
+
     /// Set node labels (bitset-based, up to 64 distinct labels).
     SetNodeLabels {
         node_id: String,
@@ -284,4 +297,78 @@ pub enum GraphOp {
         collection: Option<String>,
         as_of: Option<i64>,
     },
+}
+
+/// Boxed payload of [`GraphOp::BspSuperstep`] — all per-superstep inputs.
+///
+/// Kept out-of-line (the variant holds a `Box`) so the large param + vector
+/// fields don't bloat `PhysicalPlan`, which is cloned/moved on every request.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct BspSuperstepPlan {
+    /// Algorithm selector. Only `PageRank` is supported in Phase A; other
+    /// variants surface a typed `Unsupported` error from the handler.
+    pub algorithm: GraphAlgorithm,
+    /// Algorithm parameters. Carries the target `collection` (mirroring `Algo`)
+    /// plus `damping`.
+    pub params: AlgoParams,
+    /// Zero-based superstep index. `0` triggers `1/global_n` initialization.
+    pub superstep: u32,
+    /// Total OWNED nodes across all shards (Control-Plane computed). Used as the
+    /// PageRank `n` in the teleport / dangling redistribution terms.
+    pub global_n: usize,
+    /// The vShards this shard owns (Control-Plane supplied). A destination node
+    /// whose `VShardId::from_key(name)` is not in this set is a ghost
+    /// (cross-shard) edge target and its contribution is emitted in `outbound`
+    /// rather than scattered locally.
+    pub owned_vshards: Vec<u32>,
+    /// Cross-shard contributions routed to THIS shard's owned nodes for this
+    /// superstep: `(dst_node_name, contribution)`.
+    pub incoming_contributions: Vec<(String, f64)>,
+    /// Round-tripped per-shard rank vector, indexed identically to the
+    /// response's `node_names`. EMPTY on superstep 0 → the handler initializes
+    /// each owned node to `1/global_n`.
+    pub rank_vec: Vec<f64>,
+}
+
+/// Result of one [`GraphOp::BspSuperstep`] on a single shard.
+///
+/// `rank_vec` and `node_names` are positionally aligned: `rank_vec[i]` is the
+/// post-superstep PageRank of the owned node `node_names[i]`. The Control-Plane
+/// coordinator (Phase B) round-trips `rank_vec` back into the next superstep's
+/// `GraphOp::BspSuperstep::rank_vec` and uses `node_names` to map indices back
+/// to node identities for final assembly and for routing `outbound`
+/// contributions to the owning shard. `node_names` is returned on every
+/// superstep (it is cheap and keeps the op stateless).
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct BspSuperstepResult {
+    /// Sum of `|rank_old - rank_new|` over this shard's owned nodes — the
+    /// shard's contribution to the global convergence delta.
+    pub local_delta: f64,
+    /// Cross-shard contributions to scatter to other shards next superstep:
+    /// `(target_vshard, dst_node_name, contribution)`.
+    pub outbound: Vec<(u32, String, f64)>,
+    /// Post-superstep rank vector over this shard's owned nodes, aligned with
+    /// `node_names`.
+    pub rank_vec: Vec<f64>,
+    /// Number of owned nodes on this shard (== `rank_vec.len()`).
+    pub vertex_count: usize,
+    /// Owned-node names, positionally aligned with `rank_vec`.
+    pub node_names: Vec<String>,
 }

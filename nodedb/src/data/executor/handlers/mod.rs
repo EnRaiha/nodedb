@@ -18,6 +18,7 @@ pub mod fts_sync;
 pub mod generated;
 pub mod graph;
 pub mod graph_algo;
+pub mod graph_bsp;
 pub mod graph_match;
 pub mod graph_rag;
 pub mod graph_rag_triple;

@@ -283,6 +283,20 @@ impl CoreLoop {
                 self.execute_graph_temporal_algo(task, tid, algorithm, params, system_as_of_ms)
             }
 
+            GraphOp::BspSuperstep(plan) => self.execute_bsp_superstep(
+                task,
+                tid,
+                super::super::handlers::graph_bsp::BspSuperstepArgs {
+                    algorithm: &plan.algorithm,
+                    params: &plan.params,
+                    superstep: plan.superstep,
+                    global_n: plan.global_n,
+                    owned_vshards: &plan.owned_vshards,
+                    incoming_contributions: &plan.incoming_contributions,
+                    rank_vec: &plan.rank_vec,
+                },
+            ),
+
             GraphOp::Stats { collection, as_of } => {
                 self.execute_graph_stats(task, tid, collection.as_deref(), *as_of)
             }
