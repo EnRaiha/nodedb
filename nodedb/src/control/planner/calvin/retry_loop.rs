@@ -34,21 +34,21 @@ use crate::control::planner::calvin::submit::RoutedAssignment;
 /// live server/executor: a fake scheduler driving the real
 /// [`CalvinCompletionRegistry`] suffices.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_dependent_with_retry<SF, SFut, RF, RFut>(
+pub async fn run_dependent_with_retry<P, SF, SFut, RF, RFut>(
     registry: &CalvinCompletionRegistry,
     orchestrator: &OllpOrchestrator,
     predicate_class_hash: u64,
     timeout: std::time::Duration,
     ollp_max_retries: u32,
-    initial_predicted: Vec<u32>,
+    initial_predicted: P,
     mut submit: SF,
     mut rescan: RF,
 ) -> crate::Result<()>
 where
-    SF: FnMut(&[u32]) -> SFut,
+    SF: FnMut(&P) -> SFut,
     SFut: std::future::Future<Output = Result<RoutedAssignment, OllpError>>,
     RF: FnMut() -> RFut,
-    RFut: std::future::Future<Output = crate::Result<Vec<u32>>>,
+    RFut: std::future::Future<Output = crate::Result<P>>,
 {
     let mut predicted = initial_predicted;
     let mut retry: u32 = 0;

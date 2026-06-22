@@ -107,7 +107,7 @@ fn converges_after_two_mismatches() {
                 std::time::Duration::from_secs(5),
                 5,
                 vec![1, 2, 3],
-                move |_predicted: &[u32]| {
+                move |_predicted: &Vec<u32>| {
                     let seq = Arc::clone(&seq);
                     let submit_calls = Arc::clone(&submit_calls);
                     let tx = tx.clone();
@@ -175,7 +175,7 @@ fn exhausts_on_persistent_mismatch() {
                 std::time::Duration::from_secs(5),
                 3,
                 vec![1],
-                move |_predicted: &[u32]| {
+                move |_predicted: &Vec<u32>| {
                     let seq = Arc::clone(&seq);
                     let submit_calls = Arc::clone(&submit_calls);
                     let tx = tx.clone();
@@ -238,7 +238,7 @@ fn pre_admission_retry_does_not_rescan() {
                 std::time::Duration::from_secs(5),
                 5,
                 vec![1],
-                move |_predicted: &[u32]| {
+                move |_predicted: &Vec<u32>| {
                     let seq = Arc::clone(&seq);
                     let submit_calls = Arc::clone(&submit_calls);
                     let tx = tx.clone();

@@ -81,6 +81,18 @@ pub async fn insert_edge(
     let properties_json = properties_to_json(properties)?;
     let tenant_id = identity.tenant_id;
 
+    // Flag the collection edge-bearing so a later predicate DELETE on it routes
+    // through OLLP (which derives the matching `EdgeDelete`) instead of the
+    // single-shard fast path. Idempotent; skips the Raft write once already set.
+    crate::control::planner::implicit_edges::mark_collection_edge_bearing(
+        state,
+        database_id,
+        tenant_id,
+        &collection,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+
     // Dual-home routing (F1b-dualhome): an edge is reachable from BOTH endpoints
     // (forward from src, reverse from dst), so a cross-shard edge must be written
     // on the home vShard of src AND dst — otherwise reverse/IN traversal that

@@ -43,6 +43,58 @@ struct ImplicitEdge {
     weight: Option<f64>,
 }
 
+/// Mark a collection as edge-bearing in the system catalog (idempotent).
+///
+/// Sets [`StoredCollection::has_implicit_edges`] to `true` the first time an
+/// edge (implicit `_from`/`_to` document, or explicit `GRAPH INSERT EDGE`) is
+/// written into `collection`. This is the routing gate for implicit-edge
+/// DELETE cleanup — see `has_implicit_edges`'s doc comment.
+///
+/// Read-then-conditional-write: if the collection is already flagged the write
+/// is SKIPPED, so the common steady-state insert path issues zero catalog
+/// proposals (only the very first edge into a fresh collection pays the cost).
+/// If the catalog is unavailable or the collection row is absent, this is a
+/// no-op `Ok(())` — flag bookkeeping must never fail a write that otherwise
+/// succeeds. A genuine propose/put error IS propagated (not swallowed).
+///
+/// The flag is committed via the REPLICATED metadata path
+/// (`propose_catalog_entry` → `CatalogEntry::PutCollection`), exactly like
+/// CREATE/ALTER COLLECTION. A bare local `put_collection` would only update the
+/// proposing node's catalog, so a DELETE coordinated on a different node would
+/// not observe the flag and would skip implicit-edge cleanup — the bug this
+/// routing gate exists to prevent. The `log_index == 0` single-node path
+/// bypasses the applier, so it writes through locally (mirrors the DDL handlers).
+pub async fn mark_collection_edge_bearing(
+    state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    collection: &str,
+) -> crate::Result<()> {
+    let Some(catalog) = state.credentials.catalog() else {
+        // No catalog wired (e.g. minimal/test harness) — nothing to record.
+        return Ok(());
+    };
+    let Some(mut coll) = catalog.get_collection(database_id, tenant_id.as_u64(), collection)?
+    else {
+        // Collection row absent — don't fail the write over flag bookkeeping.
+        return Ok(());
+    };
+    if coll.has_implicit_edges {
+        // Already flagged — skip the proposal entirely.
+        return Ok(());
+    }
+    coll.has_implicit_edges = true;
+
+    let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
+    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
+    if log_index == 0 {
+        // Single-node path: the metadata applier's post-apply hook is bypassed,
+        // so write through to the local catalog directly.
+        catalog.put_collection(database_id, &coll)?;
+    }
+    Ok(())
+}
+
 /// Scan the current document-write tasks for `_from` / `_to` documents and
 /// append a `GraphOp::EdgePut` task per implicit edge.
 ///
@@ -90,6 +142,17 @@ pub async fn append_implicit_edge_tasks(
         }
     }
 
+    // Flag each DISTINCT edge-bearing collection exactly once. Only runs when at
+    // least one implicit edge was found, so non-edge inserts do zero catalog
+    // work. The mark is idempotent and skips the Raft write when already set.
+    let mut marked: Vec<&str> = Vec::new();
+    for edge in &edges {
+        if !marked.contains(&edge.collection.as_str()) {
+            marked.push(edge.collection.as_str());
+            mark_collection_edge_bearing(state, database_id, tenant_id, &edge.collection).await?;
+        }
+    }
+
     for edge in edges {
         let vsrc = VShardId::from_key(edge.src.as_bytes());
         let vdst = VShardId::from_key(edge.dst.as_bytes());
@@ -130,6 +193,88 @@ pub async fn append_implicit_edge_tasks(
                 label: edge.label,
                 dst_id: edge.dst,
                 properties,
+                src_surrogate,
+                dst_surrogate,
+            }),
+            post_set_op: PostSetOp::None,
+        });
+    }
+
+    Ok(())
+}
+
+/// Append a `GraphOp::EdgeDelete` task per implicit edge surfaced by the OLLP
+/// pre-execution reconnaissance scan of a predicate `DELETE`.
+///
+/// This is the symmetric counterpart to [`append_implicit_edge_tasks`]: when a
+/// schemaless edge document (`_from`/`_to`) is deleted via a predicate
+/// `BulkDelete`, the implicit graph edge auto-created for it on INSERT must be
+/// deleted in the SAME Calvin transaction, cross-shard-correctly. Each appended
+/// task is built exactly like an explicit `GRAPH DELETE EDGE`: homed on
+/// `from_key(_from)` with both endpoints' canonical surrogates resolved, so the
+/// downstream classify/Calvin logic dual-homes cross-shard deletes and
+/// single-homes same-shard deletes identically to the matching insert.
+///
+/// # Surrogate resolution never allocates
+///
+/// A delete must never *allocate* a surrogate. We reuse `assign_surrogate_routed`
+/// (the same call the INSERT side uses) because the implicit-edge invariant
+/// guarantees both endpoints are already bound — the matching INSERT assigned
+/// them — so the get-or-create path always hits the existing binding and never
+/// allocates. A read-only `lookup_surrogate_routed` is a tracked
+/// defense-in-depth follow-up; we deliberately do NOT introduce a new RPC for it
+/// in this unit.
+///
+/// # Label default
+///
+/// The label default is applied HERE via [`DEFAULT_EDGE_LABEL`] so the emitted
+/// `EdgeDelete` label matches the `EdgePut` label the matching INSERT created
+/// (which also defaults `_type`-absent edges to `"edge"`).
+pub async fn append_implicit_edge_delete_tasks(
+    state: &SharedState,
+    out: &mut Vec<PhysicalTask>,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    trace_id: TraceId,
+    collection: &str,
+    edges: &[crate::control::planner::calvin::preexec::ScannedEdge],
+) -> crate::Result<()> {
+    for edge in edges {
+        let vsrc = VShardId::from_key(edge.from.as_bytes());
+        let vdst = VShardId::from_key(edge.to.as_bytes());
+
+        let src_surrogate = assign_surrogate_routed(
+            state,
+            vsrc,
+            database_id,
+            tenant_id,
+            collection,
+            edge.from.as_bytes(),
+            trace_id,
+        )
+        .await?;
+        let dst_surrogate = assign_surrogate_routed(
+            state,
+            vdst,
+            database_id,
+            tenant_id,
+            collection,
+            edge.to.as_bytes(),
+            trace_id,
+        )
+        .await?;
+
+        let label = resolve_edge_label(edge.label.as_deref());
+
+        out.push(PhysicalTask {
+            tenant_id,
+            vshard_id: vsrc,
+            database_id,
+            plan: PhysicalPlan::Graph(GraphOp::EdgeDelete {
+                collection: collection.to_string(),
+                src_id: edge.from.clone(),
+                label,
+                dst_id: edge.to.clone(),
                 src_surrogate,
                 dst_surrogate,
             }),
@@ -191,9 +336,17 @@ fn extract_edge(collection: &str, value: &[u8]) -> Option<ImplicitEdge> {
         collection: collection.to_string(),
         src,
         dst,
-        label: label.unwrap_or_else(|| DEFAULT_EDGE_LABEL.to_string()),
+        label: resolve_edge_label(label.as_deref()),
         weight,
     })
+}
+
+/// Resolve the edge label, substituting [`DEFAULT_EDGE_LABEL`] when a document
+/// omits `_type`. Shared by the INSERT (`extract_edge`) and DELETE
+/// (`append_implicit_edge_delete_tasks`) paths so an `EdgeDelete` always uses
+/// the same label the matching `EdgePut` created.
+fn resolve_edge_label(label: Option<&str>) -> String {
+    label.unwrap_or(DEFAULT_EDGE_LABEL).to_owned()
 }
 
 /// Encode `{"weight": <w>}` as a standard-msgpack map.
@@ -283,6 +436,16 @@ mod tests {
     #[test]
     fn empty_properties_default_to_unit_weight() {
         assert_eq!(extract_weight_from_properties(&[]), 1.0);
+    }
+
+    #[test]
+    fn delete_label_default_matches_insert_default() {
+        // The delete-side helper substitutes the SAME default label the INSERT
+        // side uses when a `ScannedEdge` carries no `_type`, via the shared
+        // `resolve_edge_label`. The surrogate-resolution path needs a live
+        // `state` and is covered by the cross-node cluster test.
+        assert_eq!(resolve_edge_label(None), "edge");
+        assert_eq!(resolve_edge_label(Some("ROAD")), "ROAD");
     }
 
     #[test]

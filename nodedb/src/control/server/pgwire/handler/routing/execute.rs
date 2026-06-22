@@ -6,7 +6,8 @@
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
-use crate::control::planner::calvin::{DispatchClass, classify_dispatch};
+use crate::control::planner::calvin::dispatch::collection_name_from_plan;
+use crate::control::planner::calvin::{DispatchClass, classify_dispatch, is_dependent_predicate};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -152,6 +153,56 @@ impl NodeDbPgHandler {
             .await?
         {
             return Ok(clone_responses);
+        }
+
+        // Implicit-edge DELETE/UPDATE routing gate. A dependent predicate
+        // (`BulkDelete`/`BulkUpdate`) on an edge-bearing collection must run
+        // through the OLLP/Calvin coordinator path so the implicit edge-delete
+        // tasks are derived (via the pre-exec recon read) and committed
+        // atomically with the doc write. This MUST preempt gateway-forwarding:
+        // a non-(data-shard)-leader coordinator would otherwise forward the raw
+        // single-shard `BulkDelete` to the shard leader, bypassing edge cleanup
+        // entirely. It also preempts the `classify_dispatch` match below, since a
+        // single-collection delete classifies as `SingleShard`. Deliberately NOT
+        // gated on `cross_shard_txn` mode — this is INTERNAL index/edge
+        // maintenance that must run regardless of the user's cross-shard
+        // preference (unlike the `MultiShard` arm, which gates USER cross-shard
+        // writes on Strict). `dispatch_calvin_multishard` owns the OLLP retry
+        // loop and routes the submit to the sequencer-group leader, so it runs
+        // correctly on a coordinator that is not the data-shard leader.
+        {
+            let tx_state = self.sessions.transaction_state(addr);
+            if tx_state != crate::control::server::pgwire::session::TransactionState::InBlock
+                && self.state.calvin_completion_registry.get().is_some()
+                && let Some(dep_task) = tasks.iter().find(|t| is_dependent_predicate(&t.plan))
+            {
+                let coll = collection_name_from_plan(&dep_task.plan);
+                let db = dep_task.database_id;
+                // A genuine catalog READ error propagates (misrouting a delete on
+                // a real I/O fault would silently skip edge cleanup → dangling
+                // edges). An ABSENT catalog (None) or absent collection row
+                // (`Ok(None)`) is treated as non-edge-bearing and falls through.
+                let edge_bearing = match self.state.credentials.catalog().as_ref() {
+                    Some(catalog) => catalog
+                        .get_collection(db, tenant_id.as_u64(), &coll)
+                        .map_err(|e| {
+                            let (severity, code, message) = error_to_sqlstate(&e);
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                severity.to_owned(),
+                                code.to_owned(),
+                                message,
+                            )))
+                        })?
+                        .map(|c| c.has_implicit_edges)
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if edge_bearing {
+                    return self
+                        .dispatch_calvin_multishard(tasks, tenant_id, identity, addr)
+                        .await;
+                }
+            }
         }
 
         let consistency = consistency_for_tasks(&tasks);

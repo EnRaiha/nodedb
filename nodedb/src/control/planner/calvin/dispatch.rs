@@ -161,9 +161,9 @@ pub fn classify_dispatch(tasks: &[PhysicalTask]) -> DispatchClass {
                 .unwrap_or(VShardId::new(0)),
         },
         1 => DispatchClass::SingleShard {
-            // SAFETY: vshards.len() == 1 guarantees the loop ran at least once
-            // and set last_vshard. The unwrap_or_else is a defensive fallback
-            // that upholds the no-panic contract for library code.
+            // Invariant: vshards.len() == 1 guarantees the loop ran at least
+            // once and set last_vshard. The unwrap_or_else is a defensive
+            // fallback that upholds the no-panic contract for library code.
             vshard: last_vshard.unwrap_or_else(|| VShardId::new(0)),
         },
         _ => DispatchClass::MultiShard { vshards },
@@ -303,6 +303,13 @@ pub fn build_dependent_tx_class(
     // Accumulate per-collection surrogate sets. The OLLP collection uses the
     // predicted surrogates; all other tasks use static key extraction.
     let mut doc_surrogates: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    // Graph edges (appended implicit-edge deletes) route by from_key(src)/
+    // from_key(dst), NOT by collection — mirror `build_static_tx_class`'s edge
+    // handling so an `EdgeDelete` appended to a dependent txn is classified as
+    // an `EngineKeySet::Edge` (and dual-homed/locked) rather than misrouted as a
+    // document write via `surrogate_from_plan`.
+    let mut edge_pairs: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
+    let mut edge_homes: BTreeMap<String, Vec<u32>> = BTreeMap::new();
 
     // Seed with the OLLP collection's predicted surrogates.
     doc_surrogates
@@ -312,6 +319,38 @@ pub fn build_dependent_tx_class(
 
     // Add static surrogates for all non-OLLP tasks.
     for task in tasks {
+        // Edges first: collect surrogate-pair identity + from_key routing homes,
+        // then skip the doc-surrogate path. EdgePut/EdgeDelete share identity
+        // fields so both produce an `EngineKeySet::Edge`.
+        if let PhysicalPlan::Graph(
+            GraphOp::EdgePut {
+                collection: edge_coll,
+                src_id,
+                dst_id,
+                src_surrogate,
+                dst_surrogate,
+                ..
+            }
+            | GraphOp::EdgeDelete {
+                collection: edge_coll,
+                src_id,
+                dst_id,
+                src_surrogate,
+                dst_surrogate,
+                ..
+            },
+        ) = &task.plan
+        {
+            edge_pairs
+                .entry(edge_coll.clone())
+                .or_default()
+                .push((src_surrogate.as_u32(), dst_surrogate.as_u32()));
+            let homes = edge_homes.entry(edge_coll.clone()).or_default();
+            homes.push(VShardId::from_key(src_id.as_bytes()).as_u32());
+            homes.push(VShardId::from_key(dst_id.as_bytes()).as_u32());
+            continue;
+        }
+
         let coll = collection_name_from_plan(&task.plan);
         if coll.is_empty() || coll == collection {
             continue;
@@ -327,6 +366,22 @@ pub fn build_dependent_tx_class(
             surrogates: SortedVec::new(surrogates),
         })
         .collect();
+    // Emit one Edge keyset per edge collection, with the SAME missing-homes-is-
+    // hard-error guard `build_static_tx_class` uses: `edge_pairs` and
+    // `edge_homes` are populated in lockstep, so a missing homes entry is an
+    // invariant violation, not an empty-participant write.
+    for (edge_coll, pairs) in edge_pairs {
+        let homes = edge_homes.remove(&edge_coll).ok_or_else(|| Error::Internal {
+            detail: format!(
+                "build_dependent_tx_class invariant violated: no edge_homes for collection {edge_coll}"
+            ),
+        })?;
+        write_sets.push(EngineKeySet::Edge {
+            collection: edge_coll,
+            edges: SortedVec::new(pairs),
+            home_vshards: SortedVec::new(homes),
+        });
+    }
     write_sets.sort_by(|a, b| a.collection().cmp(b.collection()));
 
     let write_set = ReadWriteSet::new(write_sets);
@@ -344,7 +399,7 @@ pub fn build_dependent_tx_class(
 }
 
 /// Extract the collection name from a write plan.
-fn collection_name_from_plan(plan: &PhysicalPlan) -> String {
+pub(crate) fn collection_name_from_plan(plan: &PhysicalPlan) -> String {
     match plan {
         PhysicalPlan::Document(
             DocumentOp::PointPut { collection, .. }

@@ -10,14 +10,16 @@ use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::cluster::calvin::executor::ollp::error::OllpError;
-use crate::control::planner::calvin::preexec::run_preexec_scan;
+use crate::control::planner::calvin::preexec::{PreexecScan, run_preexec_scan};
 use crate::control::planner::calvin::{
     build_dependent_tx_class, dispatch_tasks_to_calvin, is_dependent_predicate,
     predicate_class_for_filters, run_dependent_with_retry, submit_calvin_routed_assign,
 };
+use crate::control::planner::implicit_edges::append_implicit_edge_delete_tasks;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::session::TransactionState;
-use crate::types::TenantId;
+use crate::types::{TenantId, TraceId};
+use nodedb_cluster::calvin::sequencer::error::SequencerError;
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::super::types::error_to_sqlstate;
@@ -165,42 +167,73 @@ impl NodeDbPgHandler {
         // via `submit_calvin_routed_assign` (returning the leader-assigned
         // `RoutedAssignment`). This lets a non-leader coordinator drive the
         // dependent (OLLP) cross-shard write to completion.
-        let submit = |predicted: &[u32]| {
-            let predicted = predicted.to_vec();
+        let submit = |predicted: &PreexecScan| {
+            let surrogates = predicted.surrogates.clone();
+            let edges = predicted.edges.clone();
             let tasks = &tasks;
             let dep_collection = &dep_collection;
             let state = &self.state;
             async move {
+                // Implicit-edge cleanup: a matched edge document (`_from`/`_to`)
+                // has an auto-created graph edge that must be deleted in the SAME
+                // Calvin transaction, cross-shard-correctly. Build the symmetric
+                // `EdgeDelete` tasks (async: each endpoint surrogate is resolved
+                // via the routed surrogate exchange) BEFORE entering the sync
+                // tx_builder, then splice them into the modified task set there.
+                //
+                // Content-drift TOCTOU (a concurrent UPDATE of a matched doc's
+                // `_from`/`_to` between recon and execution) is NOT yet detected —
+                // OLLP today validates write-set surrogates only, not referenced-
+                // field content. Closed by the follow-up content-drift validation
+                // unit.
+                let mut edge_delete_tasks: Vec<PhysicalTask> = Vec::new();
+                append_implicit_edge_delete_tasks(
+                    state,
+                    &mut edge_delete_tasks,
+                    tenant_id,
+                    database_id,
+                    TraceId::ZERO,
+                    dep_collection,
+                    &edges,
+                )
+                .await
+                .map_err(|_| OllpError::Sequencer(SequencerError::Unavailable))?;
+
                 orc.submit_with_retry_via(
                     pred_class,
                     tenant_id,
                     || {
-                        let modified_tasks: Vec<PhysicalTask> = tasks
+                        let mut modified_tasks: Vec<PhysicalTask> = tasks
                             .iter()
                             .map(|t| {
                                 let mut t = t.clone();
-                                inject_ollp_surrogates(&mut t.plan, predicted.clone());
+                                // `inject_ollp_surrogates` only touches the
+                                // original doc tasks; the edge-delete tasks are
+                                // appended AFTER, so they are untouched.
+                                inject_ollp_surrogates(&mut t.plan, surrogates.clone());
                                 t
                             })
                             .collect();
+                        // Clone — `submit_with_retry_via`'s tx_builder may be
+                        // invoked more than once, so the edge tasks must survive
+                        // a rebuild.
+                        modified_tasks.extend(edge_delete_tasks.iter().cloned());
                         build_dependent_tx_class(
                             &modified_tasks,
                             tenant_id,
                             dep_collection,
-                            &predicted,
+                            &surrogates,
                         )
                         .map_err(|_| {
                             nodedb_cluster::error::CalvinError::Sequencer(
-                                nodedb_cluster::calvin::sequencer::error::SequencerError::Unavailable,
+                                SequencerError::Unavailable,
                             )
                         })
                     },
                     |tx_class| async move {
-                        submit_calvin_routed_assign(state, tx_class).await.map_err(|_| {
-                            OllpError::Sequencer(
-                                nodedb_cluster::calvin::sequencer::error::SequencerError::Unavailable,
-                            )
-                        })
+                        submit_calvin_routed_assign(state, tx_class)
+                            .await
+                            .map_err(|_| OllpError::Sequencer(SequencerError::Unavailable))
                     },
                 )
                 .await

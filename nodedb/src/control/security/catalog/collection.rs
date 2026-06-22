@@ -201,6 +201,24 @@ pub struct StoredCollection {
     /// will have `cloned_from = None` so `clone_status` is never consulted.
     #[msgpack(default)]
     pub clone_status: CloneStatus,
+
+    /// `true` once at least one implicit graph edge (a schemaless document
+    /// carrying `_from`/`_to`) — or an explicit `GRAPH INSERT EDGE` — has been
+    /// written into this collection. Set idempotently at the edge-creation
+    /// chokepoints (see `mark_collection_edge_bearing`).
+    ///
+    /// This is the routing gate for implicit-edge DELETE cleanup: a
+    /// single-collection predicate `DELETE` is otherwise a one-task, one-vshard
+    /// `SingleShard` dispatch that bypasses the OLLP/Calvin path entirely, so
+    /// the implicit edge-delete derivation never runs. The gate routes such a
+    /// `DELETE` through OLLP only when its collection is edge-bearing, leaving
+    /// non-edge collections on the fast path.
+    ///
+    /// Defaults to `false` on deserialization so catalog entries written before
+    /// this field was added decode as non-edge-bearing — the safe value, since
+    /// a pre-existing collection with no edges needs no edge-delete derivation.
+    #[msgpack(default)]
+    pub has_implicit_edges: bool,
 }
 
 impl StoredCollection {
@@ -253,6 +271,7 @@ impl StoredCollection {
             database_id: DatabaseId::DEFAULT,
             cloned_from: None,
             clone_status: CloneStatus::default(),
+            has_implicit_edges: false,
         }
     }
 

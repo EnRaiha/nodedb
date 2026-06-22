@@ -180,6 +180,7 @@ pub async fn build_and_persist(
         database_id,
         cloned_from: None,
         clone_status: nodedb_types::CloneStatus::default(),
+        has_implicit_edges: false,
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
