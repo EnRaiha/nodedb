@@ -52,6 +52,7 @@ impl CoreLoop {
             partition,
             &self.edge_store,
             frontier_bitmap,
+            None, // single-node path: all nodes are local, no frontier entries
         ) {
             Ok(outcome) => {
                 match crate::engine::graph::pattern::executor::rows_to_msgpack(&outcome.rows) {

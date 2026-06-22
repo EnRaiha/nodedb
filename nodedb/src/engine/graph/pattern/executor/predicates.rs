@@ -62,7 +62,7 @@ pub(super) fn apply_predicate(
             // `apply_predicate` already tracks. Here we keep a throwaway
             // local state and inspect it.
             for row in rows {
-                let mut sub_state = ExecutionState::default();
+                let mut sub_state = ExecutionState::new(None);
                 // NOT EXISTS sub-patterns check structural connectivity
                 // against already-bound variables — no anchor enumeration
                 // occurs, so the frontier bitmap does not apply here.

@@ -12,10 +12,51 @@ use std::collections::HashMap;
 
 use super::ast::*;
 use crate::engine::graph::csr::CsrIndex;
-use crate::engine::graph::edge_store::EdgeStore;
+use crate::engine::graph::edge_store::{Direction, EdgeStore};
 
 /// A single result row: variable bindings.
 pub type BindingRow = HashMap<String, String>;
+
+/// An expansion source that has zero local adjacency in the queried
+/// direction — its out-edges (or in-edges) are homed on another shard.
+///
+/// Emitted by the executor so the Control Plane can dispatch a
+/// continuation query to the owning shard. The frontier is produced
+/// on every MATCH execution; on a fully-local CSR it is always empty.
+///
+/// # Cross-shard contract
+///
+/// The executor emits an `UnresolvedExpansion` for a source node when
+/// **all four** conditions hold:
+/// 1. The source variable was **bound** — it was resolved from an existing
+///    binding in `input_row` (the multi-hop intermediate case), not
+///    free-ranged over all local nodes.  A free-ranging anchor must NOT
+///    emit because every shard covers all its own local nodes during its
+///    own pass; emitting would duplicate work and flood the frontier with
+///    every zero-degree local sink.
+/// 2. The node has **zero raw adjacency** in the triple's direction
+///    (regardless of edge-label filter).
+/// 3. The caller supplied a locality predicate (`is_remote_node`).
+/// 4. The predicate returns `true` for the node's name.
+///
+/// A node that has edges in the direction but none that pass the label
+/// filter produces an empty local result and is NOT included in the
+/// frontier (that is a legitimate "no match locally," not a
+/// missing-shard situation).
+///
+/// Passing `None` for the predicate (the default for fully-local,
+/// single-node deployments) guarantees the frontier is always empty.
+#[derive(Debug, Clone)]
+pub struct UnresolvedExpansion {
+    /// The source binding variable name from the triple (e.g. `"b"`).
+    pub binding_var: String,
+    /// The resolved source node name with no local edges (e.g. `"bob"`).
+    pub node_name: String,
+    /// 0-based index of the triple in its chain that could not expand.
+    pub triple_idx: usize,
+    /// Bindings accumulated up to (but not including) this triple.
+    pub partial_row: BindingRow,
+}
 
 /// Result of running a MATCH query.
 ///
@@ -23,16 +64,39 @@ pub type BindingRow = HashMap<String, String>;
 /// fired — the binding rows are incomplete. Data Plane handlers MUST set
 /// the `partial` flag on the response envelope when this is set so
 /// clients can observe the incomplete result.
+///
+/// `unresolved_frontier` lists expansion sources whose edges are not
+/// present in the local CSR partition. On a fully-local CSR this vec
+/// is always empty and existing behaviour is byte-identical to before.
 pub struct MatchOutcome {
     pub rows: Vec<BindingRow>,
     pub truncated: bool,
+    pub unresolved_frontier: Vec<UnresolvedExpansion>,
 }
 
 /// Shared mutable state collected during triple execution: the list of
-/// binding rows being built + the across-query truncation flag.
-#[derive(Default)]
-pub(super) struct ExecutionState {
+/// binding rows being built + the across-query truncation flag +
+/// the cross-shard unresolved frontier.
+///
+/// `is_remote_node` is an optional caller-supplied predicate: when
+/// `Some(pred)`, `pred(node_name)` returns `true` for nodes that are
+/// homed on a remote shard. When `None` every node is treated as local
+/// and no frontier entries are ever emitted. The predicate is borrowed
+/// for the lifetime `'a` of the execution call to avoid allocation.
+pub(super) struct ExecutionState<'a> {
     pub truncated: bool,
+    pub frontier: Vec<UnresolvedExpansion>,
+    pub is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
+}
+
+impl<'a> ExecutionState<'a> {
+    fn new(is_remote_node: Option<&'a dyn Fn(&str) -> bool>) -> Self {
+        Self {
+            truncated: false,
+            frontier: Vec::new(),
+            is_remote_node,
+        }
+    }
 }
 
 /// Execute a MATCH query on a CSR index and edge store.
@@ -45,27 +109,39 @@ pub(super) struct ExecutionState {
 /// bitmap are eligible as pattern anchors. Bound variables (already resolved
 /// from a prior binding row) bypass the bitmap check — only free-variable
 /// anchor enumeration is restricted.
-pub fn execute(
+///
+/// `is_remote_node`: when `Some(pred)`, `pred(node_name)` returns `true` for
+/// nodes homed on a remote shard. Only nodes that (a) were reached via a
+/// **bound** source variable (resolved from `input_row`, not free-ranged),
+/// AND (b) satisfy this predicate, AND (c) have zero raw directional
+/// adjacency, are added to `unresolved_frontier`.  Free-ranging anchors never
+/// emit, even when the predicate and degree conditions hold, because each
+/// shard's own pass covers all its local nodes.
+/// Pass `None` (the production default on a fully-local CSR) to guarantee
+/// an always-empty frontier, preserving byte-identical single-node behaviour.
+pub fn execute<'a>(
     query: &MatchQuery,
     csr: &CsrIndex,
     edge_store: &EdgeStore,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+    is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
 ) -> Result<MatchOutcome, crate::Error> {
     // Optimize query before execution (reorder triples by selectivity).
     let mut optimized = query.clone();
     super::optimizer::optimize(&mut optimized, csr);
-    execute_query(&optimized, csr, edge_store, frontier_bitmap)
+    execute_query(&optimized, csr, edge_store, frontier_bitmap, is_remote_node)
 }
 
 /// Execute a pre-optimized MATCH query (internal, skip optimizer).
-fn execute_query(
+fn execute_query<'a>(
     query: &MatchQuery,
     csr: &CsrIndex,
     edge_store: &EdgeStore,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+    is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
 ) -> Result<MatchOutcome, crate::Error> {
     let mut rows: Vec<BindingRow> = vec![HashMap::new()];
-    let mut state = ExecutionState::default();
+    let mut state = ExecutionState::new(is_remote_node);
 
     for clause in &query.clauses {
         let clause_rows = execute_clause(clause, csr, &rows, &mut state, frontier_bitmap)?;
@@ -99,6 +175,7 @@ fn execute_query(
     Ok(MatchOutcome {
         rows,
         truncated: state.truncated,
+        unresolved_frontier: state.frontier,
     })
 }
 
@@ -158,10 +235,17 @@ fn execute_chain(
 ) -> Result<Vec<BindingRow>, crate::Error> {
     let mut rows = vec![input_row.clone()];
 
-    for triple in &chain.triples {
+    for (triple_idx, triple) in chain.triples.iter().enumerate() {
         let mut next_rows = Vec::new();
         for row in &rows {
-            next_rows.extend(execute_triple(triple, csr, row, state, frontier_bitmap)?);
+            next_rows.extend(execute_triple(
+                triple,
+                triple_idx,
+                csr,
+                row,
+                state,
+                frontier_bitmap,
+            )?);
         }
         rows = next_rows;
         if rows.is_empty() {
@@ -173,8 +257,12 @@ fn execute_chain(
 }
 
 /// Execute a single triple `(src)-[edge]->(dst)` against a binding row.
+///
+/// `triple_idx` is the 0-based position of this triple within its chain;
+/// it is recorded in any `UnresolvedExpansion` emitted.
 fn execute_triple(
     triple: &PatternTriple,
+    triple_idx: usize,
     csr: &CsrIndex,
     input_row: &BindingRow,
     state: &mut ExecutionState,
@@ -222,7 +310,66 @@ fn execute_triple(
             }
         }
     } else {
+        // Determine whether the source variable was BOUND (resolved from a
+        // prior binding in `input_row` or from a literal match) or
+        // FREE-RANGING (enumerated over all local nodes because no binding
+        // existed yet).  `resolve_binding` takes the BOUND path only when
+        // `binding.name` is `Some` AND that name already appears in `input_row`.
+        // Everything else — anonymous nodes, unbound variables, and
+        // frontier-bitmap-restricted enumeration — is FREE-RANGING.
+        //
+        // Only BOUND sources can produce a frontier entry: they represent a
+        // locally-originated partial match whose continuation must be dispatched
+        // to the source node's home shard.  A FREE-RANGING source must NOT emit
+        // because every shard will range over the same local nodes during its own
+        // pass; emitting here would duplicate work and pollute the frontier with
+        // every zero-degree sink.
+        let source_is_bound = triple
+            .src
+            .name
+            .as_deref()
+            .is_some_and(|n| input_row.contains_key(n));
+
         for &src_id in &src_nodes {
+            // Check raw degree in the queried direction BEFORE any label
+            // filter. A source with zero raw adjacency means its edges may
+            // live on a remote shard — record it in the frontier so the
+            // Control Plane can dispatch a continuation. A source that has
+            // edges locally but none pass the label filter is a legitimate
+            // empty local result; do NOT add it to the frontier.
+            let raw_degree = match direction {
+                Direction::Out => csr.out_degree_raw(src_id),
+                Direction::In => csr.in_degree_raw(src_id),
+                Direction::Both => csr.out_degree_raw(src_id) + csr.in_degree_raw(src_id),
+            };
+            if raw_degree == 0 {
+                // Emit a frontier entry only when ALL four conditions hold:
+                // 1. The source variable was BOUND (not free-ranging).
+                // 2. The caller supplied a locality predicate.
+                // 3. The predicate identifies this node as remote.
+                // 4. (implicit) Zero raw adjacency — we are inside this branch.
+                //
+                // A free-ranging unbound source NEVER emits regardless of
+                // degree or predicate.  Without a predicate (None) — the
+                // fully-local single-node path — every leaf is a legitimate
+                // terminal, not a cross-shard ghost.
+                if source_is_bound && let Some(pred) = state.is_remote_node {
+                    let node_name = csr.node_name_raw(src_id).to_string();
+                    if pred(&node_name) {
+                        let binding_var =
+                            triple.src.name.clone().unwrap_or_else(|| node_name.clone());
+                        state.frontier.push(UnresolvedExpansion {
+                            binding_var,
+                            node_name,
+                            triple_idx,
+                            partial_row: input_row.clone(),
+                        });
+                    }
+                }
+                // No local edges to produce — continue to next src.
+                continue;
+            }
+
             let neighbors = expansion::collect_neighbors(csr, src_id, label_filter, direction);
             for (lid, dst_id) in neighbors {
                 if !binding_compatible(&triple.dst, csr, input_row, dst_id) {
@@ -366,34 +513,13 @@ mod tests {
     use super::*;
 
     fn make_social_graph() -> (CsrIndex, EdgeStore, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = EdgeStore::open(&dir.path().join("graph.redb")).unwrap();
-
-        use crate::engine::graph::edge_store::EdgeRef;
-        use nodedb_types::{DatabaseId, TenantId};
-        const DB: DatabaseId = DatabaseId::DEFAULT;
-        const T: TenantId = TenantId::new(1);
-        let mut ord = 0i64;
-        let mut put = |src: &str, label: &str, dst: &str| {
-            ord += 1;
-            store
-                .put_edge_versioned(
-                    EdgeRef::new(DB, T, "col", src, label, dst),
-                    b"",
-                    ord,
-                    ord,
-                    i64::MAX,
-                )
-                .unwrap();
-        };
-        put("alice", "KNOWS", "bob");
-        put("bob", "KNOWS", "carol");
-        put("carol", "KNOWS", "dave");
-        put("alice", "LIKES", "carol");
-        put("bob", "BLOCKED", "dave");
-
-        let csr = crate::engine::graph::csr::rebuild::rebuild_from_store(&store).unwrap();
-        (csr, store, dir)
+        make_csr(&[
+            ("alice", "KNOWS", "bob"),
+            ("bob", "KNOWS", "carol"),
+            ("carol", "KNOWS", "dave"),
+            ("alice", "LIKES", "carol"),
+            ("bob", "BLOCKED", "dave"),
+        ])
     }
 
     #[test]
@@ -402,7 +528,7 @@ mod tests {
         let query =
             super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b")
                 .unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["a"], "alice");
         assert_eq!(rows[0]["b"], "bob");
@@ -415,7 +541,7 @@ mod tests {
             "MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a = 'alice' RETURN a, b, c",
         )
         .unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["c"], "carol");
     }
@@ -426,7 +552,7 @@ mod tests {
         let query = super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) OPTIONAL MATCH (b)-[:LIKES]->(c) WHERE a = 'alice' RETURN a, b, c",
         ).unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["c"], "NULL");
     }
@@ -438,7 +564,7 @@ mod tests {
             "MATCH (a)-[:KNOWS]->(b) WHERE NOT EXISTS { MATCH (a)-[:BLOCKED]->(b) } RETURN a, b",
         )
         .unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         assert_eq!(rows.len(), 3);
     }
 
@@ -447,7 +573,7 @@ mod tests {
         let (csr, store, _dir) = make_social_graph();
         let query =
             super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b LIMIT 2").unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         assert_eq!(rows.len(), 2);
     }
 
@@ -456,7 +582,7 @@ mod tests {
         let (csr, store, _dir) = make_social_graph();
         let query =
             super::super::compiler::parse("MATCH (a)-[:NONEXISTENT]->(b) RETURN a, b").unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         assert!(rows.is_empty());
     }
 
@@ -472,20 +598,20 @@ mod tests {
 
         // Without label filter — all KNOWS edges.
         let query = super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         assert_eq!(rows.len(), 3);
 
         // With label filter — only Person src.
         let query =
             super::super::compiler::parse("MATCH (a:Person)-[:KNOWS]->(b) RETURN a, b").unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         // alice->bob, bob->carol, carol->dave — all 3 srcs are Person.
         assert_eq!(rows.len(), 3);
 
         // With label filter — only Bot dst.
         let query =
             super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b:Bot) RETURN a, b").unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         // Only carol->dave where dave is Bot.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["a"], "carol");
@@ -494,14 +620,14 @@ mod tests {
         // Both labels — Person->Bot.
         let query = super::super::compiler::parse("MATCH (a:Person)-[:KNOWS]->(b:Bot) RETURN a, b")
             .unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["a"], "carol");
 
         // Non-matching labels — should return 0.
         let query = super::super::compiler::parse("MATCH (a:Bot)-[:KNOWS]->(b:Person) RETURN a, b")
             .unwrap();
-        let rows = execute(&query, &csr, &store, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
         assert!(rows.is_empty());
     }
 
@@ -535,12 +661,188 @@ mod tests {
         let bm = SurrogateBitmap::from_iter([Surrogate::new(1)]);
 
         let query = super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
-        let rows = execute(&query, &csr, &store, Some(&bm)).unwrap().rows;
+        let rows = execute(&query, &csr, &store, Some(&bm), None).unwrap().rows;
 
         // Only alice->bob should appear; bob->carol and carol->dave are blocked
         // because the src anchor (bob, carol) is not in the bitmap.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["a"], "alice");
         assert_eq!(rows[0]["b"], "bob");
+    }
+
+    // ── Unresolved frontier tests ─────────────────────────────────────────
+
+    /// Helper: build a CsrIndex from a list of `(src, label, dst)` edges.
+    fn make_csr(
+        edges: &[(&str, &str, &str)],
+    ) -> (
+        CsrIndex,
+        crate::engine::graph::edge_store::EdgeStore,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::engine::graph::edge_store::EdgeStore::open(&dir.path().join("graph.redb"))
+                .unwrap();
+
+        use crate::engine::graph::edge_store::EdgeRef;
+        use nodedb_types::{DatabaseId, TenantId};
+        const DB: DatabaseId = DatabaseId::DEFAULT;
+        const T: TenantId = TenantId::new(1);
+        let mut ord = 0i64;
+        for &(src, label, dst) in edges {
+            ord += 1;
+            store
+                .put_edge_versioned(
+                    EdgeRef::new(DB, T, "col", src, label, dst),
+                    b"",
+                    ord,
+                    ord,
+                    i64::MAX,
+                )
+                .unwrap();
+        }
+        let csr = crate::engine::graph::csr::rebuild::rebuild_from_store(&store).unwrap();
+        (csr, store, dir)
+    }
+
+    /// Frontier emitted for a BOUND multi-hop intermediate: hop-1 binds `b`
+    /// to "bob" via the output row; hop-2 receives `b` as a bound source
+    /// (present in `input_row`). Bob has zero out-edges AND is flagged remote,
+    /// so the executor records it in `unresolved_frontier`.
+    ///
+    /// The hop-1 source `a` is free-ranging (WHERE a='alice' is a
+    /// post-processing predicate, not carried in the initial `input_row={}`),
+    /// so it NEVER produces a frontier entry — only the bound intermediate
+    /// `b` does.
+    ///
+    /// Graph: alice --KNOWS--> bob (bob has no out-edges)
+    /// Query: MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a = 'alice'
+    /// bob is bound from hop-1; hop-2 finds bob has 0 out-edges AND bob is
+    /// flagged remote → exactly one frontier entry.
+    #[test]
+    fn frontier_emitted_when_source_has_zero_out_degree() {
+        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let query = super::super::compiler::parse(
+            "MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a = 'alice' RETURN a, b, c",
+        )
+        .unwrap();
+        // "bob" is the hop-2 source with zero out-edges; mark it remote.
+        let is_remote: &dyn Fn(&str) -> bool = &|name| name == "bob";
+        let outcome = execute(&query, &csr, &store, None, Some(is_remote)).unwrap();
+
+        // No local rows — bob has no out-edges locally.
+        assert!(
+            outcome.rows.is_empty(),
+            "expected no rows; got {:?}",
+            outcome.rows
+        );
+
+        // Exactly one frontier entry for the hop-2 source "bob".
+        assert_eq!(
+            outcome.unresolved_frontier.len(),
+            1,
+            "expected 1 frontier entry; got {:?}",
+            outcome.unresolved_frontier.len()
+        );
+        let entry = &outcome.unresolved_frontier[0];
+        assert_eq!(entry.node_name, "bob");
+        assert_eq!(entry.triple_idx, 1, "hop-2 is triple_idx 1");
+        // partial_row carries the hop-1 binding.
+        assert_eq!(
+            entry.partial_row.get("a").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(entry.partial_row.get("b").map(String::as_str), Some("bob"));
+    }
+
+    /// No false positive on label miss: a source HAS out-edges but none
+    /// match the triple's label filter. The executor must NOT emit a frontier
+    /// entry — this is a legitimate empty result, not a cross-shard gap.
+    ///
+    /// Two independent gates both suppress the frontier here:
+    /// (1) The source variable `a` is free-ranging (WHERE a='alice' is a
+    ///     post-processing predicate, not a binding carried in `input_row`),
+    ///     so the bound gate suppresses emission.
+    /// (2) Even if `a` were bound, alice has a LIKES out-edge so raw_degree
+    ///     > 0 in the Out direction, which means the degree gate would also
+    ///     suppress it — a node with local edges but no matching-label edges
+    ///     is a legitimate empty result, not a cross-shard gap.
+    ///
+    /// We pass an all-remote predicate (`|_| true`) to prove that neither
+    /// the degree gate nor the bound gate is defeated by the predicate alone.
+    ///
+    /// Graph: alice --LIKES--> bob (alice has LIKES out-edge, no KNOWS out-edge)
+    /// Query: MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b
+    #[test]
+    fn no_frontier_when_source_has_edges_but_label_does_not_match() {
+        let (csr, store, _dir) = make_csr(&[("alice", "LIKES", "bob")]);
+        let query =
+            super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b")
+                .unwrap();
+        // All-remote predicate: even with every node marked remote, a source
+        // that is free-ranging or has local edges must not produce a frontier
+        // entry.
+        let is_remote: &dyn Fn(&str) -> bool = &|_| true;
+        let outcome = execute(&query, &csr, &store, None, Some(is_remote)).unwrap();
+
+        assert!(outcome.rows.is_empty(), "expected no rows");
+        assert!(
+            outcome.unresolved_frontier.is_empty(),
+            "must NOT emit frontier when source is free-ranging or has local edges; \
+             got {:?}",
+            outcome.unresolved_frontier
+        );
+    }
+
+    /// Normal local expansion unchanged: a source with matching local edges
+    /// produces rows as expected and the frontier stays empty.
+    /// With `None` predicate no frontier entries can ever be emitted.
+    #[test]
+    fn no_frontier_for_fully_local_expansion() {
+        let (csr, store, _dir) = make_social_graph();
+        let query =
+            super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b")
+                .unwrap();
+        let outcome = execute(&query, &csr, &store, None, None).unwrap();
+
+        assert_eq!(outcome.rows.len(), 1);
+        assert_eq!(outcome.rows[0]["b"], "bob");
+        assert!(
+            outcome.unresolved_frontier.is_empty(),
+            "frontier must be empty when all edges resolve locally"
+        );
+    }
+
+    /// Multi-hop: a 2-triple pattern where hop-1 binds an intermediate that
+    /// has no local out-edges for hop-2. The frontier entry must record
+    /// `triple_idx == 1` and the partial_row carrying hop-1's binding.
+    ///
+    /// Graph: root --EDGE--> mid (mid has zero out-edges)
+    /// Query: MATCH (x)-[:EDGE]->(y)-[:EDGE]->(z) WHERE x = 'root'
+    /// "mid" is marked remote so the frontier is emitted for it.
+    #[test]
+    fn frontier_triple_idx_and_partial_row_for_multi_hop() {
+        let (csr, store, _dir) = make_csr(&[("root", "EDGE", "mid")]);
+        let query = super::super::compiler::parse(
+            "MATCH (x)-[:EDGE]->(y)-[:EDGE]->(z) WHERE x = 'root' RETURN x, y, z",
+        )
+        .unwrap();
+        // "mid" is the hop-2 source with zero out-edges; mark it remote.
+        let is_remote: &dyn Fn(&str) -> bool = &|name| name == "mid";
+        let outcome = execute(&query, &csr, &store, None, Some(is_remote)).unwrap();
+
+        assert!(outcome.rows.is_empty());
+        assert_eq!(
+            outcome.unresolved_frontier.len(),
+            1,
+            "expected exactly one frontier entry for hop-2"
+        );
+        let entry = &outcome.unresolved_frontier[0];
+        assert_eq!(entry.node_name, "mid", "frontier source should be mid");
+        assert_eq!(entry.triple_idx, 1, "second triple is index 1");
+        // partial_row must carry x=root and y=mid (hop-1 bindings).
+        assert_eq!(entry.partial_row.get("x").map(String::as_str), Some("root"));
+        assert_eq!(entry.partial_row.get("y").map(String::as_str), Some("mid"));
     }
 }
