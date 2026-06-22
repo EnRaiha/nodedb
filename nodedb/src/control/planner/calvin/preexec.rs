@@ -46,6 +46,11 @@ pub struct ScannedEdge {
     pub from: String,
     pub to: String,
     pub label: Option<String>,
+    /// The document's `weight` as stored, when present and finite. Carried so an
+    /// UPDATE that moves or relabels the edge re-creates it with the SAME weight
+    /// the matching INSERT mirrored — otherwise the re-created edge would silently
+    /// revert to the default unit weight. `None` when absent or non-finite.
+    pub weight: Option<f64>,
 }
 
 /// Result of the OLLP pre-execution reconnaissance scan.
@@ -89,10 +94,17 @@ pub async fn run_preexec_scan(
         sort_keys: vec![],
         distinct: false,
         // `id` (the hex surrogate) is always included regardless of
-        // projection. We additionally request `_from`/`_to`/`_type` so the
-        // recon scan can surface the implicit edge of any matched edge document
-        // — its auto-created graph edge must be deleted in the same Calvin txn.
-        projection: vec!["_from".to_string(), "_to".to_string(), "_type".to_string()],
+        // projection. We additionally request `_from`/`_to`/`_type`/`weight` so
+        // the recon scan can surface the implicit edge of any matched edge
+        // document — its auto-created graph edge must be kept consistent in the
+        // same Calvin txn, including its `weight` when the edge is moved or
+        // relabeled.
+        projection: vec![
+            "_from".to_string(),
+            "_to".to_string(),
+            "_type".to_string(),
+            "weight".to_string(),
+        ],
         computed_columns: vec![],
         window_functions: vec![],
         system_time: nodedb_types::SystemTimeScope::Current,
@@ -235,11 +247,20 @@ fn decode_scan_json(json_str: &str) -> PreexecScan {
                     .and_then(|d| d.get("_type"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
+                // A finite numeric `weight` mirrors the doc's mirrored edge
+                // weight; non-finite / absent / non-numeric → `None` (unit
+                // weight). `as_f64` covers both integer and float JSON numbers.
+                let weight = data
+                    .as_ref()
+                    .and_then(|d| d.get("weight"))
+                    .and_then(|v| v.as_f64())
+                    .filter(|w| w.is_finite());
                 edges.push(ScannedEdge {
                     surrogate,
                     from: from.to_string(),
                     to: to.to_string(),
                     label,
+                    weight,
                 });
             }
         }
@@ -265,7 +286,7 @@ mod tests {
         // Two edge rows + one non-edge row. `id` is the 8-hex surrogate; an edge
         // row additionally carries `_from`/`_to` (and optionally `_type`).
         let json = r#"[
-            {"id":"0000002a","data":{"_from":"a","_to":"b","_type":"ROAD"}},
+            {"id":"0000002a","data":{"_from":"a","_to":"b","_type":"ROAD","weight":5.0}},
             {"id":"0000000b","data":{"_from":"c","_to":"d"}},
             {"id":"00000001","data":{"name":"alice"}}
         ]"#;
@@ -285,6 +306,9 @@ mod tests {
         assert_eq!(road.label.as_deref(), Some("ROAD"));
         // The edge carries the document's surrogate (id "0000002a" → 42).
         assert_eq!(road.surrogate, 42);
+        // A finite numeric `weight` is surfaced so a moved/relabeled edge keeps
+        // it.
+        assert_eq!(road.weight, Some(5.0));
         let untyped = scan
             .edges
             .iter()
@@ -294,6 +318,8 @@ mod tests {
         assert_eq!(untyped.label, None);
         // id "0000000b" → 11.
         assert_eq!(untyped.surrogate, 11);
+        // No `weight` field → `None` (unit weight).
+        assert_eq!(untyped.weight, None);
     }
 
     #[test]

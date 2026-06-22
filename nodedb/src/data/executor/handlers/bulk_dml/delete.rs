@@ -237,7 +237,7 @@ impl CoreLoop {
     /// (msgpack→JSON) is the field-extraction primitive — no hand-rolled
     /// msgpack. Bytes that don't decode (e.g. a strict Binary Tuple) yield no
     /// edge, matching the schemaless-only scope of implicit edges.
-    fn ollp_actual_edges(
+    pub(in crate::data::executor) fn ollp_actual_edges(
         &self,
         database_id: u64,
         tid: u64,

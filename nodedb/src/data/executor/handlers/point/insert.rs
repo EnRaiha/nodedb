@@ -109,7 +109,7 @@ impl CoreLoop {
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
         // Implicit graph-edge extraction now lives on the Control Plane
-        // (`control/planner/implicit_edges.rs`): a `_from`/`_to` document is
+        // (`control/planner/implicit_edges/`): a `_from`/`_to` document is
         // mirrored as a `GraphOp::EdgePut` task BEFORE dispatch, so the edge is
         // homed and surrogate-resolved per endpoint and routes through the same
         // single-home/Calvin path as an explicit edge. The PointInsert handler

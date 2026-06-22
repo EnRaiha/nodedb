@@ -9,7 +9,7 @@ use crate::data::executor::doc_format;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::ReturningSpec;
+use nodedb_physical::physical_plan::{OllpPredictedEdge, ReturningSpec};
 
 /// Parameters for a bulk update operation.
 pub(in crate::data::executor) struct BulkUpdateParams<'a> {
@@ -18,6 +18,12 @@ pub(in crate::data::executor) struct BulkUpdateParams<'a> {
     pub updates: &'a [(String, nodedb_physical::physical_plan::UpdateValue)],
     pub returning: Option<&'a ReturningSpec>,
     pub ollp_predicted_surrogates: Option<&'a [u32]>,
+    /// Predicted OLD (pre-update) implicit-edge set of the matched docs. When
+    /// `Some`, the handler recomputes the ACTUAL old edges of the matched docs
+    /// and returns [`ErrorCode::OllpRetryRequired`] on any divergence BEFORE
+    /// applying writes — closing the recon→execute TOCTOU on `_from`/`_to`/
+    /// `_type` so the Control-Plane-derived edge reconciliation stays valid.
+    pub ollp_predicted_edges: Option<&'a [OllpPredictedEdge]>,
 }
 
 impl CoreLoop {
@@ -41,6 +47,7 @@ impl CoreLoop {
             updates,
             returning,
             ollp_predicted_surrogates,
+            ollp_predicted_edges,
         } = params;
         debug!(core = self.core_id, %collection, has_returning = returning.is_some(), "bulk update");
 
@@ -96,6 +103,34 @@ impl CoreLoop {
         if let Some(predicted) = ollp_predicted_surrogates {
             let actual = super::scan::ollp_actual_surrogates(&matching_ids);
             let mut predicted_sorted: Vec<u32> = predicted.to_vec();
+            predicted_sorted.sort_unstable();
+            if actual != predicted_sorted {
+                return self.response_error(task, ErrorCode::OllpRetryRequired);
+            }
+        }
+
+        // OLLP edge-content verification: the Control Plane derived the implicit
+        // edge reconciliation (EdgeDelete of the OLD edge + EdgePut of the NEW
+        // edge) from the recon scan's `_from`/`_to`/`_type`. If a matched doc's
+        // edge fields were concurrently changed (or an edge appeared/disappeared
+        // among the matched docs) between recon and now, the wrong old edge
+        // would be retracted / a stale edge would dangle. The surrogate-set
+        // check above cannot see this — the surrogate set is unchanged.
+        // Recompute the ACTUAL OLD (pre-update) edge set from the matched docs —
+        // this runs BEFORE any write below, so `sparse.get` returns the
+        // pre-mutation content — and compare it to the predicted set; on ANY
+        // divergence return OllpRetryRequired WITHOUT writing. Both sides are
+        // sorted the same way (the Control Plane sorts the injected set), so this
+        // is a plain sorted-slice equality check. The existing retry loop
+        // re-scans and re-derives fresh edges.
+        if let Some(predicted) = ollp_predicted_edges {
+            let actual = self.ollp_actual_edges(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                &matching_ids,
+            );
+            let mut predicted_sorted: Vec<OllpPredictedEdge> = predicted.to_vec();
             predicted_sorted.sort_unstable();
             if actual != predicted_sorted {
                 return self.response_error(task, ErrorCode::OllpRetryRequired);

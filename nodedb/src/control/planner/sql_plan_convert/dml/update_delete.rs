@@ -111,6 +111,54 @@ pub(in super::super) fn convert_update(
         }]);
     }
 
+    // EDGE-BEARING GATE: an UPDATE on a schemaless-document collection that
+    // carries implicit edges must NOT lower to a static `PointUpdate` for a
+    // PK-equality WHERE — that op bypasses the dependent-predicate (OLLP) path
+    // and would leave the mirrored graph edge stale when `_from`/`_to`/`_type`
+    // change. Route it as a `BulkUpdate` with an equivalent filter so the
+    // Calvin/OLLP coordinator derives + drift-validates the routed edge
+    // reconciliation (mirroring the edge-bearing DELETE gate). Non-edge-bearing
+    // collections keep the fast `PointUpdate` path below. Reached only for
+    // document engines (KV / columnar / spatial returned above); strict/etc.
+    // never set `has_implicit_edges`, so the flag naturally scopes this.
+    let edge_bearing =
+        !target_keys.is_empty() && document_collection_is_edge_bearing(ctx, collection)?;
+
+    if edge_bearing {
+        // Reject `Expr` RHS to a reserved edge field: the edge reconciliation
+        // diffs against literal SET values (it cannot evaluate an expression
+        // against per-row state on the Control Plane). Mirrors the KV /
+        // columnar `Expr`-RHS rejection above. Expr to OTHER fields and literal
+        // assignments to edge fields are allowed.
+        if let Some((field, _)) = assignments.iter().find(|(field, expr)| {
+            matches!(field.as_str(), "_from" | "_to" | "_type")
+                && !matches!(expr, SqlExpr::Literal(_))
+        }) {
+            return Err(crate::Error::BadRequest {
+                detail: format!(
+                    "expression updates to reserved edge fields (_from, _to, _type) \
+                     are not supported on edge-bearing collections (field '{field}'); \
+                     use a literal value"
+                ),
+            });
+        }
+        let effective_filter = pk_effective_filter(filter_bytes, target_keys)?;
+        return Ok(vec![PhysicalTask {
+            tenant_id,
+            vshard_id: vshard,
+            database_id: ctx.database_id,
+            plan: PhysicalPlan::Document(DocumentOp::BulkUpdate {
+                collection: collection.into(),
+                filters: effective_filter,
+                updates,
+                returning: None,
+                ollp_predicted_surrogates: None,
+                ollp_predicted_edges: None,
+            }),
+            post_set_op: PostSetOp::None,
+        }]);
+    }
+
     if !target_keys.is_empty() {
         let mut tasks = Vec::new();
         for key in target_keys {
@@ -140,6 +188,23 @@ pub(in super::super) fn convert_update(
         }
         Ok(tasks)
     } else {
+        // Predicate (non-PK) UPDATE: also reject `Expr` RHS to reserved edge
+        // fields on an edge-bearing collection. `target_keys` is empty here so
+        // the gate above did not run; re-check via the catalog flag.
+        if document_collection_is_edge_bearing(ctx, collection)?
+            && let Some((field, _)) = assignments.iter().find(|(field, expr)| {
+                matches!(field.as_str(), "_from" | "_to" | "_type")
+                    && !matches!(expr, SqlExpr::Literal(_))
+            })
+        {
+            return Err(crate::Error::BadRequest {
+                detail: format!(
+                    "expression updates to reserved edge fields (_from, _to, _type) \
+                     are not supported on edge-bearing collections (field '{field}'); \
+                     use a literal value"
+                ),
+            });
+        }
         Ok(vec![PhysicalTask {
             tenant_id,
             vshard_id: vshard,
