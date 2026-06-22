@@ -17,6 +17,7 @@ pub use dispatch::{
 };
 pub use dispatch_multi::dispatch_tasks_to_calvin;
 pub use explain::calvin_explain_preamble;
+pub use predicate::predicate_class_for_filters;
 pub use retry_loop::{run_dependent_with_retry, submit_once};
 pub use submit::{
     submit_and_await_calvin, submit_and_await_calvin_with_timeout, submit_calvin_routed,

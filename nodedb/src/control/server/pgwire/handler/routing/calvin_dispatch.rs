@@ -11,8 +11,8 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::planner::calvin::preexec::run_preexec_scan;
 use crate::control::planner::calvin::{
-    build_dependent_tx_class, dispatch_tasks_to_calvin, is_dependent_predicate, predicate_class,
-    run_dependent_with_retry, submit_once,
+    build_dependent_tx_class, dispatch_tasks_to_calvin, is_dependent_predicate,
+    predicate_class_for_filters, run_dependent_with_retry, submit_once,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::session::TransactionState;
@@ -140,7 +140,7 @@ impl NodeDbPgHandler {
 
         // Hoisted across the retry loop so both `submit` and `rescan` can borrow them.
         let (dep_collection, dep_filter_bytes) = extract_bulk_predicate_info(&dep_task.plan);
-        let pred_class = predicate_class(&dep_collection, &dep_collection);
+        let pred_class = predicate_class_for_filters(&dep_filter_bytes, &dep_collection);
         let database_id = dep_task.database_id;
 
         // Initial reconnaissance — the first prediction the loop submits.
