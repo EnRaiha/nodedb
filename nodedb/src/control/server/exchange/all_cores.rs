@@ -166,16 +166,33 @@ async fn fan_bsp_all_cores(
     // Eager dispatch: register a tracker receiver and dispatch to each core
     // BEFORE awaiting any response, matching gather_all_cores' true-parallelism
     // prologue.
+    //
+    // CRITICAL: scope each core's `owned_vshards` to the vShards round-robin
+    // homed on THAT core (`vshard % num_cores == core_id`, mirroring
+    // `VShardRouter::round_robin`). The plan arrives carrying the NODE's full
+    // owned-vShard set; if every core received the full set, each core would
+    // claim ownership of any node appearing in its local CSR — including nodes
+    // physically homed on a SIBLING core (they appear as cross-core edge
+    // endpoints). That node would then be ranked AND emitted by two cores,
+    // duplicating it in the merged result. Per-core scoping makes the owned sets
+    // genuinely disjoint (each graph node is owned by exactly its home core), so
+    // the field-concat merge is correct with no dedup, and cross-core edges
+    // become ordinary ghosts routed via `outbound` like any cross-shard edge.
     let mut receivers = Vec::with_capacity(num_cores);
     for core_id in 0..num_cores {
         let request_id = state.next_request_id();
         let vshard_id = VShardId::new(core_id as u32);
+        let mut core_plan = plan.clone();
+        if let PhysicalPlan::Graph(GraphOp::BspSuperstep(bsp)) = &mut core_plan {
+            bsp.owned_vshards
+                .retain(|v| (*v as usize) % num_cores == core_id);
+        }
         let request = Request {
             request_id,
             tenant_id,
             database_id,
             vshard_id,
-            plan: plan.clone(),
+            plan: core_plan,
             deadline: Instant::now() + Duration::from_secs(deadline_secs),
             priority: Priority::Normal,
             trace_id,
@@ -288,9 +305,9 @@ async fn fan_bsp_all_cores(
 
 /// Merge per-core [`BspSuperstepResult`] parts by field concatenation.
 ///
-/// Owned-node sets are DISJOINT across cores — each graph node is homed on
-/// exactly one core via `VShardId::from_key` — so concatenation requires no
-/// dedup.
+/// Owned-node sets are DISJOINT across cores because `fan_bsp_all_cores` scopes
+/// each core's `owned_vshards` to the vShards homed on that core, so each graph
+/// node is owned by exactly one core. Concatenation therefore requires no dedup.
 fn merge_bsp_results(parts: Vec<BspSuperstepResult>) -> BspSuperstepResult {
     let mut out = BspSuperstepResult::default();
     for p in parts {

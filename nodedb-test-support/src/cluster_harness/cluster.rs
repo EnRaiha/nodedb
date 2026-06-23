@@ -19,23 +19,16 @@ impl TestCluster {
     /// via node 1's pre-bound address. Waits until every node sees
     /// topology_size == 3 (10s deadline).
     pub async fn spawn_three() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::spawn_three_with_tuning(ClusterTransportTuning {
-            // Fast health pings so the HealthMonitor re-broadcasts
-            // topology within ~1s if the initial join broadcast was missed.
-            health_ping_interval_secs: 1,
-            // Sub-second election windows. Bootstrap defaults are 150/300ms;
-            // we allow significantly more headroom (500/1000ms) because
-            // integration tests share the host CPU pool with hundreds of
-            // unit tests running in parallel — under that load the Raft
-            // tick loop can be starved long enough that aggressive
-            // 200/500ms windows trigger spurious re-elections mid-test.
-            // 500/1000ms is still ~3× faster than the seconds-floor of
-            // 1s/2s but stable under contention.
-            election_timeout_min_ms: 500,
-            election_timeout_max_ms: 1000,
-            ..ClusterTransportTuning::default()
-        })
-        .await
+        Self::spawn_three_with_tuning(fast_cluster_tuning()).await
+    }
+
+    /// Spawn a 3-node cluster with `num_cores` Data-Plane cores PER NODE,
+    /// using the same fast election tuning as [`spawn_three`]. Exercises
+    /// multi-core cross-node code paths (the per-core store fan-out).
+    pub async fn spawn_three_with_cores(
+        num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_with_tuning_and_cores(fast_cluster_tuning(), num_cores).await
     }
 
     /// Spawn a 3-node cluster with a custom `ClusterTransportTuning`.
@@ -45,7 +38,18 @@ impl TestCluster {
     pub async fn spawn_three_with_tuning(
         tuning: ClusterTransportTuning,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let node1 = TestClusterNode::spawn_with_tuning(1, vec![], tuning.clone()).await?;
+        Self::spawn_three_with_tuning_and_cores(tuning, 1).await
+    }
+
+    /// Spawn a 3-node cluster with a custom `ClusterTransportTuning` and a
+    /// specific number of Data-Plane cores per node.
+    pub async fn spawn_three_with_tuning_and_cores(
+        tuning: ClusterTransportTuning,
+        num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let node1 =
+            TestClusterNode::spawn_with_tuning_and_cores(1, vec![], tuning.clone(), num_cores)
+                .await?;
 
         // Wait until node 1 has bootstrapped (topology shows itself)
         // before peers try to join. The old fixed 200ms sleep was too
@@ -61,7 +65,13 @@ impl TestCluster {
         }
 
         let seeds = vec![node1.listen_addr];
-        let node2 = TestClusterNode::spawn_with_tuning(2, seeds.clone(), tuning.clone()).await?;
+        let node2 = TestClusterNode::spawn_with_tuning_and_cores(
+            2,
+            seeds.clone(),
+            tuning.clone(),
+            num_cores,
+        )
+        .await?;
 
         // Wait for node 2's join to be reflected before spawning node 3.
         // Under load, spawning both peers simultaneously can overwhelm the
@@ -75,7 +85,8 @@ impl TestCluster {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let node3 = TestClusterNode::spawn_with_tuning(3, seeds, tuning).await?;
+        let node3 =
+            TestClusterNode::spawn_with_tuning_and_cores(3, seeds, tuning, num_cores).await?;
 
         let cluster = Self {
             nodes: vec![node1, node2, node3],
@@ -391,5 +402,26 @@ impl TestCluster {
         while let Some(node) = nodes.pop() {
             node.shutdown().await;
         }
+    }
+}
+
+/// Fast election tuning used by [`TestCluster::spawn_three`] and
+/// [`TestCluster::spawn_three_with_cores`].
+fn fast_cluster_tuning() -> ClusterTransportTuning {
+    ClusterTransportTuning {
+        // Fast health pings so the HealthMonitor re-broadcasts
+        // topology within ~1s if the initial join broadcast was missed.
+        health_ping_interval_secs: 1,
+        // Sub-second election windows. Bootstrap defaults are 150/300ms;
+        // we allow significantly more headroom (500/1000ms) because
+        // integration tests share the host CPU pool with hundreds of
+        // unit tests running in parallel — under that load the Raft
+        // tick loop can be starved long enough that aggressive
+        // 200/500ms windows trigger spurious re-elections mid-test.
+        // 500/1000ms is still ~3× faster than the seconds-floor of
+        // 1s/2s but stable under contention.
+        election_timeout_min_ms: 500,
+        election_timeout_max_ms: 1000,
+        ..ClusterTransportTuning::default()
     }
 }

@@ -51,10 +51,10 @@ pub struct TestClusterNode {
     pub(super) pg_shutdown_bus: nodedb::control::shutdown::ShutdownBus,
     pub(super) poller_shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub(super) cluster_shutdown_tx: tokio::sync::watch::Sender<bool>,
-    pub(super) core_stop_tx: std::sync::mpsc::Sender<()>,
+    pub(super) core_stop_txs: Vec<std::sync::mpsc::Sender<()>>,
     pub(super) _pg_handle: tokio::task::JoinHandle<()>,
     pub(super) _poller_handle: tokio::task::JoinHandle<()>,
-    pub(super) _core_handle: tokio::task::JoinHandle<()>,
+    pub(super) _core_handles: Vec<tokio::task::JoinHandle<()>>,
     pub(super) _event_plane: EventPlane,
 }
 
@@ -80,6 +80,18 @@ impl TestClusterNode {
         node_id: u64,
         seed_nodes: Vec<SocketAddr>,
         tuning: ClusterTransportTuning,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_with_tuning_and_cores(node_id, seed_nodes, tuning, 1).await
+    }
+
+    /// Spawn a cluster node with a custom `ClusterTransportTuning` and a
+    /// specific number of Data-Plane cores. Used to exercise multi-core
+    /// code paths in cluster tests.
+    pub async fn spawn_with_tuning_and_cores(
+        node_id: u64,
+        seed_nodes: Vec<SocketAddr>,
+        tuning: ClusterTransportTuning,
+        num_cores: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let data_dir = tempfile::tempdir()?;
         let data_dir_path: PathBuf = data_dir.path().to_path_buf();
@@ -118,8 +130,8 @@ impl TestClusterNode {
         let wal = Arc::new(WalManager::open_for_testing(
             &data_dir_path.join("test.wal"),
         )?);
-        let (dispatcher, data_sides) = Dispatcher::new(1, 1024);
-        let (event_producers, event_consumers) = create_event_bus(1);
+        let (dispatcher, data_sides) = Dispatcher::new(num_cores, 1024);
+        let (event_producers, event_consumers) = create_event_bus(num_cores);
 
         // Credential store backed by the system catalog — required for
         // CREATE COLLECTION to exercise the full persistence path.
@@ -172,22 +184,30 @@ impl TestClusterNode {
             return Err("SharedState already cloned before cluster wire-up".into());
         }
 
-        // Start Data Plane core via the shared core-loop runner.
-        let data_side = data_sides.into_iter().next().expect("data side");
-        let event_producer = event_producers.into_iter().next().expect("event producer");
-        let (core_stop_tx, core_stop_rx) = std::sync::mpsc::channel::<()>();
-        let core_handle =
-            crate::core_loop_runner::spawn_core_loop(crate::core_loop_runner::CoreLoopSpawn {
-                idx: 0,
-                data_side,
-                core_dir: data_dir_path.clone(),
-                core_array_catalog: shared.array_catalog.clone(),
-                event_producer,
-                core_metrics: shared.system_metrics.clone(),
-                governor: shared.governor.clone(),
-                replay: None,
-                stop_rx: core_stop_rx,
-            });
+        // Start one Data-Plane core loop per core. Each core gets its own SPSC
+        // data side and event producer; per-core stores live under the shared
+        // data dir keyed by `idx` (graph/core-{idx}.redb, etc.).
+        let mut core_stop_txs = Vec::with_capacity(num_cores);
+        let mut core_handles = Vec::with_capacity(num_cores);
+        for (idx, (data_side, event_producer)) in
+            data_sides.into_iter().zip(event_producers).enumerate()
+        {
+            let (core_stop_tx, core_stop_rx) = std::sync::mpsc::channel::<()>();
+            let core_handle =
+                crate::core_loop_runner::spawn_core_loop(crate::core_loop_runner::CoreLoopSpawn {
+                    idx,
+                    data_side,
+                    core_dir: data_dir_path.clone(),
+                    core_array_catalog: shared.array_catalog.clone(),
+                    event_producer,
+                    core_metrics: shared.system_metrics.clone(),
+                    governor: shared.governor.clone(),
+                    replay: None,
+                    stop_rx: core_stop_rx,
+                });
+            core_stop_txs.push(core_stop_tx);
+            core_handles.push(core_handle);
+        }
 
         // Response poller (Data Plane → control plane routing).
         let shared_poller = Arc::clone(&shared);
@@ -322,10 +342,10 @@ impl TestClusterNode {
             pg_shutdown_bus,
             poller_shutdown_tx,
             cluster_shutdown_tx,
-            core_stop_tx,
+            core_stop_txs,
             _pg_handle: pg_handle,
             _poller_handle: poller_handle,
-            _core_handle: core_handle,
+            _core_handles: core_handles,
             _event_plane: event_plane,
         })
     }
@@ -343,7 +363,9 @@ impl TestClusterNode {
         self.pg_shutdown_bus.initiate();
         let _ = self.cluster_shutdown_tx.send(true);
         let _ = self.poller_shutdown_tx.send(true);
-        let _ = self.core_stop_tx.send(());
+        for tx in &self.core_stop_txs {
+            let _ = tx.send(());
+        }
         // Give tokio a chance to drop the task futures before TempDir
         // is dropped — otherwise redb file locks can linger.
         for _ in 0..32 {
@@ -384,7 +406,9 @@ impl Drop for TestClusterNode {
         self._conn_handle.abort();
         self._pg_handle.abort();
         self._poller_handle.abort();
-        self._core_handle.abort();
+        for h in &self._core_handles {
+            h.abort();
+        }
     }
 }
 
