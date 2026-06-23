@@ -293,7 +293,7 @@ impl CoreLoop {
                     global_n: plan.global_n,
                     owned_vshards: &plan.owned_vshards,
                     incoming_contributions: &plan.incoming_contributions,
-                    rank_vec: &plan.rank_vec,
+                    rank_seed: &plan.rank_seed,
                 },
             ),
 

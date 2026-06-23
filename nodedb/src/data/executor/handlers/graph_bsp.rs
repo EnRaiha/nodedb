@@ -5,7 +5,7 @@
 //!
 //! Phase A primitive: the handler is stateless across supersteps. All
 //! per-superstep state is carried in the `GraphOp::BspSuperstep` plan variant
-//! (the round-tripped `rank_vec`, the `incoming_contributions` routed to this
+//! (the round-tripped `rank_seed`, the `incoming_contributions` routed to this
 //! shard's owned nodes) and returned in [`BspSuperstepResult`]. The
 //! Control-Plane coordinator (Phase B) owns the superstep loop, convergence
 //! check, and contribution routing; this handler only computes one shard's
@@ -52,7 +52,7 @@ pub struct BspSuperstepArgs<'a> {
     pub global_n: usize,
     pub owned_vshards: &'a [u32],
     pub incoming_contributions: &'a [(String, f64)],
-    pub rank_vec: &'a [f64],
+    pub rank_seed: &'a [(String, f64)],
 }
 
 /// The pure BSP-superstep core: given an already-built `CsrIndex` and the
@@ -64,8 +64,8 @@ pub struct BspSuperstepArgs<'a> {
 /// `build_csr_for_collection`) and the unit tests call this function, so the
 /// tests exercise the real handler math rather than a re-implementation.
 ///
-/// Returns a typed `crate::Error::Internal` only for the rank_vec length
-/// mismatch that the handler surfaces as `ErrorCode::Internal`.
+/// Returns `Ok(BspSuperstepResult)` in normal operation; other internal paths
+/// (e.g. encoding) may still surface `crate::Error::Internal`.
 pub(super) fn run_bsp_superstep_core(
     csr: &CsrIndex,
     args: &BspSuperstepArgs<'_>,
@@ -138,25 +138,25 @@ pub(super) fn run_bsp_superstep_core(
     let mut state =
         ShardPageRankState::init(vertex_count, out_degrees, |_name| None, &csr_out_edges);
 
-    // Seed rank: superstep 0 keeps init's uniform 1/vertex_count re-seeded to
-    // 1/global_n; otherwise the Control Plane round-trips the prior rank vector.
-    if !args.rank_vec.is_empty() {
-        if args.rank_vec.len() != vertex_count {
-            return Err(crate::Error::Internal {
-                detail: format!(
-                    "bsp superstep rank_vec length {} != owned vertex_count {}",
-                    args.rank_vec.len(),
-                    vertex_count
-                ),
-            });
-        }
-        state.rank.copy_from_slice(args.rank_vec);
-    } else if args.global_n > 0 {
-        // Re-seed init's 1/vertex_count to the global 1/global_n so the
-        // teleport mass is correct across all shards on superstep 0.
-        let init = 1.0 / args.global_n as f64;
+    // Seed rank from the name-keyed seed. Each owned node takes its seed rank by
+    // NAME (so the same seed can be fanned to every core, each self-filtering to
+    // its owned nodes); superstep 0 sends an empty seed → uniform 1/global_n.
+    let init = 1.0 / args.global_n as f64;
+    if args.rank_seed.is_empty() {
         for r in state.rank.iter_mut() {
             *r = init;
+        }
+    } else {
+        let seed: std::collections::HashMap<&str, f64> = args
+            .rank_seed
+            .iter()
+            .map(|(name, rank)| (name.as_str(), *rank))
+            .collect();
+        for (i, name) in node_names.iter().enumerate() {
+            // A node missing from the seed falls back to the uniform init — a
+            // correct coordinator always includes every owned node, but this
+            // keeps a missing entry safe rather than panicking.
+            state.rank[i] = seed.get(name.as_str()).copied().unwrap_or(init);
         }
     }
 
@@ -314,7 +314,7 @@ mod tests {
             global_n: 3,
             owned_vshards: &owned,
             incoming_contributions: &[],
-            rank_vec: &[],
+            rank_seed: &[],
         };
 
         let res = run_bsp_superstep_core(&csr, &args).unwrap();
@@ -357,7 +357,7 @@ mod tests {
             global_n: 0,
             owned_vshards: &owned,
             incoming_contributions: &[],
-            rank_vec: &[],
+            rank_seed: &[],
         };
 
         let res = run_bsp_superstep_core(&csr, &args).unwrap();
@@ -385,7 +385,7 @@ mod tests {
             global_n: 3,
             owned_vshards: &owned,
             incoming_contributions: &[],
-            rank_vec: &[],
+            rank_seed: &[],
         };
 
         let res = run_bsp_superstep_core(&csr, &args).unwrap();

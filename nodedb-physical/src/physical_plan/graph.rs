@@ -325,7 +325,7 @@ pub struct BspSuperstepPlan {
     /// PageRank `n` in the teleport / dangling redistribution terms.
     ///
     /// `global_n == 0` is the COUNT-ONLY sentinel: the coordinator dispatches one
-    /// superstep with `global_n = 0` (and empty `rank_vec` / `incoming_contributions`)
+    /// superstep with `global_n = 0` (and empty `rank_seed` / `incoming_contributions`)
     /// to every shard BEFORE superstep 0 so it can sum each shard's owned
     /// `vertex_count` into the real `global_n`. On that sentinel the handler
     /// short-circuits after building the owned-node set and runs NO superstep —
@@ -340,10 +340,12 @@ pub struct BspSuperstepPlan {
     /// Cross-shard contributions routed to THIS shard's owned nodes for this
     /// superstep: `(dst_node_name, contribution)`.
     pub incoming_contributions: Vec<(String, f64)>,
-    /// Round-tripped per-shard rank vector, indexed identically to the
-    /// response's `node_names`. EMPTY on superstep 0 → the handler initializes
-    /// each owned node to `1/global_n`.
-    pub rank_vec: Vec<f64>,
+    /// Round-tripped per-shard rank seed as `(node_name, rank)` pairs (name-keyed,
+    /// NOT positional) so the same plan can be fanned across a node's cores and
+    /// each core self-filters to its owned nodes by name. EMPTY on superstep 0 →
+    /// the handler initializes every owned node to `1/global_n`. A node absent from
+    /// the seed also falls back to `1/global_n`.
+    pub rank_seed: Vec<(String, f64)>,
 }
 
 /// Result of one [`GraphOp::BspSuperstep`] on a single shard.

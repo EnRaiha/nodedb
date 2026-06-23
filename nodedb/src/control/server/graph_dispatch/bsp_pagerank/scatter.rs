@@ -37,9 +37,9 @@ pub(super) struct ShardDispatch {
     /// Cross-shard contributions routed to THIS node's owned nodes this
     /// superstep (empty on the count phase and superstep 0).
     pub(super) incoming_contributions: Vec<(String, f64)>,
-    /// This node's current rank vector (empty on the count phase and on
-    /// superstep 0 — the handler seeds `1/global_n`).
-    pub(super) rank_vec: Vec<f64>,
+    /// Name-keyed `(node_name, rank)` seed for this node's owned nodes (empty on
+    /// the count phase and on superstep 0 — the handler seeds `1/global_n`).
+    pub(super) rank_seed: Vec<(String, f64)>,
 }
 
 /// One node's decoded superstep result, tagged with its owner node id.
@@ -76,7 +76,7 @@ pub(super) async fn scatter_superstep(
             // here in one pass and emits ghosts only for dsts on OTHER nodes.
             owned_vshards: d.owned_vshards.clone(),
             incoming_contributions: d.incoming_contributions,
-            rank_vec: d.rank_vec,
+            rank_seed: d.rank_seed,
         })));
         // Local node → ONE single-core local dispatch (NOT broadcast-to-all-cores,
         // which would double-count contributions per core). Remote node → one

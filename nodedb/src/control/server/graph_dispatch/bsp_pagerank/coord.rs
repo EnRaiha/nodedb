@@ -115,7 +115,7 @@ pub async fn run_bsp_pagerank(
             owned_vshards: t.owned_vshards.clone(),
             route_vshard: t.route_vshard(),
             incoming_contributions: Vec::new(),
-            rank_vec: Vec::new(),
+            rank_seed: Vec::new(),
         })
         .collect();
     let counts = scatter_superstep(
@@ -177,7 +177,12 @@ pub async fn run_bsp_pagerank(
                     owned_vshards: st.owned_vshards.clone(),
                     route_vshard: st.route_vshard,
                     incoming_contributions: incoming.remove(&node_id).unwrap_or_default(),
-                    rank_vec: st.rank_vec.clone(),
+                    rank_seed: st
+                        .node_names
+                        .iter()
+                        .cloned()
+                        .zip(st.rank_vec.iter().copied())
+                        .collect(),
                 }
             })
             .collect();
