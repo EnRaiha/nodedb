@@ -45,6 +45,35 @@ pub(crate) fn encode_match_envelope(
     Ok(buf)
 }
 
+/// Build the `{rows, frontier}` envelope from an ALREADY-encoded bare rows
+/// msgpack array plus frontier entries.
+///
+/// Mirrors [`encode_match_envelope`] but accepts pre-merged rows bytes (as
+/// produced by `broadcast_match_to_all_cores`) instead of `&[BindingRow]`,
+/// avoiding a redundant decode+re-encode round-trip.  The output is byte-
+/// identical to what `encode_match_envelope` would produce for the same rows.
+///
+/// Called by `execute_plan_all_local_cores` in the MATCH branch to reconstruct
+/// the single-shard envelope shape from a node-level `MatchBroadcastOutcome`.
+pub(crate) fn encode_match_envelope_raw(
+    rows_array: &[u8],
+    frontier: &[UnresolvedExpansion],
+) -> Result<Vec<u8>, crate::Error> {
+    use nodedb_query::msgpack_scan::writer::{write_kv_raw, write_map_header};
+
+    let frontier_bytes =
+        zerompk::to_msgpack_vec(&frontier.to_vec()).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("match frontier serialization: {e}"),
+        })?;
+
+    let mut buf = Vec::with_capacity(rows_array.len() + frontier_bytes.len() + 16);
+    write_map_header(&mut buf, 2);
+    write_kv_raw(&mut buf, MATCH_ENVELOPE_ROWS_KEY, rows_array);
+    write_kv_raw(&mut buf, MATCH_ENVELOPE_FRONTIER_KEY, &frontier_bytes);
+    Ok(buf)
+}
+
 impl CoreLoop {
     /// Encode a `MatchOutcome` into the DP→CP MATCH envelope and build the
     /// appropriate response (`partial` if the outcome was truncated, normal

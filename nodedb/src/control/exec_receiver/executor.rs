@@ -4,27 +4,26 @@
 //!
 //! When a remote node sends an `ExecuteRequest` to this node (because this
 //! node is the leader for the target vShard), the [`LocalPlanExecutor`]
-//! validates descriptor versions, decodes the `PhysicalPlan`, dispatches
-//! it through the local SPSC bridge, and returns an `ExecuteResponse`. The
-//! streaming sibling (`ExecuteStreamRequest`) shares the same validation +
-//! dispatch prologue ([`LocalPlanExecutor::prepare_dispatch`]) but pushes each
-//! result frame to a [`ChunkSink`] as it arrives.
+//! validates descriptor versions, decodes the `PhysicalPlan`, and fans it
+//! across ALL local Data-Plane cores via
+//! [`crate::control::server::exchange::execute_plan_all_local_cores`] before
+//! returning the merged result to the caller.
 //!
-//! Unlike the retired SQL-string forwarding path, this path skips planning
-//! entirely — the plan is already encoded by the sender.
+//! At 1 core/node the fan is over a single core and behaviour is identical to
+//! the prior single-core dispatch.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
+use futures::StreamExt;
 use tracing::{Instrument, info_span};
 
 use nodedb_cluster::forward::{ChunkSink, PlanExecutor};
 use nodedb_cluster::rpc_codec::{ExecuteRequest, ExecuteResponse, TypedClusterError};
 
-use crate::bridge::envelope::{Priority, Request};
+use crate::control::server::exchange::execute_plan_all_local_cores;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
-use crate::types::ReadConsistency;
 use nodedb_physical::physical_plan::wire as plan_wire;
 
 use super::support::{
@@ -92,25 +91,22 @@ impl PlanExecutor for LocalPlanExecutor {
     }
 }
 
-/// Outcome of [`LocalPlanExecutor::prepare_dispatch`]: a registered tracker
-/// receiver for a dispatched plan, plus the effective deadline and the
-/// request id (needed to cancel the tracker on the streaming error paths).
-struct PreparedDispatch {
-    rx: tokio::sync::mpsc::Receiver<crate::bridge::envelope::Response>,
-    deadline: Duration,
-    request_id: crate::types::RequestId,
-}
-
 impl LocalPlanExecutor {
-    /// Shared prologue for both the one-shot and streaming execution paths:
-    /// validate the deadline + descriptor versions, decode the plan, reject
-    /// unresolved Exchange nodes, then register a tracker and dispatch through
-    /// the local SPSC bridge. Returns the registered receiver on success or a
-    /// typed cluster error to surface to the caller.
-    fn prepare_dispatch(
+    /// Shared validation + decode prologue for both the one-shot and streaming
+    /// paths: validate deadline + descriptor versions, decode the plan, reject
+    /// unresolved Exchange nodes.  Returns `(plan, database_id, deadline)` on
+    /// success or a typed cluster error to surface to the caller.
+    fn validate_and_decode(
         &self,
         req: &ExecuteRequest,
-    ) -> Result<PreparedDispatch, TypedClusterError> {
+    ) -> Result<
+        (
+            nodedb_physical::physical_plan::PhysicalPlan,
+            DatabaseId,
+            Duration,
+        ),
+        TypedClusterError,
+    > {
         // ── 1. Deadline check ─────────────────────────────────────────────────
         if req.deadline_remaining_ms == 0 {
             return Err(TypedClusterError::DeadlineExceeded { elapsed_ms: 0 });
@@ -181,83 +177,73 @@ impl LocalPlanExecutor {
             });
         }
 
-        // ── 4. Dispatch through local SPSC bridge ─────────────────────────────
-        let request_id = self.state.next_request_id();
-        let tenant_id = crate::types::TenantId::new(req.tenant_id);
-
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id,
-            vshard_id: crate::types::VShardId::new(0),
-            plan,
-            deadline: Instant::now() + deadline,
-            priority: Priority::Normal,
-            trace_id: nodedb_types::TraceId(req.trace_id),
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-        };
-
-        let rx = self.state.tracker.register(request_id);
-
-        let dispatch_result = match self.state.dispatcher.lock() {
-            Ok(mut d) => d.dispatch(request),
-            Err(poisoned) => poisoned.into_inner().dispatch(request),
-        };
-
-        if let Err(e) = dispatch_result {
-            return Err(TypedClusterError::Internal {
-                code: PLAN_DECODE_FAILED,
-                message: format!("dispatch failed: {e}"),
-            });
-        }
-
-        Ok(PreparedDispatch {
-            rx,
-            deadline,
-            request_id,
-        })
+        Ok((plan, database_id, deadline))
     }
 
-    /// Streaming execution: prepare + dispatch as usual, then push each result
-    /// frame to `sink` as it arrives instead of collecting into one response.
+    /// One-shot execution: validate + decode, fan across all local cores,
+    /// merge, and return the merged payload.
+    async fn execute_plan_inner(&self, req: ExecuteRequest) -> ExecuteResponse {
+        let (plan, database_id, deadline) = match self.validate_and_decode(&req) {
+            Ok(t) => t,
+            Err(e) => return ExecuteResponse::err(e),
+        };
+
+        let tenant_id = crate::types::TenantId::new(req.tenant_id);
+        let trace_id = nodedb_types::TraceId(req.trace_id);
+
+        match tokio::time::timeout(
+            deadline,
+            execute_plan_all_local_cores(&self.state, tenant_id, database_id, plan, trace_id),
+        )
+        .await
+        {
+            Ok(Ok(result)) => ExecuteResponse::ok(vec![result.payload]),
+            Ok(Err(e)) => ExecuteResponse::err(TypedClusterError::Internal {
+                code: PLAN_DECODE_FAILED,
+                message: e.to_string(),
+            }),
+            Err(_) => ExecuteResponse::err(TypedClusterError::DeadlineExceeded {
+                elapsed_ms: deadline.as_millis() as u64,
+            }),
+        }
+    }
+
+    /// Streaming execution: validate + decode, fan across all local cores via
+    /// `gather_all_cores_stream`, and push each result frame to `sink` as it
+    /// arrives.
     ///
     /// Returns `None` on a clean end, or `Some(err)` on a terminal failure
-    /// (validation rejection, stream error, over-budget, or deadline). A
-    /// `send_chunk` error means the coordinator is gone: cancel the tracker and
-    /// return `None` (there is no peer to receive a terminal frame).
+    /// (validation rejection, stream error, or deadline). A `send_chunk` error
+    /// means the coordinator is gone: return `None` (there is no peer to
+    /// receive a terminal frame).
     async fn execute_plan_streaming_inner(
         &self,
         req: ExecuteRequest,
         mut sink: impl ChunkSink,
     ) -> Option<TypedClusterError> {
-        use futures::StreamExt;
-
-        let PreparedDispatch {
-            rx,
-            deadline,
-            request_id,
-        } = match self.prepare_dispatch(&req) {
-            Ok(p) => p,
+        let (plan, database_id, deadline) = match self.validate_and_decode(&req) {
+            Ok(t) => t,
             Err(e) => return Some(e),
         };
 
-        let max_result_bytes = self.state.tuning.network.max_query_result_bytes as usize;
-        // `tolerate_not_found: false` — a remote single-shard executor that
-        // reports NotFound surfaces it as an error, matching the one-shot path
-        // (which maps a `Status::Error` terminal frame to `Internal`). The
-        // coordinator's `gather_all_cores_stream` is the place NotFound is
-        // tolerated (per-core "no rows on this core"); a single remote shard
-        // returning NotFound means the scan genuinely found nothing here.
-        let mut stream = crate::control::server::result_stream::stream_response_channel(
-            rx,
-            max_result_bytes,
-            false,
-        );
+        let tenant_id = crate::types::TenantId::new(req.tenant_id);
+        let trace_id = nodedb_types::TraceId(req.trace_id);
+
+        let mut stream = match crate::control::server::exchange::gather::gather_all_cores_stream(
+            &self.state,
+            tenant_id,
+            database_id,
+            plan,
+            trace_id,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return Some(TypedClusterError::Internal {
+                    code: PLAN_DECODE_FAILED,
+                    message: e.to_string(),
+                });
+            }
+        };
 
         let stream_fut = async {
             while let Some(batch) = stream.next().await {
@@ -265,13 +251,11 @@ impl LocalPlanExecutor {
                     Ok(b) => {
                         if let Err(_e) = sink.send_chunk(b.payload, b.watermark_lsn.as_u64()).await
                         {
-                            // Coordinator gone — stop, cancel tracker, no terminal.
-                            self.state.tracker.cancel(&request_id);
+                            // Coordinator gone — stop, no terminal frame.
                             return SinkOutcome::CoordinatorGone;
                         }
                     }
                     Err(e) => {
-                        self.state.tracker.cancel(&request_id);
                         return SinkOutcome::StreamError(stream_error_to_typed(e));
                     }
                 }
@@ -283,193 +267,7 @@ impl LocalPlanExecutor {
             Ok(SinkOutcome::CleanEnd) => None,
             Ok(SinkOutcome::CoordinatorGone) => None,
             Ok(SinkOutcome::StreamError(e)) => Some(e),
-            Err(_) => {
-                self.state.tracker.cancel(&request_id);
-                Some(TypedClusterError::DeadlineExceeded {
-                    elapsed_ms: deadline.as_millis() as u64,
-                })
-            }
-        }
-    }
-
-    async fn execute_plan_inner(&self, req: ExecuteRequest) -> ExecuteResponse {
-        // ── 1. Deadline check ─────────────────────────────────────────────────
-        if req.deadline_remaining_ms == 0 {
-            return ExecuteResponse::err(TypedClusterError::DeadlineExceeded { elapsed_ms: 0 });
-        }
-
-        let deadline = Duration::from_millis(req.deadline_remaining_ms).min(Duration::from_secs(
-            self.state.tuning.network.default_deadline_secs,
-        ));
-
-        let database_id = DatabaseId::from(req.database_id);
-
-        // ── 2. Descriptor version validation ──────────────────────────────────
-        //
-        // For each (collection, version) pair the caller sent, look up the local
-        // descriptor version from SystemCatalog. If any version differs, the
-        // caller's plan was built against a stale schema — reject with a typed
-        // error so they re-plan against fresh leases.
-        let catalog_ref = self.state.credentials.catalog();
-        if let Some(catalog) = catalog_ref.as_ref() {
-            for entry in &req.descriptor_versions {
-                match catalog.get_collection(database_id, req.tenant_id, &entry.collection) {
-                    Ok(Some(stored)) => {
-                        // Version 0 is the pre-B.1 sentinel; treat as 1 (same
-                        // floor the drain gate uses).
-                        let actual = if stored.descriptor_version == 0 {
-                            1
-                        } else {
-                            stored.descriptor_version
-                        };
-                        if actual != entry.version {
-                            return ExecuteResponse::err(TypedClusterError::DescriptorMismatch {
-                                collection: entry.collection.clone(),
-                                expected_version: entry.version,
-                                actual_version: actual,
-                            });
-                        }
-                    }
-                    Ok(None) => {
-                        // Collection not found locally — could be a new collection
-                        // the follower saw but we haven't applied yet, or a race.
-                        // Treat as DescriptorMismatch so the caller re-plans.
-                        if entry.version != 0 {
-                            return ExecuteResponse::err(TypedClusterError::DescriptorMismatch {
-                                collection: entry.collection.clone(),
-                                expected_version: entry.version,
-                                actual_version: 0,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        return ExecuteResponse::err(TypedClusterError::Internal {
-                            code: PLAN_DECODE_FAILED,
-                            message: format!("catalog lookup failed: {e}"),
-                        });
-                    }
-                }
-            }
-        }
-
-        // ── 3. Decode the PhysicalPlan ────────────────────────────────────────
-        let plan = match plan_wire::decode(&req.plan_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                return ExecuteResponse::err(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: format!("plan decode failed: {e}"),
-                });
-            }
-        };
-
-        // ── 3b. Reject unresolved Exchange nodes ──────────────────────────────
-        //
-        // Exchange is data-movement and is always resolved by the coordinator on
-        // the requesting node before a plan is shipped here. A local core cannot
-        // perform cross-core/cross-node movement, so a plan that still contains an
-        // Exchange node anywhere in its tree is a coordinator bug — reject it
-        // deterministically instead of dispatching an unexecutable plan.
-        if plan_contains_exchange(&plan) {
-            return ExecuteResponse::err(TypedClusterError::Internal {
-                code: PLAN_DECODE_FAILED,
-                message: "received plan with unresolved Exchange node; coordinator must resolve \
-                          data movement before cross-node dispatch"
-                    .into(),
-            });
-        }
-
-        // ── 4. Dispatch through local SPSC bridge ─────────────────────────────
-        //
-        // Build a Request, register a oneshot tracker, dispatch, and await the response.
-        let request_id = self.state.next_request_id();
-        let tenant_id = crate::types::TenantId::new(req.tenant_id);
-
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id,
-            // Use the first vshard_id from the plan — the sender already routed
-            // this to the correct node. Use 0 as the default if the plan doesn't
-            // embed vshard info directly; the Data Plane ignores it for local exec.
-            vshard_id: crate::types::VShardId::new(0),
-            plan,
-            deadline: Instant::now() + deadline,
-            priority: Priority::Normal,
-            trace_id: nodedb_types::TraceId(req.trace_id),
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-        };
-
-        let mut rx = self.state.tracker.register(request_id);
-
-        let dispatch_result = match self.state.dispatcher.lock() {
-            Ok(mut d) => d.dispatch(request),
-            Err(poisoned) => poisoned.into_inner().dispatch(request),
-        };
-
-        if let Err(e) = dispatch_result {
-            return ExecuteResponse::err(TypedClusterError::Internal {
-                code: PLAN_DECODE_FAILED,
-                message: format!("dispatch failed: {e}"),
-            });
-        }
-
-        // ── 5. Collect response payloads ──────────────────────────────────────
-        //
-        // A remote scan can stream as several `Partial` chunks before its
-        // terminal frame — the Data Plane chunks any result wider than
-        // `stream_chunk_size`. Consuming only the first frame would silently
-        // truncate the remote shard's result to one chunk and orphan the
-        // request's tracker entry. Drain and concatenate every frame via the
-        // same bounded collector the local dispatch path uses, so the combined
-        // payload is held to the Control-Plane `max_query_result_bytes` ceiling.
-        use crate::control::server::dispatch_utils::{
-            DispatchCollectError, collect_bounded_response,
-        };
-        let max_result_bytes = self.state.tuning.network.max_query_result_bytes as usize;
-        match tokio::time::timeout(
-            deadline,
-            collect_bounded_response(&mut rx, max_result_bytes),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => {
-                if resp.status == crate::bridge::envelope::Status::Error {
-                    let msg = resp
-                        .error_code
-                        .as_ref()
-                        .map(|c| format!("{c:?}"))
-                        .unwrap_or_else(|| "unknown error".into());
-                    ExecuteResponse::err(TypedClusterError::Internal {
-                        code: PLAN_DECODE_FAILED,
-                        message: msg,
-                    })
-                } else {
-                    ExecuteResponse::ok(vec![resp.payload.to_vec()])
-                }
-            }
-            Ok(Err(DispatchCollectError::OverBudget { bytes })) => {
-                self.state.tracker.cancel(&request_id);
-                ExecuteResponse::err(TypedClusterError::Internal {
-                    code: 0,
-                    message: format!(
-                        "remote query result exceeded max_query_result_bytes \
-                         ({bytes} > {max_result_bytes} bytes)"
-                    ),
-                })
-            }
-            Ok(Err(DispatchCollectError::ChannelClosed)) => {
-                ExecuteResponse::err(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: "response channel closed".into(),
-                })
-            }
-            Err(_) => ExecuteResponse::err(TypedClusterError::DeadlineExceeded {
+            Err(_) => Some(TypedClusterError::DeadlineExceeded {
                 elapsed_ms: deadline.as_millis() as u64,
             }),
         }

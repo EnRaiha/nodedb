@@ -6,10 +6,11 @@
 //!
 //! Each dispatch carries the owner node's FULL `owned_vshards` set so the
 //! handler ranks every node homed on that owner in a single CSR pass. A remote
-//! node gets one `RouteDecision::Remote` dispatch; the local node gets ONE
-//! single-core `RouteDecision::Local` dispatch (NOT a broadcast to every local
-//! core — that would re-run the superstep on each core's CSR and double-count
-//! PageRank contributions per core).
+//! node gets one `RouteDecision::Remote` dispatch; the local node fans across
+//! ALL local cores via `execute_plan_all_local_cores` (which merges the
+//! per-core disjoint results into one `BspSuperstepResult` before returning).
+//! At 1 core/node the fan is over a single core and behaviour is identical to
+//! the prior single-core dispatch.
 
 use futures::future::join_all;
 
@@ -78,39 +79,49 @@ pub(super) async fn scatter_superstep(
             incoming_contributions: d.incoming_contributions,
             rank_seed: d.rank_seed,
         })));
-        // Local node → ONE single-core local dispatch (NOT broadcast-to-all-cores,
-        // which would double-count contributions per core). Remote node → one
-        // remote dispatch carrying any one of the node's vShards as the route key.
-        let (decision, route_vshard) = if d.is_local {
-            (RouteDecision::Local, d.route_vshard)
-        } else {
-            (
-                RouteDecision::Remote {
-                    node_id: d.node_id,
-                    vshard_id: d.route_vshard as u64,
-                },
-                d.route_vshard,
-            )
-        };
-        let route = TaskRoute {
-            plan,
-            decision,
-            vshard_id: route_vshard,
-        };
         let version_set = version_set.clone();
         let node_id = d.node_id;
+        let is_local = d.is_local;
+        let route_vshard = d.route_vshard;
+
         Box::pin(async move {
-            let payloads = dispatch_route(
-                route,
-                shared_arc,
-                tenant_id,
-                database_id,
-                TraceId::ZERO,
-                deadline_ms,
-                &version_set,
-            )
-            .await?;
-            let result = decode_single_result(node_id, payloads)?;
+            let result = if is_local {
+                // Local node: fan across ALL local cores and merge. The per-core
+                // owned-node sets are disjoint, so the merged result is correct
+                // without dedup.  At 1 core/node this is behaviour-identical to
+                // the prior single-core RouteDecision::Local dispatch.
+                let node_result = crate::control::server::exchange::execute_plan_all_local_cores(
+                    shared_arc.as_ref(),
+                    tenant_id,
+                    database_id,
+                    plan,
+                    TraceId::ZERO,
+                )
+                .await?;
+                let payload = crate::bridge::envelope::Payload::from_vec(node_result.payload);
+                decode_single_result_from_payload(node_id, payload)?
+            } else {
+                // Remote node: one dispatch via the gateway (unchanged path).
+                let route = TaskRoute {
+                    plan,
+                    decision: RouteDecision::Remote {
+                        node_id,
+                        vshard_id: route_vshard as u64,
+                    },
+                    vshard_id: route_vshard,
+                };
+                let payloads = dispatch_route(
+                    route,
+                    shared_arc,
+                    tenant_id,
+                    database_id,
+                    TraceId::ZERO,
+                    deadline_ms,
+                    &version_set,
+                )
+                .await?;
+                decode_single_result(node_id, payloads)?
+            };
             Ok::<ShardResult, crate::Error>(ShardResult { node_id, result })
         })
     });
@@ -138,6 +149,17 @@ fn decode_single_result(node_id: u64, payloads: Vec<Vec<u8>>) -> crate::Result<B
             detail: format!("bsp pagerank: node={node_id} returned no payload"),
         })?;
     let payload = Payload::from_vec(payload);
+    decode_single_result_from_payload(node_id, payload)
+}
+
+/// Decode a single node's `BspSuperstepResult` from an already-wrapped
+/// [`Payload`].  Empty payload → `BspSuperstepResult::default()` (zero-vertex
+/// shard, contributes nothing). Used both by the remote payload-list path
+/// (via `decode_single_result`) and the local all-cores merged payload path.
+fn decode_single_result_from_payload(
+    node_id: u64,
+    payload: Payload,
+) -> crate::Result<BspSuperstepResult> {
     if payload.is_empty() {
         return Ok(BspSuperstepResult::default());
     }
