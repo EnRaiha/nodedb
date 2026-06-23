@@ -41,6 +41,9 @@ pub(super) struct ShardDispatch {
     /// Name-keyed `(node_name, rank)` seed for this node's owned nodes (empty on
     /// the count phase and on superstep 0 — the handler seeds `1/global_n`).
     pub(super) rank_seed: Vec<(String, f64)>,
+    /// Global dangling-node rank mass to seed this superstep's teleport base.
+    /// `0.0` on the count phase and on superstep 0.
+    pub(super) global_dangling: f64,
 }
 
 /// One node's decoded superstep result, tagged with its owner node id.
@@ -78,6 +81,7 @@ pub(super) async fn scatter_superstep(
             owned_vshards: d.owned_vshards.clone(),
             incoming_contributions: d.incoming_contributions,
             rank_seed: d.rank_seed,
+            global_dangling: d.global_dangling,
         })));
         let version_set = version_set.clone();
         let node_id = d.node_id;

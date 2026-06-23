@@ -346,6 +346,14 @@ pub struct BspSuperstepPlan {
     /// the handler initializes every owned node to `1/global_n`. A node absent from
     /// the seed also falls back to `1/global_n`.
     pub rank_seed: Vec<(String, f64)>,
+    /// Global dangling-node rank mass aggregated by the coordinator from the
+    /// PREVIOUS superstep across all shards; used for the teleport base so dangling
+    /// mass redistributes across the WHOLE graph, not just this shard.
+    ///
+    /// `0.0` on superstep 0 and the count phase: no previous local sums exist yet,
+    /// so the base collapses to the plain teleport `(1−d)/n` — identical to a
+    /// non-dangling graph and correct for initialization.
+    pub global_dangling: f64,
 }
 
 /// Result of one [`GraphOp::BspSuperstep`] on a single shard.
@@ -381,4 +389,9 @@ pub struct BspSuperstepResult {
     pub vertex_count: usize,
     /// Owned-node names, positionally aligned with `rank_vec`.
     pub node_names: Vec<String>,
+    /// This shard's dangling-node rank mass this superstep (sum of `rank` for all
+    /// owned nodes with out-degree 0, computed BEFORE the rank swap). The
+    /// coordinator sums these across shards into the next superstep's
+    /// `global_dangling` field so dangling mass redistributes globally.
+    pub dangling_sum: f64,
 }

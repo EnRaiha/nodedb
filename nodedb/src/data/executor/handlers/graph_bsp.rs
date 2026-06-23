@@ -53,6 +53,9 @@ pub struct BspSuperstepArgs<'a> {
     pub owned_vshards: &'a [u32],
     pub incoming_contributions: &'a [(String, f64)],
     pub rank_seed: &'a [(String, f64)],
+    /// Global dangling-node rank mass from the coordinator (see
+    /// `BspSuperstepPlan::global_dangling`). `0.0` on count phase and superstep 0.
+    pub global_dangling: f64,
 }
 
 /// The pure BSP-superstep core: given an already-built `CsrIndex` and the
@@ -108,6 +111,7 @@ pub(super) fn run_bsp_superstep_core(
             rank_vec: Vec::new(),
             vertex_count,
             node_names,
+            dangling_sum: 0.0,
         });
     }
 
@@ -183,8 +187,13 @@ pub(super) fn run_bsp_superstep_core(
     };
 
     let damping = args.params.damping_factor();
-    let (local_delta, outbound_map) =
-        state.superstep(damping, args.global_n, &local_edge_iter, &node_id_to_local);
+    let (local_delta, local_dangling_sum, outbound_map) = state.superstep(
+        damping,
+        args.global_n,
+        args.global_dangling,
+        &local_edge_iter,
+        &node_id_to_local,
+    );
 
     // Flatten outbound HashMap<u16, Vec<(String, f64)>> into the msgpack-flat
     // (target_vshard, dst_name, contribution) shape.
@@ -201,6 +210,7 @@ pub(super) fn run_bsp_superstep_core(
         rank_vec: state.rank,
         vertex_count,
         node_names,
+        dangling_sum: local_dangling_sum,
     })
 }
 
@@ -315,6 +325,7 @@ mod tests {
             owned_vshards: &owned,
             incoming_contributions: &[],
             rank_seed: &[],
+            global_dangling: 0.0,
         };
 
         let res = run_bsp_superstep_core(&csr, &args).unwrap();
@@ -358,6 +369,7 @@ mod tests {
             owned_vshards: &owned,
             incoming_contributions: &[],
             rank_seed: &[],
+            global_dangling: 0.0,
         };
 
         let res = run_bsp_superstep_core(&csr, &args).unwrap();
@@ -386,6 +398,7 @@ mod tests {
             owned_vshards: &owned,
             incoming_contributions: &[],
             rank_seed: &[],
+            global_dangling: 0.0,
         };
 
         let res = run_bsp_superstep_core(&csr, &args).unwrap();

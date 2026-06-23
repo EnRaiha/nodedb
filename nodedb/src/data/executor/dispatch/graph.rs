@@ -294,6 +294,7 @@ impl CoreLoop {
                     owned_vshards: &plan.owned_vshards,
                     incoming_contributions: &plan.incoming_contributions,
                     rank_seed: &plan.rank_seed,
+                    global_dangling: plan.global_dangling,
                 },
             ),
 

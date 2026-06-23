@@ -60,33 +60,53 @@ impl ShardPageRankState {
         }
     }
 
-    /// Execute one superstep. Returns (local_delta, outbound_contributions).
+    /// Execute one superstep. Returns `(local_delta, local_dangling_sum,
+    /// outbound_contributions)`.
     ///
-    /// Incoming cross-shard contributions accumulated via
-    /// [`Self::add_remote_contribution`] are folded into `next_rank`
-    /// **after** the local scatter and **before** the rank swap. This
-    /// ordering is mandatory for a stateless per-superstep round trip:
-    /// the previous design applied incoming contributions in a separate
-    /// `apply_incoming_contributions` call that mutated `next_rank` after
-    /// the swap, which silently landed them in the *previous* iteration's
-    /// rank vector. Threading them through `superstep` makes a single
-    /// `superstep(...)` invocation the complete, self-contained iteration
-    /// the distributed BSP handler round-trips per step.
+    /// # Global dangling mass
     ///
-    /// `node_id_to_local` maps an incoming contribution's destination
-    /// vertex name to its local dense index; contributions whose target
-    /// is not owned by this shard are dropped.
+    /// `global_dangling_sum` is the dangling-node rank mass aggregated by the
+    /// coordinator from ALL shards' previous-superstep local sums (supplied via
+    /// the `local_dangling_sum` field of each shard's return value). The base
+    /// teleport term therefore uses the GLOBAL dangling mass rather than this
+    /// shard's local dangling mass, so dangling-node rank redistributes across
+    /// the WHOLE graph, not just the shard that owns the dangling node.
+    ///
+    /// On superstep 0 the coordinator passes `0.0` (no previous local sums exist
+    /// yet) and the base collapses to the plain teleport `(1−d)/n` — identical
+    /// to before, correct for a single-shard graph with no dangling nodes. The
+    /// 1-superstep lag converges to the correct fixed point, exactly like the
+    /// existing cross-shard contribution round-trip.
+    ///
+    /// The returned `local_dangling_sum` is this shard's dangling-node mass
+    /// computed from `self.rank` BEFORE the rank swap; the coordinator sums these
+    /// across shards into the next superstep's `global_dangling_sum`.
+    ///
+    /// # Incoming contributions
+    ///
+    /// Cross-shard contributions accumulated via [`Self::add_remote_contribution`]
+    /// are folded into `next_rank` **after** the local scatter and **before** the
+    /// rank swap. This ordering is mandatory for a stateless per-superstep round
+    /// trip: applying them after the swap silently lands them in the *previous*
+    /// iteration's rank vector.
+    ///
+    /// `node_id_to_local` maps an incoming contribution's destination vertex name
+    /// to its local dense index; contributions whose target is not owned by this
+    /// shard are dropped.
     pub fn superstep(
         &mut self,
         damping: f64,
         global_n: usize,
+        global_dangling_sum: f64,
         local_edge_iter: &dyn Fn(u32) -> Vec<u32>,
         node_id_to_local: &dyn Fn(&str) -> Option<u32>,
-    ) -> (f64, HashMap<u16, Vec<(String, f64)>>) {
+    ) -> (f64, f64, HashMap<u16, Vec<(String, f64)>>) {
         let n = global_n as f64;
         let teleport = (1.0 - damping) / n;
 
-        let dangling_sum: f64 = self
+        // Compute THIS shard's local dangling mass from the PRE-SWAP rank vector
+        // and return it so the coordinator can aggregate it for the NEXT superstep.
+        let local_dangling_sum: f64 = self
             .rank
             .iter()
             .enumerate()
@@ -94,7 +114,11 @@ impl ShardPageRankState {
             .map(|(_, r)| r)
             .sum();
 
-        let base = teleport + damping * dangling_sum / n;
+        // Use the GLOBAL dangling sum supplied by the coordinator (aggregated from
+        // all shards' previous-superstep local sums). When there are no dangling
+        // nodes anywhere, `global_dangling_sum` is 0.0 and base == teleport —
+        // behaviour is identical to a non-dangling graph.
+        let base = teleport + damping * global_dangling_sum / n;
 
         for r in self.next_rank.iter_mut() {
             *r = base;
@@ -142,7 +166,7 @@ impl ShardPageRankState {
         std::mem::swap(&mut self.rank, &mut self.next_rank);
         self.incoming_contributions.clear();
 
-        (delta, outbound)
+        (delta, local_dangling_sum, outbound)
     }
 
     pub fn add_remote_contribution(&mut self, vertex_name: String, value: f64) {
@@ -186,9 +210,12 @@ mod tests {
     #[test]
     fn shard_superstep_local_only() {
         let mut state = ShardPageRankState::init(3, vec![1, 1, 1], |_| None, &|_| Vec::new());
-        let (delta, outbound) = state.superstep(
+        // No dangling nodes in this ring, so global_dangling_sum = 0.0 — behaviour
+        // is unchanged: base == teleport only, mass is conserved.
+        let (delta, local_dangling_sum, outbound) = state.superstep(
             0.85,
             3,
+            0.0, // no dangling nodes anywhere
             &|node| match node {
                 0 => vec![1],
                 1 => vec![2],
@@ -199,8 +226,58 @@ mod tests {
         );
         assert!(outbound.is_empty());
         assert!(delta >= 0.0);
+        // No dangling nodes → local_dangling_sum must be 0.0.
+        assert_eq!(local_dangling_sum, 0.0);
         let sum: f64 = state.rank.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn global_dangling_sum_used_in_base() {
+        // 2 vertices: vertex 0 has out-degree 1 (non-dangling), vertex 1 has
+        // out-degree 0 (dangling). Simulate a cross-shard scenario by passing a
+        // global_dangling_sum LARGER than this shard's own dangling mass — as if
+        // additional dangling mass exists on other shards. Assert each node's
+        // base reflects the GLOBAL value, not just the local shard's dangling sum.
+        let n: usize = 10; // fictional global node count — larger than local 2
+        let damping = 0.85_f64;
+        // Local dangling mass = rank of vertex 1 = 1/2 (uniform init).
+        // External dangling mass = 0.3 (simulated from other shards).
+        let local_dangling_init = 1.0 / 2.0_f64;
+        let extra_dangling = 0.3_f64;
+        let global_dangling = local_dangling_init + extra_dangling;
+
+        let mut state = ShardPageRankState::init(
+            2,
+            vec![1, 0], // vertex 1 is dangling
+            |_| None,
+            &|_| Vec::new(), // no boundary edges in this focused test
+        );
+        // Edge 0 → 1 (local, no boundary edges needed for this assertion).
+        let (_delta, _local_dangling_sum, _outbound) = state.superstep(
+            damping,
+            n,
+            global_dangling,
+            &|node| if node == 0 { vec![1] } else { Vec::new() },
+            &|_name| None,
+        );
+
+        // The base each node receives must be (1-d)/n + d*global_dangling/n.
+        let expected_base = (1.0 - damping) / n as f64 + damping * global_dangling / n as f64;
+        // Vertex 0: base + contribution from no in-edge in this pass
+        //           (vertex 1 is dangling; no out-edges scatter to 0 locally).
+        // Vertex 1: base + damping * rank[0] / 1 (edge 0→1).
+        //
+        // We assert the minimum: both nodes start with at least `expected_base`
+        // in next_rank (the base is applied before any scatter). Since next_rank
+        // after the swap is state.rank, and vertex 1 also got vertex 0's scatter,
+        // we check vertex 0's rank == expected_base (it received no in-edge
+        // scatter this superstep).
+        let rank_v0 = state.rank[0];
+        assert!(
+            (rank_v0 - expected_base).abs() < 1e-12,
+            "vertex 0 rank should equal base={expected_base:.15} (no in-edge scatter), got {rank_v0:.15}"
+        );
     }
 
     #[test]

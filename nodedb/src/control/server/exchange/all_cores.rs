@@ -316,6 +316,10 @@ fn merge_bsp_results(parts: Vec<BspSuperstepResult>) -> BspSuperstepResult {
         out.outbound.extend(p.outbound);
         out.node_names.extend(p.node_names);
         out.rank_vec.extend(p.rank_vec);
+        // Owned-node sets are DISJOINT across cores (each graph node is homed on
+        // exactly one core), so summing per-core dangling sums counts every
+        // dangling node exactly once.
+        out.dangling_sum += p.dangling_sum;
     }
     out
 }

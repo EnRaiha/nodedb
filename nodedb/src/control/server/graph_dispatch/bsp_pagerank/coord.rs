@@ -116,6 +116,7 @@ pub async fn run_bsp_pagerank(
             route_vshard: t.route_vshard(),
             incoming_contributions: Vec::new(),
             rank_seed: Vec::new(),
+            global_dangling: 0.0, // count phase: no previous superstep dangling sums.
         })
         .collect();
     let counts = scatter_superstep(
@@ -159,6 +160,15 @@ pub async fn run_bsp_pagerank(
     // owner node id → Vec<(dst_name, contrib)>.
     let mut incoming: HashMap<u64, Vec<(String, f64)>> = HashMap::new();
 
+    // Global dangling-node rank mass aggregated from all shards' previous
+    // superstep. Starts at 0.0 before superstep 0 (no previous superstep exists),
+    // which collapses the base to the plain teleport `(1−d)/n` — correct for
+    // initialization. After each superstep the coordinator sums each shard's
+    // returned `dangling_sum` here; the NEXT superstep's dispatches carry this
+    // value so dangling mass redistributes globally, not just within the shard
+    // that owns the dangling node.
+    let mut global_dangling: f64 = 0.0;
+
     // ── Phase 2/3: superstep loop. ──
     let mut superstep: u32 = 0;
     loop {
@@ -183,6 +193,9 @@ pub async fn run_bsp_pagerank(
                         .cloned()
                         .zip(st.rank_vec.iter().copied())
                         .collect(),
+                    // Pass the globally aggregated dangling mass from the PREVIOUS
+                    // superstep. 0.0 on superstep 0 (no previous sums yet).
+                    global_dangling,
                 }
             })
             .collect();
@@ -200,8 +213,10 @@ pub async fn run_bsp_pagerank(
         )
         .await?;
 
-        // Store new rank vectors + node names, record ACKs, route outbound.
+        // Store new rank vectors + node names, record ACKs, route outbound, and
+        // aggregate per-shard dangling sums into global_dangling for the NEXT step.
         incoming = HashMap::new();
+        global_dangling = 0.0;
         for sr in results {
             let node_id = sr.node_id;
             let res = sr.result;
@@ -213,6 +228,12 @@ pub async fn run_bsp_pagerank(
                 vertex_count: res.vertex_count,
                 contributions_sent: res.outbound.len(),
             });
+
+            // Aggregate each node's local dangling mass into the global total for
+            // the NEXT superstep. Each graph node is homed on exactly one owner
+            // node, so summing per-node dangling sums counts every dangling node
+            // exactly once.
+            global_dangling += res.dangling_sum;
 
             // Route this node's outbound contributions to the node that OWNS the
             // target vShard. An unmapped target vShard is a routing
