@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::bridge::envelope::Payload;
 use crate::control::gateway::RouteDecision;
-use crate::control::gateway::router::resolve_decision;
+use crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard;
 use crate::control::state::SharedState;
 use crate::engine::graph::pattern::executor::{UnresolvedExpansion, rows_to_msgpack};
 use crate::types::{DatabaseId, TenantId, VShardId};
@@ -184,34 +184,6 @@ fn frontier_to_continuations(
         ));
     }
     Ok(out)
-}
-
-/// Resolve a vShard to a `RouteDecision` against live Raft leadership.
-pub(super) fn resolve_for_vshard(state: &SharedState, vshard_id: u32) -> RouteDecision {
-    let routing_guard = state
-        .cluster_routing
-        .as_ref()
-        .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
-    let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
-        state.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-    let live_leader = move |group_id: u64| -> u64 {
-        raft_snapshot
-            .iter()
-            .find(|gs| gs.group_id == group_id)
-            .map(|gs| gs.leader_id)
-            .unwrap_or(0)
-    };
-    let live_lookup: Option<&dyn Fn(u64) -> u64> = if state.raft_status_fn.get().is_some() {
-        Some(&live_leader)
-    } else {
-        None
-    };
-    resolve_decision(
-        vshard_id,
-        state.node_id,
-        routing_guard.as_deref(),
-        live_lookup,
-    )
 }
 
 /// Decode a bare msgpack rows array (the shape `rows_to_msgpack` produces and

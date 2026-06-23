@@ -21,6 +21,12 @@
 //! destination's vShard) instead of being scattered locally.
 //! `VShardId::from_key` is a pure hash, so no routing table is needed on the
 //! Data Plane.
+//!
+//! Count-only sentinel: `global_n == 0` means the coordinator is running its
+//! pre-superstep count phase. `run_bsp_superstep_core` then short-circuits after
+//! building the owned-node set and returns just `vertex_count` + `node_names`
+//! (no superstep runs) so the coordinator can sum owned counts into the real
+//! `global_n`. Every actual superstep passes `global_n > 0`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -88,6 +94,22 @@ pub(super) fn run_bsp_superstep_core(
         }
     }
     let vertex_count = node_names.len();
+
+    // `global_n == 0` is the COUNT-ONLY sentinel: the Control-Plane coordinator
+    // runs a cheap count phase (sum every shard's owned `vertex_count` →
+    // `global_n`) BEFORE superstep 0. In that phase we must not run any
+    // superstep — `global_n` is not yet known, so the teleport / dangling terms
+    // would be wrong. Short-circuit after building the owned-node set and return
+    // just the count + names. A real run always passes `global_n > 0`.
+    if args.global_n == 0 {
+        return Ok(BspSuperstepResult {
+            local_delta: 0.0,
+            outbound: Vec::new(),
+            rank_vec: Vec::new(),
+            vertex_count,
+            node_names,
+        });
+    }
 
     // Out-degree per owned node, counted over ALL out-edges (owned + ghost)
     // so dangling classification and contribution division match the
@@ -316,6 +338,36 @@ mod tests {
         for r in &res.rank_vec {
             assert!((r - r0).abs() < 1e-12, "ring symmetry: ranks equal");
         }
+    }
+
+    #[test]
+    fn global_n_zero_is_count_only_no_superstep() {
+        let csr = triangle_csr();
+        // Exclude c's vShard so only a and b are owned — proves the count-only
+        // path reports the OWNED vertex count (not the whole CSR) and still
+        // emits zero rank/outbound.
+        let c_vs = VShardId::from_key(b"c").as_u32();
+        let owned: Vec<u32> = (0..VShardId::COUNT).filter(|&v| v != c_vs).collect();
+        let params = dummy_params(0.85);
+        let args = BspSuperstepArgs {
+            algorithm: &GraphAlgorithm::PageRank,
+            params: &params,
+            superstep: 0,
+            // Sentinel: count phase only.
+            global_n: 0,
+            owned_vshards: &owned,
+            incoming_contributions: &[],
+            rank_vec: &[],
+        };
+
+        let res = run_bsp_superstep_core(&csr, &args).unwrap();
+
+        // Count-only: owned vertex count + names, but NO superstep ran.
+        assert_eq!(res.vertex_count, 2, "owned node count (a, b) reported");
+        assert_eq!(res.node_names, vec!["a".to_string(), "b".to_string()]);
+        assert!(res.rank_vec.is_empty(), "no ranks computed in count phase");
+        assert!(res.outbound.is_empty(), "no contributions in count phase");
+        assert_eq!(res.local_delta, 0.0, "no convergence delta in count phase");
     }
 
     #[test]

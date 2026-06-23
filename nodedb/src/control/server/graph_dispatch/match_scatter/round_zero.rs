@@ -4,7 +4,6 @@
 //! non-local group leader, issued concurrently.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use futures::future::join_all;
 
@@ -12,6 +11,7 @@ use crate::bridge::envelope::{Payload, PhysicalPlan};
 use crate::control::gateway::dispatcher::dispatch_route;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
+use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
 use crate::control::server::graph_dispatch::match_broadcast::{
     broadcast_match_to_all_cores, unwrap_match_envelope,
 };
@@ -158,21 +158,6 @@ fn distinct_remote_owners(state: &SharedState) -> crate::Result<Vec<RemoteOwner>
         }
     }
     Ok(owners)
-}
-
-/// The gateway's `Arc<SharedState>` for the remote dispatch path. In cluster
-/// mode the gateway is always wired; failing loudly here beats silently
-/// degrading to a local-only (partial) scatter.
-pub(super) fn gateway_shared(state: &SharedState) -> crate::Result<&Arc<SharedState>> {
-    state
-        .gateway
-        .as_ref()
-        .map(|g| &g.shared)
-        .ok_or_else(|| crate::Error::Internal {
-            detail: "match scatter: cluster routing present but gateway unavailable for \
-                     remote dispatch"
-                .into(),
-        })
 }
 
 /// Unwrap each remote `{rows, frontier}` envelope payload into one tagged

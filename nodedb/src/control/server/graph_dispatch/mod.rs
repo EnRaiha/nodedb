@@ -19,6 +19,8 @@
 //! subgraph traversal read path.
 
 pub mod bfs;
+pub mod bsp_pagerank;
+pub(crate) mod cluster_resolve;
 pub mod helpers;
 pub(crate) mod hop;
 pub mod match_broadcast;
@@ -27,6 +29,7 @@ pub mod shortest_path;
 pub mod traverse_subgraph;
 
 pub use bfs::cross_core_bfs_with_options;
+pub use bsp_pagerank::run_bsp_pagerank;
 pub use match_broadcast::{
     MatchBroadcastOutcome, broadcast_match_to_all_cores, unwrap_match_envelope,
 };

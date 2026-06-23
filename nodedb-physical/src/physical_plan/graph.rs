@@ -323,6 +323,14 @@ pub struct BspSuperstepPlan {
     pub superstep: u32,
     /// Total OWNED nodes across all shards (Control-Plane computed). Used as the
     /// PageRank `n` in the teleport / dangling redistribution terms.
+    ///
+    /// `global_n == 0` is the COUNT-ONLY sentinel: the coordinator dispatches one
+    /// superstep with `global_n = 0` (and empty `rank_vec` / `incoming_contributions`)
+    /// to every shard BEFORE superstep 0 so it can sum each shard's owned
+    /// `vertex_count` into the real `global_n`. On that sentinel the handler
+    /// short-circuits after building the owned-node set and runs NO superstep —
+    /// it returns only `vertex_count` + `node_names`. Every real superstep
+    /// (`superstep >= 0` of the actual run) passes `global_n > 0`.
     pub global_n: usize,
     /// The vShards this shard owns (Control-Plane supplied). A destination node
     /// whose `VShardId::from_key(name)` is not in this set is a ghost

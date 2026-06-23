@@ -17,8 +17,10 @@ use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_cluster::distributed_graph::PatternContinuation;
 use nodedb_physical::physical_plan::GraphOp;
 
-use super::coord::{TaggedShardResult, decode_rows, resolve_for_vshard};
-use super::round_zero::{collect_remote_envelopes, gateway_shared};
+use crate::control::server::graph_dispatch::cluster_resolve::{gateway_shared, resolve_for_vshard};
+
+use super::coord::{TaggedShardResult, decode_rows};
+use super::round_zero::collect_remote_envelopes;
 
 /// Dispatch one round of pending continuations, grouped by target shard.
 pub(super) async fn dispatch_continuations(

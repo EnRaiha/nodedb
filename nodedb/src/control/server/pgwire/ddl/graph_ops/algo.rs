@@ -14,6 +14,7 @@ use crate::control::server::broadcast;
 use crate::control::server::pgwire::types::{sqlstate_error, text_field};
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
+use crate::engine::graph::algo::GraphAlgorithm;
 use crate::types::TraceId;
 use nodedb_physical::physical_plan::GraphOp;
 use nodedb_types::DatabaseId;
@@ -60,6 +61,35 @@ pub async fn algo(
     };
 
     let tenant_id = identity.tenant_id;
+
+    // Cluster PageRank routes through the distributed BSP coordinator (F1d-4
+    // Phase B): graph edges are Raft-homed on `from_key(src)` and each core's
+    // CSR is partitioned, so a single-node `broadcast_to_all_cores` would only
+    // see the coordinator's local partitions. The coordinator runs the
+    // `GraphOp::BspSuperstep` primitive across every shard and assembles the
+    // result into the SAME `AlgoResultBatch` payload the single-node path
+    // produces, so `algo_payload_to_query_response` renders identical output.
+    //
+    // Single-node (`cluster_routing.is_none()`) and every non-PageRank algorithm
+    // keep the existing `broadcast_to_all_cores` path byte-identical — only
+    // cluster-mode PageRank diverges here. (WCC and others stay single-node for
+    // now — F1d-5.)
+    if state.cluster_routing.is_some() && matches!(algorithm, GraphAlgorithm::PageRank) {
+        let deadline_ms = state.tuning.network.default_deadline_secs * 1_000;
+        return match crate::control::server::graph_dispatch::run_bsp_pagerank(
+            state,
+            tenant_id,
+            database_id,
+            params,
+            deadline_ms,
+        )
+        .await
+        {
+            Ok(payload) => algo_payload_to_query_response(&payload, algorithm),
+            Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        };
+    }
+
     let plan = PhysicalPlan::Graph(GraphOp::Algo { algorithm, params });
 
     match broadcast::broadcast_to_all_cores(state, tenant_id, database_id, plan, TraceId::ZERO)
@@ -188,7 +218,6 @@ fn algo_payload_to_query_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::graph::algo::GraphAlgorithm;
 
     #[test]
     fn community_resolves_to_label_propagation() {
