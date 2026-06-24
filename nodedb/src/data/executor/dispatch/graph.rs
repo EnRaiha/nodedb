@@ -298,6 +298,10 @@ impl CoreLoop {
                 },
             ),
 
+            GraphOp::WccSuperstep(plan) => {
+                self.execute_wcc_superstep(task, tid, &plan.params, &plan.owned_vshards)
+            }
+
             GraphOp::Stats { collection, as_of } => {
                 self.execute_graph_stats(task, tid, collection.as_deref(), *as_of)
             }

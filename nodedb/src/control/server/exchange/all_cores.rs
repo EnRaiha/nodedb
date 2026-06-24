@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 use crate::bridge::envelope::{Priority, Request, Response, Status};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, TenantId, TraceId, VShardId};
-use nodedb_physical::physical_plan::{BspSuperstepResult, GraphOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{
+    BspSuperstepResult, GraphOp, PhysicalPlan, WccSuperstepResult,
+};
 
 /// The canonical node-level result of fanning a plan across all local cores
 /// and merging into the SAME payload shape a single core produces.
@@ -78,6 +80,11 @@ pub async fn execute_plan_all_local_cores(
             // ── BspSuperstep ─────────────────────────────────────────────────
             GraphOp::BspSuperstep(_) => {
                 fan_bsp_all_cores(state, tenant_id, database_id, plan, trace_id).await
+            }
+
+            // ── WccSuperstep ─────────────────────────────────────────────────
+            GraphOp::WccSuperstep(_) => {
+                fan_wcc_all_cores(state, tenant_id, database_id, plan, trace_id).await
             }
 
             // ── All other GraphOp variants → generic gather ───────────────────
@@ -151,6 +158,107 @@ async fn fan_bsp_all_cores(
     plan: PhysicalPlan,
     trace_id: TraceId,
 ) -> crate::Result<NodeLevelResult> {
+    let responses =
+        gather_graph_op_all_cores(state, tenant_id, database_id, plan, trace_id, "bsp").await?;
+
+    let mut parts: Vec<BspSuperstepResult> = Vec::with_capacity(responses.len());
+    for resp in responses {
+        // An empty payload decodes to BspSuperstepResult::default() (a
+        // zero-vertex shard — contributes nothing to global_n or the ranks),
+        // matching decode_single_result's contract.
+        let part = if resp.payload.is_empty() {
+            BspSuperstepResult::default()
+        } else {
+            zerompk::from_msgpack::<BspSuperstepResult>(resp.payload.as_ref()).map_err(|e| {
+                crate::Error::Codec {
+                    detail: format!("bsp gather: result decode: {e}"),
+                }
+            })?
+        };
+        parts.push(part);
+    }
+
+    let merged = merge_bsp_results(parts);
+    let payload = zerompk::to_msgpack_vec(&merged).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("bsp gather: merged result encode: {e}"),
+    })?;
+
+    Ok(NodeLevelResult {
+        payload,
+        watermark_lsn: Lsn::ZERO,
+    })
+}
+
+/// WCC contraction-round fan: dispatch to all local cores, decode each core's
+/// [`WccSuperstepResult`], merge by field concatenation, and re-encode.
+///
+/// Owned-node sets are disjoint across cores (each graph node is homed on
+/// exactly one core via `VShardId::from_key`), so concatenation requires no
+/// dedup. Cross-core edges become ordinary boundary edges (the destination is
+/// owned by a sibling core) and are stitched globally by the coordinator.
+async fn fan_wcc_all_cores(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+) -> crate::Result<NodeLevelResult> {
+    let responses =
+        gather_graph_op_all_cores(state, tenant_id, database_id, plan, trace_id, "wcc").await?;
+
+    let mut parts: Vec<WccSuperstepResult> = Vec::with_capacity(responses.len());
+    for resp in responses {
+        // An empty payload decodes to WccSuperstepResult::default() (a
+        // zero-vertex shard — contributes no labels or boundary edges).
+        let part = if resp.payload.is_empty() {
+            WccSuperstepResult::default()
+        } else {
+            zerompk::from_msgpack::<WccSuperstepResult>(resp.payload.as_ref()).map_err(|e| {
+                crate::Error::Codec {
+                    detail: format!("wcc gather: result decode: {e}"),
+                }
+            })?
+        };
+        parts.push(part);
+    }
+
+    let merged = merge_wcc_results(parts);
+    let payload = zerompk::to_msgpack_vec(&merged).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wcc gather: merged result encode: {e}"),
+    })?;
+
+    Ok(NodeLevelResult {
+        payload,
+        watermark_lsn: Lsn::ZERO,
+    })
+}
+
+/// Shared per-core fan for a graph BSP/WCC superstep plan: eagerly dispatch the
+/// plan to every local core (scoping each core's `owned_vshards` to the vShards
+/// round-robin homed on that core), gather the bounded responses, drop
+/// `NotFound`/empty-CSR cores, and return the successful [`Response`]s for the
+/// caller to decode and merge.
+///
+/// CRITICAL: scope each core's `owned_vshards` to the vShards round-robin homed
+/// on THAT core (`vshard % num_cores == core_id`, mirroring
+/// `VShardRouter::round_robin`). The plan arrives carrying the NODE's full
+/// owned-vShard set; if every core received the full set, each core would claim
+/// ownership of any node appearing in its local CSR — including nodes physically
+/// homed on a SIBLING core (they appear as cross-core edge endpoints). That node
+/// would then be emitted by two cores, duplicating it in the merged result.
+/// Per-core scoping makes the owned sets genuinely disjoint (each graph node is
+/// owned by exactly its home core), so the field-concat merge is correct with no
+/// dedup, and cross-core edges become ordinary ghosts / boundary edges.
+async fn gather_graph_op_all_cores(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+    label: &'static str,
+) -> crate::Result<Vec<Response>> {
     // Shared broadcast call counter (parity with gather_all_cores).
     crate::control::server::broadcast::broadcast_call_count_increment();
 
@@ -166,26 +274,23 @@ async fn fan_bsp_all_cores(
     // Eager dispatch: register a tracker receiver and dispatch to each core
     // BEFORE awaiting any response, matching gather_all_cores' true-parallelism
     // prologue.
-    //
-    // CRITICAL: scope each core's `owned_vshards` to the vShards round-robin
-    // homed on THAT core (`vshard % num_cores == core_id`, mirroring
-    // `VShardRouter::round_robin`). The plan arrives carrying the NODE's full
-    // owned-vShard set; if every core received the full set, each core would
-    // claim ownership of any node appearing in its local CSR — including nodes
-    // physically homed on a SIBLING core (they appear as cross-core edge
-    // endpoints). That node would then be ranked AND emitted by two cores,
-    // duplicating it in the merged result. Per-core scoping makes the owned sets
-    // genuinely disjoint (each graph node is owned by exactly its home core), so
-    // the field-concat merge is correct with no dedup, and cross-core edges
-    // become ordinary ghosts routed via `outbound` like any cross-shard edge.
     let mut receivers = Vec::with_capacity(num_cores);
     for core_id in 0..num_cores {
         let request_id = state.next_request_id();
         let vshard_id = VShardId::new(core_id as u32);
         let mut core_plan = plan.clone();
-        if let PhysicalPlan::Graph(GraphOp::BspSuperstep(bsp)) = &mut core_plan {
-            bsp.owned_vshards
-                .retain(|v| (*v as usize) % num_cores == core_id);
+        match &mut core_plan {
+            PhysicalPlan::Graph(GraphOp::BspSuperstep(bsp)) => {
+                bsp.owned_vshards
+                    .retain(|v| (*v as usize) % num_cores == core_id);
+            }
+            PhysicalPlan::Graph(GraphOp::WccSuperstep(wcc)) => {
+                wcc.owned_vshards
+                    .retain(|v| (*v as usize) % num_cores == core_id);
+            }
+            // Caller only invokes this for BSP/WCC plans; any other plan is fanned
+            // verbatim (no per-core scoping field exists for it).
+            _ => {}
         }
         let request = Request {
             request_id,
@@ -224,20 +329,20 @@ async fn fan_bsp_all_cores(
         )
         .await
         .map_err(|_| crate::Error::Dispatch {
-            detail: format!("bsp gather timeout on core {core_id}"),
+            detail: format!("{label} gather timeout on core {core_id}"),
         })? {
             Ok(resp) => Ok(resp),
             Err(crate::control::server::dispatch_utils::DispatchCollectError::OverBudget {
                 bytes,
             }) => Err(crate::Error::ExecutionLimitExceeded {
                 detail: format!(
-                    "bsp gather on core {core_id} exceeded max_query_result_bytes \
+                    "{label} gather on core {core_id} exceeded max_query_result_bytes \
                      ({bytes} > {max_result_bytes} bytes)"
                 ),
             }),
             Err(crate::control::server::dispatch_utils::DispatchCollectError::ChannelClosed) => {
                 Err(crate::Error::Dispatch {
-                    detail: format!("bsp gather channel closed on core {core_id}"),
+                    detail: format!("{label} gather channel closed on core {core_id}"),
                 })
             }
         }
@@ -245,7 +350,7 @@ async fn fan_bsp_all_cores(
 
     let results: Vec<crate::Result<Response>> = join_all(response_futures).await;
 
-    let mut parts: Vec<BspSuperstepResult> = Vec::with_capacity(num_cores);
+    let mut out = Vec::with_capacity(num_cores);
     let mut had_error = false;
     let mut error_msg = String::new();
 
@@ -272,35 +377,14 @@ async fn fan_bsp_all_cores(
             continue;
         }
 
-        // An empty payload decodes to BspSuperstepResult::default() (a
-        // zero-vertex shard — contributes nothing to global_n or the ranks),
-        // matching decode_single_result's contract.
-        let part = if resp.payload.is_empty() {
-            BspSuperstepResult::default()
-        } else {
-            zerompk::from_msgpack::<BspSuperstepResult>(resp.payload.as_ref()).map_err(|e| {
-                crate::Error::Codec {
-                    detail: format!("bsp gather: result decode: {e}"),
-                }
-            })?
-        };
-        parts.push(part);
+        out.push(resp);
     }
 
-    if had_error && parts.is_empty() {
+    if had_error && out.is_empty() {
         return Err(crate::Error::Dispatch { detail: error_msg });
     }
 
-    let merged = merge_bsp_results(parts);
-    let payload = zerompk::to_msgpack_vec(&merged).map_err(|e| crate::Error::Serialization {
-        format: "msgpack".into(),
-        detail: format!("bsp gather: merged result encode: {e}"),
-    })?;
-
-    Ok(NodeLevelResult {
-        payload,
-        watermark_lsn: Lsn::ZERO,
-    })
+    Ok(out)
 }
 
 /// Merge per-core [`BspSuperstepResult`] parts by field concatenation.
@@ -320,6 +404,23 @@ fn merge_bsp_results(parts: Vec<BspSuperstepResult>) -> BspSuperstepResult {
         // exactly one core), so summing per-core dangling sums counts every
         // dangling node exactly once.
         out.dangling_sum += p.dangling_sum;
+    }
+    out
+}
+
+/// Merge per-core [`WccSuperstepResult`] parts by field concatenation.
+///
+/// Owned-node sets are DISJOINT across cores because `gather_graph_op_all_cores`
+/// scopes each core's `owned_vshards` to the vShards homed on that core, so each
+/// graph node is owned by exactly one core. Concatenation therefore requires no
+/// dedup; cross-core edges already appear as boundary edges (their destination
+/// is owned by a sibling core) and are stitched globally by the coordinator.
+fn merge_wcc_results(parts: Vec<WccSuperstepResult>) -> WccSuperstepResult {
+    let mut out = WccSuperstepResult::default();
+    for p in parts {
+        out.vertex_count += p.vertex_count;
+        out.node_labels.extend(p.node_labels);
+        out.boundary_edges.extend(p.boundary_edges);
     }
     out
 }

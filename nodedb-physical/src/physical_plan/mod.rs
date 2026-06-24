@@ -33,7 +33,9 @@ pub use document::{
     ReturningItem, ReturningSpec, StorageMode, UpdateValue,
 };
 pub use exchange::{ExchangeMode, ExchangeOp};
-pub use graph::{BatchEdge, BspSuperstepPlan, BspSuperstepResult, GraphOp};
+pub use graph::{
+    BatchEdge, BspSuperstepPlan, BspSuperstepResult, GraphOp, WccSuperstepPlan, WccSuperstepResult,
+};
 pub use kv::KvOp;
 pub use meta::MetaOp;
 pub use query::{AggregateSpec, JoinProjection, QueryOp};
@@ -242,6 +244,7 @@ impl PhysicalPlan {
                 | PhysicalPlan::Graph(GraphOp::TemporalNeighbors { .. })
                 | PhysicalPlan::Graph(GraphOp::TemporalAlgorithm { .. })
                 | PhysicalPlan::Graph(GraphOp::BspSuperstep(_))
+                | PhysicalPlan::Graph(GraphOp::WccSuperstep(_))
                 | PhysicalPlan::Graph(GraphOp::Stats { .. })
                 | PhysicalPlan::Vector(VectorOp::Search { .. })
                 | PhysicalPlan::Text(TextOp::Search { .. })

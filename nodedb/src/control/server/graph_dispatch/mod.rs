@@ -20,6 +20,7 @@
 
 pub mod bfs;
 pub mod bsp_pagerank;
+pub mod bsp_wcc;
 pub(crate) mod cluster_resolve;
 pub mod helpers;
 pub(crate) mod hop;
@@ -30,6 +31,7 @@ pub mod traverse_subgraph;
 
 pub use bfs::cross_core_bfs_with_options;
 pub use bsp_pagerank::run_bsp_pagerank;
+pub use bsp_wcc::run_bsp_wcc;
 pub use match_broadcast::{
     MatchBroadcastOutcome, broadcast_match_to_all_cores, unwrap_match_envelope,
 };

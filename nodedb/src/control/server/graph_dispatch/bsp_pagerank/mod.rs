@@ -8,7 +8,10 @@
 //! final ranks into the same `AlgoResultBatch` shape as single-node PageRank.
 
 mod coord;
-mod enumerate;
+/// Shard enumeration is shared with the distributed-WCC coordinator
+/// (`bsp_wcc`): both need one dispatch per distinct owner node carrying that
+/// node's full owned-vShard set. Exposed within `graph_dispatch` only.
+pub(in crate::control::server::graph_dispatch) mod enumerate;
 mod scatter;
 
 pub use coord::run_bsp_pagerank;

@@ -38,18 +38,18 @@ use crate::types::VShardId;
 /// One BSP shard: a distinct owner node, the FULL set of vShards it owns (the
 /// union of every data group it leads), and whether it is the coordinating node
 /// (dispatch local vs. remote).
-pub(super) struct ShardTarget {
+pub(in crate::control::server::graph_dispatch) struct ShardTarget {
     /// Owning node (resolved via live Raft leadership). Used as the stable
     /// per-shard key for the coordinator's rank-state map and as the remote
     /// dispatch target.
-    pub(super) node_id: u64,
+    pub(in crate::control::server::graph_dispatch) node_id: u64,
     /// `true` if this node is the coordinating node (dispatch local).
-    pub(super) is_local: bool,
+    pub(in crate::control::server::graph_dispatch) is_local: bool,
     /// The FULL set of vShards this node owns this superstep (union of
     /// `vshards_for_group` over every data group whose resolved leader is this
     /// node). Passed verbatim as the plan's `owned_vshards` so the handler ranks
     /// EVERY node homed on this owner in one CSR pass.
-    pub(super) owned_vshards: Vec<u32>,
+    pub(in crate::control::server::graph_dispatch) owned_vshards: Vec<u32>,
 }
 
 impl ShardTarget {
@@ -57,19 +57,19 @@ impl ShardTarget {
     /// remote `RouteDecision::Remote` route (any one of the node's vShards picks
     /// the same node). Owned sets are never empty (a node is only a shard target
     /// if it leads at least one data group with at least one vShard).
-    pub(super) fn route_vshard(&self) -> u32 {
+    pub(in crate::control::server::graph_dispatch) fn route_vshard(&self) -> u32 {
         self.owned_vshards.first().copied().unwrap_or(0)
     }
 }
 
 /// Result of per-node enumeration: the shard targets plus a `vShard → owner
 /// node` map used to redistribute cross-shard contributions to the owning node.
-pub(super) struct Enumeration {
-    pub(super) targets: Vec<ShardTarget>,
+pub(in crate::control::server::graph_dispatch) struct Enumeration {
+    pub(in crate::control::server::graph_dispatch) targets: Vec<ShardTarget>,
     /// Every owned vShard → its owner node id. Used by the coordinator to route
     /// each outbound `(target_vshard, …)` contribution to the node-shard that
     /// owns `target_vshard`.
-    pub(super) vshard_owner: HashMap<u32, u64>,
+    pub(in crate::control::server::graph_dispatch) vshard_owner: HashMap<u32, u64>,
 }
 
 /// Enumerate all BSP shards: one per distinct owner node (local + each distinct
@@ -77,7 +77,9 @@ pub(super) struct Enumeration {
 /// owns. Also returns the `vShard → owner node` map for contribution routing.
 ///
 /// Returns an empty enumeration in single-node mode (`cluster_routing.is_none()`).
-pub(super) fn enumerate_shards(state: &SharedState) -> crate::Result<Enumeration> {
+pub(in crate::control::server::graph_dispatch) fn enumerate_shards(
+    state: &SharedState,
+) -> crate::Result<Enumeration> {
     let Some(routing_lock) = state.cluster_routing.as_ref() else {
         return Ok(Enumeration {
             targets: Vec::new(),

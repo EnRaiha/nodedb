@@ -62,29 +62,46 @@ pub async fn algo(
 
     let tenant_id = identity.tenant_id;
 
-    // Cluster PageRank routes through the distributed BSP coordinator (F1d-4
-    // Phase B): graph edges are Raft-homed on `from_key(src)` and each core's
-    // CSR is partitioned, so a single-node `broadcast_to_all_cores` would only
-    // see the coordinator's local partitions. The coordinator runs the
-    // `GraphOp::BspSuperstep` primitive across every shard and assembles the
-    // result into the SAME `AlgoResultBatch` payload the single-node path
-    // produces, so `algo_payload_to_query_response` renders identical output.
+    // Cluster PageRank / WCC route through their distributed coordinators: graph
+    // edges are Raft-homed on `from_key(src)` and each core's CSR is partitioned,
+    // so a single-node `broadcast_to_all_cores` would only see the coordinator's
+    // local partitions. Each coordinator runs its per-shard primitive
+    // (`GraphOp::BspSuperstep` for PageRank, `GraphOp::WccSuperstep` for WCC)
+    // across every shard and assembles the result into the SAME `AlgoResultBatch`
+    // payload the single-node path produces, so `algo_payload_to_query_response`
+    // renders identical output.
     //
-    // Single-node (`cluster_routing.is_none()`) and every non-PageRank algorithm
-    // keep the existing `broadcast_to_all_cores` path byte-identical — only
-    // cluster-mode PageRank diverges here. (WCC and others stay single-node for
-    // now — F1d-5.)
-    if state.cluster_routing.is_some() && matches!(algorithm, GraphAlgorithm::PageRank) {
+    // Single-node (`cluster_routing.is_none()`) and every other algorithm keep
+    // the existing `broadcast_to_all_cores` path byte-identical — only
+    // cluster-mode PageRank and WCC diverge here.
+    if state.cluster_routing.is_some()
+        && matches!(algorithm, GraphAlgorithm::PageRank | GraphAlgorithm::Wcc)
+    {
         let deadline_ms = state.tuning.network.default_deadline_secs * 1_000;
-        return match crate::control::server::graph_dispatch::run_bsp_pagerank(
-            state,
-            tenant_id,
-            database_id,
-            params,
-            deadline_ms,
-        )
-        .await
-        {
+        let result = match algorithm {
+            GraphAlgorithm::PageRank => {
+                crate::control::server::graph_dispatch::run_bsp_pagerank(
+                    state,
+                    tenant_id,
+                    database_id,
+                    params,
+                    deadline_ms,
+                )
+                .await
+            }
+            _ => {
+                // Wcc — the outer guard guarantees this.
+                crate::control::server::graph_dispatch::run_bsp_wcc(
+                    state,
+                    tenant_id,
+                    database_id,
+                    params,
+                    deadline_ms,
+                )
+                .await
+            }
+        };
+        return match result {
             Ok(payload) => algo_payload_to_query_response(&payload, algorithm),
             Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
         };

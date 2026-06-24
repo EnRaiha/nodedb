@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Per-node `WccSuperstep` dispatch: one plan per distinct owner node, all
+//! issued concurrently via `join_all`, decoding each node's
+//! [`WccSuperstepResult`].
+//!
+//! Each dispatch carries the owner node's FULL `owned_vshards` set so the
+//! handler contracts every node homed on that owner in a single CSR pass. A
+//! remote node gets one `RouteDecision::Remote` dispatch; the local node fans
+//! across ALL local cores via `execute_plan_all_local_cores` (which merges the
+//! per-core disjoint results into one `WccSuperstepResult` before returning).
+//! At 1 core/node the fan is over a single core and behaviour is identical to a
+//! single-core dispatch.
+
+use futures::future::join_all;
+
+use crate::bridge::envelope::{Payload, PhysicalPlan};
+use crate::control::gateway::dispatcher::dispatch_route;
+use crate::control::gateway::version_set::GatewayVersionSet;
+use crate::control::gateway::{RouteDecision, TaskRoute};
+use crate::control::server::graph_dispatch::bsp_pagerank::enumerate::ShardTarget;
+use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
+use crate::types::{DatabaseId, TenantId, TraceId};
+use nodedb_graph::AlgoParams;
+use nodedb_physical::physical_plan::{GraphOp, WccSuperstepPlan, WccSuperstepResult};
+
+/// One owner node's decoded WCC result.
+pub(super) struct ShardWccResult {
+    pub(super) result: WccSuperstepResult,
+}
+
+/// Dispatch one `WccSuperstep` to every owner node concurrently and decode each
+/// node's [`WccSuperstepResult`]. Single round — there is no count phase or
+/// loop; the coordinator stitches the returned results globally.
+pub(super) async fn scatter_wcc_round(
+    state: &crate::control::state::SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    params: &AlgoParams,
+    targets: &[ShardTarget],
+    deadline_ms: u64,
+) -> crate::Result<Vec<ShardWccResult>> {
+    let shared_arc = gateway_shared(state)?;
+    let version_set = GatewayVersionSet::from_pairs(Vec::new());
+
+    let futs = targets.iter().map(|t| {
+        let plan = PhysicalPlan::Graph(GraphOp::WccSuperstep(Box::new(WccSuperstepPlan {
+            params: params.clone(),
+            // FULL owned set for this node — the handler contracts every node
+            // homed here in one pass and emits boundary edges only for dsts on
+            // OTHER nodes.
+            owned_vshards: t.owned_vshards.clone(),
+        })));
+        let version_set = version_set.clone();
+        let node_id = t.node_id;
+        let is_local = t.is_local;
+        let route_vshard = t.route_vshard();
+        let shared_arc = shared_arc.clone();
+
+        Box::pin(async move {
+            let result = if is_local {
+                // Local node: fan across ALL local cores and merge. The per-core
+                // owned-node sets are disjoint, so the merged result is correct
+                // without dedup.
+                let node_result = crate::control::server::exchange::execute_plan_all_local_cores(
+                    shared_arc.as_ref(),
+                    tenant_id,
+                    database_id,
+                    plan,
+                    TraceId::ZERO,
+                )
+                .await?;
+                let payload = Payload::from_vec(node_result.payload);
+                decode_wcc_from_payload(node_id, payload)?
+            } else {
+                // Remote node: one dispatch via the gateway.
+                let route = TaskRoute {
+                    plan,
+                    decision: RouteDecision::Remote {
+                        node_id,
+                        vshard_id: route_vshard as u64,
+                    },
+                    vshard_id: route_vshard,
+                };
+                let payloads = dispatch_route(
+                    route,
+                    &shared_arc,
+                    tenant_id,
+                    database_id,
+                    TraceId::ZERO,
+                    deadline_ms,
+                    &version_set,
+                )
+                .await?;
+                decode_wcc(node_id, payloads)?
+            };
+            Ok::<ShardWccResult, crate::Error>(ShardWccResult { result })
+        })
+    });
+
+    let results = join_all(futs).await;
+    let mut out = Vec::with_capacity(results.len());
+    for res in results {
+        out.push(res?);
+    }
+    Ok(out)
+}
+
+/// Decode a single node's `WccSuperstepResult` from a dispatch's payload list.
+/// An empty CSR yields an empty (default) payload — a zero-vertex shard.
+fn decode_wcc(node_id: u64, payloads: Vec<Vec<u8>>) -> crate::Result<WccSuperstepResult> {
+    let payload = payloads
+        .into_iter()
+        .next()
+        .ok_or_else(|| crate::Error::Internal {
+            detail: format!("wcc: node={node_id} returned no payload"),
+        })?;
+    decode_wcc_from_payload(node_id, Payload::from_vec(payload))
+}
+
+/// Decode a single node's `WccSuperstepResult` from an already-wrapped
+/// [`Payload`]. Empty payload → `WccSuperstepResult::default()` (zero-vertex
+/// shard, contributes no labels or boundary edges).
+fn decode_wcc_from_payload(node_id: u64, payload: Payload) -> crate::Result<WccSuperstepResult> {
+    if payload.is_empty() {
+        return Ok(WccSuperstepResult::default());
+    }
+    zerompk::from_msgpack::<WccSuperstepResult>(payload.as_ref()).map_err(|e| crate::Error::Codec {
+        detail: format!("wcc: node={node_id} result decode: {e}"),
+    })
+}
