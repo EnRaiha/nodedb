@@ -149,8 +149,9 @@ async fn generic_gather(
 /// BSP superstep fan: dispatch to all local cores, decode each core's
 /// [`BspSuperstepResult`], merge by field concatenation, and re-encode.
 ///
-/// Owned-node sets are disjoint across cores (each graph node is homed on
-/// exactly one core via `VShardId::from_key`), so concatenation requires no
+/// Owned-node sets are disjoint across cores because `gather_graph_op_all_cores`
+/// scopes each core's `owned_vshards` to the vShards homed on that core, so each
+/// graph node is owned by exactly one core; concatenation therefore requires no
 /// dedup.
 async fn fan_bsp_all_cores(
     state: &SharedState,
@@ -282,17 +283,53 @@ async fn gather_graph_op_all_cores(
         eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, |core_id| {
             let mut core_plan = plan.clone();
             match &mut core_plan {
-                PhysicalPlan::Graph(GraphOp::BspSuperstep(bsp)) => {
-                    bsp.owned_vshards
-                        .retain(|v| (*v as usize) % num_cores == core_id);
-                }
-                PhysicalPlan::Graph(GraphOp::WccSuperstep(wcc)) => {
-                    wcc.owned_vshards
-                        .retain(|v| (*v as usize) % num_cores == core_id);
-                }
-                // Caller only invokes this for BSP/WCC plans; any other plan is fanned
-                // verbatim (no per-core scoping field exists for it).
-                _ => {}
+                PhysicalPlan::Graph(g) => match g {
+                    GraphOp::BspSuperstep(bsp) => {
+                        bsp.owned_vshards
+                            .retain(|v| (*v as usize) % num_cores == core_id);
+                    }
+                    GraphOp::WccSuperstep(wcc) => {
+                        wcc.owned_vshards
+                            .retain(|v| (*v as usize) % num_cores == core_id);
+                    }
+                    // All other graph ops carry no per-core-owned vShard set —
+                    // fanned verbatim. Enumerated exhaustively (no `_ =>`) so a new
+                    // graph-superstep variant forces a compile error here and the
+                    // developer must decide whether it needs per-core scoping.
+                    GraphOp::Match { .. }
+                    | GraphOp::MatchContinuation { .. }
+                    | GraphOp::EdgePut { .. }
+                    | GraphOp::EdgePutBatch { .. }
+                    | GraphOp::EdgeDelete { .. }
+                    | GraphOp::EdgeDeleteBatch { .. }
+                    | GraphOp::Hop { .. }
+                    | GraphOp::Neighbors { .. }
+                    | GraphOp::NeighborsMulti { .. }
+                    | GraphOp::Path { .. }
+                    | GraphOp::Subgraph { .. }
+                    | GraphOp::RagFusion { .. }
+                    | GraphOp::Algo { .. }
+                    | GraphOp::SetNodeLabels { .. }
+                    | GraphOp::RemoveNodeLabels { .. }
+                    | GraphOp::TemporalNeighbors { .. }
+                    | GraphOp::TemporalAlgorithm { .. }
+                    | GraphOp::Stats { .. } => {}
+                },
+                // All non-graph plans are fanned verbatim (no per-core-owned vShard
+                // field). Enumerated exhaustively (no `_ =>`) so a new PhysicalPlan
+                // variant forces a compile error here.
+                PhysicalPlan::Vector(_)
+                | PhysicalPlan::Document(_)
+                | PhysicalPlan::Kv(_)
+                | PhysicalPlan::Text(_)
+                | PhysicalPlan::Columnar(_)
+                | PhysicalPlan::Timeseries(_)
+                | PhysicalPlan::Spatial(_)
+                | PhysicalPlan::Crdt(_)
+                | PhysicalPlan::Query(_)
+                | PhysicalPlan::Meta(_)
+                | PhysicalPlan::Array(_)
+                | PhysicalPlan::ClusterArray(_) => {}
             }
             core_plan
         })?;
