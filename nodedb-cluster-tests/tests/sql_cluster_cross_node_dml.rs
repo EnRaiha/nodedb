@@ -23,6 +23,8 @@ mod gather_cross_node;
 mod graph_algo_pagerank_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/graph_algo_pagerank_dangling_cross_node.rs"]
 mod graph_algo_pagerank_dangling_cross_node;
+#[path = "sql_cluster_cross_node_dml_tests/graph_algo_pagerank_personalized_cross_node.rs"]
+mod graph_algo_pagerank_personalized_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/graph_algo_wcc_cross_node.rs"]
 mod graph_algo_wcc_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/graph_delete_reverse_cross_node.rs"]

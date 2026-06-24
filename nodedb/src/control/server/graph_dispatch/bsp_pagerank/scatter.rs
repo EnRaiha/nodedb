@@ -44,6 +44,10 @@ pub(super) struct ShardDispatch {
     /// Global dangling-node rank mass to seed this superstep's teleport base.
     /// `0.0` on the count phase and on superstep 0.
     pub(super) global_dangling: f64,
+    /// Coordinator-computed GLOBAL `Σ max(w, 0.0)` over the Personalized-PageRank
+    /// seed map. `0.0` = uniform PageRank; `> 0.0` activates PPR on every shard.
+    /// Constant across all dispatches within a run (it is a cluster-wide scalar).
+    pub(super) personalization_sum: f64,
 }
 
 /// One node's decoded superstep result, tagged with its owner node id.
@@ -82,6 +86,7 @@ pub(super) async fn scatter_superstep(
             incoming_contributions: d.incoming_contributions,
             rank_seed: d.rank_seed,
             global_dangling: d.global_dangling,
+            personalization_sum: d.personalization_sum,
         })));
         let version_set = version_set.clone();
         let node_id = d.node_id;

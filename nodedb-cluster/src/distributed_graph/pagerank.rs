@@ -98,16 +98,27 @@ impl ShardPageRankState {
     /// `node_id_to_local` maps an incoming contribution's destination vertex name
     /// to its local dense index; contributions whose target is not owned by this
     /// shard are dropped.
+    ///
+    /// # Personalization (Personalized PageRank)
+    ///
+    /// `personalization` is `None` for standard (uniform) PageRank and
+    /// `Some(p)` for Personalized PageRank, where `p` is this shard's per-owned-node
+    /// GLOBALLY-normalized seed share, positionally aligned with `self.rank` /
+    /// `self.next_rank` (so `Σ_global p_i == 1.0` across ALL shards). When present,
+    /// both the teleport mass and the dangling mass redistribute by `p` instead of
+    /// uniformly — identical to single-node `build_personalization` semantics. The
+    /// scalar `redistributed` total mass is the same in both branches; only HOW it
+    /// is spread differs (uniform `/ n` vs. per-node `* p_i`).
     pub fn superstep(
         &mut self,
         damping: f64,
         global_n: usize,
         global_dangling_sum: f64,
+        personalization: Option<&[f64]>,
         local_edge_iter: &dyn Fn(u32) -> Vec<u32>,
         node_id_to_local: &dyn Fn(&str) -> Option<u32>,
     ) -> (f64, f64, OutboundContributions) {
         let n = global_n as f64;
-        let teleport = (1.0 - damping) / n;
 
         // Compute THIS shard's local dangling mass from the PRE-SWAP rank vector
         // and return it so the coordinator can aggregate it for the NEXT superstep.
@@ -119,14 +130,29 @@ impl ShardPageRankState {
             .map(|(_, r)| r)
             .sum();
 
-        // Use the GLOBAL dangling sum supplied by the coordinator (aggregated from
-        // all shards' previous-superstep local sums). When there are no dangling
-        // nodes anywhere, `global_dangling_sum` is 0.0 and base == teleport —
-        // behaviour is identical to a non-dangling graph.
-        let base = teleport + damping * global_dangling_sum / n;
+        // Total mass to redistribute this superstep (SCALAR, matches single-node):
+        // the (1 - damping) teleport budget plus the damped GLOBAL dangling mass
+        // (aggregated by the coordinator from all shards' previous-superstep local
+        // sums). When there are no dangling nodes anywhere, `global_dangling_sum`
+        // is 0.0 and `redistributed == 1 - damping`.
+        let redistributed = (1.0 - damping) + damping * global_dangling_sum;
 
-        for r in self.next_rank.iter_mut() {
-            *r = base;
+        match personalization {
+            // Uniform: every node gets an equal share of the redistributed mass.
+            None => {
+                let base = redistributed / n;
+                for r in self.next_rank.iter_mut() {
+                    *r = base;
+                }
+            }
+            // PPR: each owned node's base is its GLOBAL seed share of the
+            // redistributed mass. Summed over all shards this injects exactly
+            // `redistributed * Σ_global p_i == redistributed` (mass conserved).
+            Some(p) => {
+                for (slot, &pi) in self.next_rank.iter_mut().zip(p) {
+                    *slot = redistributed * pi;
+                }
+            }
         }
 
         let mut outbound: HashMap<u16, Vec<(String, f64)>> = HashMap::new();
@@ -220,7 +246,8 @@ mod tests {
         let (delta, local_dangling_sum, outbound) = state.superstep(
             0.85,
             3,
-            0.0, // no dangling nodes anywhere
+            0.0,  // no dangling nodes anywhere
+            None, // uniform PageRank
             &|node| match node {
                 0 => vec![1],
                 1 => vec![2],
@@ -263,12 +290,13 @@ mod tests {
             damping,
             n,
             global_dangling,
+            None, // uniform PageRank
             &|node| if node == 0 { vec![1] } else { Vec::new() },
             &|_name| None,
         );
 
-        // The base each node receives must be (1-d)/n + d*global_dangling/n.
-        let expected_base = (1.0 - damping) / n as f64 + damping * global_dangling / n as f64;
+        // The base each node receives must be ((1-d) + d*global_dangling) / n.
+        let expected_base = ((1.0 - damping) + damping * global_dangling) / n as f64;
         // Vertex 0: base + contribution from no in-edge in this pass
         //           (vertex 1 is dangling; no out-edges scatter to 0 locally).
         // Vertex 1: base + damping * rank[0] / 1 (edge 0→1).
@@ -282,6 +310,55 @@ mod tests {
         assert!(
             (rank_v0 - expected_base).abs() < 1e-12,
             "vertex 0 rank should equal base={expected_base:.15} (no in-edge scatter), got {rank_v0:.15}"
+        );
+    }
+
+    #[test]
+    fn personalized_superstep_biases_base_toward_seed() {
+        // 3-node ring, no dangling nodes. A seed concentrated on vertex 0
+        // (p = [1, 0, 0]) must give vertex 0 a strictly-larger teleport base than
+        // its peers — the distributed analogue of single-node PPR biasing.
+        let damping = 0.85_f64;
+        let n: usize = 3;
+        // Globally-normalized seed share: all mass on vertex 0.
+        let p = [1.0_f64, 0.0, 0.0];
+
+        let mut state = ShardPageRankState::init(3, vec![1, 1, 1], |_| None, &|_| Vec::new());
+        let (_delta, local_dangling_sum, outbound) = state.superstep(
+            damping,
+            n,
+            0.0, // no dangling nodes
+            Some(&p),
+            &|node| match node {
+                0 => vec![1],
+                1 => vec![2],
+                2 => vec![0],
+                _ => Vec::new(),
+            },
+            &|_name| None,
+        );
+        assert!(outbound.is_empty());
+        assert_eq!(local_dangling_sum, 0.0);
+
+        // redistributed = (1 - d) since dangling sum is 0. The seeded node's base
+        // is `redistributed * 1.0`, peers' base is `redistributed * 0.0 == 0.0`,
+        // before any scatter. After scatter, vertex 0 (seeded base + incoming from
+        // vertex 2 which has base 0 → 0 contribution) must strictly outrank the
+        // others.
+        let redistributed = 1.0 - damping;
+        // Vertex 0 receives base = redistributed*1.0 plus a scatter from vertex 2,
+        // whose pre-swap rank was the uniform init 1/3 (init unchanged here).
+        // Regardless, vertex 0's rank must exceed both peers'.
+        assert!(
+            state.rank[0] > state.rank[1] && state.rank[0] > state.rank[2],
+            "seeded vertex 0 base must dominate: {:?}",
+            state.rank
+        );
+        // The seeded node's base alone (before scatter) is `redistributed`.
+        assert!(
+            state.rank[0] >= redistributed - 1e-12,
+            "seeded base should be at least redistributed={redistributed}, got {}",
+            state.rank[0]
         );
     }
 

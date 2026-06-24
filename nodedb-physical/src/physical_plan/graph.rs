@@ -369,6 +369,21 @@ pub struct BspSuperstepPlan {
     /// so the base collapses to the plain teleport `(1−d)/n` — identical to a
     /// non-dangling graph and correct for initialization.
     pub global_dangling: f64,
+    /// Coordinator-computed GLOBAL `Σ max(w, 0.0)` over the Personalized-PageRank
+    /// seed map (`params.personalization_vector`), summed across the WHOLE cluster.
+    ///
+    /// `0.0` means standard (uniform) PageRank — no personalization is active,
+    /// either because no seed map was supplied, the summed weight was ≤ 0, or no
+    /// seed name exists anywhere in the cluster graph (matching single-node
+    /// `build_personalization` returning `None`). A value `> 0.0` activates
+    /// Personalized PageRank on every shard.
+    ///
+    /// Each shard divides its OWNED nodes' raw seed weights by this GLOBAL sum to
+    /// get a globally-normalized seed share `p_i` (`Σ_global p_i == 1.0`). Both the
+    /// teleport mass and the dangling mass then redistribute by `p` instead of
+    /// uniformly. Normalizing by the cluster-wide sum (never a per-shard sum) is
+    /// what preserves the mass-conservation invariant across shards.
+    pub personalization_sum: f64,
 }
 
 /// Result of one [`GraphOp::BspSuperstep`] on a single shard.
@@ -409,6 +424,14 @@ pub struct BspSuperstepResult {
     /// coordinator sums these across shards into the next superstep's
     /// `global_dangling` field so dangling mass redistributes globally.
     pub dangling_sum: f64,
+    /// Number of this shard's OWNED nodes that appear as a positively-weighted key
+    /// in the Personalized-PageRank seed map (`params.personalization_vector`),
+    /// reported by the COUNT phase (alongside `vertex_count`). The coordinator sums
+    /// these across shards: a cluster-wide total of `0` means no seed name exists
+    /// anywhere in the graph, so personalization falls back to uniform PageRank
+    /// (matching single-node `build_personalization` returning `None`). `0` on
+    /// every real superstep (only the count phase populates it).
+    pub seed_hits: usize,
 }
 
 /// Boxed payload of [`GraphOp::WccSuperstep`] — the inputs for one shard's

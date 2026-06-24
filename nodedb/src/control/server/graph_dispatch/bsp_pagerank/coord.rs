@@ -93,6 +93,17 @@ pub async fn run_bsp_pagerank(
         return empty_payload();
     }
 
+    // Personalized-PageRank global seed sum: `Σ max(w, 0.0)` over the seed map.
+    // The map already lives on the coordinator (no extra round trip). This is a
+    // PRE-CONDITION for personalization being active; the final activation
+    // decision also requires at least one seed name to exist somewhere in the
+    // cluster graph (checked via the count phase's `seed_hits` below), matching
+    // single-node `build_personalization` returning `None` for unknown seeds.
+    let global_seed_sum: f64 = params
+        .personalization_vector()
+        .map(|seed| seed.values().map(|&w| w.max(0.0)).sum())
+        .unwrap_or(0.0);
+
     let max_iterations = params
         .max_iterations
         .map(|m| m.clamp(1, u32::MAX as usize) as u32)
@@ -119,6 +130,7 @@ pub async fn run_bsp_pagerank(
             incoming_contributions: Vec::new(),
             rank_seed: Vec::new(),
             global_dangling: 0.0, // count phase: no previous superstep dangling sums.
+            personalization_sum: 0.0, // count phase runs no superstep — irrelevant here.
         })
         .collect();
     let counts = scatter_superstep(
@@ -141,6 +153,20 @@ pub async fn run_bsp_pagerank(
         // No nodes anywhere — empty result (same as single-node empty CSR).
         return empty_payload();
     }
+
+    // Cluster-wide count of owned nodes that are positively-weighted seed keys.
+    // Combined with `global_seed_sum`, this is the exact single-node
+    // `build_personalization` activation test: personalization is active iff a
+    // seed map was supplied (`global_seed_sum > 0.0`) AND at least one seed name
+    // exists somewhere in the cluster graph (`global_seed_hits > 0`). Otherwise
+    // (unknown seed / empty / non-positive) every dispatch carries
+    // `personalization_sum = 0.0` and the supersteps run UNIFORM PageRank.
+    let global_seed_hits: usize = counts.iter().map(|c| c.result.seed_hits).sum();
+    let personalization_sum = if global_seed_sum > 0.0 && global_seed_hits > 0 {
+        global_seed_sum
+    } else {
+        0.0
+    };
 
     // Seed per-node rank state from the count phase. `rank_vec` starts empty so
     // superstep 0 initializes each owned node to `1/global_n`.
@@ -198,6 +224,9 @@ pub async fn run_bsp_pagerank(
                     // Pass the globally aggregated dangling mass from the PREVIOUS
                     // superstep. 0.0 on superstep 0 (no previous sums yet).
                     global_dangling,
+                    // Cluster-wide PPR seed sum (0.0 = uniform). Constant across the
+                    // whole run; each shard normalizes its owned seeds by it.
+                    personalization_sum,
                 }
             })
             .collect();
@@ -217,7 +246,7 @@ pub async fn run_bsp_pagerank(
 
         // Store new rank vectors + node names, record ACKs, route outbound, and
         // aggregate per-shard dangling sums into global_dangling for the NEXT step.
-        incoming = HashMap::new();
+        incoming.clear();
         global_dangling = 0.0;
         for sr in results {
             let node_id = sr.node_id;

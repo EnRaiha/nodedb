@@ -420,6 +420,9 @@ fn merge_bsp_results(parts: Vec<BspSuperstepResult>) -> BspSuperstepResult {
         // exactly one core), so summing per-core dangling sums counts every
         // dangling node exactly once.
         out.dangling_sum += p.dangling_sum;
+        // Same disjointness for the count-phase seed-hit tally: each owned node is
+        // counted on exactly one core, so per-core seed hits sum cleanly.
+        out.seed_hits += p.seed_hits;
     }
     out
 }

@@ -295,6 +295,7 @@ impl CoreLoop {
                     incoming_contributions: &plan.incoming_contributions,
                     rank_seed: &plan.rank_seed,
                     global_dangling: plan.global_dangling,
+                    personalization_sum: plan.personalization_sum,
                 },
             ),
 

@@ -56,6 +56,11 @@ pub struct BspSuperstepArgs<'a> {
     /// Global dangling-node rank mass from the coordinator (see
     /// `BspSuperstepPlan::global_dangling`). `0.0` on count phase and superstep 0.
     pub global_dangling: f64,
+    /// Coordinator-computed GLOBAL `Σ max(w, 0.0)` over the Personalized-PageRank
+    /// seed map (see `BspSuperstepPlan::personalization_sum`). `0.0` means standard
+    /// uniform PageRank; `> 0.0` activates Personalized PageRank — each owned node's
+    /// globally-normalized seed share is `max(seed[name], 0.0) / personalization_sum`.
+    pub personalization_sum: f64,
 }
 
 /// The pure BSP-superstep core: given an already-built `CsrIndex` and the
@@ -105,6 +110,17 @@ pub(super) fn run_bsp_superstep_core(
     // would be wrong. Short-circuit after building the owned-node set and return
     // just the count + names. A real run always passes `global_n > 0`.
     if args.global_n == 0 {
+        // Count this shard's owned nodes that are positively-weighted seed keys, so
+        // the coordinator can sum cluster-wide seed hits and decide whether
+        // personalization is active (any seed name exists in the graph) or falls
+        // back to uniform — mirroring single-node `build_personalization` → `None`.
+        let seed_hits = match args.params.personalization_vector() {
+            Some(seed) => node_names
+                .iter()
+                .filter(|name| seed.get(name.as_str()).copied().unwrap_or(0.0) > 0.0)
+                .count(),
+            None => 0,
+        };
         return Ok(BspSuperstepResult {
             local_delta: 0.0,
             outbound: Vec::new(),
@@ -112,6 +128,7 @@ pub(super) fn run_bsp_superstep_core(
             vertex_count,
             node_names,
             dangling_sum: 0.0,
+            seed_hits,
         });
     }
 
@@ -142,13 +159,46 @@ pub(super) fn run_bsp_superstep_core(
     let mut state =
         ShardPageRankState::init(vertex_count, out_degrees, |_name| None, &csr_out_edges);
 
+    // Personalized-PageRank seed share for THIS shard's owned nodes, GLOBALLY
+    // normalized by the coordinator-computed cluster-wide sum so `Σ_global p_i ==
+    // 1.0`. `personalization_sum > 0.0` activates PPR; `None` (== 0.0) recovers
+    // standard uniform PageRank. `p[i] = max(seed[name_i], 0.0) / personalization_sum`,
+    // positionally aligned with `state.rank` / `node_names`.
+    let personalization: Option<Vec<f64>> = if args.personalization_sum > 0.0 {
+        let seed = args.params.personalization_vector();
+        let p: Vec<f64> = node_names
+            .iter()
+            .map(|name| {
+                let w = seed
+                    .and_then(|m| m.get(name.as_str()).copied())
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                w / args.personalization_sum
+            })
+            .collect();
+        Some(p)
+    } else {
+        None
+    };
+
     // Seed rank from the name-keyed seed. Each owned node takes its seed rank by
     // NAME (so the same seed can be fanned to every core, each self-filtering to
-    // its owned nodes); superstep 0 sends an empty seed → uniform 1/global_n.
+    // its owned nodes); superstep 0 sends an empty seed → the initial rank
+    // distribution. For PPR superstep 0 the initial rank IS the seed share `p[i]`
+    // (matching single-node `rank[i] = p[i]`); for uniform it is `1/global_n`.
     let init = 1.0 / args.global_n as f64;
     if args.rank_seed.is_empty() {
-        for r in state.rank.iter_mut() {
-            *r = init;
+        match &personalization {
+            Some(p) => {
+                for (slot, &pi) in state.rank.iter_mut().zip(p.iter()) {
+                    *slot = pi;
+                }
+            }
+            None => {
+                for r in state.rank.iter_mut() {
+                    *r = init;
+                }
+            }
         }
     } else {
         let seed: std::collections::HashMap<&str, f64> = args
@@ -191,6 +241,7 @@ pub(super) fn run_bsp_superstep_core(
         damping,
         args.global_n,
         args.global_dangling,
+        personalization.as_deref(),
         &local_edge_iter,
         &node_id_to_local,
     );
@@ -211,6 +262,9 @@ pub(super) fn run_bsp_superstep_core(
         vertex_count,
         node_names,
         dangling_sum: local_dangling_sum,
+        // `seed_hits` is a count-phase-only field (populated above when
+        // `global_n == 0`); real supersteps leave it zero.
+        seed_hits: 0,
     })
 }
 
@@ -326,6 +380,7 @@ mod tests {
             incoming_contributions: &[],
             rank_seed: &[],
             global_dangling: 0.0,
+            personalization_sum: 0.0,
         };
 
         let res = run_bsp_superstep_core(&csr, &args).unwrap();
@@ -370,6 +425,7 @@ mod tests {
             incoming_contributions: &[],
             rank_seed: &[],
             global_dangling: 0.0,
+            personalization_sum: 0.0,
         };
 
         let res = run_bsp_superstep_core(&csr, &args).unwrap();
@@ -399,6 +455,7 @@ mod tests {
             incoming_contributions: &[],
             rank_seed: &[],
             global_dangling: 0.0,
+            personalization_sum: 0.0,
         };
 
         let res = run_bsp_superstep_core(&csr, &args).unwrap();
@@ -428,5 +485,108 @@ mod tests {
         // plus base, and a's rank is just base (c→a is incoming from a ghost
         // shard and not present this superstep).
         assert_eq!(res.node_names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn count_phase_reports_seed_hits() {
+        use std::collections::HashMap;
+        let csr = triangle_csr();
+        let owned: Vec<u32> = (0..VShardId::COUNT).collect();
+        // Seed on "a" (weight 1.0) and "ghost" (absent) → exactly one owned hit.
+        let mut seed = HashMap::new();
+        seed.insert("a".to_string(), 1.0);
+        seed.insert("ghost".to_string(), 1.0);
+        let params = AlgoParams {
+            collection: "test_coll".into(),
+            damping: Some(0.85),
+            personalization_vector: Some(seed),
+            ..AlgoParams::default()
+        };
+        let args = BspSuperstepArgs {
+            algorithm: &GraphAlgorithm::PageRank,
+            params: &params,
+            superstep: 0,
+            global_n: 0, // count phase
+            owned_vshards: &owned,
+            incoming_contributions: &[],
+            rank_seed: &[],
+            global_dangling: 0.0,
+            personalization_sum: 0.0,
+        };
+        let res = run_bsp_superstep_core(&csr, &args).unwrap();
+        assert_eq!(
+            res.seed_hits, 1,
+            "only 'a' is an owned positively-weighted seed"
+        );
+        assert_eq!(res.vertex_count, 3);
+    }
+
+    #[test]
+    fn personalized_superstep0_seeds_rank_from_p() {
+        use std::collections::HashMap;
+        let csr = triangle_csr();
+        let owned: Vec<u32> = (0..VShardId::COUNT).collect();
+        // All seed mass on "a"; global sum (computed by coordinator) is 1.0.
+        let mut seed = HashMap::new();
+        seed.insert("a".to_string(), 1.0);
+        let params = AlgoParams {
+            collection: "test_coll".into(),
+            damping: Some(0.85),
+            personalization_vector: Some(seed),
+            ..AlgoParams::default()
+        };
+        let args = BspSuperstepArgs {
+            algorithm: &GraphAlgorithm::PageRank,
+            params: &params,
+            superstep: 0,
+            global_n: 3,
+            owned_vshards: &owned,
+            incoming_contributions: &[],
+            rank_seed: &[], // superstep 0 → init from p
+            global_dangling: 0.0,
+            personalization_sum: 1.0, // global Σ max(w,0)
+        };
+        let res = run_bsp_superstep_core(&csr, &args).unwrap();
+        // Exact one-step outcome on the directed ring a→b→c→a with all seed mass
+        // on `a` (p = [a:1, b:0, c:0]), no dangling (every node out-degree 1),
+        // damping d = 0.85:
+        //   * superstep 0 inits rank from p → rank = [a:1, b:0, c:0]
+        //   * base[i] = (1-d) * p[i] → only `a` receives teleport (0.15)
+        //   * `a` sends its full mass to its successor `b`, damped by d
+        // ⇒ a = 1-d = 0.15, b = d = 0.85, c = 0.0.
+        // After a SINGLE step the seed does NOT yet dominate — its mass has flowed
+        // to the successor; the seed only wins at convergence (covered by the
+        // cross-node integration test). These exact values instead pin down what a
+        // single personalized step must produce, distinguishing it from uniform
+        // PageRank (where ring symmetry would give all three nodes 1/3): `b = d`
+        // proves rank was seeded from `p` (not `1/global_n`), and `c = 0` proves
+        // the teleport landed only on the seed, not uniformly.
+        let rank_of = |name: &str| -> f64 {
+            let i = res
+                .node_names
+                .iter()
+                .position(|n| n == name)
+                .expect("node present");
+            res.rank_vec[i]
+        };
+        let d = 0.85;
+        assert!(
+            (rank_of("a") - (1.0 - d)).abs() < 1e-9,
+            "seed `a` base = (1-d): {}",
+            rank_of("a")
+        );
+        assert!(
+            (rank_of("b") - d).abs() < 1e-9,
+            "successor `b` must hold `a`'s damped init mass (proves init from p): {}",
+            rank_of("b")
+        );
+        assert!(
+            rank_of("c").abs() < 1e-9,
+            "non-seed `c` receives no teleport under personalization: {}",
+            rank_of("c")
+        );
+        // Mass conserved across this single shard (owns the whole graph).
+        let sum: f64 = res.rank_vec.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "mass conserved, got {sum}");
     }
 }
