@@ -41,6 +41,22 @@ pub struct TenantDataSnapshot {
     #[msgpack(default)]
     #[serde(default)]
     pub flushed_ts_segments: Vec<TsFlushedCollectionBlob>,
+
+    /// Plain-columnar (and spatial) engine state per collection.
+    ///
+    /// Each entry is `(collection_key, msgpack_bytes)` where:
+    /// - `collection_key` uses the same `"{database_id}:{tenant_id}:{collection}"`
+    ///   format as every other scoped snapshot field.
+    /// - `msgpack_bytes` is a zerompk-serialized `nodedb_columnar::ColumnarEngineSnapshot`
+    ///   (stored as opaque bytes to keep this type decoupled from the columnar
+    ///   wire layout and mirror the `vectors`/`kv_tables` encoding pattern).
+    ///
+    /// `#[msgpack(default)]`: snapshots created before this field was added
+    /// decode with an empty Vec — safe because the restore path skips an
+    /// empty slice.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub columnar_engines: Vec<(String, Vec<u8>)>,
 }
 
 /// Wire blob for all flushed partitions of one timeseries collection.
@@ -88,6 +104,54 @@ pub struct TsFlushedPartitionBlob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backward-compat: a `TenantDataSnapshot` serialized WITHOUT the
+    /// `columnar_engines` field (simulating a snapshot from before this field
+    /// was added) must decode successfully with `columnar_engines` defaulting
+    /// to `Vec::new()`.
+    ///
+    /// We simulate the "old" wire format by defining an 8-field map-encoded
+    /// struct that matches the schema before `columnar_engines` was added,
+    /// serialising it, then decoding as the new 9-field `TenantDataSnapshot`.
+    /// zerompk's `#[msgpack(default)]` fills in the missing field with
+    /// `Vec::new()`.
+    #[test]
+    fn backward_compat_missing_columnar_engines_defaults_to_empty() {
+        #[derive(zerompk::ToMessagePack, zerompk::FromMessagePack)]
+        #[msgpack(map)]
+        struct OldSnapshot {
+            documents: Vec<(String, Vec<u8>)>,
+            indexes: Vec<(String, Vec<u8>)>,
+            edges: Vec<(String, Vec<u8>)>,
+            vectors: Vec<(String, Vec<u8>)>,
+            kv_tables: Vec<(String, Vec<u8>)>,
+            crdt_state: Vec<(String, Vec<u8>)>,
+            timeseries: Vec<(String, Vec<u8>)>,
+            flushed_ts_segments: Vec<TsFlushedCollectionBlob>,
+        }
+
+        let old = OldSnapshot {
+            documents: vec![("k".to_string(), b"v".to_vec())],
+            indexes: vec![],
+            edges: vec![],
+            vectors: vec![],
+            kv_tables: vec![],
+            crdt_state: vec![],
+            timeseries: vec![("ts:c".to_string(), b"data".to_vec())],
+            flushed_ts_segments: vec![],
+        };
+        let bytes = zerompk::to_msgpack_vec(&old).expect("encode old snapshot");
+
+        // Decode as new schema — columnar_engines must default to empty.
+        let decoded: TenantDataSnapshot =
+            zerompk::from_msgpack(&bytes).expect("decode old snapshot as new schema");
+        assert_eq!(decoded.documents.len(), 1);
+        assert_eq!(decoded.timeseries.len(), 1);
+        assert!(
+            decoded.columnar_engines.is_empty(),
+            "expected columnar_engines to default to empty for old snapshot"
+        );
+    }
 
     /// Backward-compat: a `TenantDataSnapshot` serialized WITHOUT the
     /// `flushed_ts_segments` field (simulating a snapshot from before this

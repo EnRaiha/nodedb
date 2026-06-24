@@ -2,3 +2,4 @@
 
 pub mod create;
 pub mod restore;
+mod restore_segments;

@@ -138,6 +138,19 @@ impl CoreLoop {
             }
         }
 
+        // 8. Plain-columnar engines: export MutationEngine state for this tenant.
+        match self.capture_columnar_engines(database_id, tid_id) {
+            Ok(entries) => snapshot.columnar_engines = entries,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("snapshot: columnar engine capture failed: {e}"),
+                    },
+                );
+            }
+        }
+
         info!(
             tenant_id,
             documents = snapshot.documents.len(),
@@ -148,6 +161,7 @@ impl CoreLoop {
             crdt = snapshot.crdt_state.len(),
             timeseries = snapshot.timeseries.len(),
             flushed_ts_collections = snapshot.flushed_ts_segments.len(),
+            columnar_engines = snapshot.columnar_engines.len(),
             "full tenant snapshot created"
         );
 
@@ -245,6 +259,54 @@ impl CoreLoop {
         // Sort collections for deterministic snapshot output (ts_registries is
         // a HashMap so its iteration order is unspecified).
         result.sort_unstable_by(|a, b| a.collection_key.cmp(&b.collection_key));
+
+        Ok(result)
+    }
+
+    /// Capture all plain-columnar (and spatial) engine state for one tenant.
+    ///
+    /// Iterates `columnar_engines` entries belonging to `tid`, exports each
+    /// `MutationEngine` via `export_snapshot` (supplying any flushed segment
+    /// blobs from `columnar_flushed_segments`), and serialises the result to
+    /// msgpack. Returns `Err` on any export or serialization failure so the
+    /// snapshot aborts cleanly rather than silently omitting data.
+    fn capture_columnar_engines(
+        &self,
+        database_id: u64,
+        tid: crate::types::TenantId,
+    ) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        let mut result = Vec::new();
+
+        for ((eng_db, eng_tid, collection), engine) in &self.columnar_engines {
+            if *eng_tid != tid || eng_db.as_u64() != database_id {
+                continue;
+            }
+
+            let flushed: &[Vec<u8>] = self
+                .columnar_flushed_segments
+                .get(&(*eng_db, *eng_tid, collection.clone()))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+
+            let snap = engine
+                .export_snapshot(flushed)
+                .map_err(|e| crate::Error::Storage {
+                    engine: "columnar".into(),
+                    detail: format!("export_snapshot for collection '{collection}': {e}"),
+                })?;
+
+            let bytes =
+                zerompk::to_msgpack_vec(&snap).map_err(|e| crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: format!("serialize ColumnarEngineSnapshot for '{collection}': {e}"),
+                })?;
+
+            let key_str = format!("{}:{}:{}", database_id, tid.as_u64(), collection);
+            result.push((key_str, bytes));
+        }
+
+        // Sort for deterministic output (columnar_engines is a HashMap).
+        result.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         Ok(result)
     }

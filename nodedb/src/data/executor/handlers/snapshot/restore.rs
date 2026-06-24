@@ -4,8 +4,6 @@
 
 use tracing::{info, warn};
 
-use crate::types::TsFlushedCollectionBlob;
-
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
@@ -127,6 +125,18 @@ impl CoreLoop {
                     },
                 );
             }
+
+            // Restore plain-columnar engines.
+            if !snap.columnar_engines.is_empty()
+                && let Err(e) = self.restore_columnar_engines(&snap.columnar_engines)
+            {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("restore: columnar engine restore failed: {e}"),
+                    },
+                );
+            }
         }
 
         info!(
@@ -139,6 +149,7 @@ impl CoreLoop {
             crdt_written,
             ts_written,
             flushed_ts_collections = snap.flushed_ts_segments.len(),
+            columnar_engines = snap.columnar_engines.len(),
             "full tenant snapshot restored"
         );
 
@@ -151,6 +162,7 @@ impl CoreLoop {
             "kv_entries_restored": kv_written,
             "crdt_restored": crdt_written,
             "timeseries_restored": ts_written,
+            "columnar_engines_restored": snap.columnar_engines.len(),
         });
         match crate::data::executor::response_codec::encode_json(&result) {
             Ok(p) => self.response_with_payload(task, p),
@@ -254,123 +266,6 @@ impl CoreLoop {
         }
     }
 
-    /// Restore flushed on-disk timeseries segment directories from snapshot blobs.
-    ///
-    /// For each captured partition:
-    /// - Collision handling is fail-closed (no silent overwrites):
-    ///   - If the partition dir already exists AND the registry already tracks a
-    ///     partition at the same `min_ts`, we compare `row_count` and
-    ///     `last_flushed_wal_lsn` to determine idempotency:
-    ///     - Identical metadata → skip (idempotent re-apply).
-    ///     - Different metadata → return `Storage` error (would clobber live data).
-    ///   - Otherwise: create the directory, write all files, register in
-    ///     `ts_registries` mirroring `flush_ts_collection`'s exact registration.
-    fn restore_flushed_ts_segments(
-        &mut self,
-        blobs: &[TsFlushedCollectionBlob],
-    ) -> crate::Result<()> {
-        for coll_blob in blobs {
-            let (database_id, tenant_id, collection) =
-                parse_timeseries_snapshot_key(&coll_blob.collection_key);
-
-            let segment_dir = super::super::timeseries::paths::ts_collection_dir(
-                &self.data_dir,
-                database_id,
-                tenant_id,
-                &collection,
-            );
-
-            let reg_key = (
-                nodedb_types::DatabaseId::new(database_id),
-                crate::types::TenantId::new(tenant_id),
-                collection.clone(),
-            );
-
-            for part_blob in &coll_blob.partitions {
-                // Deserialize PartitionMeta from the embedded msgpack bytes.
-                let meta: nodedb_types::timeseries::PartitionMeta =
-                    zerompk::from_msgpack(&part_blob.meta_bytes).map_err(|e| {
-                        crate::Error::Serialization {
-                            format: "msgpack".into(),
-                            detail: format!(
-                                "restore: deserialize PartitionMeta for {}/{}: {e}",
-                                collection, part_blob.dir_name
-                            ),
-                        }
-                    })?;
-
-                let partition_dir = segment_dir.join(&part_blob.dir_name);
-
-                // Collision check: registry already knows this min_ts key.
-                if let Some(registry) = self.ts_registries.get(&reg_key)
-                    && let Some(existing) = registry.get(meta.min_ts)
-                {
-                    let is_identical = existing.meta.row_count == meta.row_count
-                        && existing.meta.last_flushed_wal_lsn == meta.last_flushed_wal_lsn;
-                    if is_identical {
-                        // Idempotent: same partition already present, skip.
-                        continue;
-                    }
-                    return Err(crate::Error::Storage {
-                        engine: "timeseries".into(),
-                        detail: format!(
-                            "restore: partition collision for collection '{}' min_ts={}: \
-                                 existing (rows={}, lsn={}) differs from snapshot \
-                                 (rows={}, lsn={}); refusing to overwrite live data",
-                            collection,
-                            meta.min_ts,
-                            existing.meta.row_count,
-                            existing.meta.last_flushed_wal_lsn,
-                            meta.row_count,
-                            meta.last_flushed_wal_lsn,
-                        ),
-                    });
-                }
-
-                // Also check the filesystem: if the directory already exists
-                // and is non-empty, treat it as a collision.
-                if partition_dir.exists() {
-                    let is_empty = std::fs::read_dir(&partition_dir)
-                        .map_err(crate::Error::Io)
-                        .map(|mut d| d.next().is_none())?;
-                    if !is_empty {
-                        return Err(crate::Error::Storage {
-                            engine: "timeseries".into(),
-                            detail: format!(
-                                "restore: partition directory '{}' already exists for \
-                                 collection '{}'; refusing to overwrite live data",
-                                part_blob.dir_name, collection,
-                            ),
-                        });
-                    }
-                }
-
-                // Create the partition directory and write all captured files.
-                std::fs::create_dir_all(&partition_dir)?;
-                for (filename, bytes) in &part_blob.files {
-                    std::fs::write(partition_dir.join(filename), bytes)?;
-                }
-
-                // Register the restored partition in ts_registries, mirroring
-                // exactly the registration step in flush_ts_collection.
-                let registry = self
-                    .ts_registries
-                    .entry(reg_key.clone())
-                    .or_insert_with(|| {
-                        crate::engine::timeseries::partition_registry::PartitionRegistry::new(
-                            nodedb_types::timeseries::TieredPartitionConfig::origin_defaults(),
-                        )
-                    });
-                let pe = crate::engine::timeseries::partition_registry::PartitionEntry {
-                    meta,
-                    dir_name: part_blob.dir_name.clone(),
-                };
-                registry.import(vec![(pe.meta.min_ts, pe)]);
-            }
-        }
-        Ok(())
-    }
-
     fn restore_crdt_state(&mut self, tenant_id: u64, bytes: &[u8]) -> crate::Result<()> {
         let tid = crate::types::TenantId::new(tenant_id);
         // If an engine already exists, import into it. Otherwise create a fresh one.
@@ -424,7 +319,7 @@ impl CoreLoop {
 ///   * 2 parts → legacy `tenant:collection`; database defaults to 0
 ///     (`DatabaseId::DEFAULT`).
 ///   * 1 part → bare collection; database and tenant default to 0.
-fn parse_timeseries_snapshot_key(key: &str) -> (u64, u64, String) {
+pub(super) fn parse_timeseries_snapshot_key(key: &str) -> (u64, u64, String) {
     let mut it = key.splitn(3, ':');
     let first = it.next().unwrap_or("");
     let second = it.next();
@@ -454,7 +349,7 @@ fn parse_timeseries_snapshot_key(key: &str) -> (u64, u64, String) {
 ///
 /// `coll_key` is returned as a borrowed slice of `key` so the caller can pass
 /// it straight into `restore_vector_collection` without an allocation.
-fn parse_vector_snapshot_key(key: &str, tenant_id: u64) -> (u64, &str) {
+pub(super) fn parse_vector_snapshot_key(key: &str, tenant_id: u64) -> (u64, &str) {
     let mut it = key.splitn(3, ':');
     let first = it.next().unwrap_or("");
     let second = it.next();
@@ -478,7 +373,7 @@ fn parse_vector_snapshot_key(key: &str, tenant_id: u64) -> (u64, &str) {
 /// Non-default databases qualify their collections as `"{database_id}/{name}"`;
 /// the default database uses the bare name. A bare name (no leading numeric
 /// segment before a `/`) maps to `DatabaseId::DEFAULT` (0).
-fn database_id_from_qualified(collection: &str) -> u64 {
+pub(super) fn database_id_from_qualified(collection: &str) -> u64 {
     match collection.split_once('/') {
         Some((prefix, _)) => prefix.parse::<u64>().unwrap_or(0),
         None => 0,
