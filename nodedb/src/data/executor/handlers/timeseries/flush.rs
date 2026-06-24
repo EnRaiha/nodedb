@@ -76,19 +76,23 @@ impl CoreLoop {
     /// Drains the columnar memtable, writes segments via `ColumnarSegmentWriter`,
     /// registers the new partition in `ts_registries`, and fires the continuous
     /// aggregate hook.
+    ///
+    /// Returns `Ok(())` on success (including when the memtable is empty or
+    /// absent — both are no-ops). Returns `Err` if the segment write fails;
+    /// the caller is responsible for surfacing or propagating the error.
     pub(in crate::data::executor) fn flush_ts_collection(
         &mut self,
         tid: TenantId,
         database_id: DatabaseId,
         collection: &str,
         now_ms: i64,
-    ) {
+    ) -> crate::Result<()> {
         let key = (database_id, tid, collection.to_string());
         let Some(mt) = self.columnar_memtables.get_mut(&key) else {
-            return;
+            return Ok(());
         };
         if mt.is_empty() {
-            return;
+            return Ok(());
         }
 
         let drain = mt.drain();
@@ -116,38 +120,33 @@ impl CoreLoop {
         // records which WAL records have been flushed.
         let flush_wal_lsn = self.ts_max_ingested_lsn.get(&key).copied().unwrap_or(0);
         let ts_kek = self.ts_segment_kek.as_ref();
-        match writer.write_partition(&partition_name, &drain, 0, flush_wal_lsn, ts_kek) {
-            Ok(meta) => {
-                tracing::info!(
-                    collection,
-                    rows = meta.row_count,
-                    "timeseries columnar flush complete"
-                );
+        let meta = writer
+            .write_partition(&partition_name, &drain, 0, flush_wal_lsn, ts_kek)
+            .map_err(|e| crate::Error::Storage {
+                engine: "timeseries".into(),
+                detail: format!("columnar flush failed for collection {collection}: {e}"),
+            })?;
 
-                let registry = self.ts_registries.entry(key).or_insert_with(|| {
-                    PartitionRegistry::new(
-                        nodedb_types::timeseries::TieredPartitionConfig::origin_defaults(),
-                    )
-                });
-                let mut reg_meta = meta;
-                reg_meta.min_ts = drain.min_ts;
-                reg_meta.max_ts = drain.max_ts;
-                reg_meta.state = nodedb_types::timeseries::PartitionState::Sealed;
-                let pe = crate::engine::timeseries::partition_registry::PartitionEntry {
-                    meta: reg_meta,
-                    dir_name: partition_name,
-                };
-                registry.import(vec![(drain.min_ts, pe)]);
-            }
-            Err(e) => {
-                tracing::error!(
-                    collection,
-                    error = %e,
-                    "timeseries columnar flush failed"
-                );
-                return;
-            }
-        }
+        tracing::info!(
+            collection,
+            rows = meta.row_count,
+            "timeseries columnar flush complete"
+        );
+
+        let registry = self.ts_registries.entry(key).or_insert_with(|| {
+            PartitionRegistry::new(
+                nodedb_types::timeseries::TieredPartitionConfig::origin_defaults(),
+            )
+        });
+        let mut reg_meta = meta;
+        reg_meta.min_ts = drain.min_ts;
+        reg_meta.max_ts = drain.max_ts;
+        reg_meta.state = nodedb_types::timeseries::PartitionState::Sealed;
+        let pe = crate::engine::timeseries::partition_registry::PartitionEntry {
+            meta: reg_meta,
+            dir_name: partition_name,
+        };
+        registry.import(vec![(drain.min_ts, pe)]);
 
         // Fire continuous aggregate hook.
         let refreshed =
@@ -160,6 +159,8 @@ impl CoreLoop {
                 "continuous aggregates refreshed on flush"
             );
         }
+
+        Ok(())
     }
 
     /// Re-charge the engine memory budget for a timeseries memtable's

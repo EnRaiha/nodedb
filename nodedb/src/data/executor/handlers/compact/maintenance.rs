@@ -63,8 +63,17 @@ impl CoreLoop {
                             .collect();
                         let mut flushed = 0usize;
                         for (db, tid, collection) in &collections {
-                            self.flush_ts_collection(*tid, *db, collection, now_ms);
-                            flushed += 1;
+                            match self.flush_ts_collection(*tid, *db, collection, now_ms) {
+                                Ok(()) => flushed += 1,
+                                Err(e) => {
+                                    tracing::error!(
+                                        collection = %collection,
+                                        error = %e,
+                                        "idle ts flush failed — segment write error; \
+                                         collection skipped this maintenance cycle"
+                                    );
+                                }
+                            }
                         }
                         if flushed > 0 {
                             info!(

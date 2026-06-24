@@ -105,13 +105,21 @@ impl CoreLoop {
                 }
             }
 
-            // Restore timeseries memtables.
+            // Restore timeseries memtables and flush each to an on-disk segment
+            // for durability. A flush failure is fatal to the whole restore —
+            // consistent with how `restore_flushed_ts_segments` treats durability
+            // errors — because partial restore with non-durable data is worse than
+            // a clean failure the operator can retry.
             for (key, bytes) in &snap.timeseries {
                 if let Err(e) = self.restore_timeseries(key, bytes) {
-                    warn!(key, error = %e, "failed to restore timeseries");
-                } else {
-                    ts_written += 1;
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("restore: timeseries collection {key} failed: {e}"),
+                        },
+                    );
                 }
+                ts_written += 1;
             }
 
             // Restore flushed on-disk timeseries segments.
@@ -301,12 +309,24 @@ impl CoreLoop {
 
         let mt = ColumnarMemtable::from_snapshot(snap, ColumnarMemtableConfig::default())?;
 
-        let map_key = (
-            nodedb_types::DatabaseId::new(database_id),
-            crate::types::TenantId::new(tenant_id),
-            collection,
-        );
+        let tid = crate::types::TenantId::new(tenant_id);
+        let db_id = nodedb_types::DatabaseId::new(database_id);
+        let map_key = (db_id, tid, collection.clone());
         self.columnar_memtables.insert(map_key, mt);
+
+        // Persist the restored memtable to an on-disk segment immediately so
+        // timeseries data is durable across restart. Uses a wall-clock timestamp
+        // (same source as the idle-flush path in maintenance.rs) because there
+        // is no Calvin epoch in a restore context.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // Propagate the flush error directly — flush_ts_collection already
+        // wraps the underlying I/O error in crate::Error::Storage with the
+        // collection name included.
+        self.flush_ts_collection(tid, db_id, &collection, now_ms)?;
+
         Ok(())
     }
 }

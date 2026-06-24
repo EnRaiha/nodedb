@@ -262,10 +262,20 @@ impl CoreLoop {
             )
             .is_err()
         });
-        if let Some(mt) = self.columnar_memtables.get(&key)
-            && (mt.memory_bytes() >= 64 * 1024 * 1024 || governor_pressure)
+        let needs_flush = self
+            .columnar_memtables
+            .get(&key)
+            .is_some_and(|mt| mt.memory_bytes() >= 64 * 1024 * 1024 || governor_pressure);
+        if needs_flush
+            && let Err(e) =
+                self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
         {
-            self.flush_ts_collection(tid, task.request.database_id, collection, now_ms);
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("pre-ingest ts flush failed: {e}"),
+                },
+            );
         }
 
         let Some(mt) = self.columnar_memtables.get_mut(&key) else {
@@ -295,7 +305,16 @@ impl CoreLoop {
                 rejected,
                 "ILP batch rows rejected by hard limit, flushing and retrying"
             );
-            self.flush_ts_collection(tid, task.request.database_id, collection, now_ms);
+            if let Err(e) =
+                self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
+            {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("hard-limit ts flush failed: {e}"),
+                    },
+                );
+            }
             if let Some(mt) = self.columnar_memtables.get_mut(&key) {
                 let mut retry_keys = HashMap::new();
                 let retry_lines = &lines[accepted..];
@@ -321,8 +340,17 @@ impl CoreLoop {
                 },
             );
         };
-        if mt.memory_bytes() >= 64 * 1024 * 1024 {
-            self.flush_ts_collection(tid, task.request.database_id, collection, now_ms);
+        let needs_flush = mt.memory_bytes() >= 64 * 1024 * 1024;
+        if needs_flush
+            && let Err(e) =
+                self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
+        {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("post-ingest ts flush failed: {e}"),
+                },
+            );
         }
 
         // Track WAL LSN and last ingest time for dedup + idle flush.
