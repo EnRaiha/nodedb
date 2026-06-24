@@ -4,17 +4,23 @@
 
 use super::super::ast::*;
 use super::core::execute_clause;
+use super::expansion::VarLenCaps;
 use super::types::{BindingRow, ExecutionState};
 use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::EdgeStore;
 
 /// Apply a WHERE predicate to filter rows.
+///
+/// `varlen_caps` carries the same per-expansion caps as the outer query so a
+/// variable-length sub-pattern (e.g. inside `NOT EXISTS`) truncates at the
+/// configured ceiling rather than a hardcoded one.
 pub(super) fn apply_predicate(
     rows: &[BindingRow],
     predicate: &WherePredicate,
     csr: &CsrIndex,
     edge_store: &EdgeStore,
     _frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+    varlen_caps: VarLenCaps,
 ) -> Result<Vec<BindingRow>, crate::Error> {
     match predicate {
         WherePredicate::Equals {
@@ -63,7 +69,7 @@ pub(super) fn apply_predicate(
             // `apply_predicate` already tracks. Here we keep a throwaway
             // local state and inspect it.
             for row in rows {
-                let mut sub_state = ExecutionState::new(None);
+                let mut sub_state = ExecutionState::new(None, varlen_caps);
                 // NOT EXISTS sub-patterns check structural connectivity
                 // against already-bound variables — no anchor enumeration
                 // occurs, so the frontier bitmap does not apply here.

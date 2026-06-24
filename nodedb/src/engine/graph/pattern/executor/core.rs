@@ -37,11 +37,19 @@ pub fn execute<'a>(
     edge_store: &EdgeStore,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
+    varlen_caps: expansion::VarLenCaps,
 ) -> Result<MatchOutcome, crate::Error> {
     // Optimize query before execution (reorder triples by selectivity).
     let mut optimized = query.clone();
     super::super::optimizer::optimize(&mut optimized, csr);
-    execute_query(&optimized, csr, edge_store, frontier_bitmap, is_remote_node)
+    execute_query(
+        &optimized,
+        csr,
+        edge_store,
+        frontier_bitmap,
+        is_remote_node,
+        varlen_caps,
+    )
 }
 
 /// Execute a pre-optimized MATCH query (internal, skip optimizer).
@@ -51,9 +59,10 @@ fn execute_query<'a>(
     edge_store: &EdgeStore,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
+    varlen_caps: expansion::VarLenCaps,
 ) -> Result<MatchOutcome, crate::Error> {
     let mut rows: Vec<BindingRow> = vec![HashMap::new()];
-    let mut state = ExecutionState::new(is_remote_node);
+    let mut state = ExecutionState::new(is_remote_node, varlen_caps);
 
     for clause in &query.clauses {
         let clause_rows = execute_clause(clause, csr, &rows, &mut state, frontier_bitmap)?;
@@ -64,7 +73,14 @@ fn execute_query<'a>(
         }
     }
 
-    let rows = continuation::finalize_rows(query, rows, csr, edge_store, frontier_bitmap)?;
+    let rows = continuation::finalize_rows(
+        query,
+        rows,
+        csr,
+        edge_store,
+        frontier_bitmap,
+        state.varlen_caps,
+    )?;
 
     Ok(MatchOutcome {
         rows,
@@ -175,19 +191,21 @@ pub(super) fn execute_triple(
             want_path,
         };
         for &src_id in &src_nodes {
-            let expansion = expansion::expand_variable_length(
-                csr,
-                src_id,
-                &pattern,
-                expansion::VarLenCaps::default(),
-            );
+            let expansion =
+                expansion::expand_variable_length(csr, src_id, &pattern, state.varlen_caps);
             if let Some(cursor) = expansion.cursor {
                 // Capture the LIVE resume cursor instead of silently dropping
-                // the un-expanded frontier. `input_row` are the bindings at
-                // this expansion's source; the BFS resumes from `cursor`.
+                // the un-expanded frontier. The cursor's `source_row` MUST carry
+                // this expansion's source binding (e.g. `a = src_id`): a
+                // free-ranging anchor has an empty `input_row`, and the resumed
+                // rows are rebuilt from `source_row`, so without binding the
+                // source here the resumed rows would lack the anchor variable and
+                // be dropped by a `WHERE`/projection that references it.
+                let mut source_row = input_row.clone();
+                bind_node(&mut source_row, &triple.src, csr, src_id);
                 state.record_truncation(VarLenResume {
                     triple_idx,
-                    source_row: input_row.clone(),
+                    source_row,
                     frontier: cursor.frontier,
                     depth: cursor.depth,
                 });
@@ -428,7 +446,16 @@ pub(super) mod tests {
             "MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b",
         )
         .unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["a"], "alice");
         assert_eq!(rows[0]["b"], "bob");
@@ -441,7 +468,16 @@ pub(super) mod tests {
             "MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a = 'alice' RETURN a, b, c",
         )
         .unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["c"], "carol");
     }
@@ -452,7 +488,16 @@ pub(super) mod tests {
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) OPTIONAL MATCH (b)-[:LIKES]->(c) WHERE a = 'alice' RETURN a, b, c",
         ).unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["c"], "NULL");
     }
@@ -464,7 +509,16 @@ pub(super) mod tests {
             "MATCH (a)-[:KNOWS]->(b) WHERE NOT EXISTS { MATCH (a)-[:BLOCKED]->(b) } RETURN a, b",
         )
         .unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         assert_eq!(rows.len(), 3);
     }
 
@@ -474,7 +528,16 @@ pub(super) mod tests {
         let query =
             super::super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b LIMIT 2")
                 .unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         assert_eq!(rows.len(), 2);
     }
 
@@ -484,7 +547,16 @@ pub(super) mod tests {
         let query =
             super::super::super::compiler::parse("MATCH (a)-[:NONEXISTENT]->(b) RETURN a, b")
                 .unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         assert!(rows.is_empty());
     }
 
@@ -501,21 +573,48 @@ pub(super) mod tests {
         // Without label filter — all KNOWS edges.
         let query =
             super::super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         assert_eq!(rows.len(), 3);
 
         // With label filter — only Person src.
         let query =
             super::super::super::compiler::parse("MATCH (a:Person)-[:KNOWS]->(b) RETURN a, b")
                 .unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         // alice->bob, bob->carol, carol->dave — all 3 srcs are Person.
         assert_eq!(rows.len(), 3);
 
         // With label filter — only Bot dst.
         let query = super::super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b:Bot) RETURN a, b")
             .unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         // Only carol->dave where dave is Bot.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["a"], "carol");
@@ -525,7 +624,16 @@ pub(super) mod tests {
         let query =
             super::super::super::compiler::parse("MATCH (a:Person)-[:KNOWS]->(b:Bot) RETURN a, b")
                 .unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["a"], "carol");
 
@@ -533,7 +641,16 @@ pub(super) mod tests {
         let query =
             super::super::super::compiler::parse("MATCH (a:Bot)-[:KNOWS]->(b:Person) RETURN a, b")
                 .unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
         assert!(rows.is_empty());
     }
 
@@ -568,7 +685,16 @@ pub(super) mod tests {
 
         let query =
             super::super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
-        let rows = execute(&query, &csr, &store, Some(&bm), None).unwrap().rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            Some(&bm),
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap()
+        .rows;
 
         // Only alice->bob should appear; bob->carol and carol->dave are blocked
         // because the src anchor (bob, carol) is not in the bitmap.
@@ -636,7 +762,15 @@ pub(super) mod tests {
         .unwrap();
         // "bob" is the hop-2 source with zero out-edges; mark it remote.
         let is_remote: &dyn Fn(&str) -> bool = &|name| name == "bob";
-        let outcome = execute(&query, &csr, &store, None, Some(is_remote)).unwrap();
+        let outcome = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            Some(is_remote),
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap();
 
         // No local rows — bob has no out-edges locally.
         assert!(
@@ -692,7 +826,15 @@ pub(super) mod tests {
         // that is free-ranging or has local edges must not produce a frontier
         // entry.
         let is_remote: &dyn Fn(&str) -> bool = &|_| true;
-        let outcome = execute(&query, &csr, &store, None, Some(is_remote)).unwrap();
+        let outcome = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            Some(is_remote),
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap();
 
         assert!(outcome.rows.is_empty(), "expected no rows");
         assert!(
@@ -713,7 +855,15 @@ pub(super) mod tests {
             "MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b",
         )
         .unwrap();
-        let outcome = execute(&query, &csr, &store, None, None).unwrap();
+        let outcome = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap();
 
         assert_eq!(outcome.rows.len(), 1);
         assert_eq!(outcome.rows[0]["b"], "bob");
@@ -739,7 +889,15 @@ pub(super) mod tests {
         .unwrap();
         // "mid" is the hop-2 source with zero out-edges; mark it remote.
         let is_remote: &dyn Fn(&str) -> bool = &|name| name == "mid";
-        let outcome = execute(&query, &csr, &store, None, Some(is_remote)).unwrap();
+        let outcome = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            Some(is_remote),
+            expansion::VarLenCaps::default(),
+        )
+        .unwrap();
 
         assert!(outcome.rows.is_empty());
         assert_eq!(

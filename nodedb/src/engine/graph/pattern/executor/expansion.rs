@@ -19,17 +19,32 @@ pub(super) const MAX_VARLEN_FRONTIER: usize = 100_000;
 
 /// Tunable caps for a single variable-length expansion.
 ///
-/// Production constructs this via [`VarLenCaps::default`], which preserves the
-/// historical `100_000` hard caps verbatim. The caps are a struct field rather
-/// than a module const so tests (and the future cross-shard integration test)
-/// can drive truncation deterministically on small graphs without mutating the
-/// production ceiling.
+/// Production constructs this from node `GraphTuning` via
+/// [`VarLenCaps::from_graph_tuning`], whose fields default to the historical
+/// `100_000` hard caps verbatim — so an operator who sets nothing gets
+/// byte-identical behaviour. [`VarLenCaps::default`] preserves the same
+/// `100_000` ceilings for callers (and tests) that do not thread tuning. The
+/// caps are a struct field rather than a module const so an operator (via the
+/// `[tuning.graph]` config knobs) — and tests — can drive truncation
+/// deterministically on small graphs without mutating any compile-time ceiling.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct VarLenCaps {
+pub struct VarLenCaps {
     /// Max emitted results before truncation fires.
     pub max_results: usize,
     /// Max live frontier (per-hop) before truncation fires.
     pub max_frontier: usize,
+}
+
+impl VarLenCaps {
+    /// Build the caps from node graph tuning. The two `varlen_*` fields default
+    /// to `100_000`, so the production path is identical to the prior
+    /// hardcoded ceilings unless an operator overrides them in config.
+    pub fn from_graph_tuning(tuning: &nodedb_types::config::tuning::GraphTuning) -> Self {
+        Self {
+            max_results: tuning.varlen_max_results,
+            max_frontier: tuning.varlen_max_frontier,
+        }
+    }
 }
 
 impl Default for VarLenCaps {

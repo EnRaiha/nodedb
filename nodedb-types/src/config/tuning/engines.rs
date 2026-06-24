@@ -97,6 +97,14 @@ pub const DEFAULT_MAX_VISITED: usize = 100_000;
 /// Default maximum BFS traversal depth.
 pub const DEFAULT_MAX_DEPTH: usize = 10;
 
+/// Default hard cap on results emitted from a single variable-length MATCH
+/// expansion before it must page via cross-shard resume.
+pub const DEFAULT_VARLEN_MAX_RESULTS: usize = 100_000;
+
+/// Default hard cap on the live frontier of a single variable-length MATCH
+/// expansion before it must page via cross-shard resume.
+pub const DEFAULT_VARLEN_MAX_FRONTIER: usize = 100_000;
+
 /// Graph engine tuning (traversal limits, LCC algorithm).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphTuning {
@@ -108,6 +116,19 @@ pub struct GraphTuning {
     pub lcc_high_degree_threshold: usize,
     #[serde(default = "default_lcc_sample_pairs")]
     pub lcc_sample_pairs: usize,
+    /// Hard cap on results emitted from a single variable-length MATCH
+    /// (`[*min..max]`) expansion. When an expansion would exceed this it
+    /// truncates at the current hop boundary and surfaces a resume cursor so
+    /// the remainder is paged across follow-up rounds (cross-shard or local) —
+    /// no row is silently dropped. Bounds peak per-expansion result allocation.
+    #[serde(default = "default_varlen_max_results")]
+    pub varlen_max_results: usize,
+    /// Hard cap on the live (per-hop) frontier of a single variable-length
+    /// MATCH expansion. When a single hop would grow the frontier past this it
+    /// truncates and pages via resume, bounding peak intermediate allocation on
+    /// dense / bidirectional traversals.
+    #[serde(default = "default_varlen_max_frontier")]
+    pub varlen_max_frontier: usize,
 }
 
 impl Default for GraphTuning {
@@ -117,6 +138,8 @@ impl Default for GraphTuning {
             max_depth: default_max_depth(),
             lcc_high_degree_threshold: default_lcc_high_degree_threshold(),
             lcc_sample_pairs: default_lcc_sample_pairs(),
+            varlen_max_results: default_varlen_max_results(),
+            varlen_max_frontier: default_varlen_max_frontier(),
         }
     }
 }
@@ -132,6 +155,12 @@ fn default_lcc_high_degree_threshold() -> usize {
 }
 fn default_lcc_sample_pairs() -> usize {
     10_000
+}
+fn default_varlen_max_results() -> usize {
+    DEFAULT_VARLEN_MAX_RESULTS
+}
+fn default_varlen_max_frontier() -> usize {
+    DEFAULT_VARLEN_MAX_FRONTIER
 }
 
 /// Timeseries engine tuning (memtable budgets, block sizes).

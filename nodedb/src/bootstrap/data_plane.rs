@@ -82,6 +82,7 @@ pub fn spawn_data_plane_cores(
         interval: config.checkpoint.compaction_interval(),
         tombstone_threshold: config.checkpoint.compaction_tombstone_threshold,
         query: config.tuning.query.clone(),
+        graph: config.tuning.graph.clone(),
     };
 
     let mut core_handles = Vec::with_capacity(num_cores);

@@ -72,6 +72,11 @@ pub struct CoreLoopSpawn {
     pub governor: Option<Arc<MemoryGovernor>>,
     /// WAL replay payload, or `None` for fresh-start cores.
     pub replay: Option<WalReplay>,
+    /// Graph engine tuning wired via `core.set_graph_tuning`. Production
+    /// (`data::runtime`) wires this from `config.tuning.graph`; the harness
+    /// passes `GraphTuning::default()` (100k caps) unless a test overrides the
+    /// variable-length expansion caps to drive truncation on small graphs.
+    pub graph_tuning: nodedb_types::config::tuning::GraphTuning,
     /// Stop signal for the tick loop. Sender lives in the harness shutdown path.
     pub stop_rx: std::sync::mpsc::Receiver<()>,
 }
@@ -91,6 +96,7 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
         core_metrics,
         governor,
         replay,
+        graph_tuning,
         stop_rx,
     } = spawn;
 
@@ -109,6 +115,7 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
                 )
                 .expect("CoreLoop::open_with_array_catalog");
                 core.set_event_producer(event_producer);
+                core.set_graph_tuning(graph_tuning);
                 if let Some(m) = core_metrics {
                     core.set_metrics(m);
                 }

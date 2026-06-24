@@ -68,6 +68,15 @@ impl CoreLoop {
         self.query_tuning = tuning;
     }
 
+    /// Set graph engine tuning (traversal limits + variable-length expansion
+    /// caps), called after open, before the event loop starts. The varlen caps
+    /// (`varlen_max_results` / `varlen_max_frontier`) bound a single
+    /// variable-length MATCH expansion before it pages via resume; they default
+    /// to 100k so an unset config is byte-identical to the prior behaviour.
+    pub fn set_graph_tuning(&mut self, tuning: nodedb_types::config::tuning::GraphTuning) {
+        self.graph_tuning = tuning;
+    }
+
     /// Apply secondary index extraction for a document (opens its own txn).
     ///
     /// Used by `execute_document_batch_insert` after `batch_put` has already

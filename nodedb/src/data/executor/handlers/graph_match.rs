@@ -11,7 +11,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::pattern::ast::MatchQuery;
 use crate::engine::graph::pattern::executor::{
-    BindingRow, UnresolvedExpansion, VarLenResume, rows_to_msgpack,
+    BindingRow, ContinuationSeed, UnresolvedExpansion, VarLenResume, rows_to_msgpack,
 };
 
 /// Map key carrying the binding-rows msgpack array in the MATCH envelope.
@@ -138,19 +138,15 @@ impl CoreLoop {
         task: &ExecutionTask,
         outcome: crate::engine::graph::pattern::executor::MatchOutcome,
     ) -> Response {
-        // The resume cursor (when the expansion truncated) rides INSIDE the
-        // envelope so it survives the cross-node round-trip, alongside the
-        // per-frame `partial` flag the local path still reads.
-        let truncated = outcome.truncated();
+        // Truncation is signalled by the `resume` cursor array INSIDE the
+        // envelope (decoded by `broadcast_match_to_all_cores` into
+        // `MatchBroadcastOutcome.resume`), NOT by the frame status. The response
+        // is ALWAYS a single terminal frame: the cross-core/cross-node gather
+        // (`collect_bounded_response`) drains `Partial` frames until a terminal
+        // one, so emitting a lone `Partial` frame here would hang the gather.
         let resume: Vec<VarLenResume> = outcome.truncation.into_iter().collect();
         match encode_match_envelope(&outcome.rows, &outcome.unresolved_frontier, &resume) {
-            Ok(payload) => {
-                if truncated {
-                    self.response_partial(task, payload)
-                } else {
-                    self.response_with_payload(task, payload)
-                }
-            }
+            Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
@@ -211,12 +207,20 @@ impl CoreLoop {
         } else {
             None
         };
+        // Hard caps on variable-length expansion are an operational knob:
+        // built from this node's GraphTuning (defaulting to 100k when no
+        // override is set). On a cap hit the expansion truncates and surfaces
+        // a resume cursor so the remainder pages across rounds.
+        let varlen_caps = crate::engine::graph::pattern::executor::VarLenCaps::from_graph_tuning(
+            &self.graph_tuning,
+        );
         match crate::engine::graph::pattern::executor::execute(
             &query,
             partition,
             &self.edge_store,
             frontier_bitmap,
             is_remote_node,
+            varlen_caps,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
@@ -303,14 +307,20 @@ impl CoreLoop {
         // what enables multi-round continuation across >1 shard boundary.
         let all_remote = |_: &str| true;
         let is_remote_node: Option<&dyn Fn(&str) -> bool> = Some(&all_remote);
+        let varlen_caps = crate::engine::graph::pattern::executor::VarLenCaps::from_graph_tuning(
+            &self.graph_tuning,
+        );
         match crate::engine::graph::pattern::executor::execute_continuation(
             &query,
             partition,
             &self.edge_store,
             None, // no anchor prefilter on the resume path
             is_remote_node,
-            resume_triple_idx,
-            seed_row,
+            ContinuationSeed {
+                triple_idx: resume_triple_idx,
+                seed_row,
+            },
+            varlen_caps,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
@@ -380,6 +390,9 @@ impl CoreLoop {
 
         let all_remote = |_: &str| true;
         let is_remote_node: Option<&dyn Fn(&str) -> bool> = Some(&all_remote);
+        let varlen_caps = crate::engine::graph::pattern::executor::VarLenCaps::from_graph_tuning(
+            &self.graph_tuning,
+        );
         match crate::engine::graph::pattern::executor::execute_varlen_resume(
             &query,
             partition,
@@ -387,6 +400,7 @@ impl CoreLoop {
             None, // no anchor prefilter on the resume path
             is_remote_node,
             resume,
+            varlen_caps,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),

@@ -11,7 +11,8 @@ mod shutdown;
 pub use bitemporal::BitemporalTuning;
 pub use data_plane::{DataPlaneTuning, QueryTuning};
 pub use engines::{
-    DEFAULT_MAX_DEPTH, DEFAULT_MAX_VISITED, GraphTuning, KvTuning, SparseTuning, TimeseriesToning,
+    DEFAULT_MAX_DEPTH, DEFAULT_MAX_VISITED, DEFAULT_VARLEN_MAX_FRONTIER,
+    DEFAULT_VARLEN_MAX_RESULTS, GraphTuning, KvTuning, SparseTuning, TimeseriesToning,
     VectorTuning,
 };
 pub use memory::MemoryTuning;
@@ -83,6 +84,8 @@ mod tests {
         assert_eq!(parsed.vector.flat_index_threshold, 10_000);
         assert_eq!(parsed.sparse.bm25_k1, 1.2);
         assert_eq!(parsed.graph.max_visited, 100_000);
+        assert_eq!(parsed.graph.varlen_max_results, 100_000);
+        assert_eq!(parsed.graph.varlen_max_frontier, 100_000);
         assert_eq!(parsed.timeseries.memtable_budget_bytes, 64 * 1024 * 1024);
         assert_eq!(parsed.kv.default_capacity, 16_384);
         assert_eq!(parsed.kv.rehash_load_factor, 0.75);

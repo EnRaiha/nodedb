@@ -33,6 +33,8 @@ mod graph_delete_reverse_cross_node;
 mod graph_implicit_reverse_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/graph_match_cross_node.rs"]
 mod graph_match_cross_node;
+#[path = "sql_cluster_cross_node_dml_tests/graph_match_varlen_truncation_recovery_cross_node.rs"]
+mod graph_match_varlen_truncation_recovery_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/graph_multicore_cross_node.rs"]
 mod graph_multicore_cross_node;
 #[path = "sql_cluster_cross_node_dml_tests/graph_traverse_cross_node.rs"]

@@ -137,6 +137,21 @@ impl MatchOutcome {
     }
 }
 
+/// Seed for a cross-shard MATCH continuation: the within-chain triple index
+/// at which to resume plus the binding row accumulated by the originating
+/// shard up to (but not including) that triple.
+///
+/// Bundling these two together keeps [`super::continuation::execute_continuation`]'s
+/// argument count within clippy's `too_many_arguments` limit while reflecting
+/// that `triple_idx` and `seed_row` are always a unit — they describe the same
+/// "point to resume from" in the originating shard's triple order.
+pub struct ContinuationSeed {
+    /// 0-based index of the triple within its pattern chain at which to resume.
+    pub triple_idx: usize,
+    /// Bindings accumulated by the originating shard for triples `[0, triple_idx)`.
+    pub seed_row: BindingRow,
+}
+
 /// Shared mutable state collected during triple execution: the list of
 /// binding rows being built + the across-query truncation flag +
 /// the cross-shard unresolved frontier.
@@ -155,14 +170,23 @@ pub(super) struct ExecutionState<'a> {
     pub varlen_resume: Option<VarLenResume>,
     pub frontier: Vec<UnresolvedExpansion>,
     pub is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
+    /// Hard caps applied to every variable-length expansion in this execution.
+    /// Threaded from node `GraphTuning` by the Data Plane handler (defaulting
+    /// to `100_000` when no tuning override is set), so truncation is a real
+    /// operational knob rather than a compile-time constant.
+    pub varlen_caps: super::expansion::VarLenCaps,
 }
 
 impl<'a> ExecutionState<'a> {
-    pub(super) fn new(is_remote_node: Option<&'a dyn Fn(&str) -> bool>) -> Self {
+    pub(super) fn new(
+        is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
+        varlen_caps: super::expansion::VarLenCaps,
+    ) -> Self {
         Self {
             varlen_resume: None,
             frontier: Vec::new(),
             is_remote_node,
+            varlen_caps,
         }
     }
 

@@ -86,11 +86,32 @@ impl TestClusterNode {
 
     /// Spawn a cluster node with a custom `ClusterTransportTuning` and a
     /// specific number of Data-Plane cores. Used to exercise multi-core
-    /// code paths in cluster tests.
+    /// code paths in cluster tests. Graph tuning defaults (100k varlen caps).
     pub async fn spawn_with_tuning_and_cores(
         node_id: u64,
         seed_nodes: Vec<SocketAddr>,
         tuning: ClusterTransportTuning,
+        num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_with_tuning_graph_and_cores(
+            node_id,
+            seed_nodes,
+            tuning,
+            nodedb_types::config::tuning::GraphTuning::default(),
+            num_cores,
+        )
+        .await
+    }
+
+    /// Spawn a cluster node with custom cluster-transport AND graph engine
+    /// tuning plus a specific core count. The `graph_tuning` knob lets cluster
+    /// tests lower the variable-length MATCH expansion caps to drive truncation
+    /// (and exercise the cross-shard resume drain) on small graphs.
+    pub async fn spawn_with_tuning_graph_and_cores(
+        node_id: u64,
+        seed_nodes: Vec<SocketAddr>,
+        tuning: ClusterTransportTuning,
+        graph_tuning: nodedb_types::config::tuning::GraphTuning,
         num_cores: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let data_dir = tempfile::tempdir()?;
@@ -203,6 +224,7 @@ impl TestClusterNode {
                     core_metrics: shared.system_metrics.clone(),
                     governor: shared.governor.clone(),
                     replay: None,
+                    graph_tuning: graph_tuning.clone(),
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);

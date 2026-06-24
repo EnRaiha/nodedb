@@ -31,6 +31,13 @@ use super::round_zero::scatter_round_zero;
 /// it is the single, surfaced backstop, never a silent drop.
 const MAX_RESUME_ROUNDS: u32 = 10_000;
 
+/// Ceiling on the per-pattern cross-shard hop-round budget (see
+/// [`pattern_round_budget`]). Bounds an unbounded `[*]` traversal (whose
+/// `max_hops` is near `usize::MAX`) to a large but finite number of rounds so
+/// the budget cannot overflow; a pattern that genuinely needs more rounds than
+/// this surfaces as `partial` rather than looping.
+const MAX_TRAVERSAL_ROUNDS: usize = 10_000;
+
 /// Result of a cross-shard MATCH scatter: the deduped binding rows as the bare
 /// msgpack array shape `match_payload_to_response` expects, plus a `partial`
 /// flag set ONLY on a real, unrecoverable partial: the coordinator exhausted
@@ -71,11 +78,11 @@ pub async fn scatter_match(
     query_bytes: Vec<u8>,
     deadline_ms: u64,
 ) -> crate::Result<MatchScatterOutcome> {
-    // The pattern's total triple count bounds the rounds: each round advances
-    // the frontier by at least one hop, so a triple-count of rounds suffices to
-    // resolve any acyclic pattern. This is a correctness-derived bound, not an
-    // arbitrary truncation cap.
-    let max_rounds = pattern_triple_count(&query_bytes).max(1) as u32;
+    // Round budget = the maximum number of hops the pattern can take (summed
+    // per-triple `max_hops`), since each round advances every frontier by one
+    // hop and a variable-length triple crossing shard boundaries spends one
+    // round per hop. A correctness-derived bound, not an arbitrary cap.
+    let max_rounds = pattern_round_budget(&query_bytes).max(1) as u32;
     let mut coordinator = DistributedMatchCoordinator::new(max_rounds);
 
     let mut partial = false;
@@ -302,7 +309,18 @@ fn dedup_and_encode(rows: &[HashMap<String, String>]) -> crate::Result<Payload> 
 /// Count the total pattern triples across every clause/chain in the serialized
 /// `MatchQuery`. Used to bound the continuation rounds. A malformed query (or a
 /// query with no triples) yields 0 — the caller floors `max_rounds` at 1.
-fn pattern_triple_count(query_bytes: &[u8]) -> usize {
+/// Upper bound on cross-shard continuation rounds a pattern can require.
+///
+/// Each round advances every live frontier by at most ONE hop, so the budget
+/// must cover the maximum number of hops the pattern can take. A fixed-length
+/// triple is one hop; a variable-length triple `*min..max` is up to `max` hops,
+/// and when its chain crosses a shard boundary on (nearly) every hop, each hop
+/// becomes its own continuation round. Summing per-triple `max_hops` is the
+/// correctness-derived bound — undercounting (e.g. counting a varlen triple as
+/// one) starves the frontier and the query can never complete. Saturating-summed
+/// and capped at [`MAX_TRAVERSAL_ROUNDS`] so an unbounded `[*]` (max_hops near
+/// `usize::MAX`) yields a large finite budget rather than overflowing.
+fn pattern_round_budget(query_bytes: &[u8]) -> usize {
     use crate::engine::graph::pattern::ast::MatchQuery;
     let query: MatchQuery = match zerompk::from_msgpack(query_bytes) {
         Ok(q) => q,
@@ -312,6 +330,8 @@ fn pattern_triple_count(query_bytes: &[u8]) -> usize {
         .clauses
         .iter()
         .flat_map(|c| c.patterns.iter())
-        .map(|chain| chain.triples.len())
-        .sum()
+        .flat_map(|chain| chain.triples.iter())
+        .map(|triple| triple.edge.max_hops.max(1))
+        .fold(0usize, |acc, hops| acc.saturating_add(hops))
+        .min(MAX_TRAVERSAL_ROUNDS)
 }

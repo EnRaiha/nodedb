@@ -150,6 +150,8 @@ pub struct CoreCompactionConfig {
     pub tombstone_threshold: f64,
     /// Query execution tuning parameters.
     pub query: nodedb_types::config::tuning::QueryTuning,
+    /// Graph engine tuning (traversal limits + variable-length expansion caps).
+    pub graph: nodedb_types::config::tuning::GraphTuning,
 }
 
 impl Default for CoreCompactionConfig {
@@ -158,6 +160,7 @@ impl Default for CoreCompactionConfig {
             interval: std::time::Duration::from_secs(600),
             tombstone_threshold: 0.2,
             query: nodedb_types::config::tuning::QueryTuning::default(),
+            graph: nodedb_types::config::tuning::GraphTuning::default(),
         }
     }
 }
@@ -240,6 +243,9 @@ pub fn spawn_core(
 
             // 2c. Apply query tuning config.
             core.set_query_tuning(compaction_config.query);
+
+            // 2d. Apply graph engine tuning (traversal limits + varlen caps).
+            core.set_graph_tuning(compaction_config.graph);
 
             // 3. Load vector + spatial + sparse vector checkpoints (fast recovery).
             core.load_vector_checkpoints();

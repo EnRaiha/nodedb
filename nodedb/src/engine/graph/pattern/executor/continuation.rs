@@ -12,7 +12,7 @@ use super::super::ast::{MatchQuery, PatternChain};
 use super::core::{bind_node, binding_compatible, execute_triple};
 use super::expansion::{VarLenCaps, VarLenCursor, VarLenPattern, resume_variable_length};
 use super::predicates;
-use super::types::{BindingRow, ExecutionState, MatchOutcome, VarLenResume};
+use super::types::{BindingRow, ContinuationSeed, ExecutionState, MatchOutcome, VarLenResume};
 use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::EdgeStore;
 
@@ -73,9 +73,17 @@ pub(super) fn finalize_rows(
     csr: &CsrIndex,
     edge_store: &EdgeStore,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+    varlen_caps: VarLenCaps,
 ) -> Result<Vec<BindingRow>, crate::Error> {
     for predicate in &query.where_predicates {
-        rows = predicates::apply_predicate(&rows, predicate, csr, edge_store, frontier_bitmap)?;
+        rows = predicates::apply_predicate(
+            &rows,
+            predicate,
+            csr,
+            edge_store,
+            frontier_bitmap,
+            varlen_caps,
+        )?;
     }
 
     if let Some(limit) = query.limit {
@@ -103,33 +111,33 @@ pub(super) fn finalize_rows(
     Ok(rows)
 }
 
-/// Resume a MATCH pattern on THIS shard's CSR starting at `resume_triple_idx`.
+/// Resume a MATCH pattern on THIS shard's CSR starting at `seed.triple_idx`.
 ///
 /// # Why this does NOT optimize
 ///
 /// [`super::execute`] reorders the query's triples by per-shard selectivity
 /// (using THIS CSR's edge counts) before running. A continuation MUST NOT
-/// re-optimize: `resume_triple_idx` is an index into the **originating
+/// re-optimize: `seed.triple_idx` is an index into the **originating
 /// shard's already-optimized triple order**. Re-optimizing here against a
 /// different CSR's edge counts could yield a different order, so
-/// `resume_triple_idx` would point at the wrong triple. The caller therefore
+/// `seed.triple_idx` would point at the wrong triple. The caller therefore
 /// passes the originating shard's already-optimized `query` AS GIVEN, and this
 /// function runs it verbatim — the optimizer is never invoked on the resume
 /// path.
 ///
 /// # How it resumes
 ///
-/// `seed_row` carries all bindings accumulated by the originating shard up to
-/// (and including) the source node being resumed from — i.e. the bindings for
-/// triples `[0, resume_triple_idx)` are already present. This function seeds
-/// the row set as `vec![seed_row]` and runs [`run_chain_from`] starting at
-/// `resume_triple_idx`, skipping the already-satisfied prefix triples. The
+/// `seed.seed_row` carries all bindings accumulated by the originating shard up
+/// to (and including) the source node being resumed from — i.e. the bindings
+/// for triples `[0, seed.triple_idx)` are already present. This function seeds
+/// the row set as `vec![seed.seed_row]` and runs [`run_chain_from`] starting at
+/// `seed.triple_idx`, skipping the already-satisfied prefix triples. The
 /// query tail (WHERE / LIMIT / RETURN / DISTINCT) is then applied via
 /// [`finalize_rows`], identically to the from-scratch path.
 ///
-/// # `resume_triple_idx` semantics
+/// # `seed.triple_idx` semantics
 ///
-/// `resume_triple_idx` is the index of the triple **within its pattern
+/// `seed.triple_idx` is the index of the triple **within its pattern
 /// chain** — the exact value the originating shard recorded in
 /// `UnresolvedExpansion::triple_idx` (produced by `execute_chain`'s
 /// `enumerate`). This is a within-chain index, not a global flattening across
@@ -139,10 +147,10 @@ pub(super) fn finalize_rows(
 /// # Multi-clause limitation
 ///
 /// Resuming mid-pattern is only well-defined for a single MATCH clause with a
-/// single pattern chain (`resume_triple_idx` indexes that chain). A query with
+/// single pattern chain (`seed.triple_idx` indexes that chain). A query with
 /// multiple clauses (e.g. `OPTIONAL MATCH`) or multiple comma-separated
 /// patterns in the resumed clause makes mid-pattern resume ambiguous — there
-/// is no single chain that `resume_triple_idx` unambiguously indexes. Rather
+/// is no single chain that `seed.triple_idx` unambiguously indexes. Rather
 /// than silently mis-handle it (which would produce wrong results), this
 /// function returns a typed `BadRequest` error for that case. The frontier is
 /// only ever emitted from the single-chain expansion path today, so this
@@ -153,12 +161,12 @@ pub fn execute_continuation<'a>(
     edge_store: &EdgeStore,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
-    resume_triple_idx: usize,
-    seed_row: BindingRow,
+    seed: ContinuationSeed,
+    varlen_caps: VarLenCaps,
 ) -> Result<MatchOutcome, crate::Error> {
     // Mid-pattern resume is only unambiguous for a single clause holding a
     // single pattern chain. Reject anything else with a typed error rather
-    // than guessing which chain `resume_triple_idx` refers to.
+    // than guessing which chain `seed.triple_idx` refers to.
     let chain = match query.clauses.as_slice() {
         [clause] if clause.patterns.len() == 1 => &clause.patterns[0],
         _ => {
@@ -171,30 +179,38 @@ pub fn execute_continuation<'a>(
         }
     };
 
-    if resume_triple_idx > chain.triples.len() {
+    if seed.triple_idx > chain.triples.len() {
         return Err(crate::Error::BadRequest {
             detail: format!(
-                "cross-shard MATCH continuation resume_triple_idx {resume_triple_idx} \
+                "cross-shard MATCH continuation resume_triple_idx {} \
                  exceeds chain length {}",
+                seed.triple_idx,
                 chain.triples.len()
             ),
         });
     }
 
-    let mut state = ExecutionState::new(is_remote_node);
+    let mut state = ExecutionState::new(is_remote_node, varlen_caps);
 
     // Resume the chain from the originating shard's stopping point. The seed
-    // row already carries the bindings for triples [0, resume_triple_idx).
+    // row already carries the bindings for triples [0, seed.triple_idx).
     let rows = run_chain_from(
         chain,
-        resume_triple_idx,
-        vec![seed_row],
+        seed.triple_idx,
+        vec![seed.seed_row],
         csr,
         &mut state,
         frontier_bitmap,
     )?;
 
-    let rows = finalize_rows(query, rows, csr, edge_store, frontier_bitmap)?;
+    let rows = finalize_rows(
+        query,
+        rows,
+        csr,
+        edge_store,
+        frontier_bitmap,
+        state.varlen_caps,
+    )?;
 
     Ok(MatchOutcome {
         rows,
@@ -245,6 +261,7 @@ pub fn execute_varlen_resume<'a>(
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
     resume: VarLenResume,
+    varlen_caps: VarLenCaps,
 ) -> Result<MatchOutcome, crate::Error> {
     // Same single-chain restriction as `execute_continuation`: mid-pattern
     // resume is only unambiguous for a single MATCH clause with one chain.
@@ -280,7 +297,7 @@ pub fn execute_varlen_resume<'a>(
         });
     }
 
-    let mut state = ExecutionState::new(is_remote_node);
+    let mut state = ExecutionState::new(is_remote_node, varlen_caps);
 
     // Rebuild the pattern shape for the truncated triple verbatim (no
     // re-optimization). `want_path` matches the from-scratch branch in
@@ -300,7 +317,7 @@ pub fn execute_varlen_resume<'a>(
         frontier: resume.frontier,
         depth: resume.depth,
     };
-    let expansion = resume_variable_length(csr, &cursor, &pattern, VarLenCaps::default());
+    let expansion = resume_variable_length(csr, &cursor, &pattern, varlen_caps);
     if let Some(next_cursor) = expansion.cursor {
         state.record_truncation(VarLenResume {
             triple_idx: resume.triple_idx,
@@ -348,7 +365,14 @@ pub fn execute_varlen_resume<'a>(
         frontier_bitmap,
     )?;
 
-    let rows = finalize_rows(query, rows, csr, edge_store, frontier_bitmap)?;
+    let rows = finalize_rows(
+        query,
+        rows,
+        csr,
+        edge_store,
+        frontier_bitmap,
+        state.varlen_caps,
+    )?;
 
     Ok(MatchOutcome {
         rows,
@@ -362,7 +386,7 @@ mod tests {
     use super::super::core::execute;
     use super::super::core::tests::make_csr;
     use super::super::expansion::{VarLenCaps, VarLenPattern, expand_variable_length};
-    use super::super::types::{BindingRow, VarLenResume};
+    use super::super::types::{BindingRow, ContinuationSeed, VarLenResume};
     use super::{execute_continuation, execute_varlen_resume};
     use crate::engine::graph::edge_store::Direction;
 
@@ -392,8 +416,8 @@ mod tests {
         assert_eq!(decoded, resume, "VarLenResume must round-trip via zerompk");
     }
 
-    /// Plan/handler-level union-equivalence (mirrors 2a at the resume-orchestration
-    /// level): a `MATCH (a)-[*1..6]->(b)` expansion that TRUNCATES at a low cap,
+    /// Plan/handler-level union-equivalence at the resume-orchestration level: a
+    /// `MATCH (a)-[*1..6]->(b)` expansion that TRUNCATES at a low cap,
     /// then is RESUMED via [`execute_varlen_resume`] (the exact function the DP
     /// `MatchVarLenResume` handler calls), produces — unioned with the first-pass
     /// rows — the SAME `b` binding set as a single uncapped MATCH over the same
@@ -417,12 +441,13 @@ mod tests {
         .unwrap();
 
         // Ground truth: single uncapped MATCH.
-        let full_b: std::collections::HashSet<String> = execute(&query, &csr, &store, None, None)
-            .unwrap()
-            .rows
-            .into_iter()
-            .map(|r| r["b"].clone())
-            .collect();
+        let full_b: std::collections::HashSet<String> =
+            execute(&query, &csr, &store, None, None, VarLenCaps::default())
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|r| r["b"].clone())
+                .collect();
         assert_eq!(full_b.len(), 6, "uncapped MATCH reaches n1..n6 from n0");
 
         // First pass: drive truncation directly via a low cap on the same
@@ -461,7 +486,16 @@ mod tests {
             depth: cursor.depth,
         });
         while let Some(resume) = next.take() {
-            let outcome = execute_varlen_resume(&query, &csr, &store, None, None, resume).unwrap();
+            let outcome = execute_varlen_resume(
+                &query,
+                &csr,
+                &store,
+                None,
+                None,
+                resume,
+                VarLenCaps::default(),
+            )
+            .unwrap();
             for row in &outcome.rows {
                 assert_eq!(row["a"], "n0", "source binding carried through resume");
                 union_b.insert(row["b"].clone());
@@ -496,7 +530,19 @@ mod tests {
         seed.insert("x".to_string(), "root".to_string());
         seed.insert("y".to_string(), "mid".to_string());
 
-        let outcome = execute_continuation(&query, &csr, &store, None, None, 1, seed).unwrap();
+        let outcome = execute_continuation(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            ContinuationSeed {
+                triple_idx: 1,
+                seed_row: seed,
+            },
+            VarLenCaps::default(),
+        )
+        .unwrap();
 
         assert_eq!(outcome.rows.len(), 1, "expected exactly one tail row");
         assert_eq!(
@@ -524,7 +570,19 @@ mod tests {
         seed.insert("x".to_string(), "root".to_string());
         seed.insert("y".to_string(), "mid".to_string());
 
-        let outcome = execute_continuation(&query, &csr, &store, None, None, 1, seed).unwrap();
+        let outcome = execute_continuation(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            ContinuationSeed {
+                triple_idx: 1,
+                seed_row: seed,
+            },
+            VarLenCaps::default(),
+        )
+        .unwrap();
 
         assert!(
             outcome.rows.is_empty(),
@@ -543,7 +601,9 @@ mod tests {
             "MATCH (x)-[:E]->(y)-[:E]->(z) WHERE x = 'root' RETURN x, y, z",
         )
         .unwrap();
-        let rows = execute(&query, &csr, &store, None, None).unwrap().rows;
+        let rows = execute(&query, &csr, &store, None, None, VarLenCaps::default())
+            .unwrap()
+            .rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["x"], "root");
         assert_eq!(rows[0]["y"], "mid");

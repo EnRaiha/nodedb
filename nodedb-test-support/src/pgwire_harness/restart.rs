@@ -199,6 +199,7 @@ impl TestServer {
                     core_metrics: None,
                     governor: shared.governor.clone(),
                     replay,
+                    graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);

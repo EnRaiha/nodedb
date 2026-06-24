@@ -31,6 +31,28 @@ impl TestCluster {
         Self::spawn_three_with_tuning_and_cores(fast_cluster_tuning(), num_cores).await
     }
 
+    /// Spawn a 3-node cluster with the fast election tuning, `num_cores`
+    /// Data-Plane cores per node, AND lowered variable-length MATCH expansion
+    /// caps. Used to force `[*min..max]` truncation on a small graph and prove
+    /// the cross-shard resume pipeline drains to the complete result set.
+    pub async fn spawn_three_with_varlen_caps_and_cores(
+        num_cores: usize,
+        varlen_max_results: usize,
+        varlen_max_frontier: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let graph_tuning = nodedb_types::config::tuning::GraphTuning {
+            varlen_max_results,
+            varlen_max_frontier,
+            ..Default::default()
+        };
+        Self::spawn_three_with_tuning_graph_and_cores(
+            fast_cluster_tuning(),
+            graph_tuning,
+            num_cores,
+        )
+        .await
+    }
+
     /// Spawn a 3-node cluster with a custom `ClusterTransportTuning`.
     /// Used by the descriptor-lease renewal tests to drive the
     /// renewal loop on a much faster cadence than the production
@@ -42,14 +64,38 @@ impl TestCluster {
     }
 
     /// Spawn a 3-node cluster with a custom `ClusterTransportTuning` and a
-    /// specific number of Data-Plane cores per node.
+    /// specific number of Data-Plane cores per node. Graph tuning defaults
+    /// (100k variable-length expansion caps).
     pub async fn spawn_three_with_tuning_and_cores(
         tuning: ClusterTransportTuning,
         num_cores: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let node1 =
-            TestClusterNode::spawn_with_tuning_and_cores(1, vec![], tuning.clone(), num_cores)
-                .await?;
+        Self::spawn_three_with_tuning_graph_and_cores(
+            tuning,
+            nodedb_types::config::tuning::GraphTuning::default(),
+            num_cores,
+        )
+        .await
+    }
+
+    /// Spawn a 3-node cluster with custom cluster-transport AND graph engine
+    /// tuning plus a specific core count per node. Lets a cluster test lower
+    /// the variable-length MATCH expansion caps (`varlen_max_results` /
+    /// `varlen_max_frontier`) to force truncation on a small graph and prove
+    /// the cross-shard resume pipeline drains to the complete result set.
+    pub async fn spawn_three_with_tuning_graph_and_cores(
+        tuning: ClusterTransportTuning,
+        graph_tuning: nodedb_types::config::tuning::GraphTuning,
+        num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let node1 = TestClusterNode::spawn_with_tuning_graph_and_cores(
+            1,
+            vec![],
+            tuning.clone(),
+            graph_tuning.clone(),
+            num_cores,
+        )
+        .await?;
 
         // Wait until node 1 has bootstrapped (topology shows itself)
         // before peers try to join. The old fixed 200ms sleep was too
@@ -65,10 +111,11 @@ impl TestCluster {
         }
 
         let seeds = vec![node1.listen_addr];
-        let node2 = TestClusterNode::spawn_with_tuning_and_cores(
+        let node2 = TestClusterNode::spawn_with_tuning_graph_and_cores(
             2,
             seeds.clone(),
             tuning.clone(),
+            graph_tuning.clone(),
             num_cores,
         )
         .await?;
@@ -85,8 +132,14 @@ impl TestCluster {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let node3 =
-            TestClusterNode::spawn_with_tuning_and_cores(3, seeds, tuning, num_cores).await?;
+        let node3 = TestClusterNode::spawn_with_tuning_graph_and_cores(
+            3,
+            seeds,
+            tuning,
+            graph_tuning,
+            num_cores,
+        )
+        .await?;
 
         let cluster = Self {
             nodes: vec![node1, node2, node3],
