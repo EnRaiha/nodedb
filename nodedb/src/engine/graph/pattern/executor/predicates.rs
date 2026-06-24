@@ -8,19 +8,41 @@ use super::expansion::VarLenCaps;
 use super::types::{BindingRow, ExecutionState};
 use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::EdgeStore;
+use crate::engine::sparse::btree::SparseEngine;
+
+/// Borrowed context needed to resolve a MATCH property predicate
+/// (`WHERE a.field = 'v'`) against a node's stored document.
+///
+/// A graph node's properties live as a document in the sparse engine, keyed by
+/// the node-id string and scoped to `(database_id, tenant_id, collection)`. The
+/// CSR/graph is keyed per `(database_id, tenant_id)` only, so the collection
+/// holding the document comes from the MATCH query's `IN '<collection>'`
+/// clause (`collection`). It is threaded as ONE param through the predicate
+/// pipeline rather than four loose arguments.
+pub struct PropertyLookup<'a> {
+    pub sparse: &'a SparseEngine,
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub collection: Option<&'a str>,
+}
 
 /// Apply a WHERE predicate to filter rows.
 ///
 /// `varlen_caps` carries the same per-expansion caps as the outer query so a
 /// variable-length sub-pattern (e.g. inside `NOT EXISTS`) truncates at the
 /// configured ceiling rather than a hardcoded one.
+///
+/// `props` carries the sparse-engine handle and `(database_id, tenant_id,
+/// collection)` needed to resolve property predicates (`WHERE a.field = 'v'`)
+/// against each bound node's stored document.
 pub(super) fn apply_predicate(
     rows: &[BindingRow],
     predicate: &WherePredicate,
     csr: &CsrIndex,
-    edge_store: &EdgeStore,
+    _edge_store: &EdgeStore,
     _frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     varlen_caps: VarLenCaps,
+    props: &PropertyLookup<'_>,
 ) -> Result<Vec<BindingRow>, crate::Error> {
     match predicate {
         WherePredicate::Equals {
@@ -35,17 +57,24 @@ pub(super) fn apply_predicate(
                     .cloned()
                     .collect())
             } else {
-                Ok(rows
-                    .iter()
-                    .filter(|row| {
-                        if let Some(node_id) = row.get(binding) {
-                            check_property(edge_store, node_id, field, value)
-                        } else {
-                            false
-                        }
-                    })
-                    .cloned()
-                    .collect())
+                let expected_value = coerce_literal(value);
+                let mut kept = Vec::new();
+                for row in rows {
+                    let keep = match row.get(binding) {
+                        Some(node_id) => check_property(
+                            props,
+                            node_id,
+                            field,
+                            &ComparisonOp::Eq,
+                            &expected_value,
+                        )?,
+                        None => false,
+                    };
+                    if keep {
+                        kept.push(row.clone());
+                    }
+                }
+                Ok(kept)
             }
         }
 
@@ -89,21 +118,25 @@ pub(super) fn apply_predicate(
             } else {
                 // Property comparison: `WHERE a.age > 25`.
                 //
-                // `check_property` is a stub (sparse engine not yet wired); it
-                // always returns `true`. Property predicates will be pushed down
-                // when the document store is wired. We preserve the existing
-                // behavior rather than silently claiming the predicate is evaluated.
-                Ok(rows
-                    .iter()
-                    .filter(|row| {
-                        if let Some(node_id) = row.get(binding.as_str()) {
-                            check_property(edge_store, node_id, field, value)
-                        } else {
-                            false
+                // Each bound node's properties are fetched from the sparse
+                // engine (its document, keyed by node-id within the query's
+                // `IN '<collection>'`), decoded, and the field compared against
+                // the coerced literal using `op`. Coercion happens once here
+                // rather than inside `check_property` (which runs per row).
+                let expected_value = coerce_literal(value);
+                let mut kept = Vec::new();
+                for row in rows {
+                    let keep = match row.get(binding.as_str()) {
+                        Some(node_id) => {
+                            check_property(props, node_id, field, op, &expected_value)?
                         }
-                    })
-                    .cloned()
-                    .collect())
+                        None => false,
+                    };
+                    if keep {
+                        kept.push(row.clone());
+                    }
+                }
+                Ok(kept)
             }
         }
 
@@ -162,12 +195,123 @@ fn apply_op(op: &ComparisonOp, lhs: &str, rhs: &str) -> bool {
     }
 }
 
-/// Check if a node has a property with the expected value.
-fn check_property(_edge_store: &EdgeStore, _node_id: &str, _field: &str, _expected: &str) -> bool {
-    // Property lookups require the sparse engine (document store).
-    // For MATCH patterns, primary filtering is structural (edge traversal).
-    // Property predicates will be pushed down when sparse engine is wired.
-    true
+/// Coerce a raw WHERE-literal string into a typed [`nodedb_types::Value`].
+///
+/// The parser stores the RHS of a property predicate as a bare string (quotes
+/// already stripped), so `"25"` must compare as the integer `25` against an
+/// integer field. We try, in order: integer, float, bool, else text. The
+/// numeric/bool ladder matches how `value_ops` coerces on comparison, so e.g.
+/// `WHERE a.age = '25'` against an integer field `25` is equal.
+fn coerce_literal(expected: &str) -> nodedb_types::Value {
+    use nodedb_types::Value;
+    if let Ok(i) = expected.parse::<i64>() {
+        Value::Integer(i)
+    } else if let Ok(f) = expected.parse::<f64>() {
+        Value::Float(f)
+    } else if let Ok(b) = expected.parse::<bool>() {
+        Value::Bool(b)
+    } else {
+        Value::String(expected.to_string())
+    }
+}
+
+/// Evaluate a property predicate (`<node_id>.<field> <op> <expected>`) against
+/// the node's stored document.
+///
+/// A graph node's properties live as a document in the sparse engine, keyed by
+/// the node-id string within the query's `IN '<collection>'`. This:
+///
+/// - returns a typed `BadRequest` when no collection is available — a property
+///   predicate is unresolvable without one, so we must NOT silently pass or drop;
+/// - returns `Ok(false)` when the node has no document (a node with no
+///   properties cannot satisfy a property predicate);
+/// - returns `Ok(false)` when the document lacks `field`;
+/// - otherwise compares the stored field value against `expected_value`
+///   using `op` (type-aware, via `nodedb_query::value_ops`).
+///
+/// `expected_value` is pre-coerced by the caller so that `coerce_literal` is
+/// called once per predicate rather than once per matching row.
+fn check_property(
+    props: &PropertyLookup<'_>,
+    node_id: &str,
+    field: &str,
+    op: &ComparisonOp,
+    expected_value: &nodedb_types::Value,
+) -> Result<bool, crate::Error> {
+    use nodedb_query::value_ops::{coerced_eq, compare_values};
+    use std::cmp::Ordering;
+
+    let collection = props.collection.ok_or_else(|| crate::Error::BadRequest {
+        detail: format!(
+            "MATCH property predicate `{node_id}.{field}` requires an \
+             `IN '<collection>'` clause to resolve node properties"
+        ),
+    })?;
+
+    // Fetch the node's document. Absent document → cannot satisfy a property
+    // predicate.
+    let bytes = match props
+        .sparse
+        .get(props.database_id, props.tenant_id, collection, node_id)?
+    {
+        Some(b) => b,
+        None => return Ok(false),
+    };
+
+    // Decode the stored payload via the canonical msgpack→Value reader.
+    let doc =
+        nodedb_types::value_from_msgpack(&bytes).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("decode graph node `{node_id}` document: {e}"),
+        })?;
+
+    // Look up the field. Missing field → predicate not satisfiable.
+    let field_value = match &doc {
+        nodedb_types::Value::Object(map) => map.get(field),
+        _ => None,
+    };
+    let field_value = match field_value {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+
+    let result = match op {
+        ComparisonOp::Eq => coerced_eq(field_value, expected_value),
+        ComparisonOp::Neq => !coerced_eq(field_value, expected_value),
+        ComparisonOp::Lt => compare_values(field_value, expected_value) == Ordering::Less,
+        ComparisonOp::Lte => {
+            matches!(
+                compare_values(field_value, expected_value),
+                Ordering::Less | Ordering::Equal
+            )
+        }
+        ComparisonOp::Gt => compare_values(field_value, expected_value) == Ordering::Greater,
+        ComparisonOp::Gte => {
+            matches!(
+                compare_values(field_value, expected_value),
+                Ordering::Greater | Ordering::Equal
+            )
+        }
+    };
+    Ok(result)
+}
+
+/// Test-only re-export of [`check_property`] so sibling-module tests can
+/// exercise the property-predicate evaluation path directly against a real
+/// `SparseEngine` without standing up a full executor run.
+///
+/// Coerces `expected` via [`coerce_literal`] (matching `apply_predicate`'s
+/// per-predicate coerce-once pattern) before forwarding to `check_property`.
+#[cfg(test)]
+pub(super) fn check_property_for_test(
+    props: &PropertyLookup<'_>,
+    node_id: &str,
+    field: &str,
+    op: &ComparisonOp,
+    expected: &str,
+) -> Result<bool, crate::Error> {
+    let expected_value = coerce_literal(expected);
+    check_property(props, node_id, field, op, &expected_value)
 }
 
 /// Project RETURN columns from rows.

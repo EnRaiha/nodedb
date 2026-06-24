@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use super::super::ast::*;
 use super::continuation;
 use super::expansion;
+use super::predicates::PropertyLookup;
 use super::types::{BindingRow, ExecutionState, MatchOutcome, UnresolvedExpansion, VarLenResume};
 use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::{Direction, EdgeStore};
@@ -31,6 +32,7 @@ use crate::engine::graph::edge_store::{Direction, EdgeStore};
 /// shard's own pass covers all its local nodes.
 /// Pass `None` (the production default on a fully-local CSR) to guarantee
 /// an always-empty frontier, preserving byte-identical single-node behaviour.
+#[allow(clippy::too_many_arguments)]
 pub fn execute<'a>(
     query: &MatchQuery,
     csr: &CsrIndex,
@@ -38,6 +40,7 @@ pub fn execute<'a>(
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
     varlen_caps: expansion::VarLenCaps,
+    props: &PropertyLookup<'_>,
 ) -> Result<MatchOutcome, crate::Error> {
     // Optimize query before execution (reorder triples by selectivity).
     let mut optimized = query.clone();
@@ -49,10 +52,12 @@ pub fn execute<'a>(
         frontier_bitmap,
         is_remote_node,
         varlen_caps,
+        props,
     )
 }
 
 /// Execute a pre-optimized MATCH query (internal, skip optimizer).
+#[allow(clippy::too_many_arguments)]
 fn execute_query<'a>(
     query: &MatchQuery,
     csr: &CsrIndex,
@@ -60,6 +65,7 @@ fn execute_query<'a>(
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
     varlen_caps: expansion::VarLenCaps,
+    props: &PropertyLookup<'_>,
 ) -> Result<MatchOutcome, crate::Error> {
     let mut rows: Vec<BindingRow> = vec![HashMap::new()];
     let mut state = ExecutionState::new(is_remote_node, varlen_caps);
@@ -80,6 +86,7 @@ fn execute_query<'a>(
         edge_store,
         frontier_bitmap,
         state.varlen_caps,
+        props,
     )?;
 
     Ok(MatchOutcome {
@@ -428,6 +435,27 @@ pub(super) mod tests {
     use super::*;
     use crate::engine::graph::csr::CsrIndex;
     use crate::engine::graph::edge_store::EdgeStore;
+    use crate::engine::sparse::btree::SparseEngine;
+
+    /// Open a standalone `SparseEngine` in a fresh tempdir for tests that need
+    /// to exercise the property-predicate path (or just to satisfy the
+    /// `PropertyLookup` borrow for tests that have no property predicates).
+    pub(crate) fn make_sparse() -> (SparseEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sparse = SparseEngine::open(&dir.path().join("sparse.redb")).unwrap();
+        (sparse, dir)
+    }
+
+    /// Build a `PropertyLookup` over `sparse` scoped to the `make_csr` graph's
+    /// `(DatabaseId::DEFAULT, TenantId::new(1), "col")`.
+    pub(crate) fn props_for(sparse: &SparseEngine) -> PropertyLookup<'_> {
+        PropertyLookup {
+            sparse,
+            database_id: 0,
+            tenant_id: 1,
+            collection: Some("col"),
+        }
+    }
 
     fn make_social_graph() -> (CsrIndex, EdgeStore, tempfile::TempDir) {
         make_csr(&[
@@ -442,6 +470,8 @@ pub(super) mod tests {
     #[test]
     fn execute_simple_one_hop() {
         let (csr, store, _dir) = make_social_graph();
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b",
         )
@@ -453,6 +483,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -464,6 +495,8 @@ pub(super) mod tests {
     #[test]
     fn execute_two_hops() {
         let (csr, store, _dir) = make_social_graph();
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a = 'alice' RETURN a, b, c",
         )
@@ -475,6 +508,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -485,6 +519,8 @@ pub(super) mod tests {
     #[test]
     fn execute_optional_match() {
         let (csr, store, _dir) = make_social_graph();
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) OPTIONAL MATCH (b)-[:LIKES]->(c) WHERE a = 'alice' RETURN a, b, c",
         ).unwrap();
@@ -495,6 +531,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -505,6 +542,8 @@ pub(super) mod tests {
     #[test]
     fn execute_anti_join() {
         let (csr, store, _dir) = make_social_graph();
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) WHERE NOT EXISTS { MATCH (a)-[:BLOCKED]->(b) } RETURN a, b",
         )
@@ -516,6 +555,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -525,6 +565,8 @@ pub(super) mod tests {
     #[test]
     fn execute_with_limit() {
         let (csr, store, _dir) = make_social_graph();
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query =
             super::super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b LIMIT 2")
                 .unwrap();
@@ -535,6 +577,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -544,6 +587,8 @@ pub(super) mod tests {
     #[test]
     fn execute_empty_result() {
         let (csr, store, _dir) = make_social_graph();
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query =
             super::super::super::compiler::parse("MATCH (a)-[:NONEXISTENT]->(b) RETURN a, b")
                 .unwrap();
@@ -554,6 +599,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -563,6 +609,8 @@ pub(super) mod tests {
     #[test]
     fn execute_with_node_labels() {
         let (mut csr, store, _dir) = make_social_graph();
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
 
         // Set labels.
         csr.add_node_label("alice", "Person").unwrap();
@@ -580,6 +628,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -596,6 +645,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -612,6 +662,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -631,6 +682,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -648,6 +700,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -674,6 +727,8 @@ pub(super) mod tests {
         use nodedb_types::{Surrogate, SurrogateBitmap};
 
         let (mut csr, store, _dir) = make_social_graph();
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         // Assign surrogates: alice=1, bob=2, carol=3, dave=4.
         csr.set_node_surrogate("alice", Surrogate::new(1));
         csr.set_node_surrogate("bob", Surrogate::new(2));
@@ -692,6 +747,7 @@ pub(super) mod tests {
             Some(&bm),
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap()
         .rows;
@@ -756,6 +812,8 @@ pub(super) mod tests {
     #[test]
     fn frontier_emitted_when_source_has_zero_out_degree() {
         let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a = 'alice' RETURN a, b, c",
         )
@@ -769,6 +827,7 @@ pub(super) mod tests {
             None,
             Some(is_remote),
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap();
 
@@ -818,6 +877,8 @@ pub(super) mod tests {
     #[test]
     fn no_frontier_when_source_has_edges_but_label_does_not_match() {
         let (csr, store, _dir) = make_csr(&[("alice", "LIKES", "bob")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b",
         )
@@ -833,6 +894,7 @@ pub(super) mod tests {
             None,
             Some(is_remote),
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap();
 
@@ -851,6 +913,8 @@ pub(super) mod tests {
     #[test]
     fn no_frontier_for_fully_local_expansion() {
         let (csr, store, _dir) = make_social_graph();
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b",
         )
@@ -862,6 +926,7 @@ pub(super) mod tests {
             None,
             None,
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap();
 
@@ -883,6 +948,8 @@ pub(super) mod tests {
     #[test]
     fn frontier_triple_idx_and_partial_row_for_multi_hop() {
         let (csr, store, _dir) = make_csr(&[("root", "EDGE", "mid")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query = super::super::super::compiler::parse(
             "MATCH (x)-[:EDGE]->(y)-[:EDGE]->(z) WHERE x = 'root' RETURN x, y, z",
         )
@@ -896,6 +963,7 @@ pub(super) mod tests {
             None,
             Some(is_remote),
             expansion::VarLenCaps::default(),
+            &props,
         )
         .unwrap();
 
@@ -911,5 +979,207 @@ pub(super) mod tests {
         // partial_row must carry x=root and y=mid (hop-1 bindings).
         assert_eq!(entry.partial_row.get("x").map(String::as_str), Some("root"));
         assert_eq!(entry.partial_row.get("y").map(String::as_str), Some("mid"));
+    }
+
+    // ── Property-predicate filtering (the silent-wrong-results bug fix) ────────
+
+    /// Store a node-property document for `node_id` in collection `"col"`
+    /// (matching `make_csr`'s `(DatabaseId::DEFAULT, TenantId::new(1))` scope),
+    /// keyed by the node-id string the MATCH binding resolves to.
+    fn put_node_doc(sparse: &SparseEngine, node_id: &str, doc: nodedb_types::Value) {
+        let bytes = nodedb_types::value_to_msgpack(&doc).unwrap();
+        sparse.put(0, 1, "col", node_id, &bytes).unwrap();
+    }
+
+    fn obj(pairs: &[(&str, nodedb_types::Value)]) -> nodedb_types::Value {
+        let mut map = std::collections::HashMap::new();
+        for (k, v) in pairs {
+            map.insert(k.to_string(), v.clone());
+        }
+        nodedb_types::Value::Object(map)
+    }
+
+    /// `WHERE a.age = '30'` now FILTERS by the node's stored document instead
+    /// of matching every row (the stub bug). alice(age=30) and bob(age=25) both
+    /// have a KNOWS edge to carol/dave; only alice survives the predicate.
+    #[test]
+    fn property_equals_filters_by_stored_document() {
+        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "carol"), ("bob", "KNOWS", "dave")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
+        put_node_doc(
+            &sparse,
+            "alice",
+            obj(&[("age", nodedb_types::Value::Integer(30))]),
+        );
+        put_node_doc(
+            &sparse,
+            "bob",
+            obj(&[("age", nodedb_types::Value::Integer(25))]),
+        );
+
+        let query = super::super::super::compiler::parse(
+            "MATCH (a)-[:KNOWS]->(b) IN 'col' WHERE a.age = '30' RETURN a, b",
+        )
+        .unwrap();
+        assert_eq!(query.collection.as_deref(), Some("col"));
+
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+            &props,
+        )
+        .unwrap()
+        .rows;
+
+        assert_eq!(rows.len(), 1, "only alice(age=30) matches");
+        assert_eq!(rows[0]["a"], "alice");
+        assert_eq!(rows[0]["b"], "carol");
+    }
+
+    /// A predicate matching no node's stored value returns zero rows (proving
+    /// the predicate truly evaluates, not a no-op pass).
+    #[test]
+    fn property_equals_no_match_returns_empty() {
+        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "carol")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
+        put_node_doc(
+            &sparse,
+            "alice",
+            obj(&[("age", nodedb_types::Value::Integer(30))]),
+        );
+
+        let query = super::super::super::compiler::parse(
+            "MATCH (a)-[:KNOWS]->(b) IN 'col' WHERE a.age = '99' RETURN a, b",
+        )
+        .unwrap();
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+            &props,
+        )
+        .unwrap()
+        .rows;
+        assert!(rows.is_empty(), "no node has age=99; got {rows:?}");
+    }
+
+    /// A node with NO stored document cannot satisfy a property predicate and
+    /// is excluded (`Ok(false)`), even though it has a matching edge.
+    #[test]
+    fn property_predicate_excludes_node_without_document() {
+        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "carol"), ("bob", "KNOWS", "dave")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
+        // Only alice has a document; bob has none.
+        put_node_doc(
+            &sparse,
+            "alice",
+            obj(&[("age", nodedb_types::Value::Integer(30))]),
+        );
+
+        let query = super::super::super::compiler::parse(
+            "MATCH (a)-[:KNOWS]->(b) IN 'col' WHERE a.age >= '20' RETURN a, b",
+        )
+        .unwrap();
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+            &props,
+        )
+        .unwrap()
+        .rows;
+        assert_eq!(rows.len(), 1, "bob has no document so is excluded");
+        assert_eq!(rows[0]["a"], "alice");
+    }
+
+    /// A property predicate with NO `IN '<collection>'` clause is unresolvable
+    /// and must return a typed `BadRequest` error — never silently pass/drop.
+    #[test]
+    fn property_predicate_without_collection_is_bad_request() {
+        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "carol")]);
+        let (sparse, _sdir) = make_sparse();
+        // No collection on the lookup (mirrors a query without `IN '...'`).
+        let props = PropertyLookup {
+            sparse: &sparse,
+            database_id: 0,
+            tenant_id: 1,
+            collection: None,
+        };
+        put_node_doc(
+            &sparse,
+            "alice",
+            obj(&[("age", nodedb_types::Value::Integer(30))]),
+        );
+
+        let query = super::super::super::compiler::parse(
+            "MATCH (a)-[:KNOWS]->(b) WHERE a.age = '30' RETURN a, b",
+        )
+        .unwrap();
+        assert_eq!(query.collection, None);
+
+        let result = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+            &props,
+        );
+        // `MatchOutcome` (the Ok type) is not `Debug`, so match on the Result
+        // directly rather than `unwrap_err()`.
+        assert!(
+            matches!(result, Err(crate::Error::BadRequest { .. })),
+            "expected BadRequest error for a property predicate with no IN collection"
+        );
+    }
+
+    /// Direct `check_property` coverage for each `ComparisonOp` plus the
+    /// missing-field and missing-document branches, against a real
+    /// `SparseEngine`.
+    #[test]
+    fn check_property_ops_against_real_sparse_engine() {
+        use super::super::predicates::check_property_for_test as check;
+
+        let (sparse, _sdir) = make_sparse();
+        put_node_doc(
+            &sparse,
+            "alice",
+            obj(&[
+                ("age", nodedb_types::Value::Integer(30)),
+                ("name", nodedb_types::Value::String("alice".into())),
+            ]),
+        );
+        let props = props_for(&sparse);
+
+        // Eq / Neq (numeric coercion: stored Integer(30) vs literal "30").
+        assert!(check(&props, "alice", "age", &ComparisonOp::Eq, "30").unwrap());
+        assert!(!check(&props, "alice", "age", &ComparisonOp::Eq, "31").unwrap());
+        assert!(check(&props, "alice", "age", &ComparisonOp::Neq, "31").unwrap());
+        // Ordering.
+        assert!(check(&props, "alice", "age", &ComparisonOp::Lt, "40").unwrap());
+        assert!(!check(&props, "alice", "age", &ComparisonOp::Lt, "30").unwrap());
+        assert!(check(&props, "alice", "age", &ComparisonOp::Lte, "30").unwrap());
+        assert!(check(&props, "alice", "age", &ComparisonOp::Gt, "20").unwrap());
+        assert!(check(&props, "alice", "age", &ComparisonOp::Gte, "30").unwrap());
+        // String field equality.
+        assert!(check(&props, "alice", "name", &ComparisonOp::Eq, "alice").unwrap());
+        // Missing field → false.
+        assert!(!check(&props, "alice", "missing", &ComparisonOp::Eq, "x").unwrap());
+        // Missing document → false.
+        assert!(!check(&props, "ghost", "age", &ComparisonOp::Eq, "30").unwrap());
     }
 }

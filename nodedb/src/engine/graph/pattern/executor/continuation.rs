@@ -12,6 +12,7 @@ use super::super::ast::{MatchQuery, PatternChain};
 use super::core::{bind_node, binding_compatible, execute_triple};
 use super::expansion::{VarLenCaps, VarLenCursor, VarLenPattern, resume_variable_length};
 use super::predicates;
+use super::predicates::PropertyLookup;
 use super::types::{BindingRow, ContinuationSeed, ExecutionState, MatchOutcome, VarLenResume};
 use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::EdgeStore;
@@ -67,6 +68,7 @@ pub(super) fn run_chain_from(
 /// path (`execute_query`) and the cross-shard resume path
 /// ([`execute_continuation`]) funnel their expanded rows through here so the
 /// tail semantics are identical regardless of where expansion started.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_rows(
     query: &MatchQuery,
     mut rows: Vec<BindingRow>,
@@ -74,6 +76,7 @@ pub(super) fn finalize_rows(
     edge_store: &EdgeStore,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     varlen_caps: VarLenCaps,
+    props: &PropertyLookup<'_>,
 ) -> Result<Vec<BindingRow>, crate::Error> {
     for predicate in &query.where_predicates {
         rows = predicates::apply_predicate(
@@ -83,6 +86,7 @@ pub(super) fn finalize_rows(
             edge_store,
             frontier_bitmap,
             varlen_caps,
+            props,
         )?;
     }
 
@@ -155,6 +159,7 @@ pub(super) fn finalize_rows(
 /// function returns a typed `BadRequest` error for that case. The frontier is
 /// only ever emitted from the single-chain expansion path today, so this
 /// guard is defensive against a future multi-clause caller.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_continuation<'a>(
     query: &MatchQuery,
     csr: &CsrIndex,
@@ -163,6 +168,7 @@ pub fn execute_continuation<'a>(
     is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
     seed: ContinuationSeed,
     varlen_caps: VarLenCaps,
+    props: &PropertyLookup<'_>,
 ) -> Result<MatchOutcome, crate::Error> {
     // Mid-pattern resume is only unambiguous for a single clause holding a
     // single pattern chain. Reject anything else with a typed error rather
@@ -210,6 +216,7 @@ pub fn execute_continuation<'a>(
         edge_store,
         frontier_bitmap,
         state.varlen_caps,
+        props,
     )?;
 
     Ok(MatchOutcome {
@@ -254,6 +261,7 @@ pub fn execute_continuation<'a>(
 /// Per the cross-shard contract there is no `visited` carry-over: a node
 /// re-reached on resume yields a duplicate row the coordinator collapses, never
 /// a skipped or mis-depthed one.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_varlen_resume<'a>(
     query: &MatchQuery,
     csr: &CsrIndex,
@@ -262,6 +270,7 @@ pub fn execute_varlen_resume<'a>(
     is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
     resume: VarLenResume,
     varlen_caps: VarLenCaps,
+    props: &PropertyLookup<'_>,
 ) -> Result<MatchOutcome, crate::Error> {
     // Same single-chain restriction as `execute_continuation`: mid-pattern
     // resume is only unambiguous for a single MATCH clause with one chain.
@@ -372,6 +381,7 @@ pub fn execute_varlen_resume<'a>(
         edge_store,
         frontier_bitmap,
         state.varlen_caps,
+        props,
     )?;
 
     Ok(MatchOutcome {
@@ -384,7 +394,7 @@ pub fn execute_varlen_resume<'a>(
 #[cfg(test)]
 mod tests {
     use super::super::core::execute;
-    use super::super::core::tests::make_csr;
+    use super::super::core::tests::{make_csr, make_sparse, props_for};
     use super::super::expansion::{VarLenCaps, VarLenPattern, expand_variable_length};
     use super::super::types::{BindingRow, ContinuationSeed, VarLenResume};
     use super::{execute_continuation, execute_varlen_resume};
@@ -434,6 +444,8 @@ mod tests {
             .map(|(s, l, d)| (s.as_str(), l.as_str(), d.as_str()))
             .collect();
         let (csr, store, _dir) = make_csr(&edge_refs);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
 
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:l*1..6]->(b) WHERE a = 'n0' RETURN a, b",
@@ -441,13 +453,20 @@ mod tests {
         .unwrap();
 
         // Ground truth: single uncapped MATCH.
-        let full_b: std::collections::HashSet<String> =
-            execute(&query, &csr, &store, None, None, VarLenCaps::default())
-                .unwrap()
-                .rows
-                .into_iter()
-                .map(|r| r["b"].clone())
-                .collect();
+        let full_b: std::collections::HashSet<String> = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            VarLenCaps::default(),
+            &props,
+        )
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r["b"].clone())
+        .collect();
         assert_eq!(full_b.len(), 6, "uncapped MATCH reaches n1..n6 from n0");
 
         // First pass: drive truncation directly via a low cap on the same
@@ -494,6 +513,7 @@ mod tests {
                 None,
                 resume,
                 VarLenCaps::default(),
+                &props,
             )
             .unwrap();
             for row in &outcome.rows {
@@ -522,6 +542,8 @@ mod tests {
     #[test]
     fn continuation_resumes_tail_with_seed_bindings() {
         let (csr, store, _dir) = make_csr(&[("root", "E", "mid"), ("mid", "E", "leaf")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query =
             super::super::super::compiler::parse("MATCH (x)-[:E]->(y)-[:E]->(z) RETURN x, y, z")
                 .unwrap();
@@ -541,6 +563,7 @@ mod tests {
                 seed_row: seed,
             },
             VarLenCaps::default(),
+            &props,
         )
         .unwrap();
 
@@ -562,6 +585,8 @@ mod tests {
     #[test]
     fn continuation_no_matching_tail_edge_is_empty() {
         let (csr, store, _dir) = make_csr(&[("root", "E", "mid")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query =
             super::super::super::compiler::parse("MATCH (x)-[:E]->(y)-[:E]->(z) RETURN x, y, z")
                 .unwrap();
@@ -581,6 +606,7 @@ mod tests {
                 seed_row: seed,
             },
             VarLenCaps::default(),
+            &props,
         )
         .unwrap();
 
@@ -597,13 +623,23 @@ mod tests {
     #[test]
     fn full_execute_unchanged_after_refactor() {
         let (csr, store, _dir) = make_csr(&[("root", "E", "mid"), ("mid", "E", "leaf")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
         let query = super::super::super::compiler::parse(
             "MATCH (x)-[:E]->(y)-[:E]->(z) WHERE x = 'root' RETURN x, y, z",
         )
         .unwrap();
-        let rows = execute(&query, &csr, &store, None, None, VarLenCaps::default())
-            .unwrap()
-            .rows;
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            VarLenCaps::default(),
+            &props,
+        )
+        .unwrap()
+        .rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["x"], "root");
         assert_eq!(rows[0]["y"], "mid");

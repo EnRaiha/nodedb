@@ -11,7 +11,8 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::pattern::ast::MatchQuery;
 use crate::engine::graph::pattern::executor::{
-    BindingRow, ContinuationSeed, UnresolvedExpansion, VarLenResume, rows_to_msgpack,
+    BindingRow, ContinuationSeed, PropertyLookup, UnresolvedExpansion, VarLenResume,
+    rows_to_msgpack,
 };
 
 /// Map key carrying the binding-rows msgpack array in the MATCH envelope.
@@ -214,6 +215,15 @@ impl CoreLoop {
         let varlen_caps = crate::engine::graph::pattern::executor::VarLenCaps::from_graph_tuning(
             &self.graph_tuning,
         );
+        // Property predicates (`WHERE a.field = 'v'`) resolve each bound node's
+        // document from the sparse engine, keyed by node-id within the query's
+        // `IN '<collection>'`.
+        let props = PropertyLookup {
+            sparse: &self.sparse,
+            database_id,
+            tenant_id: tid,
+            collection: query.collection.as_deref(),
+        };
         match crate::engine::graph::pattern::executor::execute(
             &query,
             partition,
@@ -221,6 +231,7 @@ impl CoreLoop {
             frontier_bitmap,
             is_remote_node,
             varlen_caps,
+            &props,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
@@ -310,6 +321,12 @@ impl CoreLoop {
         let varlen_caps = crate::engine::graph::pattern::executor::VarLenCaps::from_graph_tuning(
             &self.graph_tuning,
         );
+        let props = PropertyLookup {
+            sparse: &self.sparse,
+            database_id,
+            tenant_id: tid,
+            collection: query.collection.as_deref(),
+        };
         match crate::engine::graph::pattern::executor::execute_continuation(
             &query,
             partition,
@@ -321,6 +338,7 @@ impl CoreLoop {
                 seed_row,
             },
             varlen_caps,
+            &props,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
@@ -393,6 +411,12 @@ impl CoreLoop {
         let varlen_caps = crate::engine::graph::pattern::executor::VarLenCaps::from_graph_tuning(
             &self.graph_tuning,
         );
+        let props = PropertyLookup {
+            sparse: &self.sparse,
+            database_id,
+            tenant_id: tid,
+            collection: query.collection.as_deref(),
+        };
         match crate::engine::graph::pattern::executor::execute_varlen_resume(
             &query,
             partition,
@@ -401,6 +425,7 @@ impl CoreLoop {
             is_remote_node,
             resume,
             varlen_caps,
+            &props,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
