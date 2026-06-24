@@ -12,6 +12,7 @@ pub mod filter;
 pub mod materialize_scan;
 pub mod materialize_scan_ts;
 pub mod scan;
+pub mod scan_flushed;
 pub mod sort;
 
 pub(in crate::data::executor) use convert::emit_column_value;

@@ -24,6 +24,12 @@ use nodedb_types::{DatabaseId, OrdinalClock};
 
 use super::priority_queues::PriorityQueues;
 
+/// Per-key flushed-surrogate table held in lockstep with
+/// `columnar_flushed_segments`: one entry per flushed segment (outer Vec index
+/// == segment Vec index), each a per-row list of cross-engine surrogates
+/// (`None` for a row flushed without one).
+type FlushedSurrogateTable = Vec<Vec<Option<nodedb_types::Surrogate>>>;
+
 /// Per-core event loop for the Data Plane.
 ///
 /// Each CPU core runs one `CoreLoop`. It owns:
@@ -234,6 +240,15 @@ pub struct CoreLoop {
     /// real on-disk segment reader is wired up).
     pub(in crate::data::executor) columnar_flushed_segments:
         HashMap<(DatabaseId, TenantId, String), Vec<Vec<u8>>>,
+
+    /// Cross-engine surrogates for flushed plain-columnar segments, held in
+    /// lockstep with `columnar_flushed_segments`: outer Vec index == segment
+    /// Vec index (so segment_id == index + 1 holds identically); inner Vec is
+    /// per-row, indexed by row position within the segment. `None` = a row
+    /// flushed without a surrogate (test fixtures / pre-surrogate rows).
+    /// In-memory only, exactly like the segment bytes it annotates.
+    pub(in crate::data::executor) columnar_flushed_surrogates:
+        HashMap<(DatabaseId, TenantId, String), FlushedSurrogateTable>,
 
     /// Per-collection max WAL LSN that has been ingested into the memtable.
     /// Used by the WAL catch-up deduplication: if a catch-up record's LSN

@@ -56,6 +56,9 @@ impl CoreLoop {
         self.columnar_flushed_segments
             .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &nm));
         let segments_removed = before_segments - self.columnar_flushed_segments.len();
+        // Lockstep: drop the surrogate sidecar for the same MV key.
+        self.columnar_flushed_surrogates
+            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &nm));
 
         // Doc cache: an MV's rows can be cached the same way a
         // collection's are (the Control Plane surfaces `SELECT * FROM

@@ -180,6 +180,9 @@ impl CoreLoop {
             .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
         self.columnar_flushed_segments
             .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
+        // Lockstep: drop the surrogate sidecar for the same keys.
+        self.columnar_flushed_surrogates
+            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
 
         // Sparse vector indexes (tuple key: database, tenant, collection, field).
         self.sparse_vector_indexes

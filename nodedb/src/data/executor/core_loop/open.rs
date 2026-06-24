@@ -118,6 +118,7 @@ impl CoreLoop {
             columnar_memtable_mem: HashMap::new(),
             columnar_engines: HashMap::new(),
             columnar_flushed_segments: HashMap::new(),
+            columnar_flushed_surrogates: HashMap::new(),
             ts_max_ingested_lsn: HashMap::new(),
             last_ts_ingest: None,
             ts_last_value_caches: HashMap::new(),

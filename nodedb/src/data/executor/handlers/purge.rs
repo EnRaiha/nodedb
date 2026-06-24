@@ -149,6 +149,9 @@ impl CoreLoop {
         self.columnar_engines.retain(|(_, t, _), _| *t != tid_key);
         self.columnar_flushed_segments
             .retain(|(_, t, _), _| *t != tid_key);
+        // Lockstep: drop the surrogate sidecar for the same keys.
+        self.columnar_flushed_surrogates
+            .retain(|(_, t, _), _| *t != tid_key);
 
         info!(
             core = self.core_id,

@@ -318,16 +318,32 @@ impl CoreLoop {
         if engine.should_flush() {
             let new_segment_id = engine.next_segment_id();
             let (schema, columns, row_count) = engine.memtable_mut().drain_optimized();
+            // Capture the memtable's per-row surrogates BEFORE `on_memtable_flushed`
+            // clears them. `drain_optimized` drains the row data but leaves
+            // `memtable_surrogates` intact; only `on_memtable_flushed` (below)
+            // clears it. This snapshot is the pre-clear, index-aligned identity
+            // table for the rows we are about to encode into the segment.
+            let flushed_surrogates: Vec<Option<nodedb_types::Surrogate>> =
+                engine.memtable_surrogates().to_vec();
             if row_count > 0 {
                 let kek = self.columnar_segment_kek.as_ref();
                 match nodedb_columnar::SegmentWriter::plain()
                     .write_segment(&schema, &columns, row_count, kek)
                 {
                     Ok(bytes) => {
+                        // Lockstep invariant: push to BOTH maps for the same key in
+                        // the SAME order so the segment-bytes Vec and the surrogate
+                        // sidecar stay equal-length and index-aligned (outer index
+                        // == segment index; segment_id == index + 1). On the Err
+                        // branch below we push to NEITHER, preserving lockstep.
                         self.columnar_flushed_segments
                             .entry(engine_key.clone())
                             .or_default()
                             .push(bytes);
+                        self.columnar_flushed_surrogates
+                            .entry(engine_key.clone())
+                            .or_default()
+                            .push(flushed_surrogates);
                         tracing::debug!(
                             core = self.core_id,
                             %collection,

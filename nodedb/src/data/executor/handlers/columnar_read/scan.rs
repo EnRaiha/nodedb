@@ -9,7 +9,6 @@ use crate::bridge::expr_eval::ComputedColumn;
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
-use crate::data::executor::scan_normalize::decoded_col_to_value;
 use crate::data::executor::task::ExecutionTask;
 
 use super::bitemporal::bitemporal_row_visible;
@@ -53,9 +52,12 @@ pub(in crate::data::executor) struct ColumnarScanParams<'a> {
 impl CoreLoop {
     /// Execute a base columnar scan: flushed segments first, then the live
     /// memtable. Flushed rows are delete-bitmap filtered. Surrogates are not
-    /// stored in segment bytes; when a prefilter is active, flushed segments
-    /// are skipped entirely. See `scan_normalize::scan_columnar` for the
-    /// parallel read path — keep both in sync on segment-iteration changes.
+    /// stored in segment bytes but are retained in the in-memory
+    /// `columnar_flushed_surrogates` sidecar (lockstep with the segment-bytes
+    /// map); when a prefilter is active, flushed rows are filtered per-row by
+    /// surrogate membership exactly like the live-memtable phase. See
+    /// `scan_normalize::scan_columnar` for the parallel read path — keep both
+    /// in sync on segment-iteration changes.
     pub(in crate::data::executor) fn execute_columnar_scan(
         &mut self,
         task: &ExecutionTask,
@@ -148,7 +150,17 @@ impl CoreLoop {
         let schema = engine.schema();
 
         let filter_predicates: Vec<ScanFilter> = if !filters.is_empty() {
-            zerompk::from_msgpack(filters).unwrap_or_default()
+            match zerompk::from_msgpack(filters) {
+                Ok(f) => f,
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("malformed scan filters: {e}"),
+                        },
+                    );
+                }
+            }
         } else {
             Vec::new()
         };
@@ -199,10 +211,17 @@ impl CoreLoop {
                     // No surrogates in memtable — cannot apply block skip.
                     false
                 } else {
-                    let bm_min = bitmap.0.min().unwrap_or(0);
-                    let bm_max = bitmap.0.max().unwrap_or(0);
-                    // Disjoint ranges: bitmap entirely before or after memtable.
-                    bm_max < mt_min || bm_min > mt_max
+                    // The bitmap is non-empty (guarded above); min/max are
+                    // always `Some`. Pattern-match to avoid `unwrap` in
+                    // non-test code while keeping the compiler honest.
+                    match (bitmap.0.min(), bitmap.0.max()) {
+                        (Some(bm_min), Some(bm_max)) => {
+                            // Disjoint ranges: bitmap entirely before or after memtable.
+                            bm_max < mt_min || bm_min > mt_max
+                        }
+                        // Unreachable: `is_empty()` was already checked above.
+                        _ => false,
+                    }
                 }
             }
         } else {
@@ -213,154 +232,32 @@ impl CoreLoop {
         // Read rows that were drained from the memtable during prior flushes.
         // These rows are older than anything in the current memtable.
         //
-        // Surrogate note: surrogates are not serialised into segment bytes (they
-        // are cleared from `memtable_surrogates` during flush). When a surrogate
-        // prefilter is active we therefore skip flushed segments entirely —
-        // we cannot verify per-row membership without a stored surrogate.
-        // See the method-level doc comment for the full rationale.
-        if prefilter.is_none()
-            && let Some(segments) = self.columnar_flushed_segments.get(&engine_key)
-        {
-            for (seg_idx, seg_bytes) in segments.iter().enumerate() {
-                if sort_keys.is_empty() && matched.len() >= limit {
-                    break;
-                }
-                // Segment ids are 1-based (segment_id 0 is reserved for the
-                // active memtable virtual segment). Mirror: materialize_scan.rs.
-                let seg_id = seg_idx as u64 + 1;
-
-                let reader = if let Some(ref reg) = self.quarantine_registry {
-                    match crate::storage::quarantine::engines::open_segment_with_quarantine(
-                        reg,
-                        seg_bytes,
-                        collection,
-                        &seg_id.to_string(),
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!(
-                                collection,
-                                seg_id,
-                                error = %e,
-                                "execute_columnar_scan: failed to open flushed segment (quarantine); skipping"
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    match nodedb_columnar::SegmentReader::open(seg_bytes) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!(
-                                collection,
-                                seg_id,
-                                error = %e,
-                                "execute_columnar_scan: failed to open flushed segment; skipping"
-                            );
-                            continue;
-                        }
-                    }
-                };
-
-                let row_count = reader.row_count() as usize;
-                let col_count = schema.columns.len();
-
-                // Decode all columns for this segment up front.
-                let mut decoded_cols = Vec::with_capacity(col_count);
-                let mut decode_ok = true;
-                for col_idx in 0..col_count {
-                    match reader.read_column(col_idx) {
-                        Ok(dc) => decoded_cols.push(dc),
-                        Err(e) => {
-                            tracing::warn!(
-                                collection,
-                                seg_id,
-                                col_idx,
-                                error = %e,
-                                "execute_columnar_scan: column decode failed; skipping segment"
-                            );
-                            decode_ok = false;
-                            break;
-                        }
-                    }
-                }
-                if !decode_ok {
-                    continue;
-                }
-
-                // Fetch the delete bitmap for this segment once per segment.
-                let delete_bm = engine.delete_bitmap(seg_id);
-
-                for row_idx in 0..row_count {
-                    // Skip tombstoned rows.
-                    if delete_bm.is_some_and(|bm| bm.is_deleted(row_idx as u32)) {
-                        continue;
-                    }
-
-                    // Build the row as Vec<Value> using the shared decoder.
-                    let row: Vec<nodedb_types::value::Value> = decoded_cols
-                        .iter()
-                        .map(|dc| decoded_col_to_value(dc, row_idx))
-                        .collect();
-
-                    if !bitemporal_row_visible(
-                        &row,
-                        ts_system_idx,
-                        ts_valid_from_idx,
-                        ts_valid_until_idx,
-                        system_as_of_ms,
-                        valid_at_ms,
-                    ) {
-                        continue;
-                    }
-                    if !filter_predicates.is_empty()
-                        && !row_matches_filters(&row, schema, &filter_predicates)
-                    {
-                        continue;
-                    }
-
-                    let mut obj = serde_json::Map::new();
-                    for (i, col_def) in schema.columns.iter().enumerate() {
-                        let force_system_col = all_versions && col_def.name == "_ts_system";
-                        if !projection.is_empty()
-                            && !force_system_col
-                            && !projection.iter().any(|p| p == &col_def.name)
-                            && !computed_cols.iter().any(|cc| cc.alias == col_def.name)
-                        {
-                            continue;
-                        }
-                        if i < row.len() {
-                            obj.insert(col_def.name.clone(), value_to_json(&row[i]));
-                        }
-                    }
-                    if !computed_cols.is_empty() {
-                        let doc_val =
-                            nodedb_types::Value::from(serde_json::Value::Object(obj.clone()));
-                        for cc in &computed_cols {
-                            let existing = obj.get(&cc.alias);
-                            if matches!(existing, Some(v) if !v.is_null()) {
-                                continue;
-                            }
-                            obj.insert(
-                                cc.alias.clone(),
-                                serde_json::Value::from(cc.expr.eval(&doc_val)),
-                            );
-                        }
-                        if !projection.is_empty() {
-                            obj.retain(|k, _| {
-                                projection.iter().any(|p| p == k)
-                                    || computed_cols.iter().any(|cc| &cc.alias == k)
-                                    || (all_versions && k == "_ts_system")
-                            });
-                        }
-                    }
-                    matched.push((row, serde_json::Value::Object(obj)));
-                    if sort_keys.is_empty() && matched.len() >= limit {
-                        break;
-                    }
-                }
-            }
-        }
+        // Surrogate note: surrogates are not serialised into segment bytes, but
+        // they ARE retained in the in-memory `columnar_flushed_surrogates`
+        // sidecar (kept in lockstep with `columnar_flushed_segments`). When a
+        // surrogate prefilter is active we therefore scan flushed segments and
+        // apply a per-row membership test below, mirroring the live-memtable
+        // phase. See the method-level doc comment for the full rationale.
+        self.scan_flushed_columnar_segments(
+            super::scan_flushed::FlushedScanCtx {
+                collection,
+                engine_key: &engine_key,
+                schema,
+                projection,
+                limit,
+                sort_keys,
+                filter_predicates: &filter_predicates,
+                prefilter,
+                computed_cols: &computed_cols,
+                all_versions,
+                system_as_of_ms,
+                valid_at_ms,
+                ts_system_idx,
+                ts_valid_from_idx,
+                ts_valid_until_idx,
+            },
+            &mut matched,
+        );
 
         // ── Phase 2: live memtable ──────────────────────────────────────────
         // Rows still in the active memtable (not yet flushed).
@@ -481,5 +378,277 @@ impl CoreLoop {
         }
 
         self.response_with_payload(task, payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Cross-engine prefilter coverage for FLUSHED plain-columnar segments.
+    //!
+    //! These tests prove the silent-wrong-results fix: rows that live only in a
+    //! flushed segment (drained out of the live memtable) are now visible to a
+    //! prefiltered scan and are filtered per-row by their cross-engine
+    //! surrogate, instead of being skipped wholesale. Each test forces a real
+    //! flush — drain the memtable, encode a `SegmentWriter` segment, push the
+    //! bytes + the captured surrogate sidecar in lockstep, then `on_memtable_flushed`
+    //! clears the memtable — so the rows truly exist only in the flushed segment
+    //! before the scan runs. This mirrors the production flush block in
+    //! `handlers/columnar_write/insert.rs`.
+
+    use std::time::{Duration, Instant};
+
+    use nodedb_bridge::buffer::RingBuffer;
+    use nodedb_columnar::MutationEngine;
+    use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
+    use nodedb_types::value::Value;
+    use nodedb_types::{Surrogate, SurrogateBitmap};
+
+    use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+    use crate::bridge::envelope::{PhysicalPlan, Priority, Request};
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::task::ExecutionTask;
+    use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+
+    use super::ColumnarScanParams;
+
+    fn schema() -> ColumnarSchema {
+        ColumnarSchema::new(vec![
+            ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+            ColumnDef::required("name", ColumnType::String),
+        ])
+        .expect("valid schema")
+    }
+
+    fn make_core() -> (CoreLoop, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, _resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("CoreLoop::open");
+        (core, dir)
+    }
+
+    fn make_task() -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            // Plan is irrelevant: `execute_columnar_scan` is called directly
+            // with `ColumnarScanParams` and only reads `database_id`/`tenant_id`.
+            plan: PhysicalPlan::Meta(nodedb_physical::physical_plan::MetaOp::Compact),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+        })
+    }
+
+    /// Insert `(id, name, surrogate)` rows into a fresh engine, then run the
+    /// EXACT production flush sequence so the rows end up only in a flushed
+    /// segment. Registers the engine + populates both lockstep maps on `core`.
+    /// Returns the engine key.
+    fn insert_and_flush(
+        core: &mut CoreLoop,
+        collection: &str,
+        rows: &[(i64, &str, Surrogate)],
+    ) -> (DatabaseId, TenantId, String) {
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            collection.to_string(),
+        );
+        let mut engine = MutationEngine::new(collection.to_string(), schema());
+        for (id, name, surr) in rows {
+            engine
+                .insert_with_surrogate(&[Value::Integer(*id), Value::String((*name).into())], *surr)
+                .expect("insert_with_surrogate");
+        }
+
+        // ── Mirror handlers/columnar_write/insert.rs flush block ────────────
+        let new_segment_id = engine.next_segment_id();
+        let (seg_schema, columns, row_count) = engine.memtable_mut().drain_optimized();
+        // Capture surrogates BEFORE `on_memtable_flushed` clears them.
+        let flushed_surrogates: Vec<Option<Surrogate>> = engine.memtable_surrogates().to_vec();
+        assert_eq!(
+            row_count,
+            flushed_surrogates.len(),
+            "drained row_count must equal captured surrogate count"
+        );
+        let bytes = nodedb_columnar::SegmentWriter::plain()
+            .write_segment(&seg_schema, &columns, row_count, None)
+            .expect("write_segment");
+        // Lockstep push: both maps, same key, same order.
+        core.columnar_flushed_segments
+            .entry(key.clone())
+            .or_default()
+            .push(bytes);
+        core.columnar_flushed_surrogates
+            .entry(key.clone())
+            .or_default()
+            .push(flushed_surrogates);
+        engine
+            .on_memtable_flushed(new_segment_id)
+            .expect("on_memtable_flushed");
+
+        // After flush the memtable is empty: rows live ONLY in the segment.
+        assert_eq!(
+            engine.memtable_surrogates().len(),
+            0,
+            "memtable surrogates cleared after flush"
+        );
+        core.columnar_engines.insert(key.clone(), engine);
+        key
+    }
+
+    /// Run a prefiltered scan and return the decoded result rows.
+    fn scan_with_prefilter(
+        core: &mut CoreLoop,
+        collection: &str,
+        prefilter: Option<&SurrogateBitmap>,
+    ) -> Vec<serde_json::Value> {
+        let task = make_task();
+        let params = ColumnarScanParams {
+            collection,
+            projection: &[],
+            limit: 0,
+            filters: &[],
+            rls_filters: &[],
+            sort_keys: &[],
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+            prefilter,
+            computed_columns: &[],
+        };
+        let resp = core.execute_columnar_scan(&task, params);
+        let decoded: Vec<nodedb_types::JsonValue> =
+            zerompk::from_msgpack(resp.payload.as_bytes()).expect("decode scan payload");
+        decoded.into_iter().map(|j| j.0).collect()
+    }
+
+    fn ids(rows: &[serde_json::Value]) -> Vec<i64> {
+        let mut v: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|x| x.as_i64()))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// A prefilter that includes SOME flushed-row surrogates must return
+    /// exactly those rows — proving flushed rows are now prefiltered, not
+    /// skipped wholesale.
+    #[test]
+    fn flushed_rows_are_prefiltered_not_skipped() {
+        let (mut core, _dir) = make_core();
+        let coll = "cf_some";
+        insert_and_flush(
+            &mut core,
+            coll,
+            &[
+                (1, "a", Surrogate(101)),
+                (2, "b", Surrogate(102)),
+                (3, "c", Surrogate(103)),
+            ],
+        );
+
+        let mut bitmap = SurrogateBitmap::new();
+        bitmap.insert(Surrogate(101));
+        bitmap.insert(Surrogate(103));
+
+        let rows = scan_with_prefilter(&mut core, coll, Some(&bitmap));
+        assert_eq!(
+            ids(&rows),
+            vec![1, 3],
+            "only rows whose surrogate is in the bitmap come back"
+        );
+    }
+
+    /// A prefilter that includes NONE of the surrogates must return zero rows.
+    #[test]
+    fn flushed_rows_empty_prefilter_returns_nothing() {
+        let (mut core, _dir) = make_core();
+        let coll = "cf_none";
+        insert_and_flush(
+            &mut core,
+            coll,
+            &[(1, "a", Surrogate(201)), (2, "b", Surrogate(202))],
+        );
+
+        let mut bitmap = SurrogateBitmap::new();
+        bitmap.insert(Surrogate(999)); // no overlap
+
+        let rows = scan_with_prefilter(&mut core, coll, Some(&bitmap));
+        assert!(
+            rows.is_empty(),
+            "no surrogate matches => zero rows, got {}",
+            rows.len()
+        );
+    }
+
+    /// Sanity: with NO prefilter all flushed rows are returned (unchanged
+    /// behaviour — the gate only applies when a prefilter is present).
+    #[test]
+    fn flushed_rows_no_prefilter_returns_all() {
+        let (mut core, _dir) = make_core();
+        let coll = "cf_all";
+        insert_and_flush(
+            &mut core,
+            coll,
+            &[
+                (1, "a", Surrogate(301)),
+                (2, "b", Surrogate(302)),
+                (3, "c", Surrogate(303)),
+            ],
+        );
+
+        let rows = scan_with_prefilter(&mut core, coll, None);
+        assert_eq!(ids(&rows), vec![1, 2, 3]);
+    }
+
+    /// Lockstep invariant: after a flush the two maps are equal-length per key
+    /// and the inner surrogate Vec length equals the segment row count.
+    #[test]
+    fn lockstep_lengths_match_after_flush() {
+        let (mut core, _dir) = make_core();
+        let coll = "cf_lockstep";
+        let rows = [
+            (1, "a", Surrogate(401)),
+            (2, "b", Surrogate(402)),
+            (3, "c", Surrogate(403)),
+            (4, "d", Surrogate(404)),
+        ];
+        let key = insert_and_flush(&mut core, coll, &rows);
+
+        let segs = core
+            .columnar_flushed_segments
+            .get(&key)
+            .expect("segments present");
+        let surrs = core
+            .columnar_flushed_surrogates
+            .get(&key)
+            .expect("surrogate sidecar present");
+        assert_eq!(
+            segs.len(),
+            surrs.len(),
+            "outer Vec lengths must be equal (lockstep)"
+        );
+        assert_eq!(segs.len(), 1, "exactly one flushed segment");
+        assert_eq!(
+            surrs[0].len(),
+            rows.len(),
+            "inner per-row surrogate Vec length must equal segment row count"
+        );
     }
 }
