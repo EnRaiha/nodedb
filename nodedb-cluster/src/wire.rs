@@ -57,19 +57,6 @@ pub enum VShardMessageType {
     /// Edge validation request.
     EdgeValidation = 23,
 
-    // ── Graph Algorithm BSP (Bulk Synchronous Parallel) ──
-    /// Superstep barrier: coordinator tells all shards to begin iteration N.
-    GraphAlgoSuperstep = 30,
-    /// Boundary vertex contributions: shard sends rank contributions for
-    /// vertices owned by the target shard (scatter phase).
-    GraphAlgoContributions = 31,
-    /// Superstep complete: shard reports local convergence delta and
-    /// vertex count to coordinator (gather phase).
-    GraphAlgoSuperstepAck = 32,
-    /// Algorithm complete: coordinator broadcasts final signal with
-    /// global convergence status.
-    GraphAlgoComplete = 33,
-
     // ── Timeseries Distributed Aggregation ──
     /// Scatter: coordinator sends aggregation query to a shard.
     TsScatterRequest = 40,
@@ -228,10 +215,7 @@ impl VShardEnvelope {
             20 => VShardMessageType::MigrationBaseCopy,
             22 => VShardMessageType::GsiForward,
             23 => VShardMessageType::EdgeValidation,
-            30 => VShardMessageType::GraphAlgoSuperstep,
-            31 => VShardMessageType::GraphAlgoContributions,
-            32 => VShardMessageType::GraphAlgoSuperstepAck,
-            33 => VShardMessageType::GraphAlgoComplete,
+            // 30-33 retired (GraphAlgoSuperstep/Contributions/SuperstepAck/Complete)
             40 => VShardMessageType::TsScatterRequest,
             41 => VShardMessageType::TsScatterResponse,
             42 => VShardMessageType::TsRetentionCommand,
@@ -311,10 +295,6 @@ mod tests {
             VShardMessageType::GhostDelete,
             VShardMessageType::GhostVerifyRequest,
             VShardMessageType::GhostVerifyResponse,
-            VShardMessageType::GraphAlgoSuperstep,
-            VShardMessageType::GraphAlgoContributions,
-            VShardMessageType::GraphAlgoSuperstepAck,
-            VShardMessageType::GraphAlgoComplete,
             VShardMessageType::TsScatterRequest,
             VShardMessageType::TsScatterResponse,
             VShardMessageType::TsRetentionCommand,

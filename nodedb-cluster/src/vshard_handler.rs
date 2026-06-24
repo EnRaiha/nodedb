@@ -7,7 +7,6 @@
 //! This handler dispatches based on `VShardMessageType` to the
 //! appropriate engine handler:
 //!
-//! - Graph BSP messages → graph algorithm shard handler
 //! - Timeseries scatter → local scan + partial aggregate response
 //! - Retention command → local retention enforcement
 //! - S3 archive command → local archive execution
@@ -42,12 +41,6 @@ pub trait VShardHandler: Send + Sync + 'static {
 /// as the dispatch core, delegating to engine-specific handlers.
 pub fn dispatch_by_type(envelope: &VShardEnvelope) -> DispatchTarget {
     match envelope.msg_type {
-        // Graph BSP
-        VShardMessageType::GraphAlgoSuperstep => DispatchTarget::GraphBsp,
-        VShardMessageType::GraphAlgoContributions => DispatchTarget::GraphBsp,
-        VShardMessageType::GraphAlgoSuperstepAck => DispatchTarget::GraphBsp,
-        VShardMessageType::GraphAlgoComplete => DispatchTarget::GraphBsp,
-
         // Timeseries distributed
         VShardMessageType::TsScatterRequest => DispatchTarget::TimeseriesScan,
         VShardMessageType::TsScatterResponse => DispatchTarget::TimeseriesCoordinator,
@@ -115,8 +108,6 @@ pub fn dispatch_by_type(envelope: &VShardEnvelope) -> DispatchTarget {
 /// Which engine subsystem should handle this envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchTarget {
-    /// Graph BSP algorithm handler.
-    GraphBsp,
     /// Graph edge validation.
     GraphValidation,
     /// Timeseries local scan (shard executes scan, returns partials).
@@ -193,12 +184,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dispatch_graph_bsp() {
-        let env = VShardEnvelope::new(VShardMessageType::GraphAlgoSuperstep, 1, 2, 42, vec![]);
-        assert_eq!(dispatch_by_type(&env), DispatchTarget::GraphBsp);
-    }
-
-    #[test]
     fn dispatch_ts_scatter() {
         let env = VShardEnvelope::new(VShardMessageType::TsScatterRequest, 1, 2, 42, vec![]);
         assert_eq!(dispatch_by_type(&env), DispatchTarget::TimeseriesScan);
@@ -233,10 +218,6 @@ mod tests {
             VShardMessageType::MigrationBaseCopy,
             VShardMessageType::GsiForward,
             VShardMessageType::EdgeValidation,
-            VShardMessageType::GraphAlgoSuperstep,
-            VShardMessageType::GraphAlgoContributions,
-            VShardMessageType::GraphAlgoSuperstepAck,
-            VShardMessageType::GraphAlgoComplete,
             VShardMessageType::TsScatterRequest,
             VShardMessageType::TsScatterResponse,
             VShardMessageType::TsRetentionCommand,
