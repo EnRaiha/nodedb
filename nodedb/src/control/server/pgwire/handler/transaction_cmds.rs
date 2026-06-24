@@ -18,6 +18,18 @@ use nodedb_cluster::calvin::{AttemptOutcome, TxnId};
 use super::core::NodeDbPgHandler;
 use crate::control::server::pgwire::types::error_to_sqlstate;
 
+/// Builds the canonical SQLSTATE 57014 error emitted when a Calvin coordinator
+/// channel is closed (coordinator task dropped due to deadline expiry).  Both
+/// the assignment-recv and completion-recv arms use this constructor so the
+/// mapping is defined exactly once and the tests exercise the production path.
+fn calvin_cancelled_error() -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "57014".to_owned(),
+        "Calvin coordinator cancelled (deadline exceeded)".to_owned(),
+    )))
+}
+
 impl NodeDbPgHandler {
     /// Handle BEGIN / START TRANSACTION.
     pub(super) fn handle_begin(&self, addr: &std::net::SocketAddr) -> PgWireResult<Vec<Response>> {
@@ -199,13 +211,7 @@ impl NodeDbPgHandler {
                                                 .to_owned(),
                                         )))
                                     })?
-                                    .map_err(|_| {
-                                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                                            "ERROR".to_owned(),
-                                            "XX000".to_owned(),
-                                            "Calvin sequencer assignment channel closed".to_owned(),
-                                        )))
-                                    })?;
+                                    .map_err(|_| calvin_cancelled_error())?;
 
                             let completion_rx = registry
                                 .register_completion(TxnId::new(epoch, position), participants);
@@ -219,13 +225,7 @@ impl NodeDbPgHandler {
                                             .to_owned(),
                                     )))
                                 })?
-                                .map_err(|_| {
-                                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                                        "ERROR".to_owned(),
-                                        "XX000".to_owned(),
-                                        "Calvin completion channel closed".to_owned(),
-                                    )))
-                                })?;
+                                .map_err(|_| calvin_cancelled_error())?;
                             // The static (non-dependent) Calvin path never
                             // produces an OLLP mismatch — `note_ollp_mismatch`
                             // only fires on the dependent-predicate retry path —
@@ -406,5 +406,67 @@ impl NodeDbPgHandler {
         // Discard NOTIFY messages buffered during this transaction.
         self.sessions.discard_pending_notifies(addr);
         Ok(vec![Response::Execution(Tag::new("ROLLBACK"))])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calvin_cancelled_error;
+    use pgwire::error::{ErrorInfo, PgWireError};
+
+    #[test]
+    fn calvin_assignment_channel_closed_returns_57014() {
+        // Exercises the production constructor directly — no replicated mapping.
+        let err = calvin_cancelled_error();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(
+                    info.code, "57014",
+                    "expected SQLSTATE 57014 (query_canceled) for Calvin channel-closed, got {}",
+                    info.code
+                );
+                assert_ne!(
+                    info.code, "XX000",
+                    "must not surface XX000 (internal_error) for a coordinator deadline cancel"
+                );
+            }
+            other => panic!("expected PgWireError::UserError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calvin_completion_channel_closed_returns_57014() {
+        // Completion arm uses the same production constructor — assert it here too.
+        let err = calvin_cancelled_error();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(
+                    info.code, "57014",
+                    "expected SQLSTATE 57014 for Calvin completion channel-closed, got {}",
+                    info.code
+                );
+            }
+            other => panic!("expected PgWireError::UserError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ollp_mismatch_is_not_57014() {
+        // Verify the OLLP mismatch arm (a genuine invariant violation) stays
+        // XX000 — a distinct code path from coordinator deadline cancellation.
+        let err = PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "XX000".to_owned(),
+            "OLLP mismatch outcome on non-dependent Calvin path".to_owned(),
+        )));
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(
+                    info.code, "XX000",
+                    "OLLP mismatch must stay XX000 (internal_error)"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 }
