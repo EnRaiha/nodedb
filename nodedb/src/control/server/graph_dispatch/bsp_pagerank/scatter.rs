@@ -15,11 +15,11 @@
 use futures::future::join_all;
 
 use crate::bridge::envelope::{Payload, PhysicalPlan};
-use crate::control::gateway::dispatcher::dispatch_route;
 use crate::control::gateway::version_set::GatewayVersionSet;
-use crate::control::gateway::{RouteDecision, TaskRoute};
-use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
-use crate::types::{DatabaseId, TenantId, TraceId};
+use crate::control::server::graph_dispatch::cluster_resolve::{
+    dispatch_superstep_to_node, gateway_shared,
+};
+use crate::types::{DatabaseId, TenantId};
 use nodedb_graph::{AlgoParams, GraphAlgorithm};
 use nodedb_physical::physical_plan::{BspSuperstepPlan, BspSuperstepResult, GraphOp};
 
@@ -89,43 +89,19 @@ pub(super) async fn scatter_superstep(
         let route_vshard = d.route_vshard;
 
         Box::pin(async move {
-            let result = if is_local {
-                // Local node: fan across ALL local cores and merge. The per-core
-                // owned-node sets are disjoint, so the merged result is correct
-                // without dedup.  At 1 core/node this is behaviour-identical to
-                // the prior single-core RouteDecision::Local dispatch.
-                let node_result = crate::control::server::exchange::execute_plan_all_local_cores(
-                    shared_arc.as_ref(),
-                    tenant_id,
-                    database_id,
-                    plan,
-                    TraceId::ZERO,
-                )
-                .await?;
-                let payload = crate::bridge::envelope::Payload::from_vec(node_result.payload);
-                decode_single_result_from_payload(node_id, payload)?
-            } else {
-                // Remote node: one dispatch via the gateway (unchanged path).
-                let route = TaskRoute {
-                    plan,
-                    decision: RouteDecision::Remote {
-                        node_id,
-                        vshard_id: route_vshard as u64,
-                    },
-                    vshard_id: route_vshard,
-                };
-                let payloads = dispatch_route(
-                    route,
-                    shared_arc,
-                    tenant_id,
-                    database_id,
-                    TraceId::ZERO,
-                    deadline_ms,
-                    &version_set,
-                )
-                .await?;
-                decode_single_result(node_id, payloads)?
-            };
+            let payload = dispatch_superstep_to_node(
+                shared_arc,
+                tenant_id,
+                database_id,
+                deadline_ms,
+                node_id,
+                is_local,
+                route_vshard,
+                plan,
+                &version_set,
+            )
+            .await?;
+            let result = decode_single_result_from_payload(node_id, payload)?;
             Ok::<ShardResult, crate::Error>(ShardResult { node_id, result })
         })
     });
@@ -138,28 +114,10 @@ pub(super) async fn scatter_superstep(
     Ok(out)
 }
 
-/// Decode a single node's `BspSuperstepResult` from a dispatch's payload list.
-///
-/// Both the local single-core dispatch and the remote `ExecuteRequest` (which
-/// runs on one core) yield exactly one payload. An empty CSR on that core yields
-/// an empty (default) payload — the handler encodes `BspSuperstepResult::default()`,
-/// which decodes to a zero-vertex shard (it contributes nothing to `global_n` or
-/// the ranks).
-fn decode_single_result(node_id: u64, payloads: Vec<Vec<u8>>) -> crate::Result<BspSuperstepResult> {
-    let payload = payloads
-        .into_iter()
-        .next()
-        .ok_or_else(|| crate::Error::Internal {
-            detail: format!("bsp pagerank: node={node_id} returned no payload"),
-        })?;
-    let payload = Payload::from_vec(payload);
-    decode_single_result_from_payload(node_id, payload)
-}
-
 /// Decode a single node's `BspSuperstepResult` from an already-wrapped
 /// [`Payload`].  Empty payload → `BspSuperstepResult::default()` (zero-vertex
-/// shard, contributes nothing). Used both by the remote payload-list path
-/// (via `decode_single_result`) and the local all-cores merged payload path.
+/// shard, contributes nothing). Used by both the remote (first) payload path
+/// and the local all-cores merged payload path via `dispatch_superstep_to_node`.
 fn decode_single_result_from_payload(
     node_id: u64,
     payload: Payload,

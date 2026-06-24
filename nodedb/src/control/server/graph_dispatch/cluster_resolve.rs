@@ -11,9 +11,14 @@
 
 use std::sync::Arc;
 
-use crate::control::gateway::RouteDecision;
+use crate::bridge::envelope::{Payload, PhysicalPlan};
+use crate::control::gateway::dispatcher::dispatch_route;
 use crate::control::gateway::router::resolve_decision;
+use crate::control::gateway::version_set::GatewayVersionSet;
+use crate::control::gateway::{RouteDecision, TaskRoute};
+use crate::control::server::exchange::execute_plan_all_local_cores;
 use crate::control::state::SharedState;
+use crate::types::{DatabaseId, TenantId, TraceId};
 
 /// Resolve a vShard to a `RouteDecision` against live Raft leadership, falling
 /// back to the routing-table hint when no live snapshot is available.
@@ -42,6 +47,69 @@ pub(super) fn resolve_for_vshard(state: &SharedState, vshard_id: u32) -> RouteDe
         routing_guard.as_deref(),
         live_lookup,
     )
+}
+
+/// Dispatch a single already-built graph-superstep `plan` to one owner node and
+/// return its node-level payload. The LOCAL node fans the plan across all its
+/// Data-Plane cores via `execute_plan_all_local_cores` (per-core results merged
+/// into one payload); a REMOTE node gets one `RouteDecision::Remote` dispatch via
+/// `dispatch_route`. An empty payload denotes a zero-vertex shard — the caller's
+/// decoder maps it to its result type's `::default()`. Shared by the PageRank and
+/// WCC per-node scatter paths.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_node(
+    shared_arc: &Arc<SharedState>,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    deadline_ms: u64,
+    node_id: u64,
+    is_local: bool,
+    route_vshard: u32,
+    plan: PhysicalPlan,
+    version_set: &GatewayVersionSet,
+) -> crate::Result<Payload> {
+    if is_local {
+        // Local node: fan across ALL local cores and merge. The per-core
+        // owned-node sets are disjoint, so the merged result is correct without
+        // dedup. At 1 core/node this is behaviour-identical to a single-core
+        // dispatch.
+        let node_result = execute_plan_all_local_cores(
+            shared_arc.as_ref(),
+            tenant_id,
+            database_id,
+            plan,
+            TraceId::ZERO,
+        )
+        .await?;
+        Ok(Payload::from_vec(node_result.payload))
+    } else {
+        // Remote node: one dispatch via the gateway.
+        let route = TaskRoute {
+            plan,
+            decision: RouteDecision::Remote {
+                node_id,
+                vshard_id: route_vshard as u64,
+            },
+            vshard_id: route_vshard,
+        };
+        let payloads = dispatch_route(
+            route,
+            shared_arc,
+            tenant_id,
+            database_id,
+            TraceId::ZERO,
+            deadline_ms,
+            version_set,
+        )
+        .await?;
+        payloads
+            .into_iter()
+            .next()
+            .map(Payload::from_vec)
+            .ok_or_else(|| crate::Error::Internal {
+                detail: format!("graph superstep: node={node_id} returned no payload"),
+            })
+    }
 }
 
 /// The gateway's `Arc<SharedState>` for the remote dispatch path. In cluster

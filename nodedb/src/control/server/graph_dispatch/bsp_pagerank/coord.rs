@@ -2,8 +2,10 @@
 
 //! Control-Plane coordinator for distributed BSP PageRank (F1d-4 Phase B).
 //!
-//! Drives the superstep loop across every shard (= one owner NODE) using the
-//! Phase A `GraphOp::BspSuperstep` primitive. The coordinator OWNS all durable
+//! Drives the superstep loop with one dispatch per DISTINCT OWNER NODE (each
+//! carrying that node's full owned-vShard set), NOT one dispatch per vShard,
+//! using the Phase A `GraphOp::BspSuperstep` primitive; each node's dispatch is
+//! then fanned across that node's cores below. The coordinator OWNS all durable
 //! state — the per-node rank vectors and the routed cross-shard contributions;
 //! [`BspCoordinator`] is used ONLY for convergence bookkeeping (`record_ack` /
 //! `all_acked` / `global_delta` / `advance`).
