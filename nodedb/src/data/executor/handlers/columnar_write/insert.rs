@@ -120,7 +120,11 @@ impl CoreLoop {
             } else {
                 base_schema
             };
-            let engine = MutationEngine::new(collection.to_string(), schema);
+            let engine = MutationEngine::with_flush_threshold(
+                collection.to_string(),
+                schema,
+                self.query_tuning.columnar_flush_threshold,
+            );
             self.columnar_engines.insert(engine_key.clone(), engine);
         }
 

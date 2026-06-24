@@ -50,8 +50,21 @@ pub struct MutationResult {
 }
 
 impl MutationEngine {
-    /// Create a new mutation engine for a collection.
+    /// Create a new mutation engine for a collection with the default flush threshold.
     pub fn new(collection: String, schema: ColumnarSchema) -> Self {
+        Self::with_flush_threshold(collection, schema, crate::memtable::DEFAULT_FLUSH_THRESHOLD)
+    }
+
+    /// Create a new mutation engine with a custom memtable flush threshold.
+    ///
+    /// The threshold is clamped to a minimum of 1 to prevent a zero-threshold
+    /// from causing unbounded flush loops. Use this when the node-level
+    /// `QueryTuning::columnar_flush_threshold` config overrides the default.
+    pub fn with_flush_threshold(
+        collection: String,
+        schema: ColumnarSchema,
+        flush_threshold: usize,
+    ) -> Self {
         let pk_col_indices: Vec<usize> = schema
             .columns
             .iter()
@@ -60,7 +73,7 @@ impl MutationEngine {
             .map(|(i, _)| i)
             .collect();
 
-        let memtable = ColumnarMemtable::new(&schema);
+        let memtable = ColumnarMemtable::with_threshold(&schema, flush_threshold.max(1));
         // Reserve segment_id 0 for the first memtable. Real segments start at 1.
         let memtable_segment_id = 0;
 
@@ -298,6 +311,39 @@ mod tests {
         assert!(
             matches!(result, Err(ColumnarError::SegmentIdExhausted)),
             "expected SegmentIdExhausted, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn with_flush_threshold_triggers_should_flush_at_threshold() {
+        use nodedb_types::value::Value;
+
+        let schema = minimal_schema();
+        // Threshold of 2: after 2 inserts the engine must report should_flush.
+        let mut engine = MutationEngine::with_flush_threshold("col".to_string(), schema, 2);
+        assert!(!engine.should_flush(), "empty engine should not need flush");
+
+        engine.insert(&[Value::Integer(1)]).expect("insert row 1");
+        assert!(!engine.should_flush(), "1 row below threshold of 2");
+
+        engine.insert(&[Value::Integer(2)]).expect("insert row 2");
+        assert!(
+            engine.should_flush(),
+            "2 rows at threshold of 2 must trigger flush"
+        );
+    }
+
+    #[test]
+    fn with_flush_threshold_zero_is_clamped_to_one() {
+        use nodedb_types::value::Value;
+
+        let schema = minimal_schema();
+        let mut engine = MutationEngine::with_flush_threshold("col".to_string(), schema, 0);
+        engine.insert(&[Value::Integer(1)]).expect("insert");
+        // A zero threshold would be pathological; clamped to 1, so 1 row = flush.
+        assert!(
+            engine.should_flush(),
+            "clamped-to-1 threshold: 1 row must flush"
         );
     }
 }

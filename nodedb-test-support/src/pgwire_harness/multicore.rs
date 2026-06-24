@@ -72,6 +72,7 @@ impl TestServer {
                     governor: shared.governor.clone(),
                     replay: None,
                     graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
+                    query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);

@@ -114,6 +114,31 @@ impl TestClusterNode {
         graph_tuning: nodedb_types::config::tuning::GraphTuning,
         num_cores: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_with_tuning_graph_query_and_cores(
+            node_id,
+            seed_nodes,
+            tuning,
+            graph_tuning,
+            nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores,
+        )
+        .await
+    }
+
+    /// Spawn a cluster node with custom cluster-transport, graph engine
+    /// tuning, query execution tuning, and a specific core count.
+    ///
+    /// The `query_tuning` knob lets cluster tests override per-core Data Plane
+    /// parameters (e.g. `columnar_flush_threshold`) to exercise flush behaviour
+    /// on small datasets.
+    pub async fn spawn_with_tuning_graph_query_and_cores(
+        node_id: u64,
+        seed_nodes: Vec<SocketAddr>,
+        tuning: ClusterTransportTuning,
+        graph_tuning: nodedb_types::config::tuning::GraphTuning,
+        query_tuning: nodedb_types::config::tuning::QueryTuning,
+        num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let data_dir = tempfile::tempdir()?;
         let data_dir_path: PathBuf = data_dir.path().to_path_buf();
 
@@ -225,6 +250,7 @@ impl TestClusterNode {
                     governor: shared.governor.clone(),
                     replay: None,
                     graph_tuning: graph_tuning.clone(),
+                    query_tuning: query_tuning.clone(),
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);

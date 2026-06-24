@@ -53,6 +53,28 @@ impl TestCluster {
         .await
     }
 
+    /// Spawn a 3-node cluster with a lowered `columnar_flush_threshold` so
+    /// cluster tests can observe flush / segment behaviour on small datasets
+    /// (e.g. a handful of rows) without inserting 65k rows per test.
+    ///
+    /// All other tuning values stay at their defaults. Uses 1 Data-Plane core
+    /// per node and the standard fast-election cluster transport tuning.
+    pub async fn spawn_three_with_columnar_flush_threshold(
+        flush_threshold: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let query_tuning = nodedb_types::config::tuning::QueryTuning {
+            columnar_flush_threshold: flush_threshold,
+            ..Default::default()
+        };
+        Self::spawn_three_with_tuning_graph_query_and_cores(
+            fast_cluster_tuning(),
+            nodedb_types::config::tuning::GraphTuning::default(),
+            query_tuning,
+            1,
+        )
+        .await
+    }
+
     /// Spawn a 3-node cluster with a custom `ClusterTransportTuning`.
     /// Used by the descriptor-lease renewal tests to drive the
     /// renewal loop on a much faster cadence than the production
@@ -88,11 +110,32 @@ impl TestCluster {
         graph_tuning: nodedb_types::config::tuning::GraphTuning,
         num_cores: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let node1 = TestClusterNode::spawn_with_tuning_graph_and_cores(
+        Self::spawn_three_with_tuning_graph_query_and_cores(
+            tuning,
+            graph_tuning,
+            nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores,
+        )
+        .await
+    }
+
+    /// Spawn a 3-node cluster with custom cluster-transport, graph engine tuning,
+    /// query execution tuning, and a specific core count per node.
+    ///
+    /// This is the lowest-level cluster spawn entry point. Public methods that
+    /// tune only a subset of parameters delegate here with appropriate defaults.
+    pub async fn spawn_three_with_tuning_graph_query_and_cores(
+        tuning: ClusterTransportTuning,
+        graph_tuning: nodedb_types::config::tuning::GraphTuning,
+        query_tuning: nodedb_types::config::tuning::QueryTuning,
+        num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let node1 = TestClusterNode::spawn_with_tuning_graph_query_and_cores(
             1,
             vec![],
             tuning.clone(),
             graph_tuning.clone(),
+            query_tuning.clone(),
             num_cores,
         )
         .await?;
@@ -111,11 +154,12 @@ impl TestCluster {
         }
 
         let seeds = vec![node1.listen_addr];
-        let node2 = TestClusterNode::spawn_with_tuning_graph_and_cores(
+        let node2 = TestClusterNode::spawn_with_tuning_graph_query_and_cores(
             2,
             seeds.clone(),
             tuning.clone(),
             graph_tuning.clone(),
+            query_tuning.clone(),
             num_cores,
         )
         .await?;
@@ -132,11 +176,12 @@ impl TestCluster {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let node3 = TestClusterNode::spawn_with_tuning_graph_and_cores(
+        let node3 = TestClusterNode::spawn_with_tuning_graph_query_and_cores(
             3,
             seeds,
             tuning,
             graph_tuning,
+            query_tuning,
             num_cores,
         )
         .await?;
