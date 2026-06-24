@@ -9,7 +9,9 @@
 //! [`execute_continuation`].
 
 use super::super::ast::{MatchQuery, PatternChain};
-use super::{BindingRow, ExecutionState, MatchOutcome, execute_triple, predicates};
+use super::core::execute_triple;
+use super::predicates;
+use super::types::{BindingRow, ExecutionState, MatchOutcome};
 use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::EdgeStore;
 
@@ -202,8 +204,9 @@ pub fn execute_continuation<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::make_csr;
-    use super::super::{BindingRow, execute};
+    use super::super::core::execute;
+    use super::super::core::tests::make_csr;
+    use super::super::types::BindingRow;
     use super::execute_continuation;
 
     /// Resume produces the correct tail. Graph `(x)-[:E]->(y)-[:E]->(z)` with

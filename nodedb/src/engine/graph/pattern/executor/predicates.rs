@@ -3,7 +3,8 @@
 //! WHERE predicate application and RETURN column projection.
 
 use super::super::ast::*;
-use super::{BindingRow, ExecutionState, execute_clause};
+use super::core::execute_clause;
+use super::types::{BindingRow, ExecutionState};
 use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::EdgeStore;
 
