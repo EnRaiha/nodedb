@@ -105,7 +105,7 @@ impl CoreLoop {
     ) -> Response {
         match encode_match_envelope(&outcome.rows, &outcome.unresolved_frontier) {
             Ok(payload) => {
-                if outcome.truncated {
+                if outcome.truncated() {
                     self.response_partial(task, payload)
                 } else {
                     self.response_with_payload(task, payload)

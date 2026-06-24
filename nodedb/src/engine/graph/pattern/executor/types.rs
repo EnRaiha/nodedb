@@ -55,20 +55,65 @@ pub struct UnresolvedExpansion {
     pub partial_row: BindingRow,
 }
 
+/// A resume cursor for a variable-length expansion that hit a hard cap.
+///
+/// When `MATCH (a)-[*min..max]->(b)` truncates inside the executor, this
+/// captures the LIVE state needed to continue the BFS on a later round
+/// instead of silently dropping the un-expanded frontier:
+///
+/// - `triple_idx` — the within-chain triple whose expansion was capped.
+/// - `source_row` — the bindings present at that triple's source (so the
+///   resumed rows re-bind `a`/`b`/the edge var identically to a single pass).
+/// - `frontier` — the surviving un-expanded node ids (reached at
+///   `depth - 1`, awaiting expansion AT `depth`).
+/// - `depth` — the hop depth at which `frontier` is resumed.
+///
+/// There is deliberately **no `visited` set**: termination relies on the
+/// varlen `min..max` depth bound plus downstream coordinator row-dedup.
+/// Carrying `visited` across a future wire boundary is explicitly rejected,
+/// so the executor never depends on it for correctness — a node re-reached
+/// on resume produces a duplicate row that the coordinator collapses, never
+/// a skipped or mis-depthed row.
+//
+// The fields are produced by the executor in this sub-unit (2a) and consumed
+// by the cross-plane resume dispatch in the following sub-units (2b–2d), so
+// they are write-only within 2a.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct VarLenResume {
+    /// 0-based index of the capped triple within its pattern chain.
+    pub triple_idx: usize,
+    /// Bindings present at the capped expansion's source.
+    pub source_row: BindingRow,
+    /// Surviving un-expanded frontier node ids.
+    pub frontier: Vec<u32>,
+    /// Hop depth reached at the cap (the depth `frontier` resumes at).
+    pub depth: usize,
+}
+
 /// Result of running a MATCH query.
 ///
-/// `truncated` is `true` iff a hard cap inside variable-length expansion
-/// fired — the binding rows are incomplete. Data Plane handlers MUST set
-/// the `partial` flag on the response envelope when this is set so
-/// clients can observe the incomplete result.
+/// `truncation` is `Some` iff a hard cap inside variable-length expansion
+/// fired — the binding rows are incomplete and the [`VarLenResume`] cursor
+/// records where to continue. Data Plane handlers MUST set the `partial`
+/// flag on the response envelope when this is set so clients can observe
+/// the incomplete result. Use [`MatchOutcome::truncated`] for the bare bool.
 ///
 /// `unresolved_frontier` lists expansion sources whose edges are not
 /// present in the local CSR partition. On a fully-local CSR this vec
 /// is always empty and existing behaviour is byte-identical to before.
 pub struct MatchOutcome {
     pub rows: Vec<BindingRow>,
-    pub truncated: bool,
+    pub truncation: Option<VarLenResume>,
     pub unresolved_frontier: Vec<UnresolvedExpansion>,
+}
+
+impl MatchOutcome {
+    /// `true` iff a variable-length expansion hit a hard cap and the result
+    /// set is incomplete. Convenience for callers that only need the flag.
+    pub fn truncated(&self) -> bool {
+        self.truncation.is_some()
+    }
 }
 
 /// Shared mutable state collected during triple execution: the list of
@@ -81,7 +126,11 @@ pub struct MatchOutcome {
 /// and no frontier entries are ever emitted. The predicate is borrowed
 /// for the lifetime `'a` of the execution call to avoid allocation.
 pub(super) struct ExecutionState<'a> {
-    pub truncated: bool,
+    /// Structured resume cursor for the first variable-length expansion that
+    /// hit a cap during this execution; `None` until one truncates. Only the
+    /// first capped expansion is retained — resume is single-cursor by design
+    /// for 2a (multi-cursor fan-out is a later unit).
+    pub varlen_resume: Option<VarLenResume>,
     pub frontier: Vec<UnresolvedExpansion>,
     pub is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
 }
@@ -89,9 +138,22 @@ pub(super) struct ExecutionState<'a> {
 impl<'a> ExecutionState<'a> {
     pub(super) fn new(is_remote_node: Option<&'a dyn Fn(&str) -> bool>) -> Self {
         Self {
-            truncated: false,
+            varlen_resume: None,
             frontier: Vec::new(),
             is_remote_node,
+        }
+    }
+
+    /// `true` iff a variable-length expansion hit a cap during this execution.
+    pub(super) fn truncated(&self) -> bool {
+        self.varlen_resume.is_some()
+    }
+
+    /// Record the resume cursor from the first capped expansion. Subsequent
+    /// truncations are ignored (single-cursor design for 2a).
+    pub(super) fn record_truncation(&mut self, resume: VarLenResume) {
+        if self.varlen_resume.is_none() {
+            self.varlen_resume = Some(resume);
         }
     }
 }

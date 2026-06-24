@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use super::super::ast::*;
 use super::continuation;
 use super::expansion;
-use super::types::{BindingRow, ExecutionState, MatchOutcome, UnresolvedExpansion};
+use super::types::{BindingRow, ExecutionState, MatchOutcome, UnresolvedExpansion, VarLenResume};
 use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::{Direction, EdgeStore};
 
@@ -68,7 +68,7 @@ fn execute_query<'a>(
 
     Ok(MatchOutcome {
         rows,
-        truncated: state.truncated,
+        truncation: state.varlen_resume,
         unresolved_frontier: state.frontier,
     })
 }
@@ -167,18 +167,30 @@ pub(super) fn execute_triple(
         // (e.g. `(a)-[e*1..3]->(b) RETURN e`). For anonymous variable
         // expansions skip all `format!`/`String` work in the hot loop.
         let want_path = triple.edge.name.is_some();
+        let pattern = expansion::VarLenPattern {
+            label_filter,
+            direction,
+            min_hops: triple.edge.min_hops,
+            max_hops: triple.edge.max_hops,
+            want_path,
+        };
         for &src_id in &src_nodes {
             let expansion = expansion::expand_variable_length(
                 csr,
                 src_id,
-                label_filter,
-                direction,
-                triple.edge.min_hops,
-                triple.edge.max_hops,
-                want_path,
+                &pattern,
+                expansion::VarLenCaps::default(),
             );
-            if expansion.truncated {
-                state.truncated = true;
+            if let Some(cursor) = expansion.cursor {
+                // Capture the LIVE resume cursor instead of silently dropping
+                // the un-expanded frontier. `input_row` are the bindings at
+                // this expansion's source; the BFS resumes from `cursor`.
+                state.record_truncation(VarLenResume {
+                    triple_idx,
+                    source_row: input_row.clone(),
+                    frontier: cursor.frontier,
+                    depth: cursor.depth,
+                });
             }
             for (dst_id, path) in expansion.results {
                 if !binding_compatible(&triple.dst, csr, input_row, dst_id) {

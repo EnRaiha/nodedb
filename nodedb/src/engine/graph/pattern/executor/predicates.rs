@@ -74,7 +74,7 @@ pub(super) fn apply_predicate(
                     &mut sub_state,
                     None,
                 )?;
-                if sub_state.truncated {
+                if sub_state.truncated() {
                     // Sub-pattern hit a cap — treat the outer match as
                     // truncated too. The outer caller of apply_predicate
                     // is responsible for surfacing this, but we have no

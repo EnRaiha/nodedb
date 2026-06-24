@@ -13,4 +13,4 @@ pub(super) mod types;
 
 pub use self::continuation::execute_continuation;
 pub use self::core::{execute, rows_to_msgpack};
-pub use self::types::{BindingRow, MatchOutcome, UnresolvedExpansion};
+pub use self::types::{BindingRow, MatchOutcome, UnresolvedExpansion, VarLenResume};

@@ -197,7 +197,7 @@ pub fn execute_continuation<'a>(
 
     Ok(MatchOutcome {
         rows,
-        truncated: state.truncated,
+        truncation: state.varlen_resume,
         unresolved_frontier: state.frontier,
     })
 }
