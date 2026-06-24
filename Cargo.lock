@@ -4341,6 +4341,7 @@ dependencies = [
  "nodedb",
  "nodedb-array",
  "nodedb-bridge",
+ "nodedb-client",
  "nodedb-cluster",
  "nodedb-physical",
  "nodedb-query",

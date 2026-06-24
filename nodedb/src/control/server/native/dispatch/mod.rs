@@ -5,6 +5,7 @@
 mod auth;
 mod conversion;
 mod direct_ops;
+mod edge_recon_gate;
 mod limits;
 mod pgwire_bridge;
 mod plan_builder;

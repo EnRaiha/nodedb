@@ -16,6 +16,7 @@ path = "src/lib.rs"
 nodedb = { workspace = true }
 nodedb-array = { workspace = true }
 nodedb-bridge = { workspace = true }
+nodedb-client = { workspace = true, features = ["native"] }
 nodedb-cluster = { workspace = true }
 nodedb-physical = { workspace = true }
 nodedb-query = { workspace = true }

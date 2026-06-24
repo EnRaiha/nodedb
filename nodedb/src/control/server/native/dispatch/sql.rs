@@ -238,6 +238,19 @@ async fn execute_planned(
         return resp(error_to_native(seq, &e));
     }
 
+    // Implicit-edge DELETE/UPDATE routing gate (native-protocol parity with
+    // pgwire). See `edge_recon_gate` for the full invariant and guard
+    // documentation. Returns early when the gate fires, consuming `tasks`.
+    {
+        use super::edge_recon_gate::{EdgeReconResult, try_edge_recon_dispatch};
+        match try_edge_recon_dispatch(ctx, seq, tasks).await {
+            EdgeReconResult::Outcome(outcome) => return outcome,
+            EdgeReconResult::NotFired(returned_tasks) => {
+                tasks = returned_tasks;
+            }
+        }
+    }
+
     // Cross-shard write parity with pgwire: classify the planned task set and,
     // for a strict multi-shard write, route the whole batch through the Calvin
     // sequencer so it commits atomically. Single-shard (and best-effort) keep

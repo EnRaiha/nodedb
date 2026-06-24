@@ -44,6 +44,9 @@ pub struct TestClusterNode {
     pub node_id: u64,
     pub listen_addr: SocketAddr,
     pub pg_addr: SocketAddr,
+    /// Native (MessagePack) protocol listener port. Bound on an ephemeral port
+    /// so `NativeClient::connect("127.0.0.1:<native_port>")` works in tests.
+    pub native_port: u16,
     pub client: tokio_postgres::Client,
     pub shared: Arc<SharedState>,
     pub(super) _data_dir: tempfile::TempDir,
@@ -53,6 +56,7 @@ pub struct TestClusterNode {
     pub(super) cluster_shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub(super) core_stop_txs: Vec<std::sync::mpsc::Sender<()>>,
     pub(super) _pg_handle: tokio::task::JoinHandle<()>,
+    pub(super) _native_handle: tokio::task::JoinHandle<()>,
     pub(super) _poller_handle: tokio::task::JoinHandle<()>,
     pub(super) _core_handles: Vec<tokio::task::JoinHandle<()>>,
     pub(super) _event_plane: EventPlane,
@@ -364,7 +368,34 @@ impl TestClusterNode {
                 .await;
         });
 
-        // Give the listener a moment to start accepting.
+        // Native (MessagePack) listener — same SharedState, ephemeral port,
+        // trust-mode auth. Uses the pre-fired startup gate so it accepts
+        // immediately without a startup-phase wait (same as the pgwire listener).
+        let native_listener =
+            nodedb::control::server::listener::Listener::bind("127.0.0.1:0".parse()?)
+                .await
+                .map_err(|e| format!("bind native listener: {e}"))?;
+        let native_port = native_listener.local_addr().port();
+        let shared_native = Arc::clone(&shared);
+        let native_startup_gate = Arc::clone(&shared.startup);
+        let bus_native = pg_shutdown_bus.clone();
+        let native_handle = tokio::spawn(async move {
+            let _ = native_listener
+                .run(nodedb::control::server::listener::ListenerRunParams {
+                    state: shared_native,
+                    auth_mode: AuthMode::Trust,
+                    tls_acceptor: None,
+                    conn_semaphore: Arc::new(tokio::sync::Semaphore::new(128)),
+                    startup_gate: native_startup_gate,
+                    bus: bus_native,
+                    admission: Arc::new(
+                        nodedb::control::server::admission::AdmissionRegistry::new(),
+                    ),
+                })
+                .await;
+        });
+
+        // Give the listeners a moment to start accepting.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Connect tokio_postgres client.
@@ -383,6 +414,7 @@ impl TestClusterNode {
             node_id,
             listen_addr,
             pg_addr,
+            native_port,
             client,
             shared,
             _data_dir: data_dir,
@@ -392,6 +424,7 @@ impl TestClusterNode {
             cluster_shutdown_tx,
             core_stop_txs,
             _pg_handle: pg_handle,
+            _native_handle: native_handle,
             _poller_handle: poller_handle,
             _core_handles: core_handles,
             _event_plane: event_plane,
@@ -453,6 +486,7 @@ impl Drop for TestClusterNode {
         // no explicit signal needed here.
         self._conn_handle.abort();
         self._pg_handle.abort();
+        self._native_handle.abort();
         self._poller_handle.abort();
         for h in &self._core_handles {
             h.abort();
