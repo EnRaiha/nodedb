@@ -65,11 +65,16 @@ pub struct UnresolvedExpansion {
 /// - `source_row` — the bindings present at that triple's source (so the
 ///   resumed rows re-bind `a`/`b`/the edge var identically to a single pass).
 /// - `frontier` — the surviving un-expanded frontier entries, each a
-///   `(local_id, path_string)` pair (reached at `depth - 1`, awaiting
+///   `(node_name, path_string)` pair (reached at `depth - 1`, awaiting
 ///   expansion AT `depth`). The path string is the accumulated path-so-far
 ///   from the original source when the edge variable is bound (`want_path`),
 ///   empty otherwise. Carrying it verbatim is what keeps resumed `RETURN p`
-///   path strings continuous with the first pass.
+///   path strings continuous with the first pass. Keying the frontier by node
+///   NAME (not a CSR-local dense id) is what makes a resume safe to broadcast
+///   to ALL cores on a node: a local id is per-core and overlaps across cores,
+///   so a foreign core would misinterpret it against its own CSR; a name is
+///   global, so only the owning core resolves it to a local id and every other
+///   core naturally skips names it does not own.
 /// - `depth` — the hop depth at which `frontier` is resumed.
 ///
 /// There is deliberately **no `visited` set**: termination relies on the
@@ -82,10 +87,11 @@ pub struct UnresolvedExpansion {
 // The fields are produced by the executor on a capped expansion and consumed by
 // the cross-plane resume dispatch (`GraphOp::MatchVarLenResume`). The struct is
 // wire-serializable (serde + zerompk) so the cursor can ride the SPSC bridge
-// inside the resume plan variant; each `frontier` entry is a `(local_id,
-// path_string)` pair carrying a CSR-local node id alongside its accumulated
-// path-so-far, so a same-shard resume is exact (cross-shard id↔name translation
-// is handled by the remote-resume envelope path).
+// inside the resume plan variant; each `frontier` entry is a `(node_name,
+// path_string)` pair carrying a global node name alongside its accumulated
+// path-so-far. Name-keying makes the cursor core-agnostic: the resume plan is
+// fanned to all cores, and each core resolves the name against its own CSR —
+// the owning core resumes, foreign cores skip names they do not own.
 #[derive(
     Debug,
     Clone,
@@ -100,8 +106,8 @@ pub struct VarLenResume {
     pub triple_idx: usize,
     /// Bindings present at the capped expansion's source.
     pub source_row: BindingRow,
-    /// Surviving un-expanded frontier entries: `(local_id, path_so_far)`.
-    pub frontier: Vec<(u32, String)>,
+    /// Surviving un-expanded frontier entries: `(node_name, path_so_far)`.
+    pub frontier: Vec<(String, String)>,
     /// Hop depth reached at the cap (the depth `frontier` resumes at).
     pub depth: usize,
 }

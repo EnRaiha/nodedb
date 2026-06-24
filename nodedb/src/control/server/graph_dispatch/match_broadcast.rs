@@ -324,7 +324,10 @@ mod tests {
         VarLenResume {
             triple_idx: 2,
             source_row: row(&[("a", "alice"), ("b", "bob")]),
-            frontier: vec![(7, "alice->bob".into()), (9, "alice->carol".into())],
+            frontier: vec![
+                ("bob".into(), "alice->bob".into()),
+                ("carol".into(), "alice->carol".into()),
+            ],
             depth: 3,
         }
     }

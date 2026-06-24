@@ -378,10 +378,10 @@ mod tests {
             triple_idx: 2,
             source_row,
             frontier: vec![
-                (3, "n0->n1->n3".to_string()),
-                (7, "n0->n2->n7".to_string()),
-                (11, String::new()),
-                (0, "n0".to_string()),
+                ("n3".to_string(), "n0->n1->n3".to_string()),
+                ("n7".to_string(), "n0->n2->n7".to_string()),
+                ("n11".to_string(), String::new()),
+                ("n0".to_string(), "n0".to_string()),
             ],
             depth: 4,
         };

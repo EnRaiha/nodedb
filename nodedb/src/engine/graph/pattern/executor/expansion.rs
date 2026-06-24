@@ -53,11 +53,14 @@ impl Default for VarLenCaps {
 #[derive(Debug, Clone)]
 pub(super) struct VarLenCursor {
     /// Un-expanded frontier entries to resume the BFS from, each a
-    /// `(node_id, path_so_far)` pair held verbatim from the live BFS frontier.
-    /// The path string carries the accumulated route from the original source
-    /// (empty when the edge variable is unbound), so resumed `RETURN p` rows
-    /// render full paths instead of bare node names.
-    pub frontier: Vec<(u32, String)>,
+    /// `(node_name, path_so_far)` pair. The node is keyed by its GLOBAL name,
+    /// not the CSR-local dense id used during live traversal: local ids are
+    /// per-core and overlap across cores, so a captured cursor must be
+    /// core-agnostic to be safely fanned to all cores on resume. The path
+    /// string carries the accumulated route from the original source (empty
+    /// when the edge variable is unbound), so resumed `RETURN p` rows render
+    /// full paths instead of bare node names.
+    pub frontier: Vec<(String, String)>,
     /// Hop depth at which `frontier` is to be expanded (`resume_depth`).
     pub depth: usize,
 }
@@ -155,13 +158,18 @@ pub(super) fn expand_variable_length(
 
 /// Resume a previously-capped variable-length expansion from a [`VarLenCursor`].
 ///
-/// `cursor.frontier` are `(node_id, path_so_far)` pairs reached at
+/// `cursor.frontier` are `(node_name, path_so_far)` pairs reached at
 /// `cursor.depth - 1` on the prior round and awaiting expansion AT
-/// `cursor.depth`. The pairs are fed into the BFS verbatim, so the accumulated
-/// path prefix from the original source is preserved — resumed `RETURN p` rows
-/// render the full path, not just the resume node's own name. The BFS continues
-/// with a **fresh** `visited` set (seeded only with the resume frontier ids so a
-/// node is not expanded twice within this round): per the cross-shard contract,
+/// `cursor.depth`. Each name is resolved against THIS core's CSR via
+/// `node_id_raw`: a name the CSR owns seeds the BFS at its local id; a name the
+/// CSR does NOT own is silently skipped (not an error). This name-keyed
+/// self-scoping is what lets the resume plan be broadcast to all cores — only
+/// the owning core resolves the frontier and resumes; every other core skips
+/// every name and yields an empty expansion. The carried path prefix from the
+/// original source is preserved, so resumed `RETURN p` rows render the full
+/// path, not just the resume node's own name. The BFS continues with a
+/// **fresh** `visited` set (seeded only with the resolved resume frontier ids so
+/// a node is not expanded twice within this round): per the cross-shard contract,
 /// dedup of rows already emitted on the prior round is the coordinator's job,
 /// never the executor's. The `min_hops..=max_hops` bound is honored across the
 /// resume boundary because the loop continues at `cursor.depth`, so a node
@@ -175,19 +183,25 @@ pub(super) fn resume_variable_length(
     pattern: &VarLenPattern<'_>,
     caps: VarLenCaps,
 ) -> VarLenExpansion {
-    // Seed visited with the resume frontier ids so an intra-round revisit of a
-    // resume node is suppressed; rows already emitted in the PRIOR round are
-    // intentionally NOT tracked (coordinator dedups across rounds). The frontier
-    // pairs are seeded directly — their carried `path_so_far` strings are the
-    // accumulated route from the original source, so resumed paths stay
-    // continuous instead of being rebuilt from the resume node's own name.
+    // Resolve each frontier NAME against this core's CSR. A name the CSR owns
+    // becomes a local id and seeds the BFS; a name it does NOT own is skipped —
+    // this is what lets the resume plan be fanned to all cores and self-scope to
+    // the owning one. Seed visited with the resolved ids so an intra-round
+    // revisit of a resume node is suppressed; rows already emitted in the PRIOR
+    // round are intentionally NOT tracked (coordinator dedups across rounds).
+    // The carried `path_so_far` strings are the accumulated route from the
+    // original source, so resumed paths stay continuous instead of being rebuilt
+    // from the resume node's own name.
     let mut visited: HashSet<u32> = HashSet::new();
     let mut frontier: Vec<(u32, String)> = Vec::with_capacity(cursor.frontier.len());
-    for (node, path) in &cursor.frontier {
-        if !visited.insert(*node) {
+    for (name, path) in &cursor.frontier {
+        let Some(local_id) = csr.node_id_raw(name) else {
+            continue;
+        };
+        if !visited.insert(local_id) {
             continue;
         }
-        frontier.push((*node, path.clone()));
+        frontier.push((local_id, path.clone()));
     }
 
     run_bfs(
@@ -258,11 +272,19 @@ fn run_bfs(
         let cap_hit = results.len() >= caps.max_results || next_frontier.len() >= caps.max_frontier;
         if cap_hit {
             if depth < pattern.max_hops && !next_frontier.is_empty() {
+                // Convert the live `(local_id, path_so_far)` frontier to a
+                // `(node_name, path_so_far)` cursor. The live BFS keys on dense
+                // CSR-local ids for traversal speed, but the captured cursor must
+                // key on GLOBAL names so it is core-agnostic and safe to fan to
+                // all cores on resume (local ids overlap across cores). The
+                // carried path strings keep path-returning queries continuous
+                // across the cap.
+                let named_frontier: Vec<(String, String)> = next_frontier
+                    .into_iter()
+                    .map(|(local_id, path)| (csr.node_name_raw(local_id).to_string(), path))
+                    .collect();
                 cursor = Some(VarLenCursor {
-                    // Store the live frontier verbatim — the `(id, path_so_far)`
-                    // pairs — so resume seeds the exact accumulated path context
-                    // and path-returning queries stay continuous across the cap.
-                    frontier: next_frontier,
+                    frontier: named_frontier,
                     depth: depth + 1,
                 });
             }
@@ -696,6 +718,82 @@ mod tests {
             union, full_paths,
             "first-pass ∪ resumed path strings must equal the uncapped want_path set; \
              a truncated suffix on the resumed tail would fail this"
+        );
+    }
+
+    /// Spec (multi-core safety): a resume cursor is fanned to ALL cores on a
+    /// node, each running `resume_variable_length` against its OWN CSR. A core
+    /// that does not own any of the cursor's frontier NAMES must produce ZERO
+    /// results — never spurious rows from misinterpreting a foreign core's
+    /// dense local id against its own CSR. With name-keyed frontiers, a name
+    /// absent from this CSR resolves to `None` via `node_id_raw` and is skipped.
+    #[test]
+    fn varlen_resume_skips_unowned_names_yields_empty() {
+        // This CSR owns only {n0..n6}. The cursor's frontier names belong to a
+        // DIFFERENT core's partition and are entirely absent here.
+        let csr = make_chain(6);
+        let pat = VarLenPattern {
+            label_filter: Some("l"),
+            direction: Direction::Out,
+            min_hops: 1,
+            max_hops: 6,
+            want_path: false,
+        };
+        let cursor = VarLenCursor {
+            frontier: vec![
+                ("foreign_a".to_string(), "src->foreign_a".to_string()),
+                ("foreign_b".to_string(), "src->foreign_b".to_string()),
+            ],
+            depth: 2,
+        };
+
+        let resumed = resume_variable_length(&csr, &cursor, &pat, VarLenCaps::default());
+
+        assert!(
+            resumed.results.is_empty(),
+            "a core that owns none of the cursor's frontier names must yield no \
+             rows; got {:?}",
+            resumed.results
+        );
+        assert!(
+            resumed.cursor.is_none(),
+            "an empty resume frontier has nothing to truncate"
+        );
+    }
+
+    /// Spec (positive resolution): a cursor whose frontier NAMES exist in this
+    /// CSR resolves each name to its local id and resumes correctly. Pairing
+    /// with the skip-unowned test above, this proves name-keying preserves
+    /// single-core correctness while making the cursor core-agnostic: the
+    /// owning core resolves and resumes, foreign cores skip.
+    #[test]
+    fn varlen_resume_resolves_owned_names() {
+        // Chain n0 -> ... -> n6. Resume at depth 2 from the owned name "n1"
+        // (reached at depth 1 on a hypothetical prior round). Expanding "n1"
+        // onward at *1..6 reaches {n2..n6}.
+        let csr = make_chain(6);
+        let pat = VarLenPattern {
+            label_filter: Some("l"),
+            direction: Direction::Out,
+            min_hops: 1,
+            max_hops: 6,
+            want_path: false,
+        };
+        let cursor = VarLenCursor {
+            frontier: vec![("n1".to_string(), "n0->n1".to_string())],
+            depth: 2,
+        };
+
+        let resumed = resume_variable_length(&csr, &cursor, &pat, VarLenCaps::default());
+
+        let dsts = dst_set(&resumed.results);
+        let expected: std::collections::HashSet<u32> = ["n2", "n3", "n4", "n5", "n6"]
+            .iter()
+            .map(|n| csr.node_id_raw(n).unwrap())
+            .collect();
+        assert_eq!(
+            dsts, expected,
+            "resuming from owned name n1 must reach {{n2..n6}}; got {dsts:?}"
         );
     }
 }
