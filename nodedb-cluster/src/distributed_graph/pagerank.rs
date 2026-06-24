@@ -4,6 +4,11 @@
 
 use std::collections::HashMap;
 
+/// Per-superstep outbound cross-shard contributions: `target_shard_id ->
+/// [(destination_vertex_name, contribution)]`. The coordinator routes each entry
+/// to the shard that owns `target_shard_id` for the next superstep.
+pub type OutboundContributions = HashMap<u16, Vec<(String, f64)>>;
+
 /// Per-shard PageRank state maintained across supersteps.
 #[derive(Debug)]
 pub struct ShardPageRankState {
@@ -100,7 +105,7 @@ impl ShardPageRankState {
         global_dangling_sum: f64,
         local_edge_iter: &dyn Fn(u32) -> Vec<u32>,
         node_id_to_local: &dyn Fn(&str) -> Option<u32>,
-    ) -> (f64, f64, HashMap<u16, Vec<(String, f64)>>) {
+    ) -> (f64, f64, OutboundContributions) {
         let n = global_n as f64;
         let teleport = (1.0 - damping) / n;
 
