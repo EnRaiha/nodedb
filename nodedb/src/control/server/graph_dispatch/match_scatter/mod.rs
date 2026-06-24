@@ -37,6 +37,7 @@
 //! `cluster_routing.is_none()`.
 
 mod coord;
+mod resume_queue;
 mod round_loop;
 mod round_zero;
 

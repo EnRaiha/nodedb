@@ -15,14 +15,29 @@ use nodedb_cluster::distributed_graph::{
     DistributedMatchCoordinator, PatternContinuation, ShardMatchResult,
 };
 
-use super::round_loop::dispatch_continuations;
+use super::resume_queue::{PendingResume, resume_to_pending};
+use super::round_loop::{dispatch_continuations, dispatch_resumes};
 use super::round_zero::scatter_round_zero;
+
+/// Anti-livelock ceiling on variable-length resume paging rounds.
+///
+/// The pattern's triple count (`max_rounds`) bounds cross-shard *hops*, but it
+/// does NOT bound variable-length expansion *paging depth*: a single capped
+/// triple can require many resume rounds to drain (one per cap re-fire), and the
+/// coordinator has no live `|V|` to derive a tighter bound from. This generous
+/// ceiling guarantees termination for pathological patterns (e.g. dense graphs
+/// with a wide `*min..max` range) without truncating any realistic workload.
+/// Exhausting it with cursors still pending sets the outcome's `partial` flag —
+/// it is the single, surfaced backstop, never a silent drop.
+const MAX_RESUME_ROUNDS: u32 = 10_000;
 
 /// Result of a cross-shard MATCH scatter: the deduped binding rows as the bare
 /// msgpack array shape `match_payload_to_response` expects, plus a `partial`
-/// flag set when any shard truncated OR the coordinator exhausted `max_rounds`
-/// with continuations still pending (a real partial result — never silently
-/// dropped).
+/// flag set ONLY on a real, unrecoverable partial: the coordinator exhausted
+/// `max_rounds` with continuations still pending, or exhausted
+/// `MAX_RESUME_ROUNDS` with variable-length resume cursors still pending. A
+/// shard truncation that yields a resume cursor is RECOVERABLE — it is drained
+/// across resume rounds and does NOT set `partial`.
 pub struct MatchScatterOutcome {
     pub rows_payload: Payload,
     pub partial: bool,
@@ -37,21 +52,13 @@ pub(super) struct TaggedShardResult {
     pub(super) emitting_node: u64,
     pub(super) rows: Vec<HashMap<String, String>>,
     pub(super) frontier: Vec<UnresolvedExpansion>,
-    /// `true` if the shard truncated its result (a hard cap fired). Surfaced
-    /// up to the scatter outcome's `partial` so a truncated cross-shard MATCH
-    /// is never silently presented as complete. Populated symmetrically for the
-    /// LOCAL broadcast and every REMOTE shard — both ride the resume cursor(s)
-    /// in the envelope bytes, so remote truncation is now observable here.
-    pub(super) truncated: bool,
     /// The variable-length truncation resume cursor(s) this shard produced,
     /// tagged (by `emitting_node`) like the frontier. A node fanned across
     /// cores can truncate on several at once, hence a `Vec`. Decoded from the
-    /// shard's `{rows, frontier, resume}` envelope (local OR remote) and landed
-    /// here carrying per-shard variable-length truncation cursors that the
-    /// coordinator's resume re-dispatch path will consume to re-issue
-    /// `MatchVarLenResume` plans. The re-dispatch wiring is not yet connected;
-    /// the field is populated and preserved so the data survives until it is.
-    #[allow(dead_code)]
+    /// shard's `{rows, frontier, resume}` envelope (local OR remote). The
+    /// coordinator's resume re-dispatch path consumes these to re-issue
+    /// `MatchVarLenResume` plans, draining a capped expansion across rounds
+    /// until the full result set is returned.
     pub(super) resume: Vec<VarLenResume>,
 }
 
@@ -73,38 +80,82 @@ pub async fn scatter_match(
 
     let mut partial = false;
 
+    // Variable-length resume cursors awaiting re-dispatch. A frontier-hop
+    // continuation lives in the coordinator's pending queue; a varlen-paging
+    // resume lives here (its cursor type is a nodedb-crate type, kept on the
+    // Control-Plane side). Both feed back through `feed_result`, so a resume can
+    // emit a fresh frontier (→ coordinator) and a fresh resume (→ this queue),
+    // and they round-trip naturally.
+    let mut pending_resumes: Vec<PendingResume> = Vec::new();
+    let mut resume_rounds: u32 = 0;
+    // Latches once the coordinator's hop budget (`max_rounds`) is exhausted with
+    // continuations still pending, so the loop stops re-attempting `advance()`
+    // (which would spin) but keeps draining any remaining resume cursors.
+    let mut continuations_exhausted = false;
+
     // ---- Round 0: scatter the Match plan to local + every remote owner. ----
     let round0 =
         scatter_round_zero(state, tenant_id, database_id, &query_bytes, deadline_ms).await?;
     for tagged in round0 {
-        if feed_result(state, &mut coordinator, tagged)? {
-            partial = true;
-        }
+        feed_result(state, &mut coordinator, &mut pending_resumes, tagged)?;
     }
 
-    // ---- Round loop: dispatch pending continuations until none remain. ----
-    while coordinator.has_pending() {
-        if !coordinator.advance() {
-            // Exhausted max_rounds with work still pending: surface as partial
-            // rather than silently dropping the remaining continuations.
-            if coordinator.has_pending() {
-                partial = true;
+    // ---- Round loop: drain both frontier continuations AND varlen resumes. ----
+    while (coordinator.has_pending() && !continuations_exhausted) || !pending_resumes.is_empty() {
+        // Frontier continuations: bounded by the pattern's hop count.
+        if coordinator.has_pending() && !continuations_exhausted {
+            if !coordinator.advance() {
+                // Exhausted max_rounds with hops still pending: surface as
+                // partial rather than silently dropping the continuations.
+                // Latch so the loop stops re-attempting `advance()` (it would
+                // spin) but still drains any pending resume cursors below.
+                if coordinator.has_pending() {
+                    partial = true;
+                }
+                continuations_exhausted = true;
+            } else {
+                let pending = coordinator.take_all_pending();
+                let tagged = dispatch_continuations(
+                    state,
+                    tenant_id,
+                    database_id,
+                    &query_bytes,
+                    deadline_ms,
+                    pending,
+                )
+                .await?;
+                for t in tagged {
+                    feed_result(state, &mut coordinator, &mut pending_resumes, t)?;
+                }
             }
-            break;
         }
-        let pending = coordinator.take_all_pending();
-        let tagged = dispatch_continuations(
-            state,
-            tenant_id,
-            database_id,
-            &query_bytes,
-            deadline_ms,
-            pending,
-        )
-        .await?;
-        for t in tagged {
-            if feed_result(state, &mut coordinator, t)? {
+
+        // Variable-length resume cursors: bounded by MAX_RESUME_ROUNDS, a
+        // separate paging budget (hops do not bound paging depth).
+        if !pending_resumes.is_empty() {
+            if resume_rounds >= MAX_RESUME_ROUNDS {
+                // Budget exhausted with cursors pending: the surfaced backstop.
+                // Never drop cursors silently.
                 partial = true;
+                break;
+            }
+            resume_rounds += 1;
+            // Take the current batch so this round cannot spin on the same
+            // cursors: progress is guaranteed because each dispatched resume
+            // either grows its owning core's BFS visited set or is capped again
+            // (re-enqueued as a fresh, advanced cursor).
+            let batch = std::mem::take(&mut pending_resumes);
+            let tagged = dispatch_resumes(
+                state,
+                tenant_id,
+                database_id,
+                &query_bytes,
+                deadline_ms,
+                batch,
+            )
+            .await?;
+            for t in tagged {
+                feed_result(state, &mut coordinator, &mut pending_resumes, t)?;
             }
         }
     }
@@ -119,26 +170,34 @@ pub async fn scatter_match(
 
 /// Convert a tagged shard result into a `ShardMatchResult` (filtering its
 /// frontier to genuine cross-shard continuations) and feed it to the
-/// coordinator. Returns `true` if this shard truncated its result, so the
-/// caller can set the scatter outcome's `partial` flag.
+/// coordinator. Any variable-length resume cursor(s) the shard produced are
+/// routed back to their owning node and appended to `pending_resumes` for
+/// re-dispatch.
+///
+/// A truncation that yields a resume cursor is RECOVERABLE (drained across
+/// resume rounds) and is enqueued rather than surfaced — so this no longer
+/// reports a partial. The only surfaced partials come from the coordinator's
+/// hop budget and the resume-round budget, both handled in `scatter_match`.
 pub(super) fn feed_result(
     state: &SharedState,
     coordinator: &mut DistributedMatchCoordinator,
+    pending_resumes: &mut Vec<PendingResume>,
     tagged: TaggedShardResult,
-) -> crate::Result<bool> {
+) -> crate::Result<()> {
     let TaggedShardResult {
         emitting_node,
         rows,
         frontier,
-        truncated,
-        // Carried-but-not-yet-acted-on: the decoded resume cursor(s) are now
-        // present in the scatter (no longer dropped on the remote path). The
-        // round loop does NOT yet re-dispatch a `MatchVarLenResume` plan from
-        // them — that is the next sub-unit. For now the coordinator only lifts
-        // the `truncated` flag into `partial` (below) so a capped result is
-        // never presented as complete.
-        resume: _,
+        resume,
     } = tagged;
+
+    // Enqueue each resume cursor, routed back to the node owning its surviving
+    // frontier. Degenerate (empty-frontier) cursors are skipped.
+    for cursor in resume {
+        if let Some(pending) = resume_to_pending(state, cursor)? {
+            pending_resumes.push(pending);
+        }
+    }
 
     let continuations = frontier_to_continuations(state, emitting_node, frontier)?;
     coordinator.add_shard_result(ShardMatchResult {
@@ -148,7 +207,7 @@ pub(super) fn feed_result(
         completed_rows: rows,
         continuations,
     });
-    Ok(truncated)
+    Ok(())
 }
 
 /// Convert a shard's `UnresolvedExpansion` frontier into cross-shard
