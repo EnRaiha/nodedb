@@ -16,7 +16,6 @@ mod clone_write_dispatch;
 mod execute;
 mod gateway_dispatch;
 mod kv_wrapping;
-mod ollp_helpers;
 mod planning;
 mod set_ops;
 mod streaming;

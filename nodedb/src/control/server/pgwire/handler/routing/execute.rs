@@ -6,8 +6,9 @@
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
-use crate::control::planner::calvin::dispatch::collection_name_from_plan;
-use crate::control::planner::calvin::{DispatchClass, classify_dispatch, is_dependent_predicate};
+use crate::control::planner::calvin::{
+    DispatchClass, classify_dispatch, plan_needs_implicit_edge_recon,
+};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -172,36 +173,28 @@ impl NodeDbPgHandler {
         // correctly on a coordinator that is not the data-shard leader.
         {
             let tx_state = self.sessions.transaction_state(addr);
+            // The not-in-txn-block + registry-available guards are session-state
+            // concerns and stay here (per protocol); the edge-bearing detection
+            // is the protocol-neutral `plan_needs_implicit_edge_recon`. A genuine
+            // catalog READ error propagates (misrouting a delete on a real I/O
+            // fault would silently skip edge cleanup → dangling edges); an absent
+            // catalog or collection row falls through as non-edge-bearing.
             if tx_state != crate::control::server::pgwire::session::TransactionState::InBlock
                 && self.state.calvin_completion_registry.get().is_some()
-                && let Some(dep_task) = tasks.iter().find(|t| is_dependent_predicate(&t.plan))
+                && plan_needs_implicit_edge_recon(&self.state, &tasks, tenant_id)
+                    .map_err(|e| {
+                        let (severity, code, message) = error_to_sqlstate(&e);
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            severity.to_owned(),
+                            code.to_owned(),
+                            message,
+                        )))
+                    })?
+                    .is_some()
             {
-                let coll = collection_name_from_plan(&dep_task.plan);
-                let db = dep_task.database_id;
-                // A genuine catalog READ error propagates (misrouting a delete on
-                // a real I/O fault would silently skip edge cleanup → dangling
-                // edges). An ABSENT catalog (None) or absent collection row
-                // (`Ok(None)`) is treated as non-edge-bearing and falls through.
-                let edge_bearing = match self.state.credentials.catalog().as_ref() {
-                    Some(catalog) => catalog
-                        .get_collection(db, tenant_id.as_u64(), &coll)
-                        .map_err(|e| {
-                            let (severity, code, message) = error_to_sqlstate(&e);
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                severity.to_owned(),
-                                code.to_owned(),
-                                message,
-                            )))
-                        })?
-                        .map(|c| c.has_implicit_edges)
-                        .unwrap_or(false),
-                    None => false,
-                };
-                if edge_bearing {
-                    return self
-                        .dispatch_calvin_multishard(tasks, tenant_id, identity, addr)
-                        .await;
-                }
+                return self
+                    .dispatch_calvin_multishard(tasks, tenant_id, identity, addr)
+                    .await;
             }
         }
 
