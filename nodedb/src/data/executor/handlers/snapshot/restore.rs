@@ -257,27 +257,29 @@ impl CoreLoop {
     }
 
     fn restore_timeseries(&mut self, key: &str, bytes: &[u8]) -> crate::Result<()> {
-        let columns: Vec<(String, Vec<u8>)> =
+        use crate::engine::timeseries::columnar_memtable::{
+            ColumnarMemtable, ColumnarMemtableConfig, MemtableSnapshot,
+        };
+
+        let snap: MemtableSnapshot =
             zerompk::from_msgpack(bytes).map_err(|e| crate::Error::Serialization {
                 format: "msgpack".into(),
                 detail: e.to_string(),
             })?;
-        // Snapshot keys are backward-compatible:
-        //   * new format: "{database_id}:{tenant_id}:{collection}"
-        //   * legacy format (pre-scoping): "{tenant_id}:{collection}" →
-        //     database_id defaults to `DatabaseId::DEFAULT` (0).
-        // Re-emit a canonical db-scoped key so restored data lands in the
-        // right database namespace regardless of the snapshot's age.
+
+        // Parse key: "{database_id}:{tenant_id}:{collection}" (canonical).
+        // Legacy 2-part key ("{tenant_id}:{collection}") and bare keys are
+        // handled by `parse_timeseries_snapshot_key`.
         let (database_id, tenant_id, collection) = parse_timeseries_snapshot_key(key);
-        let scoped_key = format!("{database_id}:{tenant_id}:{collection}");
-        // Store column data in sparse engine keyed by scoped collection.
-        // Timeseries engine will rebuild memtable from these on access.
-        for (col_name, col_data) in columns {
-            let restore_key = format!("{scoped_key}:{col_name}");
-            if let Err(e) = self.sparse.put_raw(&restore_key, &col_data) {
-                warn!(restore_key, error = %e, "failed to restore timeseries column");
-            }
-        }
+
+        let mt = ColumnarMemtable::from_snapshot(snap, ColumnarMemtableConfig::default())?;
+
+        let map_key = (
+            nodedb_types::DatabaseId::new(database_id),
+            crate::types::TenantId::new(tenant_id),
+            collection,
+        );
+        self.columnar_memtables.insert(map_key, mt);
         Ok(())
     }
 }

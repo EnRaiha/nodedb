@@ -68,7 +68,16 @@ impl TimeRange {
 ///
 /// Tag columns store 4-byte u32 IDs instead of full strings. Shared by
 /// Origin columnar segments, Lite native segments, and WASM segments.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
 pub struct SymbolDictionary {
     /// String → symbol ID.
     forward: HashMap<String, u32>,

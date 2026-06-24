@@ -5,13 +5,24 @@
 use std::collections::HashMap;
 
 use nodedb_types::timeseries::{SeriesId, SymbolDictionary};
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
 /// Column data type in a columnar memtable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
 pub enum ColumnType {
     /// Designated timestamp column (i64 millis).
     Timestamp,
