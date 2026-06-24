@@ -197,6 +197,26 @@ impl ColumnarMemtable {
         Ok(())
     }
 
+    /// Reconstruct a memtable directly from already-validated column data.
+    ///
+    /// Used by `MutationEngine::from_snapshot` to restore a memtable from a
+    /// backup without re-running per-row validation. The caller must guarantee
+    /// that `columns` is parallel to `schema.columns` and that every column
+    /// contains exactly `row_count` rows. The flush threshold is set to the
+    /// default value.
+    pub(crate) fn from_raw_columns(
+        schema: &ColumnarSchema,
+        columns: Vec<ColumnData>,
+        row_count: usize,
+    ) -> Self {
+        Self {
+            schema: schema.clone(),
+            columns,
+            row_count,
+            flush_threshold: DEFAULT_FLUSH_THRESHOLD,
+        }
+    }
+
     /// Add a new column to the schema, backfilling existing rows with nulls/defaults.
     pub fn add_column(&mut self, name: String, column_type: ColumnType, nullable: bool) {
         if self.schema.columns.iter().any(|c| c.name == name) {

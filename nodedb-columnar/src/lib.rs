@@ -42,7 +42,7 @@ pub use format::{
     VERSION_MAJOR, VERSION_MINOR,
 };
 pub use memtable::{ColumnarMemtable, IngestValue, MemtableRowIter};
-pub use mutation::MutationEngine;
+pub use mutation::{ColumnDataSnapshot, ColumnarEngineSnapshot, MutationEngine};
 pub use pk_index::PkIndex;
 pub use predicate::{
     BLOOM_BITS_DEFAULT, BLOOM_BYTES, BLOOM_K_DEFAULT, PredicateOp, PredicateValue, ScanPredicate,
