@@ -61,7 +61,9 @@ pub async fn execute_plan_all_local_cores(
     match &plan {
         PhysicalPlan::Graph(g) => match g {
             // ── MATCH / MatchContinuation ─────────────────────────────────────
-            GraphOp::Match { .. } | GraphOp::MatchContinuation { .. } => {
+            GraphOp::Match { .. }
+            | GraphOp::MatchContinuation { .. }
+            | GraphOp::MatchVarLenResume { .. } => {
                 use crate::control::server::graph_dispatch::match_broadcast::broadcast_match_to_all_cores;
                 use crate::data::executor::handlers::graph_match::encode_match_envelope_raw;
 
@@ -298,6 +300,7 @@ async fn gather_graph_op_all_cores(
                     // developer must decide whether it needs per-core scoping.
                     GraphOp::Match { .. }
                     | GraphOp::MatchContinuation { .. }
+                    | GraphOp::MatchVarLenResume { .. }
                     | GraphOp::EdgePut { .. }
                     | GraphOp::EdgePutBatch { .. }
                     | GraphOp::EdgeDelete { .. }

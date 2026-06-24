@@ -325,7 +325,7 @@ fn resolve_binding(
     .collect()
 }
 
-fn binding_compatible(
+pub(super) fn binding_compatible(
     binding: &NodeBinding,
     csr: &CsrIndex,
     row: &BindingRow,
@@ -345,7 +345,7 @@ fn binding_compatible(
     true
 }
 
-fn bind_node(row: &mut BindingRow, binding: &NodeBinding, csr: &CsrIndex, node_id: u32) {
+pub(super) fn bind_node(row: &mut BindingRow, binding: &NodeBinding, csr: &CsrIndex, node_id: u32) {
     if let Some(ref name) = binding.name {
         row.entry(name.clone())
             .or_insert_with(|| csr.node_name_raw(node_id).to_string());

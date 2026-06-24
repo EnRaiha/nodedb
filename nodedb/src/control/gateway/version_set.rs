@@ -257,6 +257,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | WccSuperstep(_)
                 | Match { .. }
                 | MatchContinuation { .. }
+                | MatchVarLenResume { .. }
                 | TemporalAlgorithm { .. }
                 | Stats {
                     collection: None, ..

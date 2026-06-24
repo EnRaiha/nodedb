@@ -91,6 +91,7 @@ pub fn plan_contains_cluster_partitioned_leaf(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Graph(GraphOp::Algo { .. })
         | PhysicalPlan::Graph(GraphOp::Match { .. })
         | PhysicalPlan::Graph(GraphOp::MatchContinuation { .. })
+        | PhysicalPlan::Graph(GraphOp::MatchVarLenResume { .. })
         | PhysicalPlan::Graph(GraphOp::TemporalNeighbors { .. })
         | PhysicalPlan::Graph(GraphOp::TemporalAlgorithm { .. })
         | PhysicalPlan::Graph(GraphOp::BspSuperstep(_))

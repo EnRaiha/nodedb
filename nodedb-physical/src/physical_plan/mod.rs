@@ -241,6 +241,7 @@ impl PhysicalPlan {
                 | PhysicalPlan::Graph(GraphOp::RagFusion { .. })
                 | PhysicalPlan::Graph(GraphOp::Match { .. })
                 | PhysicalPlan::Graph(GraphOp::MatchContinuation { .. })
+                | PhysicalPlan::Graph(GraphOp::MatchVarLenResume { .. })
                 | PhysicalPlan::Graph(GraphOp::TemporalNeighbors { .. })
                 | PhysicalPlan::Graph(GraphOp::TemporalAlgorithm { .. })
                 | PhysicalPlan::Graph(GraphOp::BspSuperstep(_))

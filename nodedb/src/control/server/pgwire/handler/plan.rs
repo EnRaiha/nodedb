@@ -110,6 +110,7 @@ pub(super) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Graph(GraphOp::Algo { .. })
         | PhysicalPlan::Graph(GraphOp::Match { .. })
         | PhysicalPlan::Graph(GraphOp::MatchContinuation { .. })
+        | PhysicalPlan::Graph(GraphOp::MatchVarLenResume { .. })
         | PhysicalPlan::Graph(GraphOp::BspSuperstep(_))
         | PhysicalPlan::Graph(GraphOp::WccSuperstep(_)) => None,
         // Exchange: recurse into the child plan to extract the collection.
@@ -150,6 +151,7 @@ pub(super) fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Graph(GraphOp::Algo { .. })
         | PhysicalPlan::Graph(GraphOp::Match { .. })
         | PhysicalPlan::Graph(GraphOp::MatchContinuation { .. })
+        | PhysicalPlan::Graph(GraphOp::MatchVarLenResume { .. })
         | PhysicalPlan::Graph(GraphOp::BspSuperstep(_))
         | PhysicalPlan::Graph(GraphOp::WccSuperstep(_))
         | PhysicalPlan::Text(TextOp::Search { .. })

@@ -222,6 +222,35 @@ pub enum GraphOp {
         source_binding: String,
     },
 
+    /// Cross-shard MATCH variable-length RESUME (continue a truncated
+    /// `[*min..max]` expansion on this shard).
+    ///
+    /// Dispatched after a shard's `MATCH (a)-[*min..max]->(b)-...` expansion hit
+    /// a hard cap and surfaced a `VarLenResume` cursor in its `MatchOutcome`. The
+    /// receiving shard rebuilds the variable-length `VarLenPattern` for the
+    /// capped triple from the (already-optimized) `query` and continues the BFS
+    /// from the carried frontier/depth, then runs the remaining pattern triples
+    /// over the resumed rows — yielding the SAME `{rows, frontier}` envelope as a
+    /// plain `Match`, and a FRESH truncation cursor if the resume itself caps
+    /// again (so paging continues across rounds).
+    ///
+    /// Unlike `MatchContinuation` (which resumes at a TRIPLE boundary), this
+    /// resumes MID-triple inside the variable-length edge. The query is carried
+    /// already-optimized and MUST NOT be re-optimized on resume —
+    /// `VarLenResume::triple_idx` indexes the originating shard's triple order.
+    ///
+    /// Both fields are MessagePack blobs (mirroring `MatchContinuation::query` /
+    /// `partial_row`) so `nodedb-physical` carries no dependency on the
+    /// executor's `VarLenResume` / `MatchQuery` types.
+    MatchVarLenResume {
+        /// Serialized (already-optimized) `MatchQuery` (MessagePack).
+        query: Vec<u8>,
+        /// Serialized `VarLenResume` resume cursor (MessagePack): the capped
+        /// triple index, the source bindings, and the un-expanded frontier /
+        /// resume depth.
+        resume: Vec<u8>,
+    },
+
     /// One distributed-PageRank BSP superstep on this shard's local CSR.
     ///
     /// Phase A primitive: the Control-Plane coordinator (Phase B) round-trips

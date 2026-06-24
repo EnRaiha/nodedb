@@ -276,4 +276,80 @@ impl CoreLoop {
             Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
+
+    /// Cross-shard MATCH variable-length RESUME: continue a truncated
+    /// `[*min..max]` expansion on THIS shard.
+    ///
+    /// Deserializes the already-optimized `MatchQuery` and the `VarLenResume`
+    /// cursor (the capped triple index, the source bindings, and the
+    /// un-expanded frontier / resume depth), then continues the BFS from that
+    /// cursor and runs the remaining pattern triples over the resumed rows —
+    /// producing the SAME `{rows, frontier}` envelope as a plain MATCH via
+    /// [`Self::match_outcome_response`], including a FRESH `partial` flag /
+    /// truncation cursor when the resume itself caps again.
+    ///
+    /// Like `MatchContinuation`, a varlen resume only ever runs cross-shard, so
+    /// its remaining-pattern expansion surfaces its OWN unresolved frontier
+    /// (`is_remote_node = Some(&|_| true)`) for the Control-Plane coordinator to
+    /// route onward. The query MUST NOT be re-optimized — `triple_idx` indexes
+    /// the originating shard's triple order.
+    pub(in crate::data::executor) fn execute_graph_match_varlen_resume(
+        &self,
+        task: &ExecutionTask,
+        tid: u64,
+        query_bytes: &[u8],
+        resume_bytes: &[u8],
+    ) -> Response {
+        debug!(
+            core = self.core_id,
+            tid, "graph match variable-length resume execution"
+        );
+        let database_id = task.request.database_id.as_u64();
+
+        let query: MatchQuery = match zerompk::from_msgpack(query_bytes) {
+            Ok(q) => q,
+            Err(e) => {
+                warn!(core = self.core_id, error = %e, "failed to deserialize MatchQuery");
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("invalid match query: {e}"),
+                    },
+                );
+            }
+        };
+
+        let resume: crate::engine::graph::pattern::executor::VarLenResume =
+            match zerompk::from_msgpack(resume_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(core = self.core_id, error = %e, "failed to deserialize VarLenResume");
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("invalid varlen resume cursor: {e}"),
+                        },
+                    );
+                }
+            };
+
+        let partition = match self.csr_partition(database_id, tid) {
+            Some(p) => p,
+            None => return self.match_empty_partition_response(task),
+        };
+
+        let all_remote = |_: &str| true;
+        let is_remote_node: Option<&dyn Fn(&str) -> bool> = Some(&all_remote);
+        match crate::engine::graph::pattern::executor::execute_varlen_resume(
+            &query,
+            partition,
+            &self.edge_store,
+            None, // no anchor prefilter on the resume path
+            is_remote_node,
+            resume,
+        ) {
+            Ok(outcome) => self.match_outcome_response(task, outcome),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
+        }
+    }
 }

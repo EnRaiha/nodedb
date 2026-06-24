@@ -9,9 +9,10 @@
 //! [`execute_continuation`].
 
 use super::super::ast::{MatchQuery, PatternChain};
-use super::core::execute_triple;
+use super::core::{bind_node, binding_compatible, execute_triple};
+use super::expansion::{VarLenCaps, VarLenCursor, VarLenPattern, resume_variable_length};
 use super::predicates;
-use super::types::{BindingRow, ExecutionState, MatchOutcome};
+use super::types::{BindingRow, ExecutionState, MatchOutcome, VarLenResume};
 use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::EdgeStore;
 
@@ -202,12 +203,277 @@ pub fn execute_continuation<'a>(
     })
 }
 
+/// Resume a TRUNCATED variable-length expansion from a [`VarLenResume`] cursor
+/// and run the rest of the pattern on the resumed rows.
+///
+/// # When this fires
+///
+/// A `MATCH (a)-[*min..max]->(b)-...` whose `*min..max` expansion hit a hard cap
+/// on the originating shard surfaces a [`VarLenResume`] in
+/// [`MatchOutcome::truncation`]. The Control-Plane coordinator carries that
+/// cursor in `GraphOp::MatchVarLenResume` and dispatches it back so the BFS
+/// continues from exactly where it stopped — no row is silently dropped.
+///
+/// # How it resumes (vs [`execute_continuation`])
+///
+/// [`execute_continuation`] resumes at a TRIPLE boundary (the prior shard fully
+/// finished triple `< resume_triple_idx`). This function resumes MID-triple: the
+/// truncated triple `resume.triple_idx` is a variable-length edge whose BFS was
+/// interrupted at `resume.depth` with `resume.frontier` still un-expanded. It:
+///
+/// 1. Rebuilds the `VarLenPattern` for that triple from the (already-optimized)
+///    `query` chain — verbatim, NEVER re-optimized (same contract as
+///    [`execute_continuation`]: `resume.triple_idx` indexes the originating
+///    shard's order).
+/// 2. Continues the BFS via [`resume_variable_length`] from `resume.frontier` /
+///    `resume.depth`, honoring the same `VarLenCaps`. If this resume ALSO hits a
+///    cap, the fresh [`VarLenCursor`] becomes a NEW [`VarLenResume`] in the
+///    returned outcome so paging continues across multiple rounds.
+/// 3. Binds the resumed destinations into rows exactly as the from-scratch
+///    varlen branch in `execute_triple` does (same `binding_compatible` /
+///    `bind_node` / edge-path logic), then runs the REMAINING triples
+///    (`resume.triple_idx + 1 ..`) through [`run_chain_from`] and applies the
+///    query tail via [`finalize_rows`] — identical downstream pipeline.
+///
+/// Per the cross-shard contract there is no `visited` carry-over: a node
+/// re-reached on resume yields a duplicate row the coordinator collapses, never
+/// a skipped or mis-depthed one.
+pub fn execute_varlen_resume<'a>(
+    query: &MatchQuery,
+    csr: &CsrIndex,
+    edge_store: &EdgeStore,
+    frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+    is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
+    resume: VarLenResume,
+) -> Result<MatchOutcome, crate::Error> {
+    // Same single-chain restriction as `execute_continuation`: mid-pattern
+    // resume is only unambiguous for a single MATCH clause with one chain.
+    let chain = match query.clauses.as_slice() {
+        [clause] if clause.patterns.len() == 1 => &clause.patterns[0],
+        _ => {
+            return Err(crate::Error::BadRequest {
+                detail: "cross-shard variable-length MATCH resume is only supported for a single \
+                         MATCH clause with a single pattern chain"
+                    .to_string(),
+            });
+        }
+    };
+
+    let triple = chain
+        .triples
+        .get(resume.triple_idx)
+        .ok_or_else(|| crate::Error::BadRequest {
+            detail: format!(
+                "variable-length MATCH resume triple_idx {} exceeds chain length {}",
+                resume.triple_idx,
+                chain.triples.len()
+            ),
+        })?;
+
+    if !triple.edge.is_variable_length() {
+        return Err(crate::Error::BadRequest {
+            detail: format!(
+                "variable-length MATCH resume targets triple {} which is not a \
+                 variable-length edge",
+                resume.triple_idx
+            ),
+        });
+    }
+
+    let mut state = ExecutionState::new(is_remote_node);
+
+    // Rebuild the pattern shape for the truncated triple verbatim (no
+    // re-optimization). `want_path` matches the from-scratch branch in
+    // `execute_triple`.
+    let want_path = triple.edge.name.is_some();
+    let pattern = VarLenPattern {
+        label_filter: triple.edge.edge_type.as_deref(),
+        direction: triple.edge.direction.to_csr_direction(),
+        min_hops: triple.edge.min_hops,
+        max_hops: triple.edge.max_hops,
+        want_path,
+    };
+
+    // Continue the BFS from the carried cursor. A fresh cap hit here records a
+    // new resume cursor so multi-round paging can continue.
+    let cursor = VarLenCursor {
+        frontier: resume.frontier,
+        depth: resume.depth,
+    };
+    let expansion = resume_variable_length(csr, &cursor, &pattern, VarLenCaps::default());
+    if let Some(next_cursor) = expansion.cursor {
+        state.record_truncation(VarLenResume {
+            triple_idx: resume.triple_idx,
+            source_row: resume.source_row.clone(),
+            frontier: next_cursor.frontier,
+            depth: next_cursor.depth,
+        });
+    }
+
+    // Bind the resumed destinations onto the source row exactly as the
+    // from-scratch varlen branch does, then carry them into the remaining
+    // triples.
+    let src_binding = &triple.src;
+    let dst_binding = &triple.dst;
+    let mut resumed_rows: Vec<BindingRow> = Vec::new();
+    for (dst_id, path) in expansion.results {
+        if !binding_compatible(dst_binding, csr, &resume.source_row, dst_id) {
+            continue;
+        }
+        let mut row = resume.source_row.clone();
+        // The source id is already carried in `source_row`; bind_node is a
+        // no-op when the variable is present, but keep the call for parity
+        // with `execute_triple` (handles anonymous/unbound source shapes).
+        if let Some(src_name) = src_binding.name.as_deref()
+            && let Some(src_value) = resume.source_row.get(src_name)
+            && let Some(src_id) = csr.node_id_raw(src_value)
+        {
+            bind_node(&mut row, src_binding, csr, src_id);
+        }
+        bind_node(&mut row, dst_binding, csr, dst_id);
+        if let Some(ref edge_name) = triple.edge.name {
+            row.insert(edge_name.clone(), path);
+        }
+        resumed_rows.push(row);
+    }
+
+    // Run the REMAINING triples (after the truncated one) over the resumed rows,
+    // identical to the normal downstream pipeline.
+    let rows = run_chain_from(
+        chain,
+        resume.triple_idx + 1,
+        resumed_rows,
+        csr,
+        &mut state,
+        frontier_bitmap,
+    )?;
+
+    let rows = finalize_rows(query, rows, csr, edge_store, frontier_bitmap)?;
+
+    Ok(MatchOutcome {
+        rows,
+        truncation: state.varlen_resume,
+        unresolved_frontier: state.frontier,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::core::execute;
     use super::super::core::tests::make_csr;
-    use super::super::types::BindingRow;
-    use super::execute_continuation;
+    use super::super::expansion::{VarLenCaps, VarLenPattern, expand_variable_length};
+    use super::super::types::{BindingRow, VarLenResume};
+    use super::{execute_continuation, execute_varlen_resume};
+    use crate::engine::graph::edge_store::Direction;
+
+    /// `VarLenResume` round-trips through zerompk byte-for-byte. The resume
+    /// cursor rides the SPSC bridge inside `GraphOp::MatchVarLenResume` as a
+    /// MessagePack blob, so it MUST survive ser/de unchanged.
+    #[test]
+    fn varlen_resume_zerompk_round_trip() {
+        let mut source_row = BindingRow::new();
+        source_row.insert("a".to_string(), "n0".to_string());
+        source_row.insert("x".to_string(), "anchor".to_string());
+        let resume = VarLenResume {
+            triple_idx: 2,
+            source_row,
+            frontier: vec![3, 7, 11, 0],
+            depth: 4,
+        };
+
+        let bytes = zerompk::to_msgpack_vec(&resume).expect("serialize VarLenResume");
+        let decoded: VarLenResume =
+            zerompk::from_msgpack(&bytes).expect("deserialize VarLenResume");
+        assert_eq!(decoded, resume, "VarLenResume must round-trip via zerompk");
+    }
+
+    /// Plan/handler-level union-equivalence (mirrors 2a at the resume-orchestration
+    /// level): a `MATCH (a)-[*1..6]->(b)` expansion that TRUNCATES at a low cap,
+    /// then is RESUMED via [`execute_varlen_resume`] (the exact function the DP
+    /// `MatchVarLenResume` handler calls), produces — unioned with the first-pass
+    /// rows — the SAME `b` binding set as a single uncapped MATCH over the same
+    /// graph. The cap is injected via `VarLenCaps`, NOT by lowering the prod const.
+    #[test]
+    fn varlen_resume_handler_union_equals_uncapped_match() {
+        // Chain n0 -> n1 -> ... -> n6. `(a)-[*1..6]->(b)` from n0 reaches
+        // {n1..n6}; a low results cap forces mid-expansion truncation.
+        let edges: Vec<(String, String, String)> = (0..6)
+            .map(|i| (format!("n{i}"), "l".to_string(), format!("n{}", i + 1)))
+            .collect();
+        let edge_refs: Vec<(&str, &str, &str)> = edges
+            .iter()
+            .map(|(s, l, d)| (s.as_str(), l.as_str(), d.as_str()))
+            .collect();
+        let (csr, store, _dir) = make_csr(&edge_refs);
+
+        let query = super::super::super::compiler::parse(
+            "MATCH (a)-[:l*1..6]->(b) WHERE a = 'n0' RETURN a, b",
+        )
+        .unwrap();
+
+        // Ground truth: single uncapped MATCH.
+        let full_b: std::collections::HashSet<String> = execute(&query, &csr, &store, None, None)
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| r["b"].clone())
+            .collect();
+        assert_eq!(full_b.len(), 6, "uncapped MATCH reaches n1..n6 from n0");
+
+        // First pass: drive truncation directly via a low cap on the same
+        // varlen expansion the executor uses, capturing the resume cursor.
+        let src = csr.node_id_raw("n0").unwrap();
+        let pat = VarLenPattern {
+            label_filter: Some("l"),
+            direction: Direction::Out,
+            min_hops: 1,
+            max_hops: 6,
+            want_path: false,
+        };
+        let caps = VarLenCaps {
+            max_results: 2,
+            max_frontier: usize::MAX,
+        };
+        let first = expand_variable_length(&csr, src, &pat, caps);
+        let cursor = first.cursor.clone().expect("low cap must truncate");
+
+        let mut source_row = BindingRow::new();
+        source_row.insert("a".to_string(), "n0".to_string());
+
+        // First-pass rows' `b` bindings (what the originating shard emitted).
+        let mut union_b: std::collections::HashSet<String> = first
+            .results
+            .iter()
+            .map(|(dst, _)| csr.node_name_raw(*dst).to_string())
+            .collect();
+
+        // Resume — possibly across multiple rounds — through the handler-level
+        // entry point, unioning each round's `b` bindings.
+        let mut next = Some(VarLenResume {
+            triple_idx: 0,
+            source_row: source_row.clone(),
+            frontier: cursor.frontier,
+            depth: cursor.depth,
+        });
+        while let Some(resume) = next.take() {
+            let outcome = execute_varlen_resume(&query, &csr, &store, None, None, resume).unwrap();
+            for row in &outcome.rows {
+                assert_eq!(row["a"], "n0", "source binding carried through resume");
+                union_b.insert(row["b"].clone());
+            }
+            next = outcome.truncation.map(|t| VarLenResume {
+                triple_idx: 0,
+                source_row: source_row.clone(),
+                frontier: t.frontier,
+                depth: t.depth,
+            });
+        }
+
+        assert_eq!(
+            union_b, full_b,
+            "first-pass ∪ resumed `b` bindings must equal the uncapped MATCH set"
+        );
+    }
 
     /// Resume produces the correct tail. Graph `(x)-[:E]->(y)-[:E]->(z)` with
     /// `root -E-> mid -E-> leaf`. Resume at triple_idx 1 with the seed bindings

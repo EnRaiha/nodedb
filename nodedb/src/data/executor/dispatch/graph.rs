@@ -221,6 +221,10 @@ impl CoreLoop {
                 source_binding,
             ),
 
+            GraphOp::MatchVarLenResume { query, resume } => {
+                self.execute_graph_match_varlen_resume(task, tid, query, resume)
+            }
+
             GraphOp::SetNodeLabels { node_id, labels } => {
                 let partition = self.csr_partition_mut(database_id, tid);
                 for label in labels {

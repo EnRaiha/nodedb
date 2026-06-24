@@ -75,11 +75,21 @@ pub struct UnresolvedExpansion {
 /// on resume produces a duplicate row that the coordinator collapses, never
 /// a skipped or mis-depthed row.
 //
-// The fields are produced by the executor in this sub-unit (2a) and consumed
-// by the cross-plane resume dispatch in the following sub-units (2b–2d), so
-// they are write-only within 2a.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
+// The fields are produced by the executor on a capped expansion and consumed by
+// the cross-plane resume dispatch (`GraphOp::MatchVarLenResume`). The struct is
+// wire-serializable (serde + zerompk) so the cursor can ride the SPSC bridge
+// inside the resume plan variant; `frontier` carries CSR-local node ids, so a
+// same-shard resume is exact (cross-shard id↔name translation is handled by the
+// remote-resume envelope path).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
 pub struct VarLenResume {
     /// 0-based index of the capped triple within its pattern chain.
     pub triple_idx: usize,
@@ -129,7 +139,8 @@ pub(super) struct ExecutionState<'a> {
     /// Structured resume cursor for the first variable-length expansion that
     /// hit a cap during this execution; `None` until one truncates. Only the
     /// first capped expansion is retained — resume is single-cursor by design
-    /// for 2a (multi-cursor fan-out is a later unit).
+    /// (a query with multiple capping varlen triples would need multi-cursor
+    /// fan-out, which is not yet supported).
     pub varlen_resume: Option<VarLenResume>,
     pub frontier: Vec<UnresolvedExpansion>,
     pub is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
@@ -150,7 +161,7 @@ impl<'a> ExecutionState<'a> {
     }
 
     /// Record the resume cursor from the first capped expansion. Subsequent
-    /// truncations are ignored (single-cursor design for 2a).
+    /// truncations are ignored (single-cursor design).
     pub(super) fn record_truncation(&mut self, resume: VarLenResume) {
         if self.varlen_resume.is_none() {
             self.varlen_resume = Some(resume);

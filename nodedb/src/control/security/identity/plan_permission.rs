@@ -54,6 +54,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | GraphOp::Algo { .. }
             | GraphOp::Match { .. }
             | GraphOp::MatchContinuation { .. }
+            | GraphOp::MatchVarLenResume { .. }
             | GraphOp::TemporalNeighbors { .. }
             | GraphOp::TemporalAlgorithm { .. }
             | GraphOp::BspSuperstep(_)

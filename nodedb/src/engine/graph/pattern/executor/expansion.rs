@@ -160,9 +160,7 @@ pub(super) fn expand_variable_length(
 /// boundary because the loop continues at `cursor.depth`, so a node reached at
 /// depth `d` here behaves exactly as a node reached at depth `d` in one pass.
 //
-// Exercised by the unit tests below; the cross-plane resume path that calls
-// this on the owning shard is wired up in the following sub-unit (2b).
-#[allow(dead_code)]
+// Consumed by `execute_varlen_resume` (the cross-plane resume path).
 pub(super) fn resume_variable_length(
     csr: &CsrIndex,
     cursor: &VarLenCursor,
