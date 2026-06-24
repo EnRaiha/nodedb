@@ -7,7 +7,7 @@ use tracing::{info, warn};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use crate::types::TenantDataSnapshot;
+use crate::types::{TenantDataSnapshot, TsFlushedCollectionBlob, TsFlushedPartitionBlob};
 
 impl CoreLoop {
     /// Create a snapshot of a tenant's data across ALL engines.
@@ -124,6 +124,20 @@ impl CoreLoop {
             }
         }
 
+        // 7. Flushed timeseries segments: capture all on-disk partition
+        // directories for this tenant from `ts_registries`.
+        match self.capture_flushed_ts_segments(database_id, tid_id) {
+            Ok(blobs) => snapshot.flushed_ts_segments = blobs,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("snapshot: flushed ts segment capture failed: {e}"),
+                    },
+                );
+            }
+        }
+
         info!(
             tenant_id,
             documents = snapshot.documents.len(),
@@ -133,6 +147,7 @@ impl CoreLoop {
             kv_tables = snapshot.kv_tables.len(),
             crdt = snapshot.crdt_state.len(),
             timeseries = snapshot.timeseries.len(),
+            flushed_ts_collections = snapshot.flushed_ts_segments.len(),
             "full tenant snapshot created"
         );
 
@@ -145,5 +160,92 @@ impl CoreLoop {
                 },
             ),
         }
+    }
+
+    /// Capture all flushed on-disk timeseries segments for one tenant.
+    ///
+    /// Iterates `ts_registries` entries belonging to `tid`, reads every file
+    /// in each partition directory from disk, and returns the packed blobs.
+    /// Returns `Err` on any I/O failure so the snapshot aborts cleanly rather
+    /// than silently omitting data.
+    fn capture_flushed_ts_segments(
+        &self,
+        database_id: u64,
+        tid: crate::types::TenantId,
+    ) -> crate::Result<Vec<TsFlushedCollectionBlob>> {
+        let mut result = Vec::new();
+
+        for ((reg_db, reg_tid, collection), registry) in &self.ts_registries {
+            if *reg_tid != tid || reg_db.as_u64() != database_id {
+                continue;
+            }
+
+            let segment_dir = super::super::timeseries::paths::ts_collection_dir(
+                &self.data_dir,
+                reg_db.as_u64(),
+                reg_tid.as_u64(),
+                collection,
+            );
+
+            let mut partition_blobs = Vec::new();
+
+            for (_start_ts, entry) in registry.iter() {
+                let partition_dir = segment_dir.join(&entry.dir_name);
+
+                // Serialize PartitionMeta to msgpack bytes for the wire blob.
+                let meta_bytes = zerompk::to_msgpack_vec(&entry.meta).map_err(|e| {
+                    crate::Error::Serialization {
+                        format: "msgpack".into(),
+                        detail: format!(
+                            "serialize PartitionMeta for {}/{}: {e}",
+                            collection, entry.dir_name
+                        ),
+                    }
+                })?;
+
+                // Read all files in the partition directory.
+                let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+                let read_dir = std::fs::read_dir(&partition_dir)?;
+                for dir_entry in read_dir {
+                    let dir_entry = dir_entry?;
+                    let file_name = dir_entry.file_name();
+                    let Some(name_str) = file_name.to_str() else {
+                        warn!(
+                            partition = &entry.dir_name,
+                            "skipping non-UTF8 filename in partition dir during snapshot"
+                        );
+                        continue;
+                    };
+                    if !dir_entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let bytes = std::fs::read(dir_entry.path())?;
+                    files.push((name_str.to_string(), bytes));
+                }
+
+                // Sort files for deterministic snapshot output.
+                files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+                partition_blobs.push(TsFlushedPartitionBlob {
+                    dir_name: entry.dir_name.clone(),
+                    meta_bytes,
+                    files,
+                });
+            }
+
+            if !partition_blobs.is_empty() {
+                let collection_key = format!("{}:{}:{}", database_id, tid.as_u64(), collection);
+                result.push(TsFlushedCollectionBlob {
+                    collection_key,
+                    partitions: partition_blobs,
+                });
+            }
+        }
+
+        // Sort collections for deterministic snapshot output (ts_registries is
+        // a HashMap so its iteration order is unspecified).
+        result.sort_unstable_by(|a, b| a.collection_key.cmp(&b.collection_key));
+
+        Ok(result)
     }
 }

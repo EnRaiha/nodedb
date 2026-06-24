@@ -4,6 +4,8 @@
 
 use tracing::{info, warn};
 
+use crate::types::TsFlushedCollectionBlob;
+
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
@@ -113,6 +115,18 @@ impl CoreLoop {
                     ts_written += 1;
                 }
             }
+
+            // Restore flushed on-disk timeseries segments.
+            if !snap.flushed_ts_segments.is_empty()
+                && let Err(e) = self.restore_flushed_ts_segments(&snap.flushed_ts_segments)
+            {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("restore: flushed ts segment restore failed: {e}"),
+                    },
+                );
+            }
         }
 
         info!(
@@ -124,6 +138,7 @@ impl CoreLoop {
             kv_written,
             crdt_written,
             ts_written,
+            flushed_ts_collections = snap.flushed_ts_segments.len(),
             "full tenant snapshot restored"
         );
 
@@ -237,6 +252,123 @@ impl CoreLoop {
                 nodedb_types::Surrogate::ZERO,
             );
         }
+    }
+
+    /// Restore flushed on-disk timeseries segment directories from snapshot blobs.
+    ///
+    /// For each captured partition:
+    /// - Collision handling is fail-closed (no silent overwrites):
+    ///   - If the partition dir already exists AND the registry already tracks a
+    ///     partition at the same `min_ts`, we compare `row_count` and
+    ///     `last_flushed_wal_lsn` to determine idempotency:
+    ///     - Identical metadata → skip (idempotent re-apply).
+    ///     - Different metadata → return `Storage` error (would clobber live data).
+    ///   - Otherwise: create the directory, write all files, register in
+    ///     `ts_registries` mirroring `flush_ts_collection`'s exact registration.
+    fn restore_flushed_ts_segments(
+        &mut self,
+        blobs: &[TsFlushedCollectionBlob],
+    ) -> crate::Result<()> {
+        for coll_blob in blobs {
+            let (database_id, tenant_id, collection) =
+                parse_timeseries_snapshot_key(&coll_blob.collection_key);
+
+            let segment_dir = super::super::timeseries::paths::ts_collection_dir(
+                &self.data_dir,
+                database_id,
+                tenant_id,
+                &collection,
+            );
+
+            let reg_key = (
+                nodedb_types::DatabaseId::new(database_id),
+                crate::types::TenantId::new(tenant_id),
+                collection.clone(),
+            );
+
+            for part_blob in &coll_blob.partitions {
+                // Deserialize PartitionMeta from the embedded msgpack bytes.
+                let meta: nodedb_types::timeseries::PartitionMeta =
+                    zerompk::from_msgpack(&part_blob.meta_bytes).map_err(|e| {
+                        crate::Error::Serialization {
+                            format: "msgpack".into(),
+                            detail: format!(
+                                "restore: deserialize PartitionMeta for {}/{}: {e}",
+                                collection, part_blob.dir_name
+                            ),
+                        }
+                    })?;
+
+                let partition_dir = segment_dir.join(&part_blob.dir_name);
+
+                // Collision check: registry already knows this min_ts key.
+                if let Some(registry) = self.ts_registries.get(&reg_key)
+                    && let Some(existing) = registry.get(meta.min_ts)
+                {
+                    let is_identical = existing.meta.row_count == meta.row_count
+                        && existing.meta.last_flushed_wal_lsn == meta.last_flushed_wal_lsn;
+                    if is_identical {
+                        // Idempotent: same partition already present, skip.
+                        continue;
+                    }
+                    return Err(crate::Error::Storage {
+                        engine: "timeseries".into(),
+                        detail: format!(
+                            "restore: partition collision for collection '{}' min_ts={}: \
+                                 existing (rows={}, lsn={}) differs from snapshot \
+                                 (rows={}, lsn={}); refusing to overwrite live data",
+                            collection,
+                            meta.min_ts,
+                            existing.meta.row_count,
+                            existing.meta.last_flushed_wal_lsn,
+                            meta.row_count,
+                            meta.last_flushed_wal_lsn,
+                        ),
+                    });
+                }
+
+                // Also check the filesystem: if the directory already exists
+                // and is non-empty, treat it as a collision.
+                if partition_dir.exists() {
+                    let is_empty = std::fs::read_dir(&partition_dir)
+                        .map_err(crate::Error::Io)
+                        .map(|mut d| d.next().is_none())?;
+                    if !is_empty {
+                        return Err(crate::Error::Storage {
+                            engine: "timeseries".into(),
+                            detail: format!(
+                                "restore: partition directory '{}' already exists for \
+                                 collection '{}'; refusing to overwrite live data",
+                                part_blob.dir_name, collection,
+                            ),
+                        });
+                    }
+                }
+
+                // Create the partition directory and write all captured files.
+                std::fs::create_dir_all(&partition_dir)?;
+                for (filename, bytes) in &part_blob.files {
+                    std::fs::write(partition_dir.join(filename), bytes)?;
+                }
+
+                // Register the restored partition in ts_registries, mirroring
+                // exactly the registration step in flush_ts_collection.
+                let registry = self
+                    .ts_registries
+                    .entry(reg_key.clone())
+                    .or_insert_with(|| {
+                        crate::engine::timeseries::partition_registry::PartitionRegistry::new(
+                            nodedb_types::timeseries::TieredPartitionConfig::origin_defaults(),
+                        )
+                    });
+                let pe = crate::engine::timeseries::partition_registry::PartitionEntry {
+                    meta,
+                    dir_name: part_blob.dir_name.clone(),
+                };
+                registry.import(vec![(pe.meta.min_ts, pe)]);
+            }
+        }
+        Ok(())
     }
 
     fn restore_crdt_state(&mut self, tenant_id: u64, bytes: &[u8]) -> crate::Result<()> {
