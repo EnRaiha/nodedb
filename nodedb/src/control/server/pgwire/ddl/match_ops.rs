@@ -20,6 +20,16 @@ use nodedb_types::DatabaseId;
 
 use super::super::types::{sqlstate_error, text_field};
 
+/// Returned when a MATCH could not be fully resolved within its expansion
+/// budget — either the cross-shard hop rounds or the variable-length paging
+/// rounds were exhausted with work still pending, or a single-node
+/// variable-length expansion hit its hard cap with no coordinator to drain it.
+/// The result set would be INCOMPLETE, so it is surfaced as a fail-closed error
+/// (SQLSTATE 54001, `program_limit_exceeded`) rather than silently returning a
+/// truncated result the client cannot distinguish from a complete one.
+const MATCH_INCOMPLETE_MESSAGE: &str = "MATCH result incomplete: the pattern exceeded the expansion budget; \
+     narrow the pattern or its variable-length `*min..max` bound";
+
 /// Handle a MATCH query.
 ///
 /// Parses the Cypher-style MATCH syntax, serializes the MatchQuery AST,
@@ -102,11 +112,16 @@ pub async fn match_query(
         .await
         {
             Ok(outcome) => {
-                // Single-node frontier is always empty (cluster_mode=false);
-                // `partial` is surfaced exactly as the prior broadcast path did.
+                // Single-node frontier is always empty (cluster_mode=false). A
+                // variable-length expansion can still hit its hard cap on a
+                // single node (no coordinator to drive resume), so a partial
+                // result is surfaced fail-closed rather than silently truncated.
                 let _frontier = outcome.frontier;
-                let _partial = outcome.partial;
-                match_payload_to_response(&outcome.rows_payload, &column_names)
+                if outcome.partial {
+                    Err(sqlstate_error("54001", MATCH_INCOMPLETE_MESSAGE))
+                } else {
+                    match_payload_to_response(&outcome.rows_payload, &column_names)
+                }
             }
             Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
         };
@@ -121,11 +136,15 @@ pub async fn match_query(
         .await
     {
         Ok(outcome) => {
-            // `partial` is surfaced for parity with the broadcast path; it is
-            // not threaded into the pgwire row stream (the stream protocol has
-            // no partial-result marker), matching prior MATCH behaviour.
-            let _partial = outcome.partial;
-            match_payload_to_response(&outcome.rows_payload, &column_names)
+            // A `partial` result means the cross-shard hop rounds or the
+            // variable-length resume paging budget were exhausted with work
+            // still pending: the result set is INCOMPLETE. Surface it
+            // fail-closed so a client never mistakes it for a complete result.
+            if outcome.partial {
+                Err(sqlstate_error("54001", MATCH_INCOMPLETE_MESSAGE))
+            } else {
+                match_payload_to_response(&outcome.rows_payload, &column_names)
+            }
         }
         Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
     }
