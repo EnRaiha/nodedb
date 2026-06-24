@@ -93,8 +93,10 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> Result<AlgoResultBatch, crate
 
 /// Newtype wrapper for f64 that implements `Ord` for use in `BinaryHeap`.
 ///
-/// NaN is treated as greater than all other values (pushed to bottom of
-/// min-heap). This is safe because edge weights should never be NaN.
+/// Uses `f64::total_cmp` which defines a total order: negative NaN < negative
+/// finite < -0.0 == +0.0 < positive finite < positive NaN. A NaN weight is
+/// therefore treated as greater than all finite distances and sinks to the
+/// bottom of the min-heap — correct because edge weights must never be NaN.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct OrdF64(f64);
 
@@ -108,9 +110,7 @@ impl PartialOrd for OrdF64 {
 
 impl Ord for OrdF64 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .partial_cmp(&other.0)
-            .unwrap_or(std::cmp::Ordering::Greater)
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -303,5 +303,33 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("non-negative"), "error: {err}");
+    }
+
+    #[test]
+    fn ordf64_total_cmp_nan_sorts_after_finite() {
+        // NaN must sort deterministically in a BinaryHeap<Reverse<(OrdF64, u32)>>.
+        // total_cmp places NaN after +∞ after finite; in a min-heap (Reverse),
+        // NaN pops last (highest OrdF64 value = last out of min-heap).
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        let mut heap: BinaryHeap<Reverse<(OrdF64, u32)>> = BinaryHeap::new();
+        heap.push(Reverse((OrdF64(f64::NAN), 0)));
+        heap.push(Reverse((OrdF64(1.0), 1)));
+        heap.push(Reverse((OrdF64(5.0), 2)));
+        heap.push(Reverse((OrdF64(0.5), 3)));
+
+        // Min-heap: 0.5 pops first, then 1.0, then 5.0, then NaN.
+        let first = heap.pop().unwrap().0.0.0;
+        assert_eq!(first, 0.5);
+        let second = heap.pop().unwrap().0.0.0;
+        assert_eq!(second, 1.0);
+        let third = heap.pop().unwrap().0.0.0;
+        assert_eq!(third, 5.0);
+        let last = heap.pop().unwrap().0.0.0;
+        assert!(
+            last.is_nan(),
+            "NaN should pop last from min-heap, got {last}"
+        );
     }
 }

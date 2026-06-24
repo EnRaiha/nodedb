@@ -18,6 +18,7 @@ use super::params::AlgoParams;
 use super::progress::ProgressReporter;
 use super::result::AlgoResultBatch;
 use super::simd;
+use super::util::cmp_desc_nan_last;
 use crate::engine::graph::algo::GraphAlgorithm;
 use crate::engine::graph::csr::CsrIndex;
 
@@ -107,7 +108,7 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
 
     // Build result batch sorted by rank descending.
     let mut indexed: Vec<(usize, f64)> = rank.into_iter().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.sort_by(|a, b| cmp_desc_nan_last(a.1, b.1));
 
     let mut batch = AlgoResultBatch::new(GraphAlgorithm::PageRank);
     for (node_id, r) in indexed {
@@ -315,5 +316,18 @@ mod tests {
         assert_eq!(rb.num_columns(), 2);
         assert_eq!(rb.schema().field(0).name(), "node_id");
         assert_eq!(rb.schema().field(1).name(), "rank");
+    }
+
+    #[test]
+    fn pagerank_sort_is_total_nan_goes_last() {
+        // Direct comparator test: NaN must sort deterministically after all finite values.
+        let mut indexed: Vec<(usize, f64)> = vec![(0, f64::NAN), (1, 0.5), (2, 0.3), (3, 0.2)];
+        indexed.sort_by(|a, b| cmp_desc_nan_last(a.1, b.1));
+        assert!(!indexed[0].1.is_nan());
+        assert!(!indexed[1].1.is_nan());
+        assert!(!indexed[2].1.is_nan());
+        assert!(indexed[3].1.is_nan());
+        assert!(indexed[0].1 > indexed[1].1);
+        assert!(indexed[1].1 > indexed[2].1);
     }
 }

@@ -9,6 +9,7 @@
 
 use super::params::AlgoParams;
 use super::result::AlgoResultBatch;
+use super::util::cmp_desc_nan_last;
 use crate::engine::graph::algo::GraphAlgorithm;
 use crate::engine::graph::csr::CsrIndex;
 
@@ -38,7 +39,7 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
         })
         .collect();
 
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| cmp_desc_nan_last(a.1, b.1));
 
     let mut batch = AlgoResultBatch::new(GraphAlgorithm::Degree);
     for (node, centrality) in scored {
@@ -120,5 +121,17 @@ mod tests {
         csr.compact().expect("no governor, cannot fail");
         let batch = run(&csr, &AlgoParams::default());
         assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn degree_sort_is_total_nan_goes_last() {
+        // Direct comparator test: NaN must sort deterministically after all finite values.
+        let mut scores: Vec<(usize, f64)> = vec![(0, f64::NAN), (1, 1.0), (2, 0.333), (3, 0.0)];
+        scores.sort_by(|a, b| cmp_desc_nan_last(a.1, b.1));
+        assert!(!scores[0].1.is_nan());
+        assert!(!scores[1].1.is_nan());
+        assert!(!scores[2].1.is_nan());
+        assert!(scores[3].1.is_nan());
+        assert!(scores[0].1 > scores[1].1);
     }
 }

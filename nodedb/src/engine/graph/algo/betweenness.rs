@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 
 use super::params::AlgoParams;
 use super::result::AlgoResultBatch;
+use super::util::{cmp_desc_nan_last, undirected_neighbors};
 use crate::engine::graph::algo::GraphAlgorithm;
 use crate::engine::graph::csr::CsrIndex;
 
@@ -73,7 +74,7 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
 
     // Build result sorted by centrality descending.
     let mut scored: Vec<(usize, f64)> = cb.into_iter().enumerate().collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| cmp_desc_nan_last(a.1, b.1));
 
     let mut batch = AlgoResultBatch::new(GraphAlgorithm::Betweenness);
     for (node, centrality) in scored {
@@ -132,8 +133,6 @@ fn brandes_from_source(csr: &CsrIndex, s: usize, n: usize, cb: &mut [f64]) {
         }
     }
 }
-
-use super::util::undirected_neighbors;
 
 #[cfg(test)]
 mod tests {
@@ -246,5 +245,18 @@ mod tests {
     fn betweenness_empty() {
         let csr = CsrIndex::new();
         assert!(run(&csr, &AlgoParams::default()).is_empty());
+    }
+
+    #[test]
+    fn betweenness_sort_is_total_nan_goes_last() {
+        // Direct comparator test: NaN must sort deterministically after all finite values.
+        let mut scores: Vec<(usize, f64)> = vec![(0, f64::NAN), (1, 3.0), (2, 1.0), (3, 0.0)];
+        scores.sort_by(|a, b| cmp_desc_nan_last(a.1, b.1));
+        assert!(!scores[0].1.is_nan());
+        assert!(!scores[1].1.is_nan());
+        assert!(!scores[2].1.is_nan());
+        assert!(scores[3].1.is_nan());
+        assert!(scores[0].1 > scores[1].1);
+        assert!(scores[1].1 > scores[2].1);
     }
 }
