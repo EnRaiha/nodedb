@@ -37,9 +37,9 @@ use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
 use crate::control::server::exchange::gather::eager_dispatch_to_all_cores;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::data::executor::handlers::graph_match::{
-    MATCH_ENVELOPE_FRONTIER_KEY, MATCH_ENVELOPE_ROWS_KEY,
+    MATCH_ENVELOPE_FRONTIER_KEY, MATCH_ENVELOPE_RESUME_KEY, MATCH_ENVELOPE_ROWS_KEY,
 };
-use crate::engine::graph::pattern::executor::UnresolvedExpansion;
+use crate::engine::graph::pattern::executor::{UnresolvedExpansion, VarLenResume};
 use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_query::msgpack_scan::reader::{map_header, read_str_advance, skip_value};
 
@@ -52,6 +52,13 @@ pub struct MatchBroadcastOutcome {
     /// Union of every core's cross-shard frontier entries. Empty on a
     /// fully-local CSR. Consumed by B2 cross-shard continuation dispatch.
     pub frontier: Vec<UnresolvedExpansion>,
+    /// Union of every core's variable-length truncation resume cursors. Empty
+    /// when nothing truncated. Each capping core contributes its own cursor, so
+    /// this is a `Vec` — a single node fanned across N cores can truncate on
+    /// several cores at once and ALL their cursors must survive (the round loop
+    /// re-dispatches each independently). Carried onto the cross-node wire by
+    /// `encode_match_envelope_raw` so remote truncation is no longer dropped.
+    pub resume: Vec<VarLenResume>,
     /// `true` if any core returned a partial (truncated) result.
     pub partial: bool,
 }
@@ -75,14 +82,31 @@ fn map_value_raw<'a>(payload: &'a [u8], key: &str) -> Option<&'a [u8]> {
     None
 }
 
-/// Decode one core's `{rows, frontier}` envelope into its row elements and
-/// frontier entries.
+/// Decoded fields of a single Data-Plane MATCH `{rows, frontier, resume}` envelope.
 ///
-/// Malformed bytes (not a map, missing keys, undecodable frontier) surface as a
-/// typed [`crate::Error`] rather than a panic.
-fn decode_match_envelope(
-    payload: &[u8],
-) -> crate::Result<(Vec<Vec<u8>>, Vec<UnresolvedExpansion>)> {
+/// Returned by [`decode_match_envelope`] and [`unwrap_match_envelope`] so callers
+/// can address fields by name instead of destructuring a positional 3-tuple.
+pub(crate) struct DecodedMatchEnvelope {
+    /// Raw msgpack bytes of each binding row (one element per row), ready to be
+    /// merged via [`encode_msgpack_array`].
+    pub(crate) row_elements: Vec<Vec<u8>>,
+    /// Cross-shard frontier entries decoded from the `frontier` map value.
+    pub(crate) frontier: Vec<UnresolvedExpansion>,
+    /// Variable-length truncation resume cursors decoded from the optional
+    /// `resume` map value. Empty when the key is absent (backward-compat with
+    /// pre-resume 2-key envelopes from older peers).
+    pub(crate) resume: Vec<VarLenResume>,
+}
+
+/// Decode one core's `{rows, frontier, resume}` envelope.
+///
+/// The `resume` key is OPTIONAL on decode: an older-version peer (or the
+/// historic 2-key envelope) that omits it decodes to an empty cursor vec, so a
+/// mixed-version cluster never breaks. `rows` and `frontier` remain mandatory.
+///
+/// Malformed bytes (not a map, missing mandatory keys, undecodable frontier or
+/// resume) surface as a typed [`crate::Error`] rather than a panic.
+fn decode_match_envelope(payload: &[u8]) -> crate::Result<DecodedMatchEnvelope> {
     let rows_bytes =
         map_value_raw(payload, MATCH_ENVELOPE_ROWS_KEY).ok_or_else(|| crate::Error::Codec {
             detail: "match envelope: missing or malformed 'rows' field".into(),
@@ -97,30 +121,65 @@ fn decode_match_envelope(
         zerompk::from_msgpack(frontier_bytes).map_err(|e| crate::Error::Codec {
             detail: format!("match envelope: invalid frontier: {e}"),
         })?;
-    Ok((row_elements, frontier))
+    // Backward-compat: a missing `resume` key (older peer / pre-resume 2-key
+    // envelope) decodes to an empty cursor vec, never an error.
+    let resume: Vec<VarLenResume> = match map_value_raw(payload, MATCH_ENVELOPE_RESUME_KEY) {
+        Some(resume_bytes) => {
+            zerompk::from_msgpack(resume_bytes).map_err(|e| crate::Error::Codec {
+                detail: format!("match envelope: invalid resume: {e}"),
+            })?
+        }
+        None => Vec::new(),
+    };
+    Ok(DecodedMatchEnvelope {
+        row_elements,
+        frontier,
+        resume,
+    })
 }
 
-/// Unwrap a SINGLE Data-Plane MATCH `{rows, frontier}` envelope payload into a
-/// bare rows msgpack array plus its frontier entries.
+/// Decoded fields from [`unwrap_match_envelope`], with `rows` already merged
+/// into a single bare msgpack array ready for the MATCH consumer.
+pub struct UnwrappedMatchEnvelope {
+    /// Merged binding rows as a single BARE msgpack array — the exact shape
+    /// `match_payload_to_response` decodes (byte-identical to the prior
+    /// bare-array response for single-node / empty-frontier results).
+    pub(crate) rows_payload: Payload,
+    /// Cross-shard frontier entries decoded from the envelope.
+    pub(crate) frontier: Vec<UnresolvedExpansion>,
+    /// Variable-length truncation resume cursors. Empty when nothing truncated
+    /// or when the envelope is from a pre-resume peer (backward-compat).
+    pub(crate) resume: Vec<VarLenResume>,
+}
+
+/// Unwrap a SINGLE Data-Plane MATCH `{rows, frontier, resume}` envelope payload
+/// into a bare rows msgpack array plus its frontier entries and resume cursors.
 ///
 /// Used by surfaces that dispatch a MATCH plan to one shard rather than
 /// fanning out to all cores (e.g. the native protocol's direct-op path), so
 /// they can recover the same bare rows array shape every MATCH consumer
 /// expected before the envelope existed. On a single-node / empty-frontier
 /// MATCH the returned rows payload is byte-identical to the prior bare-array
-/// response.
+/// response. The cross-node scatter reads the returned `resume` cursors so a
+/// remote shard's truncation lands in the coordinator instead of being dropped.
 ///
 /// Malformed bytes surface a typed [`crate::Error`], never a panic. An empty
 /// payload (e.g. a successful op with no result) passes through unchanged.
-pub fn unwrap_match_envelope(
-    payload: &Payload,
-) -> crate::Result<(Payload, Vec<UnresolvedExpansion>)> {
+pub fn unwrap_match_envelope(payload: &Payload) -> crate::Result<UnwrappedMatchEnvelope> {
     if payload.is_empty() {
-        return Ok((payload.clone(), Vec::new()));
+        return Ok(UnwrappedMatchEnvelope {
+            rows_payload: payload.clone(),
+            frontier: Vec::new(),
+            resume: Vec::new(),
+        });
     }
-    let (row_elements, frontier) = decode_match_envelope(payload.as_ref())?;
-    let merged_rows = encode_msgpack_array(&row_elements);
-    Ok((Payload::from_vec(merged_rows), frontier))
+    let decoded = decode_match_envelope(payload.as_ref())?;
+    let merged_rows = encode_msgpack_array(&decoded.row_elements);
+    Ok(UnwrappedMatchEnvelope {
+        rows_payload: Payload::from_vec(merged_rows),
+        frontier: decoded.frontier,
+        resume: decoded.resume,
+    })
 }
 
 /// Fan a MATCH plan to every Data-Plane core, unwrap each core's
@@ -186,6 +245,7 @@ pub async fn broadcast_match_to_all_cores(
 
     let mut all_row_elements: Vec<Vec<u8>> = Vec::new();
     let mut frontier: Vec<UnresolvedExpansion> = Vec::new();
+    let mut resume: Vec<VarLenResume> = Vec::new();
     let mut partial = false;
     let mut had_error = false;
     let mut error_msg = String::new();
@@ -221,9 +281,13 @@ pub async fn broadcast_match_to_all_cores(
             continue;
         }
 
-        let (mut rows, mut core_frontier) = decode_match_envelope(resp.payload.as_ref())?;
-        all_row_elements.append(&mut rows);
-        frontier.append(&mut core_frontier);
+        let mut decoded = decode_match_envelope(resp.payload.as_ref())?;
+        all_row_elements.append(&mut decoded.row_elements);
+        frontier.append(&mut decoded.frontier);
+        // Union every capping core's resume cursor — a node fanned across cores
+        // can truncate on more than one, and each cursor must survive for the
+        // round loop to re-dispatch independently. Never keep only one.
+        resume.append(&mut decoded.resume);
     }
 
     if had_error && all_row_elements.is_empty() {
@@ -235,6 +299,7 @@ pub async fn broadcast_match_to_all_cores(
     Ok(MatchBroadcastOutcome {
         rows_payload: Payload::from_vec(merged_rows),
         frontier,
+        resume,
         partial,
     })
 }
@@ -242,14 +307,26 @@ pub async fn broadcast_match_to_all_cores(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::executor::handlers::graph_match::encode_match_envelope;
-    use crate::engine::graph::pattern::executor::{BindingRow, UnresolvedExpansion};
+    use crate::data::executor::handlers::graph_match::{
+        encode_match_envelope, encode_match_envelope_raw,
+    };
+    use crate::engine::graph::pattern::executor::{BindingRow, UnresolvedExpansion, VarLenResume};
+    use nodedb_query::msgpack_scan::writer::{write_kv_raw, write_map_header};
 
     fn row(pairs: &[(&str, &str)]) -> BindingRow {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    fn resume_cursor() -> VarLenResume {
+        VarLenResume {
+            triple_idx: 2,
+            source_row: row(&[("a", "alice"), ("b", "bob")]),
+            frontier: vec![(7, "alice->bob".into()), (9, "alice->carol".into())],
+            depth: 3,
+        }
     }
 
     /// Round-trip the `{rows, frontier}` envelope: encode in the handler shape,
@@ -264,8 +341,9 @@ mod tests {
             partial_row: row(&[("a", "alice"), ("b", "bob")]),
         }];
 
-        let payload = encode_match_envelope(&rows, &frontier).unwrap();
-        let (row_elements, decoded_frontier) = decode_match_envelope(&payload).unwrap();
+        let payload = encode_match_envelope(&rows, &frontier, &[]).unwrap();
+        let decoded = decode_match_envelope(&payload).unwrap();
+        assert!(decoded.resume.is_empty());
 
         // Rows preserved: 2 elements. Merging them back into a bare array
         // reproduces the exact `rows` map values embedded in the envelope —
@@ -273,8 +351,8 @@ mod tests {
         // independent `rows_to_msgpack` call could differ only in HashMap key
         // order, so we reconstruct the expected bare array from the envelope's
         // own `rows` field rather than re-serializing).
-        assert_eq!(row_elements.len(), 2);
-        let merged = encode_msgpack_array(&row_elements);
+        assert_eq!(decoded.row_elements.len(), 2);
+        let merged = encode_msgpack_array(&decoded.row_elements);
         let envelope_rows = map_value_raw(&payload, MATCH_ENVELOPE_ROWS_KEY).unwrap();
         assert_eq!(
             merged, envelope_rows,
@@ -289,12 +367,12 @@ mod tests {
         assert_eq!(arr[1]["a"], "carol");
 
         // Frontier preserved.
-        assert_eq!(decoded_frontier.len(), 1);
-        assert_eq!(decoded_frontier[0].node_name, "bob");
-        assert_eq!(decoded_frontier[0].binding_var, "b");
-        assert_eq!(decoded_frontier[0].triple_idx, 1);
+        assert_eq!(decoded.frontier.len(), 1);
+        assert_eq!(decoded.frontier[0].node_name, "bob");
+        assert_eq!(decoded.frontier[0].binding_var, "b");
+        assert_eq!(decoded.frontier[0].triple_idx, 1);
         assert_eq!(
-            decoded_frontier[0].partial_row.get("a").map(String::as_str),
+            decoded.frontier[0].partial_row.get("a").map(String::as_str),
             Some("alice")
         );
     }
@@ -304,13 +382,66 @@ mod tests {
     /// is empty.
     #[test]
     fn envelope_round_trips_empty() {
-        let payload = encode_match_envelope(&[], &[]).unwrap();
-        let (row_elements, decoded_frontier) = decode_match_envelope(&payload).unwrap();
-        assert!(row_elements.is_empty());
-        assert!(decoded_frontier.is_empty());
-        let merged = encode_msgpack_array(&row_elements);
+        let payload = encode_match_envelope(&[], &[], &[]).unwrap();
+        let decoded = decode_match_envelope(&payload).unwrap();
+        assert!(decoded.row_elements.is_empty());
+        assert!(decoded.frontier.is_empty());
+        assert!(decoded.resume.is_empty());
+        let merged = encode_msgpack_array(&decoded.row_elements);
         let expected = crate::engine::graph::pattern::executor::rows_to_msgpack(&[]).unwrap();
         assert_eq!(merged, expected);
+    }
+
+    /// The truncation resume cursor survives the envelope round-trip with every
+    /// field intact: triple_idx, source_row, the `(local_id, path)` frontier
+    /// pairs, and depth. Exercised via BOTH the `&[BindingRow]` encoder and the
+    /// pre-merged-bytes `_raw` encoder (the cross-node path) so they stay in
+    /// lockstep.
+    #[test]
+    fn envelope_round_trips_resume_cursor() {
+        let rows = vec![row(&[("a", "alice"), ("b", "bob")])];
+        let cursor = resume_cursor();
+
+        // `&[BindingRow]` encoder (DP handler shape).
+        let payload = encode_match_envelope(&rows, &[], std::slice::from_ref(&cursor)).unwrap();
+        let decoded = decode_match_envelope(&payload).unwrap();
+        assert_eq!(decoded.resume.len(), 1);
+        assert_eq!(decoded.resume[0], cursor);
+
+        // `_raw` encoder (node-level re-wrap onto the cross-node wire). Two
+        // cursors (two capping cores) must BOTH survive — never collapsed to one.
+        let rows_array = crate::engine::graph::pattern::executor::rows_to_msgpack(&rows).unwrap();
+        let two = vec![cursor.clone(), resume_cursor()];
+        let raw = encode_match_envelope_raw(&rows_array, &[], &two).unwrap();
+        let decoded_raw = decode_match_envelope(&raw).unwrap();
+        assert_eq!(decoded_raw.resume.len(), 2);
+        assert_eq!(decoded_raw.resume[0], cursor);
+        assert_eq!(decoded_raw.resume[0].frontier, cursor.frontier);
+        assert_eq!(decoded_raw.resume[0].depth, cursor.depth);
+        assert_eq!(decoded_raw.resume[0].triple_idx, cursor.triple_idx);
+        assert_eq!(decoded_raw.resume[0].source_row, cursor.source_row);
+    }
+
+    /// Backward-compat: an OLD-style 2-key `{rows, frontier}` envelope (no
+    /// `resume` key) still decodes cleanly, with the resume cursors defaulting
+    /// to empty — a mixed-version cluster never breaks.
+    #[test]
+    fn legacy_two_key_envelope_decodes_resume_as_empty() {
+        let rows_array =
+            crate::engine::graph::pattern::executor::rows_to_msgpack(&[row(&[("a", "x")])])
+                .unwrap();
+        let frontier_bytes = zerompk::to_msgpack_vec(&Vec::<UnresolvedExpansion>::new()).unwrap();
+
+        // Hand-roll the legacy 2-key map exactly as the pre-resume encoder did.
+        let mut buf = Vec::new();
+        write_map_header(&mut buf, 2);
+        write_kv_raw(&mut buf, MATCH_ENVELOPE_ROWS_KEY, &rows_array);
+        write_kv_raw(&mut buf, MATCH_ENVELOPE_FRONTIER_KEY, &frontier_bytes);
+
+        let decoded = decode_match_envelope(&buf).unwrap();
+        assert_eq!(decoded.row_elements.len(), 1);
+        assert!(decoded.frontier.is_empty());
+        assert!(decoded.resume.is_empty());
     }
 
     /// Malformed bytes (not a map) surface a typed error, never a panic.

@@ -10,24 +10,49 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::pattern::ast::MatchQuery;
-use crate::engine::graph::pattern::executor::{BindingRow, UnresolvedExpansion, rows_to_msgpack};
+use crate::engine::graph::pattern::executor::{
+    BindingRow, UnresolvedExpansion, VarLenResume, rows_to_msgpack,
+};
 
 /// Map key carrying the binding-rows msgpack array in the MATCH envelope.
 pub(crate) const MATCH_ENVELOPE_ROWS_KEY: &str = "rows";
 /// Map key carrying the cross-shard frontier msgpack array in the MATCH envelope.
 pub(crate) const MATCH_ENVELOPE_FRONTIER_KEY: &str = "frontier";
+/// Map key carrying the variable-length truncation resume cursors in the MATCH
+/// envelope. A msgpack array of [`VarLenResume`] (empty when nothing truncated).
+///
+/// A shard truncates a `[*min..max]` expansion independently, so a node fanned
+/// across multiple cores can produce several resume cursors in one envelope —
+/// the value is therefore an ARRAY, never a single optional cursor. The array
+/// rides the SAME envelope bytes that already carry `rows`/`frontier` across the
+/// SPSC bridge AND the cross-node round-trip; nothing widens `ExecuteResponse`.
+pub(crate) const MATCH_ENVELOPE_RESUME_KEY: &str = "resume";
 
-/// Encode a MATCH result into the DP→CP `{rows, frontier}` msgpack envelope.
+/// Zerompk-encode a `VarLenResume` slice into the `resume` map value (a msgpack
+/// array, empty when nothing truncated). Modeled exactly on the `frontier`
+/// value encoding so encode/decode/empty-case stay symmetric.
+fn encode_resume_value(resume: &[VarLenResume]) -> Result<Vec<u8>, crate::Error> {
+    zerompk::to_msgpack_vec(&resume.to_vec()).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("match resume serialization: {e}"),
+    })
+}
+
+/// Encode a MATCH result into the DP→CP `{rows, frontier, resume}` msgpack
+/// envelope.
 ///
 /// `rows` are serialized exactly as [`rows_to_msgpack`] produces (an unchanged
 /// bare msgpack array) and embedded as the `rows` map value. The
 /// `unresolved_frontier` is zerompk-encoded (a msgpack array of
-/// [`UnresolvedExpansion`]) and embedded as the `frontier` map value. Both are
+/// [`UnresolvedExpansion`]) and embedded as the `frontier` map value. The
+/// variable-length truncation `resume` cursors are zerompk-encoded the same way
+/// (a msgpack array of [`VarLenResume`], empty when nothing truncated). All are
 /// already-valid msgpack values, so they are spliced in via `write_kv_raw`
-/// without re-encoding.
+/// without re-encoding. The map ALWAYS carries 3 keys so decode is uniform.
 pub(crate) fn encode_match_envelope(
     rows: &[BindingRow],
     frontier: &[UnresolvedExpansion],
+    resume: &[VarLenResume],
 ) -> Result<Vec<u8>, crate::Error> {
     use nodedb_query::msgpack_scan::writer::{write_kv_raw, write_map_header};
 
@@ -37,27 +62,32 @@ pub(crate) fn encode_match_envelope(
             format: "msgpack".into(),
             detail: format!("match frontier serialization: {e}"),
         })?;
+    let resume_bytes = encode_resume_value(resume)?;
 
-    let mut buf = Vec::with_capacity(rows_bytes.len() + frontier_bytes.len() + 16);
-    write_map_header(&mut buf, 2);
+    let mut buf =
+        Vec::with_capacity(rows_bytes.len() + frontier_bytes.len() + resume_bytes.len() + 24);
+    write_map_header(&mut buf, 3);
     write_kv_raw(&mut buf, MATCH_ENVELOPE_ROWS_KEY, &rows_bytes);
     write_kv_raw(&mut buf, MATCH_ENVELOPE_FRONTIER_KEY, &frontier_bytes);
+    write_kv_raw(&mut buf, MATCH_ENVELOPE_RESUME_KEY, &resume_bytes);
     Ok(buf)
 }
 
-/// Build the `{rows, frontier}` envelope from an ALREADY-encoded bare rows
-/// msgpack array plus frontier entries.
+/// Build the `{rows, frontier, resume}` envelope from an ALREADY-encoded bare
+/// rows msgpack array plus frontier entries and resume cursors.
 ///
 /// Mirrors [`encode_match_envelope`] but accepts pre-merged rows bytes (as
 /// produced by `broadcast_match_to_all_cores`) instead of `&[BindingRow]`,
 /// avoiding a redundant decode+re-encode round-trip.  The output is byte-
-/// identical to what `encode_match_envelope` would produce for the same rows.
+/// identical to what `encode_match_envelope` would produce for the same inputs.
 ///
 /// Called by `execute_plan_all_local_cores` in the MATCH branch to reconstruct
-/// the single-shard envelope shape from a node-level `MatchBroadcastOutcome`.
+/// the single-shard envelope shape from a node-level `MatchBroadcastOutcome`,
+/// carrying the merged-across-cores `resume` cursors onto the cross-node wire.
 pub(crate) fn encode_match_envelope_raw(
     rows_array: &[u8],
     frontier: &[UnresolvedExpansion],
+    resume: &[VarLenResume],
 ) -> Result<Vec<u8>, crate::Error> {
     use nodedb_query::msgpack_scan::writer::{write_kv_raw, write_map_header};
 
@@ -66,11 +96,14 @@ pub(crate) fn encode_match_envelope_raw(
             format: "msgpack".into(),
             detail: format!("match frontier serialization: {e}"),
         })?;
+    let resume_bytes = encode_resume_value(resume)?;
 
-    let mut buf = Vec::with_capacity(rows_array.len() + frontier_bytes.len() + 16);
-    write_map_header(&mut buf, 2);
+    let mut buf =
+        Vec::with_capacity(rows_array.len() + frontier_bytes.len() + resume_bytes.len() + 24);
+    write_map_header(&mut buf, 3);
     write_kv_raw(&mut buf, MATCH_ENVELOPE_ROWS_KEY, rows_array);
     write_kv_raw(&mut buf, MATCH_ENVELOPE_FRONTIER_KEY, &frontier_bytes);
+    write_kv_raw(&mut buf, MATCH_ENVELOPE_RESUME_KEY, &resume_bytes);
     Ok(buf)
 }
 
@@ -79,13 +112,15 @@ impl CoreLoop {
     /// appropriate response (`partial` if the outcome was truncated, normal
     /// otherwise).
     ///
-    /// The envelope is a 2-field msgpack map carrying BOTH the binding rows
-    /// (exactly as [`rows_to_msgpack`] produces them — a bare msgpack array)
-    /// AND the cross-shard `unresolved_frontier` (a zerompk-encoded array of
-    /// [`UnresolvedExpansion`]):
+    /// The envelope is a 3-field msgpack map carrying the binding rows
+    /// (exactly as [`rows_to_msgpack`] produces them — a bare msgpack array),
+    /// the cross-shard `unresolved_frontier` (a zerompk-encoded array of
+    /// [`UnresolvedExpansion`]), AND the variable-length truncation `resume`
+    /// cursors (a zerompk-encoded array of [`VarLenResume`], empty when nothing
+    /// truncated):
     ///
     /// ```text
-    /// { "rows": <rows msgpack array>, "frontier": <frontier msgpack array> }
+    /// { "rows": <rows array>, "frontier": <frontier array>, "resume": <resume array> }
     /// ```
     ///
     /// The Control Plane's `broadcast_match_to_all_cores` unwraps this map:
@@ -103,9 +138,14 @@ impl CoreLoop {
         task: &ExecutionTask,
         outcome: crate::engine::graph::pattern::executor::MatchOutcome,
     ) -> Response {
-        match encode_match_envelope(&outcome.rows, &outcome.unresolved_frontier) {
+        // The resume cursor (when the expansion truncated) rides INSIDE the
+        // envelope so it survives the cross-node round-trip, alongside the
+        // per-frame `partial` flag the local path still reads.
+        let truncated = outcome.truncated();
+        let resume: Vec<VarLenResume> = outcome.truncation.into_iter().collect();
+        match encode_match_envelope(&outcome.rows, &outcome.unresolved_frontier, &resume) {
             Ok(payload) => {
-                if outcome.truncated() {
+                if truncated {
                     self.response_partial(task, payload)
                 } else {
                     self.response_with_payload(task, payload)
@@ -120,7 +160,7 @@ impl CoreLoop {
     ///
     /// Shared by [`execute_graph_match`] and [`execute_graph_match_continuation`].
     fn match_empty_partition_response(&self, task: &ExecutionTask) -> Response {
-        match encode_match_envelope(&[], &[]) {
+        match encode_match_envelope(&[], &[], &[]) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
         }

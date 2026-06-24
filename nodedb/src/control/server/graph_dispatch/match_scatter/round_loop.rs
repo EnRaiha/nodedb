@@ -101,11 +101,13 @@ pub(super) async fn dispatch_continuations(
                             TraceId::ZERO,
                         )
                         .await?;
+                        let truncated = outcome.partial || !outcome.resume.is_empty();
                         Ok::<_, crate::Error>(vec![TaggedShardResult {
                             emitting_node: state.node_id,
                             rows: decode_rows(&outcome.rows_payload)?,
                             frontier: outcome.frontier,
-                            truncated: outcome.partial,
+                            truncated,
+                            resume: outcome.resume,
                         }])
                     }));
                 }

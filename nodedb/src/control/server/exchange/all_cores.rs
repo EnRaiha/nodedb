@@ -71,8 +71,14 @@ pub async fn execute_plan_all_local_cores(
                     broadcast_match_to_all_cores(state, tenant_id, database_id, plan, trace_id)
                         .await?;
 
-                let envelope =
-                    encode_match_envelope_raw(outcome.rows_payload.as_ref(), &outcome.frontier)?;
+                // Carry the truncation resume cursor(s) onto the cross-node
+                // wire inside the envelope bytes so a remote shard's truncation
+                // lands in the coordinator instead of being silently dropped.
+                let envelope = encode_match_envelope_raw(
+                    outcome.rows_payload.as_ref(),
+                    &outcome.frontier,
+                    &outcome.resume,
+                )?;
 
                 Ok(NodeLevelResult {
                     payload: envelope,

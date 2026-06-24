@@ -205,12 +205,14 @@ pub(crate) async fn handle_graph_match(
         return data_plane_response_to_native(seq, &resp);
     }
 
-    // Unwrap the `{rows, frontier}` envelope into a bare rows array. The
-    // frontier is discarded here (B2 consumes it for cross-shard dispatch).
+    // Unwrap the `{rows, frontier, resume}` envelope into a bare rows array. The
+    // frontier is discarded here (B2 consumes it for cross-shard dispatch); the
+    // resume cursor is likewise not acted on on this single-shard direct-op
+    // path — the frame's `partial` flag already marks a truncated result.
     let unwrapped =
         match crate::control::server::graph_dispatch::unwrap_match_envelope(&resp.payload) {
-            Ok((rows_payload, _frontier)) => Response {
-                payload: rows_payload,
+            Ok(u) => Response {
+                payload: u.rows_payload,
                 ..resp
             },
             Err(e) => return error_to_native(seq, &e),

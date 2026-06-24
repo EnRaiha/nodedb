@@ -9,7 +9,7 @@ use crate::bridge::envelope::Payload;
 use crate::control::gateway::RouteDecision;
 use crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard;
 use crate::control::state::SharedState;
-use crate::engine::graph::pattern::executor::{UnresolvedExpansion, rows_to_msgpack};
+use crate::engine::graph::pattern::executor::{UnresolvedExpansion, VarLenResume, rows_to_msgpack};
 use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_cluster::distributed_graph::{
     DistributedMatchCoordinator, PatternContinuation, ShardMatchResult,
@@ -39,11 +39,20 @@ pub(super) struct TaggedShardResult {
     pub(super) frontier: Vec<UnresolvedExpansion>,
     /// `true` if the shard truncated its result (a hard cap fired). Surfaced
     /// up to the scatter outcome's `partial` so a truncated cross-shard MATCH
-    /// is never silently presented as complete. Remote dispatch collapses the
-    /// per-frame `partial` flag into the payload bytes, so remote truncation is
-    /// not recoverable here (a known gap — see module docs); the LOCAL
-    /// broadcast partial IS threaded.
+    /// is never silently presented as complete. Populated symmetrically for the
+    /// LOCAL broadcast and every REMOTE shard — both ride the resume cursor(s)
+    /// in the envelope bytes, so remote truncation is now observable here.
     pub(super) truncated: bool,
+    /// The variable-length truncation resume cursor(s) this shard produced,
+    /// tagged (by `emitting_node`) like the frontier. A node fanned across
+    /// cores can truncate on several at once, hence a `Vec`. Decoded from the
+    /// shard's `{rows, frontier, resume}` envelope (local OR remote) and landed
+    /// here carrying per-shard variable-length truncation cursors that the
+    /// coordinator's resume re-dispatch path will consume to re-issue
+    /// `MatchVarLenResume` plans. The re-dispatch wiring is not yet connected;
+    /// the field is populated and preserved so the data survives until it is.
+    #[allow(dead_code)]
+    pub(super) resume: Vec<VarLenResume>,
 }
 
 /// Orchestrate a cross-shard MATCH. Caller guarantees cluster mode
@@ -122,6 +131,13 @@ pub(super) fn feed_result(
         rows,
         frontier,
         truncated,
+        // Carried-but-not-yet-acted-on: the decoded resume cursor(s) are now
+        // present in the scatter (no longer dropped on the remote path). The
+        // round loop does NOT yet re-dispatch a `MatchVarLenResume` plan from
+        // them — that is the next sub-unit. For now the coordinator only lifts
+        // the `truncated` flag into `partial` (below) so a capped result is
+        // never presented as complete.
+        resume: _,
     } = tagged;
 
     let continuations = frontier_to_continuations(state, emitting_node, frontier)?;

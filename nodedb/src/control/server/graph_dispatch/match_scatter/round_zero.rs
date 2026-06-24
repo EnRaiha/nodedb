@@ -87,11 +87,13 @@ pub(super) async fn scatter_round_zero(
 
     let mut out: Vec<TaggedShardResult> = Vec::new();
     let local_outcome = local_outcome?;
+    let local_truncated = local_outcome.partial || !local_outcome.resume.is_empty();
     out.push(TaggedShardResult {
         emitting_node: state.node_id,
         rows: decode_rows(&local_outcome.rows_payload)?,
         frontier: local_outcome.frontier,
-        truncated: local_outcome.partial,
+        truncated: local_truncated,
+        resume: local_outcome.resume,
     });
     for res in remote_results {
         out.extend(res?);
@@ -168,14 +170,18 @@ pub(super) fn collect_remote_envelopes(
 ) -> crate::Result<Vec<TaggedShardResult>> {
     let mut out = Vec::with_capacity(payloads.len());
     for payload in payloads {
-        let (rows_payload, frontier) = unwrap_match_envelope(&Payload::from_vec(payload))?;
+        let unwrapped = unwrap_match_envelope(&Payload::from_vec(payload))?;
+        // The truncation signal now rides INSIDE the envelope bytes (the resume
+        // cursor array), so remote truncation is recoverable: a non-empty resume
+        // marks this shard truncated. The per-frame `partial` flag is still
+        // collapsed by remote dispatch, but the in-payload cursor replaces it.
+        let truncated = !unwrapped.resume.is_empty();
         out.push(TaggedShardResult {
             emitting_node: node_id,
-            rows: decode_rows(&rows_payload)?,
-            frontier,
-            // Remote dispatch collapses the per-frame `partial` flag into the
-            // payload bytes, so remote truncation is not recoverable here.
-            truncated: false,
+            rows: decode_rows(&unwrapped.rows_payload)?,
+            frontier: unwrapped.frontier,
+            truncated,
+            resume: unwrapped.resume,
         });
     }
     Ok(out)
