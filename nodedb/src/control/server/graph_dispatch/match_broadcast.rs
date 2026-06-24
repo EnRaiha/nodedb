@@ -29,17 +29,18 @@
 //! This is MATCH-only: the generic gather primitives are left untouched for all
 //! other plan types.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::future::join_all;
 
-use crate::bridge::envelope::{Payload, PhysicalPlan, Priority, Request, Response, Status};
+use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
+use crate::control::server::exchange::gather::eager_dispatch_to_all_cores;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::data::executor::handlers::graph_match::{
     MATCH_ENVELOPE_FRONTIER_KEY, MATCH_ENVELOPE_ROWS_KEY,
 };
 use crate::engine::graph::pattern::executor::UnresolvedExpansion;
-use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_query::msgpack_scan::reader::{map_header, read_str_advance, skip_value};
 
 /// Result of a MATCH cross-core broadcast after envelope unwrapping.
@@ -141,44 +142,11 @@ pub async fn broadcast_match_to_all_cores(
 
     let deadline_secs = state.tuning.network.default_deadline_secs;
 
-    let num_cores = state
-        .dispatcher
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .num_cores();
-
     // Eager dispatch: register a tracker receiver and dispatch to each core
     // BEFORE awaiting any response, matching gather_all_cores' true-parallelism
     // prologue.
-    let mut receivers = Vec::with_capacity(num_cores);
-    for core_id in 0..num_cores {
-        let request_id = state.next_request_id();
-        let vshard_id = VShardId::new(core_id as u32);
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id,
-            vshard_id,
-            plan: plan.clone(),
-            deadline: Instant::now() + Duration::from_secs(deadline_secs),
-            priority: Priority::Normal,
-            trace_id,
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-        };
-
-        let rx = state.tracker.register(request_id);
-        state
-            .dispatcher
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .dispatch_to_core(core_id, request)?;
-        receivers.push((core_id, rx));
-    }
+    let receivers =
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, |_| plan.clone())?;
 
     // Await all cores in parallel, draining the full bounded response per core
     // (a core's result may stream as several Partial frames before its terminal

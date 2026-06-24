@@ -26,6 +26,69 @@ use crate::control::server::result_stream::ResultStream;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
 
+/// Eagerly dispatch a plan to every local Data-Plane core, registering a tracker
+/// receiver per core BEFORE returning so all cores have the request in flight
+/// (true-parallelism prologue). `plan_for_core(core_id)` produces each core's
+/// plan — pass `|_| plan.clone()` for an identical plan across cores, or scope it
+/// per core (e.g. a graph-superstep's `owned_vshards`). Returns the per-core
+/// `(core_id, receiver)` pairs in core_id order (0..num_cores); the caller
+/// collects/merges as it sees fit.
+///
+/// Does NOT call `broadcast_call_count_increment()` — each caller is responsible
+/// for its own observability increment.
+pub(crate) fn eager_dispatch_to_all_cores(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    trace_id: TraceId,
+    plan_for_core: impl Fn(usize) -> PhysicalPlan,
+) -> crate::Result<
+    Vec<(
+        usize,
+        tokio::sync::mpsc::Receiver<crate::bridge::envelope::Response>,
+    )>,
+> {
+    let deadline_secs = state.tuning.network.default_deadline_secs;
+
+    let num_cores = state
+        .dispatcher
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .num_cores();
+
+    let mut receivers = Vec::with_capacity(num_cores);
+    for core_id in 0..num_cores {
+        let request_id = state.next_request_id();
+        let vshard_id = VShardId::new(core_id as u32);
+        let request = Request {
+            request_id,
+            tenant_id,
+            database_id,
+            vshard_id,
+            plan: plan_for_core(core_id),
+            deadline: Instant::now() + Duration::from_secs(deadline_secs),
+            priority: Priority::Normal,
+            trace_id,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+        };
+
+        let rx = state.tracker.register(request_id);
+        state
+            .dispatcher
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .dispatch_to_core(core_id, request)?;
+        receivers.push((core_id, rx));
+    }
+
+    Ok(receivers)
+}
+
 /// Outcomes of a full fan-out/gather cycle across all Data-Plane cores.
 pub struct GatherOutcome {
     /// Concatenated per-core payloads (multiple msgpack arrays back-to-back).
@@ -58,44 +121,11 @@ pub async fn gather_all_cores(
 
     let deadline_secs = state.tuning.network.default_deadline_secs;
 
-    let num_cores = state
-        .dispatcher
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .num_cores();
-
     // Issue all per-core sends and collect receiver channels before awaiting.
     // This ensures every core has the request in flight before we block on any
     // of them, matching true parallelism semantics.
-    let mut receivers = Vec::with_capacity(num_cores);
-    for core_id in 0..num_cores {
-        let request_id = state.next_request_id();
-        let vshard_id = VShardId::new(core_id as u32);
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id,
-            vshard_id,
-            plan: plan.clone(),
-            deadline: Instant::now() + Duration::from_secs(deadline_secs),
-            priority: Priority::Normal,
-            trace_id,
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-        };
-
-        let rx = state.tracker.register(request_id);
-        state
-            .dispatcher
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .dispatch_to_core(core_id, request)?;
-        receivers.push((core_id, rx));
-    }
+    let receivers =
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, |_| plan.clone())?;
 
     // Await all responses in parallel using join_all. Each core's scan result
     // may stream as several `Partial` frames before its terminal frame, so drain
@@ -223,47 +253,16 @@ pub fn gather_all_cores_stream(
     // Track broadcast calls for observability (shared counter with broadcast.rs).
     crate::control::server::broadcast::broadcast_call_count_increment();
 
-    let deadline_secs = state.tuning.network.default_deadline_secs;
     let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
-
-    let num_cores = state
-        .dispatcher
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .num_cores();
 
     // Eager dispatch: register a tracker receiver and dispatch to each core
     // BEFORE returning the stream, so every core has the request in flight
     // immediately (matching `gather_all_cores`'s true-parallelism prologue).
-    let mut per_core: Vec<ResultStream> = Vec::with_capacity(num_cores);
-    for core_id in 0..num_cores {
-        let request_id = state.next_request_id();
-        let vshard_id = VShardId::new(core_id as u32);
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id,
-            vshard_id,
-            plan: plan.clone(),
-            deadline: Instant::now() + Duration::from_secs(deadline_secs),
-            priority: Priority::Normal,
-            trace_id,
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-        };
-
-        let rx = state.tracker.register(request_id);
-        state
-            .dispatcher
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .dispatch_to_core(core_id, request)?;
-        per_core.push(stream_response_channel(rx, max_result_bytes, true));
-    }
+    let per_core: Vec<ResultStream> =
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, |_| plan.clone())?
+            .into_iter()
+            .map(|(_core_id, rx)| stream_response_channel(rx, max_result_bytes, true))
+            .collect();
 
     Ok(Box::pin(futures::stream::select_all(per_core)))
 }

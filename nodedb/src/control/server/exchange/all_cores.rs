@@ -16,11 +16,12 @@
 //! behaviour-identical to the prior single-core dispatch.
 
 use futures::future::join_all;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::bridge::envelope::{Priority, Request, Response, Status};
+use crate::bridge::envelope::{Response, Status};
+use crate::control::server::exchange::gather::eager_dispatch_to_all_cores;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, ReadConsistency, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
 use nodedb_physical::physical_plan::{
     BspSuperstepResult, GraphOp, PhysicalPlan, WccSuperstepResult,
 };
@@ -274,49 +275,27 @@ async fn gather_graph_op_all_cores(
     // Eager dispatch: register a tracker receiver and dispatch to each core
     // BEFORE awaiting any response, matching gather_all_cores' true-parallelism
     // prologue.
-    let mut receivers = Vec::with_capacity(num_cores);
-    for core_id in 0..num_cores {
-        let request_id = state.next_request_id();
-        let vshard_id = VShardId::new(core_id as u32);
-        let mut core_plan = plan.clone();
-        match &mut core_plan {
-            PhysicalPlan::Graph(GraphOp::BspSuperstep(bsp)) => {
-                bsp.owned_vshards
-                    .retain(|v| (*v as usize) % num_cores == core_id);
+    // CRITICAL: scope each core's `owned_vshards` to the vShards round-robin homed
+    // on THAT core (`vshard % num_cores == core_id`) so owned sets are genuinely
+    // disjoint across cores. See function-level doc for details.
+    let receivers =
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, |core_id| {
+            let mut core_plan = plan.clone();
+            match &mut core_plan {
+                PhysicalPlan::Graph(GraphOp::BspSuperstep(bsp)) => {
+                    bsp.owned_vshards
+                        .retain(|v| (*v as usize) % num_cores == core_id);
+                }
+                PhysicalPlan::Graph(GraphOp::WccSuperstep(wcc)) => {
+                    wcc.owned_vshards
+                        .retain(|v| (*v as usize) % num_cores == core_id);
+                }
+                // Caller only invokes this for BSP/WCC plans; any other plan is fanned
+                // verbatim (no per-core scoping field exists for it).
+                _ => {}
             }
-            PhysicalPlan::Graph(GraphOp::WccSuperstep(wcc)) => {
-                wcc.owned_vshards
-                    .retain(|v| (*v as usize) % num_cores == core_id);
-            }
-            // Caller only invokes this for BSP/WCC plans; any other plan is fanned
-            // verbatim (no per-core scoping field exists for it).
-            _ => {}
-        }
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id,
-            vshard_id,
-            plan: core_plan,
-            deadline: Instant::now() + Duration::from_secs(deadline_secs),
-            priority: Priority::Normal,
-            trace_id,
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-        };
-
-        let rx = state.tracker.register(request_id);
-        state
-            .dispatcher
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .dispatch_to_core(core_id, request)?;
-        receivers.push((core_id, rx));
-    }
+            core_plan
+        })?;
 
     let deadline = Duration::from_secs(deadline_secs);
     let response_futures = receivers.into_iter().map(|(core_id, mut rx)| async move {
