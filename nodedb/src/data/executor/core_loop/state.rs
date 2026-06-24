@@ -19,16 +19,11 @@ use crate::engine::sparse::inverted::InvertedIndex;
 use crate::engine::vector::collection::VectorCollection;
 use crate::engine::vector::sparse::SparseInvertedIndex;
 use crate::types::{Lsn, TenantId};
+use nodedb_columnar::mutation::snapshot::FlushedSurrogateTable;
 use nodedb_graph::ShardedCsrIndex;
 use nodedb_types::{DatabaseId, OrdinalClock};
 
 use super::priority_queues::PriorityQueues;
-
-/// Per-key flushed-surrogate table held in lockstep with
-/// `columnar_flushed_segments`: one entry per flushed segment (outer Vec index
-/// == segment Vec index), each a per-row list of cross-engine surrogates
-/// (`None` for a row flushed without one).
-type FlushedSurrogateTable = Vec<Vec<Option<nodedb_types::Surrogate>>>;
 
 /// Per-core event loop for the Data Plane.
 ///

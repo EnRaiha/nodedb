@@ -288,8 +288,17 @@ impl CoreLoop {
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
 
+            // Cross-engine surrogate sidecar, keyed identically to the segment
+            // bytes. Absent for collections that never flushed surrogate-bearing
+            // rows; defaults to empty so the snapshot still round-trips.
+            let flushed_surrogates: &[Vec<Option<nodedb_types::Surrogate>>] = self
+                .columnar_flushed_surrogates
+                .get(&(*eng_db, *eng_tid, collection.clone()))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+
             let snap = engine
-                .export_snapshot(flushed)
+                .export_snapshot(flushed, flushed_surrogates)
                 .map_err(|e| crate::Error::Storage {
                     engine: "columnar".into(),
                     detail: format!("export_snapshot for collection '{collection}': {e}"),

@@ -184,7 +184,7 @@ impl CoreLoop {
                     ),
                 })?;
 
-            let (engine, flushed) =
+            let (engine, flushed, flushed_surrogates) =
                 nodedb_columnar::MutationEngine::from_snapshot(snap).map_err(|e| {
                     crate::Error::Storage {
                         engine: "columnar".into(),
@@ -196,7 +196,19 @@ impl CoreLoop {
 
             self.columnar_engines.insert(engine_key.clone(), engine);
             if !flushed.is_empty() {
-                self.columnar_flushed_segments.insert(engine_key, flushed);
+                self.columnar_flushed_segments
+                    .insert(engine_key.clone(), flushed);
+            }
+            // Re-attach the cross-engine surrogate sidecar under the SAME key so
+            // prefiltered scans see flushed rows post-restore. Old snapshots
+            // carry empty surrogates (non-empty segments): we skip populating
+            // the sidecar, so those rows read as `None`-surrogate and are
+            // conservatively excluded under an active prefilter — the correct
+            // backward-compat behavior. Order is preserved so segment_id ==
+            // index + 1 holds for the sidecar too.
+            if !flushed_surrogates.is_empty() {
+                self.columnar_flushed_surrogates
+                    .insert(engine_key, flushed_surrogates);
             }
         }
         Ok(())
