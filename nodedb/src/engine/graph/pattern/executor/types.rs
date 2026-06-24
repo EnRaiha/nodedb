@@ -64,8 +64,12 @@ pub struct UnresolvedExpansion {
 /// - `triple_idx` — the within-chain triple whose expansion was capped.
 /// - `source_row` — the bindings present at that triple's source (so the
 ///   resumed rows re-bind `a`/`b`/the edge var identically to a single pass).
-/// - `frontier` — the surviving un-expanded node ids (reached at
-///   `depth - 1`, awaiting expansion AT `depth`).
+/// - `frontier` — the surviving un-expanded frontier entries, each a
+///   `(local_id, path_string)` pair (reached at `depth - 1`, awaiting
+///   expansion AT `depth`). The path string is the accumulated path-so-far
+///   from the original source when the edge variable is bound (`want_path`),
+///   empty otherwise. Carrying it verbatim is what keeps resumed `RETURN p`
+///   path strings continuous with the first pass.
 /// - `depth` — the hop depth at which `frontier` is resumed.
 ///
 /// There is deliberately **no `visited` set**: termination relies on the
@@ -78,9 +82,10 @@ pub struct UnresolvedExpansion {
 // The fields are produced by the executor on a capped expansion and consumed by
 // the cross-plane resume dispatch (`GraphOp::MatchVarLenResume`). The struct is
 // wire-serializable (serde + zerompk) so the cursor can ride the SPSC bridge
-// inside the resume plan variant; `frontier` carries CSR-local node ids, so a
-// same-shard resume is exact (cross-shard id↔name translation is handled by the
-// remote-resume envelope path).
+// inside the resume plan variant; each `frontier` entry is a `(local_id,
+// path_string)` pair carrying a CSR-local node id alongside its accumulated
+// path-so-far, so a same-shard resume is exact (cross-shard id↔name translation
+// is handled by the remote-resume envelope path).
 #[derive(
     Debug,
     Clone,
@@ -95,8 +100,8 @@ pub struct VarLenResume {
     pub triple_idx: usize,
     /// Bindings present at the capped expansion's source.
     pub source_row: BindingRow,
-    /// Surviving un-expanded frontier node ids.
-    pub frontier: Vec<u32>,
+    /// Surviving un-expanded frontier entries: `(local_id, path_so_far)`.
+    pub frontier: Vec<(u32, String)>,
     /// Hop depth reached at the cap (the depth `frontier` resumes at).
     pub depth: usize,
 }

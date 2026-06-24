@@ -52,8 +52,12 @@ impl Default for VarLenCaps {
 /// later — never a skipped or mis-depthed row.
 #[derive(Debug, Clone)]
 pub(super) struct VarLenCursor {
-    /// Un-expanded source node ids to resume the BFS from.
-    pub frontier: Vec<u32>,
+    /// Un-expanded frontier entries to resume the BFS from, each a
+    /// `(node_id, path_so_far)` pair held verbatim from the live BFS frontier.
+    /// The path string carries the accumulated route from the original source
+    /// (empty when the edge variable is unbound), so resumed `RETURN p` rows
+    /// render full paths instead of bare node names.
+    pub frontier: Vec<(u32, String)>,
     /// Hop depth at which `frontier` is to be expanded (`resume_depth`).
     pub depth: usize,
 }
@@ -151,14 +155,18 @@ pub(super) fn expand_variable_length(
 
 /// Resume a previously-capped variable-length expansion from a [`VarLenCursor`].
 ///
-/// `cursor.frontier` are nodes reached at `cursor.depth - 1` on the prior round
-/// and awaiting expansion AT `cursor.depth`. The BFS continues with a **fresh**
-/// `visited` set (seeded only with the resume frontier itself so a node is not
-/// expanded twice within this round): per the cross-shard contract, dedup of
-/// rows already emitted on the prior round is the coordinator's job, never the
-/// executor's. The `min_hops..=max_hops` bound is honored across the resume
-/// boundary because the loop continues at `cursor.depth`, so a node reached at
-/// depth `d` here behaves exactly as a node reached at depth `d` in one pass.
+/// `cursor.frontier` are `(node_id, path_so_far)` pairs reached at
+/// `cursor.depth - 1` on the prior round and awaiting expansion AT
+/// `cursor.depth`. The pairs are fed into the BFS verbatim, so the accumulated
+/// path prefix from the original source is preserved — resumed `RETURN p` rows
+/// render the full path, not just the resume node's own name. The BFS continues
+/// with a **fresh** `visited` set (seeded only with the resume frontier ids so a
+/// node is not expanded twice within this round): per the cross-shard contract,
+/// dedup of rows already emitted on the prior round is the coordinator's job,
+/// never the executor's. The `min_hops..=max_hops` bound is honored across the
+/// resume boundary because the loop continues at `cursor.depth`, so a node
+/// reached at depth `d` here behaves exactly as a node reached at depth `d` in
+/// one pass.
 //
 // Consumed by `execute_varlen_resume` (the cross-plane resume path).
 pub(super) fn resume_variable_length(
@@ -167,16 +175,19 @@ pub(super) fn resume_variable_length(
     pattern: &VarLenPattern<'_>,
     caps: VarLenCaps,
 ) -> VarLenExpansion {
-    // Seed visited with the resume frontier so an intra-round revisit of a
+    // Seed visited with the resume frontier ids so an intra-round revisit of a
     // resume node is suppressed; rows already emitted in the PRIOR round are
-    // intentionally NOT tracked (coordinator dedups across rounds).
+    // intentionally NOT tracked (coordinator dedups across rounds). The frontier
+    // pairs are seeded directly — their carried `path_so_far` strings are the
+    // accumulated route from the original source, so resumed paths stay
+    // continuous instead of being rebuilt from the resume node's own name.
     let mut visited: HashSet<u32> = HashSet::new();
     let mut frontier: Vec<(u32, String)> = Vec::with_capacity(cursor.frontier.len());
-    for &node in &cursor.frontier {
-        if !visited.insert(node) {
+    for (node, path) in &cursor.frontier {
+        if !visited.insert(*node) {
             continue;
         }
-        frontier.push((node, node_name_or_empty(csr, node, pattern.want_path)));
+        frontier.push((*node, path.clone()));
     }
 
     run_bfs(
@@ -248,7 +259,10 @@ fn run_bfs(
         if cap_hit {
             if depth < pattern.max_hops && !next_frontier.is_empty() {
                 cursor = Some(VarLenCursor {
-                    frontier: next_frontier.into_iter().map(|(id, _)| id).collect(),
+                    // Store the live frontier verbatim — the `(id, path_so_far)`
+                    // pairs — so resume seeds the exact accumulated path context
+                    // and path-returning queries stay continuous across the cap.
+                    frontier: next_frontier,
                     depth: depth + 1,
                 });
             }
@@ -620,6 +634,68 @@ mod tests {
         assert_eq!(
             union, expected,
             "*1..2 resume union must be exactly the depth-1..2 set {{n1,n2}}"
+        );
+    }
+
+    fn path_set(results: &[(u32, String)]) -> std::collections::HashSet<String> {
+        results.iter().map(|(_, p)| p.clone()).collect()
+    }
+
+    /// Spec: with `want_path = true`, a capped expansion resumed from its cursor
+    /// renders the FULL path string from the original source for every resumed
+    /// row — not a truncated suffix starting at the resume frontier. Exact set
+    /// equality of (first-pass ∪ resumed) path strings vs a single uncapped
+    /// `want_path` pass. This is the path-continuity guarantee: the cursor
+    /// carries each frontier node's accumulated path verbatim, so resume seeds
+    /// the exact path context instead of rebuilding only the node's own name.
+    #[test]
+    fn varlen_resume_want_path_strings_are_full_paths() {
+        // Chain n0 -> n1 -> ... -> n6. `*1..6` from n0 yields paths
+        // "n0->n1", "n0->n1->n2", ... "n0->n1->...->n6".
+        let csr = make_chain(6);
+        let src = csr.node_id_raw("n0").unwrap();
+
+        let pat = VarLenPattern {
+            label_filter: Some("l"),
+            direction: Direction::Out,
+            min_hops: 1,
+            max_hops: 6,
+            want_path: true,
+        };
+
+        // Ground truth: a single uncapped want_path pass.
+        let uncapped = expand_variable_length(&csr, src, &pat, VarLenCaps::default());
+        assert!(uncapped.cursor.is_none(), "uncapped pass must not truncate");
+        let full_paths = path_set(&uncapped.results);
+        assert!(
+            full_paths.contains("n0->n1->n2->n3->n4->n5->n6"),
+            "uncapped want_path pass must render the full chain path; got {full_paths:?}"
+        );
+
+        // Inject a low results cap so truncation fires mid-chain.
+        let caps = VarLenCaps {
+            max_results: 2,
+            max_frontier: usize::MAX,
+        };
+        let first = expand_variable_length(&csr, src, &pat, caps);
+        let cursor = first
+            .cursor
+            .clone()
+            .expect("low cap must produce a resume cursor");
+
+        // Resume — possibly across multiple rounds — unioning path strings.
+        let mut union: std::collections::HashSet<String> = path_set(&first.results);
+        let mut next = Some(cursor);
+        while let Some(c) = next {
+            let resumed = resume_variable_length(&csr, &c, &pat, caps);
+            union.extend(path_set(&resumed.results));
+            next = resumed.cursor;
+        }
+
+        assert_eq!(
+            union, full_paths,
+            "first-pass ∪ resumed path strings must equal the uncapped want_path set; \
+             a truncated suffix on the resumed tail would fail this"
         );
     }
 }
