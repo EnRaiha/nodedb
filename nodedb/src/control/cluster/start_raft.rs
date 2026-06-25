@@ -37,7 +37,7 @@ use crate::control::state::SharedState;
 pub fn start_raft(
     handle: &ClusterHandle,
     shared: Arc<SharedState>,
-    _data_dir: &std::path::Path,
+    data_dir: &std::path::Path,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     transport_tuning: &ClusterTransportTuning,
 ) -> crate::Result<tokio::sync::watch::Receiver<bool>> {
@@ -162,9 +162,33 @@ pub fn start_raft(
     // Per-group snapshot applier for the RECEIVE path: on the follower, apply a
     // received per-group snapshot to the local Data-Plane state machine (via the
     // existing restore handler with replace_mode = true) before Raft advances.
-    let snapshot_applier: Arc<dyn nodedb_cluster::SnapshotApplier> = Arc::new(
-        crate::control::cluster::snapshot_applier::DataPlaneSnapshotApplier::new(shared.clone()),
-    );
+    let snapshot_applier_concrete =
+        crate::control::cluster::snapshot_applier::DataPlaneSnapshotApplier::new(shared.clone());
+
+    // Follower boot-restore: re-install any persisted `.snap` snapshots from a
+    // prior run BEFORE the apply loop is spawned. The leader's log-compaction
+    // discards the pre-snapshot prefix, so the post-snapshot log tail the apply
+    // loop will replay can NOT reconstruct that prefix — the persisted snapshot
+    // is the only source for it. Must precede `run_apply_loop` for that reason.
+    // Match the surrounding block_in_place style used for other cluster
+    // subsystems rather than introducing a new runtime entry.
+    let restored = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            crate::control::cluster::boot_restore::restore_persisted_snapshots(
+                data_dir,
+                &snapshot_applier_concrete,
+            ),
+        )
+    })?;
+    if restored > 0 {
+        info!(
+            node_id = handle.node_id,
+            restored, "follower boot-restore re-installed persisted snapshots"
+        );
+    }
+
+    let snapshot_applier: Arc<dyn nodedb_cluster::SnapshotApplier> =
+        Arc::new(snapshot_applier_concrete);
 
     // Cross-node streaming-shuffle receiver (E1): bridge the cluster
     // `ShufflePush` read-loop to the in-process registry on `SharedState`.
@@ -237,7 +261,7 @@ pub fn start_raft(
         .with_assign_remote_surrogate(assign_remote_surrogate)
         .with_calvin_submit(calvin_submit)
         .with_calvin_submit_inbox(calvin_submit_inbox)
-        .with_data_dir(_data_dir.to_path_buf())
+        .with_data_dir(data_dir.to_path_buf())
         .with_snapshot_chunk_bytes(snapshot_chunk_bytes)
         .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs),
     );

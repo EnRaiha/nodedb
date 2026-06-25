@@ -19,6 +19,7 @@
 pub mod array_cluster_exec;
 pub mod array_cluster_helpers;
 pub mod array_executor;
+pub mod boot_restore;
 pub mod bootstrap_listener;
 pub mod calvin;
 pub mod handle;
