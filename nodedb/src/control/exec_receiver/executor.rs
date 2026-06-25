@@ -157,7 +157,7 @@ impl LocalPlanExecutor {
         }
 
         // ── 3. Decode the PhysicalPlan ────────────────────────────────────────
-        let plan = match plan_wire::decode(&req.plan_bytes) {
+        let mut plan = match plan_wire::decode(&req.plan_bytes) {
             Ok(p) => p,
             Err(e) => {
                 return Err(TypedClusterError::Internal {
@@ -166,6 +166,41 @@ impl LocalPlanExecutor {
                 });
             }
         };
+
+        // ── 3a. Re-resolve an unresolved PK point-get surrogate ───────────────
+        //
+        // The query coordinator resolves `WHERE pk = <v>` → surrogate against
+        // ITS OWN local catalog. The surrogate↔PK map is sharded to the
+        // collection's data-group members, so a coordinator that is NOT a
+        // member of that group misses the binding and ships `Surrogate::ZERO`.
+        // We (the owner) ARE a group member, so our local catalog HAS the
+        // binding — re-resolve here before the plan reaches the Data Plane.
+        //
+        // Scope is intentionally tight: only `DocumentOp::PointGet` reads, only
+        // when the carried surrogate is ZERO and `pk_bytes` is non-empty. A
+        // non-ZERO carried surrogate is authoritative (immutable first-wins
+        // bind) and is left untouched; a genuinely-absent PK stays ZERO and
+        // correctly resolves to not-found.
+        if let nodedb_physical::physical_plan::PhysicalPlan::Document(
+            nodedb_physical::physical_plan::DocumentOp::PointGet {
+                surrogate,
+                pk_bytes,
+                collection,
+                ..
+            },
+        ) = &mut plan
+            && *surrogate == nodedb_types::Surrogate::ZERO
+            && !pk_bytes.is_empty()
+            && let Some(catalog) = catalog_ref.as_ref()
+            && let Ok(Some(resolved)) = catalog.get_surrogate_for_pk(
+                database_id,
+                crate::types::TenantId::new(req.tenant_id),
+                collection,
+                pk_bytes,
+            )
+        {
+            *surrogate = resolved;
+        }
 
         // ── 3b. Reject unresolved Exchange nodes ──────────────────────────────
         if plan_contains_exchange(&plan) {
