@@ -43,6 +43,8 @@ pub struct RestoreStats {
     pub kv_tables: usize,
     pub crdt_state: usize,
     pub timeseries: usize,
+    pub columnar_engines: usize,
+    pub flushed_ts_segments: usize,
     pub nodes_dispatched: usize,
     /// Non-zero = snapshot contained unparseable keys (possible corruption).
     pub malformed_keys: usize,
@@ -105,7 +107,7 @@ pub async fn restore_tenant(
     };
 
     if !dry_run {
-        apply_metadata_sections(state, tenant_id, &env);
+        apply_metadata_sections(state, tenant_id, &env)?;
     }
 
     let merged = merge_sections(&env.sections)?;
@@ -116,6 +118,8 @@ pub async fn restore_tenant(
     stats.kv_tables = merged.kv_tables.len();
     stats.crdt_state = merged.crdt_state.len();
     stats.timeseries = merged.timeseries.len();
+    stats.columnar_engines = merged.columnar_engines.len();
+    stats.flushed_ts_segments = merged.flushed_ts_segments.len();
 
     warn_on_tombstoned_restores(state, tenant_id, &merged, env.meta.snapshot_watermark);
 

@@ -117,13 +117,32 @@ impl TestServer {
     /// `open_on_path()` on the saved dir.
     pub async fn open_on_path(dir: TestDataDir) -> (Self, TestDataDir) {
         let data_dir = TestDataDir(dir.0);
-        let server = Self::start_on_dir_ref(data_dir.path()).await;
+        let server = Self::start_on_dir_ref(data_dir.path(), None).await;
+        (server, data_dir)
+    }
+
+    /// Open a server backed by an existing data directory with a custom
+    /// `columnar_flush_threshold`.
+    ///
+    /// The threshold only affects ingest-time flushing while the reopened
+    /// server is running (e.g. during a restore into the restarted server).
+    /// Pass the same value used for the original server to keep behaviour
+    /// consistent across the restart boundary.
+    pub async fn open_on_path_with_columnar_flush_threshold(
+        dir: TestDataDir,
+        flush_threshold: usize,
+    ) -> (Self, TestDataDir) {
+        let data_dir = TestDataDir(dir.0);
+        let server = Self::start_on_dir_ref(data_dir.path(), Some(flush_threshold)).await;
         (server, data_dir)
     }
 
     /// Internal: start a server rooted at an existing path without taking
     /// ownership of the directory wrapper.
-    async fn start_on_dir_ref(dir_path: &std::path::Path) -> Self {
+    async fn start_on_dir_ref(
+        dir_path: &std::path::Path,
+        columnar_flush_threshold: Option<usize>,
+    ) -> Self {
         let wal_path = dir_path.join("test.wal");
         let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
         let wal_records: Arc<[nodedb_wal::WalRecord]> =
@@ -200,7 +219,13 @@ impl TestServer {
                     governor: shared.governor.clone(),
                     replay,
                     graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
-                    query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
+                    query_tuning: {
+                        let mut qt = nodedb_types::config::tuning::QueryTuning::default();
+                        if let Some(threshold) = columnar_flush_threshold {
+                            qt.columnar_flush_threshold = threshold;
+                        }
+                        qt
+                    },
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);

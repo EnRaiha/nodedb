@@ -1,14 +1,51 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! Cluster end-to-end BACKUP / RESTORE for engine-specific data paths.
 //!
-//! Validates that BACKUP TENANT captures BOTH flushed (on-disk segment) data
-//! AND memtable (in-memory, not yet flushed) data, and that RESTORE TENANT
-//! replays both through the cluster, making them visible from a different node
-//! than the backup source.
+//! Validates that BACKUP TENANT faithfully captures BOTH flushed (on-disk
+//! segment) data AND memtable (in-memory, not yet flushed) data, and that
+//! RESTORE TENANT replays both into a genuinely CLEAN target: a FRESH second
+//! cluster that has never seen the collection.
 //!
-//! NOTE: Validates same-process restore→query. Restart-survival is NOT
-//! covered: the cluster harness cannot restart a node against the same
-//! data_dir (documented harness limitation, filed separately).
+//! ## Why a fresh second cluster (not DROP-PURGE on the same cluster)
+//!
+//! Two restore bugs were fixed that require a truly clean restore target to
+//! test faithfully:
+//!   (1) Columnar/flushed-TS data was silently dropped on restore.
+//!   (2) Catalog recreation was coordinator-local; now it propagates
+//!       cluster-wide via metadata Raft.
+//!
+//! Restoring onto the SAME cluster after DROP … PURGE is an imperfect
+//! substitute for two reasons:
+//!   - The fail-closed "refuse to overwrite live data" guard fires if any
+//!     engine state survives the purge window, making the test fragile.
+//!   - DROP … PURGE advances the tenant write-HLC, which can trip the restore
+//!     staleness gate (backup snapshot_watermark < destination tenant_write_hlc).
+//!
+//! A FRESH cluster B has tenant_write_hlc == 0, so the staleness gate always
+//! passes, and there is no live data to collide with. The test backup KEK is a
+//! fixed constant across all harness instances, so cluster B can decrypt
+//! cluster A's envelope without key exchange. Cluster ports are ephemeral, so
+//! two clusters never conflict.
+//!
+//! ## Flow for each test
+//!
+//!  1. Spawn SOURCE cluster A, CREATE collection, INSERT rows (triggering
+//!     flush where relevant), then BACKUP from node 0 into `bytes`.
+//!  2. Shut down cluster A — `bytes` is owned by the test and survives.
+//!  3. Spawn a FRESH TARGET cluster B with the SAME spawn config as A (so any
+//!     flush thresholds match if RESTORE re-ingests). Do NOT create the
+//!     collection on B — RESTORE must recreate the catalog cluster-wide (that
+//!     is part of what we are testing).
+//!  4. `push_restore` into cluster B node 0. B's tenant_write_hlc is 0, so
+//!     the staleness gate passes; no live data, so no fail-closed collision.
+//!  5. `wait_for_full_apply_convergence` on cluster B.
+//!  6. Final assertions query NODE 1 of cluster B (not the coordinator node 0)
+//!     to prove the catalog propagated cluster-wide AND data is routable from
+//!     a non-coordinator node.
+//!  7. Shut down cluster B.
+//!
+//! NOTE: Cluster A is fully shut down before cluster B spawns (sequential, not
+//! concurrent) to limit resource use and avoid port/file-descriptor exhaustion.
 
 mod common;
 use common::cluster_harness::TestCluster;
@@ -17,6 +54,7 @@ use bytes::Bytes;
 use futures::SinkExt;
 use futures::StreamExt;
 use std::time::Duration;
+use std::time::Instant;
 
 const TENANT: u64 = 1;
 
@@ -67,21 +105,69 @@ fn db_detail(e: &tokio_postgres::Error) -> String {
     }
 }
 
-// ── Helper: count rows via simple_query and extract the first column value ───
+/// Poll `SELECT COUNT(*) FROM <table>` on `client` until the collection is
+/// queryable (i.e., the catalog has propagated to this node after a restore),
+/// then return the row count.
+///
+/// Retry policy:
+/// - "table not found" (sqlstate 42601 or message contains "table not found"):
+///   catalog not yet applied on this node — sleep 100 ms and retry.
+/// - Any OTHER query error: panic immediately (real failure, not lag).
+/// - Timeout exceeded without the collection becoming queryable: panic with a
+///   clear message naming the table and timeout.
+async fn count_rows_when_ready(
+    client: &tokio_postgres::Client,
+    table: &str,
+    timeout: Duration,
+) -> usize {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match client
+            .simple_query(&format!("SELECT COUNT(*) FROM {table}"))
+            .await
+        {
+            Ok(rows) => {
+                // Collection is queryable — parse and return the count.
+                for msg in &rows {
+                    if let tokio_postgres::SimpleQueryMessage::Row(r) = msg
+                        && let Some(s) = r.get(0)
+                    {
+                        return s.parse::<usize>().expect("COUNT(*) parse");
+                    }
+                }
+                panic!("COUNT(*) returned no rows for {table}");
+            }
+            Err(ref e) => {
+                let is_not_found = e
+                    .as_db_error()
+                    .map(|db| {
+                        db.code().code() == "42601"
+                            || db.message().contains("table not found")
+                            || db.message().contains("collection not found")
+                    })
+                    .unwrap_or(false);
 
-async fn count_rows(client: &tokio_postgres::Client, table: &str) -> usize {
-    let rows = client
-        .simple_query(&format!("SELECT COUNT(*) FROM {table}"))
-        .await
-        .unwrap_or_else(|e| panic!("SELECT COUNT(*) FROM {table}: {}", db_detail(&e)));
-    for msg in &rows {
-        if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
-            if let Some(s) = r.get(0) {
-                return s.parse::<usize>().expect("COUNT(*) parse");
+                if !is_not_found {
+                    // Real error — fail loudly immediately.
+                    panic!(
+                        "SELECT COUNT(*) FROM {table} failed with unexpected error: {}",
+                        db_detail(e)
+                    );
+                }
+
+                // "table not found" — catalog propagation lag; retry if time remains.
+                if Instant::now() >= deadline {
+                    panic!(
+                        "collection `{table}` never became queryable on this node within \
+                         {timeout:?}: last error: {}",
+                        db_detail(e)
+                    );
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
-    panic!("COUNT(*) returned no rows for {table}");
 }
 
 /// Collect the first column of every data row returned by `simple_query`.
@@ -92,41 +178,43 @@ async fn collect_first_col(client: &tokio_postgres::Client, sql: &str) -> Vec<St
         .unwrap_or_else(|e| panic!("query `{sql}`: {}", db_detail(&e)));
     let mut out = Vec::new();
     for msg in rows {
-        if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
-            if let Some(s) = r.get(0) {
-                out.push(s.to_string());
-            }
+        if let tokio_postgres::SimpleQueryMessage::Row(r) = msg
+            && let Some(s) = r.get(0)
+        {
+            out.push(s.to_string());
         }
     }
     out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 1 — Timeseries: flushed segments + memtable rows are both captured
+// Test 1 — Timeseries: flushed segments + memtable rows survive restore into
+//           a FRESH second cluster
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_restore_preserves_timeseries_flushed_and_memtable() {
-    let cluster = TestCluster::spawn_three().await.expect("cluster");
+    // ── SOURCE cluster A ─────────────────────────────────────────────────────
+    let cluster_a = TestCluster::spawn_three().await.expect("cluster A");
 
     // DDL — copied from nodedb/tests/engine_surface_timeseries.rs
     // `ingest_and_time_range_scan`. COLUMNS keyword, no PRIMARY KEY (timeseries
     // uses TIME_KEY as the ordering axis, not a primary key constraint).
-    cluster
+    cluster_a
         .exec_ddl_on_any_leader(
             "CREATE COLLECTION ts_br \
              COLUMNS (id TEXT, ts BIGINT TIME_KEY, metric TEXT, value FLOAT) \
              WITH (engine='timeseries')",
         )
         .await
-        .expect("CREATE COLLECTION ts_br");
+        .expect("CREATE COLLECTION ts_br on cluster A");
 
     // Insert 5 rows with DISTINCT timestamps (no dedup risk). Written through
     // node 0; the gateway routes to the correct vshard owner.
     let pre_flush_ids = ["p1", "p2", "p3", "p4", "p5"];
     let pre_flush_ts: [u64; 5] = [1000, 2000, 3000, 4000, 5000];
     for (id, ts) in pre_flush_ids.iter().zip(pre_flush_ts.iter()) {
-        cluster.nodes[0]
+        cluster_a.nodes[0]
             .client
             .simple_query(&format!(
                 "INSERT INTO ts_br (id, ts, metric, value) \
@@ -147,7 +235,7 @@ async fn backup_restore_preserves_timeseries_flushed_and_memtable() {
     let post_flush_ids = ["p6", "p7"];
     let post_flush_ts: [u64; 2] = [6000, 7000];
     for (id, ts) in post_flush_ids.iter().zip(post_flush_ts.iter()) {
-        cluster.nodes[0]
+        cluster_a.nodes[0]
             .client
             .simple_query(&format!(
                 "INSERT INTO ts_br (id, ts, metric, value) \
@@ -157,60 +245,91 @@ async fn backup_restore_preserves_timeseries_flushed_and_memtable() {
             .unwrap_or_else(|e| panic!("insert post-flush {id}: {}", db_detail(&e)));
     }
 
-    // Backup from node 0, restore into the same cluster via node 0.
-    let bytes = drain_backup(0, &cluster, TENANT).await;
-    push_restore(0, &cluster, TENANT, bytes)
-        .await
-        .expect("RESTORE ts_br");
+    // Capture the backup from cluster A. `bytes` is owned by the test and
+    // survives cluster A's shutdown.
+    let bytes = drain_backup(0, &cluster_a, TENANT).await;
+    assert!(!bytes.is_empty(), "backup must produce non-empty bytes");
 
-    // Wait for all Raft groups to apply the restore entries on every node.
-    cluster
+    // Shut down cluster A before spawning cluster B to limit resource use and
+    // avoid port / file-descriptor exhaustion between the two clusters.
+    cluster_a.shutdown().await;
+
+    // ── TARGET cluster B (fresh — no ts_br collection, no data) ─────────────
+    // Spawn with the same config as cluster A so that engine parameters match
+    // if RESTORE re-ingests rows. Do NOT create ts_br here: RESTORE must
+    // recreate the catalog cluster-wide via metadata Raft — that is the
+    // behavior under test.
+    //
+    // cluster B's tenant_write_hlc starts at 0, so the restore staleness gate
+    // (snapshot_watermark >= tenant_write_hlc) always passes. There is no live
+    // data, so the fail-closed "refuse to overwrite live data" guard does not
+    // fire.
+    let cluster_b = TestCluster::spawn_three().await.expect("cluster B");
+
+    // ── Restore into the fresh target ────────────────────────────────────────
+    push_restore(0, &cluster_b, TENANT, bytes)
+        .await
+        .expect("RESTORE ts_br into fresh cluster B");
+
+    // Wait for all Raft groups on cluster B to apply the restored catalog +
+    // data entries before asserting.
+    cluster_b
         .wait_for_full_apply_convergence(Duration::from_secs(10))
         .await;
 
-    // Assert count from node 1 (different from the backup source, node 0).
-    // This proves cross-node restore visibility.
-    let total = count_rows(&cluster.nodes[1].client, "ts_br").await;
+    // ── Final assertions on NODE 1 of cluster B ──────────────────────────────
+    // Querying node 1 (not the coordinator node 0 that received the RESTORE)
+    // proves:
+    //   (a) the restored catalog propagated cluster-wide via metadata Raft, and
+    //   (b) data is routable from a non-coordinator node.
+    let total =
+        count_rows_when_ready(&cluster_b.nodes[1].client, "ts_br", Duration::from_secs(15)).await;
     assert_eq!(
         total, 7,
-        "post-restore SELECT COUNT(*) from node 1 must be 7 (5 flushed + 2 memtable), \
-         got {total}"
+        "post-restore SELECT COUNT(*) from cluster B node 1 must be 7 \
+         (5 flushed + 2 memtable), got {total}"
     );
 
-    // Assert the full set of IDs is present (ORDER BY ts).
-    let ids = collect_first_col(&cluster.nodes[1].client, "SELECT id FROM ts_br ORDER BY ts").await;
+    // Assert the full set of IDs is present, in timestamp order.
+    let ids = collect_first_col(
+        &cluster_b.nodes[1].client,
+        "SELECT id FROM ts_br ORDER BY ts",
+    )
+    .await;
     let expected: Vec<&str> = vec!["p1", "p2", "p3", "p4", "p5", "p6", "p7"];
     assert_eq!(
         ids, expected,
-        "post-restore row IDs from node 1 must match all 7 rows in ts order; \
+        "post-restore row IDs from cluster B node 1 must match all 7 rows in ts order; \
          got {ids:?}"
     );
 
-    cluster.shutdown().await;
+    cluster_b.shutdown().await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 2 — Plain-Columnar: flushed segment + memtable rows are both captured
+// Test 2 — Plain-Columnar: flushed segment + memtable rows survive restore
+//           into a FRESH second cluster
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_restore_preserves_columnar_flushed_and_memtable() {
+    // ── SOURCE cluster A ─────────────────────────────────────────────────────
     // Low flush threshold (4 rows) so that inserting 5 rows triggers a flush
     // to a segment deterministically — no sleep required.
-    let cluster = TestCluster::spawn_three_with_columnar_flush_threshold(4)
+    let cluster_a = TestCluster::spawn_three_with_columnar_flush_threshold(4)
         .await
-        .expect("cluster");
+        .expect("cluster A");
 
     // DDL — copied from nodedb/tests/engine_surface_columnar.rs
     // `ingest_and_select`. Plain columnar uses COLUMNS, no TIME_KEY.
-    cluster
+    cluster_a
         .exec_ddl_on_any_leader(
             "CREATE COLLECTION col_br \
              COLUMNS (id TEXT, region TEXT, revenue FLOAT, ts BIGINT) \
              WITH (engine='columnar')",
         )
         .await
-        .expect("CREATE COLLECTION col_br");
+        .expect("CREATE COLLECTION col_br on cluster A");
 
     // Insert 5 rows (> threshold of 4) — after the 5th insert the columnar
     // engine will have flushed a segment containing at least the first 4 rows,
@@ -223,7 +342,7 @@ async fn backup_restore_preserves_columnar_flushed_and_memtable() {
         ("c5", "us", 180.0, 5),
     ];
     for (id, region, revenue, ts) in &pre_rows {
-        cluster.nodes[0]
+        cluster_a.nodes[0]
             .client
             .simple_query(&format!(
                 "INSERT INTO col_br (id, region, revenue, ts) \
@@ -241,7 +360,7 @@ async fn backup_restore_preserves_columnar_flushed_and_memtable() {
         ("c8", "eu", 175.0, 8),
     ];
     for (id, region, revenue, ts) in &post_rows {
-        cluster.nodes[0]
+        cluster_a.nodes[0]
             .client
             .simple_query(&format!(
                 "INSERT INTO col_br (id, region, revenue, ts) \
@@ -251,37 +370,69 @@ async fn backup_restore_preserves_columnar_flushed_and_memtable() {
             .unwrap_or_else(|e| panic!("insert post-flush {id}: {}", db_detail(&e)));
     }
 
-    // Backup from node 0, restore into the same cluster via node 0.
-    let bytes = drain_backup(0, &cluster, TENANT).await;
-    push_restore(0, &cluster, TENANT, bytes)
-        .await
-        .expect("RESTORE col_br");
+    // Capture the backup from cluster A. `bytes` is owned by the test and
+    // survives cluster A's shutdown.
+    let bytes = drain_backup(0, &cluster_a, TENANT).await;
+    assert!(!bytes.is_empty(), "backup must produce non-empty bytes");
 
-    // Wait for all Raft groups to apply the restore entries on every node.
-    cluster
+    // Shut down cluster A before spawning cluster B to limit resource use and
+    // avoid port / file-descriptor exhaustion between the two clusters.
+    cluster_a.shutdown().await;
+
+    // ── TARGET cluster B (fresh — no col_br collection, no data) ─────────────
+    // Spawn with the SAME columnar flush threshold as cluster A so that engine
+    // parameters match if RESTORE re-ingests rows. Do NOT create col_br here:
+    // RESTORE must recreate the catalog cluster-wide via metadata Raft — that
+    // is the behavior under test (bug 2 listed in the module doc).
+    //
+    // cluster B's tenant_write_hlc starts at 0, so the restore staleness gate
+    // (snapshot_watermark >= tenant_write_hlc) always passes. There is no live
+    // data, so the fail-closed "refuse to overwrite live data" guard does not
+    // fire.
+    let cluster_b = TestCluster::spawn_three_with_columnar_flush_threshold(4)
+        .await
+        .expect("cluster B");
+
+    // ── Restore into the fresh target ────────────────────────────────────────
+    push_restore(0, &cluster_b, TENANT, bytes)
+        .await
+        .expect("RESTORE col_br into fresh cluster B");
+
+    // Wait for all Raft groups on cluster B to apply the restored catalog +
+    // data entries before asserting.
+    cluster_b
         .wait_for_full_apply_convergence(Duration::from_secs(10))
         .await;
 
-    // Assert count from node 1 (different from the backup source, node 0).
-    let total = count_rows(&cluster.nodes[1].client, "col_br").await;
+    // ── Final assertions on NODE 1 of cluster B ──────────────────────────────
+    // Querying node 1 (not the coordinator node 0 that received the RESTORE)
+    // proves:
+    //   (a) the restored catalog propagated cluster-wide via metadata Raft, and
+    //   (b) data is routable from a non-coordinator node.
+    let total = count_rows_when_ready(
+        &cluster_b.nodes[1].client,
+        "col_br",
+        Duration::from_secs(15),
+    )
+    .await;
     assert_eq!(
         total, 8,
-        "post-restore SELECT COUNT(*) from node 1 must be 8 (5 flushed + 3 memtable), \
-         got {total}"
+        "post-restore SELECT COUNT(*) from cluster B node 1 must be 8 \
+         (5 flushed + 3 memtable), got {total}"
     );
 
-    // Assert the full PK set is present (ORDER BY ts).
+    // Assert the full PK set is present, ordered by ts.
     let ids = collect_first_col(
-        &cluster.nodes[1].client,
+        &cluster_b.nodes[1].client,
         "SELECT id FROM col_br ORDER BY ts",
     )
     .await;
     let expected: Vec<&str> = vec!["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"];
     assert_eq!(
         ids, expected,
-        "post-restore row IDs from node 1 must match all 8 rows in ts order; \
+        "post-restore row IDs from cluster B node 1 must match all 8 rows in ts order; \
          got {ids:?}"
     );
 
-    cluster.shutdown().await;
+    cluster_b.shutdown().await;
 }

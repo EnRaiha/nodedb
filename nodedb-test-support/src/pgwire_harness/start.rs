@@ -25,6 +25,10 @@ pub(super) struct StartConfig {
     /// store's lockout policy before it is shared. `None` leaves lockout
     /// disabled (`max_failed_logins = 0`).
     pub lockout: Option<(u32, u64)>,
+    /// Override for `QueryTuning::columnar_flush_threshold`.  `None` keeps the
+    /// system default (65 536 rows).  Set to a small value (e.g. `4`) in tests
+    /// that need to observe segment-flush behaviour without inserting 65k rows.
+    pub columnar_flush_threshold: Option<usize>,
 }
 
 impl Default for StartConfig {
@@ -32,6 +36,7 @@ impl Default for StartConfig {
         Self {
             auth_mode: AuthMode::Trust,
             lockout: None,
+            columnar_flush_threshold: None,
         }
     }
 }
@@ -41,6 +46,20 @@ impl TestServer {
     /// Spawn a single-core NodeDB server and connect via pgwire (trust mode).
     pub async fn start() -> Self {
         Self::start_with_config(StartConfig::default()).await
+    }
+
+    /// Spawn a single-core NodeDB server with a lowered
+    /// `QueryTuning::columnar_flush_threshold` so tests can observe
+    /// segment-flush behaviour on small datasets without inserting 65k rows.
+    ///
+    /// All other settings stay at their defaults (trust-mode auth, lockout
+    /// disabled).  Mirrors `ClusterTestHarness::spawn_three_with_columnar_flush_threshold`.
+    pub async fn start_with_columnar_flush_threshold(flush_threshold: usize) -> Self {
+        Self::start_with_config(StartConfig {
+            columnar_flush_threshold: Some(flush_threshold),
+            ..Default::default()
+        })
+        .await
     }
 
     /// Spawn a single-core server in pgwire **password mode** (SCRAM-SHA-256)
@@ -53,6 +72,7 @@ impl TestServer {
         Self::start_with_config(StartConfig {
             auth_mode: AuthMode::Password,
             lockout: Some((5, 300)),
+            ..Default::default()
         })
         .await
     }
@@ -124,7 +144,13 @@ impl TestServer {
                     governor: shared.governor.clone(),
                     replay: None,
                     graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
-                    query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
+                    query_tuning: {
+                        let mut qt = nodedb_types::config::tuning::QueryTuning::default();
+                        if let Some(threshold) = cfg.columnar_flush_threshold {
+                            qt.columnar_flush_threshold = threshold;
+                        }
+                        qt
+                    },
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);

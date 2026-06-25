@@ -28,6 +28,8 @@ pub(super) fn merge_sections(
         merged.kv_tables.extend(snap.kv_tables);
         merged.crdt_state.extend(snap.crdt_state);
         merged.timeseries.extend(snap.timeseries);
+        merged.flushed_ts_segments.extend(snap.flushed_ts_segments);
+        merged.columnar_engines.extend(snap.columnar_engines);
     }
     Ok(merged)
 }
@@ -42,17 +44,24 @@ pub(super) fn is_metadata_section(section: &nodedb_types::backup_envelope::Secti
 
 /// Apply catalog-row and source-tombstone sections to the destination catalog.
 /// Runs BEFORE the data-section restore.
+///
+/// Catalog rows are proposed cluster-wide through the metadata Raft
+/// group (group 0) — exactly like CREATE COLLECTION — so every node's
+/// catalog learns the restored collection and can serve it. A
+/// catalog-propose failure on this path is FATAL: returning the data
+/// restored but unqueryable on non-coordinator nodes is the
+/// silent-partial-success anti-pattern this codebase forbids.
 pub(super) fn apply_metadata_sections(
     state: &Arc<SharedState>,
     tenant_id: u64,
     env: &nodedb_types::backup_envelope::Envelope,
-) {
+) -> Result<(), Error> {
     use nodedb_types::backup_envelope::{
         SECTION_ORIGIN_CATALOG_ROWS, SECTION_ORIGIN_SOURCE_TOMBSTONES, SourceTombstoneEntry,
         StoredCollectionBlob,
     };
     let Some(catalog) = state.credentials.catalog() else {
-        return;
+        return Ok(());
     };
 
     for section in &env.sections {
@@ -77,17 +86,38 @@ pub(super) fn apply_metadata_sections(
                         );
                         continue;
                     };
-                    if let Err(e) = catalog.put_collection(DatabaseId::DEFAULT, &coll) {
-                        tracing::warn!(
-                            tenant_id,
-                            name = %blob.name,
-                            error = %e,
-                            "restore: catalog put_collection failed"
-                        );
+                    // Propose the collection through the metadata Raft
+                    // group so every node's applier (`catalog_entry::
+                    // apply::collection::put`) writes the row — mirroring
+                    // CREATE COLLECTION and DROP COLLECTION. The proposer
+                    // blocks on its local applied-index watcher, so on the
+                    // cluster path it has already applied the put via the
+                    // same applier — we must NOT also put locally (double-put).
+                    let entry =
+                        crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll));
+                    let log_index =
+                        crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
+                    if log_index == 0 {
+                        // Single-node / no-cluster fallback: apply the
+                        // catalog mutation directly, matching what the
+                        // applier would have done on a clustered deployment.
+                        // A failure here is FATAL — the collection would be
+                        // unqueryable otherwise.
+                        if let crate::control::catalog_entry::CatalogEntry::PutCollection(boxed) =
+                            entry
+                        {
+                            catalog.put_collection(DatabaseId::DEFAULT, &boxed)?;
+                        }
                     }
                 }
             }
             SECTION_ORIGIN_SOURCE_TOMBSTONES => {
+                // Source tombstones are intentionally coordinator-local for
+                // now: they are a WAL-recovery guard, not replicated catalog
+                // state. Cluster-wide tombstone replication is a known
+                // follow-up. Failures here stay non-fatal (warn-and-continue):
+                // a missing local tombstone does not make restored data
+                // unqueryable, unlike a missing catalog row.
                 let Ok(tombs) = zerompk::from_msgpack::<Vec<SourceTombstoneEntry>>(&section.body)
                 else {
                     tracing::warn!(
@@ -113,4 +143,5 @@ pub(super) fn apply_metadata_sections(
             _ => {}
         }
     }
+    Ok(())
 }
