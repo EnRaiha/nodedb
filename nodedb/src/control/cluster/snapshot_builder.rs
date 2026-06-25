@@ -13,13 +13,14 @@
 //! to the collections whose vshard belongs to the target Raft group, and merges
 //! the per-tenant slices into one `TenantDataSnapshot` for the wire.
 //!
-//! Scope (this unit builds the LEADER side only — follower APPLY is a later
-//! unit): the vshard-partitioned engines are filtered and shipped, including
-//! graph `edges` (the edge key already embeds the collection, so it is routed
-//! through the same vshard filter as every other section). `crdt_state` remains
-//! a DECLARED, tracked omission — it is one Loro doc per tenant and needs
-//! per-collection scoping before it can be group-filtered; it is left empty in
-//! the merged snapshot.
+//! The vshard-partitioned engines are filtered and shipped, including graph
+//! `edges` (the edge key already embeds the collection, so it is routed through
+//! the same vshard filter as every other section). CRDT is one Loro doc per
+//! tenant; Loro 1.13 has no per-container export, so the whole tenant doc is
+//! shipped — but only to groups that own at least one of the doc's collections
+//! (the doc's collections are tagged on each `tenant_crdt_state` entry and
+//! matched against the group's vshards). Over-including is a harmless idempotent
+//! merge on apply; under-including would be silent data loss.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -202,13 +203,21 @@ impl DataPlaneSnapshotBuilder {
             }
         }
 
-        // EXCLUDED in this unit (declared, tracked omission): `crdt_state` is
-        // one Loro doc per tenant and needs per-collection scoping before it
-        // can be group-filtered. It is intentionally left empty in `merged`
-        // here — NOT a silent drop. The follower APPLY unit installs whatever
-        // sections this builder ships, so once CRDT per-group scoping lands the
-        // line below extends to filter + carry it.
-        let _ = &snap.crdt_state;
+        // CRDT: one Loro doc per tenant. Loro 1.13 has no per-container export,
+        // so the WHOLE tenant doc is shipped — but only to groups that own ≥1 of
+        // the doc's collections. The doc's collections are tagged on each entry
+        // (`collection_names`); include it iff ANY of them routes into this
+        // group's vshards. Including the doc in extra groups is harmless (Loro
+        // import is an idempotent, monotonic merge); UNDER-including is silent
+        // data loss, hence the "any collection in group" inclusion test.
+        for (tid, collections, bytes) in snap.tenant_crdt_state {
+            if collections
+                .iter()
+                .any(|c| group_vshards.contains(&Self::vshard_of(c)))
+            {
+                merged.tenant_crdt_state.push((tid, collections, bytes));
+            }
+        }
 
         Ok(())
     }

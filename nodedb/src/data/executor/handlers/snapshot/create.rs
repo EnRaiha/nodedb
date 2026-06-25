@@ -96,13 +96,18 @@ impl CoreLoop {
             }
         }
 
-        // 5. CRDT state: Loro export.
-        if let Some(crdt) = self
-            .crdt_engines
-            .get(&crate::types::TenantId::new(tenant_id))
-        {
+        // 5. CRDT state: Loro export. Carried tenant-explicit and tagged with
+        // the doc's top-level collections so the per-group Raft snapshot builder
+        // can filter the whole-tenant doc into only the groups whose vshards own
+        // one of those collections (Loro 1.13 has no per-container export).
+        if let Some(crdt) = self.crdt_engines.get(&tid_obj) {
             match crdt.export_snapshot_bytes() {
-                Ok(bytes) => snapshot.crdt_state.push((tenant_id.to_string(), bytes)),
+                Ok(bytes) => {
+                    let collections = crdt.state().collection_names();
+                    snapshot
+                        .tenant_crdt_state
+                        .push((tenant_id, collections, bytes));
+                }
                 Err(e) => warn!(tenant_id, error = %e, "snapshot: crdt export failed"),
             }
         }
@@ -158,7 +163,7 @@ impl CoreLoop {
             edges = snapshot.edges.len(),
             vectors = snapshot.vectors.len(),
             kv_tables = snapshot.kv_tables.len(),
-            crdt = snapshot.crdt_state.len(),
+            crdt = snapshot.tenant_crdt_state.len(),
             timeseries = snapshot.timeseries.len(),
             flushed_ts_collections = snapshot.flushed_ts_segments.len(),
             columnar_engines = snapshot.columnar_engines.len(),

@@ -136,10 +136,23 @@ impl CoreLoop {
                 kv_written += count;
             }
 
-            // Restore CRDT state.
+            // Restore CRDT state (legacy / user-RESTORE path: tenant from
+            // dispatch context).
             for (_key, bytes) in &snap.crdt_state {
                 if let Err(e) = self.restore_crdt_state(tenant_id, bytes) {
                     warn!(tenant_id, error = %e, "failed to restore crdt state");
+                } else {
+                    crdt_written += 1;
+                }
+            }
+            // Restore CRDT from the per-group Raft snapshot (tenant carried
+            // explicitly; the merged blob's dispatch tenant is 0). Loro import
+            // is a monotonic CRDT merge, so no replace_mode handling is needed:
+            // the snapshot is >= the follower's committed state and merge
+            // converges to the correct result.
+            for (tid_raw, _collections, bytes) in &snap.tenant_crdt_state {
+                if let Err(e) = self.restore_crdt_state(*tid_raw, bytes) {
+                    warn!(tid_raw, error = %e, "failed to restore tenant crdt state");
                 } else {
                     crdt_written += 1;
                 }

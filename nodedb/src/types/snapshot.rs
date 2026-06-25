@@ -100,6 +100,17 @@ pub struct TenantDataSnapshot {
     #[msgpack(default)]
     #[serde(default)]
     pub tenant_edges: Vec<(u64, String, Vec<u8>)>,
+
+    /// CRDT state for the per-group Raft snapshot, tenant-explicit and
+    /// collection-tagged. Each entry: `(tenant_id, collection_names, loro_export_bytes)`.
+    /// `tenant_id` is carried explicitly because the merged multi-tenant Raft snapshot
+    /// is applied with a dispatch tenant of 0 (the merged blob spans tenants).
+    /// `collection_names` are the doc's top-level Loro collections, used by the builder
+    /// to filter the doc into only the groups whose vshards own one of those collections.
+    /// `#[msgpack(default)]`: snapshots written before this field decode as empty.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub tenant_crdt_state: Vec<(u64, Vec<String>, Vec<u8>)>,
 }
 
 /// A single PK → surrogate identity binding carried in a snapshot/backup.
@@ -230,6 +241,10 @@ mod tests {
             decoded.tenant_edges.is_empty(),
             "expected tenant_edges to default to empty for old snapshot"
         );
+        assert!(
+            decoded.tenant_crdt_state.is_empty(),
+            "expected tenant_crdt_state to default to empty for old snapshot"
+        );
     }
 
     /// Round-trip + backward-compat for the `surrogate_pk` field: a snapshot
@@ -297,6 +312,10 @@ mod tests {
         assert!(
             decoded_old.tenant_edges.is_empty(),
             "expected tenant_edges to default to empty for old 9-field snapshot"
+        );
+        assert!(
+            decoded_old.tenant_crdt_state.is_empty(),
+            "expected tenant_crdt_state to default to empty for old 9-field snapshot"
         );
     }
 

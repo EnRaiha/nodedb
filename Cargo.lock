@@ -4153,6 +4153,7 @@ dependencies = [
  "flate2",
  "futures",
  "getrandom 0.3.4",
+ "hex",
  "hkdf",
  "hmac 0.12.1",
  "io-uring",

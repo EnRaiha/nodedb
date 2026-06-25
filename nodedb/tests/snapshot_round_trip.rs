@@ -33,27 +33,11 @@ use nodedb::control::cluster::snapshot_builder::DataPlaneSnapshotBuilder;
 use nodedb::types::TenantId;
 use nodedb_cluster::SnapshotApplier;
 use nodedb_cluster::SnapshotBuilder;
-use nodedb_cluster::routing::RoutingTable;
 use nodedb_cluster::routing::vshard_for_collection;
 use nodedb_types::id::DatabaseId;
 
-/// The single data group every vShard maps into under `uniform(1, ..)`.
-const DATA_GROUP_ID: u64 = 1;
-
-/// Extract the first column of the first `Row` message.
-fn first_value(msgs: &[tokio_postgres::SimpleQueryMessage]) -> Option<String> {
-    for msg in msgs {
-        if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
-            return row.get(0).map(|s| s.to_owned());
-        }
-    }
-    None
-}
-
-/// Build a uniform single-data-group routing table for a single node.
-fn single_node_routing() -> RoutingTable {
-    RoutingTable::uniform(1, &[1], 1)
-}
+mod snapshot_rt_common;
+use snapshot_rt_common::{DATA_GROUP_ID, first_value, single_node_routing};
 
 #[tokio::test]
 async fn snapshot_round_trip_builder_to_applier() {
