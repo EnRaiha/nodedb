@@ -59,6 +59,27 @@ pub struct RaftConfig {
     pub election_timeout_max: Duration,
     /// Heartbeat interval (must be << election_timeout_min).
     pub heartbeat_interval: Duration,
+    /// Number of log entries to retain past `snapshot_index` before the
+    /// node auto-compacts its Raft log.
+    ///
+    /// When `Some(t)`, after the DATA-PLANE state machine has durably
+    /// applied an entry at index `I`, the node compacts its log up to `I`
+    /// once `I - snapshot_index >= t`. Compaction discards entries
+    /// `<= I`; thereafter a lagging or freshly-joined follower whose
+    /// `next_index` falls behind the new `snapshot_index` is brought up
+    /// to date via an `InstallSnapshot` (rebuilt on demand by the
+    /// `SnapshotBuilder` hook from live engine state) rather than log
+    /// replay.
+    ///
+    /// `None` (the default) disables auto-compaction entirely — the log
+    /// grows until an explicit snapshot/compaction is triggered
+    /// elsewhere. This preserves the historical behavior exactly.
+    ///
+    /// The trigger MUST be gated on the data-plane applied watermark, not
+    /// raft's commit index: compacting past an index the state machine
+    /// has not yet applied would let the `SnapshotBuilder` serialize
+    /// incomplete state and corrupt a follower's snapshot.
+    pub log_compaction_threshold: Option<u64>,
 }
 
 impl RaftConfig {
@@ -93,6 +114,7 @@ mod tests {
             election_timeout_min: Duration::from_millis(150),
             election_timeout_max: Duration::from_millis(300),
             heartbeat_interval: Duration::from_millis(50),
+            log_compaction_threshold: None,
         }
     }
 

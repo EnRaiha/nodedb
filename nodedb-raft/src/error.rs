@@ -15,6 +15,11 @@ pub enum RaftError {
         first_available: u64,
     },
 
+    #[error(
+        "compaction ahead of applied: requested index {requested}, last applied {last_applied}"
+    )]
+    CompactionAheadOfApplied { requested: u64, last_applied: u64 },
+
     #[error("proposal rejected: {reason}")]
     ProposalRejected { reason: String },
 

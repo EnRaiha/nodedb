@@ -314,7 +314,8 @@ fn apply_join_response(
     //    role and will not run an election until a subsequent
     //    `PromoteLearner` conf change is applied.
     let mut multi_raft = MultiRaft::new(config.node_id, routing.clone(), config.data_dir.clone())
-        .with_election_timeout(config.election_timeout_min, config.election_timeout_max);
+        .with_election_timeout(config.election_timeout_min, config.election_timeout_max)
+        .with_log_compaction_threshold(config.log_compaction_threshold);
     for g in &resp.groups {
         let is_voter = g.members.contains(&config.node_id);
         let is_learner = g.learners.contains(&config.node_id);
@@ -495,6 +496,7 @@ mod tests {
             election_timeout_max: Duration::from_millis(300),
             install_snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
+            log_compaction_threshold: None,
         };
         let state1 = bootstrap(&config1, &catalog1, None).unwrap();
 
@@ -640,6 +642,7 @@ mod tests {
             election_timeout_max: Duration::from_millis(300),
             install_snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
+            log_compaction_threshold: None,
         };
 
         let lifecycle = ClusterLifecycleTracker::new();

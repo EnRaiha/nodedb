@@ -157,6 +157,90 @@ impl<S: LogStorage> RaftNode<S> {
         self.volatile.last_applied = applied_to;
     }
 
+    /// Auto-compaction threshold: entries retained past `snapshot_index`
+    /// before the log is compacted. `None` disables auto-compaction.
+    pub fn log_compaction_threshold(&self) -> Option<u64> {
+        self.config.log_compaction_threshold
+    }
+
+    /// Compact the log up to `up_to_index` after the DATA-PLANE state
+    /// machine has durably applied every entry `<= up_to_index`.
+    ///
+    /// Resolves the term at `up_to_index` from the in-memory log and
+    /// calls [`RaftLog::apply_snapshot`], which discards entries
+    /// `<= up_to_index` and persists the new snapshot boundary. The
+    /// snapshot bytes themselves are NOT materialized here — the
+    /// `SnapshotBuilder` hook rebuilds them on demand from live engine
+    /// state when a lagging follower needs an `InstallSnapshot`.
+    ///
+    /// # Safety / gating
+    ///
+    /// The CALLER MUST pass an `up_to_index` that the DATA-PLANE state
+    /// machine has durably applied. Compacting past a data-plane-unapplied
+    /// index would let the `SnapshotBuilder` serialize incomplete state.
+    /// The sole caller path (`run_apply_loop` → [`Self::maybe_compact_log`])
+    /// guarantees this: it only compacts an index after the SPSC round-trip
+    /// that applies that entry to the Data Plane has returned.
+    ///
+    /// This method additionally clamps to raft's `volatile.last_applied`
+    /// (returning [`RaftError::CompactionAheadOfApplied`] otherwise) as a
+    /// coarse sanity bound — but note that for data groups raft's
+    /// `last_applied` advances at commit/enqueue time and is therefore
+    /// `>=` the data-plane applied index. So this guard is an upper bound,
+    /// NOT a substitute for the caller's data-plane gating.
+    ///
+    /// Returns `Ok(false)` when there is nothing to compact
+    /// (`up_to_index <= snapshot_index`). Returns
+    /// `Err(RaftError::LogCompacted)` if the term at `up_to_index` is no
+    /// longer available (already compacted away).
+    pub fn compact_log_up_to(&mut self, up_to_index: u64) -> Result<bool> {
+        if up_to_index <= self.log.snapshot_index() {
+            return Ok(false);
+        }
+        if up_to_index > self.volatile.last_applied {
+            return Err(RaftError::CompactionAheadOfApplied {
+                requested: up_to_index,
+                last_applied: self.volatile.last_applied,
+            });
+        }
+        let term = self
+            .log
+            .term_at(up_to_index)
+            .ok_or(RaftError::LogCompacted {
+                requested: up_to_index,
+                first_available: self.log.snapshot_index() + 1,
+            })?;
+        self.log.apply_snapshot(up_to_index, term);
+        Ok(true)
+    }
+
+    /// Check the configured auto-compaction threshold against the
+    /// data-plane applied index `applied_index` and compact the log up to
+    /// `applied_index` if the retained-entry count has reached the
+    /// threshold.
+    ///
+    /// `applied_index` is the index the DATA-PLANE state machine has
+    /// durably applied up to (NOT raft's commit index) — see
+    /// [`RaftConfig::log_compaction_threshold`]. No-op when the threshold
+    /// is `None` or the retained count is below it.
+    ///
+    /// Returns `Ok(true)` when a compaction was performed.
+    pub fn maybe_compact_log(&mut self, applied_index: u64) -> Result<bool> {
+        let Some(threshold) = self.config.log_compaction_threshold else {
+            return Ok(false);
+        };
+        let snapshot_index = self.log.snapshot_index();
+        if applied_index <= snapshot_index {
+            return Ok(false);
+        }
+        if applied_index - snapshot_index < threshold {
+            return Ok(false);
+        }
+        // Never compact past the data-plane applied watermark.
+        let up_to = applied_index.min(self.volatile.last_applied);
+        self.compact_log_up_to(up_to)
+    }
+
     /// Query a peer's match_index from the leader's replication state.
     /// Returns `None` if this node is not the leader or the peer is unknown.
     pub fn match_index_for(&self, peer: u64) -> Option<u64> {
@@ -291,7 +375,22 @@ mod tests {
             election_timeout_min: Duration::from_millis(150),
             election_timeout_max: Duration::from_millis(300),
             heartbeat_interval: Duration::from_millis(50),
+            log_compaction_threshold: None,
         }
+    }
+
+    /// Drive a single-voter node to leadership and apply its initial
+    /// election no-op so `last_applied` tracks the log.
+    fn leader_with_applied_noop(config: RaftConfig) -> RaftNode<MemStorage> {
+        let mut node = RaftNode::new(config, MemStorage::new());
+        node.election_deadline = Instant::now() - Duration::from_millis(1);
+        node.tick();
+        assert_eq!(node.role(), NodeRole::Leader);
+        let ready = node.take_ready();
+        if let Some(last) = ready.committed_entries.last() {
+            node.advance_applied(last.index);
+        }
+        node
     }
 
     #[test]
@@ -373,6 +472,84 @@ mod tests {
         cfg.starts_as_learner = true;
         let node = RaftNode::new(cfg, MemStorage::new());
         assert_eq!(node.role(), NodeRole::Learner);
+    }
+
+    #[test]
+    fn threshold_some_compacts_after_enough_applied() {
+        // Single-voter group so every propose commits immediately.
+        let mut cfg = test_config(1, vec![]);
+        cfg.log_compaction_threshold = Some(4);
+        let mut node = leader_with_applied_noop(cfg);
+
+        // Propose entries and apply each as the data plane would.
+        for _ in 0..8 {
+            let idx = node.propose(b"write".to_vec()).unwrap();
+            let _ = node.take_ready();
+            node.advance_applied(idx);
+
+            // Trigger gated on the data-plane applied watermark (= idx here).
+            node.maybe_compact_log(idx).unwrap();
+        }
+
+        let snap = node.log_snapshot_index();
+        // With threshold 4, the log keeps at most 4 entries past the
+        // snapshot boundary; the boundary must have advanced.
+        assert!(
+            snap > 0,
+            "snapshot_index should have advanced past 0, got {snap}"
+        );
+        assert!(
+            node.last_log_index() - snap <= 4,
+            "retained entries ({}) must be <= threshold (4)",
+            node.last_log_index() - snap
+        );
+
+        // Entries at or before the snapshot boundary are discarded.
+        assert!(
+            node.log.entry_at(snap).is_none(),
+            "entry at snapshot boundary must be gone"
+        );
+        assert!(
+            node.log.entries_range(1, snap).is_err(),
+            "range into compacted region must fail"
+        );
+    }
+
+    #[test]
+    fn threshold_none_never_compacts() {
+        let cfg = test_config(1, vec![]); // log_compaction_threshold: None
+        let mut node = leader_with_applied_noop(cfg);
+
+        for _ in 0..12 {
+            let idx = node.propose(b"write".to_vec()).unwrap();
+            let _ = node.take_ready();
+            node.advance_applied(idx);
+            // No-op: threshold is None.
+            assert!(!node.maybe_compact_log(idx).unwrap());
+        }
+
+        assert_eq!(
+            node.log_snapshot_index(),
+            0,
+            "no compaction must occur when threshold is None"
+        );
+        // Every entry from index 1 is still present.
+        assert!(node.log.entry_at(1).is_some());
+        assert!(node.log.entries_range(1, node.last_log_index()).is_ok());
+    }
+
+    #[test]
+    fn compact_log_up_to_rejects_ahead_of_applied() {
+        let mut cfg = test_config(1, vec![]);
+        cfg.log_compaction_threshold = Some(2);
+        let mut node = leader_with_applied_noop(cfg);
+
+        let idx = node.propose(b"write".to_vec()).unwrap();
+        let _ = node.take_ready();
+        // Deliberately do NOT advance_applied past the noop — the data
+        // plane has not applied `idx` yet.
+        let err = node.compact_log_up_to(idx).unwrap_err();
+        assert!(matches!(err, RaftError::CompactionAheadOfApplied { .. }));
     }
 
     #[test]

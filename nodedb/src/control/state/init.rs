@@ -140,6 +140,7 @@ impl SharedState {
             propose_tracker: std::sync::OnceLock::new(),
             raft_proposer: std::sync::OnceLock::new(),
             async_raft_proposer: std::sync::OnceLock::new(),
+            raft_compactor: std::sync::OnceLock::new(),
             raft_status_fn: std::sync::OnceLock::new(),
             cluster_observer: std::sync::OnceLock::new(),
             loop_metrics_registry: nodedb_cluster::LoopMetricsRegistry::new(),

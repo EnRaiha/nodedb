@@ -40,7 +40,8 @@ pub(super) fn restart(
     // leave the node permanently without any copy of it and
     // silently broken.
     let mut multi_raft = MultiRaft::new(config.node_id, routing.clone(), config.data_dir.clone())
-        .with_election_timeout(config.election_timeout_min, config.election_timeout_max);
+        .with_election_timeout(config.election_timeout_min, config.election_timeout_max)
+        .with_log_compaction_threshold(config.log_compaction_threshold);
     for (group_id, info) in routing.group_members() {
         let is_voter = info.members.contains(&config.node_id);
         let is_learner = info.learners.contains(&config.node_id);
@@ -122,6 +123,7 @@ mod tests {
             election_timeout_max: Duration::from_millis(300),
             install_snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
+            log_compaction_threshold: None,
         };
 
         // Bootstrap first.

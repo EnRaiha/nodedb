@@ -111,6 +111,16 @@ pub struct ClusterConfig {
     /// Defaults to 300 s (5 min). A partial file is orphaned when the
     /// leader that was sending it has since lost leadership or crashed.
     pub orphan_partial_max_age_secs: u64,
+    /// Number of Raft log entries to retain past `snapshot_index` before
+    /// a group auto-compacts its log once entries are durably applied to
+    /// the Data Plane.
+    ///
+    /// `None` (the default) disables auto-compaction — the log grows
+    /// unbounded until an explicit snapshot is triggered. `Some(t)`
+    /// bounds log growth and lets a lagging or freshly-joined follower
+    /// naturally require an `InstallSnapshot`. The trigger is gated on
+    /// the data-plane applied watermark, never raft's commit index.
+    pub log_compaction_threshold: Option<u64>,
 }
 
 /// Result of cluster startup — everything needed to run the Raft loop.

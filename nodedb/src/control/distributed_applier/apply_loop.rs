@@ -274,7 +274,51 @@ pub async fn run_apply_loop(
                 }
             };
 
+            let applied_ok = result.is_ok();
             tracker.complete(batch.group_id, entry.index, applied_key, result);
+
+            // Auto-compact the group's Raft log if its configured
+            // threshold has been reached. This MUST run only after the
+            // entry has been DURABLY applied to the Data Plane above —
+            // `entry.index` is the data-plane applied watermark at this
+            // point, NOT raft's commit index. Compacting on commit while
+            // the SPSC apply lags would let the `SnapshotBuilder`
+            // serialize incomplete engine state and corrupt a lagging
+            // follower's snapshot. Skip on apply failure: the engines did
+            // not persist this index, so it is not a safe compaction
+            // boundary.
+            if applied_ok {
+                maybe_compact_log(&state, batch.group_id, entry.index);
+            }
+        }
+    }
+}
+
+/// Fire the Raft log-compaction trigger for `group_id` up to the
+/// data-plane applied index `applied_index`, if a compactor is wired.
+///
+/// Gated by the caller on data-plane apply completion. A no-op when no
+/// compactor is installed (single-node mode) or when the group's
+/// `log_compaction_threshold` is `None`.
+fn maybe_compact_log(state: &Arc<SharedState>, group_id: u64, applied_index: u64) {
+    let Some(compactor) = state.raft_compactor.get() else {
+        return;
+    };
+    match compactor(group_id, applied_index) {
+        Ok(true) => {
+            debug!(
+                group_id,
+                applied_index, "raft log compacted past data-plane applied watermark"
+            );
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(
+                group_id,
+                applied_index,
+                error = %e,
+                "raft log compaction failed"
+            );
         }
     }
 }

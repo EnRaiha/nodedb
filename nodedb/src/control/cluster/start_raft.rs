@@ -315,6 +315,24 @@ pub fn start_raft(
         tracing::warn!("raft_proposer already set — start_raft appears to have run twice");
     }
 
+    // Wire the Raft log-compaction trigger. `run_apply_loop` invokes this
+    // after a committed entry has been durably applied to the Data Plane,
+    // so compaction is gated on the data-plane applied watermark — never
+    // raft's commit index. A no-op for groups whose
+    // `log_compaction_threshold` is `None`.
+    let raft_loop_for_compact = raft_loop.clone();
+    let compactor: Arc<crate::control::wal_replication::RaftCompactor> =
+        Arc::new(move |group_id, applied_index| {
+            raft_loop_for_compact
+                .maybe_compact_group(group_id, applied_index)
+                .map_err(|e| crate::Error::Internal {
+                    detail: format!("raft log compaction: {e}"),
+                })
+        });
+    if shared.raft_compactor.set(compactor).is_err() {
+        tracing::warn!("raft_compactor already set — start_raft appears to have run twice");
+    }
+
     // Install the async proposer with transparent leader forwarding.
     //
     // Proposes via the data group leader (forwarding to a remote leader if

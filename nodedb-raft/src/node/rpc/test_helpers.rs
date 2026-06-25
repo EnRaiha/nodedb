@@ -23,6 +23,7 @@ pub(super) fn test_config(node_id: u64, peers: Vec<u64>) -> RaftConfig {
         election_timeout_min: Duration::from_millis(150),
         election_timeout_max: Duration::from_millis(300),
         heartbeat_interval: Duration::from_millis(50),
+        log_compaction_threshold: None,
     }
 }
 
@@ -39,6 +40,7 @@ pub(super) fn observer_self_config(node_id: u64) -> RaftConfig {
         election_timeout_min: Duration::from_millis(150),
         election_timeout_max: Duration::from_millis(300),
         heartbeat_interval: Duration::from_millis(50),
+        log_compaction_threshold: None,
     }
 }
 
@@ -58,6 +60,7 @@ pub(super) fn setup_leader_with_observer() -> (RaftNode<MemStorage>, RaftNode<Me
             election_timeout_min: Duration::from_millis(150),
             election_timeout_max: Duration::from_millis(300),
             heartbeat_interval: Duration::from_millis(50),
+            log_compaction_threshold: None,
         },
         MemStorage::new(),
     );

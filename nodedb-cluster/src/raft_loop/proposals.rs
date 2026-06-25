@@ -18,6 +18,24 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         mr.propose(vshard_id, data)
     }
 
+    /// Auto-compact a group's Raft log if its configured threshold has
+    /// been reached, given the DATA-PLANE applied watermark
+    /// `applied_index`.
+    ///
+    /// `applied_index` MUST be the index the data-plane state machine has
+    /// durably applied to (NOT raft's commit index). Callers invoke this
+    /// from the data-plane apply-completion path so the
+    /// `SnapshotBuilder` can never be asked to serialize state past what
+    /// the engines have actually applied.
+    ///
+    /// Returns `Ok(true)` when a compaction was performed. No-op
+    /// (`Ok(false)`) when the group is absent, the threshold is `None`,
+    /// or the retained-entry count is below the threshold.
+    pub fn maybe_compact_group(&self, group_id: u64, applied_index: u64) -> Result<bool> {
+        let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+        mr.maybe_compact_group(group_id, applied_index)
+    }
+
     /// Propose a command directly to the metadata Raft group (group 0).
     ///
     /// Used by the host crate's metadata proposer and by integration

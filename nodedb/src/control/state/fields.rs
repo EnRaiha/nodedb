@@ -125,6 +125,13 @@ pub struct SharedState {
     pub raft_proposer: OnceLock<Arc<crate::control::wal_replication::RaftProposer>>,
     /// Async Raft propose with transparent leader forwarding (for array sync inbound handlers).
     pub async_raft_proposer: OnceLock<Arc<crate::control::wal_replication::AsyncRaftProposer>>,
+    /// Raft log-compaction trigger. Set by `start_raft`; absent in
+    /// single-node mode. Invoked by `run_apply_loop` after a committed
+    /// entry has been durably applied to the Data Plane, so compaction is
+    /// gated on the data-plane applied watermark — never raft's commit
+    /// index. A no-op when the group's `log_compaction_threshold` is
+    /// `None`.
+    pub raft_compactor: OnceLock<Arc<crate::control::wal_replication::RaftCompactor>>,
     /// Query Raft group statuses for observability (unset in single-node mode).
     pub raft_status_fn:
         std::sync::OnceLock<Arc<dyn Fn() -> Vec<nodedb_cluster::GroupStatus> + Send + Sync>>,

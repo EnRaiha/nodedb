@@ -33,6 +33,7 @@ fn config(node_id: u64, peers: Vec<u64>) -> RaftConfig {
         election_timeout_min: Duration::from_millis(150),
         election_timeout_max: Duration::from_millis(300),
         heartbeat_interval: Duration::from_millis(50),
+        log_compaction_threshold: None,
     }
 }
 

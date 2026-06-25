@@ -61,6 +61,10 @@ pub struct MultiRaft {
     pub(super) election_timeout_max: Duration,
     /// Heartbeat interval.
     pub(super) heartbeat_interval: Duration,
+    /// Auto-compaction threshold applied to every group created on this
+    /// node. `None` (default) disables auto-compaction. See
+    /// [`RaftConfig::log_compaction_threshold`].
+    pub(super) log_compaction_threshold: Option<u64>,
     /// Data directory for persistent Raft log storage.
     pub(super) data_dir: PathBuf,
 }
@@ -95,6 +99,7 @@ impl MultiRaft {
             election_timeout_min: Duration::from_secs(2),
             election_timeout_max: Duration::from_secs(5),
             heartbeat_interval: Duration::from_millis(50),
+            log_compaction_threshold: None,
             data_dir,
         }
     }
@@ -109,6 +114,14 @@ impl MultiRaft {
     /// Configure heartbeat interval.
     pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Configure the auto-compaction threshold for every group created on
+    /// this node. `None` disables auto-compaction (the default). See
+    /// [`RaftConfig::log_compaction_threshold`].
+    pub fn with_log_compaction_threshold(mut self, threshold: Option<u64>) -> Self {
+        self.log_compaction_threshold = threshold;
         self
     }
 
@@ -155,6 +168,7 @@ impl MultiRaft {
             election_timeout_min: self.election_timeout_min,
             election_timeout_max: self.election_timeout_max,
             heartbeat_interval: self.heartbeat_interval,
+            log_compaction_threshold: self.log_compaction_threshold,
         };
 
         let storage_path = self.data_dir.join(format!("raft/group-{group_id}.redb"));
@@ -345,6 +359,24 @@ impl MultiRaft {
             .ok_or(ClusterError::GroupNotFound { group_id })?;
         let entries = node.log_entries_range(lo, hi)?;
         Ok(entries.to_vec())
+    }
+
+    /// Auto-compact a group's log if its configured threshold has been
+    /// reached, given the DATA-PLANE applied watermark `applied_index`.
+    ///
+    /// `applied_index` MUST be the index the data-plane state machine has
+    /// durably applied to (NOT raft's commit index). Compacting past an
+    /// unapplied index would let the `SnapshotBuilder` serialize
+    /// incomplete state and corrupt a lagging follower's snapshot.
+    ///
+    /// No-op (returns `Ok(false)`) when the group is absent on this node,
+    /// the threshold is `None`, or the retained-entry count is below the
+    /// threshold. Returns `Ok(true)` when a compaction was performed.
+    pub fn maybe_compact_group(&mut self, group_id: u64, applied_index: u64) -> Result<bool> {
+        let Some(node) = self.groups.get_mut(&group_id) else {
+            return Ok(false);
+        };
+        Ok(node.maybe_compact_log(applied_index)?)
     }
 }
 

@@ -35,6 +35,17 @@ pub type AsyncRaftProposer = dyn Fn(
     > + Send
     + Sync;
 
+/// Type alias for the Raft log-compaction callback.
+///
+/// Takes `(group_id, applied_index)` where `applied_index` is the index the
+/// DATA-PLANE state machine has durably applied to (NOT raft's commit
+/// index). Invoked from the apply-completion path so a log can only be
+/// compacted up to an index the engines have actually persisted — never
+/// past it, which would corrupt a rebuilt snapshot. Returns `true` when a
+/// compaction was performed. A no-op when the group's
+/// `log_compaction_threshold` is `None`.
+pub type RaftCompactor = dyn Fn(u64, u64) -> std::result::Result<bool, crate::Error> + Send + Sync;
+
 fn default_pq_m() -> usize {
     crate::engine::vector::index_config::DEFAULT_PQ_M
 }
