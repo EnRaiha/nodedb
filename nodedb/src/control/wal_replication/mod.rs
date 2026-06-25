@@ -10,10 +10,12 @@
 pub mod decode;
 mod decode_sync_engines;
 pub mod encode;
+pub mod propose;
 pub mod types;
 
 pub use decode::from_replicated_entry;
 pub use encode::to_replicated_entry;
+pub use propose::propose_replicated_entry;
 pub use types::{AsyncRaftProposer, RaftProposer, ReplicatedEntry, ReplicatedWrite};
 
 pub use crate::control::distributed_applier::{
