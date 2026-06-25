@@ -26,7 +26,7 @@ use crate::transport::NexarTransport;
 
 use super::hooks::{
     AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ShuffleAggregator, ShuffleConsumer,
-    ShuffleProducer, ShuffleReceiver, SnapshotBuilder, SnapshotQuarantineHook,
+    ShuffleProducer, ShuffleReceiver, SnapshotApplier, SnapshotBuilder, SnapshotQuarantineHook,
 };
 
 /// Default tick interval (10ms — fast enough for sub-second elections).
@@ -214,6 +214,16 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// `None`, which makes the sender fall back to the stub (empty) chunk.
     pub(super) snapshot_builder: Option<Arc<dyn SnapshotBuilder>>,
 
+    /// Optional per-group snapshot applier for the RECEIVE path.
+    ///
+    /// When set (by the `nodedb` binary via `with_snapshot_applier`), the
+    /// install-snapshot finalize path applies the received per-group snapshot to
+    /// the local Data-Plane state machine AFTER the atomic `.partial`→`.snap`
+    /// rename and BEFORE advancing Raft. Cluster-only tests leave this `None`,
+    /// which makes the follower advance Raft without restoring engine state
+    /// (correct for the empty bootstrap stub shipped by those tests).
+    pub(super) snapshot_applier: Option<Arc<dyn SnapshotApplier>>,
+
     /// In-progress partial snapshot receives, keyed by `group_id`.
     ///
     /// Each entry tracks the `.partial` file, running CRC, and expected next
@@ -269,6 +279,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             calvin_submit: None,
             calvin_submit_inbox: None,
             snapshot_builder: None,
+            snapshot_applier: None,
             partial_snapshots: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             data_dir: None,
             snapshot_chunk_bytes: 4 * 1024 * 1024,

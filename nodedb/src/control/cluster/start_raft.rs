@@ -159,6 +159,13 @@ pub fn start_raft(
         crate::control::cluster::snapshot_builder::DataPlaneSnapshotBuilder::new(shared.clone()),
     );
 
+    // Per-group snapshot applier for the RECEIVE path: on the follower, apply a
+    // received per-group snapshot to the local Data-Plane state machine (via the
+    // existing restore handler with replace_mode = true) before Raft advances.
+    let snapshot_applier: Arc<dyn nodedb_cluster::SnapshotApplier> = Arc::new(
+        crate::control::cluster::snapshot_applier::DataPlaneSnapshotApplier::new(shared.clone()),
+    );
+
     // Cross-node streaming-shuffle receiver (E1): bridge the cluster
     // `ShufflePush` read-loop to the in-process registry on `SharedState`.
     let shuffle_receiver: Arc<dyn nodedb_cluster::ShuffleReceiver> = Arc::new(
@@ -222,6 +229,7 @@ pub fn start_raft(
         .with_group_watchers(handle.group_watchers.clone())
         .with_snapshot_quarantine_hook(quarantine_hook)
         .with_snapshot_builder(snapshot_builder)
+        .with_snapshot_applier(snapshot_applier)
         .with_shuffle_receiver(shuffle_receiver)
         .with_shuffle_producer(shuffle_producer)
         .with_shuffle_consumer(shuffle_consumer)

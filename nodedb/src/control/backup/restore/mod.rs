@@ -167,6 +167,8 @@ pub async fn restore_tenant(
         let plan = PhysicalPlan::Meta(MetaOp::RestoreTenantSnapshot {
             tenant_id,
             snapshot: payload,
+            // User RESTORE keeps the fail-closed collision behavior.
+            replace_mode: false,
         });
         if is_self(state, node_id) {
             local_plan = Some(plan);

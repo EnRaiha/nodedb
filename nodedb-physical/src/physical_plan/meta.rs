@@ -101,7 +101,17 @@ pub enum MetaOp {
 
     /// Restore a tenant's data across all engines from a snapshot.
     /// `snapshot` is a MessagePack-serialized `TenantDataSnapshot`.
-    RestoreTenantSnapshot { tenant_id: u64, snapshot: Vec<u8> },
+    ///
+    /// `replace_mode` selects the collision policy for engines whose restore is
+    /// otherwise fail-closed (columnar / vector / flushed-timeseries):
+    /// - `false` (user RESTORE): refuse to overwrite keys already present.
+    /// - `true` (Raft InstallSnapshot apply): OVERWRITE present keys, because a
+    ///   Raft install must replace local state, not fail against it.
+    RestoreTenantSnapshot {
+        tenant_id: u64,
+        snapshot: Vec<u8>,
+        replace_mode: bool,
+    },
 
     /// Purge ALL data for a tenant across every engine and cache.
     ///

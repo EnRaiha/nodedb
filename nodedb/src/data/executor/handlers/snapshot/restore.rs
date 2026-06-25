@@ -19,6 +19,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         tenant_id: u64,
         snapshot_bytes: &[u8],
+        replace_mode: bool,
     ) -> Response {
         info!(core = self.core_id, tenant_id, "restoring tenant snapshot");
 
@@ -78,7 +79,13 @@ impl CoreLoop {
                     };
                 let count = vectors.len() as u64;
                 let (database_id, coll_key) = parse_vector_snapshot_key(key, tenant_id);
-                self.restore_vector_collection(database_id, tenant_id, coll_key, vectors);
+                self.restore_vector_collection(
+                    database_id,
+                    tenant_id,
+                    coll_key,
+                    vectors,
+                    replace_mode,
+                );
                 vectors_written += count;
             }
 
@@ -124,7 +131,8 @@ impl CoreLoop {
 
             // Restore flushed on-disk timeseries segments.
             if !snap.flushed_ts_segments.is_empty()
-                && let Err(e) = self.restore_flushed_ts_segments(&snap.flushed_ts_segments)
+                && let Err(e) =
+                    self.restore_flushed_ts_segments(&snap.flushed_ts_segments, replace_mode)
             {
                 return self.response_error(
                     task,
@@ -136,7 +144,7 @@ impl CoreLoop {
 
             // Restore plain-columnar engines.
             if !snap.columnar_engines.is_empty()
-                && let Err(e) = self.restore_columnar_engines(&snap.columnar_engines)
+                && let Err(e) = self.restore_columnar_engines(&snap.columnar_engines, replace_mode)
             {
                 return self.response_error(
                     task,
@@ -214,6 +222,7 @@ impl CoreLoop {
         tenant_id: u64,
         coll_key: &str,
         vectors: Vec<(u32, Vec<f32>, Option<nodedb_types::Surrogate>)>,
+        replace_mode: bool,
     ) {
         if vectors.is_empty() {
             return;
@@ -229,6 +238,16 @@ impl CoreLoop {
             .get(&map_key)
             .cloned()
             .unwrap_or_default();
+        // Raft InstallSnapshot apply (`replace_mode`) must REPLACE the local
+        // collection so the snapshot's vectors are not appended on top of stale
+        // entries. User RESTORE (`!replace_mode`) keeps the prior insert-into-
+        // existing-or-create behavior.
+        if replace_mode {
+            self.vector_collections.insert(
+                map_key.clone(),
+                crate::engine::vector::collection::VectorCollection::new(dim, params.clone()),
+            );
+        }
         let coll = self.vector_collections.entry(map_key).or_insert_with(|| {
             crate::engine::vector::collection::VectorCollection::new(dim, params)
         });

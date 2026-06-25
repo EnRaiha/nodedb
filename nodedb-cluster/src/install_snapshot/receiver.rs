@@ -38,6 +38,7 @@ use crate::error::ClusterError;
 use crate::install_snapshot::finalize;
 use crate::install_snapshot::state::PartialSnapshotState;
 use crate::multi_raft::MultiRaft;
+use crate::raft_loop::SnapshotApplier;
 
 /// Thread-safe map of in-progress partial snapshot receives, keyed by `group_id`.
 pub type PartialSnapshotMap = Mutex<HashMap<u64, PartialSnapshotState>>;
@@ -61,6 +62,7 @@ pub async fn handle_chunk(
     partial_map: &PartialSnapshotMap,
     data_dir: &Path,
     multi_raft: &std::sync::Arc<std::sync::Mutex<MultiRaft>>,
+    snapshot_applier: Option<&std::sync::Arc<dyn SnapshotApplier>>,
 ) -> Result<ChunkOutcome, ClusterError> {
     let group_id = req.group_id;
     let recv_dir = data_dir.join("recv_snapshots");
@@ -149,31 +151,30 @@ pub async fn handle_chunk(
     }
 
     // Write chunk bytes to the partial file via spawn_blocking.
-    let chunk_bytes = req.data.clone();
-    let written_len = chunk_bytes.len() as u64;
+    let written_len = req.data.len() as u64;
 
     // Take the file out of the state, write via spawn_blocking, then restore it.
+    let taken_file = {
+        let mut map = partial_map.lock().unwrap_or_else(|p| p.into_inner());
+        let state = map
+            .get_mut(&group_id)
+            .ok_or_else(|| ClusterError::PartialSnapshotCorrupt {
+                group_id,
+                detail: "partial state disappeared during write".into(),
+            })?;
+        state
+            .partial_file
+            .take()
+            .ok_or_else(|| ClusterError::PartialSnapshotCorrupt {
+                group_id,
+                detail: "partial file already taken".into(),
+            })?
+    };
     let file = {
-        let file = {
-            let mut map = partial_map.lock().unwrap_or_else(|p| p.into_inner());
-            let state =
-                map.get_mut(&group_id)
-                    .ok_or_else(|| ClusterError::PartialSnapshotCorrupt {
-                        group_id,
-                        detail: "partial state disappeared during write".into(),
-                    })?;
-            state
-                .partial_file
-                .take()
-                .ok_or_else(|| ClusterError::PartialSnapshotCorrupt {
-                    group_id,
-                    detail: "partial file already taken".into(),
-                })?
-        };
         tokio::task::spawn_blocking({
-            let bytes = chunk_bytes.clone();
+            let bytes = req.data.clone();
             move || -> std::io::Result<std::fs::File> {
-                let mut f = file;
+                let mut f = taken_file;
                 f.write_all(&bytes)?;
                 f.flush()?;
                 Ok(f)
@@ -202,10 +203,10 @@ pub async fn handle_chunk(
         // Update running CRC over the raw chunk payload bytes.
         if written_len > 0 {
             if !state.running_crc_initialized {
-                state.running_crc = crc32c::crc32c(&chunk_bytes);
+                state.running_crc = crc32c::crc32c(&req.data);
                 state.running_crc_initialized = true;
             } else {
-                state.running_crc = crc32c::crc32c_append(state.running_crc, &chunk_bytes);
+                state.running_crc = crc32c::crc32c_append(state.running_crc, &req.data);
             }
         }
 
@@ -227,7 +228,7 @@ pub async fn handle_chunk(
             })?
     };
 
-    let resp = finalize::commit(state, multi_raft).await?;
+    let resp = finalize::commit(state, multi_raft, snapshot_applier).await?;
     Ok(ChunkOutcome::Committed(resp))
 }
 

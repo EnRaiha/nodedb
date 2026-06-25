@@ -89,7 +89,7 @@ async fn chunked_happy_path() {
         let done = i == total - 1;
         let req = make_req(group_id, offset, chunk.to_vec(), done, 10);
 
-        let outcome = handle_chunk(&req, &partial_map, data_dir, &mr)
+        let outcome = handle_chunk(&req, &partial_map, data_dir, &mr, None)
             .await
             .expect("handle_chunk");
 
@@ -140,7 +140,7 @@ async fn restart_mid_stream() {
 
     // Send chunk 0 (offset 0, not done).
     let req0 = make_req(group_id, 0, b"first".to_vec(), false, 7);
-    handle_chunk(&req0, &partial_map, data_dir, &mr)
+    handle_chunk(&req0, &partial_map, data_dir, &mr, None)
         .await
         .expect("chunk 0");
 
@@ -152,7 +152,7 @@ async fn restart_mid_stream() {
 
     // Send chunk 1 (offset 5, not done) — map has no entry → regression.
     let req1 = make_req(group_id, 5, b"second".to_vec(), false, 7);
-    let err = handle_chunk(&req1, &partial_map, data_dir, &mr)
+    let err = handle_chunk(&req1, &partial_map, data_dir, &mr, None)
         .await
         .expect_err("expected SnapshotOffsetRegression");
 
@@ -196,12 +196,12 @@ async fn corrupt_chunk_crc() {
     let chunk1 = b"bbbb".to_vec();
 
     let req0 = make_req(group_id, 0, chunk0, false, 20);
-    handle_chunk(&req0, &partial_map, data_dir, &mr)
+    handle_chunk(&req0, &partial_map, data_dir, &mr, None)
         .await
         .expect("chunk 0");
 
     let req1 = make_req(group_id, 4, chunk1, false, 20);
-    handle_chunk(&req1, &partial_map, data_dir, &mr)
+    handle_chunk(&req1, &partial_map, data_dir, &mr, None)
         .await
         .expect("chunk 1");
 
@@ -222,7 +222,7 @@ async fn corrupt_chunk_crc() {
     }
 
     let req2 = make_req(group_id, 8, chunk2.clone(), true, 20);
-    let err = handle_chunk(&req2, &partial_map, data_dir, &mr)
+    let err = handle_chunk(&req2, &partial_map, data_dir, &mr, None)
         .await
         .expect_err("expected CRC error");
 
@@ -262,12 +262,12 @@ async fn offset_regression() {
     let group_id = 9u64;
 
     let req0 = make_req(group_id, 0, b"hello".to_vec(), false, 30);
-    handle_chunk(&req0, &partial_map, data_dir, &mr)
+    handle_chunk(&req0, &partial_map, data_dir, &mr, None)
         .await
         .expect("chunk 0");
 
     let req1 = make_req(group_id, 5, b"world".to_vec(), false, 30);
-    handle_chunk(&req1, &partial_map, data_dir, &mr)
+    handle_chunk(&req1, &partial_map, data_dir, &mr, None)
         .await
         .expect("chunk 1");
 
@@ -276,7 +276,7 @@ async fn offset_regression() {
     // because `offset == 0` always triggers a reset and truncation.
     // Simulate a non-zero lower offset instead (e.g. 5 when we expect 10).
     let req_regress = make_req(group_id, 5, b"back ".to_vec(), false, 30);
-    let err = handle_chunk(&req_regress, &partial_map, data_dir, &mr)
+    let err = handle_chunk(&req_regress, &partial_map, data_dir, &mr, None)
         .await
         .expect_err("expected SnapshotOffsetRegression");
 
@@ -294,7 +294,7 @@ async fn offset_regression() {
 
     // Sending offset=0 should reset the state and succeed.
     let req_restart = make_req(group_id, 0, b"fresh".to_vec(), false, 30);
-    handle_chunk(&req_restart, &partial_map, data_dir, &mr)
+    handle_chunk(&req_restart, &partial_map, data_dir, &mr, None)
         .await
         .expect("reset from offset 0 must succeed");
 }

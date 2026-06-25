@@ -160,6 +160,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                         &self.partial_snapshots,
                         data_dir,
                         &self.multi_raft,
+                        self.snapshot_applier.as_ref(),
                     )
                     .await
                     {

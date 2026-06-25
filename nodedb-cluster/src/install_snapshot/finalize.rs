@@ -30,6 +30,7 @@ use nodedb_raft::{InstallSnapshotRequest, InstallSnapshotResponse};
 use crate::error::ClusterError;
 use crate::install_snapshot::state::PartialSnapshotState;
 use crate::multi_raft::MultiRaft;
+use crate::raft_loop::SnapshotApplier;
 
 /// Validate, rename, and advance Raft state after the last chunk.
 ///
@@ -39,6 +40,7 @@ use crate::multi_raft::MultiRaft;
 pub async fn commit(
     state: PartialSnapshotState,
     multi_raft: &Arc<Mutex<MultiRaft>>,
+    snapshot_applier: Option<&Arc<dyn SnapshotApplier>>,
 ) -> Result<InstallSnapshotResponse, ClusterError> {
     let group_id = state.group_id;
     let partial_path = state.partial_path.clone();
@@ -100,6 +102,24 @@ pub async fn commit(
     .map_err(|e| ClusterError::Storage {
         detail: format!("rename partial to snap for group {group_id}: {e}"),
     })?;
+
+    // Apply the snapshot to the local Data-Plane state machine BEFORE advancing
+    // Raft, so the data is visible on this node before the Raft log boundary
+    // moves. An apply failure is fatal — we return WITHOUT advancing Raft so the
+    // follower retries the install (no silent partial success). The empty
+    // bootstrap stub (no engine data) is skipped: there is nothing to apply, and
+    // group 0 (metadata) is a no-op the applier handles internally.
+    if !file_bytes.is_empty()
+        && let Some(applier) = snapshot_applier
+    {
+        applier
+            .apply_snapshot(group_id, &file_bytes)
+            .await
+            .map_err(|e| ClusterError::SnapshotApplyFailed {
+                group_id,
+                detail: e.to_string(),
+            })?;
+    }
 
     // Advance Raft log boundary. Build a minimal InstallSnapshotRequest
     // that satisfies `handle_install_snapshot` — `data` is the assembled

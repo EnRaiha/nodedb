@@ -18,7 +18,7 @@ use crate::metadata_group::applier::MetadataApplier;
 
 use super::hooks::{
     AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ShuffleAggregator, ShuffleConsumer,
-    ShuffleProducer, ShuffleReceiver, SnapshotBuilder, SnapshotQuarantineHook,
+    ShuffleProducer, ShuffleReceiver, SnapshotApplier, SnapshotBuilder, SnapshotQuarantineHook,
 };
 use super::loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};
 
@@ -50,6 +50,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             calvin_submit: self.calvin_submit,
             calvin_submit_inbox: self.calvin_submit_inbox,
             snapshot_builder: self.snapshot_builder,
+            snapshot_applier: self.snapshot_applier,
             partial_snapshots: self.partial_snapshots,
             data_dir: self.data_dir,
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
@@ -174,6 +175,18 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// set, the sender falls back to the stub (empty) chunk.
     pub fn with_snapshot_builder(mut self, builder: Arc<dyn SnapshotBuilder>) -> Self {
         self.snapshot_builder = Some(builder);
+        self
+    }
+
+    /// Attach the per-group snapshot applier for the RECEIVE path (builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s Data Plane restore
+    /// dispatch) is called by the install-snapshot finalize path to apply a
+    /// received per-group snapshot to the local state machine after the atomic
+    /// `.partial`→`.snap` rename and before advancing Raft. When not set, the
+    /// follower advances Raft without restoring engine state.
+    pub fn with_snapshot_applier(mut self, applier: Arc<dyn SnapshotApplier>) -> Self {
+        self.snapshot_applier = Some(applier);
         self
     }
 

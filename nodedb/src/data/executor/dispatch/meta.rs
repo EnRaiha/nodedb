@@ -65,7 +65,8 @@ impl CoreLoop {
             MetaOp::RestoreTenantSnapshot {
                 tenant_id,
                 snapshot,
-            } => self.execute_restore_tenant_snapshot(task, *tenant_id, snapshot),
+                replace_mode,
+            } => self.execute_restore_tenant_snapshot(task, *tenant_id, snapshot, *replace_mode),
 
             MetaOp::ConvertCollection {
                 collection,

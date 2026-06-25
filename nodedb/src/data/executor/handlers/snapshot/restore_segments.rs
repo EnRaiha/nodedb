@@ -21,9 +21,15 @@ impl CoreLoop {
     ///     - Different metadata → return `Storage` error (would clobber live data).
     ///   - Otherwise: create the directory, write all files, register in
     ///     `ts_registries` mirroring `flush_ts_collection`'s exact registration.
+    ///
+    /// `replace_mode` (Raft InstallSnapshot apply) SKIPS the fail-closed
+    /// collision checks and OVERWRITES the partition directory and registry
+    /// entry with the snapshot's version. `!replace_mode` (user RESTORE) keeps
+    /// the fail-closed behavior described above.
     pub(super) fn restore_flushed_ts_segments(
         &mut self,
         blobs: &[TsFlushedCollectionBlob],
+        replace_mode: bool,
     ) -> crate::Result<()> {
         for coll_blob in blobs {
             let (database_id, tenant_id, collection) =
@@ -58,7 +64,12 @@ impl CoreLoop {
                 let partition_dir = segment_dir.join(&part_blob.dir_name);
 
                 // Collision check: registry already knows this min_ts key.
-                if let Some(registry) = self.ts_registries.get(&reg_key)
+                // Skipped under `replace_mode` (Raft install): the snapshot's
+                // partition OVERWRITES the local one — `registry.import` replaces
+                // the entry keyed by min_ts and the directory is wiped + rewritten
+                // below.
+                if !replace_mode
+                    && let Some(registry) = self.ts_registries.get(&reg_key)
                     && let Some(existing) = registry.get(meta.min_ts)
                 {
                     let is_identical = existing.meta.row_count == meta.row_count
@@ -84,8 +95,9 @@ impl CoreLoop {
                 }
 
                 // Also check the filesystem: if the directory already exists
-                // and is non-empty, treat it as a collision.
-                if partition_dir.exists() {
+                // and is non-empty, treat it as a collision. Skipped under
+                // `replace_mode` — the directory is removed and rewritten below.
+                if !replace_mode && partition_dir.exists() {
                     let is_empty = std::fs::read_dir(&partition_dir)
                         .map_err(crate::Error::Io)
                         .map(|mut d| d.next().is_none())?;
@@ -99,6 +111,12 @@ impl CoreLoop {
                             ),
                         });
                     }
+                }
+
+                // Under replace_mode, wipe any stale partition directory so a
+                // changed file layout cannot leave orphaned segment files behind.
+                if replace_mode && partition_dir.exists() {
+                    std::fs::remove_dir_all(&partition_dir)?;
                 }
 
                 // Create the partition directory and write all captured files.
@@ -135,14 +153,20 @@ impl CoreLoop {
     /// - Inserts the engine into `columnar_engines` and any returned flushed
     ///   segment blobs into `columnar_flushed_segments`.
     ///
-    /// **Collision handling is fail-closed:** if either `columnar_engines` or
-    /// `columnar_flushed_segments` already contains an entry for the key, this
-    /// returns `Error::Storage` rather than silently overwriting live data.
-    /// Idempotent re-restore (same snapshot applied twice to an empty engine set)
-    /// can be added later as a follow-up when it is needed.
+    /// **Collision handling depends on `replace_mode`:**
+    /// - `!replace_mode` (user RESTORE): fail-closed — if either
+    ///   `columnar_engines` or `columnar_flushed_segments` already contains an
+    ///   entry for the key, return `Error::Storage` rather than silently
+    ///   overwriting live data.
+    /// - `replace_mode` (Raft InstallSnapshot apply): SKIP the guards and
+    ///   OVERWRITE — the engine entry is replaced, and the flushed segments /
+    ///   surrogates maps are SET to the snapshot's (the stale entries are removed
+    ///   when the snapshot carries none) so they are never appended to stale
+    ///   state.
     pub(super) fn restore_columnar_engines(
         &mut self,
         entries: &[(String, Vec<u8>)],
+        replace_mode: bool,
     ) -> crate::Result<()> {
         for (collection_key, bytes) in entries {
             let (database_id, tenant_id, collection) =
@@ -154,26 +178,29 @@ impl CoreLoop {
                 collection.clone(),
             );
 
-            // Fail-closed: refuse to overwrite any live engine or flushed segment
-            // state that was present before this restore call.
-            if self.columnar_engines.contains_key(&engine_key) {
-                return Err(crate::Error::Storage {
-                    engine: "columnar".into(),
-                    detail: format!(
-                        "restore: columnar engine already exists for collection '{collection}' \
-                         (db={database_id}, tenant={tenant_id}); refusing to overwrite live data"
-                    ),
-                });
-            }
-            if self.columnar_flushed_segments.contains_key(&engine_key) {
-                return Err(crate::Error::Storage {
-                    engine: "columnar".into(),
-                    detail: format!(
-                        "restore: flushed segment state already exists for collection \
-                         '{collection}' (db={database_id}, tenant={tenant_id}); \
-                         refusing to overwrite live data"
-                    ),
-                });
+            // Fail-closed (user RESTORE only): refuse to overwrite any live
+            // engine or flushed segment state that was present before this
+            // restore call. Skipped under `replace_mode` (Raft install).
+            if !replace_mode {
+                if self.columnar_engines.contains_key(&engine_key) {
+                    return Err(crate::Error::Storage {
+                        engine: "columnar".into(),
+                        detail: format!(
+                            "restore: columnar engine already exists for collection '{collection}' \
+                             (db={database_id}, tenant={tenant_id}); refusing to overwrite live data"
+                        ),
+                    });
+                }
+                if self.columnar_flushed_segments.contains_key(&engine_key) {
+                    return Err(crate::Error::Storage {
+                        engine: "columnar".into(),
+                        detail: format!(
+                            "restore: flushed segment state already exists for collection \
+                             '{collection}' (db={database_id}, tenant={tenant_id}); \
+                             refusing to overwrite live data"
+                        ),
+                    });
+                }
             }
 
             let snap: nodedb_columnar::ColumnarEngineSnapshot = zerompk::from_msgpack(bytes)
@@ -198,6 +225,11 @@ impl CoreLoop {
             if !flushed.is_empty() {
                 self.columnar_flushed_segments
                     .insert(engine_key.clone(), flushed);
+            } else if replace_mode {
+                // Replace: the snapshot carries no flushed segments, so any stale
+                // local entry must be dropped (not left behind to mismatch the
+                // overwritten engine).
+                self.columnar_flushed_segments.remove(&engine_key);
             }
             // Re-attach the cross-engine surrogate sidecar under the SAME key so
             // prefiltered scans see flushed rows post-restore. Old snapshots
@@ -209,6 +241,11 @@ impl CoreLoop {
             if !flushed_surrogates.is_empty() {
                 self.columnar_flushed_surrogates
                     .insert(engine_key, flushed_surrogates);
+            } else if replace_mode {
+                // Replace: drop any stale surrogate sidecar when the snapshot
+                // carries none, keeping the sidecar consistent with the
+                // overwritten engine + flushed segments.
+                self.columnar_flushed_surrogates.remove(&engine_key);
             }
         }
         Ok(())

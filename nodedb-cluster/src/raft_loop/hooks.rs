@@ -39,6 +39,40 @@ pub trait SnapshotBuilder: Send + Sync + 'static {
     ) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// Hook for applying a received per-group snapshot to local engine state on the
+/// Raft snapshot RECEIVE path.
+///
+/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the follower-side
+/// apply — which deserializes the per-group `TenantDataSnapshot` bytes and
+/// installs them into the local Data-Plane state machine through the existing
+/// SPSC bridge — lives in the host crate (`nodedb`) behind this `Send + Sync`
+/// hook. The install-snapshot finalize path (see
+/// [`crate::install_snapshot::finalize::commit`]) calls
+/// [`apply_snapshot`](Self::apply_snapshot) AFTER the atomic `.partial`→`.snap`
+/// rename and BEFORE advancing Raft, so the data is visible on this node before
+/// the Raft log boundary moves.
+///
+/// Cluster-only tests leave the `RaftLoop` field `None`, which makes the
+/// follower advance Raft WITHOUT restoring engine state — the pre-applier
+/// behaviour (correct for tests that ship only the empty bootstrap stub).
+///
+/// The hook is **async** because the host-crate implementation dispatches the
+/// per-tenant restore to the Data Plane through the SPSC bridge (an awaited
+/// round-trip on the Tokio transport reactor); it never touches io_uring or
+/// storage directly.
+#[async_trait::async_trait]
+pub trait SnapshotApplier: Send + Sync + 'static {
+    /// Apply a per-group snapshot to the local data-plane state machine.
+    /// Called AFTER the atomic .partial→.snap rename, BEFORE handle_install_snapshot
+    /// advances Raft. Err MUST prevent the raft advance (follower retries).
+    /// group_id 0 (metadata) is a no-op (metadata restored inline).
+    async fn apply_snapshot(
+        &self,
+        group_id: u64,
+        snapshot_bytes: &[u8],
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
 /// Hook for quarantine integration on the Raft snapshot receive path.
 ///
 /// `nodedb-cluster` cannot depend on `nodedb` (circular), so the host crate
