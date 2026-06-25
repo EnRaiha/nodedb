@@ -117,7 +117,22 @@ pub(super) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         PhysicalPlan::Query(QueryOp::Exchange(op)) => extract_collection(&op.child),
         // ProviderScan is a catalog/constant source — no user collection.
         PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
-        _ => None,
+        // All remaining ops carry no extractable user collection here. The
+        // specific arms above take precedence; these inner wildcards catch the
+        // unmatched ops of each engine plus the engines with no arms at all
+        // (Kv, Array, ClusterArray). Exhaustive so a new PhysicalPlan variant
+        // forces a decision rather than silently returning None.
+        PhysicalPlan::Document(_)
+        | PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_) => None,
     }
 }
 
@@ -231,7 +246,22 @@ pub(super) fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
             PlanKind::SingleDocument
         }
 
-        _ => PlanKind::Execution,
+        // Default: opaque execution result. The specific arms above take
+        // precedence; these inner wildcards catch every unmatched op of each
+        // engine plus the engines with no arms here (Crdt, Meta, ClusterArray).
+        // Exhaustive so a new PhysicalPlan variant forces a decision.
+        PhysicalPlan::Document(_)
+        | PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_) => PlanKind::Execution,
     }
 }
 
@@ -285,8 +315,22 @@ pub(super) fn is_calvin_foldable(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Kv(KvOp::InsertIfAbsent { .. })
         | PhysicalPlan::Kv(KvOp::Delete { .. }) => true,
 
-        // Everything else: not foldable.
-        _ => false,
+        // Everything else: not foldable. The foldable arms above take
+        // precedence; these inner wildcards catch every remaining op of each
+        // engine. Exhaustive so a new PhysicalPlan variant forces a decision.
+        PhysicalPlan::Document(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_) => false,
     }
 }
 

@@ -73,7 +73,22 @@ fn extract_bulk_predicate_info(plan: &PhysicalPlan) -> (String, Vec<u8>) {
             filters,
             ..
         }) => (collection.clone(), filters.clone()),
-        _ => (String::new(), vec![]),
+        // Not a bulk predicate. The two bulk arms above take precedence; these
+        // inner wildcards catch every other op (including non-bulk document
+        // ops). Exhaustive so a new PhysicalPlan variant forces a decision.
+        PhysicalPlan::Document(_)
+        | PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_) => (String::new(), vec![]),
     }
 }
 
@@ -94,7 +109,22 @@ fn inject_ollp_surrogates(plan: &mut PhysicalPlan, surrogates: Vec<u32>) {
         }) => {
             *ollp_predicted_surrogates = Some(surrogates);
         }
-        _ => {}
+        // Non-bulk plans are left unchanged. The two bulk arms above take
+        // precedence; these inner wildcards catch every other op. Exhaustive
+        // so a new PhysicalPlan variant forces a decision.
+        PhysicalPlan::Document(_)
+        | PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_) => {}
     }
 }
 
@@ -122,7 +152,22 @@ fn inject_ollp_predicted_edges(plan: &mut PhysicalPlan, mut edges: Vec<OllpPredi
         }) => {
             *ollp_predicted_edges = Some(edges);
         }
-        _ => {}
+        // Non-bulk plans are left unchanged. The two bulk arms above take
+        // precedence; these inner wildcards catch every other op. Exhaustive
+        // so a new PhysicalPlan variant forces a decision.
+        PhysicalPlan::Document(_)
+        | PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_) => {}
     }
 }
 
@@ -230,8 +275,22 @@ pub async fn dispatch_dependent_edge_recon(
             EdgeLifecycle::Update(overrides)
         }
         // Unreachable: `is_dependent_predicate` only selects BulkUpdate /
-        // BulkDelete. Surface a typed error rather than panicking.
-        _ => {
+        // BulkDelete. Surface a typed error rather than panicking. The two
+        // bulk arms above take precedence; these inner wildcards catch every
+        // other op. Exhaustive so a new PhysicalPlan variant forces a decision.
+        PhysicalPlan::Document(_)
+        | PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_) => {
             return Err(Error::Internal {
                 detail: "dependent Calvin task is neither BulkUpdate nor BulkDelete".to_owned(),
             });
