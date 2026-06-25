@@ -29,7 +29,7 @@ pub mod reader;
 pub mod wal_record;
 pub mod writer;
 
-pub use compaction::compact_segments;
+pub use compaction::{compact_segments, materialize_segment_live_rows};
 pub use delete_bitmap::DeleteBitmap;
 pub use error::ColumnarError;
 pub use filter::{

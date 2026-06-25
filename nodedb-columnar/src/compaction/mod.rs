@@ -11,11 +11,13 @@
 //! or when the segment count exceeds a limit.
 
 pub mod extract;
+pub mod materialize;
 pub mod segment;
 pub mod segments;
 
 #[cfg(test)]
 mod tests;
 
+pub use materialize::materialize_segment_live_rows;
 pub use segment::{CompactionResult, DEFAULT_DELETE_RATIO_THRESHOLD, compact_segment};
 pub use segments::compact_segments;
