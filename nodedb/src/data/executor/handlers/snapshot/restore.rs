@@ -45,8 +45,9 @@ impl CoreLoop {
         let mut ts_written = 0u64;
 
         {
-            // Restore graph edges. Keys are the unscoped
-            // `"src\0label\0dst"` form; tenant is supplied from context.
+            // Restore graph edges. Keys are the versioned form
+            // `"{collection}\x00{src}\x00{label}\x00{dst}\x00{system_from:020}"`;
+            // tenant is supplied from context.
             let tid = crate::types::TenantId::new(tenant_id);
             let database_id = task.request.database_id.as_u64();
             for (key, props) in &snap.edges {
@@ -56,12 +57,44 @@ impl CoreLoop {
                 }
                 edges_written += 1;
             }
-            // Rebuild CSR from restored edges.
-            if edges_written > 0
-                && let Ok(rebuilt) =
-                    crate::engine::graph::csr::rebuild::rebuild_sharded_from_store(&self.edge_store)
-            {
-                self.csr = rebuilt;
+            // Restore tenant-aware edges from the multi-tenant merged Raft
+            // snapshot. The edge key does NOT carry the tenant, so each entry
+            // carries its owning `tid` explicitly — install it under THAT tenant
+            // rather than the dispatch-context tenant (which is 0 for the merged
+            // group snapshot). Shares `edges_written` with the legacy loop so the
+            // CSR rebuild below runs if EITHER source installed edges.
+            for (tid_raw, key, props) in &snap.tenant_edges {
+                let edge_tid = crate::types::TenantId::new(*tid_raw);
+                if let Err(e) = self
+                    .edge_store
+                    .put_edge_raw(database_id, edge_tid, key, props)
+                {
+                    warn!(key, error = %e, "failed to restore tenant edge");
+                    continue;
+                }
+                edges_written += 1;
+            }
+            // Rebuild CSR from restored edges. A rebuild failure is fatal to the
+            // whole restore: leaving the stale CSR in place would make graph
+            // traversals silently return wrong results over the just-installed
+            // edges — the same silent-corruption class the durable-section
+            // failures above treat as fatal.
+            if edges_written > 0 {
+                match crate::engine::graph::csr::rebuild::rebuild_sharded_from_store(
+                    &self.edge_store,
+                ) {
+                    Ok(rebuilt) => self.csr = rebuilt,
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!(
+                                    "restore: CSR rebuild after edge install failed: {e}"
+                                ),
+                            },
+                        );
+                    }
+                }
             }
 
             // Restore vector collections.

@@ -162,6 +162,7 @@ nodedb-array = { workspace = true }
 nodedb-test-support = { workspace = true }
 tower = { workspace = true }
 rcgen = "0.13"
+zerompk = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # io_uring for Data Plane batched I/O (columnar reads, WAL)

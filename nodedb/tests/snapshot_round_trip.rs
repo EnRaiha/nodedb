@@ -378,3 +378,112 @@ async fn snapshot_round_trip_vector() {
         vecs.len()
     );
 }
+
+/// Builder→applier round-trip for the **GRAPH EDGE** snapshot section.
+///
+/// Edges live in their own snapshot section (`snap.edges`) keyed by the
+/// versioned composite key `{collection}\x00{src}\x00{label}\x00{dst}\x00{sys}`
+/// — the collection is the first component, so the builder routes each edge
+/// through the same vshard filter every other section uses. Before the fix the
+/// builder dropped this section entirely, so a snapshot-installed follower lost
+/// all edge data; this test would fail (empty traversal) without the fix.
+///
+/// SQL is copied verbatim from `graph_cross_core_bfs.rs`:
+/// - `CREATE COLLECTION <name>`               (e.g. `bfs_nodes`)
+/// - `GRAPH INSERT EDGE IN '<coll>' FROM '<src>' TO '<dst>' TYPE '<label>'`
+/// - `GRAPH TRAVERSE FROM '<src>' DEPTH <n> LABEL '<label>' DIRECTION out`
+#[tokio::test]
+async fn snapshot_round_trip_edges() {
+    const COLL: &str = "snap_rt_edges";
+    // root → leaf_0..leaf_(FANOUT-1), label 'l'. Small fan-out keeps the test
+    // fast; the traversal below is non-empty ONLY if the edges round-trip.
+    const FANOUT: usize = 8;
+
+    // ── Sanity: the collection's vShard belongs to the data group we build. ───
+    let vshard = vshard_for_collection(DatabaseId::DEFAULT, COLL);
+    assert!(
+        single_node_routing()
+            .vshards_for_group(DATA_GROUP_ID)
+            .contains(&vshard),
+        "collection vShard {vshard} must belong to data group {DATA_GROUP_ID}"
+    );
+
+    // ── SOURCE node: create collection + insert edges over pgwire. ────────────
+    let source = TestServer::start_with_routing(single_node_routing()).await;
+    source
+        .exec(&format!("CREATE COLLECTION {COLL}"))
+        .await
+        .expect("CREATE COLLECTION on source");
+    for i in 0..FANOUT {
+        source
+            .exec(&format!(
+                "GRAPH INSERT EDGE IN '{COLL}' FROM 'root' TO 'leaf_{i}' TYPE 'l'"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("GRAPH INSERT EDGE leaf_{i} on source: {e}"));
+    }
+
+    // (No source-side traversal sanity: with `cluster_routing` injected — which
+    // the builder requires — `GRAPH TRAVERSE` attempts distributed graph dispatch
+    // and needs a cluster gateway the single-node harness has no. The edge
+    // INSERTs above are `.expect`-checked, so the edges are definitely present;
+    // the round-trip is proven by the TARGET traversal below.)
+
+    // ── Build the group snapshot via the PRODUCTION builder. ──────────────────
+    let builder = DataPlaneSnapshotBuilder::new(source.shared.clone());
+    let bytes = builder
+        .build_group_snapshot(DATA_GROUP_ID, 0, 0)
+        .await
+        .expect("build_group_snapshot");
+    assert!(
+        !bytes.is_empty(),
+        "production builder must produce a non-empty group snapshot"
+    );
+
+    // Decode the snapshot and assert the builder actually carried the edges
+    // (group-filtered). This is the direct proof of the builder fix and is
+    // independent of the apply/traversal path below.
+    let decoded: nodedb::types::TenantDataSnapshot =
+        zerompk::from_msgpack(&bytes).expect("decode group snapshot");
+    assert_eq!(
+        decoded.tenant_edges.len(),
+        FANOUT,
+        "builder must carry all {FANOUT} edges (tenant-aware) for the in-group \
+         collection; got {}",
+        decoded.tenant_edges.len()
+    );
+
+    // ── TARGET node: fresh server, identical schema pre-created. ──────────────
+    // The target is started WITHOUT a routing table: the applier does not need
+    // one (the snapshot bytes are already group-filtered), and its absence keeps
+    // the verification `GRAPH TRAVERSE` below on the local (non-distributed) path
+    // so it does not require a cluster gateway.
+    let target = TestServer::start().await;
+    target
+        .exec(&format!("CREATE COLLECTION {COLL}"))
+        .await
+        .expect("CREATE COLLECTION on target");
+
+    // ── Apply via the PRODUCTION applier. ─────────────────────────────────────
+    let applier = DataPlaneSnapshotApplier::new(target.shared.clone());
+    applier
+        .apply_snapshot(DATA_GROUP_ID, &bytes)
+        .await
+        .expect("apply_snapshot");
+
+    // ── Verify on the TARGET: all edges round-tripped. ────────────────────────
+    // This traversal is non-empty ONLY if the edges were carried in the
+    // snapshot and the applier rebuilt the CSR. Without the builder fix the
+    // edge section ships empty and this assertion fails.
+    let tgt_traverse = target
+        .query_text("GRAPH TRAVERSE FROM 'root' DEPTH 1 LABEL 'l' DIRECTION out")
+        .await
+        .expect("GRAPH TRAVERSE on target");
+    let tgt_blob = tgt_traverse.join("");
+    for i in 0..FANOUT {
+        assert!(
+            tgt_blob.contains(&format!("leaf_{i}")),
+            "target must traverse leaf_{i} from snapshot-installed edges; got: {tgt_blob}"
+        );
+    }
+}

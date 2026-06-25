@@ -20,7 +20,13 @@ pub struct TenantDataSnapshot {
     pub documents: Vec<(String, Vec<u8>)>,
     /// Sparse engine index entries: `[("{tid}:{collection}:{field}:{value}:{doc_id}", []), ...]`
     pub indexes: Vec<(String, Vec<u8>)>,
-    /// Graph edges: `[("{tid}:{src}\x00{label}\x00{tid}:{dst}", properties), ...]`
+    /// Graph edges: `[("{collection}\x00{src}\x00{label}\x00{dst}\x00{system_from:020}", value_bytes), ...]`
+    ///
+    /// The edge key does NOT carry the owning tenant. This (no-tenant) field is
+    /// used by the per-tenant user RESTORE path, which dispatches with the
+    /// correct tenant from context. For the multi-tenant merged Raft snapshot
+    /// (which spans tenants and applies once with no per-tenant dispatch), use
+    /// the tenant-aware companion [`Self::tenant_edges`] instead.
     pub edges: Vec<(String, Vec<u8>)>,
     /// Vector collections: `[("{tid}:{collection}", serialized_vectors_msgpack), ...]`
     /// Each value is a MessagePack-serialized list of `(vector_id, f32_data, doc_id)`.
@@ -79,6 +85,21 @@ pub struct TenantDataSnapshot {
     #[msgpack(default)]
     #[serde(default)]
     pub surrogate_pk: Vec<SurrogateBindEntry>,
+
+    /// Graph edges WITH their owning tenant, for the per-group Raft snapshot
+    /// (the merged snapshot spans multiple tenants and the edge key —
+    /// `"{collection}\x00{src}\x00{label}\x00{dst}\x00{system:020}"` — does NOT
+    /// carry the tenant, unlike every other section's key). Each entry is
+    /// `(tenant_id, edge_key, value_bytes)`. The legacy `edges` field (no tenant)
+    /// is still used by the per-tenant user RESTORE path, which dispatches with
+    /// the correct tenant; this field is for the multi-tenant merged Raft path.
+    ///
+    /// `#[msgpack(default)]`: snapshots created before this field was added
+    /// decode with an empty Vec — safe because the restore path skips an empty
+    /// slice (same evolution pattern as `surrogate_pk`).
+    #[msgpack(default)]
+    #[serde(default)]
+    pub tenant_edges: Vec<(u64, String, Vec<u8>)>,
 }
 
 /// A single PK → surrogate identity binding carried in a snapshot/backup.
@@ -205,6 +226,10 @@ mod tests {
             decoded.surrogate_pk.is_empty(),
             "expected surrogate_pk to default to empty for old snapshot"
         );
+        assert!(
+            decoded.tenant_edges.is_empty(),
+            "expected tenant_edges to default to empty for old snapshot"
+        );
     }
 
     /// Round-trip + backward-compat for the `surrogate_pk` field: a snapshot
@@ -268,6 +293,10 @@ mod tests {
         assert!(
             decoded_old.surrogate_pk.is_empty(),
             "expected surrogate_pk to default to empty for old 9-field snapshot"
+        );
+        assert!(
+            decoded_old.tenant_edges.is_empty(),
+            "expected tenant_edges to default to empty for old 9-field snapshot"
         );
     }
 

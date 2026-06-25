@@ -14,11 +14,12 @@
 //! the per-tenant slices into one `TenantDataSnapshot` for the wire.
 //!
 //! Scope (this unit builds the LEADER side only — follower APPLY is a later
-//! unit): the vshard-partitioned engines are filtered and shipped. Graph
-//! `edges` and `crdt_state` are per-group-replicated-by-design but require the
-//! edge wire-format change / CRDT per-group scoping that land in subsequent
-//! units; they are a DECLARED, tracked omission here and left empty in the
-//! merged snapshot.
+//! unit): the vshard-partitioned engines are filtered and shipped, including
+//! graph `edges` (the edge key already embeds the collection, so it is routed
+//! through the same vshard filter as every other section). `crdt_state` remains
+//! a DECLARED, tracked omission — it is one Loro doc per tenant and needs
+//! per-collection scoping before it can be group-filtered; it is left empty in
+//! the merged snapshot.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -33,6 +34,7 @@ use crate::control::backup::snapshot_keys::{
 };
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::state::SharedState;
+use crate::engine::graph::edge_store::parse_versioned_edge_key;
 use crate::types::{SurrogateBindEntry, TenantDataSnapshot, TenantId};
 use nodedb_physical::physical_plan::MetaOp;
 
@@ -170,14 +172,43 @@ impl DataPlaneSnapshotBuilder {
             }
         }
 
-        // EXCLUDED in this unit (declared, tracked omission): graph `edges` and
-        // `crdt_state` are per-group-replicated-by-design but require the edge
-        // wire-format change / CRDT per-group scoping that land in subsequent
-        // units. They are intentionally left empty in `merged` here — NOT a
-        // silent drop. The follower APPLY unit will install whatever sections
-        // this builder ships, so once those units land the lines below extend
-        // to filter + carry them.
-        let _ = (&snap.edges, &snap.crdt_state);
+        // Graph edges: the versioned edge key embeds the collection as its
+        // FIRST `\x00`-delimited component, and edge writes are homed at
+        // `vshard_for_collection(DEFAULT, collection)` — the SAME routing
+        // function `Self::vshard_of` uses. So edges route through the identical
+        // vshard filter every other section uses. The restore path parses the
+        // key and rebuilds CSR, so no key transformation is needed here.
+        //
+        // Unlike every other section, the edge key does NOT carry the tenant,
+        // so the merged multi-tenant snapshot (applied ONCE with no per-tenant
+        // dispatch) carries edges tenant-aware via `tenant_edges` — pushing to
+        // the no-tenant `edges` field here would install them under the wrong
+        // tenant on apply.
+        for (key, value) in snap.edges {
+            match parse_versioned_edge_key(&key) {
+                Some((collection, ..)) => {
+                    if group_vshards.contains(&Self::vshard_of(collection)) {
+                        merged.tenant_edges.push((tenant_id, key, value));
+                    }
+                }
+                None => {
+                    // All edge keys are the versioned format; an unparseable
+                    // key has no determinable group, and restore would reject
+                    // it via `put_edge_raw`. Do NOT silently drop it — surface
+                    // it. Log only a short prefix, never the full key.
+                    let key_prefix: String = key.chars().take(32).collect();
+                    tracing::warn!(key_prefix, "snapshot build: unparseable edge key, skipping");
+                }
+            }
+        }
+
+        // EXCLUDED in this unit (declared, tracked omission): `crdt_state` is
+        // one Loro doc per tenant and needs per-collection scoping before it
+        // can be group-filtered. It is intentionally left empty in `merged`
+        // here — NOT a silent drop. The follower APPLY unit installs whatever
+        // sections this builder ships, so once CRDT per-group scoping lands the
+        // line below extends to filter + carry it.
+        let _ = &snap.crdt_state;
 
         Ok(())
     }
