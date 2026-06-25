@@ -28,7 +28,9 @@ use nodedb_types::id::DatabaseId;
 
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::backup::snapshot_keys::{extract_collection, extract_db_scoped_collection};
+use crate::control::backup::snapshot_keys::{
+    extract_db_scoped_collection, extract_db_tenant_scoped_collection,
+};
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::state::SharedState;
 use crate::types::{SurrogateBindEntry, TenantDataSnapshot, TenantId};
@@ -117,9 +119,9 @@ impl DataPlaneSnapshotBuilder {
                 detail: format!("snapshot build: decode tenant {tenant_id} snapshot: {e}"),
             })?;
 
-        // tenant-scoped sections: key shape "{tid}:{collection}:..."
-        let in_group_tenant_scoped = |key: &str| {
-            extract_collection(key, tenant_id)
+        // db-tenant-scoped sections: key shape "{db}:{tid}:{collection}[:suffix]"
+        let in_group_db_tenant_scoped = |key: &str| {
+            extract_db_tenant_scoped_collection(key, tenant_id)
                 .map(|c| group_vshards.contains(&Self::vshard_of(c)))
                 .unwrap_or(false)
         };
@@ -131,22 +133,22 @@ impl DataPlaneSnapshotBuilder {
         };
 
         for (k, v) in snap.documents {
-            if in_group_tenant_scoped(&k) {
+            if in_group_db_tenant_scoped(&k) {
                 merged.documents.push((k, v));
             }
         }
         for (k, v) in snap.indexes {
-            if in_group_tenant_scoped(&k) {
+            if in_group_db_tenant_scoped(&k) {
                 merged.indexes.push((k, v));
             }
         }
         for (k, v) in snap.vectors {
-            if in_group_tenant_scoped(&k) {
+            if in_group_db_tenant_scoped(&k) {
                 merged.vectors.push((k, v));
             }
         }
         for (k, v) in snap.timeseries {
-            if in_group_tenant_scoped(&k) {
+            if in_group_db_tenant_scoped(&k) {
                 merged.timeseries.push((k, v));
             }
         }

@@ -28,6 +28,7 @@ use crate::control::state::SharedState;
 use crate::types::{SurrogateBindEntry, TenantDataSnapshot, TenantId};
 use nodedb_physical::physical_plan::MetaOp;
 
+use crate::control::backup::snapshot_keys::extract_db_scoped_collection;
 use remote::{NODE_RESTORE_TIMEOUT, dispatch_remote, envelope_to_err};
 use sections::{apply_metadata_sections, merge_sections};
 use topology::{SplitOutput, is_self, split_by_current_topology};
@@ -245,11 +246,12 @@ async fn reissue_columnar_snapshots(
 
     let mut reissued = 0usize;
     for (key, bytes) in entries {
-        let Some((_db_id, tid, collection)) = parse_columnar_snapshot_key(&key, tenant_id) else {
+        let Some(collection) = extract_db_scoped_collection(&key, tenant_id) else {
             return Err(Error::Internal {
                 detail: format!("restore reissue: malformed columnar snapshot key '{key}'"),
             });
         };
+        let collection = collection.to_owned();
 
         let snap: nodedb_columnar::ColumnarEngineSnapshot =
             zerompk::from_msgpack(&bytes).map_err(|e| Error::Serialization {
@@ -267,7 +269,7 @@ async fn reissue_columnar_snapshots(
         let plan = columnar_reissue::build_columnar_insert_plan(&collection, decoded)?;
         columnar_reissue::reissue_columnar_durably(
             state,
-            TenantId::new(tid),
+            TenantId::new(tenant_id),
             database_id,
             &collection,
             plan,
@@ -305,20 +307,6 @@ fn rebind_surrogates(
         )?;
     }
     Ok(())
-}
-
-/// Parse a `"{db}:{tid}:{collection}"` columnar snapshot key, verifying the
-/// embedded tenant matches. The collection may itself contain `':'`. Returns
-/// `None` on a malformed key or tenant mismatch.
-fn parse_columnar_snapshot_key(key: &str, tenant_id: u64) -> Option<(u64, u64, String)> {
-    let mut it = key.splitn(3, ':');
-    let db = it.next()?.parse::<u64>().ok()?;
-    let tid = it.next()?.parse::<u64>().ok()?;
-    let coll = it.next()?;
-    if tid != tenant_id || coll.is_empty() {
-        return None;
-    }
-    Some((db, tid, coll.to_string()))
 }
 
 fn warn_on_tombstoned_restores(
@@ -383,38 +371,6 @@ fn warn_on_tombstoned_restores(
 fn collection_from_key(key: &str) -> Option<&str> {
     let tail = key.split_once(':')?.1;
     tail.split([':', '\0']).next()
-}
-
-#[cfg(test)]
-mod columnar_key_tests {
-    use super::parse_columnar_snapshot_key;
-
-    #[test]
-    fn parses_db_prefixed_key() {
-        assert_eq!(
-            parse_columnar_snapshot_key("0:7:metrics", 7),
-            Some((0, 7, "metrics".to_string()))
-        );
-    }
-
-    #[test]
-    fn collection_retains_embedded_colon() {
-        assert_eq!(
-            parse_columnar_snapshot_key("0:7:a:b", 7),
-            Some((0, 7, "a:b".to_string()))
-        );
-    }
-
-    #[test]
-    fn tenant_mismatch_rejected() {
-        assert_eq!(parse_columnar_snapshot_key("0:8:metrics", 7), None);
-    }
-
-    #[test]
-    fn missing_or_empty_collection_rejected() {
-        assert_eq!(parse_columnar_snapshot_key("0:7", 7), None);
-        assert_eq!(parse_columnar_snapshot_key("0:7:", 7), None);
-    }
 }
 
 #[cfg(test)]

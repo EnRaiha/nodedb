@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use nodedb_cluster::routing::{VSHARD_COUNT, vshard_for_collection};
 use nodedb_types::id::DatabaseId;
 
-use crate::control::backup::snapshot_keys::{extract_collection, extract_db_scoped_collection};
+use crate::control::backup::snapshot_keys::{
+    extract_db_scoped_collection, extract_db_tenant_scoped_collection,
+};
 use crate::control::state::SharedState;
 use crate::types::TenantDataSnapshot;
 
@@ -74,16 +76,16 @@ pub(super) fn split_by_current_topology(
             _ => RouteOutcome::NoLeader,
         }
     };
+    // Documents / indexes / vectors / timeseries keys are db-tenant-scoped:
+    // `"{db}:{tid}:{collection}[:suffix]"` (collection never contains ':'/'\0').
     let route_key = |key: &str| -> RouteOutcome {
-        match extract_collection(key, tenant_id) {
+        match extract_db_tenant_scoped_collection(key, tenant_id) {
             Some(coll) => route_collection(coll),
             None => RouteOutcome::Malformed,
         }
     };
-    // Columnar / flushed-ts keys are `"{db}:{tid}:{collection}"` (db-prefixed),
-    // unlike the `extract_collection`/`route_key` shape (`"{tid}:{collection}:..."`).
-    // Mirror `parse_timeseries_snapshot_key` (data-plane handler, different
-    // module): split on the first two ':' — first=db, second=tid, rest=collection.
+    // Columnar / flushed-ts keys are db-scoped: `"{db}:{tid}:{collection}"`
+    // where the collection is the whole remainder and may itself contain ':'.
     let route_db_scoped_key = |key: &str| -> RouteOutcome {
         match extract_db_scoped_collection(key, tenant_id) {
             Some(coll) => route_collection(coll),

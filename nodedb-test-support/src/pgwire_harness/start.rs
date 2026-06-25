@@ -29,6 +29,12 @@ pub(super) struct StartConfig {
     /// system default (65 536 rows).  Set to a small value (e.g. `4`) in tests
     /// that need to observe segment-flush behaviour without inserting 65k rows.
     pub columnar_flush_threshold: Option<usize>,
+    /// When `Some`, installs a cluster routing table on the node's
+    /// `SharedState` (`cluster_routing`) before the state is shared.  A
+    /// single-node `TestServer` is normally `cluster_routing == None`; the
+    /// Raft snapshot builder requires a routing table to resolve a group's
+    /// vShards, so round-trip tests inject one here.
+    pub routing: Option<nodedb_cluster::RoutingTable>,
 }
 
 impl Default for StartConfig {
@@ -37,6 +43,7 @@ impl Default for StartConfig {
             auth_mode: AuthMode::Trust,
             lockout: None,
             columnar_flush_threshold: None,
+            routing: None,
         }
     }
 }
@@ -72,6 +79,23 @@ impl TestServer {
         Self::start_with_config(StartConfig {
             auth_mode: AuthMode::Password,
             lockout: Some((5, 300)),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Spawn a single-core NodeDB server with a cluster routing table
+    /// installed on `SharedState::cluster_routing`.
+    ///
+    /// Single-node `TestServer`s are normally `cluster_routing == None`, but
+    /// the production Raft snapshot builder/applier resolve a group's vShards
+    /// through the routing table. Snapshot round-trip tests inject one with
+    /// `RoutingTable::uniform(...)` so the builder can filter and the applier
+    /// can rebind. All other settings stay at their defaults (trust-mode auth,
+    /// lockout disabled).
+    pub async fn start_with_routing(routing: nodedb_cluster::RoutingTable) -> Self {
+        Self::start_with_config(StartConfig {
+            routing: Some(routing),
             ..Default::default()
         })
         .await
@@ -120,6 +144,9 @@ impl TestServer {
         if let Some(s) = Arc::get_mut(&mut shared) {
             s.backup_kek = Some(Arc::new([0x42u8; 32]));
             s.governor = init_test_memory_governor();
+            if let Some(routing) = cfg.routing {
+                s.cluster_routing = Some(std::sync::Arc::new(std::sync::RwLock::new(routing)));
+            }
         }
         let shared = shared;
 
