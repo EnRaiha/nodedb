@@ -152,6 +152,13 @@ pub fn start_raft(
         registry: Arc::clone(&shared.quarantine_registry),
     });
 
+    // Per-group snapshot builder for the SEND path: on the leader, build the
+    // real serialized engine state for a lagging follower's group vshards
+    // (replacing the prior empty stub bytes).
+    let snapshot_builder: Arc<dyn nodedb_cluster::SnapshotBuilder> = Arc::new(
+        crate::control::cluster::snapshot_builder::DataPlaneSnapshotBuilder::new(shared.clone()),
+    );
+
     // Cross-node streaming-shuffle receiver (E1): bridge the cluster
     // `ShufflePush` read-loop to the in-process registry on `SharedState`.
     let shuffle_receiver: Arc<dyn nodedb_cluster::ShuffleReceiver> = Arc::new(
@@ -214,6 +221,7 @@ pub fn start_raft(
         .with_tick_interval(tick_interval)
         .with_group_watchers(handle.group_watchers.clone())
         .with_snapshot_quarantine_hook(quarantine_hook)
+        .with_snapshot_builder(snapshot_builder)
         .with_shuffle_receiver(shuffle_receiver)
         .with_shuffle_producer(shuffle_producer)
         .with_shuffle_consumer(shuffle_consumer)

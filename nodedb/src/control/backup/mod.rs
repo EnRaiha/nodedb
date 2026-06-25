@@ -3,6 +3,7 @@
 pub mod detect;
 pub mod orchestrator;
 pub mod restore;
+pub mod snapshot_keys;
 pub mod state;
 
 pub use detect::{CopyIntent, detect};
