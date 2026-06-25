@@ -90,6 +90,22 @@ impl CsrIndex {
         }
     }
 
+    /// Forward lookup: the `Surrogate` bound to a node by name, or `None` if the
+    /// node is unknown to this partition or has no surrogate set (ZERO sentinel).
+    ///
+    /// A graph node and its same-pk document share one global surrogate, so this
+    /// is the bridge from a MATCH binding's node name to the document storage key
+    /// (`surrogate_to_doc_id`) used to fetch the node's properties.
+    pub fn node_surrogate(&self, node: &str) -> Option<nodedb_types::Surrogate> {
+        let &local_id = self.node_to_id.get(node)?;
+        let raw = self.node_surrogate_raw(local_id);
+        if raw == 0 {
+            None
+        } else {
+            Some(nodedb_types::Surrogate::new(raw))
+        }
+    }
+
     /// Return the raw surrogate `u32` for a CSR-local node id.
     ///
     /// Returns `0` (the ZERO sentinel) when the node has no surrogate set.

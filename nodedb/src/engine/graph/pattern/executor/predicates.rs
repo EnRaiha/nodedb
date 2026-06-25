@@ -13,14 +13,21 @@ use crate::engine::sparse::btree::SparseEngine;
 /// Borrowed context needed to resolve a MATCH property predicate
 /// (`WHERE a.field = 'v'`) against a node's stored document.
 ///
-/// A graph node's properties live as a document in the sparse engine, keyed by
-/// the node-id string and scoped to `(database_id, tenant_id, collection)`. The
-/// CSR/graph is keyed per `(database_id, tenant_id)` only, so the collection
+/// A graph node's properties live as a document in the sparse engine. The
+/// document is NOT keyed by the user-visible node-id string — it is keyed by
+/// `surrogate_to_doc_id(surrogate)`, the fixed-width hex form of the row's
+/// global surrogate. A graph node and its same-pk document share one surrogate
+/// (the CSR node surrogate is set from the edge surrogate allocated by the same
+/// pk-keyed allocator), so the fetch chain is:
+/// `node name → Surrogate (via `csr`) → surrogate_to_doc_id → sparse.get`.
+///
+/// The CSR/graph is keyed per `(database_id, tenant_id)` only, so the collection
 /// holding the document comes from the MATCH query's `IN '<collection>'`
-/// clause (`collection`). It is threaded as ONE param through the predicate
-/// pipeline rather than four loose arguments.
+/// clause (`collection`). All of this is threaded as ONE param through the
+/// predicate pipeline rather than as loose arguments.
 pub struct PropertyLookup<'a> {
     pub sparse: &'a SparseEngine,
+    pub csr: &'a CsrIndex,
     pub database_id: u64,
     pub tenant_id: u64,
     pub collection: Option<&'a str>,
@@ -221,6 +228,13 @@ fn coerce_literal(expected: &str) -> nodedb_types::Value {
 /// decoded, `Ok(None)` when the node has no stored document, and `Err` for
 /// storage or decode failures.
 ///
+/// The document is keyed by the node's GLOBAL SURROGATE, not by the node-id
+/// string. We resolve `node_id → Surrogate` through the CSR (a graph node and
+/// its same-pk document share one surrogate), derive the redb storage key via
+/// `surrogate_to_doc_id`, then fetch. A node that is unknown to the partition
+/// or has no surrogate set (the ZERO sentinel) is treated as having no
+/// document → `Ok(None)`.
+///
 /// The `collection` argument is already resolved by the caller (both
 /// `check_property` and `project_property` guard `props.collection` first
 /// because their `BadRequest` messages reference context the caller owns).
@@ -229,9 +243,13 @@ fn fetch_node_doc(
     collection: &str,
     node_id: &str,
 ) -> Result<Option<nodedb_types::Value>, crate::Error> {
+    let Some(surrogate) = props.csr.node_surrogate(node_id) else {
+        return Ok(None);
+    };
+    let doc_id = crate::engine::document::store::key::surrogate_to_doc_id(surrogate);
     let bytes = match props
         .sparse
-        .get(props.database_id, props.tenant_id, collection, node_id)?
+        .get(props.database_id, props.tenant_id, collection, &doc_id)?
     {
         Some(b) => b,
         None => return Ok(None),

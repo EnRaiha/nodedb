@@ -446,11 +446,18 @@ pub(super) mod tests {
         (sparse, dir)
     }
 
-    /// Build a `PropertyLookup` over `sparse` scoped to the `make_csr` graph's
-    /// `(DatabaseId::DEFAULT, TenantId::new(1), "col")`.
-    pub(crate) fn props_for(sparse: &SparseEngine) -> PropertyLookup<'_> {
+    /// Build a `PropertyLookup` over `sparse` + `csr` scoped to the `make_csr`
+    /// graph's `(DatabaseId::DEFAULT, TenantId::new(1), "col")`.
+    ///
+    /// `csr` resolves a bound node name to its surrogate; the document is then
+    /// fetched at `surrogate_to_doc_id(surrogate)`, mirroring the real keying.
+    pub(crate) fn props_for<'a>(
+        sparse: &'a SparseEngine,
+        csr: &'a CsrIndex,
+    ) -> PropertyLookup<'a> {
         PropertyLookup {
             sparse,
+            csr,
             database_id: 0,
             tenant_id: 1,
             collection: Some("col"),
@@ -471,7 +478,7 @@ pub(super) mod tests {
     fn execute_simple_one_hop() {
         let (csr, store, _dir) = make_social_graph();
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b",
         )
@@ -496,7 +503,7 @@ pub(super) mod tests {
     fn execute_two_hops() {
         let (csr, store, _dir) = make_social_graph();
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a = 'alice' RETURN a, b, c",
         )
@@ -520,7 +527,7 @@ pub(super) mod tests {
     fn execute_optional_match() {
         let (csr, store, _dir) = make_social_graph();
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) OPTIONAL MATCH (b)-[:LIKES]->(c) WHERE a = 'alice' RETURN a, b, c",
         ).unwrap();
@@ -543,7 +550,7 @@ pub(super) mod tests {
     fn execute_anti_join() {
         let (csr, store, _dir) = make_social_graph();
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) WHERE NOT EXISTS { MATCH (a)-[:BLOCKED]->(b) } RETURN a, b",
         )
@@ -566,7 +573,7 @@ pub(super) mod tests {
     fn execute_with_limit() {
         let (csr, store, _dir) = make_social_graph();
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query =
             super::super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b LIMIT 2")
                 .unwrap();
@@ -588,7 +595,7 @@ pub(super) mod tests {
     fn execute_empty_result() {
         let (csr, store, _dir) = make_social_graph();
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query =
             super::super::super::compiler::parse("MATCH (a)-[:NONEXISTENT]->(b) RETURN a, b")
                 .unwrap();
@@ -610,13 +617,16 @@ pub(super) mod tests {
     fn execute_with_node_labels() {
         let (mut csr, store, _dir) = make_social_graph();
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
 
         // Set labels.
         csr.add_node_label("alice", "Person").unwrap();
         csr.add_node_label("bob", "Person").unwrap();
         csr.add_node_label("carol", "Person").unwrap();
         csr.add_node_label("dave", "Bot").unwrap();
+
+        // Build the lookup AFTER mutating the CSR so the immutable borrow does
+        // not overlap the `set`/`add` calls above.
+        let props = props_for(&sparse, &csr);
 
         // Without label filter — all KNOWS edges.
         let query =
@@ -728,12 +738,14 @@ pub(super) mod tests {
 
         let (mut csr, store, _dir) = make_social_graph();
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
         // Assign surrogates: alice=1, bob=2, carol=3, dave=4.
         csr.set_node_surrogate("alice", Surrogate::new(1));
         csr.set_node_surrogate("bob", Surrogate::new(2));
         csr.set_node_surrogate("carol", Surrogate::new(3));
         csr.set_node_surrogate("dave", Surrogate::new(4));
+        // Build the lookup AFTER mutating the CSR so the immutable borrow does
+        // not overlap the surrogate assignments above.
+        let props = props_for(&sparse, &csr);
 
         // Bitmap contains only alice (surrogate 1).
         let bm = SurrogateBitmap::from_iter([Surrogate::new(1)]);
@@ -813,7 +825,7 @@ pub(super) mod tests {
     fn frontier_emitted_when_source_has_zero_out_degree() {
         let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE a = 'alice' RETURN a, b, c",
         )
@@ -878,7 +890,7 @@ pub(super) mod tests {
     fn no_frontier_when_source_has_edges_but_label_does_not_match() {
         let (csr, store, _dir) = make_csr(&[("alice", "LIKES", "bob")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b",
         )
@@ -914,7 +926,7 @@ pub(super) mod tests {
     fn no_frontier_for_fully_local_expansion() {
         let (csr, store, _dir) = make_social_graph();
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a, b",
         )
@@ -949,7 +961,7 @@ pub(super) mod tests {
     fn frontier_triple_idx_and_partial_row_for_multi_hop() {
         let (csr, store, _dir) = make_csr(&[("root", "EDGE", "mid")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query = super::super::super::compiler::parse(
             "MATCH (x)-[:EDGE]->(y)-[:EDGE]->(z) WHERE x = 'root' RETURN x, y, z",
         )
@@ -983,12 +995,21 @@ pub(super) mod tests {
 
     // ── Property-predicate filtering (the silent-wrong-results bug fix) ────────
 
-    /// Store a node-property document for `node_id` in collection `"col"`
-    /// (matching `make_csr`'s `(DatabaseId::DEFAULT, TenantId::new(1))` scope),
-    /// keyed by the node-id string the MATCH binding resolves to.
-    fn put_node_doc(sparse: &SparseEngine, node_id: &str, doc: nodedb_types::Value) {
+    /// Store a node-property document in collection `"col"` (matching
+    /// `make_csr`'s `(DatabaseId::DEFAULT, TenantId::new(1))` scope), keyed by
+    /// `surrogate_to_doc_id(surrogate)` — the REAL document key. A graph node
+    /// and its same-pk document share one surrogate, so the caller assigns the
+    /// same surrogate to the node in the CSR via `set_node_surrogate`.
+    fn put_node_doc(
+        sparse: &SparseEngine,
+        surrogate: nodedb_types::Surrogate,
+        doc: nodedb_types::Value,
+    ) {
+        use crate::engine::document::store::key::surrogate_to_doc_id;
         let bytes = nodedb_types::value_to_msgpack(&doc).unwrap();
-        sparse.put(0, 1, "col", node_id, &bytes).unwrap();
+        sparse
+            .put(0, 1, "col", &surrogate_to_doc_id(surrogate), &bytes)
+            .unwrap();
     }
 
     fn obj(pairs: &[(&str, nodedb_types::Value)]) -> nodedb_types::Value {
@@ -1004,17 +1025,22 @@ pub(super) mod tests {
     /// have a KNOWS edge to carol/dave; only alice survives the predicate.
     #[test]
     fn property_equals_filters_by_stored_document() {
-        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "carol"), ("bob", "KNOWS", "dave")]);
+        let (mut csr, store, _dir) =
+            make_csr(&[("alice", "KNOWS", "carol"), ("bob", "KNOWS", "dave")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        // alice/bob share their surrogate with their stored document (the real
+        // keying): node → surrogate → surrogate_to_doc_id → sparse.
+        csr.set_node_surrogate("alice", nodedb_types::Surrogate::new(1));
+        csr.set_node_surrogate("bob", nodedb_types::Surrogate::new(2));
+        let props = props_for(&sparse, &csr);
         put_node_doc(
             &sparse,
-            "alice",
+            nodedb_types::Surrogate::new(1),
             obj(&[("age", nodedb_types::Value::Integer(30))]),
         );
         put_node_doc(
             &sparse,
-            "bob",
+            nodedb_types::Surrogate::new(2),
             obj(&[("age", nodedb_types::Value::Integer(25))]),
         );
 
@@ -1045,12 +1071,13 @@ pub(super) mod tests {
     /// the predicate truly evaluates, not a no-op pass).
     #[test]
     fn property_equals_no_match_returns_empty() {
-        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "carol")]);
+        let (mut csr, store, _dir) = make_csr(&[("alice", "KNOWS", "carol")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        csr.set_node_surrogate("alice", nodedb_types::Surrogate::new(1));
+        let props = props_for(&sparse, &csr);
         put_node_doc(
             &sparse,
-            "alice",
+            nodedb_types::Surrogate::new(1),
             obj(&[("age", nodedb_types::Value::Integer(30))]),
         );
 
@@ -1076,13 +1103,18 @@ pub(super) mod tests {
     /// is excluded (`Ok(false)`), even though it has a matching edge.
     #[test]
     fn property_predicate_excludes_node_without_document() {
-        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "carol"), ("bob", "KNOWS", "dave")]);
+        let (mut csr, store, _dir) =
+            make_csr(&[("alice", "KNOWS", "carol"), ("bob", "KNOWS", "dave")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
-        // Only alice has a document; bob has none.
+        // Both nodes have a surrogate, but only alice has a document stored at
+        // its surrogate key; bob's surrogate resolves to no stored row → fetch
+        // returns None → bob is excluded.
+        csr.set_node_surrogate("alice", nodedb_types::Surrogate::new(1));
+        csr.set_node_surrogate("bob", nodedb_types::Surrogate::new(2));
+        let props = props_for(&sparse, &csr);
         put_node_doc(
             &sparse,
-            "alice",
+            nodedb_types::Surrogate::new(1),
             obj(&[("age", nodedb_types::Value::Integer(30))]),
         );
 
@@ -1112,15 +1144,17 @@ pub(super) mod tests {
         let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "carol")]);
         let (sparse, _sdir) = make_sparse();
         // No collection on the lookup (mirrors a query without `IN '...'`).
+        // The BadRequest fires before any fetch, so no surrogate is needed.
         let props = PropertyLookup {
             sparse: &sparse,
+            csr: &csr,
             database_id: 0,
             tenant_id: 1,
             collection: None,
         };
         put_node_doc(
             &sparse,
-            "alice",
+            nodedb_types::Surrogate::new(1),
             obj(&[("age", nodedb_types::Value::Integer(30))]),
         );
 
@@ -1154,16 +1188,20 @@ pub(super) mod tests {
     fn check_property_ops_against_real_sparse_engine() {
         use super::super::predicates::check_property_for_test as check;
 
+        let (mut csr, _store, _dir) = make_csr(&[("alice", "KNOWS", "carol")]);
         let (sparse, _sdir) = make_sparse();
+        // alice has a surrogate + document; "ghost" is unknown to the CSR so its
+        // surrogate resolves to None → missing-document branch.
+        csr.set_node_surrogate("alice", nodedb_types::Surrogate::new(1));
         put_node_doc(
             &sparse,
-            "alice",
+            nodedb_types::Surrogate::new(1),
             obj(&[
                 ("age", nodedb_types::Value::Integer(30)),
                 ("name", nodedb_types::Value::String("alice".into())),
             ]),
         );
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
 
         // Eq / Neq (numeric coercion: stored Integer(30) vs literal "30").
         assert!(check(&props, "alice", "age", &ComparisonOp::Eq, "30").unwrap());
@@ -1191,12 +1229,13 @@ pub(super) mod tests {
     /// convention. The non-dotted `b` column still projects the node identity.
     #[test]
     fn property_projection_returns_stored_values() {
-        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let (mut csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        csr.set_node_surrogate("alice", nodedb_types::Surrogate::new(1));
+        let props = props_for(&sparse, &csr);
         put_node_doc(
             &sparse,
-            "alice",
+            nodedb_types::Surrogate::new(1),
             obj(&[
                 ("name", nodedb_types::Value::String("Alice".into())),
                 ("age", nodedb_types::Value::Integer(30)),
@@ -1233,10 +1272,11 @@ pub(super) mod tests {
     /// (SQL projection: missing row → NULL), not an error.
     #[test]
     fn property_projection_no_document_is_null() {
-        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let (mut csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
-        // No document stored for alice.
+        // alice has a surrogate but NO document stored at its key → fetch None.
+        csr.set_node_surrogate("alice", nodedb_types::Surrogate::new(1));
+        let props = props_for(&sparse, &csr);
 
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:KNOWS]->(b) IN 'col' WHERE a = 'alice' RETURN a.name",
@@ -1263,12 +1303,13 @@ pub(super) mod tests {
     /// projects `"NULL"` (missing field → NULL), not an error.
     #[test]
     fn property_projection_missing_field_is_null() {
-        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let (mut csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        csr.set_node_surrogate("alice", nodedb_types::Surrogate::new(1));
+        let props = props_for(&sparse, &csr);
         put_node_doc(
             &sparse,
-            "alice",
+            nodedb_types::Surrogate::new(1),
             obj(&[("name", nodedb_types::Value::String("Alice".into()))]),
         );
 
@@ -1300,15 +1341,17 @@ pub(super) mod tests {
     fn property_projection_without_collection_is_bad_request() {
         let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
         let (sparse, _sdir) = make_sparse();
+        // BadRequest fires before any fetch, so no surrogate is needed.
         let props = PropertyLookup {
             sparse: &sparse,
+            csr: &csr,
             database_id: 0,
             tenant_id: 1,
             collection: None,
         };
         put_node_doc(
             &sparse,
-            "alice",
+            nodedb_types::Surrogate::new(1),
             obj(&[("name", nodedb_types::Value::String("Alice".into()))]),
         );
 
@@ -1337,12 +1380,13 @@ pub(super) mod tests {
     /// the alias, and a plain `RETURN a` still projects the node identity.
     #[test]
     fn property_projection_alias_and_identity() {
-        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let (mut csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        csr.set_node_surrogate("alice", nodedb_types::Surrogate::new(1));
+        let props = props_for(&sparse, &csr);
         put_node_doc(
             &sparse,
-            "alice",
+            nodedb_types::Surrogate::new(1),
             obj(&[("name", nodedb_types::Value::String("Alice".into()))]),
         );
 

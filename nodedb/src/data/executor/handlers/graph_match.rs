@@ -220,6 +220,7 @@ impl CoreLoop {
         // `IN '<collection>'`.
         let props = PropertyLookup {
             sparse: &self.sparse,
+            csr: partition,
             database_id,
             tenant_id: tid,
             collection: query.collection.as_deref(),
@@ -323,6 +324,7 @@ impl CoreLoop {
         );
         let props = PropertyLookup {
             sparse: &self.sparse,
+            csr: partition,
             database_id,
             tenant_id: tid,
             collection: query.collection.as_deref(),
@@ -413,6 +415,7 @@ impl CoreLoop {
         );
         let props = PropertyLookup {
             sparse: &self.sparse,
+            csr: partition,
             database_id,
             tenant_id: tid,
             collection: query.collection.as_deref(),

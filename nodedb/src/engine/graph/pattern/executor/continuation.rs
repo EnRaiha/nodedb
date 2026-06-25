@@ -445,7 +445,7 @@ mod tests {
             .collect();
         let (csr, store, _dir) = make_csr(&edge_refs);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
 
         let query = super::super::super::compiler::parse(
             "MATCH (a)-[:l*1..6]->(b) WHERE a = 'n0' RETURN a, b",
@@ -543,7 +543,7 @@ mod tests {
     fn continuation_resumes_tail_with_seed_bindings() {
         let (csr, store, _dir) = make_csr(&[("root", "E", "mid"), ("mid", "E", "leaf")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query =
             super::super::super::compiler::parse("MATCH (x)-[:E]->(y)-[:E]->(z) RETURN x, y, z")
                 .unwrap();
@@ -586,7 +586,7 @@ mod tests {
     fn continuation_no_matching_tail_edge_is_empty() {
         let (csr, store, _dir) = make_csr(&[("root", "E", "mid")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query =
             super::super::super::compiler::parse("MATCH (x)-[:E]->(y)-[:E]->(z) RETURN x, y, z")
                 .unwrap();
@@ -624,7 +624,7 @@ mod tests {
     fn full_execute_unchanged_after_refactor() {
         let (csr, store, _dir) = make_csr(&[("root", "E", "mid"), ("mid", "E", "leaf")]);
         let (sparse, _sdir) = make_sparse();
-        let props = props_for(&sparse);
+        let props = props_for(&sparse, &csr);
         let query = super::super::super::compiler::parse(
             "MATCH (x)-[:E]->(y)-[:E]->(z) WHERE x = 'root' RETURN x, y, z",
         )
