@@ -60,6 +60,31 @@ fn assign_or_zero(
     }
 }
 
+/// Resolve `carried` for a mutating op that does NOT create rows (UPDATE /
+/// DELETE). When `carried` is authoritative (non-ZERO, from a member
+/// coordinator) the binding is installed first-wins via `bind`. When `carried`
+/// is ZERO (non-member coordinator that missed resolution) the catalog is
+/// queried READ-ONLY; ZERO is never bound, so a later INSERT of the same pk
+/// gets a freshly allocated surrogate instead of the corrupt ZERO entry.
+fn bind_or_lookup(
+    assigner: Option<&SurrogateAssigner>,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    collection: &str,
+    pk_bytes: &[u8],
+    carried: nodedb_types::Surrogate,
+) -> crate::Result<nodedb_types::Surrogate> {
+    match assigner {
+        Some(a) if carried != nodedb_types::Surrogate::ZERO => {
+            a.bind(database_id, tenant_id, collection, pk_bytes, carried)
+        }
+        Some(a) => Ok(a
+            .lookup(database_id, tenant_id, collection, pk_bytes)?
+            .unwrap_or(nodedb_types::Surrogate::ZERO)),
+        None => Ok(carried),
+    }
+}
+
 /// Convert a ReplicatedWrite back into a PhysicalPlan for Data Plane execution.
 fn to_physical_plan(
     write: &ReplicatedWrite,
@@ -115,15 +140,15 @@ fn to_physical_plan(
             surrogate,
         } => {
             let pk_bytes = document_id.as_bytes().to_vec();
-            // Bind the carried (authoritative) surrogate even on a delete:
-            // a delete that applies before its insert still installs the
-            // correct identity, and the engine op is a no-op on a row that
-            // does not exist yet. Re-deriving via `lookup` would diverge.
             let carried = nodedb_types::Surrogate::new(*surrogate);
-            let surrogate = match assigner {
-                Some(a) => a.bind(database_id, tenant_id, collection, &pk_bytes, carried)?,
-                None => carried,
-            };
+            let surrogate = bind_or_lookup(
+                assigner,
+                database_id,
+                tenant_id,
+                collection,
+                &pk_bytes,
+                carried,
+            )?;
             PhysicalPlan::Document(DocumentOp::PointDelete {
                 collection: collection.clone(),
                 document_id: document_id.clone(),
@@ -139,13 +164,15 @@ fn to_physical_plan(
             surrogate,
         } => {
             let pk_bytes = document_id.as_bytes().to_vec();
-            // Same rationale as `PointDelete`: bind the carried surrogate so
-            // identity is authoritative regardless of apply ordering.
             let carried = nodedb_types::Surrogate::new(*surrogate);
-            let surrogate = match assigner {
-                Some(a) => a.bind(database_id, tenant_id, collection, &pk_bytes, carried)?,
-                None => carried,
-            };
+            let surrogate = bind_or_lookup(
+                assigner,
+                database_id,
+                tenant_id,
+                collection,
+                &pk_bytes,
+                carried,
+            )?;
             PhysicalPlan::Document(DocumentOp::PointUpdate {
                 collection: collection.clone(),
                 document_id: document_id.clone(),
