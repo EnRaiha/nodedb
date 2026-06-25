@@ -131,6 +131,7 @@ impl CoreLoop {
             task.request.database_id,
             TenantId::new(tenant_id),
             collection,
+            false,
         );
 
         // Surface the L1 byte reclaim to the purge metrics. Stays in the
@@ -192,6 +193,13 @@ impl CoreLoop {
     /// counts; callers that don't need them (snapshot clear-then-install)
     /// can discard the result.
     ///
+    /// When `preserve_collection_metadata` is true the collection's schema and
+    /// derived metadata (`CollectionConfig`, bitemporal chain hashes, aggregate
+    /// cache) are kept — used by clear-then-install, where the row data is
+    /// cleared and reinstalled from the snapshot but the collection definition
+    /// (which the data snapshot does not carry) must remain so the reinstalled
+    /// rows stay readable. A full DROP passes false to remove everything.
+    ///
     /// Idempotent: missing in-memory state is a no-op; missing files are a
     /// no-op. Metrics emission and audit/response building are the caller's
     /// concern.
@@ -200,6 +208,7 @@ impl CoreLoop {
         database_id: DatabaseId,
         tenant_id: TenantId,
         collection: &str,
+        preserve_collection_metadata: bool,
     ) -> ClearCollectionStats {
         let db = database_id;
         let tid = tenant_id;
@@ -343,13 +352,17 @@ impl CoreLoop {
             collection,
         ));
 
-        // Doc configs + chain hashes + aggregate cache.
-        self.doc_configs
-            .retain(|(t, c), _| !(*t == tid && c == &coll));
-        self.chain_hashes
-            .retain(|(t, c), _| !(*t == tid && c == &coll));
-        self.aggregate_cache
-            .retain(|(t, c), _| !(*t == tid && c == &coll));
+        // Doc configs + chain hashes + aggregate cache: the collection's schema
+        // and derived metadata. Preserved for clear-then-install (the snapshot
+        // carries row data, not the collection definition); removed on a full DROP.
+        if !preserve_collection_metadata {
+            self.doc_configs
+                .retain(|(t, c), _| !(*t == tid && c == &coll));
+            self.chain_hashes
+                .retain(|(t, c), _| !(*t == tid && c == &coll));
+            self.aggregate_cache
+                .retain(|(t, c), _| !(*t == tid && c == &coll));
+        }
 
         ClearCollectionStats {
             docs_removed,

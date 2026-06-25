@@ -31,10 +31,14 @@ impl CoreLoop {
         // installing, so keys deleted before the snapshot index and dropped
         // collections do not linger on a lagging follower. Empty list = no-op.
         for (tid_raw, coll) in collections_to_clear {
+            // Preserve the collection definition: clear-then-install replaces row
+            // data from the snapshot, but the snapshot does not carry the schema,
+            // so the reinstalled rows must land in the still-defined collection.
             self.clear_collection_all_engines(
                 nodedb_types::DatabaseId::DEFAULT,
                 crate::types::TenantId::new(*tid_raw),
                 coll,
+                true,
             );
         }
 

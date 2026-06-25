@@ -23,9 +23,11 @@
 //! Plane handler performs an exact clear-then-install for lagging followers —
 //! keys deleted before the snapshot index and dropped collections do not linger.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nodedb_cluster::routing::vshard_for_collection;
 use nodedb_types::Surrogate;
 use nodedb_types::id::DatabaseId;
 
@@ -73,6 +75,46 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
             return Ok(());
         }
 
+        // Resolve the target group's vshards from the LOCAL routing table,
+        // mirroring the builder's resolution exactly. Single-node (no routing)
+        // or an empty/ownerless group → empty set → no clear (correct: a fresh
+        // or single-node follower has no stale state to remove).
+        let group_vshards: HashSet<u32> = match self.shared.cluster_routing.as_ref() {
+            Some(routing) => {
+                let table = routing.read().map_err(|_| {
+                    Box::new(crate::Error::Internal {
+                        detail: "snapshot apply: cluster_routing RwLock poisoned".into(),
+                    }) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+                table.vshards_for_group(group_id).into_iter().collect()
+            }
+            None => HashSet::new(),
+        };
+
+        // Build the clear list for an exact clear-then-install. A lagging
+        // follower's LOCAL catalog still lists collections that were dropped
+        // after its lag point, so clearing every in-group collection BEFORE
+        // installing the snapshot removes dropped collections (the snapshot
+        // omits them) and stale keys (the snapshot carries only survivors),
+        // while survivors are cleared-then-reinstalled. The Data Plane has no
+        // catalog access, so this resolution is Control-Plane (applier) only.
+        let mut clear_vshards: Vec<u32> = group_vshards.iter().copied().collect();
+        clear_vshards.sort_unstable();
+        let mut collections_to_clear: Vec<(u64, String)> = Vec::new();
+        if !group_vshards.is_empty()
+            && let Some(catalog) = self.shared.credentials.catalog()
+        {
+            let collections = catalog
+                .load_all_collections(DatabaseId::DEFAULT)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            for coll in collections.iter().filter(|c| {
+                c.is_active
+                    && group_vshards.contains(&vshard_for_collection(DatabaseId::DEFAULT, &c.name))
+            }) {
+                collections_to_clear.push((coll.tenant_id, coll.name.clone()));
+            }
+        }
+
         // Reuse the existing local restore handler with replace_mode = true so a
         // Raft install OVERWRITES present keys. The handler installs by the
         // snapshot's own per-key tenant/db prefixes, so the `tenant_id` plan
@@ -83,8 +125,8 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
             tenant_id: 0,
             snapshot: snapshot_bytes.to_vec(),
             replace_mode: true,
-            clear_vshards: Vec::new(),
-            collections_to_clear: Vec::new(),
+            clear_vshards,
+            collections_to_clear,
         });
 
         crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
