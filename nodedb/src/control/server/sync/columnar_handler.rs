@@ -65,7 +65,7 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
         provenance: nodedb_types::sync::wire::SyncProvenance,
     ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::wal_dispatch::wal_append_columnar;
+        use crate::control::server::wal_dispatch::{ColumnarWalAppendArgs, wal_append_columnar};
         use nodedb_physical::physical_plan::columnar::{ColumnarInsertIntent, ColumnarOp};
         use nodedb_types::columnar::ColumnarSchema;
         use std::collections::HashMap;
@@ -111,14 +111,20 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
 
         // Allocate a WAL LSN on the Control Plane before dispatching to the
         // Data Plane. This is the canonical LSN for dedup tracking.
+        // The sync/CRDT columnar path does not currently carry cross-engine
+        // surrogates (pre-existing gap — tracked as a separate follow-up), so
+        // it persists none; replay allocates fresh identity for these rows.
         let wal_lsn = wal_append_columnar(
             &self.shared.wal,
             tenant_id,
             vshard,
             DatabaseId::DEFAULT,
-            &collection,
-            &payload,
-            Some(&prov),
+            ColumnarWalAppendArgs {
+                collection: &collection,
+                payload: &payload,
+                provenance: Some(&prov),
+                surrogates: &[],
+            },
         )?
         .map(|lsn| lsn.as_u64());
 

@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! WAL append logic for write operations.
-//!
-//! Serializes write plans as MessagePack and appends to the appropriate
-//! WAL record type. Read operations are no-ops.
-
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::credential::CredentialStore;
 use crate::engine::array::wal::{
@@ -17,11 +12,7 @@ use nodedb_physical::physical_plan::{
     ArrayOp, CrdtOp, DocumentOp, GraphOp, TimeseriesOp, VectorOp,
 };
 
-use super::wal_dispatch_kv;
-
-pub use super::wal_dispatch_fts_spatial::{
-    wal_append_fts_delete, wal_append_fts_index, wal_append_spatial_delete, wal_append_spatial_put,
-};
+use super::super::wal_dispatch_kv;
 
 /// Append a write operation to the WAL for single-node durability.
 ///
@@ -240,20 +231,29 @@ pub fn wal_append_if_write_with_creds(
             format: _,
             intent: _,
             on_conflict_updates: _,
-            surrogates: _,
+            surrogates,
             schema_bytes: _,
             provenance,
             wal_lsn: _,
         }) => {
-            // Provenance is appended last; older 3-element decoders ignore
-            // the trailing field via their arity-fallback paths.
-            let wal_payload = zerompk::to_msgpack_vec(&(
-                "columnar", collection, payload, provenance,
-            ))
-            .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal columnar batch: {e}"),
-            })?;
+            // Encode a map-shaped `ColumnarWalRecord` carrying the per-row
+            // cross-engine surrogates so replay restores the exact same
+            // identity after a restart. `surrogates` is index-aligned with the
+            // rows in `payload`. The map shape is distinct from the legacy
+            // 4-tuple array, so old on-disk records still decode via the
+            // replay fallback path.
+            let record = nodedb_types::columnar::ColumnarWalRecord {
+                kind: "columnar".to_string(),
+                collection: collection.clone(),
+                payload: payload.clone(),
+                provenance: provenance.clone(),
+                surrogates: surrogates.clone(),
+            };
+            let wal_payload =
+                zerompk::to_msgpack_vec(&record).map_err(|e| crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: format!("wal columnar batch: {e}"),
+                })?;
             wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?;
         }
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
@@ -344,157 +344,4 @@ pub fn wal_append_if_write_with_creds(
         _ => {}
     }
     Ok(())
-}
-
-/// Append a timeseries batch to WAL and return the assigned LSN.
-///
-/// Used by the ILP listener and the sync timeseries handler to propagate the
-/// WAL LSN to the Data Plane for proper dedup tracking and `flush_wal_lsn` in
-/// partition metadata. Returns `None` if WAL is bypassed for this collection.
-///
-/// `provenance` is `None` for the ILP direct-ingest path; the sync path passes
-/// the frame's `SyncProvenance` so the WAL record carries full idempotency context.
-pub fn wal_append_timeseries(
-    wal: &WalManager,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    collection: &str,
-    payload: &[u8],
-    provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
-    credentials: Option<&CredentialStore>,
-) -> crate::Result<Option<nodedb_types::Lsn>> {
-    let database_id = DatabaseId::DEFAULT;
-    // WAL bypass check.
-    if let Some(creds) = credentials
-        && let Some(catalog) = creds.catalog()
-        && let Ok(Some(coll)) = catalog.get_collection(database_id, tenant_id.as_u64(), collection)
-        && let Some(config) = coll.get_timeseries_config()
-        && config.get("wal").and_then(|v| v.as_str()) == Some("false")
-    {
-        return Ok(None);
-    }
-
-    let payload_vec = payload.to_vec();
-    let wal_payload = zerompk::to_msgpack_vec(&("timeseries", collection, payload_vec, provenance))
-        .map_err(|e| crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("wal timeseries batch: {e}"),
-        })?;
-    let lsn = wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?;
-    Ok(Some(lsn))
-}
-
-/// Append a columnar batch to WAL and return the assigned LSN.
-///
-/// Mirrors `wal_append_timeseries` but encodes with kind `"columnar"` so the
-/// WAL replay decoder routes to `replay_columnar_payload`.
-/// Returns `None` if WAL is bypassed (columnar collections do not currently
-/// support `wal=false`, so this always returns `Some`).
-pub fn wal_append_columnar(
-    wal: &WalManager,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    database_id: DatabaseId,
-    collection: &str,
-    payload: &[u8],
-    provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
-) -> crate::Result<Option<nodedb_types::Lsn>> {
-    let payload_vec = payload.to_vec();
-    let wal_payload = zerompk::to_msgpack_vec(&("columnar", collection, payload_vec, provenance))
-        .map_err(|e| crate::Error::Serialization {
-        format: "msgpack".into(),
-        detail: format!("wal columnar batch: {e}"),
-    })?;
-    let lsn = wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?;
-    Ok(Some(lsn))
-}
-
-/// Operation fields for a vector put WAL record.
-///
-/// Groups the vector-identity and provenance fields that together describe a
-/// single vector insert, reducing the call-site argument count.
-pub struct VectorPutWalArgs<'a> {
-    pub collection: &'a str,
-    pub vector: &'a [f32],
-    pub dim: usize,
-    pub field_name: &'a str,
-    pub surrogate: nodedb_types::Surrogate,
-    pub provenance: Option<&'a nodedb_types::sync::wire::SyncProvenance>,
-}
-
-/// Operation fields for a vector delete-by-surrogate WAL record.
-///
-/// Groups the collection, surrogate, field, and provenance fields that
-/// together identify a single vector deletion.
-pub struct VectorDeleteWalArgs<'a> {
-    pub collection: &'a str,
-    pub surrogate: nodedb_types::Surrogate,
-    pub field_name: &'a str,
-    pub provenance: Option<&'a nodedb_types::sync::wire::SyncProvenance>,
-}
-
-/// Append a vector put (insert) to the WAL and return the assigned LSN.
-///
-/// Encodes `(collection, vector, dim, field_name, doc_id_compat, surrogate_u32, provenance)`
-/// exactly as the non-sync `VectorOp::Insert` arm in `wal_append_if_write_with_creds` does,
-/// so replay decodes both paths with the same 7-element shape.
-pub fn wal_append_vector_put(
-    wal: &WalManager,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    database_id: DatabaseId,
-    args: VectorPutWalArgs<'_>,
-) -> crate::Result<nodedb_types::Lsn> {
-    let VectorPutWalArgs {
-        collection,
-        vector,
-        dim,
-        field_name,
-        surrogate,
-        provenance,
-    } = args;
-    let doc_id_compat: Option<String> = None;
-    let entry = zerompk::to_msgpack_vec(&(
-        collection,
-        vector,
-        dim,
-        field_name,
-        doc_id_compat,
-        surrogate.as_u32(),
-        provenance,
-    ))
-    .map_err(|e| crate::Error::Serialization {
-        format: "msgpack".into(),
-        detail: format!("wal vector put (sync): {e}"),
-    })?;
-    let lsn = wal.append_vector_put(tenant_id, vshard_id, database_id, &entry)?;
-    Ok(lsn)
-}
-
-/// Append a vector delete-by-surrogate to the WAL and return the assigned LSN.
-///
-/// Encodes `(collection, surrogate_u32, field_name, provenance)` as a `VectorDelete`
-/// record. The replay decoder uses a surrogate-aware arm (4-element shape) that maps
-/// back to `execute_vector_delete_by_surrogate`; the legacy 2-element and 3-element
-/// delete arms fall through to direct node-id deletion and remain backward-compatible.
-pub fn wal_append_vector_delete_by_surrogate(
-    wal: &WalManager,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    database_id: DatabaseId,
-    args: VectorDeleteWalArgs<'_>,
-) -> crate::Result<nodedb_types::Lsn> {
-    let VectorDeleteWalArgs {
-        collection,
-        surrogate,
-        field_name,
-        provenance,
-    } = args;
-    let entry = zerompk::to_msgpack_vec(&(collection, surrogate.as_u32(), field_name, provenance))
-        .map_err(|e| crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("wal vector delete by surrogate (sync): {e}"),
-        })?;
-    let lsn = wal.append_vector_delete(tenant_id, vshard_id, database_id, &entry)?;
-    Ok(lsn)
 }
