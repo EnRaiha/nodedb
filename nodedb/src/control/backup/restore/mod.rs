@@ -7,6 +7,7 @@
 //! sub-snapshots according to the *current* cluster topology and
 //! dispatches `MetaOp::RestoreTenantSnapshot` to each owning node.
 
+pub mod columnar_reissue;
 mod remote;
 mod sections;
 mod topology;
@@ -110,7 +111,7 @@ pub async fn restore_tenant(
         apply_metadata_sections(state, tenant_id, &env)?;
     }
 
-    let merged = merge_sections(&env.sections)?;
+    let mut merged = merge_sections(&env.sections)?;
     stats.documents = merged.documents.len();
     stats.indexes = merged.indexes.len();
     stats.edges = merged.edges.len();
@@ -118,14 +119,21 @@ pub async fn restore_tenant(
     stats.kv_tables = merged.kv_tables.len();
     stats.crdt_state = merged.crdt_state.len();
     stats.timeseries = merged.timeseries.len();
-    stats.columnar_engines = merged.columnar_engines.len();
     stats.flushed_ts_segments = merged.flushed_ts_segments.len();
 
     warn_on_tombstoned_restores(state, tenant_id, &merged, env.meta.snapshot_watermark);
 
     if dry_run {
+        stats.columnar_engines = merged.columnar_engines.len();
         return Ok(stats);
     }
+
+    // Plain-columnar engine state is NOT installed via the snapshot path (that
+    // lands in in-memory-only Data Plane maps — lost on restart, never
+    // replicated). Drain it here and re-issue durably below as
+    // `ColumnarOp::Insert`s. The topology split must therefore never see
+    // columnar engines.
+    let columnar_snapshots = std::mem::take(&mut merged.columnar_engines);
 
     let SplitOutput {
         buckets,
@@ -185,7 +193,81 @@ pub async fn restore_tenant(
         return Err(first_err);
     }
 
+    // Durable re-issue of plain-columnar rows. Each restored collection's live
+    // rows are decoded from the snapshot and replayed as a durable
+    // `ColumnarOp::Insert` (Raft-replicated in cluster mode; WAL-appended then
+    // installed in single-node mode). Collections that decode to zero live rows
+    // are skipped. Any failure is fatal — no warn-and-continue.
+    stats.columnar_engines =
+        reissue_columnar_snapshots(state, tenant_id, columnar_snapshots).await?;
+
     Ok(stats)
+}
+
+/// Decode and durably re-issue every restored plain-columnar collection.
+///
+/// Returns the number of collections that produced at least one live row and
+/// were re-issued. `entries` are `("{db}:{tid}:{collection}", msgpack)` pairs
+/// (the `ColumnarEngineSnapshot` wire shape).
+async fn reissue_columnar_snapshots(
+    state: &Arc<SharedState>,
+    tenant_id: u64,
+    entries: Vec<(String, Vec<u8>)>,
+) -> Result<usize, Error> {
+    // Columnar segment KEK == the WAL encryption key (segments are written via
+    // `SegmentWriter::plain().write_segment(..., kek)` with this key). Absent
+    // when at-rest encryption is not configured, in which case segments are
+    // plaintext NDBS and decode with `kek = None`.
+    let kek = state.wal.encryption_key().cloned();
+    let database_id = crate::types::DatabaseId::DEFAULT;
+
+    let mut reissued = 0usize;
+    for (key, bytes) in entries {
+        let Some((_db_id, tid, collection)) = parse_columnar_snapshot_key(&key, tenant_id) else {
+            return Err(Error::Internal {
+                detail: format!("restore reissue: malformed columnar snapshot key '{key}'"),
+            });
+        };
+
+        let snap: nodedb_columnar::ColumnarEngineSnapshot =
+            zerompk::from_msgpack(&bytes).map_err(|e| Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!(
+                    "restore reissue: deserialize ColumnarEngineSnapshot for '{collection}': {e}"
+                ),
+            })?;
+
+        let decoded = columnar_reissue::decode_snapshot_live_rows(&collection, snap, kek.as_ref())?;
+        if decoded.rows.is_empty() {
+            continue;
+        }
+
+        let plan = columnar_reissue::build_columnar_insert_plan(&collection, decoded)?;
+        columnar_reissue::reissue_columnar_durably(
+            state,
+            TenantId::new(tid),
+            database_id,
+            &collection,
+            plan,
+        )
+        .await?;
+        reissued += 1;
+    }
+    Ok(reissued)
+}
+
+/// Parse a `"{db}:{tid}:{collection}"` columnar snapshot key, verifying the
+/// embedded tenant matches. The collection may itself contain `':'`. Returns
+/// `None` on a malformed key or tenant mismatch.
+fn parse_columnar_snapshot_key(key: &str, tenant_id: u64) -> Option<(u64, u64, String)> {
+    let mut it = key.splitn(3, ':');
+    let db = it.next()?.parse::<u64>().ok()?;
+    let tid = it.next()?.parse::<u64>().ok()?;
+    let coll = it.next()?;
+    if tid != tenant_id || coll.is_empty() {
+        return None;
+    }
+    Some((db, tid, coll.to_string()))
 }
 
 fn warn_on_tombstoned_restores(
@@ -250,6 +332,38 @@ fn warn_on_tombstoned_restores(
 fn collection_from_key(key: &str) -> Option<&str> {
     let tail = key.split_once(':')?.1;
     tail.split([':', '\0']).next()
+}
+
+#[cfg(test)]
+mod columnar_key_tests {
+    use super::parse_columnar_snapshot_key;
+
+    #[test]
+    fn parses_db_prefixed_key() {
+        assert_eq!(
+            parse_columnar_snapshot_key("0:7:metrics", 7),
+            Some((0, 7, "metrics".to_string()))
+        );
+    }
+
+    #[test]
+    fn collection_retains_embedded_colon() {
+        assert_eq!(
+            parse_columnar_snapshot_key("0:7:a:b", 7),
+            Some((0, 7, "a:b".to_string()))
+        );
+    }
+
+    #[test]
+    fn tenant_mismatch_rejected() {
+        assert_eq!(parse_columnar_snapshot_key("0:8:metrics", 7), None);
+    }
+
+    #[test]
+    fn missing_or_empty_collection_rejected() {
+        assert_eq!(parse_columnar_snapshot_key("0:7", 7), None);
+        assert_eq!(parse_columnar_snapshot_key("0:7:", 7), None);
+    }
 }
 
 #[cfg(test)]

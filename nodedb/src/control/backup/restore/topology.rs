@@ -130,16 +130,16 @@ pub(super) fn split_by_current_topology(
         let node = resolve(route_key(&entry.0), Some(&entry.0));
         all_owners.entry(node).or_default().timeseries.push(entry);
     }
-    // Columnar/flushed-ts are sharded by collection (like timeseries), not
-    // replicated. Both use the `"{db}:{tid}:{collection}"` key shape.
-    for entry in merged.columnar_engines {
-        let node = resolve(route_db_scoped_key(&entry.0), Some(&entry.0));
-        all_owners
-            .entry(node)
-            .or_default()
-            .columnar_engines
-            .push(entry);
-    }
+    // Plain-columnar engine state is NOT installed via the snapshot path: the
+    // snapshot-install lands data in in-memory-only Data Plane maps with no WAL
+    // record and no Raft entry, so it is lost on restart (single-node) and never
+    // reaches replicas (cluster). RESTORE re-issues columnar rows as durable
+    // `ColumnarOp::Insert`s instead (see `columnar_reissue`); `merged.columnar_engines`
+    // is therefore drained by the caller before this split and never bucketed here.
+    debug_assert!(
+        merged.columnar_engines.is_empty(),
+        "columnar engines must be drained before topology split"
+    );
     for blob in merged.flushed_ts_segments {
         let node = resolve(
             route_db_scoped_key(&blob.collection_key),
