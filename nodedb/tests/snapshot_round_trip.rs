@@ -193,3 +193,188 @@ async fn snapshot_round_trip_builder_to_applier() {
         "rebound target surrogate must equal the source surrogate for pk0"
     );
 }
+
+/// Builder→applier round-trip for the **TIMESERIES** snapshot section.
+///
+/// A handful of small inserts stay in the in-memory memtable (flush threshold
+/// is ~64MB), so the timeseries snapshot section captures them directly. The
+/// section key is `{db}:{tid}:{collection}` and the (now-fixed) builder filter
+/// extracts the collection name correctly. The applier restores the memtable on
+/// the target (flushing it to a segment), so `COUNT(*)` sees every row.
+#[tokio::test]
+async fn snapshot_round_trip_timeseries() {
+    const COLL: &str = "ts_rt";
+    // CREATE/INSERT/SELECT SQL copied from engine_surface_timeseries.rs.
+    const CREATE: &str = "CREATE COLLECTION ts_rt \
+         COLUMNS (id TEXT, ts BIGINT TIME_KEY, metric TEXT, value FLOAT) \
+         WITH (engine='timeseries')";
+    // Small, increasing-ts rows — stay in the memtable, never flushed.
+    let rows: &[(&str, u64, f64)] = &[
+        ("p1", 1000, 10.0),
+        ("p2", 2000, 20.0),
+        ("p3", 3000, 30.0),
+        ("p4", 4000, 40.0),
+    ];
+
+    // ── Sanity: the collection's vShard belongs to the data group we build. ───
+    let vshard = vshard_for_collection(DatabaseId::DEFAULT, COLL);
+    assert!(
+        single_node_routing()
+            .vshards_for_group(DATA_GROUP_ID)
+            .contains(&vshard),
+        "collection vShard {vshard} must belong to data group {DATA_GROUP_ID}"
+    );
+
+    // ── SOURCE node: create collection + insert rows over pgwire. ─────────────
+    let source = TestServer::start_with_routing(single_node_routing()).await;
+    {
+        let client = &*source.client;
+        client
+            .simple_query(CREATE)
+            .await
+            .expect("CREATE COLLECTION on source");
+        for (id, ts, value) in rows {
+            client
+                .simple_query(&format!(
+                    "INSERT INTO {COLL} (id, ts, metric, value) \
+                     VALUES ('{id}', {ts}, 'cpu', {value})"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("INSERT {id} on source: {e}"));
+        }
+    }
+
+    // ── Build the group snapshot via the PRODUCTION builder. ──────────────────
+    let builder = DataPlaneSnapshotBuilder::new(source.shared.clone());
+    let bytes = builder
+        .build_group_snapshot(DATA_GROUP_ID, 0, 0)
+        .await
+        .expect("build_group_snapshot");
+    assert!(
+        !bytes.is_empty(),
+        "production builder must produce a non-empty group snapshot"
+    );
+
+    // ── TARGET node: fresh server, same routing, identical schema pre-created. ─
+    let target = TestServer::start_with_routing(single_node_routing()).await;
+    {
+        let client = &*target.client;
+        client
+            .simple_query(CREATE)
+            .await
+            .expect("CREATE COLLECTION on target");
+    }
+
+    // ── Apply via the PRODUCTION applier. ─────────────────────────────────────
+    let applier = DataPlaneSnapshotApplier::new(target.shared.clone());
+    applier
+        .apply_snapshot(DATA_GROUP_ID, &bytes)
+        .await
+        .expect("apply_snapshot");
+
+    // ── Verify on the TARGET: all memtable rows round-tripped. ────────────────
+    let count_msgs = target
+        .client
+        .simple_query(&format!("SELECT COUNT(*) FROM {COLL}"))
+        .await
+        .expect("SELECT COUNT(*) on target");
+    assert_eq!(
+        first_value(&count_msgs).as_deref(),
+        Some(rows.len().to_string().as_str()),
+        "target must contain all {} snapshot-installed timeseries rows",
+        rows.len()
+    );
+}
+
+/// Builder→applier round-trip for the **VECTOR** snapshot section.
+///
+/// A vector-primary collection only registers in the snapshot's vector section
+/// after at least one vector write. With `vector_field='embedding'`, the section
+/// key is `{db}:{tid}:vec_rt:embedding`; the fixed extractor takes the first
+/// token after `{db}:{tid}:` → `vec_rt`, which is correct. The applier rebuilds
+/// the index using the **target** collection's params, so the target schema must
+/// match (dim/metric); `COUNT(*)` then sees every restored row.
+#[tokio::test]
+async fn snapshot_round_trip_vector() {
+    const COLL: &str = "vec_rt";
+    // CREATE/INSERT SQL copied from vector_primary_fast_path.rs.
+    const CREATE: &str = "CREATE COLLECTION vec_rt \
+          (id STRING PRIMARY KEY, embedding VECTOR(4)) \
+         WITH (engine='vector', primary = 'vector', vector_field = 'embedding', dim = 4)";
+    let vecs: &[(&str, [f32; 4])] = &[
+        ("v1", [1.0, 0.0, 0.0, 0.0]),
+        ("v2", [0.0, 1.0, 0.0, 0.0]),
+        ("v3", [0.0, 0.0, 1.0, 0.0]),
+        ("v4", [0.7, 0.7, 0.0, 0.0]),
+    ];
+
+    // ── Sanity: the collection's vShard belongs to the data group we build. ───
+    let vshard = vshard_for_collection(DatabaseId::DEFAULT, COLL);
+    assert!(
+        single_node_routing()
+            .vshards_for_group(DATA_GROUP_ID)
+            .contains(&vshard),
+        "collection vShard {vshard} must belong to data group {DATA_GROUP_ID}"
+    );
+
+    // ── SOURCE node: create collection + insert vectors over pgwire. ──────────
+    let source = TestServer::start_with_routing(single_node_routing()).await;
+    {
+        let client = &*source.client;
+        client
+            .simple_query(CREATE)
+            .await
+            .expect("CREATE COLLECTION on source");
+        for (id, e) in vecs {
+            client
+                .simple_query(&format!(
+                    "INSERT INTO {COLL} (id, embedding) \
+                     VALUES ('{id}', ARRAY[{}, {}, {}, {}])",
+                    e[0], e[1], e[2], e[3]
+                ))
+                .await
+                .unwrap_or_else(|err| panic!("INSERT {id} on source: {err}"));
+        }
+    }
+
+    // ── Build the group snapshot via the PRODUCTION builder. ──────────────────
+    let builder = DataPlaneSnapshotBuilder::new(source.shared.clone());
+    let bytes = builder
+        .build_group_snapshot(DATA_GROUP_ID, 0, 0)
+        .await
+        .expect("build_group_snapshot");
+    assert!(
+        !bytes.is_empty(),
+        "production builder must produce a non-empty group snapshot"
+    );
+
+    // ── TARGET node: fresh server, same routing, identical vector params. ─────
+    let target = TestServer::start_with_routing(single_node_routing()).await;
+    {
+        let client = &*target.client;
+        client
+            .simple_query(CREATE)
+            .await
+            .expect("CREATE COLLECTION on target");
+    }
+
+    // ── Apply via the PRODUCTION applier. ─────────────────────────────────────
+    let applier = DataPlaneSnapshotApplier::new(target.shared.clone());
+    applier
+        .apply_snapshot(DATA_GROUP_ID, &bytes)
+        .await
+        .expect("apply_snapshot");
+
+    // ── Verify on the TARGET: all vectors round-tripped. ──────────────────────
+    let count_msgs = target
+        .client
+        .simple_query(&format!("SELECT COUNT(*) FROM {COLL}"))
+        .await
+        .expect("SELECT COUNT(*) on target");
+    assert_eq!(
+        first_value(&count_msgs).as_deref(),
+        Some(vecs.len().to_string().as_str()),
+        "target must contain all {} snapshot-installed vectors",
+        vecs.len()
+    );
+}
