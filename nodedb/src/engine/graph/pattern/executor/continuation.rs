@@ -95,7 +95,7 @@ pub(super) fn finalize_rows(
     }
 
     if !query.return_columns.is_empty() {
-        rows = predicates::project_columns(&rows, &query.return_columns);
+        rows = predicates::project_columns(&rows, &query.return_columns, props)?;
     }
 
     if query.distinct {

@@ -215,6 +215,37 @@ fn coerce_literal(expected: &str) -> nodedb_types::Value {
     }
 }
 
+/// Fetch and decode the stored document for `node_id` within `collection`.
+///
+/// Returns `Ok(Some(doc))` when the document is present and successfully
+/// decoded, `Ok(None)` when the node has no stored document, and `Err` for
+/// storage or decode failures.
+///
+/// The `collection` argument is already resolved by the caller (both
+/// `check_property` and `project_property` guard `props.collection` first
+/// because their `BadRequest` messages reference context the caller owns).
+fn fetch_node_doc(
+    props: &PropertyLookup<'_>,
+    collection: &str,
+    node_id: &str,
+) -> Result<Option<nodedb_types::Value>, crate::Error> {
+    let bytes = match props
+        .sparse
+        .get(props.database_id, props.tenant_id, collection, node_id)?
+    {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    let doc =
+        nodedb_types::value_from_msgpack(&bytes).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("decode graph node `{node_id}` document: {e}"),
+        })?;
+
+    Ok(Some(doc))
+}
+
 /// Evaluate a property predicate (`<node_id>.<field> <op> <expected>`) against
 /// the node's stored document.
 ///
@@ -248,22 +279,12 @@ fn check_property(
         ),
     })?;
 
-    // Fetch the node's document. Absent document → cannot satisfy a property
-    // predicate.
-    let bytes = match props
-        .sparse
-        .get(props.database_id, props.tenant_id, collection, node_id)?
-    {
-        Some(b) => b,
+    // Fetch and decode the node's document. Absent document → cannot satisfy a
+    // property predicate.
+    let doc = match fetch_node_doc(props, collection, node_id)? {
+        Some(d) => d,
         None => return Ok(false),
     };
-
-    // Decode the stored payload via the canonical msgpack→Value reader.
-    let doc =
-        nodedb_types::value_from_msgpack(&bytes).map_err(|e| crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("decode graph node `{node_id}` document: {e}"),
-        })?;
 
     // Look up the field. Missing field → predicate not satisfiable.
     let field_value = match &doc {
@@ -315,29 +336,92 @@ pub(super) fn check_property_for_test(
 }
 
 /// Project RETURN columns from rows.
-pub(super) fn project_columns(rows: &[BindingRow], columns: &[ReturnColumn]) -> Vec<BindingRow> {
-    rows.iter()
-        .map(|row| {
-            let mut projected = BindingRow::new();
-            for col in columns {
-                let key = col.alias.as_deref().unwrap_or(&col.expr);
+///
+/// Non-dotted exprs (`a`, or an aliased binding) project the node identity bound
+/// in the row, `"NULL"` if absent — the mirror of node-identity resolution.
+///
+/// Dotted exprs (`a.field`) project the node's stored PROPERTY: the binding is
+/// resolved to a node-id, the node's document is fetched from the sparse engine
+/// (keyed by node-id within the query's `IN '<collection>'`), decoded, and the
+/// `field` extracted and stringified via the canonical `value_ops` display
+/// convention so projected scalars match how binding values are otherwise
+/// stringified. The same resolution rules as the predicate path apply:
+///
+/// - binding not in the row → `"NULL"` (unevaluable for that row);
+/// - no `IN '<collection>'` clause → typed `BadRequest` (a property is
+///   unresolvable without one; never silently `"NULL"`);
+/// - node has no document → `"NULL"` (SQL projection: missing row → NULL);
+/// - document lacks `field` → `"NULL"`.
+pub(super) fn project_columns(
+    rows: &[BindingRow],
+    columns: &[ReturnColumn],
+    props: &PropertyLookup<'_>,
+) -> Result<Vec<BindingRow>, crate::Error> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut projected = BindingRow::new();
+        for col in columns {
+            let key = col.alias.as_deref().unwrap_or(&col.expr);
 
-                let value = if let Some(dot) = col.expr.find('.') {
-                    let binding = &col.expr[..dot];
-                    row.get(binding)
-                        .cloned()
-                        .unwrap_or_else(|| "NULL".to_string())
-                } else {
-                    row.get(&col.expr)
-                        .cloned()
-                        .unwrap_or_else(|| "NULL".to_string())
-                };
+            let value = if let Some(dot) = col.expr.find('.') {
+                let binding = &col.expr[..dot];
+                let field = &col.expr[dot + 1..];
+                match row.get(binding) {
+                    // Binding not yet resolved in this row → NULL (unchanged).
+                    None => "NULL".to_string(),
+                    Some(node_id) => project_property(props, node_id, field)?,
+                }
+            } else {
+                row.get(&col.expr)
+                    .cloned()
+                    .unwrap_or_else(|| "NULL".to_string())
+            };
 
-                projected.insert(key.to_string(), value);
-            }
-            projected
-        })
-        .collect()
+            projected.insert(key.to_string(), value);
+        }
+        out.push(projected);
+    }
+    Ok(out)
+}
+
+/// Resolve `<node_id>.<field>` to its projected string value against the node's
+/// stored document. Mirrors [`check_property`]'s fetch+decode contract:
+///
+/// - returns a typed `BadRequest` when no collection is available (a property is
+///   unresolvable without one);
+/// - returns `"NULL"` when the node has no document (missing row → NULL);
+/// - returns `"NULL"` when the document lacks `field`;
+/// - otherwise stringifies the stored value via the canonical `value_ops`
+///   display convention so it matches how binding values are stringified.
+fn project_property(
+    props: &PropertyLookup<'_>,
+    node_id: &str,
+    field: &str,
+) -> Result<String, crate::Error> {
+    use nodedb_query::value_ops::value_to_display_string;
+
+    let collection = props.collection.ok_or_else(|| crate::Error::BadRequest {
+        detail: format!(
+            "MATCH property projection `{node_id}.{field}` requires an \
+             `IN '<collection>'` clause to resolve node properties"
+        ),
+    })?;
+
+    // Absent document → NULL (SQL projection semantics: missing row → NULL).
+    let doc = match fetch_node_doc(props, collection, node_id)? {
+        Some(d) => d,
+        None => return Ok("NULL".to_string()),
+    };
+
+    // Missing field → NULL.
+    let field_value = match &doc {
+        nodedb_types::Value::Object(map) => map.get(field),
+        _ => None,
+    };
+    match field_value {
+        Some(v) => Ok(value_to_display_string(v)),
+        None => Ok("NULL".to_string()),
+    }
 }
 
 #[cfg(test)]

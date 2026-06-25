@@ -1182,4 +1182,189 @@ pub(super) mod tests {
         // Missing document → false.
         assert!(!check(&props, "ghost", "age", &ComparisonOp::Eq, "30").unwrap());
     }
+
+    // ── Property projection (`RETURN a.field`) ────────────────────────────────
+
+    /// `RETURN a.name, a.age` now projects the node's STORED property values
+    /// instead of the old `"NULL"` stub. alice's document `{name, age}` resolves
+    /// to the string forms "Alice" / "30" via the canonical value display
+    /// convention. The non-dotted `b` column still projects the node identity.
+    #[test]
+    fn property_projection_returns_stored_values() {
+        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
+        put_node_doc(
+            &sparse,
+            "alice",
+            obj(&[
+                ("name", nodedb_types::Value::String("Alice".into())),
+                ("age", nodedb_types::Value::Integer(30)),
+            ]),
+        );
+
+        let query = super::super::super::compiler::parse(
+            "MATCH (a)-[:KNOWS]->(b) IN 'col' WHERE a = 'alice' RETURN a.name, a.age, b",
+        )
+        .unwrap();
+
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+            &props,
+        )
+        .unwrap()
+        .rows;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["a.name"], "Alice", "string property projected");
+        assert_eq!(rows[0]["a.age"], "30", "integer property stringified");
+        assert_eq!(
+            rows[0]["b"], "bob",
+            "non-dotted identity projection unchanged"
+        );
+    }
+
+    /// A node WITHOUT a stored document projects `"NULL"` for a property column
+    /// (SQL projection: missing row → NULL), not an error.
+    #[test]
+    fn property_projection_no_document_is_null() {
+        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
+        // No document stored for alice.
+
+        let query = super::super::super::compiler::parse(
+            "MATCH (a)-[:KNOWS]->(b) IN 'col' WHERE a = 'alice' RETURN a.name",
+        )
+        .unwrap();
+
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+            &props,
+        )
+        .unwrap()
+        .rows;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["a.name"], "NULL", "absent document → NULL");
+    }
+
+    /// A property column whose `field` is absent from an EXISTING document
+    /// projects `"NULL"` (missing field → NULL), not an error.
+    #[test]
+    fn property_projection_missing_field_is_null() {
+        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
+        put_node_doc(
+            &sparse,
+            "alice",
+            obj(&[("name", nodedb_types::Value::String("Alice".into()))]),
+        );
+
+        let query = super::super::super::compiler::parse(
+            "MATCH (a)-[:KNOWS]->(b) IN 'col' WHERE a = 'alice' RETURN a.age",
+        )
+        .unwrap();
+
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+            &props,
+        )
+        .unwrap()
+        .rows;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["a.age"], "NULL", "missing field → NULL");
+    }
+
+    /// Property PROJECTION with no `IN '<collection>'` clause is unresolvable and
+    /// must return a typed `BadRequest` — the same rule as the predicate path,
+    /// never a silent `"NULL"`.
+    #[test]
+    fn property_projection_without_collection_is_bad_request() {
+        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = PropertyLookup {
+            sparse: &sparse,
+            database_id: 0,
+            tenant_id: 1,
+            collection: None,
+        };
+        put_node_doc(
+            &sparse,
+            "alice",
+            obj(&[("name", nodedb_types::Value::String("Alice".into()))]),
+        );
+
+        let query = super::super::super::compiler::parse(
+            "MATCH (a)-[:KNOWS]->(b) WHERE a = 'alice' RETURN a.name",
+        )
+        .unwrap();
+        assert_eq!(query.collection, None);
+
+        let result = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+            &props,
+        );
+        assert!(
+            matches!(result, Err(crate::Error::BadRequest { .. })),
+            "expected BadRequest for a property projection with no IN collection"
+        );
+    }
+
+    /// Aliased property projection (`RETURN a.name AS who`) keys the output by
+    /// the alias, and a plain `RETURN a` still projects the node identity.
+    #[test]
+    fn property_projection_alias_and_identity() {
+        let (csr, store, _dir) = make_csr(&[("alice", "KNOWS", "bob")]);
+        let (sparse, _sdir) = make_sparse();
+        let props = props_for(&sparse);
+        put_node_doc(
+            &sparse,
+            "alice",
+            obj(&[("name", nodedb_types::Value::String("Alice".into()))]),
+        );
+
+        let query = super::super::super::compiler::parse(
+            "MATCH (a)-[:KNOWS]->(b) IN 'col' WHERE a = 'alice' RETURN a.name AS who, a",
+        )
+        .unwrap();
+
+        let rows = execute(
+            &query,
+            &csr,
+            &store,
+            None,
+            None,
+            expansion::VarLenCaps::default(),
+            &props,
+        )
+        .unwrap()
+        .rows;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["who"], "Alice", "property keyed by alias");
+        assert_eq!(rows[0]["a"], "alice", "non-dotted identity unchanged");
+    }
 }
