@@ -33,6 +33,13 @@ pub const DEFAULT_MAX_SECTION_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// the reader acts on the section body.
 pub const SECTION_ORIGIN_CATALOG_ROWS: u64 = 0xFFFF_FFFF_FFFF_FFF0;
 pub const SECTION_ORIGIN_SOURCE_TOMBSTONES: u64 = 0xFFFF_FFFF_FFFF_FFF1;
+/// Section carrying the tenant's PK→surrogate identity bindings. The surrogate
+/// map is DATA-derived per-node state that the per-node data sections do NOT
+/// carry (the Data-Plane snapshot handler has no catalog access), so without
+/// this section a restored node has documents but cannot resolve PK
+/// point-lookups (`WHERE id=<pk>`). The body is a msgpack-encoded
+/// `Vec<SurrogateBindBlob>`.
+pub const SECTION_ORIGIN_SURROGATE_PK: u64 = 0xFFFF_FFFF_FFFF_FFF2;
 
 /// Single catalog-row entry in a catalog-rows section. The outer
 /// container is `Vec<StoredCollectionBlob>` msgpack-encoded into the
@@ -54,6 +61,19 @@ pub struct StoredCollectionBlob {
 pub struct SourceTombstoneEntry {
     pub collection: String,
     pub purge_lsn: u64,
+}
+
+/// Single PK→surrogate binding carried in a `SECTION_ORIGIN_SURROGATE_PK`
+/// section. The outer container is `Vec<SurrogateBindBlob>` msgpack-encoded into
+/// the section body. Mirrors one row of the source catalog's `surrogate_pk_v3`
+/// table for one `(tenant_id, collection)`; rebound on the restore side so PK
+/// point-lookups resolve.
+#[derive(Debug, Clone, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+pub struct SurrogateBindBlob {
+    pub tenant_id: u64,
+    pub collection: String,
+    pub pk: Vec<u8>,
+    pub surrogate: u32,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

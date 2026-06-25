@@ -109,6 +109,44 @@ pub async fn backup_tenant(state: &Arc<SharedState>, tenant_id: u64) -> Result<B
             }
         }
 
+        // PK→surrogate identity map for the tenant's collections. This is
+        // DATA-derived per-node state that the per-node engine sections do NOT
+        // carry (the Data-Plane snapshot handler has no catalog access). Without
+        // it a restored node has documents but cannot resolve PK point-lookups
+        // (`WHERE id=<pk>`) — full scans work, point-lookups silently miss. The
+        // restore path rebinds these into the destination catalog.
+        if let Ok(all) = catalog.load_all_collections(DatabaseId::DEFAULT) {
+            let mut binds: Vec<nodedb_types::backup_envelope::SurrogateBindBlob> = Vec::new();
+            for coll in all.iter().filter(|c| c.tenant_id == tenant_id) {
+                if let Ok(rows) = catalog.scan_surrogates_for_collection(
+                    DatabaseId::DEFAULT,
+                    TenantId::new(tenant_id),
+                    &coll.name,
+                ) {
+                    for (pk, surrogate) in rows {
+                        binds.push(nodedb_types::backup_envelope::SurrogateBindBlob {
+                            tenant_id,
+                            collection: coll.name.clone(),
+                            pk,
+                            surrogate: surrogate.as_u32(),
+                        });
+                    }
+                }
+            }
+            if !binds.is_empty()
+                && let Ok(body) = zerompk::to_msgpack_vec(&binds)
+            {
+                writer
+                    .push_section(
+                        nodedb_types::backup_envelope::SECTION_ORIGIN_SURROGATE_PK,
+                        body,
+                    )
+                    .map_err(|e| Error::Internal {
+                        detail: format!("backup envelope (surrogate pk): {e}"),
+                    })?;
+            }
+        }
+
         if let Ok(tset) = catalog.load_wal_tombstones() {
             let mut tombs: Vec<nodedb_types::backup_envelope::SourceTombstoneEntry> = Vec::new();
             for (tid, name, purge_lsn) in tset.iter() {

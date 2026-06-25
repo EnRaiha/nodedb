@@ -27,11 +27,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use nodedb_types::Surrogate;
 use nodedb_types::id::DatabaseId;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{TenantDataSnapshot, TenantId};
 use nodedb_physical::physical_plan::MetaOp;
 
 /// The Raft group that owns cluster topology / metadata (group 0). Its state
@@ -95,6 +96,33 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
         )
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        // Rebind the PK→surrogate identity map carried in the snapshot. The
+        // Data-Plane restore handler above installs the doc/kv/etc. blobs but
+        // has no catalog access, so it can NOT rebind identities; without this
+        // step PK point-lookups (`WHERE id=<pk>`) resolve to nothing on the
+        // newly caught-up follower even though full scans work. The catalog is
+        // Control-Plane state, available here.
+        let snap: TenantDataSnapshot = zerompk::from_msgpack(snapshot_bytes).map_err(|e| {
+            Box::new(crate::Error::Internal {
+                detail: format!("snapshot apply: decode group {group_id} snapshot: {e}"),
+            }) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        if !snap.surrogate_pk.is_empty()
+            && let Some(catalog) = self.shared.credentials.catalog()
+        {
+            for e in &snap.surrogate_pk {
+                catalog
+                    .put_surrogate(
+                        DatabaseId::DEFAULT,
+                        TenantId::new(e.tenant_id),
+                        &e.collection,
+                        &e.pk,
+                        Surrogate::new(e.surrogate),
+                    )
+                    .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+        }
 
         Ok(())
     }

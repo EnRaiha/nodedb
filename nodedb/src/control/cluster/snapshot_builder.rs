@@ -29,8 +29,9 @@ use nodedb_types::id::DatabaseId;
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::backup::snapshot_keys::{extract_collection, extract_db_scoped_collection};
+use crate::control::security::catalog::SystemCatalog;
 use crate::control::state::SharedState;
-use crate::types::{TenantDataSnapshot, TenantId};
+use crate::types::{SurrogateBindEntry, TenantDataSnapshot, TenantId};
 use nodedb_physical::physical_plan::MetaOp;
 
 /// Per-tenant snapshot dispatch timeout (mirrors the backup orchestrator).
@@ -55,6 +56,42 @@ impl DataPlaneSnapshotBuilder {
     /// function (`vshard_for_collection`) used by the RESTORE topology splitter.
     fn vshard_of(collection: &str) -> u32 {
         nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, collection)
+    }
+
+    /// Capture PK→surrogate bindings for every active collection whose vshard
+    /// belongs to the target group, for each enumerated tenant.
+    ///
+    /// Uses the SAME `vshard_of` membership filter every section uses (one
+    /// source of truth), so only in-group collections' identities ship — never
+    /// more, never less than the data sections carry.
+    fn capture_surrogates(
+        catalog: &SystemCatalog,
+        tenants: &[u64],
+        group_vshards: &HashSet<u32>,
+        merged: &mut TenantDataSnapshot,
+    ) -> Result<(), Error> {
+        let collections = catalog.load_all_collections(DatabaseId::DEFAULT)?;
+        let tenant_set: HashSet<u64> = tenants.iter().copied().collect();
+        for coll in collections
+            .iter()
+            .filter(|c| c.is_active && tenant_set.contains(&c.tenant_id))
+            .filter(|c| group_vshards.contains(&Self::vshard_of(&c.name)))
+        {
+            let bindings = catalog.scan_surrogates_for_collection(
+                DatabaseId::DEFAULT,
+                TenantId::new(coll.tenant_id),
+                &coll.name,
+            )?;
+            for (pk, surrogate) in bindings {
+                merged.surrogate_pk.push(SurrogateBindEntry {
+                    tenant_id: coll.tenant_id,
+                    collection: coll.name.clone(),
+                    pk,
+                    surrogate: surrogate.as_u32(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Build the merged, group-filtered snapshot for `tenant_id`.
@@ -192,9 +229,20 @@ impl nodedb_cluster::SnapshotBuilder for DataPlaneSnapshotBuilder {
         };
 
         let mut merged = TenantDataSnapshot::default();
-        for tenant_id in tenants {
-            self.build_tenant_filtered(tenant_id, &group_vshards, &mut merged)
+        for tenant_id in &tenants {
+            self.build_tenant_filtered(*tenant_id, &group_vshards, &mut merged)
                 .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+
+        // Capture the PK→surrogate identity map for every in-group collection.
+        // The surrogate map is DATA-derived and travels with the data-group
+        // snapshot (not the metadata group): without it a snapshot-installed
+        // follower has documents but cannot resolve PK point-lookups. The
+        // catalog is Control-Plane state (the Data-Plane snapshot handler can't
+        // see it), so it is captured here and rebound on the apply side.
+        if let Some(catalog) = self.shared.credentials.catalog() {
+            Self::capture_surrogates(catalog, &tenants, &group_vshards, &mut merged)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
 

@@ -57,6 +57,56 @@ pub struct TenantDataSnapshot {
     #[msgpack(default)]
     #[serde(default)]
     pub columnar_engines: Vec<(String, Vec<u8>)>,
+
+    /// PK → surrogate identity bindings for the snapshotted collections.
+    ///
+    /// The surrogate map (`surrogate_pk_v3` / `surrogate_pk_rev_v3` catalog
+    /// tables) is DATA-derived per-node state: on the cluster apply path a
+    /// follower binds it when it applies a replicated `PointInsert`/`PointPut`.
+    /// The snapshot install path bypasses that apply path entirely (it installs
+    /// doc blobs directly), so without carrying these bindings a
+    /// snapshot-installed / restored node has documents but no PK→surrogate
+    /// mapping — full scans work but PK point-lookups (`WHERE id=<pk>`) resolve
+    /// to nothing. Carrying + rebinding these on the Control-Plane apply side
+    /// closes that gap.
+    ///
+    /// `#[msgpack(default)]`: snapshots/backups created before this field was
+    /// added decode with an empty Vec — the rebind step treats an empty slice
+    /// as "nothing to rebind", which is safe. The Data-Plane snapshot builder
+    /// (`create.rs`) has no catalog access and leaves this empty; it is filled
+    /// by the Control-Plane snapshot builder / backup orchestrator and consumed
+    /// by the Control-Plane applier / restore orchestrator.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub surrogate_pk: Vec<SurrogateBindEntry>,
+}
+
+/// A single PK → surrogate identity binding carried in a snapshot/backup.
+///
+/// Mirrors one row of the `surrogate_pk_v3` catalog table for one
+/// `(tenant_id, collection)`. Rebound on the Control-Plane apply side via
+/// `SystemCatalog::put_surrogate` so PK point-lookups resolve on a
+/// snapshot-installed / restored node.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+    Default,
+)]
+pub struct SurrogateBindEntry {
+    /// Owning tenant of the `(collection, pk)` binding.
+    pub tenant_id: u64,
+    /// Collection name (DEFAULT database scope).
+    pub collection: String,
+    /// Primary-key bytes (the catalog forward-table key component).
+    pub pk: Vec<u8>,
+    /// Surrogate the PK is bound to.
+    pub surrogate: u32,
 }
 
 /// Wire blob for all flushed partitions of one timeseries collection.
@@ -150,6 +200,74 @@ mod tests {
         assert!(
             decoded.columnar_engines.is_empty(),
             "expected columnar_engines to default to empty for old snapshot"
+        );
+        assert!(
+            decoded.surrogate_pk.is_empty(),
+            "expected surrogate_pk to default to empty for old snapshot"
+        );
+    }
+
+    /// Round-trip + backward-compat for the `surrogate_pk` field: a snapshot
+    /// carrying bindings survives encode→decode intact, and a snapshot
+    /// serialized WITHOUT the field (the 9-field schema that existed before
+    /// `surrogate_pk` was added) decodes with `surrogate_pk` defaulting to
+    /// empty.
+    #[test]
+    fn surrogate_pk_round_trips_and_back_compat() {
+        let snap = TenantDataSnapshot {
+            surrogate_pk: vec![
+                SurrogateBindEntry {
+                    tenant_id: 7,
+                    collection: "users".to_string(),
+                    pk: b"row-0".to_vec(),
+                    surrogate: 1,
+                },
+                SurrogateBindEntry {
+                    tenant_id: 7,
+                    collection: "users".to_string(),
+                    pk: b"row-1".to_vec(),
+                    surrogate: 2,
+                },
+            ],
+            ..Default::default()
+        };
+        let bytes = zerompk::to_msgpack_vec(&snap).expect("encode snapshot with surrogate_pk");
+        let decoded: TenantDataSnapshot =
+            zerompk::from_msgpack(&bytes).expect("decode snapshot with surrogate_pk");
+        assert_eq!(decoded.surrogate_pk, snap.surrogate_pk);
+
+        // Old 9-field schema (pre-surrogate_pk) must still decode.
+        #[derive(zerompk::ToMessagePack)]
+        #[msgpack(map)]
+        struct OldSnapshot {
+            documents: Vec<(String, Vec<u8>)>,
+            indexes: Vec<(String, Vec<u8>)>,
+            edges: Vec<(String, Vec<u8>)>,
+            vectors: Vec<(String, Vec<u8>)>,
+            kv_tables: Vec<(String, Vec<u8>)>,
+            crdt_state: Vec<(String, Vec<u8>)>,
+            timeseries: Vec<(String, Vec<u8>)>,
+            flushed_ts_segments: Vec<TsFlushedCollectionBlob>,
+            columnar_engines: Vec<(String, Vec<u8>)>,
+        }
+        let old = OldSnapshot {
+            documents: vec![("k".to_string(), b"v".to_vec())],
+            indexes: vec![],
+            edges: vec![],
+            vectors: vec![],
+            kv_tables: vec![],
+            crdt_state: vec![],
+            timeseries: vec![],
+            flushed_ts_segments: vec![],
+            columnar_engines: vec![],
+        };
+        let old_bytes = zerompk::to_msgpack_vec(&old).expect("encode old 9-field snapshot");
+        let decoded_old: TenantDataSnapshot =
+            zerompk::from_msgpack(&old_bytes).expect("decode old 9-field snapshot as new schema");
+        assert_eq!(decoded_old.documents.len(), 1);
+        assert!(
+            decoded_old.surrogate_pk.is_empty(),
+            "expected surrogate_pk to default to empty for old 9-field snapshot"
         );
     }
 

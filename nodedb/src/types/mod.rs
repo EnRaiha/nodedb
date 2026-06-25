@@ -9,4 +9,6 @@ pub use consistency::ReadConsistency;
 pub use id::{DatabaseId, DocumentId, RequestId, TenantId, VShardId};
 pub use lsn::Lsn;
 pub use nodedb_types::{SpanId, TraceId};
-pub use snapshot::{TenantDataSnapshot, TsFlushedCollectionBlob, TsFlushedPartitionBlob};
+pub use snapshot::{
+    SurrogateBindEntry, TenantDataSnapshot, TsFlushedCollectionBlob, TsFlushedPartitionBlob,
+};

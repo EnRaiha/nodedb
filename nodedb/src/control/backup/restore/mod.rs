@@ -19,11 +19,13 @@ use nodedb_types::backup_envelope::{
 };
 use serde::Serialize;
 
+use nodedb_types::Surrogate;
+
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::pgwire::ddl::sync_dispatch;
 use crate::control::state::SharedState;
-use crate::types::{TenantDataSnapshot, TenantId};
+use crate::types::{SurrogateBindEntry, TenantDataSnapshot, TenantId};
 use nodedb_physical::physical_plan::MetaOp;
 
 use remote::{NODE_RESTORE_TIMEOUT, dispatch_remote, envelope_to_err};
@@ -46,6 +48,8 @@ pub struct RestoreStats {
     pub timeseries: usize,
     pub columnar_engines: usize,
     pub flushed_ts_segments: usize,
+    /// Number of PK→surrogate identity bindings rebound into the catalog.
+    pub surrogate_pk: usize,
     pub nodes_dispatched: usize,
     /// Non-zero = snapshot contained unparseable keys (possible corruption).
     pub malformed_keys: usize,
@@ -120,6 +124,7 @@ pub async fn restore_tenant(
     stats.crdt_state = merged.crdt_state.len();
     stats.timeseries = merged.timeseries.len();
     stats.flushed_ts_segments = merged.flushed_ts_segments.len();
+    stats.surrogate_pk = merged.surrogate_pk.len();
 
     warn_on_tombstoned_restores(state, tenant_id, &merged, env.meta.snapshot_watermark);
 
@@ -134,6 +139,12 @@ pub async fn restore_tenant(
     // `ColumnarOp::Insert`s. The topology split must therefore never see
     // columnar engines.
     let columnar_snapshots = std::mem::take(&mut merged.columnar_engines);
+
+    // Drain the PK→surrogate identity map before the topology split (the split
+    // only routes per-key engine data). It is rebound into the destination
+    // catalog after the data install dispatches succeed — without it restored
+    // documents are unreachable by PK point-lookup (`WHERE id=<pk>`).
+    let surrogate_binds = std::mem::take(&mut merged.surrogate_pk);
 
     let SplitOutput {
         buckets,
@@ -194,6 +205,15 @@ pub async fn restore_tenant(
     if let Some(first_err) = results.into_iter().find_map(Result::err) {
         return Err(first_err);
     }
+
+    // Rebind the PK→surrogate identity map into the destination catalog now
+    // that the data is installed. The catalog is the SOURCE OF TRUTH the
+    // planner consults for PK point-lookups (`surrogate_assigner.lookup(pk)`);
+    // a missing binding makes a restored row unreachable by PK even though it
+    // is present in the doc store. A rebind failure is FATAL — silently
+    // shipping unqueryable rows is the partial-success anti-pattern this
+    // codebase forbids.
+    rebind_surrogates(state, surrogate_binds)?;
 
     // Durable re-issue of plain-columnar rows. Each restored collection's live
     // rows are decoded from the snapshot and replayed as a durable
@@ -256,6 +276,35 @@ async fn reissue_columnar_snapshots(
         reissued += 1;
     }
     Ok(reissued)
+}
+
+/// Rebind every PK→surrogate identity carried in the backup into the
+/// destination catalog so restored rows resolve by PK point-lookup.
+///
+/// No-op when the snapshot carried no bindings (e.g. an older backup created
+/// before the surrogate-pk section existed) or when the node has no catalog.
+/// Any catalog write failure is FATAL.
+fn rebind_surrogates(
+    state: &Arc<SharedState>,
+    binds: Vec<SurrogateBindEntry>,
+) -> Result<(), Error> {
+    if binds.is_empty() {
+        return Ok(());
+    }
+    let Some(catalog) = state.credentials.catalog() else {
+        return Ok(());
+    };
+    let database_id = crate::types::DatabaseId::DEFAULT;
+    for e in &binds {
+        catalog.put_surrogate(
+            database_id,
+            TenantId::new(e.tenant_id),
+            &e.collection,
+            &e.pk,
+            Surrogate::new(e.surrogate),
+        )?;
+    }
+    Ok(())
 }
 
 /// Parse a `"{db}:{tid}:{collection}"` columnar snapshot key, verifying the

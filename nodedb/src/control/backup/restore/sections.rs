@@ -7,13 +7,34 @@ use std::sync::Arc;
 
 use crate::Error;
 use crate::control::state::SharedState;
-use crate::types::TenantDataSnapshot;
+use crate::types::{SurrogateBindEntry, TenantDataSnapshot};
 
 pub(super) fn merge_sections(
     sections: &[nodedb_types::backup_envelope::Section],
 ) -> Result<TenantDataSnapshot, Error> {
+    use nodedb_types::backup_envelope::{SECTION_ORIGIN_SURROGATE_PK, SurrogateBindBlob};
+
     let mut merged = TenantDataSnapshot::default();
     for section in sections {
+        // The surrogate-pk metadata section carries the PK→surrogate identity
+        // map (not a tenant snapshot); decode it into `merged.surrogate_pk` so
+        // the restore orchestrator can rebind it after the data install.
+        if section.origin_node_id == SECTION_ORIGIN_SURROGATE_PK {
+            let binds: Vec<SurrogateBindBlob> =
+                zerompk::from_msgpack(&section.body).map_err(|_| Error::Internal {
+                    detail: "invalid backup format: surrogate-pk section payload is not decodable"
+                        .into(),
+                })?;
+            merged
+                .surrogate_pk
+                .extend(binds.into_iter().map(|b| SurrogateBindEntry {
+                    tenant_id: b.tenant_id,
+                    collection: b.collection,
+                    pk: b.pk,
+                    surrogate: b.surrogate,
+                }));
+            continue;
+        }
         if is_metadata_section(section) {
             continue;
         }
@@ -30,6 +51,9 @@ pub(super) fn merge_sections(
         merged.timeseries.extend(snap.timeseries);
         merged.flushed_ts_segments.extend(snap.flushed_ts_segments);
         merged.columnar_engines.extend(snap.columnar_engines);
+        // surrogate_pk on a per-node data section (Raft snapshots carry it
+        // there); merge it too so both transports converge here.
+        merged.surrogate_pk.extend(snap.surrogate_pk);
     }
     Ok(merged)
 }
@@ -39,6 +63,7 @@ pub(super) fn is_metadata_section(section: &nodedb_types::backup_envelope::Secti
         section.origin_node_id,
         nodedb_types::backup_envelope::SECTION_ORIGIN_CATALOG_ROWS
             | nodedb_types::backup_envelope::SECTION_ORIGIN_SOURCE_TOMBSTONES
+            | nodedb_types::backup_envelope::SECTION_ORIGIN_SURROGATE_PK
     )
 }
 
