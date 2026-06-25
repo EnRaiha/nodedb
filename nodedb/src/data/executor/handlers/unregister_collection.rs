@@ -26,12 +26,34 @@
 //! graph edges) are reclaimed here via collection-scoped purge methods
 //! on each store.
 
+use nodedb_types::DatabaseId;
 use tracing::{info, warn};
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::reclaim;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
+
+/// Per-engine reclaim counts produced by clearing one collection.
+///
+/// Returned by [`CoreLoop::clear_collection_all_engines`] so callers that
+/// surface a purge audit trail (the `UnregisterCollection` handler) can build
+/// their response; callers that only need the side effect (snapshot
+/// clear-then-install) ignore it.
+#[derive(Default)]
+pub(in crate::data::executor) struct ClearCollectionStats {
+    pub docs_removed: usize,
+    pub idxs_removed: usize,
+    pub inv_removed: usize,
+    pub edges_removed: usize,
+    pub vec_removed: usize,
+    pub ts_removed: u64,
+    pub spatial_removed: usize,
+    pub kv_removed: usize,
+    pub crdt_rows_removed: usize,
+    pub l1: reclaim::ReclaimStats,
+}
 
 /// Bounded retry wrapper for L1 reclaim ops.
 ///
@@ -93,153 +115,27 @@ impl CoreLoop {
             core = self.core_id,
             tenant_id, collection, purge_lsn, "starting collection purge"
         );
-        let tid = TenantId::new(tenant_id);
-        let db = task.request.database_id;
-        let coll = collection.to_string();
 
-        // ── Persistent engines (redb-backed, collection-scoped range drop) ──
-
-        // Sparse engine: documents + secondary indexes.
-        let database_id = task.request.database_id.as_u64();
-        let (docs_removed, idxs_removed) = retry_reclaim(
-            "sparse.delete_all_for_collection",
-            tenant_id,
-            collection,
-            || {
-                self.sparse
-                    .delete_all_for_collection(database_id, tenant_id, collection)
-            },
-        )
-        .unwrap_or((0, 0));
-
-        // Inverted index: postings + doc_lengths + stats + segments.
-        let inv_removed = retry_reclaim("inverted.purge_collection", tenant_id, collection, || {
-            self.inverted.purge_collection(database_id, tid, collection)
-        })
-        .unwrap_or(0);
-
-        // Graph edge store: remove all edges scoped to this (database, collection).
-        let edges_removed =
-            retry_reclaim("edge_store.purge_collection", tenant_id, collection, || {
-                self.edge_store
-                    .purge_collection(database_id, tid, collection)
-            })
-            .unwrap_or(0);
-        // The CSR in-memory index is collection-agnostic. Stale edges will
-        // be absent from the next CSR rebuild (which reads from EdgeStore).
-        self.csr.drop_collection(db, tid, collection);
-
-        // ── In-memory, tuple-keyed state (reclaimable today) ─────────────────
-
-        // Vector engine. Field-vector indexes are keyed "{coll}:{field}" in the
-        // String component, so eviction must drop the plain collection key AND every
-        // field variant — not just the bare "{coll}" key (which would leak the
-        // field-keyed entries in memory on drop).
-        let vec_removed = {
-            let coll_prefix = format!("{coll}:");
-            let keep = |c: &String| !(c == &coll || c.starts_with(&coll_prefix));
-            let before = self.vector_collections.len();
-            self.vector_collections
-                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
-            let removed = before - self.vector_collections.len();
-            self.vector_params
-                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
-            self.index_configs
-                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
-            self.ivf_indexes
-                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
-            removed
-        };
-
-        // Timeseries engine.
-        let ts_removed = {
-            let key = (db, tid, coll.clone());
-            let mut r = 0;
-            if self.columnar_memtables.remove(&key).is_some() {
-                r += 1;
-            }
-            self.columnar_memtable_mem.remove(&key);
-            self.ts_registries.remove(&key);
-            self.ts_max_ingested_lsn.remove(&key);
-            self.ts_last_value_caches.remove(&key);
-            r
-        };
-
-        // Spatial indexes.
-        let spatial_removed = {
-            let before = self.spatial_indexes.len();
-            self.spatial_indexes
-                .retain(|(d, t, c, _), _| !(*d == db && *t == tid && c == &coll));
-            self.spatial_doc_map
-                .retain(|(d, t, c, _, _), _| !(*d == db && *t == tid && c == &coll));
-            before - self.spatial_indexes.len()
-        };
-
-        // Columnar engine state (per-core, tuple-keyed).
-        self.columnar_engines
-            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
-        self.columnar_flushed_segments
-            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
-        // Lockstep: drop the surrogate sidecar for the same keys.
-        self.columnar_flushed_surrogates
-            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
-
-        // Sparse vector indexes (tuple key: database, tenant, collection, field).
-        self.sparse_vector_indexes
-            .retain(|(d, t, c, _), _| !(*d == db && *t == tid && c == &coll));
-
-        // KV engine: drop this collection's hash table + indexes.
-        let kv_removed = self.kv_engine.purge_collection(
-            task.request.database_id.as_u64(),
-            tenant_id,
+        let ClearCollectionStats {
+            docs_removed,
+            idxs_removed,
+            inv_removed,
+            edges_removed,
+            vec_removed,
+            ts_removed,
+            spatial_removed,
+            kv_removed,
+            crdt_rows_removed,
+            l1: l1_stats,
+        } = self.clear_collection_all_engines(
+            task.request.database_id,
+            TenantId::new(tenant_id),
             collection,
         );
 
-        // CRDT engine: clear rows for this collection in the tenant state.
-        let crdt_rows_removed = match self.crdt_engines.get_mut(&tid) {
-            Some(engine) => retry_reclaim("crdt.purge_collection", tenant_id, collection, || {
-                engine.purge_collection(collection)
-            })
-            .unwrap_or(0),
-            None => 0,
-        };
-
-        // Doc cache: evict entries for this collection.
-        self.doc_cache
-            .evict_collection(task.request.database_id.as_u64(), tenant_id, collection);
-
-        // ── Persistent on-disk unlinks (per-engine reclaim) ──────────────────
-        //
-        // Engines whose state is in shared redb (document, document-
-        // strict, FTS, graph edges) already reclaimed above; engines
-        // with no per-collection persistent file (KV hash index,
-        // CRDT — per-tenant checkpoint) are N/A.
-        use crate::data::executor::handlers::reclaim;
-        let mut l1_stats = reclaim::ReclaimStats::default();
-        l1_stats.merge(reclaim::vector::reclaim_vector_checkpoints(
-            &self.data_dir,
-            db.as_u64(),
-            tenant_id,
-            collection,
-        ));
-        l1_stats.merge(reclaim::spatial::reclaim_spatial_checkpoints(
-            &self.data_dir,
-            db.as_u64(),
-            tenant_id,
-            collection,
-        ));
-        l1_stats.merge(reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(
-            &self.data_dir,
-            db.as_u64(),
-            tenant_id,
-            collection,
-        ));
-        l1_stats.merge(reclaim::timeseries::reclaim_timeseries_partitions(
-            &self.data_dir,
-            db.as_u64(),
-            tenant_id,
-            collection,
-        ));
+        // Surface the L1 byte reclaim to the purge metrics. Stays in the
+        // caller: the reusable clear is side-effect-only and metrics are an
+        // audit concern of the unregister path.
         if let Some(metrics) = self.metrics.as_ref()
             && l1_stats.bytes_freed > 0
         {
@@ -247,14 +143,6 @@ impl CoreLoop {
                 .purge
                 .add_bytes_reclaimed(tenant_id, "l1-mixed", "l1", l1_stats.bytes_freed);
         }
-
-        // Doc configs + chain hashes + aggregate cache.
-        self.doc_configs
-            .retain(|(t, c), _| !(*t == tid && c == &coll));
-        self.chain_hashes
-            .retain(|(t, c), _| !(*t == tid && c == &coll));
-        self.aggregate_cache
-            .retain(|(t, c), _| !(*t == tid && c == &coll));
 
         info!(
             core = self.core_id,
@@ -293,6 +181,187 @@ impl CoreLoop {
         match crate::data::executor::response_codec::encode_json(&summary) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(_) => self.response_ok(task),
+        }
+    }
+
+    /// Reclaim all per-collection state on this core across every engine.
+    ///
+    /// Drops the in-memory tuple-keyed maps, range-deletes the redb-backed
+    /// engines, and unlinks the on-disk L1 checkpoints/partitions for one
+    /// `(database, tenant, collection)`. Returns the per-engine reclaim
+    /// counts; callers that don't need them (snapshot clear-then-install)
+    /// can discard the result.
+    ///
+    /// Idempotent: missing in-memory state is a no-op; missing files are a
+    /// no-op. Metrics emission and audit/response building are the caller's
+    /// concern.
+    pub(in crate::data::executor) fn clear_collection_all_engines(
+        &mut self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        collection: &str,
+    ) -> ClearCollectionStats {
+        let db = database_id;
+        let tid = tenant_id;
+        let db_raw = database_id.as_u64();
+        let tid_raw = tenant_id.as_u64();
+        let coll = collection.to_string();
+
+        // ── Persistent engines (redb-backed, collection-scoped range drop) ──
+
+        // Sparse engine: documents + secondary indexes.
+        let (docs_removed, idxs_removed) = retry_reclaim(
+            "sparse.delete_all_for_collection",
+            tid_raw,
+            collection,
+            || {
+                self.sparse
+                    .delete_all_for_collection(db_raw, tid_raw, collection)
+            },
+        )
+        .unwrap_or((0, 0));
+
+        // Inverted index: postings + doc_lengths + stats + segments.
+        let inv_removed = retry_reclaim("inverted.purge_collection", tid_raw, collection, || {
+            self.inverted.purge_collection(db_raw, tid, collection)
+        })
+        .unwrap_or(0);
+
+        // Graph edge store: remove all edges scoped to this (database, collection).
+        let edges_removed =
+            retry_reclaim("edge_store.purge_collection", tid_raw, collection, || {
+                self.edge_store.purge_collection(db_raw, tid, collection)
+            })
+            .unwrap_or(0);
+        // The CSR in-memory index is collection-agnostic. Stale edges will
+        // be absent from the next CSR rebuild (which reads from EdgeStore).
+        self.csr.drop_collection(db, tid, collection);
+
+        // ── In-memory, tuple-keyed state (reclaimable today) ─────────────────
+
+        // Vector engine. Field-vector indexes are keyed "{coll}:{field}" in the
+        // String component, so eviction must drop the plain collection key AND every
+        // field variant — not just the bare "{coll}" key (which would leak the
+        // field-keyed entries in memory on drop).
+        let vec_removed = {
+            let coll_prefix = format!("{coll}:");
+            let keep = |c: &String| !(c == &coll || c.starts_with(&coll_prefix));
+            let before = self.vector_collections.len();
+            self.vector_collections
+                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
+            let removed = before - self.vector_collections.len();
+            self.vector_params
+                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
+            self.index_configs
+                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
+            self.ivf_indexes
+                .retain(|(d, t, c), _| !(*d == db && *t == tid) || keep(c));
+            removed
+        };
+
+        // Timeseries engine.
+        let ts_removed = {
+            let key = (db, tid, coll.clone());
+            let mut r = 0u64;
+            if self.columnar_memtables.remove(&key).is_some() {
+                r += 1;
+            }
+            self.columnar_memtable_mem.remove(&key);
+            self.ts_registries.remove(&key);
+            self.ts_max_ingested_lsn.remove(&key);
+            self.ts_last_value_caches.remove(&key);
+            r
+        };
+
+        // Spatial indexes.
+        let spatial_removed = {
+            let before = self.spatial_indexes.len();
+            self.spatial_indexes
+                .retain(|(d, t, c, _), _| !(*d == db && *t == tid && c == &coll));
+            self.spatial_doc_map
+                .retain(|(d, t, c, _, _), _| !(*d == db && *t == tid && c == &coll));
+            before - self.spatial_indexes.len()
+        };
+
+        // Columnar engine state (per-core, tuple-keyed).
+        self.columnar_engines
+            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
+        self.columnar_flushed_segments
+            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
+        // Lockstep: drop the surrogate sidecar for the same keys.
+        self.columnar_flushed_surrogates
+            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
+
+        // Sparse vector indexes (tuple key: database, tenant, collection, field).
+        self.sparse_vector_indexes
+            .retain(|(d, t, c, _), _| !(*d == db && *t == tid && c == &coll));
+
+        // KV engine: drop this collection's hash table + indexes.
+        let kv_removed = self.kv_engine.purge_collection(db_raw, tid_raw, collection);
+
+        // CRDT engine: clear rows for this collection in the tenant state.
+        let crdt_rows_removed = match self.crdt_engines.get_mut(&tid) {
+            Some(engine) => retry_reclaim("crdt.purge_collection", tid_raw, collection, || {
+                engine.purge_collection(collection)
+            })
+            .unwrap_or(0),
+            None => 0,
+        };
+
+        // Doc cache: evict entries for this collection.
+        self.doc_cache.evict_collection(db_raw, tid_raw, collection);
+
+        // ── Persistent on-disk unlinks (per-engine reclaim) ──────────────────
+        //
+        // Engines whose state is in shared redb (document, document-
+        // strict, FTS, graph edges) already reclaimed above; engines
+        // with no per-collection persistent file (KV hash index,
+        // CRDT — per-tenant checkpoint) are N/A.
+        let mut l1 = reclaim::ReclaimStats::default();
+        l1.merge(reclaim::vector::reclaim_vector_checkpoints(
+            &self.data_dir,
+            db_raw,
+            tid_raw,
+            collection,
+        ));
+        l1.merge(reclaim::spatial::reclaim_spatial_checkpoints(
+            &self.data_dir,
+            db_raw,
+            tid_raw,
+            collection,
+        ));
+        l1.merge(reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(
+            &self.data_dir,
+            db_raw,
+            tid_raw,
+            collection,
+        ));
+        l1.merge(reclaim::timeseries::reclaim_timeseries_partitions(
+            &self.data_dir,
+            db_raw,
+            tid_raw,
+            collection,
+        ));
+
+        // Doc configs + chain hashes + aggregate cache.
+        self.doc_configs
+            .retain(|(t, c), _| !(*t == tid && c == &coll));
+        self.chain_hashes
+            .retain(|(t, c), _| !(*t == tid && c == &coll));
+        self.aggregate_cache
+            .retain(|(t, c), _| !(*t == tid && c == &coll));
+
+        ClearCollectionStats {
+            docs_removed,
+            idxs_removed,
+            inv_removed,
+            edges_removed,
+            vec_removed,
+            ts_removed,
+            spatial_removed,
+            kv_removed,
+            crdt_rows_removed,
+            l1,
         }
     }
 }

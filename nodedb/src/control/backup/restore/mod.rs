@@ -181,6 +181,8 @@ pub async fn restore_tenant(
             snapshot: payload,
             // User RESTORE keeps the fail-closed collision behavior.
             replace_mode: false,
+            clear_vshards: Vec::new(),
+            collections_to_clear: Vec::new(),
         });
         if is_self(state, node_id) {
             local_plan = Some(plan);

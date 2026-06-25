@@ -111,6 +111,14 @@ pub enum MetaOp {
         tenant_id: u64,
         snapshot: Vec<u8>,
         replace_mode: bool,
+        /// vShard IDs whose state must be cleared before install (clear-then-install
+        /// for a lagging follower). Empty = legacy install-over-present behavior.
+        #[serde(default)]
+        clear_vshards: Vec<u32>,
+        /// (tenant_id, collection) pairs to clear before install — pre-resolved by the
+        /// applier from the local catalog for the cleared vShards. Empty = no clear.
+        #[serde(default)]
+        collections_to_clear: Vec<(u64, String)>,
     },
 
     /// Purge ALL data for a tenant across every engine and cache.

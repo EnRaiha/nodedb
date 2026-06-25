@@ -17,12 +17,11 @@
 //! payload keys regardless of the `tenant_id` plan field, so a multi-tenant
 //! snapshot applies correctly.
 //!
-//! Scope (DECLARED, tracked residual — NOT a silent gap): this makes a
-//! FRESH/new-replica follower fully correct, plus OVERWRITE of keys PRESENT in
-//! the snapshot. It does NOT yet remove keys that were DELETED before the
-//! snapshot index, nor DROP collections that no longer exist, on a LAGGING
-//! follower — i.e. it is install-over-present, not exact clear-then-install.
-//! Exact clear-then-install lands in the next unit.
+//! Scope: this makes a FRESH/new-replica follower fully correct, plus OVERWRITE
+//! of keys PRESENT in the snapshot. The `collections_to_clear` field of
+//! `RestoreTenantSnapshot` carries the pre-resolved collection list so the Data
+//! Plane handler performs an exact clear-then-install for lagging followers —
+//! keys deleted before the snapshot index and dropped collections do not linger.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,6 +83,8 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
             tenant_id: 0,
             snapshot: snapshot_bytes.to_vec(),
             replace_mode: true,
+            clear_vshards: Vec::new(),
+            collections_to_clear: Vec::new(),
         });
 
         crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(

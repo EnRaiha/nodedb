@@ -20,8 +20,23 @@ impl CoreLoop {
         tenant_id: u64,
         snapshot_bytes: &[u8],
         replace_mode: bool,
+        // Carried for symmetry with the applier; the per-collection list below
+        // drives the actual clear. The applier populates this from the catalog.
+        _clear_vshards: &[u32],
+        collections_to_clear: &[(u64, String)],
     ) -> Response {
         info!(core = self.core_id, tenant_id, "restoring tenant snapshot");
+
+        // Clear-then-install: drop stale state for the listed collections before
+        // installing, so keys deleted before the snapshot index and dropped
+        // collections do not linger on a lagging follower. Empty list = no-op.
+        for (tid_raw, coll) in collections_to_clear {
+            self.clear_collection_all_engines(
+                nodedb_types::DatabaseId::DEFAULT,
+                crate::types::TenantId::new(*tid_raw),
+                coll,
+            );
+        }
 
         let snap: crate::types::TenantDataSnapshot = match zerompk::from_msgpack(snapshot_bytes) {
             Ok(s) => s,

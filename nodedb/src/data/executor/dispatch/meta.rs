@@ -66,7 +66,16 @@ impl CoreLoop {
                 tenant_id,
                 snapshot,
                 replace_mode,
-            } => self.execute_restore_tenant_snapshot(task, *tenant_id, snapshot, *replace_mode),
+                clear_vshards,
+                collections_to_clear,
+            } => self.execute_restore_tenant_snapshot(
+                task,
+                *tenant_id,
+                snapshot,
+                *replace_mode,
+                clear_vshards,
+                collections_to_clear,
+            ),
 
             MetaOp::ConvertCollection {
                 collection,
