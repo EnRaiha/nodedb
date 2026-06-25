@@ -451,10 +451,7 @@ pub(super) mod tests {
     ///
     /// `csr` resolves a bound node name to its surrogate; the document is then
     /// fetched at `surrogate_to_doc_id(surrogate)`, mirroring the real keying.
-    pub(crate) fn props_for<'a>(
-        sparse: &'a SparseEngine,
-        csr: &'a CsrIndex,
-    ) -> PropertyLookup<'a> {
+    pub(crate) fn props_for<'a>(sparse: &'a SparseEngine, csr: &'a CsrIndex) -> PropertyLookup<'a> {
         PropertyLookup {
             sparse,
             csr,
