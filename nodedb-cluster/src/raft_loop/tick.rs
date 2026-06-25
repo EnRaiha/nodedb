@@ -271,10 +271,29 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                             let mut shutdown_rx = self.shutdown_watch.subscribe();
                             let node_id = self.node_id;
                             let chunk_bytes = self.snapshot_chunk_bytes;
+                            let snapshot_builder = self.snapshot_builder.clone();
                             tokio::spawn(async move {
                                 if *shutdown_rx.borrow() {
                                     return;
                                 }
+                                // Build the real per-group snapshot payload on the
+                                // leader before framing the chunked RPC. A `None`
+                                // builder (cluster-only tests) or a build failure
+                                // falls back to the stub (empty) chunk, which the
+                                // sender already handles.
+                                let snapshot_bytes: Vec<u8> = match &snapshot_builder {
+                                    Some(b) => b
+                                        .build_group_snapshot(group_id, snap_index, snap_term)
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            warn!(
+                                                group_id, peer, error = %e,
+                                                "snapshot build failed; sending stub"
+                                            );
+                                            Vec::new()
+                                        }),
+                                    None => Vec::new(),
+                                };
                                 tokio::select! {
                                     biased;
                                     _ = shutdown_rx.changed() => {}
@@ -287,7 +306,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                                             leader_id: node_id,
                                             last_included_index: snap_index,
                                             last_included_term: snap_term,
-                                            snapshot_bytes: &[], // empty until engines fill in data
+                                            snapshot_bytes: &snapshot_bytes,
                                             chunk_bytes,
                                         },
                                     ) => {

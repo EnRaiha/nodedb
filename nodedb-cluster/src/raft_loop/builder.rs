@@ -18,7 +18,7 @@ use crate::metadata_group::applier::MetadataApplier;
 
 use super::hooks::{
     AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ShuffleAggregator, ShuffleConsumer,
-    ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
+    ShuffleProducer, ShuffleReceiver, SnapshotBuilder, SnapshotQuarantineHook,
 };
 use super::loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};
 
@@ -49,6 +49,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             assign_remote_surrogate: self.assign_remote_surrogate,
             calvin_submit: self.calvin_submit,
             calvin_submit_inbox: self.calvin_submit_inbox,
+            snapshot_builder: self.snapshot_builder,
             partial_snapshots: self.partial_snapshots,
             data_dir: self.data_dir,
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
@@ -162,6 +163,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// drives it to completion itself).
     pub fn with_calvin_submit_inbox(mut self, submit: Arc<dyn CalvinSubmitInbox>) -> Self {
         self.calvin_submit_inbox = Some(submit);
+        self
+    }
+
+    /// Attach the per-group snapshot builder for the SEND path (builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s Data Plane snapshot
+    /// dispatch) is called by the install-snapshot tick step to produce the real
+    /// serialized engine state for a lagging follower's group vshards. When not
+    /// set, the sender falls back to the stub (empty) chunk.
+    pub fn with_snapshot_builder(mut self, builder: Arc<dyn SnapshotBuilder>) -> Self {
+        self.snapshot_builder = Some(builder);
         self
     }
 

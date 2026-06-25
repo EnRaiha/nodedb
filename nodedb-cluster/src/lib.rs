@@ -114,8 +114,8 @@ pub use migration_executor::{
 pub use multi_raft::{GroupStatus, MultiRaft};
 pub use raft_loop::{
     AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, CommitApplier, RaftLoop,
-    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotQuarantineHook,
-    VShardEnvelopeHandler,
+    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotBuilder,
+    SnapshotQuarantineHook, VShardEnvelopeHandler,
 };
 pub use reachability::{
     NoopProber, ReachabilityDriver, ReachabilityDriverConfig, ReachabilityProber, TransportProber,

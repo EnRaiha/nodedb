@@ -10,6 +10,35 @@
 
 use crate::error::Result;
 
+/// Hook for building per-group snapshot payloads on the Raft snapshot SEND path.
+///
+/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the snapshot
+/// builder — which serializes the engine state for the vshards owned by a Raft
+/// group so a lagging/new follower can be caught up — lives in the host crate
+/// (`nodedb`) behind this `Send + Sync` hook. The tick loop's install-snapshot
+/// dispatch (see [`super::tick`]) calls [`build_group_snapshot`](Self::build_group_snapshot)
+/// before framing the chunked `InstallSnapshot` RPC.
+///
+/// Cluster-only tests leave the `RaftLoop` field `None`, which makes the sender
+/// fall back to the stub (empty) chunk — exactly the pre-builder behaviour.
+///
+/// The hook is **async** because the host-crate implementation dispatches the
+/// per-vshard snapshot build to the Data Plane through the existing SPSC bridge
+/// (an awaited round-trip on the Tokio transport reactor); it never touches
+/// io_uring or storage directly.
+#[async_trait::async_trait]
+pub trait SnapshotBuilder: Send + Sync + 'static {
+    /// Build the per-group snapshot payload (serialized engine state for the
+    /// group's vshards) to ship to a lagging/new follower. Empty Vec is a valid
+    /// "nothing to send" result (caller falls back to the stub chunk).
+    async fn build_group_snapshot(
+        &self,
+        group_id: u64,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
 /// Hook for quarantine integration on the Raft snapshot receive path.
 ///
 /// `nodedb-cluster` cannot depend on `nodedb` (circular), so the host crate
