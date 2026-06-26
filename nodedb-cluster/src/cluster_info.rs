@@ -244,6 +244,7 @@ mod tests {
             commit_index: 5,
             last_applied: 5,
             last_log_index: 5,
+            snapshot_index: 0,
             member_count: 3,
             learner_count: 0,
             vshard_count: 512,

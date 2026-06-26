@@ -100,24 +100,29 @@ impl MultiRaft {
             ConfChangeType::AddNode => {
                 // Direct voter add (used for legacy or bootstrap paths).
                 node.add_peer(change.node_id);
-                if let Some(info) = self.routing.group_info(group_id)
+                // One write guard serves both the `group_info` read and the
+                // `set_group_members` write — taking a read guard first then
+                // a write guard on the same RwLock would deadlock.
+                let mut rt = self.routing.write().unwrap_or_else(|p| p.into_inner());
+                if let Some(info) = rt.group_info(group_id)
                     && !info.members.contains(&change.node_id)
                 {
                     let mut new_members = info.members.clone();
                     new_members.push(change.node_id);
-                    self.routing.set_group_members(group_id, new_members);
+                    rt.set_group_members(group_id, new_members);
                 }
             }
             ConfChangeType::RemoveNode => {
                 node.remove_peer(change.node_id);
-                if let Some(info) = self.routing.group_info(group_id) {
+                let mut rt = self.routing.write().unwrap_or_else(|p| p.into_inner());
+                if let Some(info) = rt.group_info(group_id) {
                     let new_members: Vec<u64> = info
                         .members
                         .iter()
                         .copied()
                         .filter(|&id| id != change.node_id)
                         .collect();
-                    self.routing.set_group_members(group_id, new_members);
+                    rt.set_group_members(group_id, new_members);
                 }
             }
             ConfChangeType::AddLearner => {
@@ -125,7 +130,10 @@ impl MultiRaft {
                 // RaftNode and the routing table. Voting quorum does not
                 // change.
                 node.add_learner(change.node_id);
-                self.routing.add_group_learner(group_id, change.node_id);
+                self.routing
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .add_group_learner(group_id, change.node_id);
             }
             ConfChangeType::PromoteLearner => {
                 // Learner → voter. RaftNode and routing both update.
@@ -142,7 +150,10 @@ impl MultiRaft {
                 }
                 // The committed conf change is authoritative. This is idempotent
                 // and also handles self-promotion on a joining replica.
-                self.routing.promote_group_learner(group_id, change.node_id);
+                self.routing
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .promote_group_learner(group_id, change.node_id);
             }
         }
 
@@ -194,7 +205,9 @@ mod tests {
         assert!(node.voters().is_empty());
 
         // Routing: learners populated, members untouched.
-        let info = mr.routing.group_info(0).unwrap();
+        let rt = mr.routing();
+        let rt = rt.read().unwrap();
+        let info = rt.group_info(0).unwrap();
         assert_eq!(info.learners, vec![2]);
         assert_eq!(info.members, vec![1]); // Self.
     }
@@ -223,7 +236,9 @@ mod tests {
         assert_eq!(node.voters(), &[2]);
         assert!(node.learners().is_empty());
 
-        let info = mr.routing.group_info(0).unwrap();
+        let rt = mr.routing();
+        let rt = rt.read().unwrap();
+        let info = rt.group_info(0).unwrap();
         assert_eq!(info.learners, Vec::<u64>::new());
         assert!(info.members.contains(&2));
     }
@@ -246,7 +261,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(mr.groups.get(&0).unwrap().role(), NodeRole::Follower);
-        let info = mr.routing.group_info(0).unwrap();
+        let rt = mr.routing();
+        let rt = rt.read().unwrap();
+        let info = rt.group_info(0).unwrap();
         assert_eq!(info.members, vec![1, 2]);
         assert!(info.learners.is_empty());
     }

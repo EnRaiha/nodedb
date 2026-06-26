@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tracing::info;
@@ -26,6 +27,13 @@ pub struct GroupStatus {
     pub commit_index: u64,
     pub last_applied: u64,
     pub last_log_index: u64,
+    /// Highest log index covered by the latest compacted snapshot.
+    /// Advances when the group's log is compacted past the start (gated
+    /// by `RaftConfig::log_compaction_threshold`). A non-zero value
+    /// means entries at or below it are no longer in the log and a
+    /// lagging peer below this index can only be caught up via
+    /// `InstallSnapshot`, never `AppendEntries`.
+    pub snapshot_index: u64,
     pub member_count: usize,
     pub learner_count: usize,
     pub vshard_count: usize,
@@ -55,7 +63,13 @@ pub struct MultiRaft {
     /// Raft groups hosted on this node (group_id → RaftNode).
     pub(super) groups: HashMap<u64, RaftNode<RedbLogStorage>>,
     /// Routing table (vShard → group mapping).
-    pub(super) routing: RoutingTable,
+    ///
+    /// This is the SAME `Arc<RwLock<RoutingTable>>` held by
+    /// `ClusterState.routing` / `shared.cluster_routing`, so committed Raft
+    /// conf-changes applied here (via `apply_conf_change`) write THROUGH to
+    /// the one table the query/data plane reads. Raft is the convergence
+    /// mechanism on every applying node (leader and follower).
+    pub(super) routing: Arc<RwLock<RoutingTable>>,
     /// Default election timeout range.
     pub(super) election_timeout_min: Duration,
     pub(super) election_timeout_max: Duration,
@@ -91,7 +105,26 @@ impl MultiRaftReady {
 }
 
 impl MultiRaft {
+    /// Construct a `MultiRaft` owning its routing table by value.
+    ///
+    /// Wraps the table in a fresh `Arc<RwLock<_>>`. Used by tests that do not
+    /// need to share the routing handle with a `ClusterState`. Production
+    /// construction sites use [`MultiRaft::new_with_shared_routing`] so the
+    /// data plane and Raft state machine read/write the SAME table.
     pub fn new(node_id: u64, routing: RoutingTable, data_dir: PathBuf) -> Self {
+        Self::new_with_shared_routing(node_id, Arc::new(RwLock::new(routing)), data_dir)
+    }
+
+    /// Construct a `MultiRaft` sharing the given routing handle.
+    ///
+    /// The passed `Arc<RwLock<RoutingTable>>` MUST be the same handle stored
+    /// in `ClusterState.routing` so committed conf-changes converge the
+    /// data-plane routing view.
+    pub fn new_with_shared_routing(
+        node_id: u64,
+        routing: Arc<RwLock<RoutingTable>>,
+        data_dir: PathBuf,
+    ) -> Self {
         Self {
             node_id,
             groups: HashMap::new(),
@@ -203,12 +236,13 @@ impl MultiRaft {
         ready
     }
 
-    pub fn routing(&self) -> &RoutingTable {
-        &self.routing
-    }
-
-    pub fn routing_mut(&mut self) -> &mut RoutingTable {
-        &mut self.routing
+    /// Clone of the shared routing handle.
+    ///
+    /// Returns an `Arc` clone pointing at the same `RwLock<RoutingTable>` the
+    /// data plane reads. Callers that need a `RoutingTable` value take a tight
+    /// read guard and clone it out.
+    pub fn routing(&self) -> Arc<RwLock<RoutingTable>> {
+        self.routing.clone()
     }
 
     pub fn node_id(&self) -> u64 {
@@ -263,7 +297,12 @@ impl MultiRaft {
     pub fn group_statuses(&self) -> Vec<GroupStatus> {
         let mut statuses = Vec::with_capacity(self.groups.len());
         for (&group_id, node) in &self.groups {
-            let vshard_count = self.routing.vshards_for_group(group_id).len();
+            let vshard_count = self
+                .routing
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .vshards_for_group(group_id)
+                .len();
             let self_is_voter = !matches!(
                 node.role(),
                 nodedb_raft::NodeRole::Learner | nodedb_raft::NodeRole::Observer
@@ -277,6 +316,7 @@ impl MultiRaft {
                 commit_index: node.commit_index(),
                 last_applied: node.last_applied(),
                 last_log_index: node.last_log_index(),
+                snapshot_index: node.log_snapshot_index(),
                 member_count: node.voters().len() + usize::from(self_is_voter),
                 learner_count: node.learners().len()
                     + usize::from(node.role() == nodedb_raft::NodeRole::Learner),
@@ -289,7 +329,11 @@ impl MultiRaft {
 
     /// Get the leader for a given vShard (from local group state).
     pub fn leader_for_vshard(&self, vshard_id: u32) -> Result<Option<u64>> {
-        let group_id = self.routing.group_for_vshard(vshard_id)?;
+        let group_id = self
+            .routing
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .group_for_vshard(vshard_id)?;
         let node = self
             .groups
             .get(&group_id)
@@ -298,11 +342,37 @@ impl MultiRaft {
         Ok(if lid == 0 { None } else { Some(lid) })
     }
 
+    /// Whether THIS node is currently the leader of the data-group that owns
+    /// `vshard_id`.
+    ///
+    /// Maps the vshard to its Raft group via the routing table and reuses the
+    /// existing local leader-role check — no new election. Returns `false` when
+    /// the vshard has no group mapping or this node is a follower/learner for
+    /// the owning group. Used by the Calvin scheduler to stamp the per-node,
+    /// non-replicated `is_group_leader` dispatch flag so the OLLP optimistic-lock
+    /// verification runs only on the leader while every replica applies the same
+    /// predicted write-set (determinism).
+    pub fn vshard_role_is_leader(&self, vshard_id: u32) -> bool {
+        match self
+            .routing
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .group_for_vshard(vshard_id)
+        {
+            Ok(group_id) => self.is_group_leader(group_id),
+            Err(_) => false,
+        }
+    }
+
     /// Propose a command to the Raft group that owns the given vShard.
     ///
     /// Returns `(group_id, log_index)` on success.
     pub fn propose(&mut self, vshard_id: u32, data: Vec<u8>) -> Result<(u64, u64)> {
-        let group_id = self.routing.group_for_vshard(vshard_id)?;
+        let group_id = self
+            .routing
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .group_for_vshard(vshard_id)?;
         let node = self
             .groups
             .get_mut(&group_id)

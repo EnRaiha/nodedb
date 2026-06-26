@@ -99,7 +99,11 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // 1. Snapshot group-0 leader + clone routing under one lock.
         let (group0_leader, routing): (u64, RoutingTable) = {
             let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-            let routing = mr.routing().clone();
+            let routing = mr
+                .routing()
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
             let leader_id = mr
                 .group_statuses()
                 .into_iter()
@@ -308,7 +312,10 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 .clone();
             let routing_snapshot = {
                 let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-                mr.routing().clone()
+                mr.routing()
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
             };
             if let Err(e) = catalog.save_topology(&topo_snapshot) {
                 warn!(error = %e, "failed to persist topology after join");
@@ -417,7 +424,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     learners: membership.learners,
                 })
                 .collect();
-            (mr.routing().clone(), groups)
+            let routing = mr
+                .routing()
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            (routing, groups)
         };
         // Re-use the pure builder from `bootstrap/handle_join.rs`.
         // `handle_join_request` is idempotent against the same

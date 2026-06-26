@@ -25,11 +25,13 @@ pub(super) fn restart(
             detail: "catalog is bootstrapped but topology is missing".into(),
         })?;
 
-    let routing = catalog
-        .load_routing()?
-        .ok_or_else(|| ClusterError::Transport {
+    // ONE shared routing handle: MultiRaft and ClusterState read/write the
+    // same table so committed Raft conf-changes converge the data-plane view.
+    let routing = Arc::new(RwLock::new(catalog.load_routing()?.ok_or_else(|| {
+        ClusterError::Transport {
             detail: "catalog is bootstrapped but routing table is missing".into(),
-        })?;
+        }
+    })?));
 
     // Reconstruct MultiRaft from routing table. A restarting node
     // may be a voter (`info.members`) OR a learner (`info.learners`)
@@ -39,33 +41,44 @@ pub(super) fn restart(
     // as a learner on restart; dropping the group entirely would
     // leave the node permanently without any copy of it and
     // silently broken.
-    let mut multi_raft = MultiRaft::new(config.node_id, routing.clone(), config.data_dir.clone())
-        .with_election_timeout(config.election_timeout_min, config.election_timeout_max)
-        .with_log_compaction_threshold(config.log_compaction_threshold);
-    for (group_id, info) in routing.group_members() {
-        let is_voter = info.members.contains(&config.node_id);
-        let is_learner = info.learners.contains(&config.node_id);
+    let mut multi_raft = MultiRaft::new_with_shared_routing(
+        config.node_id,
+        routing.clone(),
+        config.data_dir.clone(),
+    )
+    .with_election_timeout(config.election_timeout_min, config.election_timeout_max)
+    .with_log_compaction_threshold(config.log_compaction_threshold);
+    // Snapshot the group membership out from under one read guard so the
+    // guard is released before `add_group` (which proposes into Raft).
+    let group_membership: Vec<(u64, Vec<u64>, Vec<u64>)> = {
+        let rt = routing.read().unwrap_or_else(|p| p.into_inner());
+        rt.group_members()
+            .iter()
+            .map(|(group_id, info)| (*group_id, info.members.clone(), info.learners.clone()))
+            .collect()
+    };
+    for (group_id, members, learners) in group_membership {
+        let is_voter = members.contains(&config.node_id);
+        let is_learner = learners.contains(&config.node_id);
 
         if is_voter {
-            let peers: Vec<u64> = info
-                .members
+            let peers: Vec<u64> = members
                 .iter()
                 .copied()
                 .filter(|&id| id != config.node_id)
                 .collect();
-            multi_raft.add_group(*group_id, peers)?;
+            multi_raft.add_group(group_id, peers)?;
         } else if is_learner {
             // Voters are the full member set (none of them is
             // self). Other learners catching up alongside us are
             // tracked for replication too.
-            let voters = info.members.clone();
-            let other_learners: Vec<u64> = info
-                .learners
+            let voters = members.clone();
+            let other_learners: Vec<u64> = learners
                 .iter()
                 .copied()
                 .filter(|&id| id != config.node_id)
                 .collect();
-            multi_raft.add_group_as_learner(*group_id, voters, other_learners)?;
+            multi_raft.add_group_as_learner(group_id, voters, other_learners)?;
         }
     }
 
@@ -87,7 +100,7 @@ pub(super) fn restart(
 
     Ok(ClusterState {
         topology: Arc::new(RwLock::new(topology)),
-        routing: Arc::new(RwLock::new(routing)),
+        routing,
         multi_raft: Arc::new(Mutex::new(multi_raft)),
     })
 }

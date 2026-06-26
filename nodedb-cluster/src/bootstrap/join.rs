@@ -294,7 +294,12 @@ fn apply_join_response(
             },
         );
     }
-    let routing = RoutingTable::from_parts(resp.vshard_to_group.clone(), group_members);
+    // ONE shared routing handle: MultiRaft and ClusterState read/write the
+    // same table so committed Raft conf-changes converge the data-plane view.
+    let routing = Arc::new(RwLock::new(RoutingTable::from_parts(
+        resp.vshard_to_group.clone(),
+        group_members,
+    )));
 
     // 2. Persist to catalog before any on-disk Raft side effects.
     //    Cluster id is written first so `is_bootstrapped()` returns
@@ -306,16 +311,20 @@ fn apply_join_response(
     //    dispatcher.
     catalog.save_cluster_id(resp.cluster_id)?;
     catalog.save_topology(&topology)?;
-    catalog.save_routing(&routing)?;
+    catalog.save_routing(&routing.read().unwrap_or_else(|p| p.into_inner()))?;
 
     // 3. Create MultiRaft — join any group that includes this node,
     //    either as a voter (group members) or as a learner (group
     //    learners). A learner-started group boots in the `Learner`
     //    role and will not run an election until a subsequent
     //    `PromoteLearner` conf change is applied.
-    let mut multi_raft = MultiRaft::new(config.node_id, routing.clone(), config.data_dir.clone())
-        .with_election_timeout(config.election_timeout_min, config.election_timeout_max)
-        .with_log_compaction_threshold(config.log_compaction_threshold);
+    let mut multi_raft = MultiRaft::new_with_shared_routing(
+        config.node_id,
+        routing.clone(),
+        config.data_dir.clone(),
+    )
+    .with_election_timeout(config.election_timeout_min, config.election_timeout_max)
+    .with_log_compaction_threshold(config.log_compaction_threshold);
     for g in &resp.groups {
         let is_voter = g.members.contains(&config.node_id);
         let is_learner = g.learners.contains(&config.node_id);
@@ -352,13 +361,16 @@ fn apply_join_response(
     info!(
         node_id = config.node_id,
         nodes = topology.node_count(),
-        groups = routing.num_groups(),
+        groups = routing
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .num_groups(),
         "joined cluster"
     );
 
     Ok(ClusterState {
         topology: Arc::new(RwLock::new(topology)),
-        routing: Arc::new(RwLock::new(routing)),
+        routing,
         multi_raft: Arc::new(Mutex::new(multi_raft)),
     })
 }

@@ -39,18 +39,33 @@ pub(super) fn bootstrap(
             .with_spki_pin(local_spki_pin),
     );
 
-    // Create routing table: all groups on this single node.
-    let routing = RoutingTable::uniform(
+    // Create routing table: all groups on this single node. The configured
+    // replication factor is passed through as-is; `RoutingTable::uniform`
+    // clamps each group's voter set to the number of available nodes (just
+    // this one at bootstrap), so a single founding node always starts with
+    // one voter per group. The configured RF is persisted in `ClusterSettings`
+    // and governs how many learners get promoted to voters as peers join.
+    // ONE shared routing handle: MultiRaft and ClusterState read/write the
+    // same table so committed Raft conf-changes converge the data-plane view.
+    let routing = Arc::new(RwLock::new(RoutingTable::uniform(
         config.num_groups,
         &[config.node_id],
-        config.replication_factor.min(1), // Single node → RF=1.
-    );
+        config.replication_factor,
+    )));
 
     // Create MultiRaft with all groups (single-node, no peers).
-    let mut multi_raft = MultiRaft::new(config.node_id, routing.clone(), config.data_dir.clone())
-        .with_election_timeout(config.election_timeout_min, config.election_timeout_max)
-        .with_log_compaction_threshold(config.log_compaction_threshold);
-    for group_id in routing.group_ids() {
+    let mut multi_raft = MultiRaft::new_with_shared_routing(
+        config.node_id,
+        routing.clone(),
+        config.data_dir.clone(),
+    )
+    .with_election_timeout(config.election_timeout_min, config.election_timeout_max)
+    .with_log_compaction_threshold(config.log_compaction_threshold);
+    let group_ids = routing
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .group_ids();
+    for group_id in group_ids {
         multi_raft.add_group(group_id, vec![])?;
     }
 
@@ -70,7 +85,7 @@ pub(super) fn bootstrap(
     catalog.save_cluster_id(cluster_id)?;
     catalog.save_cluster_settings(&ClusterSettings::from_config(config))?;
     catalog.save_topology(&topology)?;
-    catalog.save_routing(&routing)?;
+    catalog.save_routing(&routing.read().unwrap_or_else(|p| p.into_inner()))?;
 
     info!(
         node_id = config.node_id,
@@ -81,7 +96,7 @@ pub(super) fn bootstrap(
 
     Ok(ClusterState {
         topology: Arc::new(RwLock::new(topology)),
-        routing: Arc::new(RwLock::new(routing)),
+        routing,
         multi_raft: Arc::new(Mutex::new(multi_raft)),
     })
 }
@@ -138,10 +153,54 @@ mod tests {
 
         assert!(catalog.is_bootstrapped().unwrap());
         let settings = catalog.load_cluster_settings().unwrap().unwrap();
-        assert_eq!(settings.replication_factor, 1); // clamped to 1 for single node
+        assert_eq!(settings.replication_factor, 1); // config RF is 1 here
         let loaded_topo = catalog.load_topology().unwrap().unwrap();
         assert_eq!(loaded_topo.node_count(), 1);
         let loaded_rt = catalog.load_routing().unwrap().unwrap();
         assert_eq!(loaded_rt.num_groups(), 5);
+    }
+
+    #[test]
+    fn bootstrap_preserves_configured_replication_factor() {
+        // A founding node configured with RF=3 must persist RF=3 in
+        // ClusterSettings (so learners get promoted to voters as peers join),
+        // while its routing table starts with a single voter per group because
+        // it is the only node present.
+        let (_dir, catalog) = temp_catalog();
+        let config = ClusterConfig {
+            node_id: 1,
+            listen_addr: "127.0.0.1:9401".parse().unwrap(),
+            seed_nodes: vec!["127.0.0.1:9401".parse().unwrap()],
+            num_groups: 4,
+            replication_factor: 3,
+            data_dir: _dir.path().to_path_buf(),
+            force_bootstrap: false,
+            join_retry: Default::default(),
+            swim_udp_addr: None,
+            election_timeout_min: Duration::from_millis(150),
+            election_timeout_max: Duration::from_millis(300),
+            install_snapshot_chunk_bytes: 4 * 1024 * 1024,
+            orphan_partial_max_age_secs: 300,
+            log_compaction_threshold: None,
+        };
+
+        let state = bootstrap(&config, &catalog, None).unwrap();
+        let routing = state.routing.read().unwrap();
+
+        // Configured RF survives bootstrap unchanged.
+        let settings = catalog.load_cluster_settings().unwrap().unwrap();
+        assert_eq!(settings.replication_factor, 3);
+
+        // But every group has exactly one voter — the sole founding node —
+        // because routing clamps the voter set to the node count.
+        for group_id in routing.group_ids() {
+            let members = &routing.group_info(group_id).unwrap().members;
+            assert_eq!(
+                members.len(),
+                1,
+                "group {group_id} must start with a single voter at bootstrap"
+            );
+            assert_eq!(members, &vec![config.node_id]);
+        }
     }
 }
