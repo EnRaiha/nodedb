@@ -9,9 +9,26 @@ use nodedb_types::config::tuning::ClusterTransportTuning;
 use super::node::TestClusterNode;
 use super::wait::wait_for;
 
+/// The spawn configuration used to bring up every node in a cluster.
+///
+/// Captured at spawn so that a later [`TestCluster::add_learner_node`]
+/// brings the new node up with the *same* tuning — most importantly the
+/// same Raft `log_compaction_threshold`, so the learner behaves
+/// identically to the original members.
+#[derive(Clone)]
+struct ClusterSpawnConfig {
+    tuning: ClusterTransportTuning,
+    graph_tuning: nodedb_types::config::tuning::GraphTuning,
+    query_tuning: nodedb_types::config::tuning::QueryTuning,
+    num_cores: usize,
+    log_compaction_threshold: Option<u64>,
+}
+
 /// An in-process cluster of `TestClusterNode`s.
 pub struct TestCluster {
     pub nodes: Vec<TestClusterNode>,
+    /// Config used for the original members; reused by `add_learner_node`.
+    spawn_config: ClusterSpawnConfig,
 }
 
 impl TestCluster {
@@ -119,6 +136,27 @@ impl TestCluster {
         .await
     }
 
+    /// Spawn a 3-node cluster with a low Raft `log_compaction_threshold` on
+    /// every node, so a handful of writes compacts the leader's data-group
+    /// log past the start. Once compacted, a freshly-joined learner cannot be
+    /// caught up via `AppendEntries` — the leader must send a real
+    /// `InstallSnapshot`. Used by the install-snapshot end-to-end test
+    /// together with [`Self::add_learner_node`].
+    ///
+    /// Uses the standard fast-election tuning and 1 Data-Plane core per node.
+    pub async fn spawn_three_with_compaction_threshold(
+        threshold: u64,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_inner(
+            fast_cluster_tuning(),
+            nodedb_types::config::tuning::GraphTuning::default(),
+            nodedb_types::config::tuning::QueryTuning::default(),
+            1,
+            Some(threshold),
+        )
+        .await
+    }
+
     /// Spawn a 3-node cluster with custom cluster-transport, graph engine tuning,
     /// query execution tuning, and a specific core count per node.
     ///
@@ -130,13 +168,27 @@ impl TestCluster {
         query_tuning: nodedb_types::config::tuning::QueryTuning,
         num_cores: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let node1 = TestClusterNode::spawn_with_tuning_graph_query_and_cores(
+        Self::spawn_three_inner(tuning, graph_tuning, query_tuning, num_cores, None).await
+    }
+
+    /// Shared 3-node spawn body. Threads an optional Raft
+    /// `log_compaction_threshold` into every node's spawn; all public
+    /// `spawn_three_*` entry points funnel here.
+    async fn spawn_three_inner(
+        tuning: ClusterTransportTuning,
+        graph_tuning: nodedb_types::config::tuning::GraphTuning,
+        query_tuning: nodedb_types::config::tuning::QueryTuning,
+        num_cores: usize,
+        log_compaction_threshold: Option<u64>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let node1 = TestClusterNode::spawn_with_full_config(
             1,
             vec![],
             tuning.clone(),
             graph_tuning.clone(),
             query_tuning.clone(),
             num_cores,
+            log_compaction_threshold,
         )
         .await?;
 
@@ -154,13 +206,14 @@ impl TestCluster {
         }
 
         let seeds = vec![node1.listen_addr];
-        let node2 = TestClusterNode::spawn_with_tuning_graph_query_and_cores(
+        let node2 = TestClusterNode::spawn_with_full_config(
             2,
             seeds.clone(),
             tuning.clone(),
             graph_tuning.clone(),
             query_tuning.clone(),
             num_cores,
+            log_compaction_threshold,
         )
         .await?;
 
@@ -176,18 +229,26 @@ impl TestCluster {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let node3 = TestClusterNode::spawn_with_tuning_graph_query_and_cores(
+        let node3 = TestClusterNode::spawn_with_full_config(
             3,
             seeds,
-            tuning,
-            graph_tuning,
-            query_tuning,
+            tuning.clone(),
+            graph_tuning.clone(),
+            query_tuning.clone(),
             num_cores,
+            log_compaction_threshold,
         )
         .await?;
 
         let cluster = Self {
             nodes: vec![node1, node2, node3],
+            spawn_config: ClusterSpawnConfig {
+                tuning,
+                graph_tuning,
+                query_tuning,
+                num_cores,
+                log_compaction_threshold,
+            },
         };
 
         wait_for(
@@ -338,6 +399,94 @@ impl TestCluster {
         .await;
 
         Ok(cluster)
+    }
+
+    /// Add a fresh node to the running cluster as a learner and return a
+    /// reference to it.
+    ///
+    /// This drives the **production** runtime membership path end to end —
+    /// no hand-copied state:
+    ///
+    /// 1. Spawn a brand-new full node (fresh temp data dir, its own
+    ///    ephemeral QUIC + pgwire ports, 1 core, the SAME cluster config as
+    ///    the original members — including the low
+    ///    `log_compaction_threshold`). Its only seed is node 1's pre-bound
+    ///    listen address. Because the node has no prior catalog, the
+    ///    cluster-init dispatcher takes the **join** path: the node sends a
+    ///    `RaftRpc::JoinRequest` to the seed.
+    ///
+    /// 2. The seed's `RaftLoop::join_flow` (running on its live transport)
+    ///    is the real conf-change driver:
+    ///    - registers the joiner's address on the leader's transport
+    ///      (`transport.register_peer`) so the leader can immediately
+    ///      `AppendEntries` / `InstallSnapshot` to it,
+    ///    - admits it into topology, then proposes
+    ///      `ConfChange::AddLearner(new_node_id)` on **every** Raft group
+    ///      the node is missing (metadata + every data group),
+    ///    - waits for each conf-change to commit, persists topology +
+    ///      routing, and broadcasts a `TopologyUpdate` to every active peer
+    ///      so the *other* existing nodes also learn the joiner's address
+    ///      (peer wiring in both directions).
+    ///
+    ///    The `JoinResponse` carries the post-`AddLearner` routing, and the
+    ///    joining node reconstructs its local `MultiRaft` with each data
+    ///    group started in the `Learner` role (`add_group_as_learner`).
+    ///
+    /// 3. The learner now lives in every group as a non-voter. On the next
+    ///    leader tick, the leader sees the learner's `next_index` is below
+    ///    its compacted `snapshot_index`, so it cannot use `AppendEntries`
+    ///    and instead builds a real per-group snapshot via the installed
+    ///    `DataPlaneSnapshotBuilder` and streams it with `InstallSnapshot`.
+    ///    The learner applies it through the `DataPlaneSnapshotApplier`.
+    ///
+    /// This method blocks until the new node is visible in every node's
+    /// topology and every Raft group has fully propagated (via
+    /// [`Self::wait_for_full_apply_convergence`]). It does **not** assert
+    /// the data is present — that is the caller's job (query the learner's
+    /// own pgwire client).
+    ///
+    /// Returns a reference to the newly-added node (the last entry in
+    /// [`Self::nodes`]).
+    pub async fn add_learner_node(
+        &mut self,
+    ) -> Result<&TestClusterNode, Box<dyn std::error::Error + Send + Sync>> {
+        let new_node_id = self.nodes.iter().map(|n| n.node_id).max().unwrap_or(0) + 1;
+        let seeds = vec![self.nodes[0].listen_addr];
+        let cfg = self.spawn_config.clone();
+
+        let learner = TestClusterNode::spawn_with_full_config(
+            new_node_id,
+            seeds,
+            cfg.tuning,
+            cfg.graph_tuning,
+            cfg.query_tuning,
+            cfg.num_cores,
+            cfg.log_compaction_threshold,
+        )
+        .await?;
+
+        self.nodes.push(learner);
+        let expected = self.nodes.len();
+
+        // Wait until every node (including the new learner) sees the full
+        // membership. The join broadcasts a TopologyUpdate to existing
+        // peers, so this converges once that propagates.
+        wait_for(
+            "every node sees the new learner in topology",
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+            || self.nodes.iter().all(|n| n.topology_size() == expected),
+        )
+        .await;
+
+        // Wait until every Raft group has fully propagated to every member /
+        // learner. For the learner this only completes once the leader's
+        // InstallSnapshot has been applied (its data-group log starts beyond
+        // the compacted region, so AppendEntries alone cannot advance it).
+        self.wait_for_full_apply_convergence(Duration::from_secs(30))
+            .await;
+
+        Ok(self.nodes.last().expect("learner just pushed"))
     }
 
     /// Find a node that will accept the given DDL — retries up to

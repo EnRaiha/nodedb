@@ -92,7 +92,7 @@ pub async fn init_cluster_with_transport(
         ),
         install_snapshot_chunk_bytes: 4 * 1024 * 1024,
         orphan_partial_max_age_secs: 300,
-        log_compaction_threshold: None,
+        log_compaction_threshold: config.log_compaction_threshold,
     };
 
     let lifecycle = nodedb_cluster::ClusterLifecycleTracker::new();

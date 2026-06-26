@@ -135,6 +135,9 @@ impl TestClusterNode {
     /// The `query_tuning` knob lets cluster tests override per-core Data Plane
     /// parameters (e.g. `columnar_flush_threshold`) to exercise flush behaviour
     /// on small datasets.
+    ///
+    /// Delegates to [`Self::spawn_with_full_config`] with
+    /// `log_compaction_threshold = None` (auto-compaction disabled).
     pub async fn spawn_with_tuning_graph_query_and_cores(
         node_id: u64,
         seed_nodes: Vec<SocketAddr>,
@@ -142,6 +145,37 @@ impl TestClusterNode {
         graph_tuning: nodedb_types::config::tuning::GraphTuning,
         query_tuning: nodedb_types::config::tuning::QueryTuning,
         num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_with_full_config(
+            node_id,
+            seed_nodes,
+            tuning,
+            graph_tuning,
+            query_tuning,
+            num_cores,
+            None,
+        )
+        .await
+    }
+
+    /// Lowest-level cluster-node spawn. In addition to the tuning knobs of
+    /// [`Self::spawn_with_tuning_graph_query_and_cores`], this accepts the
+    /// Raft `log_compaction_threshold`: when `Some(n)`, every Raft group on
+    /// this node auto-compacts its log once it has more than `n` applied
+    /// entries past the snapshot index. A low value forces the leader's
+    /// data-group log to compact past the start after a handful of writes,
+    /// which is what makes a freshly-joined learner unreachable via
+    /// `AppendEntries` and forces a real `InstallSnapshot`.
+    ///
+    /// Every other spawn entry point delegates here with `None`.
+    pub async fn spawn_with_full_config(
+        node_id: u64,
+        seed_nodes: Vec<SocketAddr>,
+        tuning: ClusterTransportTuning,
+        graph_tuning: nodedb_types::config::tuning::GraphTuning,
+        query_tuning: nodedb_types::config::tuning::QueryTuning,
+        num_cores: usize,
+        log_compaction_threshold: Option<u64>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let data_dir = tempfile::tempdir()?;
         let data_dir_path: PathBuf = data_dir.path().to_path_buf();
@@ -174,6 +208,7 @@ impl TestClusterNode {
             login_attempts_per_ip_per_min: 30,
             login_attempts_per_user_per_min: 10,
             insecure_transport: true,
+            log_compaction_threshold,
         };
 
         // Open WAL + dispatcher + event bus.

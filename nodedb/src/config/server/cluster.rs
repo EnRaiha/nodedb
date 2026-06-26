@@ -94,6 +94,21 @@ pub struct ClusterSettings {
     /// Default: `false`.
     #[serde(default)]
     pub insecure_transport: bool,
+
+    /// Auto-compaction threshold for every Raft group on this node:
+    /// the number of applied entries retained past the snapshot index
+    /// before the log is compacted and a fresh snapshot is taken.
+    ///
+    /// `None` (the default) disables auto-compaction, so a lagging
+    /// peer is always caught up via `AppendEntries`. Setting a low
+    /// value forces the leader's data-group log to compact past the
+    /// start after only a handful of writes, which is what makes a
+    /// freshly-joined learner unable to be caught up incrementally —
+    /// the leader must send a real `InstallSnapshot` instead. Threaded
+    /// to each group's `RaftConfig::log_compaction_threshold` via
+    /// `nodedb_cluster::ClusterConfig`.
+    #[serde(default)]
+    pub log_compaction_threshold: Option<u64>,
 }
 
 /// Paths to on-disk PEM-encoded TLS credentials.

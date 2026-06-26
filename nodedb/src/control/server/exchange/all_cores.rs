@@ -23,7 +23,7 @@ use crate::control::server::exchange::gather::eager_dispatch_to_all_cores;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
 use nodedb_physical::physical_plan::{
-    BspSuperstepResult, GraphOp, PhysicalPlan, WccSuperstepResult,
+    BspSuperstepResult, GraphOp, MetaOp, PhysicalPlan, WccSuperstepResult,
 };
 
 /// The canonical node-level result of fanning a plan across all local cores
@@ -117,6 +117,72 @@ pub async fn execute_plan_all_local_cores(
             }
         },
 
+        // ── Meta ops: most return row arrays (→ generic gather); the
+        // per-node snapshot ops return ONE opaque per-node blob and must NOT
+        // be array-wrapped by the row gather/merge. ─────────────────────────
+        PhysicalPlan::Meta(meta) => match meta {
+            // A `CreateTenantSnapshot` response is a single `#[msgpack(map)]`
+            // `TenantDataSnapshot` blob per core — NOT an array of rows. The
+            // row gather (`encode_msgpack_array(extract_msgpack_elements(..))`)
+            // would prepend a fixarray header to the map, corrupting the
+            // section so restore's `from_msgpack::<TenantDataSnapshot>` fails.
+            // Merge the per-core partial snapshots by typed field concatenation
+            // (the same disjoint-per-core merge pattern as BSP/WCC) and return
+            // one snapshot blob — identical in shape to the local
+            // `snapshot_self`/`dispatch_async` path. At 1 core/node this is the
+            // lone core's snapshot verbatim.
+            MetaOp::CreateTenantSnapshot { .. } => {
+                fan_tenant_snapshot_all_cores(state, tenant_id, database_id, plan, trace_id).await
+            }
+            // A `RestoreTenantSnapshot` response is a single JSON result object
+            // (`{tenant_id, documents_restored, ...}`), not an array of rows.
+            // Array-wrapping it is the same single-blob corruption class; return
+            // the lone core's payload verbatim so the restore caller's
+            // `success`-only check (and any future result inspection) sees the
+            // unwrapped object.
+            MetaOp::RestoreTenantSnapshot { .. } => {
+                single_blob_gather(state, tenant_id, database_id, plan, trace_id).await
+            }
+            // Every other MetaOp either returns an array of rows / count payload
+            // (→ generic gather is correct) or is a single-core control op whose
+            // single-element wrap is harmless. Enumerated exhaustively (no
+            // `_ =>`) so a NEW single-blob MetaOp forces a decision here.
+            MetaOp::WalAppend { .. }
+            | MetaOp::Cancel { .. }
+            | MetaOp::TransactionBatch { .. }
+            | MetaOp::CreateSnapshot
+            | MetaOp::Compact
+            | MetaOp::Checkpoint
+            | MetaOp::RegisterContinuousAggregate { .. }
+            | MetaOp::UnregisterContinuousAggregate { .. }
+            | MetaOp::ListContinuousAggregates
+            | MetaOp::ConvertCollection { .. }
+            | MetaOp::PurgeTenant { .. }
+            | MetaOp::UnregisterCollection { .. }
+            | MetaOp::UnregisterMaterializedView { .. }
+            | MetaOp::QueryCollectionSize { .. }
+            | MetaOp::EnforceTimeseriesRetention { .. }
+            | MetaOp::TemporalPurgeEdgeStore { .. }
+            | MetaOp::TemporalPurgeDocumentStrict { .. }
+            | MetaOp::TemporalPurgeColumnar { .. }
+            | MetaOp::TemporalPurgeCrdt { .. }
+            | MetaOp::TemporalPurgeArray { .. }
+            | MetaOp::AlterArray { .. }
+            | MetaOp::ApplyContinuousAggRetention
+            | MetaOp::QueryAggregateWatermark { .. }
+            | MetaOp::QueryLastValues { .. }
+            | MetaOp::QueryLastValue { .. }
+            | MetaOp::CalvinExecuteStatic { .. }
+            | MetaOp::CalvinExecutePassive { .. }
+            | MetaOp::CalvinExecuteActive { .. }
+            | MetaOp::RebuildIndex { .. }
+            | MetaOp::PutSynonymGroup { .. }
+            | MetaOp::DeleteSynonymGroup { .. }
+            | MetaOp::RenameCollection { .. } => {
+                generic_gather(state, tenant_id, database_id, plan, trace_id).await
+            }
+        },
+
         // ── All other PhysicalPlan variants → generic gather ──────────────────
         PhysicalPlan::Vector(_)
         | PhysicalPlan::Document(_)
@@ -127,7 +193,6 @@ pub async fn execute_plan_all_local_cores(
         | PhysicalPlan::Spatial(_)
         | PhysicalPlan::Crdt(_)
         | PhysicalPlan::Query(_)
-        | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
         | PhysicalPlan::ClusterArray(_) => {
             generic_gather(state, tenant_id, database_id, plan, trace_id).await
@@ -151,6 +216,113 @@ async fn generic_gather(
     Ok(NodeLevelResult {
         payload: outcome.merged_array,
         watermark_lsn: outcome.watermark_lsn,
+    })
+}
+
+/// Single-blob gather: fan the plan across all local cores but return the lone
+/// non-empty core's payload VERBATIM, with no row array-wrap.
+///
+/// For a Meta op that returns one opaque per-node blob (e.g. a JSON result
+/// object), routing through the row gather would prepend a msgpack array header
+/// and corrupt the blob. The local single-core dispatch path returns the bytes
+/// unchanged; this mirrors that. At 1 core/node exactly one core responds and
+/// its payload is returned as-is; if more than one core returns a non-empty
+/// payload (a single-core control op fanned to many cores), the first is kept —
+/// these ops produce an identical per-core acknowledgement, so any one is the
+/// canonical node-level result.
+async fn single_blob_gather(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+) -> crate::Result<NodeLevelResult> {
+    let responses =
+        gather_graph_op_all_cores(state, tenant_id, database_id, plan, trace_id, "single-blob")
+            .await?;
+
+    let mut watermark_lsn = Lsn::ZERO;
+    let mut payload: Option<Vec<u8>> = None;
+    for resp in responses {
+        if resp.watermark_lsn > watermark_lsn {
+            watermark_lsn = resp.watermark_lsn;
+        }
+        if payload.is_none() && !resp.payload.is_empty() {
+            payload = Some(resp.payload.as_ref().to_vec());
+        }
+    }
+
+    Ok(NodeLevelResult {
+        payload: payload.unwrap_or_default(),
+        watermark_lsn,
+    })
+}
+
+/// Tenant-snapshot fan: dispatch `CreateTenantSnapshot` across all local cores,
+/// decode each core's partial [`TenantDataSnapshot`], merge them by field
+/// concatenation, and re-encode ONE snapshot blob.
+///
+/// Each core scans only the engine state for the vShards homed on that core, so
+/// the per-core snapshots cover DISJOINT key sets — concatenating every `Vec`
+/// field requires no dedup, exactly like the BSP/WCC superstep merges. The
+/// result is byte-shape-identical to the local `snapshot_self` path's single
+/// `TenantDataSnapshot` blob, so backup sections from the local and remote
+/// transports converge on the same `from_msgpack::<TenantDataSnapshot>` decode.
+/// At 1 core/node this yields the lone core's snapshot unchanged.
+async fn fan_tenant_snapshot_all_cores(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+) -> crate::Result<NodeLevelResult> {
+    use crate::types::TenantDataSnapshot;
+
+    let responses = gather_graph_op_all_cores(
+        state,
+        tenant_id,
+        database_id,
+        plan,
+        trace_id,
+        "tenant-snapshot",
+    )
+    .await?;
+
+    let mut merged = TenantDataSnapshot::default();
+    let mut watermark_lsn = Lsn::ZERO;
+    for resp in responses {
+        if resp.watermark_lsn > watermark_lsn {
+            watermark_lsn = resp.watermark_lsn;
+        }
+        if resp.payload.is_empty() {
+            continue;
+        }
+        let part: TenantDataSnapshot =
+            zerompk::from_msgpack(resp.payload.as_ref()).map_err(|e| crate::Error::Codec {
+                detail: format!("tenant-snapshot gather: part decode: {e}"),
+            })?;
+        merged.documents.extend(part.documents);
+        merged.indexes.extend(part.indexes);
+        merged.edges.extend(part.edges);
+        merged.vectors.extend(part.vectors);
+        merged.kv_tables.extend(part.kv_tables);
+        merged.crdt_state.extend(part.crdt_state);
+        merged.timeseries.extend(part.timeseries);
+        merged.flushed_ts_segments.extend(part.flushed_ts_segments);
+        merged.columnar_engines.extend(part.columnar_engines);
+        merged.surrogate_pk.extend(part.surrogate_pk);
+        merged.tenant_edges.extend(part.tenant_edges);
+        merged.tenant_crdt_state.extend(part.tenant_crdt_state);
+    }
+
+    let payload = zerompk::to_msgpack_vec(&merged).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("tenant-snapshot gather: merged encode: {e}"),
+    })?;
+
+    Ok(NodeLevelResult {
+        payload,
+        watermark_lsn,
     })
 }
 

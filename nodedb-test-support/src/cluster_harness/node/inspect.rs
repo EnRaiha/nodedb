@@ -80,6 +80,45 @@ impl TestClusterNode {
             .collect()
     }
 
+    /// Highest compacted snapshot index for `group_id` from this node's
+    /// local Raft state, or `0` if the group isn't hosted here or hasn't
+    /// compacted yet. A non-zero value means the log has been compacted
+    /// past the start — a lagging peer below this index can only be caught
+    /// up via `InstallSnapshot`, never `AppendEntries`. Used by the
+    /// install-snapshot end-to-end test to assert compaction happened on
+    /// the leader *before* the learner joined.
+    pub fn group_snapshot_index(&self, group_id: u64) -> u64 {
+        let Some(observer) = self.shared.cluster_observer.get() else {
+            return 0;
+        };
+        observer
+            .group_status
+            .group_statuses()
+            .into_iter()
+            .find(|g| g.group_id == group_id)
+            .map(|g| g.snapshot_index)
+            .unwrap_or(0)
+    }
+
+    /// Maximum compacted snapshot index across every **data** Raft group
+    /// hosted on this node (i.e. excluding the metadata group, id 0). A
+    /// non-zero value proves at least one data group's log has compacted
+    /// past the start, so a fresh learner on that group must be caught up
+    /// via `InstallSnapshot`.
+    pub fn max_data_group_snapshot_index(&self) -> u64 {
+        let Some(observer) = self.shared.cluster_observer.get() else {
+            return 0;
+        };
+        observer
+            .group_status
+            .group_statuses()
+            .into_iter()
+            .filter(|g| g.group_id != nodedb_cluster::METADATA_GROUP_ID)
+            .map(|g| g.snapshot_index)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Observed data-group (group 1) leader id from this node's local Raft
     /// state, or `0` if no leader is known yet.
     pub fn data_group_leader(&self) -> u64 {
