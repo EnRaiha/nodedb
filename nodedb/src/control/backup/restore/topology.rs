@@ -35,10 +35,10 @@ pub(super) fn split_by_current_topology(
     tenant_id: u64,
     merged: TenantDataSnapshot,
 ) -> SplitOutput {
-    let routing = state.cluster_routing.as_ref().map(|r| {
-        r.read()
-            .expect("invariant: cluster_routing RwLock is not poisoned")
-    });
+    let routing = state
+        .cluster_routing
+        .as_ref()
+        .map(|r| r.read().unwrap_or_else(|poisoned| poisoned.into_inner()));
     let single_node = routing.is_none() || state.cluster_transport.is_none();
 
     if single_node {
@@ -161,20 +161,16 @@ pub(super) fn split_by_current_topology(
             snap.edges.push(entry.clone());
         }
     }
-    for entry in &merged.crdt_state {
-        for snap in all_owners.values_mut() {
-            snap.crdt_state.push(entry.clone());
-        }
-    }
-    // Tenant-explicit CRDT (the field the snapshot CREATE handler writes today)
-    // is replicated-by-design too: every owning node imports the whole-tenant
-    // Loro doc. Dropping it here would silently lose all CRDT data on the
-    // cluster restore path even after `merge_sections` carries it through.
-    for entry in &merged.tenant_crdt_state {
-        for snap in all_owners.values_mut() {
-            snap.tenant_crdt_state.push(entry.clone());
-        }
-    }
+    // CRDT tenant state (both legacy `crdt_state` and current `tenant_crdt_state`)
+    // is NOT bucketed here: the per-node snapshot fan-out is race-prone (skips
+    // data groups that have not elected a leader yet) and not durable across
+    // restart. RESTORE drains both sections before this split and re-issues the
+    // whole-tenant Loro snapshot durably through Raft to every owning data group
+    // (see `crdt_reissue`). Both vecs are therefore empty here by contract.
+    debug_assert!(
+        merged.crdt_state.is_empty() && merged.tenant_crdt_state.is_empty(),
+        "CRDT tenant state must be drained before topology split"
+    );
 
     SplitOutput {
         buckets: all_owners,

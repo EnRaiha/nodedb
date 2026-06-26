@@ -109,6 +109,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         // Write operations.
         PhysicalPlan::Crdt(
             CrdtOp::Apply { .. }
+            | CrdtOp::ImportSnapshot { .. }
             | CrdtOp::RestoreToVersion { .. }
             | CrdtOp::ListInsert { .. }
             | CrdtOp::ListDelete { .. }

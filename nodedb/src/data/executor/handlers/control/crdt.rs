@@ -438,6 +438,50 @@ impl CoreLoop {
         self.sync_ack_response(task, status, applied_seq)
     }
 
+    /// Import a full whole-tenant Loro snapshot into the tenant CRDT engine.
+    ///
+    /// The durable RESTORE re-issue path replicates this through Raft so every
+    /// replica of the data group lands the same snapshot. `import_snapshot_bytes`
+    /// is a monotonic, idempotent, commutative Loro merge, so applying the same
+    /// bytes on every replica converges deterministically — there is no sync
+    /// idempotency gate and no per-document surrogate to bind.
+    pub(in crate::data::executor) fn execute_crdt_import_snapshot(
+        &mut self,
+        task: &ExecutionTask,
+        tenant_id: u64,
+        bytes: &[u8],
+    ) -> Response {
+        let tid = crate::types::TenantId::new(tenant_id);
+        debug!(core = self.core_id, %tid, "crdt import snapshot");
+        let engine = match self.get_crdt_engine(tid) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        };
+        match engine.import_snapshot_bytes(bytes) {
+            Ok(()) => {
+                self.checkpoint_coordinator.mark_dirty("crdt", 1);
+                self.response_ok(task)
+            }
+            Err(e) => {
+                warn!(core = self.core_id, error = %e, "crdt import snapshot failed");
+                self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                )
+            }
+        }
+    }
+
     /// Read the current HWM for a `(producer_id, stream_id)` pair without
     /// advancing it. Returns `0` when no frame from this producer has been
     /// committed on this stream yet.

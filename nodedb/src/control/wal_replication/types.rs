@@ -388,6 +388,17 @@ pub enum ReplicatedWrite {
         updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
     },
 
+    /// Full whole-tenant Loro snapshot import. Used by RESTORE to durably
+    /// replicate the tenant CRDT doc to all Raft replicas of a data group
+    /// (replacing the race-prone per-node direct dispatch). `bytes` is
+    /// `TenantCrdtEngine::export_snapshot_bytes()` output; on apply every
+    /// replica calls `import_snapshot_bytes` (a monotonic, idempotent Loro
+    /// merge — deterministic across replicas).
+    CrdtImportTenant {
+        tenant_id: u64,
+        bytes: Vec<u8>,
+    },
+
     /// Dependent-read result broadcast for a Calvin txn.
     ///
     /// A passive participant proposes this entry to the per-vshard Raft group

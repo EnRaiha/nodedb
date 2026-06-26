@@ -16,7 +16,7 @@ use crate::control::server::http::types::{HttpCrdtApplyRequest, HttpCrdtApplyRes
 use crate::control::server::pgwire::types::hex_decode;
 use nodedb_physical::physical_plan::CrdtOp;
 
-use super::document::{dispatch_plan, extract_request_id};
+use super::document::extract_request_id;
 
 /// POST /v1/collections/{name}/crdt/apply
 ///
@@ -64,11 +64,24 @@ pub async fn crdt_apply(
         provenance: None,
     });
 
+    // Route through the Raft proposer gate so the delta is quorum-durable under
+    // replication. A local-only dispatch would land it on the receiving node only
+    // — lost to followers and entirely on leader failover. This handler is scoped
+    // to the default database (matching its surrogate assignment above).
     state.shared.tenant_request_start(identity.tenant_id);
-    let result = dispatch_plan(&state, identity.tenant_id, &collection, plan).await;
+    let result = crate::control::server::sync::raft_dispatch::dispatch_write_replicated(
+        &state.shared,
+        identity.tenant_id,
+        crate::types::DatabaseId::DEFAULT,
+        &collection,
+        plan,
+        std::time::Duration::from_secs(state.shared.tuning.network.default_deadline_secs),
+        crate::event::EventSource::User,
+    )
+    .await;
     state.shared.tenant_request_end(identity.tenant_id);
 
-    result?;
+    result.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(axum::Json(HttpCrdtApplyResponse::ok(
         collection,

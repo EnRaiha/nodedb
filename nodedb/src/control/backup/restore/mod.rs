@@ -7,6 +7,7 @@
 //! submodules; supporting primitives in `remote`, `sections`, and `topology`.
 
 pub mod columnar_reissue;
+pub(crate) mod crdt_reissue;
 mod orchestrate;
 mod remote;
 mod sections;

@@ -46,6 +46,9 @@ pub struct RestoreStats {
     pub flushed_ts_segments: usize,
     /// Number of timeseries collections re-issued durably (Raft/WAL) on restore.
     pub timeseries_reissued: usize,
+    /// Number of CRDT tenant-snapshot imports re-issued durably (Raft/WAL) on
+    /// restore — one per distinct data group that owns any CRDT collection.
+    pub crdt_reissued: usize,
     /// Number of PK→surrogate identity bindings rebound into the catalog.
     pub surrogate_pk: usize,
     pub nodes_dispatched: usize,
@@ -151,6 +154,16 @@ pub async fn restore_tenant(
     let timeseries_memtables = std::mem::take(&mut merged.timeseries);
     let flushed_ts_segments = std::mem::take(&mut merged.flushed_ts_segments);
 
+    // CRDT tenant state is NOT installed via the per-node snapshot fan-out: that
+    // dispatch is race-prone (skips data groups with no leader yet) and not
+    // durable across restart. Drain both the legacy `crdt_state` and the current
+    // `tenant_crdt_state` here and re-issue durably below as
+    // `CrdtOp::ImportSnapshot` (Raft-replicated in cluster mode; WAL-appended
+    // then installed in single-node mode). The topology split must therefore
+    // never see CRDT state — otherwise the coordinator would double-import.
+    let crdt_state = std::mem::take(&mut merged.crdt_state);
+    let tenant_crdt_state = std::mem::take(&mut merged.tenant_crdt_state);
+
     // Drain the PK→surrogate identity map before the topology split (the split
     // only routes per-key engine data). It is rebound into the destination
     // catalog after the data install dispatches succeed — without it restored
@@ -245,6 +258,20 @@ pub async fn restore_tenant(
     stats.timeseries_reissued =
         reissue_timeseries_snapshots(state, tenant_id, timeseries_memtables, flushed_ts_segments)
             .await?;
+
+    // Durable re-issue of CRDT tenant state. The whole-tenant Loro snapshot is
+    // proposed through Raft to every distinct data group owning any of the
+    // tenant's CRDT collections (Raft-replicated in cluster mode; WAL-appended
+    // then installed in single-node mode). Every replica applies the same
+    // idempotent Loro merge and converges deterministically. Any failure is
+    // fatal — no warn-and-continue.
+    stats.crdt_reissued = super::crdt_reissue::reissue_crdt_snapshots(
+        state,
+        TenantId::new(tenant_id),
+        crdt_state,
+        tenant_crdt_state,
+    )
+    .await?;
 
     Ok(stats)
 }

@@ -307,6 +307,142 @@ async fn backup_restore_preserves_timeseries_flushed_and_memtable() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Test 1b — CRDT: an applied delta survives BACKUP → RESTORE into a FRESH
+//           second cluster, and is readable on every node of the target.
+//
+// Closes a declared backup/restore gap: the prior engine-coverage tests pinned
+// timeseries and columnar but never exercised the `tenant_crdt_state` section of
+// the backup envelope. A `crdt_apply` populates one Loro doc per tenant; BACKUP
+// must capture it and RESTORE must fan it out to all nodes of cluster B.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CRDT_COLL: &str = "crdt_br";
+const CRDT_DOC: &str = "doc1";
+
+/// Build a real Loro snapshot delta for `CRDT_COLL`/`CRDT_DOC` with field
+/// `name=alice`, exactly as the single-node CRDT snapshot test does. Returns the
+/// hex `crdt_apply` decodes before merging into the tenant doc.
+fn build_crdt_delta_hex() -> String {
+    let doc = loro::LoroDoc::new();
+    let coll = doc.get_map(CRDT_COLL);
+    let row = coll
+        .insert_container(CRDT_DOC, loro::LoroMap::new())
+        .expect("row container");
+    row.insert("name", "alice").expect("field");
+    doc.commit();
+    let delta = doc
+        .export(loro::ExportMode::Snapshot)
+        .expect("export loro snapshot");
+    hex::encode(delta)
+}
+
+/// Read `crdt_state(CRDT_COLL, CRDT_DOC)` on `client`, retrying transient
+/// catch-up errors until `timeout`. Returns the (possibly empty) payload text.
+async fn read_crdt_state_when_ready(client: &tokio_postgres::Client, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match client
+            .simple_query(&format!("SELECT crdt_state('{CRDT_COLL}', '{CRDT_DOC}')"))
+            .await
+        {
+            Ok(rows) => {
+                for msg in rows {
+                    if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+                        let text = r.get(0).unwrap_or("").to_string();
+                        if !text.is_empty() {
+                            return text;
+                        }
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return String::new();
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            Err(ref e) => {
+                if Instant::now() >= deadline {
+                    panic!(
+                        "crdt_state never became readable within {timeout:?}: {}",
+                        db_detail(e)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_restore_preserves_crdt_state() {
+    // ── SOURCE cluster A ─────────────────────────────────────────────────────
+    let cluster_a = TestCluster::spawn_three().await.expect("cluster A");
+
+    // CRDT collection: default-engine document collection (the CRDT doc is one
+    // Loro doc per tenant). Matches the single-node CRDT snapshot round-trip test.
+    cluster_a
+        .exec_ddl_on_any_leader(&format!("CREATE COLLECTION {CRDT_COLL}"))
+        .await
+        .expect("CREATE CRDT COLLECTION on cluster A");
+
+    // Apply one CRDT delta through node 0's gateway (proposes through Raft).
+    let delta_hex = build_crdt_delta_hex();
+    cluster_a.nodes[0]
+        .client
+        .simple_query(&format!(
+            "SELECT crdt_apply('{CRDT_COLL}', '{CRDT_DOC}', '{delta_hex}')"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("crdt_apply on cluster A: {}", db_detail(&e)));
+
+    cluster_a
+        .wait_for_full_apply_convergence(Duration::from_secs(15))
+        .await;
+
+    // Sanity: the delta is readable on cluster A before backup.
+    let src_state =
+        read_crdt_state_when_ready(&cluster_a.nodes[0].client, Duration::from_secs(10)).await;
+    assert!(
+        !src_state.is_empty(),
+        "source cluster A must read back the applied CRDT row before backup"
+    );
+
+    // Capture the backup. `bytes` is owned by the test and survives A's shutdown.
+    let bytes = drain_backup(0, &cluster_a, TENANT).await;
+    assert!(!bytes.is_empty(), "backup must produce non-empty bytes");
+
+    cluster_a.shutdown().await;
+
+    // ── TARGET cluster B (fresh — no CRDT collection, no data) ───────────────
+    let cluster_b = TestCluster::spawn_three().await.expect("cluster B");
+
+    push_restore(0, &cluster_b, TENANT, bytes)
+        .await
+        .expect("RESTORE CRDT state into fresh cluster B");
+
+    cluster_b
+        .wait_for_full_apply_convergence(Duration::from_secs(10))
+        .await;
+
+    // ── Final assertion on EVERY node of cluster B ───────────────────────────
+    // The restore fan-out replicates the tenant CRDT doc to all nodes; reading
+    // any node must return the row. `crdt_state` returns the exported Loro
+    // snapshot bytes, which exist only if the row is present in that node's
+    // tenant doc — a non-empty result proves the `tenant_crdt_state` section
+    // round-tripped through BACKUP → RESTORE.
+    for node in &cluster_b.nodes {
+        let state = read_crdt_state_when_ready(&node.client, Duration::from_secs(15)).await;
+        assert!(
+            !state.is_empty(),
+            "BUG: cluster B node {} read EMPTY crdt_state after restore — the \
+             `tenant_crdt_state` section was NOT carried through BACKUP/RESTORE",
+            node.node_id
+        );
+    }
+
+    cluster_b.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Test 2 — Plain-Columnar: flushed segment + memtable rows survive restore
 //           into a FRESH second cluster
 // ─────────────────────────────────────────────────────────────────────────────

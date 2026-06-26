@@ -143,13 +143,17 @@ pub async fn crdt_apply(
         provenance: None,
     });
 
-    super::sync_dispatch::dispatch_async(
+    // Route through the Raft proposer gate so the delta is quorum-durable under
+    // replication. A local-only dispatch would land the delta on the receiving
+    // node only — it would be lost to every follower and entirely on failover.
+    crate::control::server::sync::raft_dispatch::dispatch_write_replicated(
         state,
         tenant_id,
         database_id,
         collection,
         plan,
         Duration::from_secs(state.tuning.network.default_deadline_secs),
+        crate::event::EventSource::User,
     )
     .await
     .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;

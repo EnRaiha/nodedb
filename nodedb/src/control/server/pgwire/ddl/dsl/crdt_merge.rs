@@ -86,13 +86,16 @@ pub async fn crdt_merge(
         provenance: None,
     });
 
-    crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+    // Route the merge result through the Raft proposer gate so the applied delta
+    // is quorum-durable under replication, not lost to followers on failover.
+    crate::control::server::sync::raft_dispatch::dispatch_write_replicated(
         state,
         tenant_id,
         database_id,
         collection,
         apply_plan,
         Duration::from_secs(state.tuning.network.default_deadline_secs),
+        crate::event::EventSource::User,
     )
     .await
     .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;

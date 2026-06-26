@@ -4338,6 +4338,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "hex",
+ "loro",
  "nexar",
  "nodedb",
  "nodedb-array",

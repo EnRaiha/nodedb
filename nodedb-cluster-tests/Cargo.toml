@@ -30,6 +30,8 @@ tempfile = "3"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+hex = "0.4"
+loro = { workspace = true }
 nexar = { workspace = true }
 quinn = { workspace = true }
 redb = { workspace = true }

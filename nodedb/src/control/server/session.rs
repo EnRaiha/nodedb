@@ -665,6 +665,37 @@ impl Session {
             }
         };
 
+        // CRDT applies must be quorum-durable: route them through the Raft
+        // proposer gate so the delta replicates to followers instead of landing
+        // only on the receiving node (which loses it on leader failover). Every
+        // other op keeps the direct SPSC path below. The success/error response
+        // shape is preserved identically to the SPSC path.
+        if op == "crdt_apply" {
+            // `collection` was moved into the plan above; re-read it from the
+            // request body (indexing only borrows). The replicated vshard is
+            // collection-keyed (matching every other write path and the Raft data
+            // group routing), NOT the document-keyed `vshard_id` used for local
+            // core locality above.
+            let collection = body["collection"].as_str().unwrap_or("default");
+            let payload = crate::control::server::sync::raft_dispatch::dispatch_write_replicated(
+                &self.state,
+                tenant_id,
+                database_id,
+                collection,
+                plan,
+                Duration::from_secs(self.state.tuning.network.default_deadline_secs),
+                crate::event::EventSource::User,
+            )
+            .await?;
+            let payload_str = String::from_utf8_lossy(&payload).into_owned();
+            let resp_json = format!(
+                r#"{{"request_id":{},"status":"ok","payload":"{}","watermark_lsn":0,"error_code":null}}"#,
+                request_id.as_u64(),
+                payload_str,
+            );
+            return Ok(resp_json.into_bytes());
+        }
+
         let request = Request {
             request_id,
             tenant_id,

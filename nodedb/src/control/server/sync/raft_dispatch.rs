@@ -196,8 +196,47 @@ pub async fn dispatch_sync_bytes(
     timeout: Duration,
     event_source: EventSource,
 ) -> crate::Result<Vec<u8>> {
-    // A5 (deferred): sync inbound envelope carries no session database yet.
-    let vshard_id = VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection);
+    // The sync inbound envelope carries no session database yet, so the Lite
+    // sync path is scoped to the default database.
+    dispatch_write_replicated(
+        state,
+        tenant_id,
+        DatabaseId::DEFAULT,
+        collection,
+        plan,
+        timeout,
+        event_source,
+    )
+    .await
+}
+
+/// Dispatch a write so it is quorum-durable when the node is clustered.
+///
+/// Computes the vshard from `database_id` + `collection`, then applies the same
+/// proposer-gate-then-local-fallback policy used by every write that must not be
+/// lost on leader failover:
+///
+/// * Cluster path — when `async_raft_proposer` is set and `plan` maps to a
+///   [`ReplicatedEntry`], the write is proposed through Raft and blocks until the
+///   entry is committed to a quorum and applied locally. This is what makes a
+///   `crdt_apply` durable across replicas: without it the delta lands only on the
+///   receiving node and is lost to every follower (and entirely on leader
+///   failover).
+/// * Single-node / non-replicated path — `async_raft_proposer` is `None` (or the
+///   plan has no replicated form), so the write goes straight to the local Data
+///   Plane and the tenant write-HLC is advanced on success.
+///
+/// Returns the apply-payload bytes the caller can map to its own success shape.
+pub async fn dispatch_write_replicated(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    collection: &str,
+    plan: PhysicalPlan,
+    timeout: Duration,
+    event_source: EventSource,
+) -> crate::Result<Vec<u8>> {
+    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
 
     if let Some(proposer) = state.async_raft_proposer.get()
         && let Some(entry) = to_replicated_entry(tenant_id, vshard_id, &plan)
@@ -209,8 +248,7 @@ pub async fn dispatch_sync_bytes(
         crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async_response_with_source(
             state,
             tenant_id,
-            // A5 (deferred): sync inbound envelope carries no session database yet.
-            DatabaseId::DEFAULT,
+            database_id,
             collection,
             plan,
             timeout,
