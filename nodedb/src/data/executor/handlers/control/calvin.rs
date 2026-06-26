@@ -39,6 +39,18 @@ use nodedb_physical::physical_plan::meta::PassiveReadKeyId;
 
 use std::collections::BTreeMap;
 
+/// Execution context shared by both static and active Calvin handler variants.
+///
+/// Bundles the epoch-scoped parameters that repeat across
+/// `execute_calvin_execute_static` and `execute_calvin_execute_active`,
+/// keeping each function's argument count within the lint budget.
+pub(in crate::data::executor) struct CalvinExecCtx {
+    pub epoch: u64,
+    pub position: u32,
+    pub epoch_system_ms: i64,
+    pub is_group_leader: bool,
+}
+
 impl CoreLoop {
     /// Execute a static-set Calvin sequenced transaction batch.
     ///
@@ -52,12 +64,16 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_calvin_execute_static(
         &mut self,
         task: &ExecutionTask,
-        epoch: u64,
-        position: u32,
-        epoch_system_ms: i64,
+        ctx: CalvinExecCtx,
         tenant_id: &TenantId,
         plans: &[PhysicalPlan],
     ) -> Response {
+        let CalvinExecCtx {
+            epoch,
+            position,
+            epoch_system_ms,
+            is_group_leader,
+        } = ctx;
         let vshard_id = task.request.vshard_id.as_u32();
         debug!(
             core = self.core_id,
@@ -65,6 +81,7 @@ impl CoreLoop {
             position,
             epoch_system_ms,
             vshard_id,
+            is_group_leader,
             plan_count = plans.len(),
             "calvin execute static"
         );
@@ -81,7 +98,9 @@ impl CoreLoop {
         self.hlc
             .update_from_remote(epoch_system_ms.saturating_mul(NANOS_PER_MS));
         self.epoch_system_ms = Some(epoch_system_ms);
+        self.ollp_is_group_leader = is_group_leader;
         let result = self.execute_transaction_batch(task, tenant_id.as_u64(), plans);
+        self.ollp_is_group_leader = false;
         self.epoch_system_ms = None;
         result
     }
@@ -147,17 +166,20 @@ impl CoreLoop {
     /// If the verification fails (mismatched predicate, in future variants),
     /// returns `OllpRetryRequired` status and does NOT write. The OLLP
     /// orchestrator on the Control Plane interprets this status and retries.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_calvin_execute_active(
         &mut self,
         task: &ExecutionTask,
-        epoch: u64,
-        position: u32,
-        epoch_system_ms: i64,
+        ctx: CalvinExecCtx,
         tenant_id: &TenantId,
         plans: &[PhysicalPlan],
         injected_reads: &BTreeMap<PassiveReadKeyId, Value>,
     ) -> Response {
+        let CalvinExecCtx {
+            epoch,
+            position,
+            epoch_system_ms,
+            is_group_leader,
+        } = ctx;
         let vshard_id = task.request.vshard_id.as_u32();
         debug!(
             core = self.core_id,
@@ -165,6 +187,7 @@ impl CoreLoop {
             position,
             epoch_system_ms,
             vshard_id,
+            is_group_leader,
             plan_count = plans.len(),
             injected_count = injected_reads.len(),
             "calvin execute active"
@@ -194,7 +217,9 @@ impl CoreLoop {
         self.hlc
             .update_from_remote(epoch_system_ms.saturating_mul(NANOS_PER_MS));
         self.epoch_system_ms = Some(epoch_system_ms);
+        self.ollp_is_group_leader = is_group_leader;
         let result = self.execute_transaction_batch(task, tenant_id.as_u64(), plans);
+        self.ollp_is_group_leader = false;
         self.epoch_system_ms = None;
         result
     }

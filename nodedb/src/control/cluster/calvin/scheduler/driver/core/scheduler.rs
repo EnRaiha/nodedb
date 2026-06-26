@@ -255,6 +255,26 @@ impl Scheduler {
             // This fixes the lock-leak: the old `schedule_ollp_retry` re-submitted
             // without ever releasing the aborted attempt's locks.
             self.on_txn_complete(txn_id);
+            // OLLP mismatch broadcast is LEADER-ONLY. The optimistic-lock
+            // verification runs only on the data-group leader (the data plane
+            // skips it on followers — see the `ollp_is_group_leader` gate in the
+            // bulk-DML handlers), so by construction only a leader's executor can
+            // return `OllpRetryRequired`. This guard is defense-in-depth: a
+            // non-leader scheduler must never broadcast a mismatch — a lagging
+            // follower could otherwise poison an attempt the leader already
+            // completed, exhausting retries on a static dataset. A non-leader
+            // simply releases locks (done above) and returns; the leader owns the
+            // single mismatch signal that the completion registry observes.
+            if !self.is_group_leader() {
+                tracing::debug!(
+                    vshard_id = self.vshard_id,
+                    epoch = txn_id.epoch,
+                    position = txn_id.position,
+                    "calvin: OllpRetryRequired observed on non-leader; NOT broadcasting mismatch \
+                     (leader owns the verification decision)"
+                );
+                return;
+            }
             // (2) Broadcast the mismatch signal via the sequencer-group Raft so that
             // the coordinator's CalvinCompletionRegistry fires on EVERY replica,
             // including remote nodes. The SequencerStateMachine::apply() arm for

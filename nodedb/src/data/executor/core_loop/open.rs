@@ -167,6 +167,7 @@ impl CoreLoop {
             quarantine_registry: None,
             pending_reindex: Vec::new(),
             epoch_system_ms: None,
+            ollp_is_group_leader: false,
         })
     }
 }

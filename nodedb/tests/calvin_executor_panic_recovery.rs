@@ -61,6 +61,7 @@ fn calvin_static(epoch: u64, plans: Vec<PhysicalPlan>) -> PhysicalPlan {
         tenant_id: NodedbTenantId::new(1),
         plans,
         epoch_system_ms: 1_700_000_000_000,
+        is_group_leader: true,
     })
 }
 

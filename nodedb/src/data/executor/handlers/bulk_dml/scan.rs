@@ -84,6 +84,27 @@ impl CoreLoop {
 /// The output is sorted ascending, matching the contract expected by the
 /// OLLP verification comparison on both sides (Data Plane and Control
 /// Plane pre-exec).
+/// Convert the carried OLLP predicted surrogate set into the sorted list of
+/// document storage keys (8-char hex doc-ids) to apply the bulk mutation to.
+///
+/// This is the determinism anchor for multi-replica OLLP: every replica —
+/// leader and follower — mutates EXACTLY this set, derived from the leader's
+/// verified prediction carried in the plan, rather than from a per-replica
+/// local scan (which can differ when a follower's redb snapshot lags). Output
+/// is sorted ascending by surrogate so the apply order is identical on every
+/// replica (`surrogate_to_doc_id` is monotonic in the surrogate, so sorting the
+/// surrogates sorts the doc-ids).
+pub(super) fn ollp_predicted_doc_ids(predicted: &[u32]) -> Vec<String> {
+    let mut surrogates: Vec<u32> = predicted.to_vec();
+    surrogates.sort_unstable();
+    surrogates
+        .into_iter()
+        .map(|s| {
+            crate::engine::document::store::surrogate_to_doc_id(nodedb_types::Surrogate::new(s))
+        })
+        .collect()
+}
+
 pub(super) fn ollp_actual_surrogates(doc_ids: &[String]) -> Vec<u32> {
     let mut surrogates: Vec<u32> = doc_ids
         .iter()

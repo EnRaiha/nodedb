@@ -6,6 +6,7 @@ use crate::bridge::envelope::Response;
 use nodedb_physical::physical_plan::MetaOp;
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::control::calvin::CalvinExecCtx;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 
@@ -142,11 +143,15 @@ impl CoreLoop {
                 tenant_id,
                 plans,
                 epoch_system_ms,
+                is_group_leader,
             } => self.execute_calvin_execute_static(
                 task,
-                *epoch,
-                *position,
-                *epoch_system_ms,
+                CalvinExecCtx {
+                    epoch: *epoch,
+                    position: *position,
+                    epoch_system_ms: *epoch_system_ms,
+                    is_group_leader: *is_group_leader,
+                },
                 tenant_id,
                 plans,
             ),
@@ -171,11 +176,15 @@ impl CoreLoop {
                 plans,
                 injected_reads,
                 epoch_system_ms,
+                is_group_leader,
             } => self.execute_calvin_execute_active(
                 task,
-                *epoch,
-                *position,
-                *epoch_system_ms,
+                CalvinExecCtx {
+                    epoch: *epoch,
+                    position: *position,
+                    epoch_system_ms: *epoch_system_ms,
+                    is_group_leader: *is_group_leader,
+                },
                 tenant_id,
                 plans,
                 injected_reads,

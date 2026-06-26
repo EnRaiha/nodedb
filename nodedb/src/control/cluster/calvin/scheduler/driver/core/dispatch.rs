@@ -84,6 +84,28 @@ pub(crate) fn plan_vshard(plan: &PhysicalPlan) -> Vec<VShardId> {
 }
 
 impl Scheduler {
+    /// Whether THIS node is currently the leader of the data-group owning this
+    /// scheduler's vshard.
+    ///
+    /// Stamped into the `CalvinExecute{Static,Active}` MetaOp at dispatch time
+    /// so the Data Plane runs the OLLP optimistic-lock verification (and emits
+    /// `OllpRetryRequired`) ONLY on the leader, while every replica applies the
+    /// carried predicted write-set verbatim — preserving Calvin determinism.
+    ///
+    /// Resolved via the existing routing → group-role check (no new election).
+    /// On a poisoned lock the inner guard is recovered; a momentarily-unknown
+    /// leadership (e.g. mid-election) resolves to `false`, i.e. follower-style
+    /// apply against the predicted set, which is always determinism-safe.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn is_group_leader(
+        &self,
+    ) -> bool {
+        let mr = match self.multi_raft.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        mr.vshard_role_is_leader(self.vshard_id)
+    }
+
     fn local_calvin_plans(
         &self,
         plans: Vec<PhysicalPlan>,
@@ -166,6 +188,7 @@ impl Scheduler {
             tenant_id,
             plans,
             epoch_system_ms: txn.epoch_system_ms,
+            is_group_leader: self.is_group_leader(),
         });
 
         // no-determinism: request deadline is ephemeral, not written to WAL
@@ -283,6 +306,7 @@ impl Scheduler {
             plans,
             injected_reads,
             epoch_system_ms: txn.epoch_system_ms,
+            is_group_leader: self.is_group_leader(),
         });
 
         // no-determinism: request deadline is ephemeral, not written to WAL

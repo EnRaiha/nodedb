@@ -452,6 +452,26 @@ pub struct CoreLoop {
     /// back into a Calvin execute variant, so the reset after the batch is not
     /// premature.
     pub(in crate::data::executor) epoch_system_ms: Option<i64>,
+
+    /// Whether THIS node is the leader of the data-group owning the vshard for
+    /// the currently-executing Calvin transaction.
+    ///
+    /// Set to `true`/`false` by `execute_calvin_execute_static` and
+    /// `execute_calvin_execute_active` (from the scheduler-stamped, per-node,
+    /// non-replicated `MetaOp::is_group_leader`) before dispatching the inner
+    /// transaction batch, then reset to `false` immediately after.
+    ///
+    /// OLLP determinism: the bulk-DML handlers run the optimistic-lock
+    /// verification (`actual != predicted`) and emit `OllpRetryRequired` ONLY
+    /// when this is `true`. Every replica — leader and follower alike — applies
+    /// the carried `ollp_predicted_surrogates` set verbatim, so all replicas
+    /// mutate the identical surrogate set regardless of any per-replica local
+    /// scan drift.
+    ///
+    /// Defaults to `false` outside a Calvin execute (single-shard / non-Calvin
+    /// paths never set predicted surrogates, so the flag is never read there).
+    /// Safe for the same single-threaded `!Send` reasons as `epoch_system_ms`.
+    pub(in crate::data::executor) ollp_is_group_leader: bool,
 }
 
 impl CoreLoop {

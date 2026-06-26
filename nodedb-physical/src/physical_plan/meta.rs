@@ -303,6 +303,19 @@ pub enum MetaOp {
         /// the wall clock independently. Wire-additive: defaults to 0 on decode
         /// of older entries.
         epoch_system_ms: i64,
+        /// Whether THIS node is the leader of the data-group owning this
+        /// vshard, stamped by the dispatching scheduler at dispatch time.
+        ///
+        /// OLLP determinism: the optimistic-lock verification (`actual !=
+        /// predicted`) and the resulting `OllpRetryRequired` are LEADER-ONLY.
+        /// Followers trust the leader's verified decision and apply the carried
+        /// `ollp_predicted_surrogates` set verbatim, so every replica mutates
+        /// the identical surrogate set (Calvin determinism). This flag is a
+        /// per-node, non-replicated dispatch property — the scheduler on each
+        /// node stamps its OWN role; it is never part of the replicated log.
+        /// Wire-additive: defaults to `false` on decode of older entries (safe:
+        /// a follower-style apply against the carried predicted set).
+        is_group_leader: bool,
     },
 
     /// Calvin dependent-read executor: passive participant reads keys and
@@ -353,6 +366,13 @@ pub enum MetaOp {
         /// Wall-clock ms read once on the sequencer leader at epoch creation.
         /// Same semantics as `CalvinExecuteStatic::epoch_system_ms`.
         epoch_system_ms: i64,
+        /// Whether THIS node is the leader of the data-group owning this
+        /// vshard. Same semantics as `CalvinExecuteStatic::is_group_leader`:
+        /// gates the LEADER-ONLY OLLP verification + `OllpRetryRequired`; every
+        /// replica applies the carried `ollp_predicted_surrogates` set verbatim
+        /// for determinism. Per-node, non-replicated; wire-additive (defaults to
+        /// `false`).
+        is_group_leader: bool,
     },
 
     /// Rebuild all indexes (HNSW, FTS LSM, graph CSR) for a collection

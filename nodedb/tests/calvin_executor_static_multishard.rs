@@ -21,6 +21,7 @@ fn calvin_execute_static_round_trip_msgpack() {
         tenant_id: TenantId::new(1),
         plans: vec![],
         epoch_system_ms: 0,
+        is_group_leader: true,
     };
 
     let plan = PhysicalPlan::Meta(op.clone());
@@ -56,6 +57,7 @@ fn calvin_execute_static_and_active_are_distinct_variants() {
         tenant_id: TenantId::new(1),
         plans: vec![],
         epoch_system_ms: 0,
+        is_group_leader: true,
     };
     let passive_op = MetaOp::CalvinExecutePassive {
         epoch: 1,

@@ -96,39 +96,59 @@ impl CoreLoop {
             }
         };
 
-        // OLLP verification: when predicted surrogates are provided, compare
-        // against the actual matching set. On mismatch return OllpRetryRequired
-        // WITHOUT writing. The set comparison is deterministic: both sides are
-        // sorted before comparison.
-        if let Some(predicted) = ollp_predicted_surrogates {
-            let actual = super::scan::ollp_actual_surrogates(&matching_ids);
-            let mut predicted_sorted: Vec<u32> = predicted.to_vec();
-            predicted_sorted.sort_unstable();
-            if actual != predicted_sorted {
-                return self.response_error(task, ErrorCode::OllpRetryRequired);
+        // OLLP determinism (multi-replica): the predicted surrogate set carried
+        // in the plan is the LEADER's verified write-set and the SINGLE SOURCE
+        // OF TRUTH every replica must mutate. The optimistic-lock VERIFICATION
+        // (`actual != predicted`) is the guard that the leader's prediction is
+        // still valid; it runs ONLY on the data-group leader. A follower whose
+        // local redb snapshot lags the leader's prediction window would compute
+        // a different `actual` set — so it must NOT independently re-derive a
+        // match nor independently raise a mismatch (that poisons the attempt and
+        // exhausts retries even on a static dataset). Instead, EVERY replica —
+        // leader and follower alike — applies the update to EXACTLY the
+        // predicted set (resolved to doc-ids below), so all replicas mutate
+        // identical state. When no predicted set is present (single-shard /
+        // non-OLLP path) behavior is unchanged: apply over the local scan.
+        let apply_ids: Vec<String> = if let Some(predicted) = ollp_predicted_surrogates {
+            // Leader-only verification: compare the local actual matching set to
+            // the prediction; on drift return OllpRetryRequired WITHOUT writing.
+            // The set comparison is deterministic: both sides are sorted.
+            if self.ollp_is_group_leader {
+                let actual = super::scan::ollp_actual_surrogates(&matching_ids);
+                let mut predicted_sorted: Vec<u32> = predicted.to_vec();
+                predicted_sorted.sort_unstable();
+                if actual != predicted_sorted {
+                    return self.response_error(task, ErrorCode::OllpRetryRequired);
+                }
             }
-        }
+            // Apply set = the carried predicted surrogates (identical on every
+            // replica). On the leader this equals `matching_ids` post-verify; on
+            // a follower it is the leader's authoritative set, not a local scan.
+            super::scan::ollp_predicted_doc_ids(predicted)
+        } else {
+            matching_ids
+        };
 
-        // OLLP edge-content verification: the Control Plane derived the implicit
-        // edge reconciliation (EdgeDelete of the OLD edge + EdgePut of the NEW
-        // edge) from the recon scan's `_from`/`_to`/`_type`. If a matched doc's
-        // edge fields were concurrently changed (or an edge appeared/disappeared
-        // among the matched docs) between recon and now, the wrong old edge
-        // would be retracted / a stale edge would dangle. The surrogate-set
-        // check above cannot see this — the surrogate set is unchanged.
-        // Recompute the ACTUAL OLD (pre-update) edge set from the matched docs —
-        // this runs BEFORE any write below, so `sparse.get` returns the
-        // pre-mutation content — and compare it to the predicted set; on ANY
-        // divergence return OllpRetryRequired WITHOUT writing. Both sides are
-        // sorted the same way (the Control Plane sorts the injected set), so this
-        // is a plain sorted-slice equality check. The existing retry loop
-        // re-scans and re-derives fresh edges.
-        if let Some(predicted) = ollp_predicted_edges {
+        // OLLP edge-content verification (LEADER-ONLY, same rationale): the
+        // Control Plane derived the implicit edge reconciliation (EdgeDelete of
+        // the OLD edge + EdgePut of the NEW edge) from the recon scan's
+        // `_from`/`_to`/`_type`. If a matched doc's edge fields were concurrently
+        // changed (or an edge appeared/disappeared among the matched docs)
+        // between recon and now, the wrong old edge would be retracted / a stale
+        // edge would dangle. The surrogate-set check above cannot see this — the
+        // surrogate set is unchanged. The leader recomputes the ACTUAL OLD
+        // (pre-update) edge set from the apply set — this runs BEFORE any write
+        // below, so `sparse.get` returns the pre-mutation content — and compares
+        // it to the predicted set; on ANY divergence it returns OllpRetryRequired
+        // WITHOUT writing. Followers trust the leader's decision.
+        if let Some(predicted) = ollp_predicted_edges
+            && self.ollp_is_group_leader
+        {
             let actual = self.ollp_actual_edges(
                 task.request.database_id.as_u64(),
                 tid,
                 collection,
-                &matching_ids,
+                &apply_ids,
             );
             let mut predicted_sorted: Vec<OllpPredictedEdge> = predicted.to_vec();
             predicted_sorted.sort_unstable();
@@ -151,12 +171,12 @@ impl CoreLoop {
         // Apply updates to each matching document.
         let mut affected = 0u64;
         let mut returned_docs: Vec<serde_json::Value> = if returning.is_some() {
-            Vec::with_capacity(matching_ids.len())
+            Vec::with_capacity(apply_ids.len())
         } else {
             Vec::new()
         };
 
-        for doc_id in &matching_ids {
+        for doc_id in &apply_ids {
             match self
                 .sparse
                 .get(task.request.database_id.as_u64(), tid, collection, doc_id)
