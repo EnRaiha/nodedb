@@ -166,6 +166,15 @@ pub(super) fn split_by_current_topology(
             snap.crdt_state.push(entry.clone());
         }
     }
+    // Tenant-explicit CRDT (the field the snapshot CREATE handler writes today)
+    // is replicated-by-design too: every owning node imports the whole-tenant
+    // Loro doc. Dropping it here would silently lose all CRDT data on the
+    // cluster restore path even after `merge_sections` carries it through.
+    for entry in &merged.tenant_crdt_state {
+        for snap in all_owners.values_mut() {
+            snap.tenant_crdt_state.push(entry.clone());
+        }
+    }
 
     SplitOutput {
         buckets: all_owners,

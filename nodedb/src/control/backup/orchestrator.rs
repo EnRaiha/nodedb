@@ -10,7 +10,7 @@
 //! Single-node mode is the degenerate case: routing table absent
 //! (or 1 node) → 1 section, origin = self.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,7 +35,14 @@ const NODE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Single-node and cluster paths converge here — a single-node server
 /// produces a one-section envelope with origin = self.
 pub async fn backup_tenant(state: &Arc<SharedState>, tenant_id: u64) -> Result<Bytes, Error> {
-    let nodes = unique_origin_nodes(state);
+    // Assign every vshard to exactly ONE source node (the leader of its Raft
+    // group, or — when no leader is elected yet — the lowest-id member), and
+    // gather only from those source nodes. Under RF>1 every replica holds the
+    // full vshard data, so gathering from all members and merging would
+    // MULTIPLY append-style engine rows (columnar / timeseries) by the
+    // replication factor. Filtering each source node's snapshot to the vshards
+    // it owns makes the union cover each vshard exactly once.
+    let assignment = source_assignment(state);
     let snapshot_plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot { tenant_id });
 
     // Collect per-node sections first. The orchestrator's own
@@ -44,13 +51,18 @@ pub async fn backup_tenant(state: &Arc<SharedState>, tenant_id: u64) -> Result<B
     // fan-out guarantees `envelope.watermark ≥ tenant_write_hlc`
     // at backup time, so a subsequent restore of this envelope into
     // the same (unchanged) cluster passes the staleness gate.
-    let mut sections = Vec::with_capacity(nodes.len());
-    for node_id in nodes {
+    let mut sections = Vec::with_capacity(assignment.len());
+    for (node_id, source_vshards) in assignment {
         let body = if is_self(state, node_id) {
             snapshot_self(state, tenant_id, &snapshot_plan).await?
         } else {
             snapshot_remote(state, node_id, tenant_id, &snapshot_plan).await?
         };
+        // Single-node / single-replica: the node owns every vshard it leads, so
+        // the filter retains everything (no-op). Under RF>1: keep only the
+        // vshards this node is the assigned source for; the other replicas'
+        // copies are dropped here so the restore merge sums disjoint sections.
+        let body = filter_node_snapshot(body, tenant_id, &source_vshards)?;
         sections.push((node_id, body));
     }
 
@@ -191,30 +203,78 @@ pub async fn backup_tenant(state: &Arc<SharedState>, tenant_id: u64) -> Result<B
     Ok(Bytes::from(envelope_bytes))
 }
 
-/// Enumerate the unique node IDs that hold any vShard right now.
+/// Assign every vshard to exactly ONE source node, returning the per-source
+/// `(node_id, owned_vshard_set)` pairs to gather from.
 ///
-/// In single-node mode (no routing table) returns `[self.node_id]`,
-/// which may be 0 — that's fine; the section's origin_node_id is
-/// only carried for traceability/debugging, not for routing.
-fn unique_origin_nodes(state: &SharedState) -> Vec<u64> {
+/// Source of a vshard = the leader of its Raft group; when the group has no
+/// elected leader yet (`leader == 0`), fall back deterministically to the
+/// lowest-id member so the vshard is still captured exactly once (dropping it
+/// would be data loss; assigning it to two nodes would duplicate it). The
+/// metadata group (0) owns no vshards, so it never appears.
+///
+/// In single-node mode (no routing table) returns `[(self.node_id, ALL vshards)]`
+/// — the filter is then a no-op and every section is captured once, matching
+/// the previous single-section behavior.
+fn source_assignment(state: &SharedState) -> Vec<(u64, HashSet<u32>)> {
     let Some(routing) = state.cluster_routing.as_ref() else {
-        return vec![state.node_id];
+        return vec![(state.node_id, (0..VSHARD_COUNT).collect())];
     };
     let table = routing.read().expect("routing table poisoned");
-    let mut set = BTreeSet::new();
-    for info in table.group_members().values() {
-        if info.leader != 0 {
-            set.insert(info.leader);
-        }
-        for &m in &info.members {
-            set.insert(m);
-        }
+
+    let mut by_node: BTreeMap<u64, HashSet<u32>> = BTreeMap::new();
+    for vshard in 0..VSHARD_COUNT {
+        let Ok(group_id) = table.group_for_vshard(vshard) else {
+            continue;
+        };
+        let Some(info) = table.group_info(group_id) else {
+            continue;
+        };
+        let source = if info.leader != 0 {
+            info.leader
+        } else {
+            // No elected leader: deterministic lowest-id member so the vshard
+            // is captured by exactly one node.
+            match info.members.iter().copied().min() {
+                Some(m) => m,
+                None => continue,
+            }
+        };
+        by_node.entry(source).or_default().insert(vshard);
     }
-    if set.is_empty() {
-        vec![state.node_id]
-    } else {
-        set.into_iter().collect()
+
+    if by_node.is_empty() {
+        return vec![(state.node_id, (0..VSHARD_COUNT).collect())];
     }
+    by_node.into_iter().collect()
+}
+
+/// Decode a gathered per-node `TenantDataSnapshot`, filter it in place to the
+/// vshards this node is the assigned source for, and re-encode it.
+///
+/// The per-section vshard classification is shared with the Raft snapshot SEND
+/// builder via `snapshot_keys::retain_tenant_data_for_vshards`. The vshard-of
+/// closure is the canonical routing function, matching both the snapshot
+/// builder and the restore topology splitter.
+fn filter_node_snapshot(
+    body: Vec<u8>,
+    tenant_id: u64,
+    source_vshards: &HashSet<u32>,
+) -> Result<Vec<u8>, Error> {
+    let mut snap: crate::types::TenantDataSnapshot =
+        zerompk::from_msgpack(&body).map_err(|e| Error::Internal {
+            detail: format!("backup: decode per-node snapshot: {e}"),
+        })?;
+    crate::control::backup::snapshot_keys::retain_tenant_data_for_vshards(
+        &mut snap,
+        tenant_id,
+        source_vshards,
+        |collection| {
+            nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, collection)
+        },
+    );
+    zerompk::to_msgpack_vec(&snap).map_err(|e| Error::Internal {
+        detail: format!("backup: re-encode filtered snapshot: {e}"),
+    })
 }
 
 fn is_self(state: &SharedState, node_id: u64) -> bool {
