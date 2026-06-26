@@ -362,6 +362,32 @@ pub enum ReplicatedWrite {
         schema_hlc_bytes: [u8; 18],
     },
 
+    /// A single-shard bulk predicate write (`BulkDelete` / `BulkUpdate`) to be
+    /// replicated to the data group's Raft members and re-executed on apply.
+    ///
+    /// A single shard is ONE Raft group: proposing the bulk write as a log entry
+    /// makes every replica apply it in log order, so re-evaluating the predicate
+    /// at the apply position yields the byte-identical matching set on every
+    /// replica (deterministic by Raft ordering). No OLLP / optimistic-lock
+    /// machinery is required — that exists only to coordinate the matching set
+    /// ACROSS independent Raft groups (≥2 vshards). On apply the bulk handler
+    /// runs in its plain (non-OLLP) mode: `ollp_predicted_surrogates = None`, so
+    /// it deletes/updates exactly the locally-scanned matches.
+    ///
+    /// `filters` is the msgpack-encoded `Vec<ScanFilter>` predicate (empty = no
+    /// WHERE clause, match all). `updates` is empty for `BulkDelete` and carries
+    /// the SET assignments for `BulkUpdate`. `is_update` disambiguates the two so
+    /// apply reconstructs the correct `DocumentOp`. No surrogate sidecar is
+    /// carried: the apply re-scans local state and re-derives matches by
+    /// predicate, and cascade cleanup keys off each matched row's existing
+    /// surrogate (identical on every replica).
+    BulkDml {
+        collection: String,
+        filters: Vec<u8>,
+        is_update: bool,
+        updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
+    },
+
     /// Dependent-read result broadcast for a Calvin txn.
     ///
     /// A passive participant proposes this entry to the per-vshard Raft group

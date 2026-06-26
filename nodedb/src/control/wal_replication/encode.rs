@@ -366,7 +366,41 @@ pub fn to_replicated_entry(
             surrogate: surrogate.as_u32(),
             provenance: encode_provenance(provenance),
         },
-        // Not a write — reads, system ops, etc.
+        // Single-shard bulk predicate writes replicate as a plain `BulkDml`
+        // entry: each replica re-scans local state at the committed log
+        // position and applies the predicate deterministically (Raft log order
+        // ⇒ identical prior state ⇒ identical matching set). An OLLP-prepared
+        // bulk plan (carrying `ollp_predicted_surrogates` / `ollp_predicted_edges`)
+        // belongs to the cross-shard Calvin path and is NOT encoded here — it
+        // returns `None` and is dispatched via Calvin, which coordinates the
+        // matching set across ≥2 Raft groups.
+        PhysicalPlan::Document(DocumentOp::BulkDelete {
+            collection,
+            filters,
+            returning: _,
+            ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
+        }) => ReplicatedWrite::BulkDml {
+            collection: collection.clone(),
+            filters: filters.clone(),
+            is_update: false,
+            updates: Vec::new(),
+        },
+        PhysicalPlan::Document(DocumentOp::BulkUpdate {
+            collection,
+            filters,
+            updates,
+            returning: _,
+            ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
+        }) => ReplicatedWrite::BulkDml {
+            collection: collection.clone(),
+            filters: filters.clone(),
+            is_update: true,
+            updates: updates.clone(),
+        },
+        // Not a write — reads, system ops, etc. (Also: OLLP-prepared bulk plans
+        // carrying predicted surrogates/edges, which route via Calvin.)
         _ => return None,
     };
 

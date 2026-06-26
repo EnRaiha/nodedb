@@ -226,6 +226,54 @@ impl LocalPlanExecutor {
         let tenant_id = crate::types::TenantId::new(req.tenant_id);
         let trace_id = nodedb_types::TraceId(req.trace_id);
 
+        // ── Replicable write: drive through Raft, NOT local cores ─────────────
+        //
+        // The gateway forwarded this plan here because THIS node is the leader
+        // for the target data group. Fanning a replicable write across local
+        // cores only would commit to this node's Data Plane and NEVER propose
+        // it to the Raft group — coordinator + other voters never apply it, and
+        // SQL still returns Ok (silent write loss). So for any plan that
+        // `to_replicated_entry` recognizes as a replicable write, propose it
+        // through the SAME proposer the local pgwire write path uses: proposing
+        // via the local proposer targets the group this node leads → commit →
+        // all voters apply. The resolved surrogate is already carried on the
+        // forwarded entry (coordinator-side), and owner-side re-resolution at
+        // apply (wal_replication/decode.rs `bind_or_lookup`) covers the rest.
+        //
+        // Reads / non-replicable plans (`to_replicated_entry == None`) fall
+        // through to `execute_plan_all_local_cores` unchanged.
+        //
+        // The vshard the gateway routed this plan to is not carried on the wire;
+        // it is a pure function of the plan's primary collection (every data
+        // group is `CollectionHomed`), so we re-derive it exactly as the gateway
+        // router's `CollectionHomed` arm does (`vshard_for_collection`). This is
+        // the same group this node leads, so the local proposer targets it.
+        let vshard_id = crate::types::VShardId::new(
+            crate::control::gateway::version_set::touched_collections(&plan)
+                .into_iter()
+                .next()
+                .map(|name| nodedb_cluster::routing::vshard_for_collection(database_id, &name))
+                .unwrap_or(0),
+        );
+        if let Some(proposer) = self.state.async_raft_proposer.get()
+            && let Some(entry) =
+                crate::control::wal_replication::to_replicated_entry(tenant_id, vshard_id, &plan)
+        {
+            return match crate::control::wal_replication::propose_replicated_entry(
+                &self.state,
+                proposer,
+                entry,
+            )
+            .await
+            {
+                Ok(payload) => ExecuteResponse::ok(vec![payload]),
+                Err(e) => ExecuteResponse::err(TypedClusterError::Internal {
+                    code: PLAN_DECODE_FAILED,
+                    message: e.to_string(),
+                }),
+            };
+        }
+
         match tokio::time::timeout(
             deadline,
             execute_plan_all_local_cores(&self.state, tenant_id, database_id, plan, trace_id),

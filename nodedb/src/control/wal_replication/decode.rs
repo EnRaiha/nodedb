@@ -566,6 +566,39 @@ fn to_physical_plan(
             surrogate,
             provenance,
         } => decode_sync_engines::spatial_delete(collection, field, *surrogate, provenance)?,
+        ReplicatedWrite::BulkDml {
+            collection,
+            filters,
+            is_update,
+            updates,
+        } => {
+            // Reconstruct the bulk plan in its plain (non-OLLP) form. The apply
+            // re-scans local state at this committed log position and mutates the
+            // predicate matches; `ollp_predicted_surrogates = None` selects the
+            // local-scan path in the executor (no leader-only verification, no
+            // predicted set). Deterministic across replicas: Raft log order ⇒
+            // identical prior state ⇒ identical matching set; cascade cleanup
+            // keys off each matched row's existing surrogate. No surrogate
+            // binding is needed here — the matches already carry their identity.
+            if *is_update {
+                PhysicalPlan::Document(DocumentOp::BulkUpdate {
+                    collection: collection.clone(),
+                    filters: filters.clone(),
+                    updates: updates.clone(),
+                    returning: None,
+                    ollp_predicted_surrogates: None,
+                    ollp_predicted_edges: None,
+                })
+            } else {
+                PhysicalPlan::Document(DocumentOp::BulkDelete {
+                    collection: collection.clone(),
+                    filters: filters.clone(),
+                    returning: None,
+                    ollp_predicted_surrogates: None,
+                    ollp_predicted_edges: None,
+                })
+            }
+        }
         // The following variants are intercepted upstream (Array CRDT ops by
         // `from_replicated_entry`, CalvinReadResult by the apply loop) and never
         // dispatched through the generic Data Plane path. These arms exist only
