@@ -150,6 +150,15 @@ async fn ollp_dependent_delete_from_non_leader_coordinator_completes() {
             "dependent (BulkDelete) cross-shard write from a non-leader coordinator must complete",
         );
 
+    // Deterministic barrier: Calvin completion guarantees one ack per vshard,
+    // not that every replica has applied. Under RF>1 the coordinator hosts its
+    // own (possibly lagging) replica of the data group, so wait for every
+    // replica — including this coordinator's — to apply the routed delete
+    // before reading it back, exactly as the sibling edge-delete test does.
+    cluster
+        .wait_for_full_apply_convergence(std::time::Duration::from_secs(15))
+        .await;
+
     // Prove the delete committed: only the 2 'active' rows remain.
     let count_rows = |msgs: &[tokio_postgres::SimpleQueryMessage]| -> usize {
         msgs.iter()

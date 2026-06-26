@@ -1,53 +1,52 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! Cross-node PK WRITE correctness (UPDATE / DELETE) from a non-member
-//! coordinator — and the surrogate-map pollution regression that follows.
+//! Cross-node PK WRITE correctness (UPDATE / DELETE) from a non-leader
+//! coordinator under RF=3 — and the surrogate-map pollution regression that the
+//! apply path must never reintroduce.
 //!
-//! ## The bug this guards against
+//! ## Multi-replica reality (RF=3)
 //!
-//! A PK point op resolves pk → surrogate on the QUERY COORDINATOR's local
-//! catalog. The surrogate↔PK map (`surrogate_pk{,_rev}_v3`) is SHARDED to the
-//! collection's data-group members. `document_strict` collections are
-//! single-vShard-homed, so when the coordinator is NOT a member of that group,
-//! resolution misses → the coordinator ships `Surrogate::ZERO` to the owner.
+//! This 3-node test cluster runs replication factor 3: EVERY node is a voter of
+//! every data group and locally binds surrogates for every committed write.
+//! There is NO "non-member" coordinator that has to ship `Surrogate::ZERO` for
+//! these keys — every node resolves pk → surrogate from its own local catalog.
+//! A point WRITE (UPDATE / DELETE by PK) issued anywhere routes via Raft
+//! propose → apply and lands on all three replicas.
 //!
-//! Unlike point READS (which route through the owner's `exec_receiver`, fixed
-//! separately), point WRITES (UPDATE / DELETE by PK) route via Raft
-//! propose → apply. On apply, the owner's `decode.rs` `PointUpdate` /
-//! `PointDelete` arms resolved the carried surrogate via `assigner.bind(...)`,
-//! which is FIRST-WINS:
+//! ## The invariants this guards
 //!
-//!   - For an EXISTING row a binding already exists, so `bind` returns the
-//!     existing (correct) surrogate and the ZERO is harmlessly discarded.
-//!   - For a NON-EXISTENT pk (UPDATE/DELETE of a key that was never inserted,
-//!     or an out-of-order apply) no binding exists, so `bind` PUTS
-//!     `pk → ZERO` into the catalog. That pollutes the map: a LATER INSERT of
-//!     that same pk finds the existing ZERO binding (first-wins) and stores the
-//!     row under surrogate ZERO → silent data corruption / wrong lookups.
+//!  (a) CROSS-NODE CONVERGENCE: a PK UPDATE / DELETE issued from a coordinator
+//!      that is NOT the group leader still resolves correctly and converges on
+//!      EVERY replica. Because applies are async, a read can race a follower's
+//!      apply, so every write is followed by a full-apply convergence barrier
+//!      before any read-back.
 //!
-//! ## The fix being verified
-//!
-//! The `PointUpdate` / `PointDelete` apply arms now re-resolve a ZERO carried
-//! surrogate READ-ONLY via `assigner.lookup(...)` and NEVER bind ZERO. A
-//! non-ZERO (authoritative, member-coordinator) carried value is still bound
-//! first-wins. A missing pk stays ZERO (a correct no-op on a non-existent row)
-//! and leaves the catalog untouched, so a subsequent INSERT of that pk gets a
-//! freshly allocated surrogate and resolves correctly.
+//!  (b) NO GHOST / PHANTOM POLLUTION: a PK that is only ever DELETEd or only
+//!      ever READ (never INSERTed) must NEVER acquire a surrogate binding. On
+//!      apply, the `decode.rs` `bind_or_lookup` path re-resolves a carried
+//!      ZERO surrogate READ-ONLY and NEVER binds ZERO, so a missing pk stays
+//!      unbound. A subsequent INSERT of that pk therefore allocates a FRESH
+//!      surrogate and resolves correctly — no `pk → ZERO` phantom corrupts it.
 //!
 //! ## Test shape
 //!
-//!  1. Spawn a 3-node cluster, create a `document_strict` collection with a PK,
-//!     insert a few rows via one node, and converge.
-//!  2. UPDATE-existing from a non-owner node → read back the new value.
-//!  3. DELETE-existing from a non-owner node → assert the row is gone.
-//!  4. POLLUTION (the core regression): DELETE a ghost (non-existent) pk from a
-//!     non-owner node, THEN INSERT that same pk, converge, and assert the
-//!     inserted value resolves from a non-owner coordinator. Without the fix
-//!     the ghost-DELETE binds `ghost → ZERO`, the INSERT lands under ZERO, and
-//!     the read resolves wrong/empty.
+//!  1. Spawn a 3-node RF=3 cluster, create a `document_strict` collection with
+//!     a PK, insert a few rows via one node, and converge.
+//!  2. UPDATE-existing from a NON-LEADER node → converge → read back the new
+//!     value on every node, and assert all three members agree.
+//!  3. DELETE-existing from a NON-LEADER node → converge → assert the row is
+//!     gone on every node, and that all three members agree.
+//!  4. GHOST/PHANTOM (the anti-pollution regression):
+//!       - DELETE a key that was NEVER inserted, from every node (each delete
+//!         resolves to an unbound key → ZERO; apply must NOT bind it), then
+//!         INSERT that key and assert it reads back as its real value on every
+//!         node. A phantom `ghost → ZERO` binding would corrupt this read.
+//!       - Assert a never-written, never-deleted pk returns no row on every
+//!         node — proof that merely reading/deleting an absent key created no
+//!         spurious binding.
 //!
-//! Each mutating statement is issued from EVERY node so that at least one is a
-//! genuine non-member coordinator (the harness does not expose routing to pick
-//! a definite non-member, so iterating covers it).
+//! The mutating UPDATE / DELETE in (2) and (3) are issued from a non-leader
+//! member; the ghost DELETE in (4) is issued from every node so the
+//! anti-pollution path is exercised from all coordinators.
 
 mod common;
 use common::cluster_harness::TestCluster;
@@ -176,11 +175,43 @@ async fn exec_dml(
     }
 }
 
-/// UPDATE / DELETE by PK from a non-member coordinator must apply correctly,
-/// and a ghost UPDATE/DELETE (non-existent pk) must NOT pollute the
-/// surrogate↔PK map and corrupt a subsequent INSERT of that pk.
+/// Read `pk` back on EVERY node and assert it equals `expected` (or is gone for
+/// `None`), returning the agreed value. Also asserts all members AGREE — the
+/// genuinely-new RF=3 invariant: every replica returns the same post-write
+/// state, strictly stronger than a single-owner check.
+async fn assert_all_members_agree(
+    cluster: &TestCluster,
+    coll: &str,
+    pk: &str,
+    expected: Option<&str>,
+    label: &str,
+) {
+    let mut seen: Vec<Option<String>> = Vec::with_capacity(cluster.nodes.len());
+    for (idx, node) in cluster.nodes.iter().enumerate() {
+        let got = point_get_payload(&node.client, coll, pk, Duration::from_secs(10)).await;
+        assert_eq!(
+            got.as_deref(),
+            expected,
+            "{label}: node {idx} for pk '{pk}' returned {got:?}, expected {expected:?}"
+        );
+        seen.push(got);
+    }
+    // Cross-member consistency: all replicas must report identical state.
+    let first = &seen[0];
+    for (idx, got) in seen.iter().enumerate() {
+        assert_eq!(
+            got, first,
+            "{label}: members disagree on pk '{pk}' — node {idx} = {got:?}, node 0 = {first:?}"
+        );
+    }
+}
+
+/// Cross-node PK UPDATE / DELETE from a non-leader coordinator under RF=3 must
+/// converge on every replica, all members must agree on the result, and a key
+/// that is only ever deleted/read (never inserted) must NEVER acquire a phantom
+/// surrogate binding that would corrupt a later INSERT.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cross_node_pk_write_resolves_and_does_not_pollute() {
+async fn cross_node_pk_write_converges_and_does_not_pollute() {
     let cluster = TestCluster::spawn_three()
         .await
         .expect("spawn 3-node cluster");
@@ -193,9 +224,8 @@ async fn cross_node_pk_write_resolves_and_does_not_pollute() {
         .await
         .expect("CREATE COLLECTION xn_pk_w");
 
-    // Insert the rows through a single node. The collection is single-homed, so
-    // exactly one vShard owner holds the surrogate↔PK binding for all keys; the
-    // other two nodes are non-members for these keys.
+    // RF=3: all three nodes are voters of the data group and locally bind a
+    // surrogate for each committed write. Insert the rows through node 0.
     for i in 0..ROW_COUNT {
         cluster.nodes[0]
             .client
@@ -210,38 +240,37 @@ async fn cross_node_pk_write_resolves_and_does_not_pollute() {
         .wait_for_full_apply_convergence(Duration::from_secs(15))
         .await;
 
-    let last = cluster.nodes.len() - 1;
+    // Issue mutations from a DIFFERENT node than the one that inserted — a
+    // cross-node, non-leader coordinator. Its write resolves pk → surrogate
+    // locally (RF=3 member) and routes via Raft propose → apply to all replicas.
+    let coord = cluster.nodes.len() - 1;
 
-    // --- UPDATE-existing from a non-owner coordinator ---------------------
-    // Row-0 was inserted via node 0; mutate it from the last node, which is a
-    // non-member for this key (it shipped Surrogate::ZERO before the fix, and
-    // even with the fix relies on read-only re-resolution of the existing
-    // binding rather than binding ZERO).
+    // --- UPDATE-existing from a non-leader coordinator --------------------
     exec_dml(
-        &cluster.nodes[last].client,
+        &cluster.nodes[coord].client,
         "UPDATE xn_pk_w SET payload = 'updated-0' WHERE id = 'row-0'",
         Duration::from_secs(10),
     )
     .await
     .expect("cross-node UPDATE of row-0");
 
+    // Applies are async — barrier before reading so reads don't race followers.
     cluster
         .wait_for_full_apply_convergence(Duration::from_secs(15))
         .await;
 
-    for (idx, node) in cluster.nodes.iter().enumerate() {
-        let got =
-            point_get_payload(&node.client, "xn_pk_w", "row-0", Duration::from_secs(10)).await;
-        assert_eq!(
-            got.as_deref(),
-            Some("updated-0"),
-            "node {idx}: row-0 after cross-node UPDATE returned {got:?}, expected updated-0"
-        );
-    }
+    assert_all_members_agree(
+        &cluster,
+        "xn_pk_w",
+        "row-0",
+        Some("updated-0"),
+        "cross-node UPDATE",
+    )
+    .await;
 
-    // --- DELETE-existing from a non-owner coordinator ---------------------
+    // --- DELETE-existing from a non-leader coordinator --------------------
     exec_dml(
-        &cluster.nodes[last].client,
+        &cluster.nodes[coord].client,
         "DELETE FROM xn_pk_w WHERE id = 'row-1'",
         Duration::from_secs(10),
     )
@@ -252,13 +281,10 @@ async fn cross_node_pk_write_resolves_and_does_not_pollute() {
         .wait_for_full_apply_convergence(Duration::from_secs(15))
         .await;
 
+    assert_all_members_agree(&cluster, "xn_pk_w", "row-1", None, "cross-node DELETE").await;
+
+    // The deleted row must be gone everywhere, and the count consistent.
     for (idx, node) in cluster.nodes.iter().enumerate() {
-        let got =
-            point_get_payload(&node.client, "xn_pk_w", "row-1", Duration::from_secs(10)).await;
-        assert_eq!(
-            got, None,
-            "node {idx}: row-1 after cross-node DELETE returned {got:?}, expected gone"
-        );
         let count = count_rows(&node.client, "xn_pk_w", Duration::from_secs(10)).await;
         assert_eq!(
             count,
@@ -268,11 +294,11 @@ async fn cross_node_pk_write_resolves_and_does_not_pollute() {
         );
     }
 
-    // --- POLLUTION regression (the core assertion) ------------------------
-    // DELETE a key that was NEVER inserted, from EVERY node so at least one is
-    // a non-member coordinator that ships Surrogate::ZERO. Without the fix, the
-    // owner's apply binds `ghost → ZERO`. This is a correct no-op on the row
-    // itself either way.
+    // --- ANTI-POLLUTION (ghost) regression — load-bearing ----------------
+    // DELETE a key that was NEVER inserted, from EVERY node. Each delete
+    // resolves to an unbound key (ZERO carry); apply must re-resolve READ-ONLY
+    // and NEVER bind `ghost → ZERO`. The delete is a correct no-op either way,
+    // but a phantom ZERO binding here would corrupt the INSERT below.
     for (idx, node) in cluster.nodes.iter().enumerate() {
         exec_dml(
             &node.client,
@@ -287,10 +313,11 @@ async fn cross_node_pk_write_resolves_and_does_not_pollute() {
         .wait_for_full_apply_convergence(Duration::from_secs(15))
         .await;
 
-    // Now INSERT the ghost key. With pollution, the existing ZERO binding wins
-    // (first-wins) and the row lands under surrogate ZERO → the read below
-    // resolves wrong/empty. With the fix, no binding was ever written, so the
-    // INSERT allocates a fresh surrogate and the read resolves correctly.
+    // INSERT the ghost key. With pollution, a phantom `ghost → ZERO` binding
+    // wins (first-wins) and the row lands under surrogate ZERO → the read
+    // resolves wrong/empty. With the correct apply path no binding was ever
+    // written, so the INSERT allocates a fresh surrogate and resolves on all
+    // replicas. All members must agree.
     cluster.nodes[0]
         .client
         .simple_query("INSERT INTO xn_pk_w (id, payload) VALUES ('ghost', 'ghost-val')")
@@ -301,16 +328,27 @@ async fn cross_node_pk_write_resolves_and_does_not_pollute() {
         .wait_for_full_apply_convergence(Duration::from_secs(15))
         .await;
 
-    for (idx, node) in cluster.nodes.iter().enumerate() {
-        let got =
-            point_get_payload(&node.client, "xn_pk_w", "ghost", Duration::from_secs(10)).await;
-        assert_eq!(
-            got.as_deref(),
-            Some("ghost-val"),
-            "node {idx}: ghost after no-op DELETE + INSERT returned {got:?}, expected ghost-val \
-             (a polluted `ghost → ZERO` binding from the cross-node DELETE would corrupt this)"
-        );
-    }
+    assert_all_members_agree(
+        &cluster,
+        "xn_pk_w",
+        "ghost",
+        Some("ghost-val"),
+        "ghost no-op DELETE + INSERT (a phantom `ghost → ZERO` binding would corrupt this)",
+    )
+    .await;
+
+    // --- PHANTOM read/never-touched key — strengthened anti-pollution -----
+    // 'phantom' is never inserted and never deleted; merely reading an absent
+    // key must NOT create any binding. It must return no row on every member,
+    // and the members must agree it is absent.
+    assert_all_members_agree(
+        &cluster,
+        "xn_pk_w",
+        "phantom",
+        None,
+        "never-written/never-deleted key must have no spurious binding",
+    )
+    .await;
 
     cluster.shutdown().await;
 }
