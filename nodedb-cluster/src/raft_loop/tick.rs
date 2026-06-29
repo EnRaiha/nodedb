@@ -353,7 +353,8 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
 
     /// For every group where this node is leader, propose
     /// `PromoteLearner` for every learner whose `match_index` has
-    /// reached the current `commit_index`.
+    /// reached the current `commit_index` and whose node-id appears in
+    /// the group's placement set (when one is configured).
     ///
     /// This is the automated second phase of the two-step Raft single-
     /// server add. The first phase (`AddLearner`) is proposed by the
@@ -367,8 +368,18 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             group_ids
                 .into_iter()
                 .flat_map(|gid| {
+                    // Placement set for this group (None = promote all — unchanged behavior).
+                    let placement: Option<Vec<u64>> = mr
+                        .routing()
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .group_info(gid)
+                        .and_then(|info| info.placement.clone());
                     mr.ready_learners(gid)
                         .into_iter()
+                        .filter(move |&learner| {
+                            should_promote_learner(placement.as_deref(), learner)
+                        })
                         .map(move |learner| (gid, learner))
                 })
                 .collect()
@@ -402,5 +413,46 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 }
             }
         }
+    }
+}
+
+/// Decide whether a caught-up learner may be promoted to voter.
+///
+/// `None` placement means no explicit placement set for the group —
+/// all caught-up learners are promoted (unchanged behavior).
+/// `Some(set)` means only learners whose node-id appears in the
+/// intended voter set are promoted; others remain learners until the
+/// membership reconciler acts on them.
+fn should_promote_learner(placement: Option<&[u64]>, learner_id: u64) -> bool {
+    match placement {
+        None => true,
+        Some(set) => set.contains(&learner_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_promote_learner;
+
+    #[test]
+    fn no_placement_always_promotes() {
+        assert!(should_promote_learner(None, 1));
+        assert!(should_promote_learner(None, 42));
+    }
+
+    #[test]
+    fn placement_contains_learner_promotes() {
+        assert!(should_promote_learner(Some(&[1, 2, 3]), 2));
+    }
+
+    #[test]
+    fn placement_missing_learner_holds() {
+        assert!(!should_promote_learner(Some(&[1, 2, 3]), 99));
+    }
+
+    #[test]
+    fn empty_placement_promotes_nobody() {
+        assert!(!should_promote_learner(Some(&[]), 1));
+        assert!(!should_promote_learner(Some(&[]), 42));
     }
 }
