@@ -307,7 +307,11 @@ impl CoreLoop {
     /// Checkpoint all CRDT tenant engines to disk.
     ///
     /// Each tenant's Loro state is exported as a snapshot and written to
-    /// `{data_dir}/crdt-ckpt/tenant-{id}.ckpt` with atomic temp+rename.
+    /// `{data_dir}/crdt-ckpt/core-{core_id}/tenant-{id}.ckpt` with atomic
+    /// temp+rename. The per-core subdir is required because `data_dir` is
+    /// shared across all cores and a tenant's CRDT state is fragmented across
+    /// cores by collection — without the subdir, cores would race-overwrite
+    /// the same file and persist only a partial fragment.
     ///
     /// Called from both `snapshot.rs` (explicit checkpoint command) and
     /// `compact.rs` (periodic maintenance via `maybe_run_maintenance`).
@@ -316,7 +320,8 @@ impl CoreLoop {
             return 0;
         }
 
-        let ckpt_dir = self.data_dir.join("crdt-ckpt");
+        let ckpt_dir =
+            crate::data::executor::crdt_checkpoint::crdt_ckpt_dir(&self.data_dir, self.core_id);
         if std::fs::create_dir_all(&ckpt_dir).is_err() {
             warn!(core = self.core_id, "failed to create CRDT checkpoint dir");
             return 0;
@@ -329,8 +334,12 @@ impl CoreLoop {
                     if snapshot.is_empty() {
                         continue;
                     }
-                    let ckpt_path = ckpt_dir.join(format!("tenant-{tenant_id}.ckpt"));
-                    let tmp_path = ckpt_dir.join(format!("tenant-{tenant_id}.ckpt.tmp"));
+                    // Use the bare numeric id (not `TenantId`'s `tenant:N`
+                    // Display) so the filename is `tenant-{id}.ckpt`, matching
+                    // the loader's parse and the cluster-restore writer.
+                    let tid = tenant_id.as_u64();
+                    let ckpt_path = ckpt_dir.join(format!("tenant-{tid}.ckpt"));
+                    let tmp_path = ckpt_dir.join(format!("tenant-{tid}.ckpt.tmp"));
                     if nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &snapshot)
                         .is_ok()
                     {

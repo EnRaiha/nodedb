@@ -251,6 +251,7 @@ pub fn spawn_core(
             core.load_vector_checkpoints();
             core.load_spatial_checkpoints();
             core.load_sparse_vector_checkpoints();
+            core.load_crdt_checkpoints();
 
             // 4. Replay WAL records for crash recovery.
             //
@@ -267,6 +268,7 @@ pub fn spawn_core(
                 core.replay_kv_wal(&wal_records, num_cores, &tombstones);
                 core.replay_timeseries_wal(&wal_records, num_cores, &tombstones);
                 core.replay_array_wal(&wal_records, num_cores, &tombstones);
+                core.replay_crdt_wal(&wal_records, num_cores, &tombstones);
                 core.replay_fts_wal(&wal_records, num_cores, &tombstones);
                 core.replay_spatial_wal(&wal_records, num_cores, &tombstones);
 

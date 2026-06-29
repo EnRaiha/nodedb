@@ -110,15 +110,12 @@ fn group_representatives(state: &SharedState, collections: &[String]) -> Vec<Str
     let mut reps: Vec<String> = Vec::new();
     for c in collections {
         let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, c);
-        match routing.group_for_vshard(vshard.as_u32()) {
-            Ok(group) => {
-                if seen_groups.insert(group) {
-                    reps.push(c.clone());
-                }
-            }
-            // A collection whose vshard does not map to a group cannot route;
-            // skip it. If NONE map, the fallback below picks the first.
-            Err(_) => {}
+        // A collection whose vshard does not map to a group cannot route; skip
+        // it. If NONE map, the fallback below picks the first.
+        if let Ok(group) = routing.group_for_vshard(vshard.as_u32())
+            && seen_groups.insert(group)
+        {
+            reps.push(c.clone());
         }
     }
     if reps.is_empty() {

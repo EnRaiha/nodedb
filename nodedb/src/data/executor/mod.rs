@@ -2,6 +2,7 @@
 
 pub(crate) mod checkpoint_encoding;
 pub mod core_loop;
+pub(crate) mod crdt_checkpoint;
 mod dispatch;
 pub(crate) mod doc_format;
 pub mod enforcement;

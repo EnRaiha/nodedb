@@ -234,14 +234,14 @@ fn restore_vector_checkpoints(
 
 fn restore_crdt_checkpoints(
     data_dir: &Path,
-    _core_id: usize,
+    core_id: usize,
     crdt_snapshots: &[crate::data::snapshot::CrdtSnapshot],
 ) -> crate::Result<()> {
     if crdt_snapshots.is_empty() {
         return Ok(());
     }
 
-    let ckpt_dir = data_dir.join("crdt-ckpt");
+    let ckpt_dir = crate::data::executor::crdt_checkpoint::crdt_ckpt_dir(data_dir, core_id);
     // no-objectstore: CRDT state lands in a local engine-owned directory.
     std::fs::create_dir_all(&ckpt_dir).map_err(crate::Error::Io)?;
 
