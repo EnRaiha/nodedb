@@ -207,6 +207,10 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::PutCustomType(_) => VariantClass::Exempt,
         CatalogEntry::DeleteCustomType { .. } => VariantClass::Exempt,
 
+        // WAL replay barrier — replicated for replay correctness, but it is
+        // not a parent object and carries no per-object owner row.
+        CatalogEntry::RecordWalTombstone { .. } => VariantClass::Exempt,
+
         // Database descriptors and grants are catalog-level objects with
         // no per-object owner row — they are exempt from the parent-replicated
         // ownership invariant.
