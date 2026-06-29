@@ -58,6 +58,34 @@ fn default_ivf_nprobe() -> usize {
 
 // ── Replicated write envelope ───────────────────────────────────────
 
+/// One edge of an `EdgePutBatch` / `EdgeDeleteBatch` in the cross-node wire
+/// shape. Mirrors `nodedb_physical::physical_plan::BatchEdge` but carries the
+/// endpoint surrogates as `u32` (not the `Surrogate` newtype) so the payload
+/// uses only trivially serializable types, exactly like the single `EdgePut`
+/// variant. Followers bind both surrogates verbatim on apply (never
+/// re-allocate), so the same `src_id`/`dst_id` resolves to the same identity
+/// on every replica.
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct ReplicatedBatchEdge {
+    pub collection: String,
+    pub src_id: String,
+    pub label: String,
+    pub dst_id: String,
+    /// Leader-assigned global surrogate for the source node (binding key =
+    /// `src_id.as_bytes()`).
+    pub src_surrogate: u32,
+    /// Leader-assigned global surrogate for the destination node (binding key =
+    /// `dst_id.as_bytes()`).
+    pub dst_surrogate: u32,
+}
+
 /// A write operation serialized for Raft replication.
 ///
 /// Mirrors the write variants of [`PhysicalPlan`] but uses only types that
@@ -284,6 +312,18 @@ pub enum ReplicatedWrite {
     RemoveNodeLabels {
         node_id: String,
         labels: Vec<String>,
+    },
+    /// Batched edge insert (e.g. `CREATE GRAPH INDEX` materializing one edge
+    /// per parent→child relation). Each edge carries its endpoint surrogates
+    /// verbatim so every replica binds the same identities — never
+    /// re-allocates — exactly like the single `EdgePut` variant.
+    EdgePutBatch {
+        edges: Vec<ReplicatedBatchEdge>,
+    },
+    /// Batched edge delete (rollback of a partial `EdgePutBatch`). Mirrors
+    /// `EdgePutBatch`'s surrogate handling.
+    EdgeDeleteBatch {
+        edges: Vec<ReplicatedBatchEdge>,
     },
     KvPut {
         collection: String,

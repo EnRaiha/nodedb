@@ -2,7 +2,7 @@
 
 //! Convert write-side PhysicalPlan variants to ReplicatedWrite for Raft proposal.
 
-use super::types::{ReplicatedEntry, ReplicatedWrite};
+use super::types::{ReplicatedBatchEdge, ReplicatedEntry, ReplicatedWrite};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::{
@@ -200,6 +200,34 @@ pub fn to_replicated_entry(
             ReplicatedWrite::RemoveNodeLabels {
                 node_id: node_id.clone(),
                 labels: labels.clone(),
+            }
+        }
+        PhysicalPlan::Graph(GraphOp::EdgePutBatch { edges }) => ReplicatedWrite::EdgePutBatch {
+            edges: edges
+                .iter()
+                .map(|e| ReplicatedBatchEdge {
+                    collection: e.collection.clone(),
+                    src_id: e.src_id.clone(),
+                    label: e.label.clone(),
+                    dst_id: e.dst_id.clone(),
+                    src_surrogate: e.src_surrogate.as_u32(),
+                    dst_surrogate: e.dst_surrogate.as_u32(),
+                })
+                .collect(),
+        },
+        PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch { edges }) => {
+            ReplicatedWrite::EdgeDeleteBatch {
+                edges: edges
+                    .iter()
+                    .map(|e| ReplicatedBatchEdge {
+                        collection: e.collection.clone(),
+                        src_id: e.src_id.clone(),
+                        label: e.label.clone(),
+                        dst_id: e.dst_id.clone(),
+                        src_surrogate: e.src_surrogate.as_u32(),
+                        dst_surrogate: e.dst_surrogate.as_u32(),
+                    })
+                    .collect(),
             }
         }
         PhysicalPlan::Kv(KvOp::Put {

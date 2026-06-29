@@ -18,8 +18,12 @@
 //! 3. **schema_version gated**: `state.schema_version.bump()` runs only
 //!    on success so consumers observing catalog version do not see a
 //!    half-built index.
-//! 4. **WAL-backed**: each batch is recorded via `wal_append_if_write`
-//!    before dispatch so a mid-build crash can replay the edges.
+//! 4. **WAL-backed + replicated**: each batch is dispatched via
+//!    `dispatch_sync_response`, which proposes the write through the
+//!    destination shard's Raft group. The committed log entry is the
+//!    durable record (so a mid-build crash replays the edges) and it
+//!    reaches every replica under RF>1 — no separate WAL append, and no
+//!    local-only dispatch that would strand the index on one node.
 //! 5. **Broadcast scan**: documents live on hash-of-doc-id vshards, not
 //!    the collection-name vshard. The scan uses `broadcast_to_all_cores`
 //!    to see every document, then partitions the resulting edges by
@@ -28,19 +32,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
-use sonic_rs;
-
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::broadcast::broadcast_to_all_cores;
 use crate::control::server::pgwire::types::{sqlstate_error, text_field};
-use crate::control::server::{dispatch_utils, wal_dispatch};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use futures::stream;
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp};
+use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
+use pgwire::error::PgWireResult;
 
 use super::parse::parse_edge_columns;
 
@@ -189,25 +190,18 @@ pub async fn create_graph_index(
         let plan = PhysicalPlan::Graph(GraphOp::EdgePutBatch {
             edges: edges.clone(),
         });
-        if let Err(e) =
-            wal_dispatch::wal_append_if_write(&state.wal, tenant_id, shard, database_id, &plan)
-        {
-            return surface_failure(
-                state,
-                tenant_id,
-                database_id,
-                &committed_shards,
-                format!("WAL append failed on shard {shard:?}: {e}"),
-            )
-            .await;
-        }
-        match dispatch_utils::dispatch_to_data_plane(
+        // Route the batch to its destination vShard and replicate via Raft.
+        // `dispatch_sync_response` provides WAL durability + Raft replication
+        // internally (the proposed log entry IS the durable record), so no
+        // separate `wal_append_if_write` is needed — and under RF>1 the index
+        // edges now reach every follower instead of landing local-only.
+        match crate::control::server::sync::raft_dispatch::dispatch_sync_response(
             state,
             tenant_id,
-            database_id,
             shard,
             plan,
             TraceId::ZERO,
+            crate::event::EventSource::User,
         )
         .await
         {
@@ -216,7 +210,6 @@ pub async fn create_graph_index(
                 return surface_failure(
                     state,
                     tenant_id,
-                    database_id,
                     &committed_shards,
                     format!("edge-insert dispatch failed on shard {shard:?}: {e}"),
                 )
@@ -255,7 +248,6 @@ pub async fn create_graph_index(
 async fn surface_failure(
     state: &SharedState,
     tenant_id: TenantId,
-    database_id: DatabaseId,
     committed: &[(VShardId, Vec<BatchEdge>)],
     cause: String,
 ) -> PgWireResult<Vec<Response>> {
@@ -268,13 +260,16 @@ async fn surface_failure(
         async move {
             (
                 shard,
-                dispatch_utils::dispatch_to_data_plane(
+                // Same Raft-proposing path as the forward dispatch:
+                // `dispatch_sync_response` carries WAL durability + replication
+                // internally, so the rollback tombstones reach every replica.
+                crate::control::server::sync::raft_dispatch::dispatch_sync_response(
                     state,
                     tenant_id,
-                    database_id,
                     shard,
                     plan,
                     TraceId::ZERO,
+                    crate::event::EventSource::User,
                 )
                 .await,
             )

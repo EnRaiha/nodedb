@@ -7,7 +7,7 @@ use super::types::{ReplicatedEntry, ReplicatedWrite};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::surrogate::SurrogateAssigner;
 use crate::types::{DatabaseId, TenantId, VShardId};
-use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, GraphOp, KvOp, VectorOp};
+use nodedb_physical::physical_plan::{BatchEdge, CrdtOp, DocumentOp, GraphOp, KvOp, VectorOp};
 
 ///
 /// Returns `None` if the data is not a valid ReplicatedEntry (e.g., ConfChange or no-op).
@@ -83,6 +83,51 @@ fn bind_or_lookup(
             .unwrap_or(nodedb_types::Surrogate::ZERO)),
         None => Ok(carried),
     }
+}
+
+/// Bind the endpoint surrogates for every edge in a `ReplicatedBatchEdge` slice,
+/// producing a `Vec<BatchEdge>` with leader-assigned surrogates installed in the
+/// local catalog. Shared by the `EdgePutBatch` and `EdgeDeleteBatch` decode arms.
+fn bind_batch_edges(
+    edges: &[super::types::ReplicatedBatchEdge],
+    assigner: Option<&SurrogateAssigner>,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+) -> crate::Result<Vec<BatchEdge>> {
+    let mut bound = Vec::with_capacity(edges.len());
+    for e in edges {
+        let carried_src = nodedb_types::Surrogate::new(e.src_surrogate);
+        let src_surrogate = match assigner {
+            Some(a) => a.bind(
+                database_id,
+                tenant_id,
+                &e.collection,
+                e.src_id.as_bytes(),
+                carried_src,
+            )?,
+            None => carried_src,
+        };
+        let carried_dst = nodedb_types::Surrogate::new(e.dst_surrogate);
+        let dst_surrogate = match assigner {
+            Some(a) => a.bind(
+                database_id,
+                tenant_id,
+                &e.collection,
+                e.dst_id.as_bytes(),
+                carried_dst,
+            )?,
+            None => carried_dst,
+        };
+        bound.push(BatchEdge {
+            collection: e.collection.clone(),
+            src_id: e.src_id.clone(),
+            label: e.label.clone(),
+            dst_id: e.dst_id.clone(),
+            src_surrogate,
+            dst_surrogate,
+        });
+    }
+    Ok(bound)
 }
 
 /// Convert a ReplicatedWrite back into a PhysicalPlan for Data Plane execution.
@@ -423,6 +468,18 @@ fn to_physical_plan(
             PhysicalPlan::Graph(GraphOp::RemoveNodeLabels {
                 node_id: node_id.clone(),
                 labels: labels.clone(),
+            })
+        }
+        ReplicatedWrite::EdgePutBatch { edges } => {
+            // Bind each endpoint surrogate verbatim — never re-allocate —
+            // exactly as the single `EdgePut` arm does, looping per edge.
+            PhysicalPlan::Graph(GraphOp::EdgePutBatch {
+                edges: bind_batch_edges(edges, assigner, database_id, tenant_id)?,
+            })
+        }
+        ReplicatedWrite::EdgeDeleteBatch { edges } => {
+            PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch {
+                edges: bind_batch_edges(edges, assigner, database_id, tenant_id)?,
             })
         }
         ReplicatedWrite::KvPut {
