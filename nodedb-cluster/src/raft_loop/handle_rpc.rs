@@ -684,17 +684,28 @@ mod tests {
                 // uniform(2, ...) creates 3 groups (metadata + 2 data).
                 assert_eq!(r.groups.len(), 3);
                 assert_eq!(r.vshard_to_group.len(), 1024);
-                // The new node should appear as a learner on every group,
-                // not as a voter — voter promotion happens asynchronously
-                // via the tick loop's promotion phase.
+                // At join time the node is admitted only to the coordination
+                // group(s) — here the metadata group (0). It is added as a
+                // learner (voter promotion happens asynchronously via the tick
+                // loop's promotion phase). Data groups (1, 2) are NOT admitted
+                // at join; their membership is driven by the placement system.
                 for g in &r.groups {
-                    assert!(
-                        g.learners.contains(&2),
-                        "expected node 2 as learner in group {}, got learners={:?} members={:?}",
-                        g.group_id,
-                        g.learners,
-                        g.members
-                    );
+                    if g.group_id == crate::metadata_group::METADATA_GROUP_ID {
+                        assert!(
+                            g.learners.contains(&2),
+                            "expected node 2 as learner in metadata group, got learners={:?} members={:?}",
+                            g.learners,
+                            g.members
+                        );
+                    } else {
+                        assert!(
+                            !g.learners.contains(&2) && !g.members.contains(&2),
+                            "node 2 must NOT be admitted to data group {} at join; got learners={:?} members={:?}",
+                            g.group_id,
+                            g.learners,
+                            g.members
+                        );
+                    }
                 }
             }
             other => panic!("expected JoinResponse, got {other:?}"),

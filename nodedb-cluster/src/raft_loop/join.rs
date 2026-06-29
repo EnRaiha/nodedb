@@ -47,7 +47,9 @@
 //! 9. **Broadcast TopologyUpdate** to every currently-active peer so
 //!    followers learn the new node's address. Fire-and-forget.
 //! 10. **Build and return JoinResponse** with the updated routing
-//!     (which now includes the new node as a learner on every group).
+//!     (which includes the new node as a learner on the coordination
+//!     groups it was admitted to; data-group membership follows later
+//!     via the placement system).
 //!
 //! The Raft-level promotion from learner to voter happens asynchronously
 //! in the tick loop (`super::tick::promote_ready_learners`) once the
@@ -80,16 +82,33 @@ const CONF_CHANGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Polling interval for the commit-wait loop.
 const CONF_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Returns the coordination groups (metadata group 0 and the sequencer group)
+/// that the joining node must be admitted to at join time. Data groups are
+/// intentionally excluded: their membership is driven by the placement system
+/// (the placement reconciler authors each data group's voter set and the
+/// per-group leaders add the node as a learner once it is placed), so
+/// admitting the joiner to every data group here would create lingering
+/// learners in groups that placement has not assigned the node to.
+///
+/// Coordination groups (group 0 + sequencer) are excluded from placement
+/// reconciliation, so their membership must be established here. Promotion
+/// from learner to voter for these groups happens via the tick loop's
+/// `promote_ready_learners`, which uses an all-promote fallback for groups
+/// with no placement assignment.
 fn groups_requiring_admission(multi_raft: &MultiRaft, node_id: u64) -> Vec<u64> {
-    multi_raft
-        .group_ids()
-        .into_iter()
-        .filter(|group_id| {
-            !multi_raft
+    let existing = multi_raft.group_ids();
+    [
+        crate::metadata_group::METADATA_GROUP_ID,
+        crate::calvin::sequencer::SEQUENCER_GROUP_ID,
+    ]
+    .into_iter()
+    .filter(|group_id| {
+        existing.contains(group_id)
+            && !multi_raft
                 .group_contains_node(*group_id, node_id)
                 .unwrap_or(false)
-        })
-        .collect()
+    })
+    .collect()
 }
 
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
@@ -461,6 +480,12 @@ mod tests {
     use crate::calvin::SEQUENCER_GROUP_ID;
     use crate::routing::RoutingTable;
 
+    /// Node 2 is already a learner in group 0 (metadata) and group 1 (data).
+    /// The sequencer group exists but does not yet contain node 2.
+    /// `groups_requiring_admission` must return only SEQUENCER_GROUP_ID:
+    /// - group 0 already contains node 2 → skipped
+    /// - group 1 is a data group (not a coordination group) → excluded regardless
+    /// - SEQUENCER_GROUP_ID is missing node 2 → included
     #[test]
     fn partial_rejoin_only_reconciles_missing_group_membership() {
         let dir = tempfile::tempdir().unwrap();
@@ -482,9 +507,32 @@ mod tests {
                 .unwrap();
         }
 
+        // Only the sequencer coordination group is missing node 2.
+        // The data group (1) must not appear even though node 2 is absent
+        // from it — data group membership is driven by placement, not join.
         assert_eq!(
             groups_requiring_admission(&multi_raft, 2),
             vec![SEQUENCER_GROUP_ID]
         );
+    }
+
+    /// A fresh joining node (absent from all groups) must be admitted only
+    /// to the two coordination groups: metadata group 0 and the sequencer
+    /// group. Data groups must be excluded regardless of the node's absence.
+    #[test]
+    fn join_admits_only_coordination_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = RoutingTable::uniform(1, &[1], 1);
+        let mut multi_raft = MultiRaft::new(1, routing, dir.path().to_path_buf());
+        // Coordination groups.
+        multi_raft.add_group(0, vec![]).unwrap();
+        multi_raft.add_group(SEQUENCER_GROUP_ID, vec![]).unwrap();
+        // Data groups — node 3 is absent from both but must not be returned.
+        multi_raft.add_group(2, vec![]).unwrap();
+        multi_raft.add_group(3, vec![]).unwrap();
+
+        let admitted = groups_requiring_admission(&multi_raft, 3);
+        // Must contain exactly the two coordination groups, in declaration order.
+        assert_eq!(admitted, vec![0, SEQUENCER_GROUP_ID]);
     }
 }
