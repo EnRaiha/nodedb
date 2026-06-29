@@ -105,16 +105,18 @@ pub async fn run_apply_loop(
 ) {
     while let Some(batch) = apply_rx.recv().await {
         for entry in &batch.entries {
-            // Extract idempotency key once at the top so every
-            // tracker.complete on this entry can pass it. Returns 0
-            // for unparseable / pre-key entries; the tracker treats
-            // 0 as "no key" (no mismatch detection).
-            let applied_key = ReplicatedEntry::from_bytes(&entry.data)
+            // Decode once; reused for both the idempotency key and the
+            // Array/Calvin fast-path match below. Returns 0 for
+            // unparseable / pre-key entries; the tracker treats 0 as
+            // "no key" (no mismatch detection).
+            let replicated_opt = ReplicatedEntry::from_bytes(&entry.data);
+            let applied_key = replicated_opt
+                .as_ref()
                 .map(|e| e.idempotency_key)
                 .unwrap_or(0);
 
             // ── Array CRDT variants — handled on the Control Plane, bypass Data Plane ──
-            if let Some(replicated) = ReplicatedEntry::from_bytes(&entry.data) {
+            if let Some(replicated) = replicated_opt {
                 let target_vshard = replicated.vshard_id;
                 match replicated.write {
                     ReplicatedWrite::ArrayOp {
@@ -123,7 +125,7 @@ pub async fn run_apply_loop(
                         ref provenance,
                         ..
                     } => {
-                        apply_array_op(
+                        let applied_ok = apply_array_op(
                             &state,
                             &tracker,
                             AppliedPosition {
@@ -136,6 +138,12 @@ pub async fn run_apply_loop(
                             provenance.as_deref(),
                         )
                         .await;
+                        // Advance the compaction watermark only when the op
+                        // durably applied — same safe-watermark rule as the
+                        // Data Plane write path below.
+                        if applied_ok {
+                            maybe_compact_log(&state, batch.group_id, entry.index);
+                        }
                         continue;
                     }
                     ReplicatedWrite::ArraySchema {
@@ -143,7 +151,7 @@ pub async fn run_apply_loop(
                         ref snapshot_payload,
                         schema_hlc_bytes,
                     } => {
-                        apply_array_schema(
+                        let applied_ok = apply_array_schema(
                             &state,
                             &tracker,
                             AppliedPosition {
@@ -157,6 +165,11 @@ pub async fn run_apply_loop(
                                 schema_hlc_bytes,
                             },
                         );
+                        // Advance the compaction watermark only when the
+                        // schema snapshot durably imported.
+                        if applied_ok {
+                            maybe_compact_log(&state, batch.group_id, entry.index);
+                        }
                         continue;
                     }
                     ReplicatedWrite::CalvinReadResult {

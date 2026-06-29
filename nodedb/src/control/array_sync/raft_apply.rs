@@ -36,6 +36,10 @@ use crate::types::{DatabaseId, ReadConsistency, TraceId};
 /// Decodes the op, dispatches it to the Data Plane via SPSC, and records it
 /// in the op-log so future `already_seen` checks return `true`. This is the
 /// authoritative idempotency gate — it runs on every replica after Raft commit.
+///
+/// Returns `true` when the op was durably applied (or was already applied via
+/// the idempotency gate), `false` on any decode/dispatch/apply failure. The
+/// caller uses this to gate Raft log compaction on a safe applied watermark.
 pub(crate) async fn apply_array_op(
     state: &Arc<SharedState>,
     tracker: &Arc<ProposeTracker>,
@@ -43,7 +47,7 @@ pub(crate) async fn apply_array_op(
     array: &str,
     op_bytes: &[u8],
     provenance_bytes: Option<&[u8]>,
-) {
+) -> bool {
     let AppliedPosition {
         group_id,
         log_index,
@@ -90,7 +94,7 @@ pub(crate) async fn apply_array_op(
                     detail: format!("array op decode: {e}"),
                 }),
             );
-            return;
+            return false;
         }
     };
 
@@ -102,7 +106,7 @@ pub(crate) async fn apply_array_op(
     );
     if engine.already_seen(&op.header.array, op.header.hlc) {
         tracker.complete(group_id, log_index, applied_key, Ok(vec![]));
-        return;
+        return true;
     }
 
     // Compute vshard for dispatch.
@@ -142,7 +146,7 @@ pub(crate) async fn apply_array_op(
             "apply_array_op: ensure_array_open failed"
         );
         tracker.complete(group_id, log_index, applied_key, Err(e));
-        return;
+        return false;
     }
 
     let data_op = match op.kind {
@@ -167,7 +171,7 @@ pub(crate) async fn apply_array_op(
                             detail: format!("cells encode: {e}"),
                         }),
                     );
-                    return;
+                    return false;
                 }
             };
             DataArrayOp::Put {
@@ -191,7 +195,7 @@ pub(crate) async fn apply_array_op(
                             detail: format!("coords encode: {e}"),
                         }),
                     );
-                    return;
+                    return false;
                 }
             };
             DataArrayOp::Delete {
@@ -204,25 +208,8 @@ pub(crate) async fn apply_array_op(
     };
 
     let plan = crate::bridge::envelope::PhysicalPlan::Array(data_op);
-
-    let request_id = state.next_request_id();
-    let request = Request {
-        request_id,
-        tenant_id,
-        database_id: DatabaseId::DEFAULT,
-        vshard_id: vshard,
-        plan,
-        deadline: std::time::Instant::now() + Duration::from_secs(30),
-        priority: Priority::Normal,
-        trace_id: TraceId::generate(),
-        consistency: ReadConsistency::Strong,
-        idempotency_key: None,
-        event_source: crate::event::EventSource::CrdtSync,
-        user_roles: Vec::new(),
-        user_id: None,
-        statement_digest: None,
-    };
-
+    let request = build_array_request(state, tenant_id, vshard, plan);
+    let request_id = request.request_id;
     let mut rx = state.tracker.register(request_id);
 
     let dispatch_result = match state.dispatcher.lock() {
@@ -240,7 +227,7 @@ pub(crate) async fn apply_array_op(
                 detail: format!("dispatch: {e}"),
             }),
         );
-        return;
+        return false;
     }
 
     let result = await_data_plane(async move { rx.recv().await.ok_or(()) }, "array op").await;
@@ -255,9 +242,11 @@ pub(crate) async fn apply_array_op(
                 );
             }
             tracker.complete(group_id, log_index, applied_key, Ok(payload));
+            true
         }
         Err(e) => {
             tracker.complete(group_id, log_index, applied_key, Err(e));
+            false
         }
     }
 }
@@ -298,7 +287,6 @@ async fn ensure_array_open(
         }
     };
 
-    let open_request_id = state.next_request_id();
     let open_plan = crate::bridge::envelope::PhysicalPlan::Array(
         nodedb_physical::physical_plan::ArrayOp::OpenArray {
             array_id: array_id.clone(),
@@ -307,23 +295,8 @@ async fn ensure_array_open(
             prefix_bits,
         },
     );
-    let open_request = Request {
-        request_id: open_request_id,
-        tenant_id,
-        database_id: DatabaseId::DEFAULT,
-        vshard_id: vshard,
-        plan: open_plan,
-        deadline: std::time::Instant::now() + Duration::from_secs(30),
-        priority: Priority::Normal,
-        trace_id: TraceId::generate(),
-        consistency: ReadConsistency::Strong,
-        idempotency_key: None,
-        event_source: crate::event::EventSource::CrdtSync,
-        user_roles: Vec::new(),
-        user_id: None,
-        statement_digest: None,
-    };
-
+    let open_request = build_array_request(state, tenant_id, vshard, open_plan);
+    let open_request_id = open_request.request_id;
     let mut open_rx = state.tracker.register(open_request_id);
 
     let dispatch_result = match state.dispatcher.lock() {
@@ -357,12 +330,15 @@ pub(crate) struct ArraySchemaPayload<'a> {
 ///    This is the canonical DDL propagation path for followers: the Raft
 ///    `ArraySchema` entry is the single source of truth — no out-of-band
 ///    catalog registration is needed.
+///
+/// Returns `true` when the schema snapshot was durably imported, `false` when
+/// the import failed. The caller uses this to gate Raft log compaction.
 pub(crate) fn apply_array_schema(
     state: &Arc<SharedState>,
     tracker: &Arc<ProposeTracker>,
     pos: AppliedPosition,
     payload: ArraySchemaPayload<'_>,
-) {
+) -> bool {
     let AppliedPosition {
         group_id,
         log_index,
@@ -401,7 +377,7 @@ pub(crate) fn apply_array_schema(
                 detail: format!("schema import: {e}"),
             }),
         );
-        return;
+        return false;
     }
 
     // Decode the ArraySchema from the just-imported Loro document and register
@@ -449,6 +425,35 @@ pub(crate) fn apply_array_schema(
     }
 
     tracker.complete(group_id, log_index, applied_key, Ok(vec![]));
+    true
+}
+
+/// Build a `Request` for an array apply/open with default deadline / priority.
+///
+/// Centralises the six boilerplate fields that are identical for every
+/// Control-Plane → Data-Plane dispatch originating from the array apply path.
+fn build_array_request(
+    state: &Arc<SharedState>,
+    tenant_id: crate::types::TenantId,
+    vshard_id: crate::types::VShardId,
+    plan: crate::bridge::envelope::PhysicalPlan,
+) -> Request {
+    Request {
+        request_id: state.next_request_id(),
+        tenant_id,
+        database_id: DatabaseId::DEFAULT,
+        vshard_id,
+        plan,
+        deadline: std::time::Instant::now() + Duration::from_secs(30),
+        priority: Priority::Normal,
+        trace_id: TraceId::generate(),
+        consistency: ReadConsistency::Strong,
+        idempotency_key: None,
+        event_source: crate::event::EventSource::CrdtSync,
+        user_roles: Vec::new(),
+        user_id: None,
+        statement_digest: None,
+    }
 }
 
 /// Await a Data Plane response, mapping timeout / channel-closed / error-status
