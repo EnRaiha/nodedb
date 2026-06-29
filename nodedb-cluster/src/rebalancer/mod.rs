@@ -26,6 +26,7 @@
 pub mod driver;
 pub mod elastic;
 pub mod metrics;
+pub mod placement;
 pub mod plan;
 
 pub use driver::{
