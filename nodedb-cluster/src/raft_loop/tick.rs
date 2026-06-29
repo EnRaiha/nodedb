@@ -25,6 +25,10 @@
 //!    propose `PromoteLearner` for each. Idempotent by design — after
 //!    the first promotion the peer has moved from `learners` to
 //!    `members` and won't be returned again.
+//! 8. **Remove leaving voters**: for each group this node leads, propose
+//!    `RemoveNode` for committed voters no longer in the placement set —
+//!    capped so the group never drops below RF committed voters, one at a
+//!    time, and never removing the group leader.
 
 use std::collections::HashMap as BatchMap;
 
@@ -366,6 +370,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // catching up. Idempotent: once promoted, the peer is in
         // `members` and `ready_learners` no longer returns it.
         self.promote_ready_learners();
+
+        // Remove committed voters no longer in a group's placement set, once
+        // their replacement has been promoted (RF floor on committed voters).
+        // At most one removal per group per pass; never removes the leader.
+        // Re-proposals while a conf-change is pending are harmlessly rejected.
+        self.converge_leaving_voters();
 
         // Placement reconcile is throttled well above the tick rate: SetPlacement
         // is a normal metadata entry (not a conf-change), so Raft would not dedup
