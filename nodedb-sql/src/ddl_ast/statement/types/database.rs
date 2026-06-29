@@ -150,6 +150,7 @@ pub enum DatabaseStmt {
     },
     RestoreTenant {
         dry_run: bool,
+        force: bool,
         tenant_id: String,
     },
 }

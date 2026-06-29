@@ -17,6 +17,8 @@ use std::sync::Mutex;
 pub struct RestorePending {
     pub tenant_id: u64,
     pub dry_run: bool,
+    /// Bypass the restore staleness gate (disaster-recovery restore-after-purge).
+    pub force: bool,
     pub bytes: Vec<u8>,
     /// Hard cap on accumulated bytes. The handler aborts the COPY IN
     /// once the limit would be exceeded.
@@ -24,10 +26,11 @@ pub struct RestorePending {
 }
 
 impl RestorePending {
-    pub fn new(tenant_id: u64, dry_run: bool, max_bytes: u64) -> Self {
+    pub fn new(tenant_id: u64, dry_run: bool, force: bool, max_bytes: u64) -> Self {
         Self {
             tenant_id,
             dry_run,
+            force,
             bytes: Vec::new(),
             max_bytes,
         }
@@ -56,12 +59,12 @@ impl RestoreState {
     }
 
     pub fn begin(&self, conn_id: u64, pending: RestorePending) {
-        let mut g = self.inner.lock().expect("RestoreState poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.insert(conn_id, pending);
     }
 
     pub fn append(&self, conn_id: u64, chunk: &[u8]) -> Result<(), AppendError> {
-        let mut g = self.inner.lock().expect("RestoreState poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = g.get_mut(&conn_id).ok_or(AppendError::NotPending)?;
         entry
             .append(chunk)
@@ -69,7 +72,7 @@ impl RestoreState {
     }
 
     pub fn take(&self, conn_id: u64) -> Option<RestorePending> {
-        let mut g = self.inner.lock().expect("RestoreState poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.remove(&conn_id)
     }
 
@@ -93,7 +96,7 @@ mod tests {
     #[test]
     fn append_then_take() {
         let s = RestoreState::new();
-        s.begin(1, RestorePending::new(7, false, 1024));
+        s.begin(1, RestorePending::new(7, false, false, 1024));
         s.append(1, b"hello ").unwrap();
         s.append(1, b"world").unwrap();
         let p = s.take(1).unwrap();
@@ -111,7 +114,7 @@ mod tests {
     #[test]
     fn append_respects_cap() {
         let s = RestoreState::new();
-        s.begin(1, RestorePending::new(7, false, 4));
+        s.begin(1, RestorePending::new(7, false, false, 4));
         s.append(1, b"abc").unwrap();
         assert_eq!(s.append(1, b"de"), Err(AppendError::OverCap { cap: 4 }));
     }
@@ -119,7 +122,7 @@ mod tests {
     #[test]
     fn cancel_drops_state() {
         let s = RestoreState::new();
-        s.begin(1, RestorePending::new(7, false, 1024));
+        s.begin(1, RestorePending::new(7, false, false, 1024));
         s.cancel(1);
         assert_eq!(s.append(1, b"x"), Err(AppendError::NotPending));
     }

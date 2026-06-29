@@ -83,10 +83,14 @@ impl NodeDbPgHandler {
                 let stream = stream::once(async move { copy_data });
                 Ok(Response::CopyOut(CopyResponse::new(0, 0, stream)))
             }
-            CopyIntent::RestoreTenant { tenant_id, dry_run } => {
+            CopyIntent::RestoreTenant {
+                tenant_id,
+                dry_run,
+                force,
+            } => {
                 self.restore_state.begin(
                     conn_id(&addr),
-                    backup::RestorePending::new(tenant_id, dry_run, COPY_IN_CAP),
+                    backup::RestorePending::new(tenant_id, dry_run, force, COPY_IN_CAP),
                 );
                 // Empty out-stream — server tells client "send me bytes".
                 let empty = stream::empty();
@@ -143,6 +147,7 @@ impl CopyHandler for NodeDbCopyHandler {
             pending.tenant_id,
             &pending.bytes,
             pending.dry_run,
+            pending.force,
         )
         .await
         .map_err(internal)?;

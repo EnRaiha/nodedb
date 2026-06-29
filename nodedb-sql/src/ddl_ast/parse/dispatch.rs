@@ -523,8 +523,30 @@ mod tests {
     fn parse_restore_dry_run() {
         let stmt = ok("RESTORE TENANT 1 FROM '/tmp/backup' DRY RUN");
         match stmt {
-            NodedbStatement::Database(DatabaseStmt::RestoreTenant { dry_run, tenant_id }) => {
+            NodedbStatement::Database(DatabaseStmt::RestoreTenant {
+                dry_run,
+                force,
+                tenant_id,
+            }) => {
                 assert!(dry_run);
+                assert!(!force);
+                assert_eq!(tenant_id, "1");
+            }
+            other => panic!("expected RestoreTenant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_force() {
+        let stmt = ok("RESTORE TENANT 1 FROM '/tmp/backup' FORCE");
+        match stmt {
+            NodedbStatement::Database(DatabaseStmt::RestoreTenant {
+                dry_run,
+                force,
+                tenant_id,
+            }) => {
+                assert!(!dry_run);
+                assert!(force);
                 assert_eq!(tenant_id, "1");
             }
             other => panic!("expected RestoreTenant, got {other:?}"),

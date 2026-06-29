@@ -9,8 +9,12 @@
 pub enum CopyIntent {
     /// `COPY (BACKUP TENANT <id>) TO STDOUT`
     BackupTenant { tenant_id: u64 },
-    /// `COPY tenant_restore(<id>) FROM STDIN [DRY RUN]`
-    RestoreTenant { tenant_id: u64, dry_run: bool },
+    /// `COPY tenant_restore(<id>) FROM STDIN [FORCE] [DRY RUN]`
+    RestoreTenant {
+        tenant_id: u64,
+        dry_run: bool,
+        force: bool,
+    },
 }
 
 /// Returns Some(intent) if the SQL is one of the recognised wire-COPY shapes.
@@ -73,21 +77,26 @@ fn match_restore(sql: &str, upper: &str) -> Option<CopyIntent> {
     let after_from = after_close.strip_prefix("FROM")?.trim_start();
     let after_stdin = after_from.strip_prefix("STDIN")?.trim_start();
 
-    let dry_run = match after_stdin {
-        "" => false,
-        rest => {
-            // Accept "DRY RUN" or "DRYRUN" (matches the existing legacy parser).
-            let rest = rest.trim();
-            if rest == "DRY RUN" || rest == "DRYRUN" {
-                true
-            } else {
-                return None;
-            }
+    // Optional trailing modifiers in any order: FORCE and DRY RUN (or DRYRUN).
+    // Collapse "DRY RUN" to a single token so a flat word scan can validate
+    // that nothing unrecognised trails STDIN.
+    let normalized = after_stdin.trim().replace("DRY RUN", "DRYRUN");
+    let mut dry_run = false;
+    let mut force = false;
+    for token in normalized.split_whitespace() {
+        match token {
+            "DRYRUN" => dry_run = true,
+            "FORCE" => force = true,
+            _ => return None,
         }
-    };
+    }
 
     let _ = sql;
-    Some(CopyIntent::RestoreTenant { tenant_id, dry_run })
+    Some(CopyIntent::RestoreTenant {
+        tenant_id,
+        dry_run,
+        force,
+    })
 }
 
 #[cfg(test)]
@@ -116,7 +125,8 @@ mod tests {
             detect("COPY tenant_restore(7) FROM STDIN"),
             Some(CopyIntent::RestoreTenant {
                 tenant_id: 7,
-                dry_run: false
+                dry_run: false,
+                force: false
             })
         );
     }
@@ -127,16 +137,55 @@ mod tests {
             detect("COPY tenant_restore(7) FROM STDIN DRY RUN"),
             Some(CopyIntent::RestoreTenant {
                 tenant_id: 7,
-                dry_run: true
+                dry_run: true,
+                force: false
             })
         );
         assert_eq!(
             detect("COPY tenant_restore(7) FROM STDIN DRYRUN"),
             Some(CopyIntent::RestoreTenant {
                 tenant_id: 7,
-                dry_run: true
+                dry_run: true,
+                force: false
             })
         );
+    }
+
+    #[test]
+    fn detects_restore_force() {
+        assert_eq!(
+            detect("COPY tenant_restore(7) FROM STDIN FORCE"),
+            Some(CopyIntent::RestoreTenant {
+                tenant_id: 7,
+                dry_run: false,
+                force: true
+            })
+        );
+    }
+
+    #[test]
+    fn detects_restore_force_and_dry_run_any_order() {
+        assert_eq!(
+            detect("COPY tenant_restore(7) FROM STDIN FORCE DRY RUN"),
+            Some(CopyIntent::RestoreTenant {
+                tenant_id: 7,
+                dry_run: true,
+                force: true
+            })
+        );
+        assert_eq!(
+            detect("COPY tenant_restore(7) FROM STDIN DRY RUN FORCE"),
+            Some(CopyIntent::RestoreTenant {
+                tenant_id: 7,
+                dry_run: true,
+                force: true
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_restore_modifier() {
+        assert_eq!(detect("COPY tenant_restore(7) FROM STDIN BOGUS"), None);
     }
 
     #[test]

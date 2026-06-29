@@ -64,6 +64,7 @@ pub async fn restore_tenant(
     tenant_id: u64,
     envelope_bytes: &[u8],
     dry_run: bool,
+    force: bool,
 ) -> Result<RestoreStats, Error> {
     let env = match &state.backup_kek {
         Some(kek) => parse_envelope_encrypted(envelope_bytes, DEFAULT_MAX_TOTAL_BYTES, kek)
@@ -93,14 +94,25 @@ pub async fn restore_tenant(
             .and_then(|map| map.get(&tenant_id).copied())
             .unwrap_or(0);
         if env.meta.snapshot_watermark < current_high_water {
-            return Err(Error::Internal {
-                detail: format!(
-                    "restore refused: envelope watermark {} is older than the \
-                     destination cluster's last observed write-HLC {} for tenant \
-                     {} — newer writes would be silently overwritten",
-                    env.meta.snapshot_watermark, current_high_water, tenant_id
-                ),
-            });
+            if force {
+                tracing::warn!(
+                    tenant_id,
+                    envelope_watermark = env.meta.snapshot_watermark,
+                    current_high_water,
+                    "restore staleness protection explicitly overridden via FORCE: \
+                     envelope watermark is older than the destination cluster's last \
+                     observed write-HLC for this tenant — newer writes will be overwritten"
+                );
+            } else {
+                return Err(Error::Internal {
+                    detail: format!(
+                        "restore refused: envelope watermark {} is older than the \
+                         destination cluster's last observed write-HLC {} for tenant \
+                         {} — newer writes would be silently overwritten",
+                        env.meta.snapshot_watermark, current_high_water, tenant_id
+                    ),
+                });
+            }
         }
     }
 
