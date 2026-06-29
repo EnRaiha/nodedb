@@ -55,6 +55,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             data_dir: self.data_dir,
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
             orphan_partial_max_age_secs: self.orphan_partial_max_age_secs,
+            replication_factor: self.replication_factor,
         }
     }
 
@@ -233,6 +234,16 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
 
     pub fn with_tick_interval(mut self, interval: Duration) -> Self {
         self.tick_interval = interval;
+        self
+    }
+
+    /// Set the cluster replication factor (target voters per group).
+    ///
+    /// Pass the value loaded from `ClusterSettings::replication_factor` at
+    /// startup. The field is immutable after the loop is wrapped in `Arc` —
+    /// call this on the builder chain before that wrap.
+    pub fn with_replication_factor(mut self, rf: u32) -> Self {
+        self.replication_factor = rf;
         self
     }
 

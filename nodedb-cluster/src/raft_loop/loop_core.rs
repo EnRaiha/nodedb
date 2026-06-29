@@ -242,6 +242,12 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
 
     /// Orphan partial-snapshot max age for the GC sweeper (seconds).
     pub(super) orphan_partial_max_age_secs: u64,
+
+    /// Cluster replication factor (target voters per group), loaded once from
+    /// `ClusterSettings` at startup; immutable for the loop's lifetime. Used
+    /// to cap voter promotion at min(RF, N). Defaults to 1 (single-node, no
+    /// extra replicas) when not overridden via `with_replication_factor`.
+    pub(super) replication_factor: u32,
 }
 
 impl<A: CommitApplier> RaftLoop<A> {
@@ -284,6 +290,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             data_dir: None,
             snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
+            replication_factor: 1,
         }
     }
 }
@@ -343,6 +350,15 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// This node's id (exposed for handlers and tests).
     pub fn node_id(&self) -> u64 {
         self.node_id
+    }
+
+    /// Target replication factor for this cluster (voters per group).
+    ///
+    /// Loaded once from `ClusterSettings` at startup and immutable for the
+    /// loop's lifetime. Returns `1` when no override was set (single-node
+    /// default).
+    pub fn replication_factor(&self) -> u32 {
+        self.replication_factor
     }
 
     /// Run the event loop until shutdown.
@@ -477,6 +493,38 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// Verify that `with_replication_factor` stores the supplied value and that
+    /// the default (no builder call) is 1.
+    #[tokio::test]
+    async fn replication_factor_accessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = make_transport(1);
+        let rt = RoutingTable::uniform(1, &[1], 1);
+        let mut mr = MultiRaft::new(1, rt, dir.path().to_path_buf());
+        mr.add_group(0, vec![]).unwrap();
+        mr.add_group(1, vec![]).unwrap();
+
+        let topo = Arc::new(RwLock::new(ClusterTopology::new()));
+
+        // Default: 1 (single-node sentinel, no builder call).
+        let loop_default = RaftLoop::new(
+            MultiRaft::new(
+                1,
+                RoutingTable::uniform(1, &[1], 1),
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+            ),
+            make_transport(1),
+            topo.clone(),
+            CountingApplier::new(),
+        );
+        assert_eq!(loop_default.replication_factor(), 1);
+
+        // Explicit override via builder.
+        let loop_rf3 =
+            RaftLoop::new(mr, transport, topo, CountingApplier::new()).with_replication_factor(3);
+        assert_eq!(loop_rf3.replication_factor(), 3);
     }
 
     #[tokio::test]

@@ -148,6 +148,21 @@ pub fn start_raft(
         )
     };
 
+    // Load the replication factor from persisted cluster settings. This
+    // function is always called after bootstrap has written those settings —
+    // `None` here indicates the node was never bootstrapped, which is an
+    // invariant violation (not a recoverable condition).
+    let replication_factor = handle
+        .catalog
+        .load_cluster_settings()
+        .map_err(|e| crate::Error::Config {
+            detail: format!("start_raft: failed to load cluster settings: {e}"),
+        })?
+        .map(|s| s.replication_factor)
+        .ok_or_else(|| crate::Error::Config {
+            detail: "start_raft: cluster settings not found (node not bootstrapped)".to_string(),
+        })?;
+
     let quarantine_hook = Arc::new(RaftSnapshotQuarantineHook {
         registry: Arc::clone(&shared.quarantine_registry),
     });
@@ -263,7 +278,8 @@ pub fn start_raft(
         .with_calvin_submit_inbox(calvin_submit_inbox)
         .with_data_dir(data_dir.to_path_buf())
         .with_snapshot_chunk_bytes(snapshot_chunk_bytes)
-        .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs),
+        .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs)
+        .with_replication_factor(replication_factor),
     );
 
     // Spawn cluster subsystems now that the loop owns `MultiRaft`.
