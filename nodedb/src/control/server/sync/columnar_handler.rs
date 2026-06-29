@@ -20,6 +20,35 @@ use super::session::SyncSession;
 use super::wire::*;
 use crate::types::{DatabaseId, TenantId, VShardId};
 
+// ── PK extraction helper ─────────────────────────────────────────────────────
+
+/// Extract the primary-key bytes for a decoded columnar row, mirroring the
+/// non-sync planner's key precedence (`id`, `document_id`, `key`). Returns an
+/// empty `Vec` for headless rows (no PK column found, or PK is null/empty) —
+/// callers map that to `Surrogate::ZERO`.
+///
+/// String rendering matches `sql_value_to_string` in the non-sync path so
+/// that a numeric id such as `Value::Integer(5)` produces `b"5"`, not
+/// `b"Int(5)"`, giving identical surrogate assignments across both paths.
+fn columnar_row_pk_bytes(row: &Value) -> Vec<u8> {
+    let map = match row {
+        Value::Object(m) => m,
+        _ => return Vec::new(),
+    };
+    let pk_str = ["id", "document_id", "key"]
+        .iter()
+        .find_map(|k| map.get(*k))
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            Value::Integer(i) => i.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    pk_str.into_bytes()
+}
+
 // ── Dispatcher trait ─────────────────────────────────────────────────────────
 
 /// Encapsulates async Data Plane dispatch for a decoded columnar insert.
@@ -101,6 +130,24 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
             })
             .collect();
 
+        // Assign cross-engine surrogates in row order before WAL append so
+        // every replica stores and applies the same surrogate set. The
+        // coordinator assigns once; followers replay from the WAL record.
+        let mut surrogates: Vec<nodedb_types::Surrogate> = Vec::with_capacity(object_rows.len());
+        for row in &object_rows {
+            let pk = columnar_row_pk_bytes(row);
+            if pk.is_empty() {
+                surrogates.push(nodedb_types::Surrogate::ZERO);
+            } else {
+                surrogates.push(self.shared.surrogate_assigner.assign(
+                    DatabaseId::DEFAULT,
+                    tenant_id,
+                    &collection,
+                    &pk,
+                )?);
+            }
+        }
+
         // Encode as msgpack — the Data Plane handler calls `value_from_msgpack(payload)`
         // and expects Value::Array([Value::Object, ...]).
         let array_value = Value::Array(object_rows);
@@ -109,11 +156,8 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
                 detail: format!("columnar sync: msgpack serialize rows: {e}"),
             })?;
 
-        // Allocate a WAL LSN on the Control Plane before dispatching to the
-        // Data Plane. This is the canonical LSN for dedup tracking.
-        // The sync/CRDT columnar path does not currently carry cross-engine
-        // surrogates (pre-existing gap — tracked as a separate follow-up), so
-        // it persists none; replay allocates fresh identity for these rows.
+        // WAL append — surrogates are persisted so followers never mint their
+        // own divergent ids.
         let wal_lsn = wal_append_columnar(
             &self.shared.wal,
             tenant_id,
@@ -123,7 +167,7 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
                 collection: &collection,
                 payload: &payload,
                 provenance: Some(&prov),
-                surrogates: &[],
+                surrogates: &surrogates,
             },
         )?
         .map(|lsn| lsn.as_u64());
@@ -134,7 +178,7 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
             format: "msgpack".to_string(),
             intent: ColumnarInsertIntent::Insert,
             on_conflict_updates: Vec::new(),
-            surrogates: Vec::new(),
+            surrogates,
             schema_bytes,
             provenance: Some(prov),
             wal_lsn,
@@ -382,6 +426,72 @@ mod tests {
 
     fn encode_row(values: Vec<Value>) -> Vec<u8> {
         zerompk::to_msgpack_vec(&values).expect("encode row")
+    }
+
+    // ── columnar_row_pk_bytes tests ──────────────────────────────────────────
+
+    fn obj(pairs: &[(&str, Value)]) -> Value {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        for (k, v) in pairs {
+            map.insert(k.to_string(), v.clone());
+        }
+        Value::Object(map)
+    }
+
+    #[test]
+    fn pk_bytes_id_wins_over_document_id_and_key() {
+        let row = obj(&[
+            ("id", Value::String("id-val".to_string())),
+            ("document_id", Value::String("doc-val".to_string())),
+            ("key", Value::String("key-val".to_string())),
+        ]);
+        assert_eq!(columnar_row_pk_bytes(&row), b"id-val");
+    }
+
+    #[test]
+    fn pk_bytes_document_id_wins_over_key() {
+        let row = obj(&[
+            ("document_id", Value::String("doc-val".to_string())),
+            ("key", Value::String("key-val".to_string())),
+        ]);
+        assert_eq!(columnar_row_pk_bytes(&row), b"doc-val");
+    }
+
+    #[test]
+    fn pk_bytes_key_fallback() {
+        let row = obj(&[("key", Value::String("key-val".to_string()))]);
+        assert_eq!(columnar_row_pk_bytes(&row), b"key-val");
+    }
+
+    #[test]
+    fn pk_bytes_integer_renders_as_decimal() {
+        let row = obj(&[("id", Value::Integer(5))]);
+        assert_eq!(columnar_row_pk_bytes(&row), b"5");
+    }
+
+    #[test]
+    fn pk_bytes_headless_row_is_empty() {
+        let row = obj(&[("col0", Value::Integer(1)), ("col1", Value::Float(2.0))]);
+        assert!(columnar_row_pk_bytes(&row).is_empty());
+    }
+
+    #[test]
+    fn pk_bytes_null_pk_is_empty() {
+        let row = obj(&[("id", Value::Null)]);
+        assert!(columnar_row_pk_bytes(&row).is_empty());
+    }
+
+    #[test]
+    fn pk_bytes_non_object_is_empty() {
+        assert!(columnar_row_pk_bytes(&Value::Integer(42)).is_empty());
+        assert!(columnar_row_pk_bytes(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn pk_bytes_deterministic() {
+        let row = obj(&[("id", Value::Integer(99))]);
+        assert_eq!(columnar_row_pk_bytes(&row), columnar_row_pk_bytes(&row));
     }
 
     fn make_insert_msg(collection: &str, rows: Vec<Vec<Value>>) -> ColumnarInsertMsg {
