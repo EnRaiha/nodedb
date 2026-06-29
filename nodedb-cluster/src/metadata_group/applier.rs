@@ -253,6 +253,12 @@ impl CacheApplier {
             RoutingChange::RemoveMember { group_id, node_id } => {
                 rt.remove_group_member(*group_id, *node_id);
             }
+            RoutingChange::SetPlacement {
+                group_id,
+                placement,
+            } => {
+                rt.set_placement(*group_id, placement.clone());
+            }
         }
     }
 }
@@ -390,6 +396,35 @@ mod tests {
 
         let rt = routing.read().unwrap();
         assert!(!rt.group_info(0).unwrap().members.contains(&2));
+    }
+
+    #[test]
+    fn cache_applier_mutates_live_routing_on_set_placement() {
+        use crate::metadata_group::entry::RoutingChange;
+
+        let cache = Arc::new(RwLock::new(MetadataCache::new()));
+        let topology = Arc::new(RwLock::new(crate::topology::ClusterTopology::new()));
+        let routing = Arc::new(RwLock::new(crate::routing::RoutingTable::uniform(
+            1,
+            &[1, 2, 3],
+            3,
+        )));
+        let applier =
+            CacheApplier::new(cache.clone()).with_live_state(topology.clone(), routing.clone());
+
+        let bytes = encode_entry(&MetadataEntry::RoutingChange(RoutingChange::SetPlacement {
+            group_id: 1,
+            placement: vec![1, 2],
+        }))
+        .unwrap();
+        applier.apply(&[(1, bytes)]);
+
+        let rt = routing.read().unwrap();
+        assert_eq!(
+            rt.group_info(1).unwrap().placement,
+            Some(vec![1, 2]),
+            "placement should be set on the live routing table"
+        );
     }
 
     #[test]

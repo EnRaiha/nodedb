@@ -329,4 +329,11 @@ pub enum RoutingChange {
     /// `safety::check_can_decommission` has confirmed the group will
     /// still satisfy the configured replication factor.
     RemoveMember { group_id: u64, node_id: u64 },
+    /// Set the explicit placement (intended voter set) for a Raft group.
+    ///
+    /// Records the target voter membership authored by the placement
+    /// subsystem and replicated to all nodes via the metadata Raft group.
+    /// Consumers compare this against the current `members` to decide
+    /// whether a learner is eligible for promotion.
+    SetPlacement { group_id: u64, placement: Vec<u64> },
 }

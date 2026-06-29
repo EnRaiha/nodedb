@@ -60,6 +60,12 @@ pub struct GroupInfo {
     /// leader observes it has caught up.
     #[serde(default)]
     pub learners: Vec<u64>,
+    /// Intended voter nodes for this group (the placement set), authored
+    /// centrally and replicated via the metadata Raft group. `None` = no
+    /// explicit placement; consumers fall back to the current `members`.
+    /// `Some(_)` = the explicit target voter set used to cap promotion.
+    #[serde(default)]
+    pub placement: Option<Vec<u64>>,
 }
 
 impl RoutingTable {
@@ -98,6 +104,7 @@ impl RoutingTable {
                     leader,
                     members,
                     learners: Vec::new(),
+                    placement: None,
                 },
             );
         }
@@ -111,6 +118,7 @@ impl RoutingTable {
                 leader: meta_leader,
                 members: meta_members,
                 learners: Vec::new(),
+                placement: None,
             },
         );
 
@@ -182,6 +190,24 @@ impl RoutingTable {
     pub fn set_group_members(&mut self, group_id: u64, members: Vec<u64>) {
         if let Some(info) = self.group_members.get_mut(&group_id) {
             info.members = members;
+        }
+    }
+
+    /// Set the explicit placement (intended voter set) for a group.
+    ///
+    /// No-op if the group is not present; consistent with `set_group_members`.
+    pub fn set_placement(&mut self, group_id: u64, placement: Vec<u64>) {
+        if let Some(info) = self.group_members.get_mut(&group_id) {
+            info.placement = Some(placement);
+        }
+    }
+
+    /// The effective target voter set for a group: the explicit placement if
+    /// set, else the current members. Never panics; empty for unknown groups.
+    pub fn effective_placement(&self, group_id: u64) -> Vec<u64> {
+        match self.group_members.get(&group_id) {
+            Some(g) => g.placement.clone().unwrap_or_else(|| g.members.clone()),
+            None => Vec::new(),
         }
     }
 
@@ -419,6 +445,28 @@ mod tests {
             v_default, v_other,
             "same collection name across databases must route independently"
         );
+    }
+
+    #[test]
+    fn set_placement_and_effective_placement() {
+        let mut rt = RoutingTable::uniform(2, &[1, 2, 3], 3);
+
+        // Before any explicit placement: effective_placement returns members.
+        let members = rt.group_info(1).unwrap().members.clone();
+        assert_eq!(rt.effective_placement(1), members);
+        assert!(rt.group_info(1).unwrap().placement.is_none());
+
+        // After set_placement: effective_placement returns the explicit set.
+        rt.set_placement(1, vec![10, 20]);
+        assert_eq!(rt.effective_placement(1), vec![10, 20]);
+        assert_eq!(rt.group_info(1).unwrap().placement, Some(vec![10, 20]));
+
+        // Unknown group: effective_placement returns empty, no panic.
+        assert_eq!(rt.effective_placement(999), Vec::<u64>::new());
+
+        // set_placement on unknown group is a no-op (consistent with set_group_members).
+        rt.set_placement(999, vec![1]);
+        assert_eq!(rt.effective_placement(999), Vec::<u64>::new());
     }
 
     #[test]

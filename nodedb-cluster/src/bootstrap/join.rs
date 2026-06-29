@@ -291,6 +291,10 @@ fn apply_join_response(
                 leader: g.leader,
                 members: g.members.clone(),
                 learners: g.learners.clone(),
+                // Join response carries no placement; it converges via
+                // metadata-group replication after join (effective_placement
+                // falls back to members until then).
+                placement: None,
             },
         );
     }

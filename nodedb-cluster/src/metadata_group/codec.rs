@@ -30,13 +30,24 @@ pub fn decode_entry(data: &[u8]) -> Result<MetadataEntry, ClusterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_group::entry::{MetadataEntry, TopologyChange};
+    use crate::metadata_group::entry::{MetadataEntry, RoutingChange, TopologyChange};
 
     #[test]
     fn metadata_entry_versioned_roundtrip() {
         let entry = MetadataEntry::TopologyChange(TopologyChange::Join {
             node_id: 42,
             addr: "127.0.0.1:7001".to_string(),
+        });
+        let bytes = encode_entry(&entry).unwrap();
+        let decoded = decode_entry(&bytes).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn routing_change_set_placement_roundtrip() {
+        let entry = MetadataEntry::RoutingChange(RoutingChange::SetPlacement {
+            group_id: 3,
+            placement: vec![10, 20, 30],
         });
         let bytes = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&bytes).unwrap();
