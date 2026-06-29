@@ -68,15 +68,13 @@ pub enum TimeseriesOp {
         /// or flushed to disk. `None` for live ingest (always accepted).
         #[serde(default)]
         wal_lsn: Option<u64>,
-        /// Per-row stable cross-engine identities, parallel to the rows
-        /// in `payload`. CP-side assigner populates this in row order
-        /// before dispatch when the payload is decoded at planning time
-        /// (SQL VALUES path). For opaque bulk payloads (ILP, OTEL,
-        /// PromQL remote-write, sync push, WAL replay) the CP cannot
-        /// enumerate rows without parsing the wire format, so this is
-        /// `vec![]`; the Data Plane handler decodes the payload and the
-        /// CP-driven re-derivation pattern is owned by the timeseries
-        /// engine integration.
+        /// Reserved for per-row cross-engine `Surrogate` identities. The
+        /// timeseries ingest handler does NOT consume this field: timeseries
+        /// rows are identified internally by `series_id` (a deterministic hash
+        /// of measurement + tags, computed identically on every replica), and
+        /// timeseries does not participate in cross-engine bitmap joins, so no
+        /// cross-engine surrogate binding is required. Almost always `vec![]`;
+        /// retained for plan-shape uniformity with the columnar `Insert` op.
         #[serde(default)]
         surrogates: Vec<Surrogate>,
         /// Sync provenance: identifies the originating peer and sequence for idempotency.
