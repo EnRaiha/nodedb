@@ -22,12 +22,24 @@ use super::checkpoint_encoding::{dec_component, enc_component};
 use super::core_loop::CoreLoop;
 use crate::types::TenantId;
 
+/// Canonical path for a core's spatial checkpoint directory.
+///
+/// Used by the write path (`checkpoint_spatial_indexes`) and the load path
+/// (`load_spatial_checkpoints`) so both stay in sync. A per-core subdir means
+/// the loader needs no core-ownership filter; docmap companion files reside in
+/// the same dir and are therefore covered automatically.
+pub(crate) fn spatial_ckpt_dir(data_dir: &std::path::Path, core_id: usize) -> std::path::PathBuf {
+    data_dir
+        .join("spatial-ckpt")
+        .join(format!("core-{core_id}"))
+}
+
 impl CoreLoop {
     /// Write R-tree checkpoints for all spatial indexes to disk.
     ///
     /// Each index is serialized via `nodedb_spatial::persist` to a file at
-    /// `{data_dir}/spatial-ckpt/{db}_{tid}_{enc(coll)}_{enc(field)}.ckpt`. The
-    /// doc_map is saved alongside as `.docmap`.
+    /// `{data_dir}/spatial-ckpt/core-{core_id}/{db}_{tid}_{enc(coll)}_{enc(field)}.ckpt`.
+    /// The doc_map is saved alongside as `.docmap`.
     ///
     /// When `spatial_checkpoint_kek` is set, checkpoint files are written
     /// encrypted (AES-256-GCM SEGV framing) and plaintext loads are refused.
@@ -36,7 +48,7 @@ impl CoreLoop {
             return 0;
         }
 
-        let ckpt_dir = self.data_dir.join("spatial-ckpt");
+        let ckpt_dir = spatial_ckpt_dir(&self.data_dir, self.core_id);
         if std::fs::create_dir_all(&ckpt_dir).is_err() {
             tracing::warn!(
                 core = self.core_id,
@@ -100,10 +112,15 @@ impl CoreLoop {
 
     /// Load R-tree checkpoints from disk on startup.
     ///
+    /// Reads this core's own checkpoint directory only
+    /// (`{data_dir}/spatial-ckpt/core-{core_id}/`), so no core-ownership filter
+    /// on the filename is needed. Docmap companion files (`.docmap`) reside in
+    /// the same per-core dir and are covered automatically.
+    ///
     /// When `spatial_checkpoint_kek` is set, plaintext checkpoint files are
     /// rejected and encrypted files are decrypted before loading.
     pub fn load_spatial_checkpoints(&mut self) {
-        let ckpt_dir = self.data_dir.join("spatial-ckpt");
+        let ckpt_dir = spatial_ckpt_dir(&self.data_dir, self.core_id);
         if !ckpt_dir.exists() {
             return;
         }

@@ -16,7 +16,7 @@ mod spatial_checkpoint;
 pub(super) mod strict_format;
 pub(in crate::data) mod sync_gate;
 pub mod task;
-mod vector_checkpoint;
+pub(crate) mod vector_checkpoint;
 mod wal_replay;
 mod wal_replay_fts;
 mod wal_replay_spatial;

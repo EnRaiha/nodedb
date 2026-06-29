@@ -201,14 +201,14 @@ fn restore_edge_data(
 
 fn restore_vector_checkpoints(
     data_dir: &Path,
-    _core_id: usize,
+    core_id: usize,
     hnsw_indexes: &[crate::data::snapshot::HnswSnapshot],
 ) -> crate::Result<u64> {
     if hnsw_indexes.is_empty() {
         return Ok(0);
     }
 
-    let ckpt_dir = data_dir.join("vector-ckpt");
+    let ckpt_dir = crate::data::executor::vector_checkpoint::vector_ckpt_dir(data_dir, core_id);
     // no-objectstore: HNSW checkpoints are mmap'd locally for query hot path.
     std::fs::create_dir_all(&ckpt_dir).map_err(crate::Error::Io)?;
 

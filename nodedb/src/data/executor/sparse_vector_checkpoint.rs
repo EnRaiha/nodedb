@@ -3,7 +3,8 @@
 //! Sparse vector index checkpoint methods for [`CoreLoop`].
 //!
 //! Follows the same pattern as `vector_checkpoint.rs`: serialize each index
-//! to `{data_dir}/sparse-vector-ckpt/{stem}.ckpt` via atomic temp+rename.
+//! to `{data_dir}/sparse-vector-ckpt/core-{core_id}/{stem}.ckpt` via atomic
+//! temp+rename.
 //!
 //! ## On-disk filename encoding
 //!
@@ -21,6 +22,20 @@ use super::checkpoint_encoding::{dec_component, enc_component};
 use super::core_loop::CoreLoop;
 use crate::types::TenantId;
 
+/// Canonical path for a core's sparse-vector checkpoint directory.
+///
+/// Used by the write path (`checkpoint_sparse_vector_indexes`) and the load
+/// path (`load_sparse_vector_checkpoints`) so both stay in sync. A per-core
+/// subdir means the loader needs no core-ownership filter.
+pub(crate) fn sparse_vector_ckpt_dir(
+    data_dir: &std::path::Path,
+    core_id: usize,
+) -> std::path::PathBuf {
+    data_dir
+        .join("sparse-vector-ckpt")
+        .join(format!("core-{core_id}"))
+}
+
 impl CoreLoop {
     /// Write sparse vector index checkpoints to disk.
     ///
@@ -30,7 +45,7 @@ impl CoreLoop {
             return 0;
         }
 
-        let ckpt_dir = self.data_dir.join("sparse-vector-ckpt");
+        let ckpt_dir = sparse_vector_ckpt_dir(&self.data_dir, self.core_id);
         if std::fs::create_dir_all(&ckpt_dir).is_err() {
             tracing::warn!(
                 core = self.core_id,
@@ -71,8 +86,12 @@ impl CoreLoop {
     }
 
     /// Load sparse vector index checkpoints from disk on startup.
+    ///
+    /// Reads this core's own checkpoint directory only
+    /// (`{data_dir}/sparse-vector-ckpt/core-{core_id}/`), so no core-ownership
+    /// filter on the filename is needed.
     pub fn load_sparse_vector_checkpoints(&mut self) {
-        let ckpt_dir = self.data_dir.join("sparse-vector-ckpt");
+        let ckpt_dir = sparse_vector_ckpt_dir(&self.data_dir, self.core_id);
         if !ckpt_dir.exists() {
             return;
         }

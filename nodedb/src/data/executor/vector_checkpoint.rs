@@ -8,6 +8,18 @@ use nodedb_types::DatabaseId;
 
 use super::core_loop::CoreLoop;
 
+/// Canonical path for a core's vector checkpoint directory.
+///
+/// Used by the write path (`checkpoint_vector_indexes`), the load path
+/// (`load_vector_checkpoints`), and the restore path
+/// (`restore_vector_checkpoints`) so all three stay in sync if the scheme
+/// changes. The previous bug was that `data_dir` is shared across all TPC
+/// cores, so a flat directory caused every core to load every collection's
+/// index. A per-core subdir means the loader needs no ownership filter.
+pub(crate) fn vector_ckpt_dir(data_dir: &std::path::Path, core_id: usize) -> std::path::PathBuf {
+    data_dir.join("vector-ckpt").join(format!("core-{core_id}"))
+}
+
 /// Parse a `"{db}:{tid}:{coll_key}"` string (the current `BuildComplete.key`
 /// and on-disk checkpoint filename form, produced by
 /// `vector_checkpoint_filename`) back into the `(DatabaseId, TenantId, String)`
@@ -77,7 +89,7 @@ impl CoreLoop {
             return 0;
         }
 
-        let ckpt_dir = self.data_dir.join("vector-ckpt");
+        let ckpt_dir = vector_ckpt_dir(&self.data_dir, self.core_id);
         if std::fs::create_dir_all(&ckpt_dir).is_err() {
             tracing::warn!(
                 core = self.core_id,
@@ -117,10 +129,14 @@ impl CoreLoop {
 
     /// Load HNSW checkpoints from disk on startup, before WAL replay.
     ///
+    /// Reads this core's own checkpoint directory only
+    /// (`{data_dir}/vector-ckpt/core-{core_id}/`), so no core-ownership filter
+    /// on the filename is needed — a core only ever sees its own indexes.
+    ///
     /// For each checkpoint file, loads the index. WAL replay then only
     /// needs to process entries after the checkpoint LSN.
     pub fn load_vector_checkpoints(&mut self) {
-        let ckpt_dir = self.data_dir.join("vector-ckpt");
+        let ckpt_dir = vector_ckpt_dir(&self.data_dir, self.core_id);
         if !ckpt_dir.exists() {
             return;
         }
@@ -187,5 +203,63 @@ impl CoreLoop {
         if loaded > 0 {
             tracing::info!(core = self.core_id, loaded, "vector checkpoints loaded");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `vector_ckpt_dir` must return distinct paths for different `core_id`s
+    /// sharing the same `data_dir`, and the paths must embed the core id.
+    #[test]
+    fn per_core_dirs_are_distinct() {
+        let base = std::path::Path::new("/data");
+        let d0 = vector_ckpt_dir(base, 0);
+        let d1 = vector_ckpt_dir(base, 1);
+        assert_ne!(d0, d1, "different cores must get different checkpoint dirs");
+        assert!(
+            d0.to_str().unwrap().contains("core-0"),
+            "core-0 dir must contain 'core-0'"
+        );
+        assert!(
+            d1.to_str().unwrap().contains("core-1"),
+            "core-1 dir must contain 'core-1'"
+        );
+    }
+
+    /// A checkpoint file written under core-0's subdir must NOT be visible when
+    /// scanning core-1's subdir, proving per-core isolation. This is the critical
+    /// property: `load_vector_checkpoints` on core-1 would find an empty dir and
+    /// load nothing, even though core-0 has checkpointed a collection.
+    #[test]
+    fn checkpoint_written_for_core0_is_invisible_to_core1_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+
+        // Write a dummy .ckpt file into core-0's subdir.
+        let core0_dir = vector_ckpt_dir(data_dir, 0);
+        std::fs::create_dir_all(&core0_dir).unwrap();
+        std::fs::write(core0_dir.join("1:2:mycoll.ckpt"), b"dummy").unwrap();
+
+        // Scanning core-1's subdir should yield no .ckpt entries.
+        let core1_dir = vector_ckpt_dir(data_dir, 1);
+        // The directory does not even exist — loader returns early.
+        assert!(
+            !core1_dir.exists(),
+            "core-1 dir must not exist when only core-0 has checkpointed"
+        );
+
+        // Round-trip within core-0's own dir: the file we wrote is visible.
+        let entries: Vec<_> = std::fs::read_dir(&core0_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("ckpt"))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "core-0's own scan must find exactly the one .ckpt it wrote"
+        );
     }
 }
