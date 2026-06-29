@@ -36,12 +36,6 @@ use crate::types::{DatabaseId, ReadConsistency, TraceId};
 /// Decodes the op, dispatches it to the Data Plane via SPSC, and records it
 /// in the op-log so future `already_seen` checks return `true`. This is the
 /// authoritative idempotency gate — it runs on every replica after Raft commit.
-///
-/// Returns `true` iff the entry was successfully applied to the Data Plane
-/// (including the idempotent already-seen no-op), `false` on any failure that
-/// resolves the proposer with an `Err`. The caller uses this to gate Raft
-/// log compaction: compacting past an unapplied index would corrupt a lagging
-/// follower's snapshot.
 pub(crate) async fn apply_array_op(
     state: &Arc<SharedState>,
     tracker: &Arc<ProposeTracker>,
@@ -49,7 +43,7 @@ pub(crate) async fn apply_array_op(
     array: &str,
     op_bytes: &[u8],
     provenance_bytes: Option<&[u8]>,
-) -> bool {
+) {
     let AppliedPosition {
         group_id,
         log_index,
@@ -96,7 +90,7 @@ pub(crate) async fn apply_array_op(
                     detail: format!("array op decode: {e}"),
                 }),
             );
-            return false;
+            return;
         }
     };
 
@@ -108,7 +102,7 @@ pub(crate) async fn apply_array_op(
     );
     if engine.already_seen(&op.header.array, op.header.hlc) {
         tracker.complete(group_id, log_index, applied_key, Ok(vec![]));
-        return true;
+        return;
     }
 
     // Compute vshard for dispatch.
@@ -148,7 +142,7 @@ pub(crate) async fn apply_array_op(
             "apply_array_op: ensure_array_open failed"
         );
         tracker.complete(group_id, log_index, applied_key, Err(e));
-        return false;
+        return;
     }
 
     let data_op = match op.kind {
@@ -173,14 +167,14 @@ pub(crate) async fn apply_array_op(
                             detail: format!("cells encode: {e}"),
                         }),
                     );
-                    return false;
+                    return;
                 }
             };
             DataArrayOp::Put {
                 array_id,
                 cells_msgpack,
                 wal_lsn: 0,
-                provenance,
+                provenance: provenance.clone(),
             }
         }
         ArrayOpKind::Delete | ArrayOpKind::Erase => {
@@ -197,7 +191,7 @@ pub(crate) async fn apply_array_op(
                             detail: format!("coords encode: {e}"),
                         }),
                     );
-                    return false;
+                    return;
                 }
             };
             DataArrayOp::Delete {
@@ -246,7 +240,7 @@ pub(crate) async fn apply_array_op(
                 detail: format!("dispatch: {e}"),
             }),
         );
-        return false;
+        return;
     }
 
     let result = await_data_plane(async move { rx.recv().await.ok_or(()) }, "array op").await;
@@ -261,11 +255,9 @@ pub(crate) async fn apply_array_op(
                 );
             }
             tracker.complete(group_id, log_index, applied_key, Ok(payload));
-            true
         }
         Err(e) => {
             tracker.complete(group_id, log_index, applied_key, Err(e));
-            false
         }
     }
 }
@@ -365,18 +357,12 @@ pub(crate) struct ArraySchemaPayload<'a> {
 ///    This is the canonical DDL propagation path for followers: the Raft
 ///    `ArraySchema` entry is the single source of truth — no out-of-band
 ///    catalog registration is needed.
-///
-/// Returns `true` iff the schema snapshot imported successfully (the catalog
-/// registration that follows is best-effort and non-fatal), `false` if the
-/// import failed and the proposer was resolved with an `Err`. The caller gates
-/// Raft log compaction on this so an unapplied schema index is never compacted
-/// past.
 pub(crate) fn apply_array_schema(
     state: &Arc<SharedState>,
     tracker: &Arc<ProposeTracker>,
     pos: AppliedPosition,
     payload: ArraySchemaPayload<'_>,
-) -> bool {
+) {
     let AppliedPosition {
         group_id,
         log_index,
@@ -415,7 +401,7 @@ pub(crate) fn apply_array_schema(
                 detail: format!("schema import: {e}"),
             }),
         );
-        return false;
+        return;
     }
 
     // Decode the ArraySchema from the just-imported Loro document and register
@@ -463,7 +449,6 @@ pub(crate) fn apply_array_schema(
     }
 
     tracker.complete(group_id, log_index, applied_key, Ok(vec![]));
-    true
 }
 
 /// Await a Data Plane response, mapping timeout / channel-closed / error-status
