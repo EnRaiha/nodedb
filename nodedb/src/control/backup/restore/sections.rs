@@ -144,12 +144,6 @@ pub(super) fn apply_metadata_sections(
                 }
             }
             SECTION_ORIGIN_SOURCE_TOMBSTONES => {
-                // Source tombstones are intentionally coordinator-local for
-                // now: they are a WAL-recovery guard, not replicated catalog
-                // state. Cluster-wide tombstone replication is a known
-                // follow-up. Failures here stay non-fatal (warn-and-continue):
-                // a missing local tombstone does not make restored data
-                // unqueryable, unlike a missing catalog row.
                 let Ok(tombs) = zerompk::from_msgpack::<Vec<SourceTombstoneEntry>>(&section.body)
                 else {
                     tracing::warn!(
@@ -159,16 +153,29 @@ pub(super) fn apply_metadata_sections(
                     continue;
                 };
                 for t in tombs {
-                    if let Err(e) =
-                        catalog.record_wal_tombstone(tenant_id, &t.collection, t.purge_lsn)
-                    {
-                        tracing::warn!(
-                            tenant_id,
-                            collection = %t.collection,
-                            purge_lsn = t.purge_lsn,
-                            error = %e,
-                            "restore: record_wal_tombstone failed"
-                        );
+                    // Replicate via the metadata Raft group so every node's boot WAL
+                    // replay barrier matches — a coordinator-local tombstone lets purged
+                    // writes resurrect on follower restart.
+                    let entry = crate::control::catalog_entry::CatalogEntry::RecordWalTombstone {
+                        tenant_id,
+                        collection: t.collection,
+                        purge_lsn: t.purge_lsn,
+                    };
+                    let log_index =
+                        crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
+                    if log_index == 0 {
+                        // Single-node / no-cluster fallback: apply directly,
+                        // matching the applier. A failure here is FATAL — a
+                        // silently-skipped tombstone means purged writes resurrect
+                        // on restart, which is the bug this change fixes.
+                        if let crate::control::catalog_entry::CatalogEntry::RecordWalTombstone {
+                            collection,
+                            purge_lsn,
+                            ..
+                        } = entry
+                        {
+                            catalog.record_wal_tombstone(tenant_id, &collection, purge_lsn)?;
+                        }
                     }
                 }
             }

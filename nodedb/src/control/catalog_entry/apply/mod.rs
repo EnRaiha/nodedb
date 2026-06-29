@@ -30,6 +30,7 @@ pub mod synonym_group;
 pub mod tenant;
 pub mod trigger;
 pub mod user;
+pub mod wal_tombstone;
 
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::security::catalog::SystemCatalog;
@@ -169,6 +170,11 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
         } => database::clone_apply(target_descriptor, *source_db_id, catalog),
         CatalogEntry::PutOidcProvider(provider) => oidc_provider::put(provider, catalog),
         CatalogEntry::DeleteOidcProvider { name } => oidc_provider::delete(name, catalog),
+        CatalogEntry::RecordWalTombstone {
+            tenant_id,
+            collection,
+            purge_lsn,
+        } => wal_tombstone::record(*tenant_id, collection, *purge_lsn, catalog),
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

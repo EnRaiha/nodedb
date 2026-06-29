@@ -220,6 +220,9 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             // resolve it by name without waiting for a read-round-trip to redb.
             database::put((**target_descriptor).clone(), Arc::clone(shared));
         }
+        CatalogEntry::RecordWalTombstone { .. } => {
+            // WAL replay barrier only; no in-memory cache to refresh.
+        }
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,

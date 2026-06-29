@@ -168,6 +168,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteDatabaseGrant { .. }
         | CatalogEntry::PutOidcProvider(_)
         | CatalogEntry::DeleteOidcProvider { .. }
+        | CatalogEntry::RecordWalTombstone { .. }
         | CatalogEntry::CloneDatabase { .. }
         | CatalogEntry::MoveTenantCutover { .. }) => entry,
     }

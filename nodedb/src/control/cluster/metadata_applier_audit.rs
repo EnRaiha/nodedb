@@ -140,6 +140,7 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
         ),
         E::DeactivateCollection { name, .. } => (name.clone(), 0, String::new()),
         E::PurgeCollection { name, .. } => (name.clone(), 0, String::new()),
+        E::RecordWalTombstone { collection, .. } => (collection.clone(), 0, String::new()),
         E::PutSequence(s) => (
             s.name.clone(),
             s.descriptor_version,

@@ -293,6 +293,17 @@ pub enum CatalogEntry {
     /// Delete an OIDC provider record by name.
     DeleteOidcProvider { name: String },
 
+    // ── WAL replay tombstone ───────────────────────────────────────
+    /// Record (or raise) a per-(tenant, collection) WAL replay tombstone.
+    /// Replicated on RESTORE so every replica's boot-time WAL replay barrier
+    /// (`purge_lsn`) matches — without it, purged writes resurrect on follower
+    /// restart. Idempotent + monotone (see `record_wal_tombstone`).
+    RecordWalTombstone {
+        tenant_id: u64,
+        collection: String,
+        purge_lsn: u64,
+    },
+
     // ── Clone lifecycle ────────────────────────────────────────────
     /// Atomically record a new CoW clone database.
     ///
@@ -364,6 +375,7 @@ impl CatalogEntry {
             Self::DeleteCustomType { .. } => "delete_custom_type",
             Self::PutOidcProvider(_) => "put_oidc_provider",
             Self::DeleteOidcProvider { .. } => "delete_oidc_provider",
+            Self::RecordWalTombstone { .. } => "record_wal_tombstone",
             Self::MoveTenantCutover { .. } => "move_tenant_cutover",
             Self::CloneDatabase { .. } => "clone_database",
         }

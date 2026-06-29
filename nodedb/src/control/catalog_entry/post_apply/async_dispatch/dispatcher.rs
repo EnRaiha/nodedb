@@ -135,6 +135,7 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::DeleteDatabaseGrant { .. }
         | CatalogEntry::PutOidcProvider(_)
         | CatalogEntry::DeleteOidcProvider { .. }
+        | CatalogEntry::RecordWalTombstone { .. }
         | CatalogEntry::CloneDatabase { .. }
         | CatalogEntry::MoveTenantCutover { .. } => {
             let _ = shared;
