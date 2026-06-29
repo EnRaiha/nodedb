@@ -18,6 +18,7 @@
 mod builder;
 pub mod handle_rpc;
 pub mod hooks;
+pub mod in_flight_snapshots;
 pub mod join;
 pub mod loop_core;
 mod membership_convergence;
@@ -29,4 +30,5 @@ pub use hooks::{
     AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ShuffleAggregator, ShuffleConsumer,
     ShuffleProducer, ShuffleReceiver, SnapshotApplier, SnapshotBuilder, SnapshotQuarantineHook,
 };
+pub use in_flight_snapshots::{InFlightSnapshotGuard, InFlightSnapshots};
 pub use loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};

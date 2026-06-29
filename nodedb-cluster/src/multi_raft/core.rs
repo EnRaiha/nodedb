@@ -81,6 +81,10 @@ pub struct MultiRaft {
     pub(super) log_compaction_threshold: Option<u64>,
     /// Data directory for persistent Raft log storage.
     pub(super) data_dir: PathBuf,
+    /// Per-group count of `InstallSnapshot` transfers currently in flight.
+    /// Compaction is deferred for any group with an active transfer so the
+    /// snapshot boundary never advances mid-transfer.
+    pub(super) in_flight_snapshots: Arc<crate::raft_loop::in_flight_snapshots::InFlightSnapshots>,
 }
 
 /// Aggregated output from all Raft groups after a tick.
@@ -134,6 +138,9 @@ impl MultiRaft {
             heartbeat_interval: Duration::from_millis(50),
             log_compaction_threshold: None,
             data_dir,
+            in_flight_snapshots: Arc::new(
+                crate::raft_loop::in_flight_snapshots::InFlightSnapshots::default(),
+            ),
         }
     }
 
@@ -247,6 +254,17 @@ impl MultiRaft {
 
     pub fn node_id(&self) -> u64 {
         self.node_id
+    }
+
+    /// Clone of the in-flight `InstallSnapshot` tracker.
+    ///
+    /// The tick loop clones this to mark snapshot transfers active for their
+    /// lifetime; `maybe_compact_group` reads it to defer compaction while a
+    /// transfer is in flight.
+    pub fn in_flight_snapshots(
+        &self,
+    ) -> Arc<crate::raft_loop::in_flight_snapshots::InFlightSnapshots> {
+        self.in_flight_snapshots.clone()
     }
 
     pub fn group_count(&self) -> usize {
@@ -443,6 +461,13 @@ impl MultiRaft {
     /// the threshold is `None`, or the retained-entry count is below the
     /// threshold. Returns `Ok(true)` when a compaction was performed.
     pub fn maybe_compact_group(&mut self, group_id: u64, applied_index: u64) -> Result<bool> {
+        // Defer compaction while a snapshot transfer for this group is in
+        // flight: advancing the snapshot boundary mid-transfer would corrupt
+        // the catching-up peer. The apply loop retries on the next applied
+        // entry, so the watermark still advances once the transfer completes.
+        if self.in_flight_snapshots.is_active(group_id) {
+            return Ok(false);
+        }
         let Some(node) = self.groups.get_mut(&group_id) else {
             return Ok(false);
         };

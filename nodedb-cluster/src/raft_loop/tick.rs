@@ -275,9 +275,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
 
                 // Install-snapshot dispatch for lagging peers.
                 if !group_ready.snapshots_needed.is_empty() {
-                    let snapshot_meta = {
+                    let (snapshot_meta, in_flight_snapshots) = {
                         let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-                        mr.snapshot_metadata(group_id).ok()
+                        (
+                            mr.snapshot_metadata(group_id).ok(),
+                            mr.in_flight_snapshots(),
+                        )
                     };
 
                     if let Some((term, snap_index, snap_term)) = snapshot_meta {
@@ -288,10 +291,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                             let node_id = self.node_id;
                             let chunk_bytes = self.snapshot_chunk_bytes;
                             let snapshot_builder = self.snapshot_builder.clone();
+                            let inflight = in_flight_snapshots.clone();
                             tokio::spawn(async move {
                                 if *shutdown_rx.borrow() {
                                     return;
                                 }
+                                // Mark this group as having a snapshot transfer in
+                                // flight for the whole task (build + send). Held
+                                // until the task ends — including error/shutdown
+                                // paths — so compaction cannot advance the snapshot
+                                // boundary mid-transfer.
+                                let _inflight_guard = inflight.begin(group_id);
                                 // Build the real per-group snapshot payload on the
                                 // leader before framing the chunked RPC. A `None`
                                 // builder (cluster-only tests) or a build failure
