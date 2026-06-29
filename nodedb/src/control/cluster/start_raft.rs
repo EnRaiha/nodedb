@@ -152,16 +152,27 @@ pub fn start_raft(
     // function is always called after bootstrap has written those settings —
     // `None` here indicates the node was never bootstrapped, which is an
     // invariant violation (not a recoverable condition).
-    let replication_factor = handle
-        .catalog
-        .load_cluster_settings()
-        .map_err(|e| crate::Error::Config {
+    let replication_factor = match handle.catalog.load_cluster_settings().map_err(|e| {
+        crate::Error::Config {
             detail: format!("start_raft: failed to load cluster settings: {e}"),
-        })?
-        .map(|s| s.replication_factor)
-        .ok_or_else(|| crate::Error::Config {
-            detail: "start_raft: cluster settings not found (node not bootstrapped)".to_string(),
-        })?;
+        }
+    })? {
+        Some(s) => s.replication_factor,
+        None => {
+            // Settings not yet persisted on this path — fall back to the
+            // in-memory config RF (the same value bootstrap would persist).
+            // Error only if neither source is available.
+            handle
+                .pending_subsystems
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .map(|p| p.config.replication_factor as u32)
+                .ok_or_else(|| crate::Error::Config {
+                    detail: "start_raft: no replication factor available (catalog and config both absent)".to_string(),
+                })?
+        }
+    };
 
     let quarantine_hook = Arc::new(RaftSnapshotQuarantineHook {
         registry: Arc::clone(&shared.quarantine_registry),

@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::calvin::SEQUENCER_GROUP_ID;
-use crate::catalog::ClusterCatalog;
+use crate::catalog::{ClusterCatalog, ClusterSettings};
 use crate::error::{ClusterError, Result};
 use crate::lifecycle_state::ClusterLifecycleTracker;
 use crate::multi_raft::MultiRaft;
@@ -316,6 +316,11 @@ fn apply_join_response(
     catalog.save_cluster_id(resp.cluster_id)?;
     catalog.save_topology(&topology)?;
     catalog.save_routing(&routing.read().unwrap_or_else(|p| p.into_inner()))?;
+    // Persist cluster settings on join (mirroring the bootstrap path) so the
+    // node can load its replication factor at start_raft and on every later
+    // restart. Failing to persist settings fails the join: without them the
+    // node cannot start correctly.
+    catalog.save_cluster_settings(&ClusterSettings::from_config(config))?;
 
     // 3. Create MultiRaft — join any group that includes this node,
     //    either as a voter (group members) or as a learner (group
