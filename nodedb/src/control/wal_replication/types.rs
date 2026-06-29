@@ -272,6 +272,19 @@ pub enum ReplicatedWrite {
         /// key = `dst_id.as_bytes()`).
         dst_surrogate: u32,
     },
+    /// Set bitset-based labels on a graph node. Operates directly on the
+    /// `node_id` string and allocates no surrogate, so no surrogate is
+    /// carried — every replica applies the same labels to the same node.
+    SetNodeLabels {
+        node_id: String,
+        labels: Vec<String>,
+    },
+    /// Remove bitset-based labels from a graph node. Surrogate-free for the
+    /// same reason as `SetNodeLabels`.
+    RemoveNodeLabels {
+        node_id: String,
+        labels: Vec<String>,
+    },
     KvPut {
         collection: String,
         key: Vec<u8>,

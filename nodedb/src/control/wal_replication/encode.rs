@@ -190,6 +190,18 @@ pub fn to_replicated_entry(
             src_surrogate: src_surrogate.as_u32(),
             dst_surrogate: dst_surrogate.as_u32(),
         },
+        PhysicalPlan::Graph(GraphOp::SetNodeLabels { node_id, labels }) => {
+            ReplicatedWrite::SetNodeLabels {
+                node_id: node_id.clone(),
+                labels: labels.clone(),
+            }
+        }
+        PhysicalPlan::Graph(GraphOp::RemoveNodeLabels { node_id, labels }) => {
+            ReplicatedWrite::RemoveNodeLabels {
+                node_id: node_id.clone(),
+                labels: labels.clone(),
+            }
+        }
         PhysicalPlan::Kv(KvOp::Put {
             collection,
             key,

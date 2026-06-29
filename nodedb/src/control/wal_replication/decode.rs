@@ -413,6 +413,18 @@ fn to_physical_plan(
                 dst_surrogate,
             })
         }
+        ReplicatedWrite::SetNodeLabels { node_id, labels } => {
+            PhysicalPlan::Graph(GraphOp::SetNodeLabels {
+                node_id: node_id.clone(),
+                labels: labels.clone(),
+            })
+        }
+        ReplicatedWrite::RemoveNodeLabels { node_id, labels } => {
+            PhysicalPlan::Graph(GraphOp::RemoveNodeLabels {
+                node_id: node_id.clone(),
+                labels: labels.clone(),
+            })
+        }
         ReplicatedWrite::KvPut {
             collection,
             key,
