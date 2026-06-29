@@ -16,7 +16,11 @@
 //!    `MultiRaft` before the user applier sees them.
 //! 5. **Install snapshots**: send `InstallSnapshot` RPCs to peers that
 //!    have fallen behind the leader's snapshot boundary.
-//! 6. **Promote caught-up learners**: for every group where this node is
+//! 6. **Converge entering learners**: for each group this node leads,
+//!    propose `AddLearner` for placement nodes not yet present as
+//!    voters or learners. Re-proposals while a conf-change is pending
+//!    are harmlessly rejected by Raft and retried next tick.
+//! 7. **Promote caught-up learners**: for every group where this node is
 //!    leader, query learners whose `match_index >= commit_index` and
 //!    propose `PromoteLearner` for each. Idempotent by design — after
 //!    the first promotion the peer has moved from `learners` to
@@ -351,6 +355,11 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 }
             }
         }
+
+        // Add placement nodes as learners so `promote_ready_learners` can
+        // pick them up once they catch up. Re-proposals while a conf-change
+        // is already pending are harmlessly rejected by Raft. Runs every tick.
+        self.converge_entering_learners();
 
         // Promote caught-up learners. Runs every tick so a
         // just-caught-up learner is promoted within one tick interval of

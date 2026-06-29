@@ -20,6 +20,7 @@ pub mod handle_rpc;
 pub mod hooks;
 pub mod join;
 pub mod loop_core;
+mod membership_convergence;
 mod placement_reconcile;
 pub mod proposals;
 pub mod tick;
