@@ -33,6 +33,14 @@ use crate::forward::PlanExecutor;
 
 use super::loop_core::{CommitApplier, RaftLoop};
 
+/// Ticks between placement-reconcile passes (100 ticks × ~10ms ≈ 1s).
+///
+/// `SetPlacement` is a normal metadata entry, not a conf-change, so Raft does
+/// not dedup per-tick re-proposals before they commit. Running reconcile ~1s
+/// apart is long enough that a proposed `SetPlacement` commits+applies before
+/// the next diff, so an unchanged target never re-proposes.
+const PLACEMENT_RECONCILE_TICK_INTERVAL: u64 = 100;
+
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// Execute a single tick: drive Raft, dispatch outbound messages,
     /// apply commits, promote caught-up learners.
@@ -349,6 +357,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // catching up. Idempotent: once promoted, the peer is in
         // `members` and `ready_learners` no longer returns it.
         self.promote_ready_learners();
+
+        // Placement reconcile is throttled well above the tick rate: SetPlacement
+        // is a normal metadata entry (not a conf-change), so Raft would not dedup
+        // per-tick re-proposals before they commit. Running ~1s apart lets each
+        // proposal apply before the next diff.
+        let tick = self
+            .tick_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if tick.is_multiple_of(PLACEMENT_RECONCILE_TICK_INTERVAL) {
+            self.reconcile_placement();
+        }
     }
 
     /// For every group where this node is leader, propose

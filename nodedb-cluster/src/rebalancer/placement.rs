@@ -7,6 +7,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::routing::RoutingTable;
+
 /// Deterministic per-group target voter set via rendezvous hashing.
 ///
 /// For each group, every active node is scored by a stable hash of
@@ -63,6 +65,29 @@ fn hrw_score(group_id: u64, node_id: u64) -> u64 {
     key[..8].copy_from_slice(&group_id.to_le_bytes());
     key[8..].copy_from_slice(&node_id.to_le_bytes());
     xxhash_rust::xxh3::xxh3_64(&key)
+}
+
+/// Diff a computed target placement against the routing table's current
+/// effective placement, returning the `(group_id, target)` pairs that differ
+/// and therefore need a `SetPlacement` proposal. Both sides are compared as
+/// sorted vecs (the target is already sorted; `effective_placement` may return
+/// unsorted members on fallback, so the current side is sorted before compare).
+pub fn compute_placement_changes(
+    routing: &RoutingTable,
+    target: &BTreeMap<u64, Vec<u64>>,
+) -> Vec<(u64, Vec<u64>)> {
+    target
+        .iter()
+        .filter_map(|(&gid, want)| {
+            let mut current = routing.effective_placement(gid);
+            current.sort_unstable();
+            if current != *want {
+                Some((gid, want.clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -217,5 +242,50 @@ mod tests {
         let active = nodes(&[1, 2, 3]);
         let placement = compute_placement(&active, &[0], 3);
         assert_eq!(placement.get(&0).unwrap(), &[1u64, 2, 3]);
+    }
+
+    // ── 8. compute_placement_changes ─────────────────────────────────────────
+
+    #[test]
+    fn no_changes_when_target_equals_current() {
+        // uniform(2, [1,2,3], 3) creates data groups 1,2 with explicit placement
+        // = all three nodes. Target computed for those same groups must match.
+        let mut routing = RoutingTable::uniform(2, &[1, 2, 3], 3);
+        routing.set_placement(1, vec![1, 2, 3]);
+        routing.set_placement(2, vec![1, 2, 3]);
+
+        let mut target = BTreeMap::new();
+        target.insert(1u64, vec![1u64, 2, 3]);
+        target.insert(2u64, vec![1u64, 2, 3]);
+
+        assert!(compute_placement_changes(&routing, &target).is_empty());
+    }
+
+    #[test]
+    fn emits_change_when_target_differs() {
+        let mut routing = RoutingTable::uniform(2, &[1, 2, 3], 3);
+        routing.set_placement(1, vec![1, 2, 3]);
+        routing.set_placement(2, vec![1, 2, 3]);
+
+        let mut target = BTreeMap::new();
+        target.insert(1u64, vec![1u64, 2, 3]); // unchanged
+        target.insert(2u64, vec![1u64, 2, 4]); // node 3 -> 4
+
+        let changes = compute_placement_changes(&routing, &target);
+        assert_eq!(changes, vec![(2u64, vec![1u64, 2, 4])]);
+    }
+
+    #[test]
+    fn members_fallback_is_sorted_before_compare() {
+        // No explicit placement: effective_placement falls back to `members`,
+        // which may be unsorted. An unsorted-but-equal-as-a-set members list
+        // must NOT yield a spurious change once sorted.
+        let mut routing = RoutingTable::uniform(1, &[1, 2, 3], 3);
+        routing.set_group_members(1, vec![3, 1, 2]); // unsorted, no placement set
+
+        let mut target = BTreeMap::new();
+        target.insert(1u64, vec![1u64, 2, 3]); // sorted (canonical)
+
+        assert!(compute_placement_changes(&routing, &target).is_empty());
     }
 }

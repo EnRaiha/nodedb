@@ -248,6 +248,11 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// to cap voter promotion at min(RF, N). Defaults to 1 (single-node, no
     /// extra replicas) when not overridden via `with_replication_factor`.
     pub(super) replication_factor: u32,
+
+    /// Monotonic tick counter; throttles periodic maintenance (placement
+    /// reconcile) to a coarse cadence off the 10ms tick. `AtomicU64` because
+    /// [`super::tick::do_tick`] runs against `&self`.
+    pub(super) tick_count: std::sync::atomic::AtomicU64,
 }
 
 impl<A: CommitApplier> RaftLoop<A> {
@@ -291,6 +296,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
             replication_factor: 1,
+            tick_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }

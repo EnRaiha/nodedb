@@ -56,6 +56,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             snapshot_chunk_bytes: self.snapshot_chunk_bytes,
             orphan_partial_max_age_secs: self.orphan_partial_max_age_secs,
             replication_factor: self.replication_factor,
+            // `with_plan_executor` is a construction-time builder, called before
+            // `run()` ever ticks — `tick_count` is still 0, so reset is exact.
+            tick_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
