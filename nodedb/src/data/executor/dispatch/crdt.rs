@@ -43,12 +43,19 @@ impl CoreLoop {
 
             CrdtOp::SetConstraints {
                 collection,
+                descriptor_version,
                 constraints,
-            } => self.execute_crdt_set_constraints(task, collection, constraints),
+            } => self.execute_crdt_set_constraints(
+                task,
+                collection,
+                *descriptor_version,
+                constraints,
+            ),
 
-            CrdtOp::DropConstraints { collection } => {
-                self.execute_crdt_drop_constraints(task, collection)
-            }
+            CrdtOp::DropConstraints {
+                collection,
+                descriptor_version,
+            } => self.execute_crdt_drop_constraints(task, collection, *descriptor_version),
 
             CrdtOp::ReadAtVersion {
                 collection,

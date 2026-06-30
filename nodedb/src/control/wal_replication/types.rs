@@ -505,9 +505,17 @@ pub enum ReplicatedWrite {
     /// the opaque-payload precedent of `op_bytes` / `geometry_bytes`) and
     /// never interprets the bytes. `op` selects whether the set is installed
     /// (`Set`) or removed (`Drop`) for `collection`.
+    ///
+    /// `descriptor_version` is the collection's catalog descriptor version at
+    /// the time the change was proposed. The apply path uses it as a monotonic
+    /// fence: a replica installs (or drops) only when the incoming version is
+    /// `>=` the version it last installed for the collection, so a stale set
+    /// re-proposed by a partitioned leader cannot clobber a newer one even if
+    /// it lands at a higher data-log index.
     ConstraintChange {
         collection: String,
         op: ConstraintChangeOp,
+        descriptor_version: u64,
         constraints: Vec<Vec<u8>>,
     },
 }

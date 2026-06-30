@@ -60,13 +60,21 @@ pub enum CrdtOp {
     /// opaque payload precedent of other replicated ops). Decoded into typed
     /// constraints inside the Data Plane handler. Applied deterministically on
     /// every replica from the per-vshard data Raft log.
+    /// `descriptor_version` fences the install: a replica applies only when it
+    /// is `>=` the version last installed for the collection, so a stale set
+    /// cannot clobber a newer one regardless of data-log apply order.
     SetConstraints {
         collection: String,
+        descriptor_version: u64,
         constraints: Vec<Vec<u8>>,
     },
 
     /// Remove every constraint scoped to `collection` from the CRDT validator.
-    DropConstraints { collection: String },
+    /// `descriptor_version` fences the drop identically to `SetConstraints`.
+    DropConstraints {
+        collection: String,
+        descriptor_version: u64,
+    },
 
     /// Set conflict resolution policy for a CRDT collection (DDL).
     SetPolicy {

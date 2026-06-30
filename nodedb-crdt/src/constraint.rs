@@ -57,7 +57,14 @@ pub enum ConstraintKind {
 
 /// A constraint bound to a specific collection and field.
 #[derive(
-    Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
 )]
 pub struct Constraint {
     /// Unique name for this constraint (e.g., "users_email_unique").

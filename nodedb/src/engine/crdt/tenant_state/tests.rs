@@ -300,7 +300,7 @@ fn installed_constraints_are_enforced_and_droppable() {
         field: "email".into(),
         kind: nodedb_crdt::ConstraintKind::Unique,
     };
-    engine.set_collection_constraints("users", vec![unique_email.clone()]);
+    assert!(engine.set_collection_constraints("users", 1, vec![unique_email.clone()]));
 
     let mk = |row: &str, coll: &str, email: &str| ProposedChange {
         collection: coll.into(),
@@ -343,7 +343,7 @@ fn installed_constraints_are_enforced_and_droppable() {
         .unwrap();
 
     // After dropping the constraint, the duplicate is accepted.
-    engine.drop_collection_constraints("users");
+    assert!(engine.drop_collection_constraints("users", 2));
     engine
         .validate_and_apply(
             1,
@@ -364,12 +364,105 @@ fn set_collection_constraints_replaces_rather_than_accumulates() {
         field: "email".into(),
         kind: nodedb_crdt::ConstraintKind::Unique,
     };
-    engine.set_collection_constraints("users", vec![c.clone()]);
-    engine.set_collection_constraints("users", vec![c.clone()]);
-    // Setting twice leaves exactly one rule scoped to "users".
+    engine.set_collection_constraints("users", 1, vec![c.clone()]);
+    engine.set_collection_constraints("users", 1, vec![c.clone()]);
+    // Setting twice (same version, allowed by the `>=` fence) leaves exactly
+    // one rule scoped to "users".
     assert_eq!(engine.validator.constraints_for("users").len(), 1);
 
     // An empty set clears the collection's constraints.
-    engine.set_collection_constraints("users", Vec::<nodedb_crdt::Constraint>::new());
+    engine.set_collection_constraints("users", 2, Vec::<nodedb_crdt::Constraint>::new());
     assert_eq!(engine.validator.constraints_for("users").len(), 0);
+}
+
+/// Builds a UNIQUE constraint named `name` on `users.email`.
+fn unique_named(name: &str) -> nodedb_crdt::Constraint {
+    nodedb_crdt::Constraint {
+        name: name.into(),
+        collection: "users".into(),
+        field: "email".into(),
+        kind: nodedb_crdt::ConstraintKind::Unique,
+    }
+}
+
+#[test]
+fn set_constraint_version_fence_rejects_stale_and_accepts_newer() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+
+    // Install version 5: the constraint is visible.
+    let v5 = unique_named("rule_v5");
+    assert!(engine.set_collection_constraints("users", 5, vec![v5.clone()]));
+    let installed = engine.constraints_for_collection("users");
+    assert_eq!(installed.len(), 1);
+    assert_eq!(installed[0].name, "rule_v5");
+
+    // An older version 3 with a different set is rejected as stale; the
+    // version-5 constraints remain untouched.
+    let v3 = unique_named("rule_v3");
+    assert!(!engine.set_collection_constraints("users", 3, vec![v3.clone()]));
+    let unchanged = engine.constraints_for_collection("users");
+    assert_eq!(unchanged.len(), 1);
+    assert_eq!(unchanged[0].name, "rule_v5");
+
+    // A newer version 7 applies and replaces.
+    let v7 = unique_named("rule_v7");
+    assert!(engine.set_collection_constraints("users", 7, vec![v7.clone()]));
+    let replaced = engine.constraints_for_collection("users");
+    assert_eq!(replaced.len(), 1);
+    assert_eq!(replaced[0].name, "rule_v7");
+}
+
+#[test]
+fn drop_constraint_version_fence_rejects_stale_and_accepts_newer() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+    assert!(engine.set_collection_constraints("users", 5, vec![unique_named("rule_v5")]));
+
+    // A drop at version 4 (older than the installed 5) is rejected; the
+    // constraints survive.
+    assert!(!engine.drop_collection_constraints("users", 4));
+    assert_eq!(engine.constraints_for_collection("users").len(), 1);
+
+    // A drop at version 6 applies and clears.
+    assert!(engine.drop_collection_constraints("users", 6));
+    assert_eq!(
+        engine.constraints_for_collection("users"),
+        Vec::<nodedb_crdt::Constraint>::new()
+    );
+}
+
+#[test]
+fn set_constraint_same_version_is_idempotent() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+    let rule = unique_named("rule_v5");
+
+    // The same version delivered twice both apply (the `>=` fence) and leave a
+    // single rule per name — re-delivery is harmless.
+    assert!(engine.set_collection_constraints("users", 5, vec![rule.clone()]));
+    assert!(engine.set_collection_constraints("users", 5, vec![rule.clone()]));
+    let installed = engine.constraints_for_collection("users");
+    assert_eq!(installed.len(), 1);
+    assert_eq!(installed[0].name, "rule_v5");
+}
+
+#[test]
+fn purge_clears_constraints_and_resets_version_fence() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+
+    // Install a constraint at version 5, then drop the whole collection.
+    assert!(engine.set_collection_constraints("users", 5, vec![unique_named("old_rule")]));
+    engine.purge_collection("users").unwrap();
+
+    // Purge clears the constraints outright.
+    assert_eq!(
+        engine.constraints_for_collection("users"),
+        Vec::<nodedb_crdt::Constraint>::new()
+    );
+
+    // A re-created collection of the same name restarts its descriptor version
+    // at 1. Because purge also reset the fence, that fresh low-version install
+    // is accepted rather than rejected as stale against the dropped 5.
+    assert!(engine.set_collection_constraints("users", 1, vec![unique_named("new_rule")]));
+    let installed = engine.constraints_for_collection("users");
+    assert_eq!(installed.len(), 1);
+    assert_eq!(installed[0].name, "new_rule");
 }
