@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::constraint::ConstraintSet;
+use crate::constraint::{Constraint, ConstraintSet};
 use crate::dead_letter::DeadLetterQueue;
 use crate::deferred::DeferredQueue;
 use crate::policy::PolicyRegistry;
@@ -56,6 +56,22 @@ impl Validator {
             delta_verifier: None,
             bitemporal_collections: HashSet::new(),
         }
+    }
+
+    /// Replace the constraint set scoped to `collection`. Constraints for
+    /// other collections are unaffected.
+    pub fn set_collection_constraints(&mut self, collection: &str, new: Vec<Constraint>) {
+        self.constraints.set_for_collection(collection, new);
+    }
+
+    /// Remove every constraint scoped to `collection`.
+    pub fn clear_collection_constraints(&mut self, collection: &str) {
+        self.constraints.clear_for_collection(collection);
+    }
+
+    /// Read the constraints currently scoped to `collection`.
+    pub fn constraints_for(&self, collection: &str) -> Vec<&Constraint> {
+        self.constraints.for_collection(collection)
     }
 
     /// Register a collection as bitemporal. UNIQUE constraints for rows in

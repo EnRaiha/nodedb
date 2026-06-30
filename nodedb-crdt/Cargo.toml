@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 loro = { workspace = true }
 serde = { workspace = true }
+zerompk = { workspace = true }
 nodedb-types = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }

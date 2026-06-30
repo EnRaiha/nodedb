@@ -54,6 +54,20 @@ pub enum CrdtOp {
         bytes: Vec<u8>,
     },
 
+    /// Install a collection's constraint set into every replica's CRDT
+    /// validator. Carried opaquely as zerompk-encoded constraint blobs so this
+    /// crate stays decoupled from the constraint wire layout (mirroring the
+    /// opaque payload precedent of other replicated ops). Decoded into typed
+    /// constraints inside the Data Plane handler. Applied deterministically on
+    /// every replica from the per-vshard data Raft log.
+    SetConstraints {
+        collection: String,
+        constraints: Vec<Vec<u8>>,
+    },
+
+    /// Remove every constraint scoped to `collection` from the CRDT validator.
+    DropConstraints { collection: String },
+
     /// Set conflict resolution policy for a CRDT collection (DDL).
     SetPolicy {
         collection: String,

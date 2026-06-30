@@ -41,6 +41,15 @@ impl CoreLoop {
                 self.execute_get_collection_policy(task, collection)
             }
 
+            CrdtOp::SetConstraints {
+                collection,
+                constraints,
+            } => self.execute_crdt_set_constraints(task, collection, constraints),
+
+            CrdtOp::DropConstraints { collection } => {
+                self.execute_crdt_drop_constraints(task, collection)
+            }
+
             CrdtOp::ReadAtVersion {
                 collection,
                 document_id,

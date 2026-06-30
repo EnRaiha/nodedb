@@ -709,3 +709,56 @@ fn edge_put_surrogates_roundtrip() {
         other => panic!("expected Graph(EdgePut), got {other:?}"),
     }
 }
+
+#[test]
+fn constraint_change_set_decodes_to_set_constraints() {
+    // Decode layer keeps constraint blobs opaque, so raw bytes are sufficient
+    // and avoid coupling this test to the constraint wire layout.
+    let entry = ReplicatedEntry::new(
+        1,
+        0,
+        ReplicatedWrite::ConstraintChange {
+            collection: "users".into(),
+            op: ConstraintChangeOp::Set,
+            constraints: vec![vec![1, 2, 3]],
+        },
+    );
+    let bytes = entry.to_bytes();
+    let (_, _, plan) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("ConstraintChange(Set) must decode to a plan");
+    match plan {
+        PhysicalPlan::Crdt(CrdtOp::SetConstraints {
+            collection,
+            constraints,
+        }) => {
+            assert_eq!(collection, "users");
+            assert_eq!(constraints.len(), 1);
+            assert_eq!(constraints[0], vec![1, 2, 3]);
+        }
+        other => panic!("expected Crdt(SetConstraints), got {other:?}"),
+    }
+}
+
+#[test]
+fn constraint_change_drop_decodes_to_drop_constraints() {
+    let entry = ReplicatedEntry::new(
+        1,
+        0,
+        ReplicatedWrite::ConstraintChange {
+            collection: "users".into(),
+            op: ConstraintChangeOp::Drop,
+            constraints: Vec::new(),
+        },
+    );
+    let bytes = entry.to_bytes();
+    let (_, _, plan) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("ConstraintChange(Drop) must decode to a plan");
+    match plan {
+        PhysicalPlan::Crdt(CrdtOp::DropConstraints { collection }) => {
+            assert_eq!(collection, "users");
+        }
+        other => panic!("expected Crdt(DropConstraints), got {other:?}"),
+    }
+}

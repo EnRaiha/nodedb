@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Control operation handlers — module root.
-//! Submodules: snapshot (WAL, cancel, range scan, checkpoint),
-//! crdt (all CRDT operations), convert (JSON→LoroValue).
 
 pub mod calvin;
 pub mod convert;
 pub mod crdt;
+pub mod crdt_constraints;
 pub mod move_tenant;
 pub mod reindex;
 mod reindex_apply;

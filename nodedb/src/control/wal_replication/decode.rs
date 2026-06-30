@@ -33,9 +33,7 @@ pub fn from_replicated_entry(
     // function is called. Return None so the applier skips the generic dispatch
     // path for them.
     match &entry.write {
-        ReplicatedWrite::ArrayOp { .. }
-        | ReplicatedWrite::ArraySchema { .. }
-        | ReplicatedWrite::ConstraintChange { .. } => {
+        ReplicatedWrite::ArrayOp { .. } | ReplicatedWrite::ArraySchema { .. } => {
             return Ok(None);
         }
         _ => {}
@@ -705,11 +703,18 @@ fn to_physical_plan(
                     .into(),
             });
         }
-        ReplicatedWrite::ConstraintChange { .. } => {
-            return Err(crate::Error::Internal {
-                detail: "ConstraintChange reached to_physical_plan (should have been intercepted)"
-                    .into(),
-            });
-        }
+        ReplicatedWrite::ConstraintChange {
+            collection,
+            op,
+            constraints,
+        } => match op {
+            super::types::ConstraintChangeOp::Set => PhysicalPlan::Crdt(CrdtOp::SetConstraints {
+                collection: collection.clone(),
+                constraints: constraints.clone(),
+            }),
+            super::types::ConstraintChangeOp::Drop => PhysicalPlan::Crdt(CrdtOp::DropConstraints {
+                collection: collection.clone(),
+            }),
+        },
     })
 }

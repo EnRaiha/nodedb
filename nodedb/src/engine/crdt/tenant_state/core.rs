@@ -277,6 +277,25 @@ impl TenantCrdtEngine {
         self.validator.policies_mut().set(collection, policy);
     }
 
+    /// Install the constraint set for `collection` into this tenant's
+    /// validator, replacing any constraints previously scoped to it. Mutates
+    /// only the validator — no per-collection CRDT state is created, since
+    /// constraints govern future writes rather than existing rows.
+    pub fn set_collection_constraints(
+        &mut self,
+        collection: &str,
+        constraints: Vec<nodedb_crdt::Constraint>,
+    ) {
+        self.validator
+            .set_collection_constraints(collection, constraints);
+    }
+
+    /// Remove every constraint scoped to `collection` from this tenant's
+    /// validator.
+    pub fn drop_collection_constraints(&mut self, collection: &str) {
+        self.validator.clear_collection_constraints(collection);
+    }
+
     /// Register a collection as bitemporal on this tenant's validator.
     ///
     /// Bitemporal collections get (a) UNIQUE constraints scoped to live

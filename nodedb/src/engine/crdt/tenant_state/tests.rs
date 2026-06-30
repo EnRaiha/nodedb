@@ -282,3 +282,94 @@ fn array_surrogate_satisfies_cross_engine_fk() {
     assert!(engine.row_exists("posts", "p1"));
     assert_eq!(engine.dlq_len(), 0);
 }
+
+#[test]
+fn installed_constraints_are_enforced_and_droppable() {
+    // Engine starts with NO constraints; U2 installs them at runtime.
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+    // Strict policy so a UNIQUE violation escalates (returns Err) instead of
+    // auto-resolving.
+    engine
+        .validator
+        .policies_mut()
+        .set("users", CollectionPolicy::strict());
+
+    let unique_email = nodedb_crdt::Constraint {
+        name: "users_email_unique".into(),
+        collection: "users".into(),
+        field: "email".into(),
+        kind: nodedb_crdt::ConstraintKind::Unique,
+    };
+    engine.set_collection_constraints("users", vec![unique_email.clone()]);
+
+    let mk = |row: &str, coll: &str, email: &str| ProposedChange {
+        collection: coll.into(),
+        row_id: row.into(),
+        surrogate: nodedb_types::Surrogate::ZERO,
+        fields: vec![("email".into(), LoroValue::String(email.into()))],
+    };
+
+    // First insert with the email succeeds.
+    engine
+        .validate_and_apply(
+            1,
+            nodedb_crdt::CrdtAuthContext::default(),
+            &mk("u1", "users", "a@b.com"),
+            b"d".to_vec(),
+        )
+        .unwrap();
+
+    // Duplicate email in the same collection is rejected.
+    assert!(
+        engine
+            .validate_and_apply(
+                1,
+                nodedb_crdt::CrdtAuthContext::default(),
+                &mk("u2", "users", "a@b.com"),
+                b"d".to_vec()
+            )
+            .is_err(),
+        "duplicate email must violate the installed UNIQUE constraint"
+    );
+
+    // A different collection carries no such constraint — same value is fine.
+    engine
+        .validate_and_apply(
+            1,
+            nodedb_crdt::CrdtAuthContext::default(),
+            &mk("p1", "posts", "a@b.com"),
+            b"d".to_vec(),
+        )
+        .unwrap();
+
+    // After dropping the constraint, the duplicate is accepted.
+    engine.drop_collection_constraints("users");
+    engine
+        .validate_and_apply(
+            1,
+            nodedb_crdt::CrdtAuthContext::default(),
+            &mk("u3", "users", "a@b.com"),
+            b"d".to_vec(),
+        )
+        .unwrap();
+    assert!(engine.row_exists("users", "u3"));
+}
+
+#[test]
+fn set_collection_constraints_replaces_rather_than_accumulates() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+    let c = nodedb_crdt::Constraint {
+        name: "users_email_unique".into(),
+        collection: "users".into(),
+        field: "email".into(),
+        kind: nodedb_crdt::ConstraintKind::Unique,
+    };
+    engine.set_collection_constraints("users", vec![c.clone()]);
+    engine.set_collection_constraints("users", vec![c.clone()]);
+    // Setting twice leaves exactly one rule scoped to "users".
+    assert_eq!(engine.validator.constraints_for("users").len(), 1);
+
+    // An empty set clears the collection's constraints.
+    engine.set_collection_constraints("users", Vec::<nodedb_crdt::Constraint>::new());
+    assert_eq!(engine.validator.constraints_for("users").len(), 0);
+}

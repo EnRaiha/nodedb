@@ -312,12 +312,15 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | ListDelete { collection, .. }
                 | ListMove { collection, .. } => out.push(collection.clone()),
 
-                // `ImportSnapshot` is a whole-tenant Loro import — no per-collection
-                // version contribution.
+                // `ImportSnapshot` is a whole-tenant Loro import and
+                // `SetConstraints` / `DropConstraints` install validator rules —
+                // none produce per-collection versioned read output.
                 GetVersionVector { .. }
                 | ExportDelta { .. }
                 | CompactAtVersion { .. }
-                | ImportSnapshot { .. } => {}
+                | ImportSnapshot { .. }
+                | SetConstraints { .. }
+                | DropConstraints { .. } => {}
             }
         }
 

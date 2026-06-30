@@ -9,7 +9,16 @@
 use serde::{Deserialize, Serialize};
 
 /// The kind of SQL constraint to enforce.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
 pub enum ConstraintKind {
     /// No two rows may have the same value for this key.
     /// Analogous to SQL `UNIQUE(column)`.
@@ -47,7 +56,9 @@ pub enum ConstraintKind {
 }
 
 /// A constraint bound to a specific collection and field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
+)]
 pub struct Constraint {
     /// Unique name for this constraint (e.g., "users_email_unique").
     pub name: String,
@@ -135,6 +146,18 @@ impl ConstraintSet {
         });
     }
 
+    /// Replace every constraint scoped to `collection` with `new`.
+    /// Constraints belonging to other collections are left untouched.
+    pub fn set_for_collection(&mut self, collection: &str, new: Vec<Constraint>) {
+        self.constraints.retain(|c| c.collection != collection);
+        self.constraints.extend(new);
+    }
+
+    /// Remove every constraint scoped to `collection`.
+    pub fn clear_for_collection(&mut self, collection: &str) {
+        self.constraints.retain(|c| c.collection != collection);
+    }
+
     /// Get all constraints for a given collection.
     pub fn for_collection(&self, collection: &str) -> Vec<&Constraint> {
         self.constraints
@@ -178,5 +201,33 @@ mod tests {
 
         let btfk = cs.for_collection("orders")[0];
         assert!(matches!(btfk.kind, ConstraintKind::BiTemporalFK { .. }));
+    }
+
+    #[test]
+    fn set_for_collection_replaces_only_that_collection() {
+        let mut cs = ConstraintSet::new();
+        cs.add_unique("users_email_unique", "users", "email");
+        cs.add_not_null("posts_title_nn", "posts", "title");
+
+        let new_users = vec![Constraint {
+            name: "users_name_unique".into(),
+            collection: "users".into(),
+            field: "name".into(),
+            kind: ConstraintKind::Unique,
+        }];
+        // Replacing twice must be idempotent: exactly one rule for "users".
+        cs.set_for_collection("users", new_users.clone());
+        cs.set_for_collection("users", new_users);
+        assert_eq!(cs.for_collection("users").len(), 1);
+        assert_eq!(cs.for_collection("users")[0].name, "users_name_unique");
+        // "posts" is untouched.
+        assert_eq!(cs.for_collection("posts").len(), 1);
+
+        // An empty replacement clears the collection.
+        cs.set_for_collection("users", Vec::new());
+        assert_eq!(cs.for_collection("users").len(), 0);
+
+        cs.clear_for_collection("posts");
+        assert_eq!(cs.for_collection("posts").len(), 0);
     }
 }

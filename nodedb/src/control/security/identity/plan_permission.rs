@@ -110,6 +110,8 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         PhysicalPlan::Crdt(
             CrdtOp::Apply { .. }
             | CrdtOp::ImportSnapshot { .. }
+            | CrdtOp::SetConstraints { .. }
+            | CrdtOp::DropConstraints { .. }
             | CrdtOp::RestoreToVersion { .. }
             | CrdtOp::ListInsert { .. }
             | CrdtOp::ListDelete { .. }
