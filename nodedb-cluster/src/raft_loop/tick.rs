@@ -29,6 +29,9 @@
 //!    `RemoveNode` for committed voters no longer in the placement set —
 //!    capped so the group never drops below RF committed voters, one at a
 //!    time, and never removing the group leader.
+//! 9. **Remove leaving learners**: for each group this node leads that has an
+//!    authored placement set, propose `RemoveLearner` for non-voting learners
+//!    not in the placement. Inert while placement is `None` (bootstrap window).
 
 use std::collections::HashMap as BatchMap;
 
@@ -418,6 +421,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // At most one removal per group per pass; never removes the leader.
         // Re-proposals while a conf-change is pending are harmlessly rejected.
         self.converge_leaving_voters();
+
+        // Remove non-voting learners not in the group's placement set. Runs
+        // after converge_leaving_voters so voter and learner convergence steps
+        // share the same tick ordering (voters first, learners after). Inert
+        // while placement is None (bootstrap window — guard is inside the fn).
+        self.converge_leaving_learners();
 
         // Placement reconcile is throttled well above the tick rate: SetPlacement
         // is a normal metadata entry (not a conf-change), so Raft would not dedup

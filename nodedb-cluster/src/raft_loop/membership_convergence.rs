@@ -6,10 +6,19 @@
 //! present as voters or learners; promotion to voter is handled by
 //! `promote_ready_learners` once the learner catches up.
 //!
-//! **Leaving path** — proposes `RemoveNode` for committed voters no longer in
-//! the placement set, capped so the group never drops below RF committed
-//! voters (ensuring a replacement is promoted before the old node is removed),
-//! one removal per group per pass, never removing the group leader.
+//! **Leaving voter path** — proposes `RemoveNode` for committed voters no
+//! longer in the placement set, capped so the group never drops below RF
+//! committed voters (ensuring a replacement is promoted before the old node is
+//! removed), one removal per group per pass, never removing the group leader.
+//!
+//! **Leaving learner path** — proposes `RemoveLearner` for non-voting learners
+//! that are NOT in the group's placement set. This is the steady-state cleanup
+//! for over-replication: when N > RF a joining node is admitted as a learner
+//! to all groups (so it can catch up and bootstrap correctly), but only RF
+//! nodes appear in each group's placement. Once placement is authored, this
+//! step removes learners that placement excludes. It is deliberately inert
+//! while placement is `None` (the bootstrap window) — the `let Some` guard
+//! ensures the bootstrap invariant is never violated.
 
 use tracing::debug;
 
@@ -35,6 +44,22 @@ pub(super) fn plan_entering_learners(
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Learners that should be REMOVED to converge a group toward its placement
+/// set: learners present in membership whose node-id does NOT appear in
+/// placement. Returned sorted ascending. Pure and deterministic.
+///
+/// No RF-floor needed — learners are non-voting and their removal never affects
+/// quorum, commit, or election outcomes.
+pub(super) fn plan_leaving_learners(actual_learners: &[u64], placement: &[u64]) -> Vec<u64> {
+    let mut leaving: Vec<u64> = actual_learners
+        .iter()
+        .copied()
+        .filter(|n| !placement.contains(n))
+        .collect();
+    leaving.sort_unstable();
+    leaving
 }
 
 /// Voters that should be REMOVED to converge a group toward its placement set:
@@ -220,11 +245,93 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             }
         }
     }
+
+    /// For each group this node leads that has an authored placement set,
+    /// propose `RemoveLearner` for non-voting learners not in the placement.
+    ///
+    /// This is the steady-state cleanup for the over-replication artifact
+    /// produced when N > RF: joining admits a node as a learner to all groups,
+    /// but only RF groups include it in their placement. Once placement is
+    /// authored, non-placement learners are removed within a few ticks.
+    ///
+    /// **Bootstrap guard:** the `let Some(placement) else { continue }` below
+    /// is load-bearing. During the bootstrap window, data-group placement is
+    /// `None` (not yet authored by reconcile). Skipping on `None` makes this
+    /// step inert in that window — it cannot strip formation-time learners, and
+    /// the formation invariant is preserved. This is identical to the guard used
+    /// by `converge_entering_learners` and `converge_leaving_voters`.
+    ///
+    /// Re-proposals while a conf-change is pending are rejected by Raft and
+    /// retried next tick — no throttle needed.
+    pub(super) fn converge_leaving_learners(&self) {
+        // Phase 1: snapshot removals under one lock acquisition.
+        let removals: Vec<(u64, u64)> = {
+            let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+            let group_ids = mr.group_ids();
+            let mut out = Vec::new();
+            for gid in group_ids {
+                if gid == crate::metadata_group::METADATA_GROUP_ID
+                    || gid == crate::calvin::sequencer::SEQUENCER_GROUP_ID
+                {
+                    continue;
+                }
+                if !mr.group_role_is_leader(gid) {
+                    continue;
+                }
+                let placement: Option<Vec<u64>> = mr
+                    .routing()
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .group_info(gid)
+                    .and_then(|info| info.placement.clone());
+                // Bootstrap guard: while placement is None the group is in its
+                // formation window. Skip unconditionally — this step must be
+                // inert until placement is authored (Some).
+                let Some(placement) = placement else {
+                    continue;
+                };
+                let Some(m) = mr.group_membership(gid) else {
+                    continue;
+                };
+                for node_id in plan_leaving_learners(&m.learners, &placement) {
+                    out.push((gid, node_id));
+                }
+            }
+            out
+        };
+
+        // Phase 2: propose each removal in its own lock acquisition.
+        for (group_id, node_id) in removals {
+            let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+            let change = ConfChange {
+                change_type: ConfChangeType::RemoveLearner,
+                node_id,
+            };
+            match mr.propose_conf_change(group_id, &change) {
+                Ok((_gid, idx)) => {
+                    debug!(
+                        group_id,
+                        node_id,
+                        log_index = idx,
+                        "convergence: proposed RemoveLearner"
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        group_id,
+                        node_id,
+                        error = %e,
+                        "convergence: RemoveLearner deferred"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_entering_learners, plan_leaving_voters};
+    use super::{plan_entering_learners, plan_leaving_learners, plan_leaving_voters};
 
     #[test]
     fn entering_nodes_not_yet_in_membership() {
@@ -313,5 +420,51 @@ mod tests {
     fn leaving_output_is_sorted() {
         // unsorted voters, RF=1 → removable high; leaving {9,2,7,4} sorted.
         assert_eq!(plan_leaving_voters(&[9, 2, 7, 4], &[], 0), vec![2, 4, 7, 9]);
+    }
+
+    // --- plan_leaving_learners ---
+
+    #[test]
+    fn learner_not_in_placement_is_removed() {
+        // Learner 4 is not in placement {1,2,3} → returned for removal.
+        assert_eq!(plan_leaving_learners(&[4], &[1, 2, 3]), vec![4]);
+    }
+
+    #[test]
+    fn learner_in_placement_is_kept() {
+        // Learner 3 is in placement {1,2,3} → nothing to remove.
+        assert_eq!(
+            plan_leaving_learners(&[3], &[1, 2, 3]),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn mixed_learners_only_out_of_placement_removed() {
+        // Learners 3 (in placement) and 4 (not in placement).
+        assert_eq!(plan_leaving_learners(&[3, 4], &[1, 2, 3]), vec![4]);
+    }
+
+    #[test]
+    fn empty_placement_superset_removes_nothing() {
+        // Placement includes all learners → nothing to remove.
+        assert_eq!(
+            plan_leaving_learners(&[2, 3], &[1, 2, 3]),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn leaving_learners_output_is_sorted() {
+        // Learners in reverse order, all out-of-placement → sorted output.
+        assert_eq!(plan_leaving_learners(&[9, 2, 7], &[]), vec![2, 7, 9]);
+    }
+
+    #[test]
+    fn no_learners_returns_empty() {
+        assert_eq!(
+            plan_leaving_learners(&[], &[1, 2, 3]),
+            Vec::<u64>::new()
+        );
     }
 }
