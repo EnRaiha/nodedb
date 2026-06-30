@@ -149,6 +149,14 @@ impl CoreLoop {
             // Check for delete bitmap.
             let delete_bm = engine.delete_bitmap(seg_id as u64);
 
+            // Resolve the per-row surrogate sidecar for this segment.
+            // `columnar_flushed_surrogates` is indexed by `seg_idx` (0-based),
+            // in lockstep with `columnar_flushed_segments`.
+            let seg_surrogates: Option<&Vec<Option<nodedb_types::Surrogate>>> = self
+                .columnar_flushed_surrogates
+                .get(&columnar_key)
+                .and_then(|segs| segs.get(seg_idx));
+
             for row_idx in first_row_in_seg..row_count {
                 // Skip tombstoned rows.
                 if delete_bm.is_some_and(|bm| bm.is_deleted(row_idx as u32)) {
@@ -188,26 +196,20 @@ impl CoreLoop {
                     }
                 };
 
-                // Derive surrogate for this row.
-                // The surrogate is not stored inline in the segment, so we derive
-                // it from the surrogate list tracked by the engine.
-                // We use the row index within the flushed segment as the
-                // `row_index` component and store (seg_id, row_idx) in the
-                // cursor. For surrogate identity, we use a synthetic key of
-                // (seg_id, row_idx) bytes — the materializer re-allocates
-                // target surrogates using `surrogate_assigner.assign`, so the
-                // surrogate returned here is the SOURCE surrogate which the
-                // Control Plane uses only for tombstone/copyup lookup.
-                //
-                // The engine's surrogate list for flushed segments is not
-                // directly available (it's managed by `PkIndex`). We emit
-                // surrogate = 0 here; the Control Plane materializer does NOT
-                // use the source surrogate for columnar (unlike document) —
-                // it uses a synthetic key derived from (seg_id, row_idx) for
-                // target allocation.  See `columnar.rs` Control Plane handler.
-                let synthetic_surrogate: u32 = encode_seg_row_as_u32(seg_id, row_idx as u32);
+                // Emit the real per-row surrogate when available so the
+                // Control Plane's tombstone/copyup probe keys on the same
+                // value that was written at flush time. Fall back to the
+                // synthetic pack only for rows that have no recorded surrogate
+                // (e.g. segments restored from a pre-surrogate backup).
+                let row_surrogate = seg_surrogates
+                    .and_then(|s| s.get(row_idx))
+                    .copied()
+                    .flatten();
+                let surrogate_u32: u32 = row_surrogate
+                    .map(|s| s.as_u32())
+                    .unwrap_or_else(|| encode_seg_row_as_u32(seg_id, row_idx as u32));
 
-                entries.push((synthetic_surrogate, value_bytes));
+                entries.push((surrogate_u32, value_bytes));
                 last_segment = seg_id;
                 last_row = (row_idx + 1) as u32; // exclusive next position
 
@@ -238,7 +240,11 @@ impl CoreLoop {
             };
 
             if memtable_start_row != usize::MAX {
-                let engine = self.columnar_engines.get(&columnar_key).unwrap();
+                let Some(engine) = self.columnar_engines.get(&columnar_key) else {
+                    // Engine was confirmed to exist above; reaching here is
+                    // unexpected but safe to return what we have so far.
+                    return build_response(self, task, entries, Vec::new());
+                };
                 let schema = engine.schema().clone();
                 let ts_system_idx = schema.columns.iter().position(|c| c.name == "_ts_system");
 
@@ -279,14 +285,14 @@ impl CoreLoop {
                     };
 
                     let abs_row = memtable_start_row + mt_idx;
-                    let synthetic_surrogate: u32 =
+                    let surrogate_u32: u32 =
                         row_surrogate.map(|s| s.as_u32()).unwrap_or_else(|| {
                             // No recorded surrogate — use a hash-based synthetic value.
                             // segment_id=0 (memtable), row position in lower 24 bits.
                             (abs_row as u32) | 0x8000_0000
                         });
 
-                    entries.push((synthetic_surrogate, value_bytes));
+                    entries.push((surrogate_u32, value_bytes));
                     last_segment = 0;
                     last_row = (abs_row + 1) as u32;
 
@@ -310,12 +316,13 @@ impl CoreLoop {
 
 /// Encode `(seg_id, row_idx)` as a compact 32-bit tag.
 ///
-/// Used only as a surrogate proxy for the Control Plane's tombstone/copyup
-/// probe (which keys on source surrogate). We pack `seg_id` in the upper 16
-/// bits and `row_idx` in the lower 16 bits so the value is unique per row
-/// within a collection. For large segments / memtables the collision
-/// probability is non-zero but the Control Plane materializer uses the
-/// value only for `catalog.get_clone_copyup(…)` which is idempotent.
+/// This is the **fallback** used only for flushed-segment rows that have no
+/// recorded surrogate in `columnar_flushed_surrogates` (e.g. segments restored
+/// from a backup predating the surrogate sidecar). Current data carries real
+/// per-row surrogates that match the tombstone/copyup write side exactly; this
+/// path is exercised only for legacy-restored segments.
+///
+/// Packs `seg_id` in the upper 16 bits and `row_idx` in the lower 16 bits.
 pub(super) fn encode_seg_row_as_u32(seg_id: u32, row_idx: u32) -> u32 {
     (seg_id & 0xFFFF) << 16 | (row_idx & 0xFFFF)
 }
@@ -395,4 +402,178 @@ fn write_bin(out: &mut Vec<u8>, bytes: &[u8]) {
 fn write_u32(out: &mut Vec<u8>, v: u32) {
     out.push(0xce);
     out.extend_from_slice(&v.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use nodedb_bridge::buffer::RingBuffer;
+    use nodedb_columnar::MutationEngine;
+    use nodedb_types::Surrogate;
+    use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
+    use nodedb_types::value::Value;
+
+    use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+    use crate::bridge::envelope::{PhysicalPlan, Priority, Request};
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::task::ExecutionTask;
+    use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+
+    fn schema() -> ColumnarSchema {
+        ColumnarSchema::new(vec![
+            ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+            ColumnDef::required("val", ColumnType::Int64),
+        ])
+        .expect("valid schema")
+    }
+
+    fn make_core() -> (CoreLoop, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, _resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("CoreLoop::open");
+        (core, dir)
+    }
+
+    fn make_task() -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Meta(nodedb_physical::physical_plan::MetaOp::Compact),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+        })
+    }
+
+    /// Flush `rows` into a single flushed segment on `core`, mirroring the
+    /// production flush block in `handlers/columnar_write/insert.rs`.
+    fn insert_and_flush(
+        core: &mut CoreLoop,
+        collection: &str,
+        rows: &[(i64, i64, Surrogate)],
+    ) -> (DatabaseId, TenantId, String) {
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            collection.to_string(),
+        );
+        let mut engine = MutationEngine::new(collection.to_string(), schema());
+        for (id, val, surr) in rows {
+            engine
+                .insert_with_surrogate(&[Value::Integer(*id), Value::Integer(*val)], *surr)
+                .expect("insert_with_surrogate");
+        }
+
+        let new_segment_id = engine.next_segment_id();
+        let (seg_schema, columns, row_count) = engine.memtable_mut().drain_optimized();
+        let flushed_surrogates: Vec<Option<Surrogate>> = engine.memtable_surrogates().to_vec();
+        let bytes = nodedb_columnar::SegmentWriter::plain()
+            .write_segment(&seg_schema, &columns, row_count, None)
+            .expect("write_segment");
+
+        core.columnar_flushed_segments
+            .entry(key.clone())
+            .or_default()
+            .push(bytes);
+        core.columnar_flushed_surrogates
+            .entry(key.clone())
+            .or_default()
+            .push(flushed_surrogates);
+        engine
+            .on_memtable_flushed(new_segment_id)
+            .expect("on_memtable_flushed");
+        core.columnar_engines.insert(key.clone(), engine);
+        key
+    }
+
+    /// Parse the response payload from `execute_columnar_materialize_scan`.
+    /// Returns `(surrogates, next_cursor)`.
+    fn parse_response(payload: &[u8]) -> (Vec<u32>, Vec<u8>) {
+        use nodedb_query::msgpack_scan;
+
+        if payload.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let (outer_len, mut off) = msgpack_scan::array_header(payload, 0).expect("outer array");
+        assert_eq!(outer_len, 2);
+        let next_cursor = msgpack_scan::read_bin_advance(payload, &mut off)
+            .expect("cursor bin")
+            .to_vec();
+        let (entry_count, mut entry_off) =
+            msgpack_scan::array_header(payload, off).expect("entries array");
+        let mut surrogates = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let (pair_len, mut pair_off) =
+                msgpack_scan::array_header(payload, entry_off).expect("pair array");
+            assert_eq!(pair_len, 2);
+            let surrogate =
+                msgpack_scan::read_u32_advance(payload, &mut pair_off).expect("surrogate u32");
+            let _value = msgpack_scan::read_bin_advance(payload, &mut pair_off).expect("value bin");
+            surrogates.push(surrogate);
+            entry_off = pair_off;
+        }
+        (surrogates, next_cursor)
+    }
+
+    /// Flushed columnar segment rows with recorded surrogates must emit those
+    /// real surrogates — not the `encode_seg_row_as_u32` packed value — so that
+    /// the Control Plane's tombstone/copyup probe keys on the same value written
+    /// at flush time.
+    #[test]
+    fn flushed_segment_emits_real_surrogates() {
+        let (mut core, _dir) = make_core();
+        let coll = "mat_surr_test";
+
+        let s10 = Surrogate::new(10);
+        let s20 = Surrogate::new(20);
+        let s30 = Surrogate::new(30);
+
+        insert_and_flush(
+            &mut core,
+            coll,
+            &[(1, 100, s10), (2, 200, s20), (3, 300, s30)],
+        );
+
+        let task = make_task();
+        let resp = core.execute_columnar_materialize_scan(&task, coll, &[], 64, None);
+
+        let (emitted_surrogates, next_cursor) = parse_response(resp.payload.as_bytes());
+
+        assert!(
+            next_cursor.is_empty(),
+            "scan should be complete in one page"
+        );
+        assert_eq!(emitted_surrogates.len(), 3, "all three rows returned");
+
+        // Real surrogates must match what was recorded at flush time.
+        assert_eq!(emitted_surrogates[0], s10.as_u32());
+        assert_eq!(emitted_surrogates[1], s20.as_u32());
+        assert_eq!(emitted_surrogates[2], s30.as_u32());
+
+        // Confirm none of the emitted values equal the synthetic fallback for
+        // these positions: encode_seg_row_as_u32(seg_id=1, row_idx).
+        let synthetic_row0 = super::encode_seg_row_as_u32(1, 0);
+        let synthetic_row1 = super::encode_seg_row_as_u32(1, 1);
+        let synthetic_row2 = super::encode_seg_row_as_u32(1, 2);
+        assert_ne!(emitted_surrogates[0], synthetic_row0);
+        assert_ne!(emitted_surrogates[1], synthetic_row1);
+        assert_ne!(emitted_surrogates[2], synthetic_row2);
+    }
 }
