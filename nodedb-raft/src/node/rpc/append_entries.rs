@@ -146,6 +146,11 @@ impl<S: LogStorage> RaftNode<S> {
             }
             self.send_append_entries(peer);
         }
+
+        // If a leadership transfer is pending toward this peer and it has now
+        // reached the log frontier, emit the `TimeoutNow` trigger. Self-guards
+        // on target/emitted/caught-up, so this is a no-op otherwise.
+        self.try_emit_timeout_now();
     }
 }
 

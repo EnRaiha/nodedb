@@ -22,7 +22,7 @@ pub use error::{RaftError, Result};
 pub use log::RaftLog;
 pub use message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    LogEntry, RequestVoteRequest, RequestVoteResponse,
+    LogEntry, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 pub use node::{RaftNode, Ready};
 pub use snapshot_framing::{

@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use crate::error::{RaftError, Result};
 use crate::log::RaftLog;
-use crate::message::{AppendEntriesRequest, LogEntry};
-use crate::state::{HardState, LeaderState, NodeRole, VolatileState};
+use crate::message::{AppendEntriesRequest, LogEntry, TimeoutNowRequest};
+use crate::state::{HardState, LeaderState, LeadershipTransfer, NodeRole, VolatileState};
 use crate::storage::LogStorage;
 
 use super::config::RaftConfig;
@@ -30,6 +30,10 @@ pub struct Ready {
     pub messages: Vec<(u64, AppendEntriesRequest)>,
     /// Vote requests to send (peer_id, request).
     pub vote_requests: Vec<(u64, crate::message::RequestVoteRequest)>,
+    /// `TimeoutNow` triggers to send to leadership-transfer targets
+    /// (dest_node_id, request). Drained and dispatched by the caller; until a
+    /// caller wires the transport this field is simply ignored.
+    pub timeout_now: Vec<(u64, TimeoutNowRequest)>,
     /// Newly committed entries to apply to the state machine.
     pub committed_entries: Vec<LogEntry>,
     /// Peers that need an InstallSnapshot RPC because their next_index
@@ -42,6 +46,7 @@ impl Ready {
         self.hard_state.is_none()
             && self.messages.is_empty()
             && self.vote_requests.is_empty()
+            && self.timeout_now.is_empty()
             && self.committed_entries.is_empty()
             && self.snapshots_needed.is_empty()
     }
@@ -69,6 +74,8 @@ pub struct RaftNode<S: LogStorage> {
     pub(super) ready: Ready,
     /// Known leader ID (0 = unknown).
     pub(super) leader_id: u64,
+    /// In-progress leadership transfer, if any (leader-side, volatile).
+    pub(super) leadership_transfer: Option<LeadershipTransfer>,
 }
 
 impl<S: LogStorage> RaftNode<S> {
@@ -97,6 +104,7 @@ impl<S: LogStorage> RaftNode<S> {
             votes_received: HashSet::new(),
             ready: Ready::default(),
             leader_id: 0,
+            leadership_transfer: None,
             config,
         }
     }
@@ -144,6 +152,19 @@ impl<S: LogStorage> RaftNode<S> {
     /// Override election deadline (for testing).
     pub fn election_deadline_override(&mut self, deadline: Instant) {
         self.election_deadline = deadline;
+    }
+
+    /// Whether a leadership transfer is currently in progress.
+    pub fn leadership_transfer_in_progress(&self) -> bool {
+        self.leadership_transfer.is_some()
+    }
+
+    /// Override the in-progress leadership-transfer deadline (for testing).
+    /// No-op when no transfer is pending.
+    pub fn transfer_deadline_override(&mut self, deadline: Instant) {
+        if let Some(t) = self.leadership_transfer.as_mut() {
+            t.deadline = deadline;
+        }
     }
 
     /// Take the pending `Ready` output. Caller must execute messages,
@@ -308,6 +329,16 @@ impl<S: LogStorage> RaftNode<S> {
                 }
             }
             NodeRole::Leader => {
+                // Abort an in-progress leadership transfer whose deadline has
+                // passed: clear the volatile state so proposals unblock and
+                // the leader resumes normal operation.
+                let transfer_expired = self
+                    .leadership_transfer
+                    .as_ref()
+                    .is_some_and(|t| now >= t.deadline);
+                if transfer_expired {
+                    self.leadership_transfer = None;
+                }
                 if now >= self.heartbeat_deadline {
                     self.replicate_to_all();
                     self.heartbeat_deadline = now + self.config.heartbeat_interval;
@@ -335,6 +366,13 @@ impl<S: LogStorage> RaftNode<S> {
                     None
                 },
             });
+        }
+
+        // While a leadership transfer is pending the leader holds the log
+        // frontier fixed so the target can catch up to it. Reject new
+        // proposals (retryable) until the transfer completes or aborts.
+        if self.leadership_transfer.is_some() {
+            return Err(RaftError::LeadershipTransferInProgress);
         }
 
         let index = self.log.last_index() + 1;

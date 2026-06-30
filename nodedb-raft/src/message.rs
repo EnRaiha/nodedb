@@ -124,6 +124,29 @@ pub struct RequestVoteResponse {
     pub vote_granted: bool,
 }
 
+/// TimeoutNow RPC (Raft thesis — leadership transfer).
+///
+/// Sent by a leader to a caught-up target voter to make it immediately start
+/// an election (bypassing its election timeout). It carries no entries and
+/// grants no vote — the recipient runs a normal election at `term + 1`.
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct TimeoutNowRequest {
+    /// Leader's term at the time the transfer was initiated.
+    pub term: u64,
+    /// The leader initiating the transfer.
+    pub leader_id: u64,
+}
+
 /// InstallSnapshot RPC (Raft paper Figure 13).
 ///
 /// Used when a follower is too far behind for log-based catch-up.

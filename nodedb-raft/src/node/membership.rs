@@ -8,9 +8,13 @@
 //! per-peer replication tracking when the node is currently the leader,
 //! so a newly added peer immediately starts receiving `AppendEntries`.
 
+use std::time::Instant;
+
 use tracing::info;
 
-use crate::state::NodeRole;
+use crate::error::{RaftError, Result};
+use crate::message::TimeoutNowRequest;
+use crate::state::{LeadershipTransfer, NodeRole};
 use crate::storage::LogStorage;
 
 use super::core::RaftNode;
@@ -175,6 +179,84 @@ impl<S: LogStorage> RaftNode<S> {
                 group = self.config.group_id,
                 "promoted self from learner to follower"
             );
+        }
+    }
+
+    /// Begin transferring leadership to an in-placement voter `target`.
+    ///
+    /// `target` must be a current voter peer of this group (it is checked
+    /// against the voter set, not any external routing metadata; learners are
+    /// excluded because they cannot win an election). The leader stops
+    /// accepting new proposals so the log frontier is fixed, then emits a
+    /// `TimeoutNow` to `target` as soon as `target` has replicated up to that
+    /// frontier. If `target` is still lagging the trigger is deferred and
+    /// retried from the `AppendEntries` ack path until it catches up.
+    ///
+    /// Idempotent: a second call while a transfer is already pending is a
+    /// no-op (`Ok`), so fire-and-forget retries never produce duplicate
+    /// triggers. The transfer carries no vote and does not change any term —
+    /// `target` simply runs a normal election at `term + 1`.
+    pub fn transfer_leadership(&mut self, target: u64) -> Result<()> {
+        if self.role != NodeRole::Leader {
+            return Err(RaftError::NotLeader {
+                leader_hint: if self.leader_id != 0 {
+                    Some(self.leader_id)
+                } else {
+                    None
+                },
+            });
+        }
+
+        if target == self.config.node_id || !self.config.peers.contains(&target) {
+            return Err(RaftError::InvalidTransferTarget { target });
+        }
+
+        // Already transferring: idempotent no-op vs fire-and-forget retries.
+        if self.leadership_transfer.is_some() {
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + self.config.election_timeout_max;
+        self.leadership_transfer = Some(LeadershipTransfer {
+            target,
+            emitted: false,
+            deadline,
+        });
+
+        // Emit immediately if the target is already at the frontier; otherwise
+        // the ack hook retries once it catches up.
+        self.try_emit_timeout_now();
+        Ok(())
+    }
+
+    /// Emit a `TimeoutNow` to the leadership-transfer target if a transfer is
+    /// pending, has not yet been emitted, and the target's `match_index` has
+    /// reached the leader's log frontier.
+    ///
+    /// The `emitted` guard is load-bearing: it makes the trigger fire at most
+    /// once even though this is called from every `AppendEntries` ack.
+    pub(super) fn try_emit_timeout_now(&mut self) {
+        let (target, emitted) = match self.leadership_transfer.as_ref() {
+            Some(t) => (t.target, t.emitted),
+            None => return,
+        };
+        if emitted {
+            return;
+        }
+        if self.match_index_for(target) != Some(self.last_log_index()) {
+            return;
+        }
+
+        self.ready.timeout_now.push((
+            target,
+            TimeoutNowRequest {
+                term: self.hard_state.current_term,
+                leader_id: self.config.node_id,
+            },
+        ));
+
+        if let Some(t) = self.leadership_transfer.as_mut() {
+            t.emitted = true;
         }
     }
 }

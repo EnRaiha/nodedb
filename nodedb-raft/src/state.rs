@@ -91,6 +91,23 @@ impl Default for VolatileState {
     }
 }
 
+/// Volatile leader-side state for an in-progress leadership transfer.
+///
+/// Tracks the target voter, whether the `TimeoutNow` trigger has already been
+/// emitted (so it is sent at most once), and the deadline after which the
+/// transfer is abandoned and the leader resumes normal operation. This state
+/// is never persisted: a leader crash mid-transfer simply yields a clean
+/// follower on restart.
+#[derive(Debug, Clone)]
+pub struct LeadershipTransfer {
+    /// The voter peer that leadership is being transferred to.
+    pub target: u64,
+    /// Whether the `TimeoutNow` trigger has already been emitted to `target`.
+    pub emitted: bool,
+    /// When the transfer is abandoned if leadership has not yet moved.
+    pub deadline: std::time::Instant,
+}
+
 /// Per-observer send state tracked by the leader.
 ///
 /// Observers have an independent bounded send queue. When the queue is full

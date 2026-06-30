@@ -23,6 +23,12 @@ pub enum RaftError {
     #[error("proposal rejected: {reason}")]
     ProposalRejected { reason: String },
 
+    #[error("invalid leadership-transfer target: {target} is not a voter peer of this group")]
+    InvalidTransferTarget { target: u64 },
+
+    #[error("leadership transfer in progress; retry the proposal after it completes or aborts")]
+    LeadershipTransferInProgress,
+
     #[error("group {group_id} not found on this node")]
     GroupNotFound { group_id: u64 },
 

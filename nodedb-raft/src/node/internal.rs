@@ -80,6 +80,8 @@ impl<S: LogStorage> RaftNode<S> {
         self.hard_state.voted_for = 0;
         self.leader_state = None;
         self.votes_received.clear();
+        // Any in-progress leadership transfer is moot once we step down.
+        self.leadership_transfer = None;
         self.persist_hard_state();
         self.reset_election_timeout();
 
