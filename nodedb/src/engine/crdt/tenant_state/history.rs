@@ -16,14 +16,21 @@ use super::core::TenantCrdtEngine;
 const LORO_VV_FORMAT_VERSION: u8 = 1;
 
 impl TenantCrdtEngine {
-    /// Get the current version vector as a versioned JSON string.
+    /// Get the current version vector for a collection as a versioned JSON
+    /// string.
     ///
     /// The returned string has the shape:
     /// `{"v": <LORO_VV_FORMAT_VERSION>, "vv": {"<peer_hex>": <counter>, …}}`
     ///
+    /// A collection with no local state yields an empty version vector (the
+    /// peer has observed nothing for it yet).
+    ///
     /// Pass this string to any method that accepts a `version_json` parameter.
-    pub fn version_vector_json(&self) -> crate::Result<String> {
-        let vv = self.state.oplog_version_vector();
+    pub fn version_vector_json(&self, collection: &str) -> crate::Result<String> {
+        let vv = match self.collections.get(collection) {
+            Some(state) => state.oplog_version_vector(),
+            None => loro::VersionVector::default(),
+        };
         let inner = vv_to_json_map(&vv);
         let envelope = VvEnvelope {
             v: LORO_VV_FORMAT_VERSION,
@@ -42,7 +49,10 @@ impl TenantCrdtEngine {
         version_json: &str,
     ) -> crate::Result<Option<Vec<u8>>> {
         let vv = json_to_vv(version_json)?;
-        match self.state.read_at_version(collection, document_id, &vv) {
+        let Some(state) = self.collections.get(collection) else {
+            return Ok(None);
+        };
+        match state.read_at_version(collection, document_id, &vv) {
             Ok(Some(val)) => {
                 let json = crate::engine::document::crdt_store::loro_value_to_json(&val);
                 sonic_rs::to_vec(&json)
@@ -56,12 +66,18 @@ impl TenantCrdtEngine {
         }
     }
 
-    /// Export delta from a version to current, returning raw Loro bytes.
-    pub fn export_delta(&self, from_version_json: &str) -> crate::Result<Vec<u8>> {
+    /// Export delta for a collection from a version to current, returning raw
+    /// Loro bytes. A collection with no local state has no updates to export.
+    pub fn export_delta(
+        &self,
+        collection: &str,
+        from_version_json: &str,
+    ) -> crate::Result<Vec<u8>> {
         let vv = json_to_vv(from_version_json)?;
-        self.state
-            .export_updates_since(&vv)
-            .map_err(crate::Error::Crdt)
+        match self.collections.get(collection) {
+            Some(state) => state.export_updates_since(&vv).map_err(crate::Error::Crdt),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Restore a document to a historical version (forward mutation).
@@ -72,17 +88,28 @@ impl TenantCrdtEngine {
         target_version_json: &str,
     ) -> crate::Result<Vec<u8>> {
         let vv = json_to_vv(target_version_json)?;
-        self.state
+        let state = self.collections.get(collection).ok_or_else(|| {
+            crate::Error::Crdt(nodedb_crdt::CrdtError::Loro(
+                "document did not exist at target version".into(),
+            ))
+        })?;
+        state
             .restore_to_version(collection, document_id, &vv)
             .map_err(crate::Error::Crdt)
     }
 
-    /// Compact history at a specific version.
-    pub fn compact_at_version(&mut self, target_version_json: &str) -> crate::Result<()> {
+    /// Compact history at a specific version for a collection. A collection
+    /// with no local state is a no-op.
+    pub fn compact_at_version(
+        &mut self,
+        collection: &str,
+        target_version_json: &str,
+    ) -> crate::Result<()> {
         let vv = json_to_vv(target_version_json)?;
-        self.state
-            .compact_at_version(&vv)
-            .map_err(crate::Error::Crdt)
+        match self.collections.get_mut(collection) {
+            Some(state) => state.compact_at_version(&vv).map_err(crate::Error::Crdt),
+            None => Ok(()),
+        }
     }
 }
 

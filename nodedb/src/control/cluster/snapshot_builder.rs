@@ -16,11 +16,9 @@
 //! The vshard-partitioned engines are filtered and shipped, including graph
 //! `edges` (the edge key already embeds the collection, so it is routed through
 //! the same vshard filter as every other section). CRDT is one Loro doc per
-//! tenant; Loro 1.13 has no per-container export, so the whole tenant doc is
-//! shipped — but only to groups that own at least one of the doc's collections
-//! (the doc's collections are tagged on each `tenant_crdt_state` entry and
-//! matched against the group's vshards). Over-including is a harmless idempotent
-//! merge on apply; under-including would be silent data loss.
+//! (tenant, collection); each `crdt_state` entry carries its single collection
+//! and is shipped to the group that owns that collection's vshard — the same
+//! per-collection vshard filter as every other section.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -203,19 +201,13 @@ impl DataPlaneSnapshotBuilder {
             }
         }
 
-        // CRDT: one Loro doc per tenant. Loro 1.13 has no per-container export,
-        // so the WHOLE tenant doc is shipped — but only to groups that own ≥1 of
-        // the doc's collections. The doc's collections are tagged on each entry
-        // (`collection_names`); include it iff ANY of them routes into this
-        // group's vshards. Including the doc in extra groups is harmless (Loro
-        // import is an idempotent, monotonic merge); UNDER-including is silent
-        // data loss, hence the "any collection in group" inclusion test.
-        for (tid, collections, bytes) in snap.tenant_crdt_state {
-            if collections
-                .iter()
-                .any(|c| group_vshards.contains(&Self::vshard_of(c)))
-            {
-                merged.tenant_crdt_state.push((tid, collections, bytes));
+        // CRDT: one Loro doc per (tenant, collection). Each entry carries its
+        // single collection; include it iff that collection's vshard belongs to
+        // this group — the same per-collection vshard filter every other engine
+        // uses.
+        for (tid, collection, bytes) in snap.crdt_state {
+            if group_vshards.contains(&Self::vshard_of(&collection)) {
+                merged.crdt_state.push((tid, collection, bytes));
             }
         }
 

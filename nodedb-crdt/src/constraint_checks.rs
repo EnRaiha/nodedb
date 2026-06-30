@@ -166,16 +166,45 @@ mod bitemporal_fk_tests {
         }
     }
 
+    /// Test-only `RowLookup` that treats a fixed set of ids as live array
+    /// surrogates, mirroring the tenant-level cross-engine FK registry that now
+    /// lives outside `CrdtState`.
+    struct ArraySurrogateLookup<'a> {
+        state: &'a CrdtState,
+        surrogates: std::collections::HashSet<String>,
+    }
+
+    impl crate::row_lookup::RowLookup for ArraySurrogateLookup<'_> {
+        fn row_exists(&self, collection: &str, row_id: &str) -> bool {
+            self.state.row_exists(collection, row_id) || self.surrogates.contains(row_id)
+        }
+        fn field_value_exists(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
+            self.state.field_value_exists(collection, field, value)
+        }
+        fn field_value_exists_live(
+            &self,
+            collection: &str,
+            field: &str,
+            value: &LoroValue,
+        ) -> bool {
+            self.state.field_value_exists_live(collection, field, value)
+        }
+    }
+
     #[test]
     fn bitemporal_fk_passes_when_array_surrogate_exists() {
-        let mut state = CrdtState::new(1).unwrap();
-        state.register_array_surrogate("surr-42".to_string());
+        let state = CrdtState::new(1).unwrap();
+        let lookup = ArraySurrogateLookup {
+            state: &state,
+            surrogates: std::iter::once("surr-42".to_string()).collect(),
+        };
 
         let validator = Validator::new(Default::default(), 16);
         let constraint = make_btfk_constraint("variants", "id");
         let change = make_change("surr-42");
 
-        let violation = validator.check_foreign_key(&state, &change, &constraint, "variants", "id");
+        let violation =
+            validator.check_foreign_key(&lookup, &change, &constraint, "variants", "id");
         assert!(violation.is_none());
     }
 

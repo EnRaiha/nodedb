@@ -152,3 +152,133 @@ fn unique_violation_after_first_write() {
     );
     assert_eq!(engine.dlq_len(), 1);
 }
+
+// ── per-collection isolation ──────────────────────────────────────────────────
+
+#[test]
+fn separate_collections_have_isolated_docs() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+
+    let change = ProposedChange {
+        collection: "users".into(),
+        row_id: "u1".into(),
+        surrogate: nodedb_types::Surrogate::ZERO,
+        fields: vec![("name".into(), LoroValue::String("Alice".into()))],
+    };
+    engine
+        .validate_and_apply(
+            1,
+            nodedb_crdt::CrdtAuthContext::default(),
+            &change,
+            b"d".to_vec(),
+        )
+        .unwrap();
+
+    assert!(engine.row_exists("users", "u1"));
+    assert!(!engine.row_exists("orders", "u1"));
+    assert!(engine.read_row("users", "u1").is_some());
+    assert!(engine.read_row("orders", "u1").is_none());
+}
+
+// ── cross-collection FK via tenant-wide validator ─────────────────────────────
+
+fn fk_constraints() -> ConstraintSet {
+    let mut cs = ConstraintSet::new();
+    cs.add_foreign_key("posts_author_fk", "posts", "author_id", "users", "id");
+    cs
+}
+
+fn apply_change(
+    engine: &mut TenantCrdtEngine,
+    collection: &str,
+    row_id: &str,
+    fields: Vec<(String, LoroValue)>,
+) -> crate::Result<()> {
+    let change = ProposedChange {
+        collection: collection.into(),
+        row_id: row_id.into(),
+        surrogate: nodedb_types::Surrogate::ZERO,
+        fields,
+    };
+    engine.validate_and_apply(
+        1,
+        nodedb_crdt::CrdtAuthContext::default(),
+        &change,
+        b"d".to_vec(),
+    )
+}
+
+#[test]
+fn cross_collection_fk_rejects_missing_referent() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(2), 0, fk_constraints()).unwrap();
+    engine.set_collection_policy_typed("posts", CollectionPolicy::strict());
+
+    let result = apply_change(
+        &mut engine,
+        "posts",
+        "p1",
+        vec![
+            ("title".into(), LoroValue::String("Hello".into())),
+            ("author_id".into(), LoroValue::String("u1".into())),
+        ],
+    );
+
+    assert!(result.is_err());
+    assert_eq!(engine.dlq_len(), 1);
+    assert!(!engine.row_exists("posts", "p1"));
+}
+
+#[test]
+fn cross_collection_fk_accepts_after_referent_inserted() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(3), 0, fk_constraints()).unwrap();
+    engine.set_collection_policy_typed("posts", CollectionPolicy::strict());
+
+    apply_change(
+        &mut engine,
+        "users",
+        "u1",
+        vec![("name".into(), LoroValue::String("Alice".into()))],
+    )
+    .unwrap();
+
+    apply_change(
+        &mut engine,
+        "posts",
+        "p1",
+        vec![
+            ("title".into(), LoroValue::String("Hello".into())),
+            ("author_id".into(), LoroValue::String("u1".into())),
+        ],
+    )
+    .unwrap();
+
+    assert!(engine.row_exists("users", "u1"));
+    assert!(engine.row_exists("posts", "p1"));
+    assert_eq!(engine.dlq_len(), 0);
+}
+
+// ── array-surrogate FK via tenant registry ────────────────────────────────────
+
+#[test]
+fn array_surrogate_satisfies_cross_engine_fk() {
+    let mut cs = ConstraintSet::new();
+    cs.add_foreign_key("posts_author_fk", "posts", "author_id", "users", "id");
+    let mut engine = TenantCrdtEngine::new(TenantId::new(4), 0, cs).unwrap();
+    engine.set_collection_policy_typed("posts", CollectionPolicy::strict());
+
+    engine.register_array_surrogate("arr_42");
+
+    apply_change(
+        &mut engine,
+        "posts",
+        "p1",
+        vec![
+            ("title".into(), LoroValue::String("Hello".into())),
+            ("author_id".into(), LoroValue::String("arr_42".into())),
+        ],
+    )
+    .unwrap();
+
+    assert!(engine.row_exists("posts", "p1"));
+    assert_eq!(engine.dlq_len(), 0);
+}

@@ -369,12 +369,17 @@ fn to_physical_plan(
                 provenance,
             })
         }
-        ReplicatedWrite::CrdtImportTenant { tenant_id, bytes } => {
-            // Whole-tenant Loro doc import — no surrogate, no provenance.
+        ReplicatedWrite::CrdtImportCollection {
+            tenant_id,
+            collection,
+            bytes,
+        } => {
+            // Per-collection Loro doc import — no surrogate, no provenance.
             // Every replica applies the same snapshot via the same idempotent
             // Loro merge, converging deterministically.
             PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
                 tenant_id: *tenant_id,
+                collection: collection.clone(),
                 bytes: bytes.clone(),
             })
         }

@@ -152,12 +152,15 @@ pub fn to_replicated_entry(
             peer_id: *peer_id,
             provenance: encode_provenance(provenance),
         },
-        PhysicalPlan::Crdt(CrdtOp::ImportSnapshot { tenant_id, bytes }) => {
-            ReplicatedWrite::CrdtImportTenant {
-                tenant_id: *tenant_id,
-                bytes: bytes.clone(),
-            }
-        }
+        PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
+            tenant_id,
+            collection,
+            bytes,
+        }) => ReplicatedWrite::CrdtImportCollection {
+            tenant_id: *tenant_id,
+            collection: collection.clone(),
+            bytes: bytes.clone(),
+        },
         PhysicalPlan::Graph(GraphOp::EdgePut {
             collection,
             src_id,

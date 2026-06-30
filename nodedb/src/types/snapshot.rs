@@ -35,8 +35,14 @@ pub struct TenantDataSnapshot {
     /// KV tables: `[("{tid}:{collection}", serialized_entries_msgpack), ...]`
     /// Each value is a MessagePack-serialized list of `(key_bytes, value_bytes, expire_at_ms)`.
     pub kv_tables: Vec<(String, Vec<u8>)>,
-    /// CRDT state: `[("{tid}", loro_export_bytes), ...]`
-    pub crdt_state: Vec<(String, Vec<u8>)>,
+    /// CRDT state, one entry per `(tenant, collection)`:
+    /// `[(tenant_id, collection, loro_export_bytes), ...]`. Each collection
+    /// owns its own LoroDoc. `tenant_id` is carried explicitly because the
+    /// merged multi-tenant Raft snapshot is applied with a dispatch tenant of 0.
+    /// `#[msgpack(default)]`: snapshots written before this field decode empty.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub crdt_state: Vec<(u64, String, Vec<u8>)>,
     /// Timeseries memtable data: `[("{tid}:{collection}", serialized_columns_msgpack), ...]`
     pub timeseries: Vec<(String, Vec<u8>)>,
     /// Flushed on-disk timeseries segments per collection.
@@ -100,17 +106,6 @@ pub struct TenantDataSnapshot {
     #[msgpack(default)]
     #[serde(default)]
     pub tenant_edges: Vec<(u64, String, Vec<u8>)>,
-
-    /// CRDT state for the per-group Raft snapshot, tenant-explicit and
-    /// collection-tagged. Each entry: `(tenant_id, collection_names, loro_export_bytes)`.
-    /// `tenant_id` is carried explicitly because the merged multi-tenant Raft snapshot
-    /// is applied with a dispatch tenant of 0 (the merged blob spans tenants).
-    /// `collection_names` are the doc's top-level Loro collections, used by the builder
-    /// to filter the doc into only the groups whose vshards own one of those collections.
-    /// `#[msgpack(default)]`: snapshots written before this field decode as empty.
-    #[msgpack(default)]
-    #[serde(default)]
-    pub tenant_crdt_state: Vec<(u64, Vec<String>, Vec<u8>)>,
 }
 
 /// A single PK → surrogate identity binding carried in a snapshot/backup.
@@ -207,7 +202,6 @@ mod tests {
             edges: Vec<(String, Vec<u8>)>,
             vectors: Vec<(String, Vec<u8>)>,
             kv_tables: Vec<(String, Vec<u8>)>,
-            crdt_state: Vec<(String, Vec<u8>)>,
             timeseries: Vec<(String, Vec<u8>)>,
             flushed_ts_segments: Vec<TsFlushedCollectionBlob>,
         }
@@ -218,7 +212,6 @@ mod tests {
             edges: vec![],
             vectors: vec![],
             kv_tables: vec![],
-            crdt_state: vec![],
             timeseries: vec![("ts:c".to_string(), b"data".to_vec())],
             flushed_ts_segments: vec![],
         };
@@ -242,8 +235,8 @@ mod tests {
             "expected tenant_edges to default to empty for old snapshot"
         );
         assert!(
-            decoded.tenant_crdt_state.is_empty(),
-            "expected tenant_crdt_state to default to empty for old snapshot"
+            decoded.crdt_state.is_empty(),
+            "expected crdt_state to default to empty for old snapshot"
         );
     }
 
@@ -285,7 +278,6 @@ mod tests {
             edges: Vec<(String, Vec<u8>)>,
             vectors: Vec<(String, Vec<u8>)>,
             kv_tables: Vec<(String, Vec<u8>)>,
-            crdt_state: Vec<(String, Vec<u8>)>,
             timeseries: Vec<(String, Vec<u8>)>,
             flushed_ts_segments: Vec<TsFlushedCollectionBlob>,
             columnar_engines: Vec<(String, Vec<u8>)>,
@@ -296,26 +288,25 @@ mod tests {
             edges: vec![],
             vectors: vec![],
             kv_tables: vec![],
-            crdt_state: vec![],
             timeseries: vec![],
             flushed_ts_segments: vec![],
             columnar_engines: vec![],
         };
-        let old_bytes = zerompk::to_msgpack_vec(&old).expect("encode old 9-field snapshot");
+        let old_bytes = zerompk::to_msgpack_vec(&old).expect("encode old snapshot");
         let decoded_old: TenantDataSnapshot =
-            zerompk::from_msgpack(&old_bytes).expect("decode old 9-field snapshot as new schema");
+            zerompk::from_msgpack(&old_bytes).expect("decode old snapshot as new schema");
         assert_eq!(decoded_old.documents.len(), 1);
         assert!(
             decoded_old.surrogate_pk.is_empty(),
-            "expected surrogate_pk to default to empty for old 9-field snapshot"
+            "expected surrogate_pk to default to empty for old snapshot"
         );
         assert!(
             decoded_old.tenant_edges.is_empty(),
-            "expected tenant_edges to default to empty for old 9-field snapshot"
+            "expected tenant_edges to default to empty for old snapshot"
         );
         assert!(
-            decoded_old.tenant_crdt_state.is_empty(),
-            "expected tenant_crdt_state to default to empty for old 9-field snapshot"
+            decoded_old.crdt_state.is_empty(),
+            "expected crdt_state to default to empty for old snapshot"
         );
     }
 
@@ -339,7 +330,6 @@ mod tests {
             edges: Vec<(String, Vec<u8>)>,
             vectors: Vec<(String, Vec<u8>)>,
             kv_tables: Vec<(String, Vec<u8>)>,
-            crdt_state: Vec<(String, Vec<u8>)>,
             timeseries: Vec<(String, Vec<u8>)>,
         }
 
@@ -349,7 +339,6 @@ mod tests {
             edges: vec![],
             vectors: vec![],
             kv_tables: vec![],
-            crdt_state: vec![],
             timeseries: vec![("ts:c".to_string(), b"data".to_vec())],
         };
         let bytes = zerompk::to_msgpack_vec(&old).expect("encode old snapshot");

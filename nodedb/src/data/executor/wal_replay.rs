@@ -219,18 +219,31 @@ impl CoreLoop {
 
             let tid = crate::types::TenantId::new(record.header.tenant_id);
 
-            // Single self-describing decode. `collection` is present in the
-            // payload for future per-collection dispatch but is not acted upon
-            // during replay; Loro import is collection-agnostic.
+            // Single self-describing decode. The delta is routed to its
+            // per-collection LoroDoc by `payload.collection`.
             let Ok(payload) =
                 zerompk::from_msgpack::<crate::wal::CrdtDeltaWalPayload>(&record.payload)
             else {
                 continue;
             };
 
+            // Every CRDT delta / snapshot-import record written by the current
+            // binary carries its collection. A record with no collection cannot
+            // be routed to a per-collection doc; skip it (a pre-per-collection
+            // record from an earlier dev binary — there is no released data to
+            // preserve).
+            let Some(collection) = payload.collection.as_deref() else {
+                warn!(
+                    core = self.core_id,
+                    tenant = tid.as_u64(),
+                    "CRDT WAL record without collection; skipping (cannot route per-collection)"
+                );
+                continue;
+            };
+
             match self.get_crdt_engine(tid) {
                 Ok(engine) => {
-                    if let Err(e) = engine.import_snapshot_bytes(&payload.bytes) {
+                    if let Err(e) = engine.apply_committed_delta(collection, &payload.bytes) {
                         warn!(
                             core = self.core_id,
                             tenant = tid.as_u64(),
@@ -360,10 +373,8 @@ impl CoreLoop {
 #[cfg(test)]
 mod crdt_replay_tests {
     use super::CoreLoop;
-    use crate::engine::crdt::tenant_state::TenantCrdtEngine;
     use crate::types::TenantId;
     use loro::LoroValue;
-    use nodedb_crdt::constraint::ConstraintSet;
     use nodedb_wal::record::RecordType;
 
     /// Holds the bridge endpoints + tempdir alive for the core's lifetime.
@@ -410,21 +421,23 @@ mod crdt_replay_tests {
         collection: &str,
         row_id: &str,
     ) -> nodedb_wal::WalRecord {
-        let producer = TenantCrdtEngine::new(tid, 0, ConstraintSet::new()).expect("engine");
-        producer
-            .state()
+        // Build one collection's CRDT doc directly; the WAL record carries the
+        // collection so replay routes the import to the matching per-collection
+        // LoroDoc.
+        let state = nodedb_crdt::state::CrdtState::new(0).expect("state");
+        state
             .upsert(
                 collection,
                 row_id,
                 &[("name", LoroValue::String("alice".into()))],
             )
             .expect("upsert");
-        let snapshot = producer.export_snapshot_bytes().expect("export");
+        let snapshot = state.export_snapshot().expect("export");
         assert!(!snapshot.is_empty(), "snapshot must be non-empty");
 
         let wal_payload = crate::wal::CrdtDeltaWalPayload {
             bytes: snapshot,
-            collection: None,
+            collection: Some(collection.to_string()),
             provenance: None,
         };
         let payload = zerompk::to_msgpack_vec(&wal_payload).expect("encode payload");

@@ -41,14 +41,18 @@ pub enum CrdtOp {
         provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
     },
 
-    /// Import a full whole-tenant Loro snapshot into the tenant CRDT engine.
+    /// Import a per-collection Loro snapshot into the tenant CRDT engine.
     ///
     /// Used by the durable RESTORE re-issue path: the snapshot is replicated
     /// to every Raft replica of a data group, and each replica calls
     /// `import_snapshot_bytes` (a monotonic, idempotent, commutative Loro
     /// merge — deterministic across replicas). Carries no surrogate or
-    /// provenance: it is a whole-tenant doc import, not a per-document op.
-    ImportSnapshot { tenant_id: u64, bytes: Vec<u8> },
+    /// provenance: it is a collection-doc import, not a per-document op.
+    ImportSnapshot {
+        tenant_id: u64,
+        collection: String,
+        bytes: Vec<u8>,
+    },
 
     /// Set conflict resolution policy for a CRDT collection (DDL).
     SetPolicy {

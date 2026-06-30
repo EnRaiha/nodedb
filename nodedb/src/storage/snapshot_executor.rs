@@ -246,8 +246,12 @@ fn restore_crdt_checkpoints(
     std::fs::create_dir_all(&ckpt_dir).map_err(crate::Error::Io)?;
 
     for snap in crdt_snapshots {
-        let ckpt_path = ckpt_dir.join(format!("tenant-{}.ckpt", snap.tenant_id));
-        let tmp_path = ckpt_dir.join(format!("tenant-{}.ckpt.tmp", snap.tenant_id));
+        let fname = crate::data::executor::crdt_checkpoint::crdt_ckpt_filename(
+            snap.tenant_id,
+            &snap.collection,
+        );
+        let ckpt_path = ckpt_dir.join(&fname);
+        let tmp_path = ckpt_dir.join(format!("{fname}.tmp"));
         nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &snap.snapshot_bytes)
             .map_err(crate::Error::Wal)?;
     }

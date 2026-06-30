@@ -92,24 +92,16 @@ pub fn extract_db_scoped_collection(key: &str, tenant_id: u64) -> Option<&str> {
 /// - collection-name-only keys (`kv_tables`) routed directly.
 /// - graph `edges` via [`parse_versioned_edge_key`] (key embeds the collection).
 /// - `surrogate_pk` by its explicit `collection` field.
-/// - CRDT (`crdt_state` legacy + `tenant_crdt_state`): per-tenant, spanning
-///   vshards. Kept iff ANY of the doc's collections routes into `source_vshards`
-///   (the SAME inclusion rule the Raft snapshot builder uses) so exactly one
-///   source node retains it. The legacy untagged `crdt_state` has no collection
-///   tag, so it is anchored to the tenant's lexicographically-lowest-named
-///   in-snapshot collection: the node owning that collection's vshard keeps it,
-///   every other node drops it — captured exactly once, never duplicated.
+/// - CRDT (`crdt_state`): per-collection, tenant-explicit. Each entry carries
+///   its single collection, so it is kept iff that collection's vshard is in
+///   `source_vshards` — the node owning the collection keeps it, every other
+///   node drops it (captured exactly once, never duplicated).
 pub fn retain_tenant_data_for_vshards(
     snap: &mut TenantDataSnapshot,
     tenant_id: u64,
     source_vshards: &HashSet<u32>,
     vshard_of: impl Fn(&str) -> u32,
 ) {
-    // Compute the CRDT anchor from the PRE-filter snapshot so every source node
-    // (each of which sees the same full snapshot) agrees on the single owner
-    // before any data section is dropped.
-    let crdt_anchor = crdt_anchor_collection(snap, tenant_id);
-
     let in_group_db_tenant_scoped = |key: &str| {
         extract_db_tenant_scoped_collection(key, tenant_id)
             .map(|c| source_vshards.contains(&vshard_of(c)))
@@ -143,81 +135,11 @@ pub fn retain_tenant_data_for_vshards(
             .unwrap_or(false)
     });
 
-    // CRDT, tagged (`tenant_crdt_state`): keep an entry iff ANY of its tagged
-    // collections routes into this source set — the SAME inclusion rule the
-    // Raft snapshot builder uses. Over-inclusion (a doc spanning collections on
-    // two source nodes) is a harmless idempotent Loro merge on apply;
-    // under-inclusion would be silent data loss. An untagged entry (no
-    // collections) falls back to the anchor rule below.
-    snap.tenant_crdt_state.retain(|(_, collections, _)| {
-        if collections.is_empty() {
-            keep_anchored_crdt(crdt_anchor.as_deref(), source_vshards, &vshard_of)
-        } else {
-            collections
-                .iter()
-                .any(|c| source_vshards.contains(&vshard_of(c)))
-        }
-    });
-    // CRDT, legacy untagged (`crdt_state`): one per-tenant blob with no
-    // collection tag. Anchor it to the tenant's lexicographically-lowest
-    // in-snapshot collection — every source node agrees on that anchor from the
-    // identical full snapshot, so the single node owning the anchor's vshard
-    // keeps it and all others drop it (captured exactly once).
-    if !keep_anchored_crdt(crdt_anchor.as_deref(), source_vshards, &vshard_of) {
-        snap.crdt_state.clear();
-    }
-}
-
-/// Whether the anchor-based CRDT blob belongs to this source node: true iff the
-/// deterministic anchor collection routes into `source_vshards`. A `None` anchor
-/// (no determinable collection) keeps nothing, matching "no CRDT to anchor".
-fn keep_anchored_crdt(
-    anchor: Option<&str>,
-    source_vshards: &HashSet<u32>,
-    vshard_of: &impl Fn(&str) -> u32,
-) -> bool {
-    anchor
-        .map(|c| source_vshards.contains(&vshard_of(c)))
-        .unwrap_or(false)
-}
-
-/// Deterministic CRDT anchor: the lexicographically-lowest collection name that
-/// appears anywhere in the (pre-filter) snapshot for this tenant. All source
-/// nodes see the same full snapshot, so they agree on the anchor; the node whose
-/// `source_vshards` owns the anchor's vshard is the single CRDT source.
-///
-/// Drawn from the CRDT tags AND the data-bearing section keys so an older,
-/// untagged `crdt_state` is still anchored to one node (never dropped on all,
-/// never kept on all). Returns `None` only when the snapshot carries no CRDT
-/// state (nothing to anchor) or no collection can be determined.
-fn crdt_anchor_collection(snap: &TenantDataSnapshot, tenant_id: u64) -> Option<String> {
-    if snap.crdt_state.is_empty() && snap.tenant_crdt_state.is_empty() {
-        return None;
-    }
-    let tagged = snap
-        .tenant_crdt_state
-        .iter()
-        .flat_map(|(_, collections, _)| collections.iter().cloned());
-    let db_tenant_scoped = snap
-        .documents
-        .iter()
-        .chain(snap.indexes.iter())
-        .chain(snap.vectors.iter())
-        .chain(snap.timeseries.iter())
-        .filter_map(|(k, _)| extract_db_tenant_scoped_collection(k, tenant_id).map(str::to_owned));
-    let db_scoped = snap
-        .columnar_engines
-        .iter()
-        .filter_map(|(k, _)| extract_db_scoped_collection(k, tenant_id).map(str::to_owned))
-        .chain(snap.flushed_ts_segments.iter().filter_map(|b| {
-            extract_db_scoped_collection(&b.collection_key, tenant_id).map(str::to_owned)
-        }));
-    let kv = snap.kv_tables.iter().map(|(k, _)| k.clone());
-    tagged
-        .chain(db_tenant_scoped)
-        .chain(db_scoped)
-        .chain(kv)
-        .min()
+    // CRDT (`crdt_state`): each entry carries its single collection. Keep it iff
+    // that collection's vshard is in this source set — exactly one source node
+    // (the collection's owner) retains each entry.
+    snap.crdt_state
+        .retain(|(_, collection, _)| source_vshards.contains(&vshard_of(collection)));
 }
 
 #[cfg(test)]

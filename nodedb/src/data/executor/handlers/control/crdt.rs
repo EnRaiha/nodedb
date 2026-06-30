@@ -86,7 +86,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_get_version_vector(
         &mut self,
         task: &ExecutionTask,
-        _collection: &str,
+        collection: &str,
     ) -> Response {
         let tenant_id = task.request.tenant_id;
         let engine = match self.get_crdt_engine(tenant_id) {
@@ -100,7 +100,7 @@ impl CoreLoop {
                 );
             }
         };
-        match engine.version_vector_json() {
+        match engine.version_vector_json(collection) {
             Ok(json) => self.response_with_payload(task, json.into_bytes()),
             Err(e) => self.response_error(
                 task,
@@ -115,7 +115,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_export_delta(
         &mut self,
         task: &ExecutionTask,
-        _collection: &str,
+        collection: &str,
         from_version_json: &str,
     ) -> Response {
         let tenant_id = task.request.tenant_id;
@@ -130,7 +130,7 @@ impl CoreLoop {
                 );
             }
         };
-        match engine.export_delta(from_version_json) {
+        match engine.export_delta(collection, from_version_json) {
             Ok(delta) => self.response_with_payload(task, delta),
             Err(e) => self.response_error(
                 task,
@@ -177,7 +177,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_compact(
         &mut self,
         task: &ExecutionTask,
-        _collection: &str,
+        collection: &str,
         target_version_json: &str,
     ) -> Response {
         debug!(core = self.core_id, "crdt compact at version");
@@ -193,7 +193,7 @@ impl CoreLoop {
                 );
             }
         };
-        match engine.compact_at_version(target_version_json) {
+        match engine.compact_at_version(collection, target_version_json) {
             Ok(()) => self.response_ok(task),
             Err(e) => self.response_error(
                 task,
@@ -227,7 +227,17 @@ impl CoreLoop {
                 );
             }
         };
-        let doc = engine.state().doc();
+        let doc = match engine.collection_doc(collection) {
+            Ok(d) => d,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        };
 
         // Parse fields and insert as LoroMap container.
         let map = match nodedb_crdt::list_ops::list_insert_container(
@@ -290,13 +300,18 @@ impl CoreLoop {
                 );
             }
         };
-        match nodedb_crdt::list_ops::list_delete(
-            engine.state().doc(),
-            collection,
-            document_id,
-            list_path,
-            index,
-        ) {
+        let doc = match engine.collection_doc(collection) {
+            Ok(d) => d,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        };
+        match nodedb_crdt::list_ops::list_delete(doc, collection, document_id, list_path, index) {
             Ok(()) => self.response_ok(task),
             Err(e) => self.response_error(
                 task,
@@ -330,8 +345,19 @@ impl CoreLoop {
                 );
             }
         };
+        let doc = match engine.collection_doc(collection) {
+            Ok(d) => d,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        };
         match nodedb_crdt::list_ops::list_move(
-            engine.state().doc(),
+            doc,
             collection,
             document_id,
             list_path,
@@ -351,7 +377,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_apply(
         &mut self,
         task: &ExecutionTask,
-        _collection: &str,
+        collection: &str,
         delta: &[u8],
         provenance: Option<&SyncProvenance>,
     ) -> Response {
@@ -371,7 +397,7 @@ impl CoreLoop {
                     );
                 }
             };
-            return match engine.apply_committed_delta(delta) {
+            return match engine.apply_committed_delta(collection, delta) {
                 Ok(()) => {
                     self.checkpoint_coordinator.mark_dirty("crdt", 1);
                     self.response_ok(task)
@@ -413,7 +439,7 @@ impl CoreLoop {
                             );
                         }
                     };
-                    engine.apply_committed_delta(delta)
+                    engine.apply_committed_delta(collection, delta)
                 };
                 match apply_result {
                     Ok(()) => {
@@ -442,7 +468,7 @@ impl CoreLoop {
         self.sync_ack_response(task, status, applied_seq)
     }
 
-    /// Import a full whole-tenant Loro snapshot into the tenant CRDT engine.
+    /// Import a per-collection Loro snapshot into the tenant CRDT engine.
     ///
     /// The durable RESTORE re-issue path replicates this through Raft so every
     /// replica of the data group lands the same snapshot. `import_snapshot_bytes`
@@ -453,10 +479,11 @@ impl CoreLoop {
         &mut self,
         task: &ExecutionTask,
         tenant_id: u64,
+        collection: &str,
         bytes: &[u8],
     ) -> Response {
         let tid = crate::types::TenantId::new(tenant_id);
-        debug!(core = self.core_id, %tid, "crdt import snapshot");
+        debug!(core = self.core_id, %tid, %collection, "crdt import snapshot");
         let engine = match self.get_crdt_engine(tid) {
             Ok(e) => e,
             Err(e) => {
@@ -469,7 +496,7 @@ impl CoreLoop {
                 );
             }
         };
-        match engine.import_snapshot_bytes(bytes) {
+        match engine.import_snapshot_bytes(collection, bytes) {
             Ok(()) => {
                 self.checkpoint_coordinator.mark_dirty("crdt", 1);
                 self.response_ok(task)

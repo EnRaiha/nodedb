@@ -167,14 +167,16 @@ pub fn wal_append_if_write_with_creds(
                 })?;
             wal.append_crdt_delta(tenant_id, vshard_id, database_id, &crdt_payload)?;
         }
-        PhysicalPlan::Crdt(CrdtOp::ImportSnapshot { bytes, .. }) => {
-            // Whole-tenant snapshot import. `import_snapshot_bytes` and
+        PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
+            collection, bytes, ..
+        }) => {
+            // Per-collection snapshot import. `import_snapshot_bytes` and
             // `apply_committed_delta` are the same idempotent Loro `state.import`,
-            // so the snapshot rides the CRDT delta record and replays identically.
-            // No provenance to carry (whole-tenant import, not a per-doc sync op).
+            // so the snapshot rides the CRDT delta record and replays identically,
+            // routed to the same collection. No provenance (not a per-doc sync op).
             let payload = crate::wal::CrdtDeltaWalPayload {
                 bytes: bytes.clone(),
-                collection: None,
+                collection: Some(collection.clone()),
                 provenance: None,
             };
             let crdt_payload =

@@ -47,14 +47,10 @@ pub(super) fn merge_sections(
         merged.edges.extend(snap.edges);
         merged.vectors.extend(snap.vectors);
         merged.kv_tables.extend(snap.kv_tables);
-        // CRDT carried in BOTH the legacy `crdt_state` (older backups) and the
-        // tenant-explicit `tenant_crdt_state` (the field the snapshot CREATE
-        // handler writes today). Carry both through the merge — Loro import is a
-        // monotonic merge so installing both is safe, and dropping
-        // `tenant_crdt_state` here silently loses all CRDT data from current
-        // backups.
+        // CRDT state is per-collection and tenant-explicit:
+        // `(tenant_id, collection, loro_bytes)`. Loro import is a monotonic
+        // merge so concatenating section contributions is safe.
         merged.crdt_state.extend(snap.crdt_state);
-        merged.tenant_crdt_state.extend(snap.tenant_crdt_state);
         merged.timeseries.extend(snap.timeseries);
         merged.flushed_ts_segments.extend(snap.flushed_ts_segments);
         merged.columnar_engines.extend(snap.columnar_engines);

@@ -9,9 +9,11 @@
 
 /// WAL payload for a `RecordType::CrdtDelta` record.
 ///
-/// `collection` distinguishes the two producers:
-/// - `Some(_)` for a per-document delta apply (`CrdtOp::Apply`)
-/// - `None` for a whole-tenant snapshot import (`CrdtOp::ImportSnapshot`)
+/// `collection` is `Some(_)` for every record written by the current binary —
+/// both per-document delta applies (`CrdtOp::Apply`) and per-collection snapshot
+/// imports (`CrdtOp::ImportSnapshot`) route to a single collection's LoroDoc.
+/// `None` only appears in pre-per-collection records from an earlier dev binary
+/// and is skipped on replay (no released data to preserve).
 #[derive(
     serde::Serialize, serde::Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]

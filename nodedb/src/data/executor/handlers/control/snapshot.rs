@@ -306,9 +306,9 @@ impl CoreLoop {
 
     /// Checkpoint all CRDT tenant engines to disk.
     ///
-    /// Each tenant's Loro state is exported as a snapshot and written to
-    /// `{data_dir}/crdt-ckpt/core-{core_id}/tenant-{id}.ckpt` with atomic
-    /// temp+rename. The per-core subdir is required because `data_dir` is
+    /// Each tenant's Loro state is exported per collection and written to
+    /// `{data_dir}/crdt-ckpt/core-{core_id}/tenant-{tid}-coll-{hex(collection)}.ckpt`
+    /// with atomic temp+rename. The per-core subdir is required because `data_dir` is
     /// shared across all cores and a tenant's CRDT state is fragmented across
     /// cores by collection — without the subdir, cores would race-overwrite
     /// the same file and persist only a partial fragment.
@@ -329,30 +329,34 @@ impl CoreLoop {
 
         let mut checkpointed = 0;
         for (tenant_id, engine) in &self.crdt_engines {
-            match engine.export_snapshot_bytes() {
-                Ok(snapshot) => {
-                    if snapshot.is_empty() {
-                        continue;
-                    }
-                    // Use the bare numeric id (not `TenantId`'s `tenant:N`
-                    // Display) so the filename is `tenant-{id}.ckpt`, matching
-                    // the loader's parse and the cluster-restore writer.
-                    let tid = tenant_id.as_u64();
-                    let ckpt_path = ckpt_dir.join(format!("tenant-{tid}.ckpt"));
-                    let tmp_path = ckpt_dir.join(format!("tenant-{tid}.ckpt.tmp"));
-                    if nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &snapshot)
-                        .is_ok()
-                    {
-                        checkpointed += 1;
-                    }
-                }
+            let tid = tenant_id.as_u64();
+            // One checkpoint file per (tenant, collection) — each collection
+            // owns its own LoroDoc. Filenames are
+            // `tenant-{id}-coll-{hex(collection)}.ckpt`, matching the loader's
+            // parse and the cluster-restore writer.
+            let snapshots = match engine.export_all_snapshots() {
+                Ok(s) => s,
                 Err(e) => {
                     warn!(
                         core = self.core_id,
-                        tenant = tenant_id.as_u64(),
+                        tenant = tid,
                         error = %e,
                         "CRDT checkpoint export failed"
                     );
+                    continue;
+                }
+            };
+            for (collection, snapshot) in snapshots {
+                if snapshot.is_empty() {
+                    continue;
+                }
+                let fname =
+                    crate::data::executor::crdt_checkpoint::crdt_ckpt_filename(tid, &collection);
+                let ckpt_path = ckpt_dir.join(&fname);
+                let tmp_path = ckpt_dir.join(format!("{fname}.tmp"));
+                if nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &snapshot).is_ok()
+                {
+                    checkpointed += 1;
                 }
             }
         }

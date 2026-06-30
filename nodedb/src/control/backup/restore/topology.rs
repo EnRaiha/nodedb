@@ -161,15 +161,15 @@ pub(super) fn split_by_current_topology(
             snap.edges.push(entry.clone());
         }
     }
-    // CRDT tenant state (both legacy `crdt_state` and current `tenant_crdt_state`)
-    // is NOT bucketed here: the per-node snapshot fan-out is race-prone (skips
-    // data groups that have not elected a leader yet) and not durable across
-    // restart. RESTORE drains both sections before this split and re-issues the
-    // whole-tenant Loro snapshot durably through Raft to every owning data group
-    // (see `crdt_reissue`). Both vecs are therefore empty here by contract.
+    // CRDT state is NOT bucketed here: the per-node snapshot fan-out is
+    // race-prone (skips data groups that have not elected a leader yet) and not
+    // durable across restart. RESTORE drains the CRDT section before this split
+    // and re-issues each collection's Loro snapshot durably through Raft to its
+    // owning data group (see `crdt_reissue`). The vec is therefore empty here by
+    // contract.
     debug_assert!(
-        merged.crdt_state.is_empty() && merged.tenant_crdt_state.is_empty(),
-        "CRDT tenant state must be drained before topology split"
+        merged.crdt_state.is_empty(),
+        "CRDT state must be drained before topology split"
     );
 
     SplitOutput {

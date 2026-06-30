@@ -1,25 +1,75 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! TenantCrdtEngine core: construction, state access, delta apply, DLQ, row purge.
+//! TenantCrdtEngine core: construction, per-collection state access, delta
+//! apply, DLQ, row purge.
+//!
+//! Each `(tenant, collection)` owns its own `LoroDoc` (one [`CrdtState`] per
+//! collection). The validator, dead-letter queue and the cross-engine array
+//! surrogate registry stay tenant-wide because UNIQUE / FK constraints are
+//! cross-collection (and FK referents may be array-engine rows).
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 
 use loro::LoroValue;
 
 use nodedb_crdt::constraint::ConstraintSet;
 use nodedb_crdt::pre_validate::{self, PreValidationResult};
+use nodedb_crdt::row_lookup::RowLookup;
 use nodedb_crdt::state::CrdtState;
 use nodedb_crdt::validator::{ProposedChange, Validator};
 
 use crate::types::TenantId;
 
+/// Tenant-wide row/field lookup view passed to the constraint validator.
+///
+/// Row existence (FK / BiTemporalFK) is satisfied by ANY collection's doc OR
+/// by the tenant's array-surrogate registry (cross-engine FK referents).
+/// Field-value uniqueness probes are per-collection only — array surrogates are
+/// not document rows and never participate in UNIQUE checks.
+struct TenantRowLookup<'a> {
+    collections: &'a HashMap<String, CrdtState>,
+    array_surrogate_ids: &'a HashSet<String>,
+}
+
+impl RowLookup for TenantRowLookup<'_> {
+    fn row_exists(&self, collection: &str, row_id: &str) -> bool {
+        self.collections
+            .get(collection)
+            .is_some_and(|s| s.row_exists(collection, row_id))
+            || self.array_surrogate_ids.contains(row_id)
+    }
+
+    fn field_value_exists(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
+        self.collections
+            .get(collection)
+            .is_some_and(|s| s.field_value_exists(collection, field, value))
+    }
+
+    fn field_value_exists_live(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
+        self.collections
+            .get(collection)
+            .is_some_and(|s| s.field_value_exists_live(collection, field, value))
+    }
+}
+
 /// Per-tenant CRDT engine state.
 pub struct TenantCrdtEngine {
     pub(super) tenant_id: TenantId,
 
-    /// Leader's committed CRDT state for this tenant.
-    pub(super) state: CrdtState,
+    /// Peer ID used to construct each per-collection [`CrdtState`] lazily.
+    pub(super) peer_id: u64,
 
-    /// Constraint validator with DLQ and policy registry.
+    /// Tenant-wide cross-engine FK registry: array-engine surrogate IDs that
+    /// count as live referents for `ForeignKey` / `BiTemporalFK` checks.
+    pub(super) array_surrogate_ids: HashSet<String>,
+
+    /// Constraint validator with DLQ and policy registry (tenant-wide).
     pub(crate) validator: Validator,
+
+    /// Per-collection committed CRDT state — one `LoroDoc` per collection.
+    pub(super) collections: HashMap<String, CrdtState>,
 }
 
 impl TenantCrdtEngine {
@@ -31,61 +81,114 @@ impl TenantCrdtEngine {
     ) -> crate::Result<Self> {
         Ok(Self {
             tenant_id,
-            state: CrdtState::new(peer_id).map_err(crate::Error::Crdt)?,
+            peer_id,
+            array_surrogate_ids: HashSet::new(),
             validator: Validator::new(constraints, 1000),
+            collections: HashMap::new(),
         })
     }
 
     /// Get the peer ID for this CRDT engine.
     pub fn peer_id(&self) -> u64 {
-        self.state.peer_id()
+        self.peer_id
     }
 
-    /// Access the underlying CrdtState (for advanced operations like list ops).
-    pub fn state(&self) -> &CrdtState {
-        &self.state
-    }
-
-    /// Export the full CRDT state as binary bytes (for snapshot transfer).
-    pub fn export_snapshot_bytes(&self) -> crate::Result<Vec<u8>> {
-        self.state.export_snapshot().map_err(crate::Error::Crdt)
-    }
-
-    /// Read a document's CRDT state, returning the raw snapshot bytes.
-    pub fn read_snapshot(&self, collection: &str, row_id: &str) -> crate::Result<Option<Vec<u8>>> {
-        if self.state.row_exists(collection, row_id) {
-            Ok(Some(
-                self.state.export_snapshot().map_err(crate::Error::Crdt)?,
-            ))
-        } else {
-            Ok(None)
+    /// Lazily get (creating if absent) the per-collection state. Propagates the
+    /// `CrdtState::new` error rather than panicking.
+    pub(super) fn state_mut(&mut self, collection: &str) -> crate::Result<&mut CrdtState> {
+        match self.collections.entry(collection.to_string()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let state = CrdtState::new(self.peer_id).map_err(crate::Error::Crdt)?;
+                Ok(e.insert(state))
+            }
         }
     }
 
-    /// Read a single row's fields as a `LoroValue`.
+    /// Names of every collection that currently has local CRDT state.
+    pub fn collection_names(&self) -> Vec<String> {
+        self.collections.keys().cloned().collect()
+    }
+
+    /// Register an array-engine surrogate ID as a valid cross-engine FK
+    /// referent for this tenant.
+    pub fn register_array_surrogate(&mut self, id: impl Into<String>) {
+        self.array_surrogate_ids.insert(id.into());
+    }
+
+    /// Borrow the `LoroDoc` for a collection, creating empty state if absent.
     ///
-    /// Returns the deep value of the row (all nested containers resolved),
-    /// or `None` if the row does not exist.
+    /// Used by the block-list (LoroList) operations, which mutate containers
+    /// directly through the doc handle.
+    pub fn collection_doc(&mut self, collection: &str) -> crate::Result<&loro::LoroDoc> {
+        Ok(self.state_mut(collection)?.doc())
+    }
+
+    /// Export one collection's CRDT state as binary snapshot bytes.
+    ///
+    /// Returns `None` when the collection has no local state.
+    pub fn export_snapshot_bytes(&self, collection: &str) -> crate::Result<Option<Vec<u8>>> {
+        match self.collections.get(collection) {
+            Some(state) => state
+                .export_snapshot()
+                .map(Some)
+                .map_err(crate::Error::Crdt),
+            None => Ok(None),
+        }
+    }
+
+    /// Export every collection's snapshot as `(collection, bytes)` pairs.
+    pub fn export_all_snapshots(&self) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::with_capacity(self.collections.len());
+        for (collection, state) in &self.collections {
+            let bytes = state.export_snapshot().map_err(crate::Error::Crdt)?;
+            out.push((collection.clone(), bytes));
+        }
+        Ok(out)
+    }
+
+    /// Read a document's CRDT state, returning the raw snapshot bytes for the
+    /// document's collection. `None` when the collection or row is absent.
+    pub fn read_snapshot(&self, collection: &str, row_id: &str) -> crate::Result<Option<Vec<u8>>> {
+        match self.collections.get(collection) {
+            Some(state) if state.row_exists(collection, row_id) => {
+                Ok(Some(state.export_snapshot().map_err(crate::Error::Crdt)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Read a single row's fields as a `LoroValue`, or `None` if absent.
     pub fn read_row(&self, collection: &str, row_id: &str) -> Option<LoroValue> {
-        self.state.read_row(collection, row_id)
+        self.collections
+            .get(collection)
+            .and_then(|state| state.read_row(collection, row_id))
     }
 
     /// Pre-validate a proposed change (fast-reject before Raft).
     pub fn pre_validate(&self, change: &ProposedChange) -> PreValidationResult {
-        pre_validate::pre_validate(&self.validator, &self.state, change)
+        let view = TenantRowLookup {
+            collections: &self.collections,
+            array_surrogate_ids: &self.array_surrogate_ids,
+        };
+        pre_validate::pre_validate(&self.validator, &view, change)
     }
 
-    /// Import a full CRDT snapshot (for snapshot restore).
-    pub fn import_snapshot_bytes(&self, bytes: &[u8]) -> crate::Result<()> {
-        self.state.import(bytes).map_err(crate::Error::Crdt)
+    /// Import a full CRDT snapshot for a single collection (snapshot restore).
+    pub fn import_snapshot_bytes(&mut self, collection: &str, bytes: &[u8]) -> crate::Result<()> {
+        self.state_mut(collection)?
+            .import(bytes)
+            .map_err(crate::Error::Crdt)
     }
 
-    /// Apply a validated delta from Raft commit.
+    /// Apply a validated delta for a collection from Raft commit.
     ///
     /// This is called AFTER Raft consensus — the delta has been committed
     /// to the Raft log and now needs to be applied to the local state.
-    pub fn apply_committed_delta(&self, delta: &[u8]) -> crate::Result<()> {
-        self.state.import(delta).map_err(crate::Error::Crdt)
+    pub fn apply_committed_delta(&mut self, collection: &str, delta: &[u8]) -> crate::Result<()> {
+        self.state_mut(collection)?
+            .import(delta)
+            .map_err(crate::Error::Crdt)
     }
 
     /// Validate and attempt to apply a delta from a peer.
@@ -104,9 +207,19 @@ impl TenantCrdtEngine {
         change: &ProposedChange,
         delta_bytes: Vec<u8>,
     ) -> crate::Result<()> {
-        self.validator
-            .validate_or_reject(&self.state, peer_id, auth, change, delta_bytes)
-            .map_err(crate::Error::Crdt)?;
+        // Tenant-wide view over all collections + array surrogates. The view
+        // borrows `self.collections` / `self.array_surrogate_ids` immutably
+        // while `self.validator` is borrowed mutably — disjoint fields, so both
+        // borrows coexist. The view borrow ends before the upsert below.
+        {
+            let view = TenantRowLookup {
+                collections: &self.collections,
+                array_surrogate_ids: &self.array_surrogate_ids,
+            };
+            self.validator
+                .validate_or_reject(&view, peer_id, auth, change, delta_bytes)
+                .map_err(crate::Error::Crdt)?;
+        }
 
         let is_bitemporal = self.validator.is_bitemporal(&change.collection);
         // no-determinism: peer delta validation path, not Calvin apply_committed_delta path
@@ -122,13 +235,14 @@ impl TenantCrdtEngine {
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
 
+        let state = self.state_mut(&change.collection)?;
         if is_bitemporal {
             fields.push(("_ts_system", LoroValue::I64(now_ms)));
-            self.state
+            state
                 .upsert_versioned(&change.collection, &change.row_id, &fields)
                 .map_err(crate::Error::Crdt)
         } else {
-            self.state
+            state
                 .upsert(&change.collection, &change.row_id, &fields)
                 .map_err(crate::Error::Crdt)
         }
@@ -136,15 +250,19 @@ impl TenantCrdtEngine {
 
     /// Drop archived bitemporal versions older than `cutoff_system_ms`
     /// for the given collection. The live row is never touched. Called
-    /// from the Data Plane purge handler.
+    /// from the Data Plane purge handler. A collection with no local state
+    /// purges nothing.
     pub fn purge_history_before(
         &self,
         collection: &str,
         cutoff_system_ms: i64,
     ) -> crate::Result<usize> {
-        self.state
-            .purge_history_before(collection, cutoff_system_ms)
-            .map_err(crate::Error::Crdt)
+        match self.collections.get(collection) {
+            Some(state) => state
+                .purge_history_before(collection, cutoff_system_ms)
+                .map_err(crate::Error::Crdt),
+            None => Ok(0),
+        }
     }
 
     /// Set the conflict-resolution policy for a collection from a typed
@@ -180,7 +298,7 @@ impl TenantCrdtEngine {
     /// Purge all CRDT state for a single collection.
     ///
     /// Three things happen:
-    /// 1. Every row in the loro map for this collection is cleared.
+    /// 1. Every row in the collection's Loro doc is cleared.
     /// 2. The collection's conflict-resolution policy is removed from
     ///    the policy registry.
     /// 3. Any dead-letter entries (rejected deltas) scoped to this
@@ -189,10 +307,12 @@ impl TenantCrdtEngine {
     ///
     /// Returns the number of CRDT rows removed. Idempotent.
     pub fn purge_collection(&mut self, collection: &str) -> crate::Result<usize> {
-        let removed = self
-            .state
-            .clear_collection(collection)
-            .map_err(crate::Error::Crdt)?;
+        let removed = match self.collections.get(collection) {
+            Some(state) => state
+                .clear_collection(collection)
+                .map_err(crate::Error::Crdt)?,
+            None => 0,
+        };
         self.validator.policies_mut().remove(collection);
         let dlq_dropped = self
             .validator
@@ -209,9 +329,11 @@ impl TenantCrdtEngine {
         Ok(removed)
     }
 
-    /// Check if a row exists in a collection.
+    /// Check if a row exists in a collection's document store.
     pub fn row_exists(&self, collection: &str, row_id: &str) -> bool {
-        self.state.row_exists(collection, row_id)
+        self.collections
+            .get(collection)
+            .is_some_and(|state| state.row_exists(collection, row_id))
     }
 
     pub fn tenant_id(&self) -> TenantId {

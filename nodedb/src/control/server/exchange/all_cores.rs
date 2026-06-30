@@ -312,7 +312,6 @@ async fn fan_tenant_snapshot_all_cores(
         merged.columnar_engines.extend(part.columnar_engines);
         merged.surrogate_pk.extend(part.surrogate_pk);
         merged.tenant_edges.extend(part.tenant_edges);
-        merged.tenant_crdt_state.extend(part.tenant_crdt_state);
     }
 
     let payload = zerompk::to_msgpack_vec(&merged).map_err(|e| crate::Error::Serialization {

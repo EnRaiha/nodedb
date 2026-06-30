@@ -155,23 +155,15 @@ impl CoreLoop {
                 kv_written += count;
             }
 
-            // Restore CRDT state (legacy / user-RESTORE path: tenant from
-            // dispatch context).
-            for (_key, bytes) in &snap.crdt_state {
-                if let Err(e) = self.restore_crdt_state(tenant_id, bytes) {
-                    warn!(tenant_id, error = %e, "failed to restore crdt state");
-                } else {
-                    crdt_written += 1;
-                }
-            }
-            // Restore CRDT from the per-group Raft snapshot (tenant carried
-            // explicitly; the merged blob's dispatch tenant is 0). Loro import
-            // is a monotonic CRDT merge, so no replace_mode handling is needed:
-            // the snapshot is >= the follower's committed state and merge
-            // converges to the correct result.
-            for (tid_raw, _collections, bytes) in &snap.tenant_crdt_state {
-                if let Err(e) = self.restore_crdt_state(*tid_raw, bytes) {
-                    warn!(tid_raw, error = %e, "failed to restore tenant crdt state");
+            // Restore CRDT state per collection (tenant carried explicitly so
+            // both the per-group Raft snapshot, whose merged blob dispatches
+            // with tenant 0, and the per-tenant user RESTORE path route the same
+            // way). Loro import is a monotonic CRDT merge, so no replace_mode
+            // handling is needed: the snapshot is >= the follower's committed
+            // state and the merge converges to the correct result.
+            for (tid_raw, collection, bytes) in &snap.crdt_state {
+                if let Err(e) = self.restore_crdt_state(*tid_raw, collection, bytes) {
+                    warn!(tid_raw, %collection, error = %e, "failed to restore crdt state");
                 } else {
                     crdt_written += 1;
                 }
@@ -358,21 +350,17 @@ impl CoreLoop {
         }
     }
 
-    fn restore_crdt_state(&mut self, tenant_id: u64, bytes: &[u8]) -> crate::Result<()> {
+    fn restore_crdt_state(
+        &mut self,
+        tenant_id: u64,
+        collection: &str,
+        bytes: &[u8],
+    ) -> crate::Result<()> {
         let tid = crate::types::TenantId::new(tenant_id);
-        // If an engine already exists, import into it. Otherwise create a fresh one.
-        if let Some(engine) = self.crdt_engines.get(&tid) {
-            engine.import_snapshot_bytes(bytes)
-        } else {
-            let engine = crate::engine::crdt::TenantCrdtEngine::new(
-                tid,
-                0, // Default peer_id for restore.
-                Default::default(),
-            )?;
-            engine.import_snapshot_bytes(bytes)?;
-            self.crdt_engines.insert(tid, engine);
-            Ok(())
-        }
+        // Lazily create the tenant engine if absent, then import into the
+        // target collection's per-collection LoroDoc.
+        let engine = self.get_crdt_engine(tid)?;
+        engine.import_snapshot_bytes(collection, bytes)
     }
 
     fn restore_timeseries(&mut self, key: &str, bytes: &[u8]) -> crate::Result<()> {

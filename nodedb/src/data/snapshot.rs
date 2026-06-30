@@ -37,7 +37,7 @@ pub struct HnswSnapshot {
     pub checkpoint_bytes: Vec<u8>,
 }
 
-/// Serializable snapshot of a CRDT tenant's state.
+/// Serializable snapshot of a single CRDT collection's state.
 #[derive(
     Debug,
     Clone,
@@ -49,6 +49,8 @@ pub struct HnswSnapshot {
 pub struct CrdtSnapshot {
     pub tenant_id: u64,
     pub peer_id: u64,
+    /// Collection this snapshot belongs to.
+    pub collection: String,
     /// Loro binary snapshot (from LoroDoc::export_snapshot).
     pub snapshot_bytes: Vec<u8>,
 }
@@ -221,6 +223,7 @@ mod tests {
             crdt_snapshots: vec![CrdtSnapshot {
                 tenant_id: 1,
                 peer_id: 100,
+                collection: "notes".into(),
                 snapshot_bytes: vec![0xAB, 0xCD],
             }],
         };

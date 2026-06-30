@@ -134,9 +134,8 @@ pub async fn restore_tenant(
     stats.edges = merged.edges.len();
     stats.vectors = merged.vectors.len();
     stats.kv_tables = merged.kv_tables.len();
-    // Both the legacy `crdt_state` and the current `tenant_crdt_state` carry
-    // restorable CRDT docs; count both so the reported/dry-run stat is accurate.
-    stats.crdt_state = merged.crdt_state.len() + merged.tenant_crdt_state.len();
+    // CRDT state is one entry per (tenant, collection).
+    stats.crdt_state = merged.crdt_state.len();
     stats.timeseries = merged.timeseries.len();
     stats.flushed_ts_segments = merged.flushed_ts_segments.len();
     stats.surrogate_pk = merged.surrogate_pk.len();
@@ -166,15 +165,14 @@ pub async fn restore_tenant(
     let timeseries_memtables = std::mem::take(&mut merged.timeseries);
     let flushed_ts_segments = std::mem::take(&mut merged.flushed_ts_segments);
 
-    // CRDT tenant state is NOT installed via the per-node snapshot fan-out: that
+    // CRDT state is NOT installed via the per-node snapshot fan-out: that
     // dispatch is race-prone (skips data groups with no leader yet) and not
-    // durable across restart. Drain both the legacy `crdt_state` and the current
-    // `tenant_crdt_state` here and re-issue durably below as
-    // `CrdtOp::ImportSnapshot` (Raft-replicated in cluster mode; WAL-appended
-    // then installed in single-node mode). The topology split must therefore
-    // never see CRDT state — otherwise the coordinator would double-import.
+    // durable across restart. Drain the per-collection CRDT section here and
+    // re-issue durably below as `CrdtOp::ImportSnapshot` (Raft-replicated in
+    // cluster mode; WAL-appended then installed in single-node mode). The
+    // topology split must therefore never see CRDT state — otherwise the
+    // coordinator would double-import.
     let crdt_state = std::mem::take(&mut merged.crdt_state);
-    let tenant_crdt_state = std::mem::take(&mut merged.tenant_crdt_state);
 
     // Drain the PK→surrogate identity map before the topology split (the split
     // only routes per-key engine data). It is rebound into the destination
@@ -271,19 +269,13 @@ pub async fn restore_tenant(
         reissue_timeseries_snapshots(state, tenant_id, timeseries_memtables, flushed_ts_segments)
             .await?;
 
-    // Durable re-issue of CRDT tenant state. The whole-tenant Loro snapshot is
-    // proposed through Raft to every distinct data group owning any of the
-    // tenant's CRDT collections (Raft-replicated in cluster mode; WAL-appended
-    // then installed in single-node mode). Every replica applies the same
-    // idempotent Loro merge and converges deterministically. Any failure is
-    // fatal — no warn-and-continue.
-    stats.crdt_reissued = super::crdt_reissue::reissue_crdt_snapshots(
-        state,
-        TenantId::new(tenant_id),
-        crdt_state,
-        tenant_crdt_state,
-    )
-    .await?;
+    // Durable re-issue of CRDT state. Each collection's Loro snapshot is
+    // proposed through Raft to the data group owning that collection's vshard
+    // (Raft-replicated in cluster mode; WAL-appended then installed in
+    // single-node mode). Every replica applies the same idempotent Loro merge
+    // and converges deterministically. Any failure is fatal — no
+    // warn-and-continue.
+    stats.crdt_reissued = super::crdt_reissue::reissue_crdt_snapshots(state, crdt_state).await?;
 
     Ok(stats)
 }

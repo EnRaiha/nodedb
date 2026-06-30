@@ -26,9 +26,11 @@ impl CoreLoop {
                 provenance,
             } => self.execute_crdt_apply(task, collection, delta, provenance.as_ref()),
 
-            CrdtOp::ImportSnapshot { tenant_id, bytes } => {
-                self.execute_crdt_import_snapshot(task, *tenant_id, bytes)
-            }
+            CrdtOp::ImportSnapshot {
+                tenant_id,
+                collection,
+                bytes,
+            } => self.execute_crdt_import_snapshot(task, *tenant_id, collection, bytes),
 
             CrdtOp::SetPolicy {
                 collection,
