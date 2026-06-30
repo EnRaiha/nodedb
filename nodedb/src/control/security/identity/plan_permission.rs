@@ -41,6 +41,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             CrdtOp::Read { .. }
             | CrdtOp::ReadAtVersion { .. }
             | CrdtOp::GetVersionVector { .. }
+            | CrdtOp::ReadConstraints { .. }
             | CrdtOp::ExportDelta { .. },
         ) => Permission::Read,
 

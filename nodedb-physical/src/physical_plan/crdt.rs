@@ -76,6 +76,13 @@ pub enum CrdtOp {
         descriptor_version: u64,
     },
 
+    /// Read the constraint set currently installed in this replica's per-core
+    /// CRDT validator for `collection`. Read-only observability op: returns the
+    /// installed `Vec<Constraint>` zerompk-encoded in the response payload. It
+    /// is never replicated or logged — it is constructed directly against a
+    /// single node's data core to inspect that replica's validator state.
+    ReadConstraints { collection: String },
+
     /// Set conflict resolution policy for a CRDT collection (DDL).
     SetPolicy {
         collection: String,

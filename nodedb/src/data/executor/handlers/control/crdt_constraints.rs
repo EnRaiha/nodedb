@@ -99,4 +99,41 @@ impl CoreLoop {
         }
         self.response_ok(task)
     }
+
+    /// Read the constraint set installed in this replica's CRDT validator for
+    /// `collection`. Read-only — no `mark_dirty`. The installed
+    /// `Vec<nodedb_crdt::Constraint>` is zerompk-encoded into the response
+    /// payload so a caller can inspect exactly what this node's validator holds
+    /// (catalog replication does not prove the validator installed — the
+    /// validator itself must be read).
+    pub(in crate::data::executor) fn execute_crdt_read_constraints(
+        &mut self,
+        task: &ExecutionTask,
+        collection: &str,
+    ) -> Response {
+        debug!(core = self.core_id, %collection, "crdt read constraints");
+        let tenant_id = task.request.tenant_id;
+        let engine = match self.get_crdt_engine(tenant_id) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        };
+        let constraints = engine.constraints_for_collection(collection);
+        match zerompk::to_msgpack_vec(&constraints) {
+            Ok(bytes) => self.response_with_payload(task, bytes),
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("constraint encode failed: {e}"),
+                },
+            ),
+        }
+    }
 }

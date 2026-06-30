@@ -316,6 +316,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 // `SetConstraints` / `DropConstraints` install validator rules —
                 // none produce per-collection versioned read output.
                 GetVersionVector { .. }
+                | ReadConstraints { .. }
                 | ExportDelta { .. }
                 | CompactAtVersion { .. }
                 | ImportSnapshot { .. }

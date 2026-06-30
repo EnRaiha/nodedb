@@ -23,12 +23,20 @@ pub fn collection_constraints(stored: &StoredCollection) -> Vec<Constraint> {
     let collection = stored.name.as_str();
 
     // UNIQUE — one constraint per unique secondary index.
+    //
+    // A secondary index stores its field as an extraction path (`$.email` for a
+    // top-level column), but the validator matches a constraint's field by exact
+    // equality against the row's stored field names, which are the bare column
+    // names (`email`). Strip the leading `$.` so a UNIQUE constraint keys the
+    // same field identifier as the row data and the column-derived NOT NULL
+    // constraints.
     for idx in &stored.indexes {
         if idx.unique {
+            let field = idx.field.strip_prefix("$.").unwrap_or(&idx.field);
             out.push(Constraint {
                 name: idx.name.clone(),
                 collection: collection.to_string(),
-                field: idx.field.clone(),
+                field: field.to_string(),
                 kind: ConstraintKind::Unique,
             });
         }
@@ -132,8 +140,11 @@ mod tests {
     #[test]
     fn unique_index_yields_one_unique() {
         let mut c = base("users");
-        c.indexes.push(idx("users_email_unique", "email", true));
-        c.indexes.push(idx("users_age_idx", "age", false)); // non-unique ignored
+        // Indexes store the field as an extraction path; the translator must
+        // normalize `$.email` to the bare column name `email` so it matches the
+        // row's field keys and the column-derived NOT NULL constraints.
+        c.indexes.push(idx("users_email_unique", "$.email", true));
+        c.indexes.push(idx("users_age_idx", "$.age", false)); // non-unique ignored
         let got = collection_constraints(&c);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "users_email_unique");

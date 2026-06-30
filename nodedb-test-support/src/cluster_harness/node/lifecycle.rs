@@ -336,6 +336,13 @@ impl TestClusterNode {
             &tuning,
         )?;
 
+        // CRDT constraint reconcile loop (leader-gated). The production server
+        // spawns this from `spawn_background_loops`, which the harness does not
+        // call; wire it directly so cluster tests exercise constraint delivery
+        // to every replica's validator. Registered on `shared.loop_registry`,
+        // so cluster shutdown stops it with the other loops.
+        nodedb::bootstrap::constraint_reconcile::spawn_constraint_reconcile(Arc::clone(&shared));
+
         // Spawn the descriptor lease renewal loop on the same
         // shutdown channel as raft so cluster shutdown stops it
         // cleanly. Returns None on single-node clusters that
