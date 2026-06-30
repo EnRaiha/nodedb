@@ -52,6 +52,15 @@ use super::loop_core::{CommitApplier, RaftLoop};
 /// the next diff, so an unchanged target never re-proposes.
 const PLACEMENT_RECONCILE_TICK_INTERVAL: u64 = 100;
 
+/// Orphaned-partial-snapshot GC runs far less often than placement reconcile:
+/// once every ~60s (6000 ticks at the 10ms default tick interval). Stale
+/// `.partial` files only appear from crashed/interrupted snapshot transfers,
+/// so a minute of latency before reclaiming their disk space is ample, and a
+/// directory scan every tick would be wasteful. Like placement reconcile this
+/// is throttled by tick count, not wall-clock, so a faster test tick simply
+/// sweeps proportionally more often (harmless).
+const ORPHAN_PARTIAL_GC_TICK_INTERVAL: u64 = 6000;
+
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// Execute a single tick: drive Raft, dispatch outbound messages,
     /// apply commits, promote caught-up learners.
@@ -437,6 +446,27 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if tick.is_multiple_of(PLACEMENT_RECONCILE_TICK_INTERVAL) {
             self.reconcile_placement();
+        }
+        if tick.is_multiple_of(ORPHAN_PARTIAL_GC_TICK_INTERVAL)
+            && let Some(ref dir) = self.data_dir
+        {
+            match crate::install_snapshot::gc::sweep_orphans(dir, self.orphan_partial_max_age_secs)
+            {
+                Ok((removed, errs)) => {
+                    if removed > 0 {
+                        tracing::info!(
+                            removed,
+                            "periodic gc: removed orphaned partial snapshot files"
+                        );
+                    }
+                    for e in errs {
+                        tracing::warn!(error = %e, "periodic gc: partial snapshot GC error");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "periodic gc: failed to sweep partial snapshot directory");
+                }
+            }
         }
     }
 

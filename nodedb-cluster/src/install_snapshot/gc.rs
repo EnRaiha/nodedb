@@ -8,13 +8,12 @@
 //!
 //! # When to call
 //!
-//! `sweep_orphans` is called:
-//! - Once at node startup (via [`crate::raft_loop::loop_core::RaftLoop::run`]).
-//!
-//! TODO: Add a periodic call (e.g. every 60 s) via the existing periodic-task
-//! infrastructure once that infrastructure is wired into the cluster subsystem.
-//! The startup-only sweep is correct for correctness; the periodic sweep is a
-//! space-reclamation improvement.
+//! `sweep_orphans` is called at two points in the node lifecycle:
+//! - Once at node startup (via [`crate::raft_loop::loop_core::RaftLoop::run`]),
+//!   to remove leftover files from previous runs that did not complete.
+//! - Periodically (~every 60 s) from the Raft tick loop, to reclaim disk space
+//!   from partial files that accumulate during the node's lifetime without
+//!   requiring a restart.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
