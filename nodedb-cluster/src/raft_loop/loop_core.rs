@@ -253,6 +253,12 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// reconcile) to a coarse cadence off the 10ms tick. `AtomicU64` because
     /// [`super::tick::do_tick`] runs against `&self`.
     pub(super) tick_count: std::sync::atomic::AtomicU64,
+
+    /// Notification channel for kicking placement reconcile immediately
+    /// when a node joins, instead of waiting up to ~1 s for the throttled
+    /// tick. Fired from [`super::join`] on the success path; consumed by
+    /// an extra `select!` arm in [`Self::run`].
+    pub(super) reconcile_notify: tokio::sync::Notify,
 }
 
 impl<A: CommitApplier> RaftLoop<A> {
@@ -297,6 +303,7 @@ impl<A: CommitApplier> RaftLoop<A> {
             orphan_partial_max_age_secs: 300,
             replication_factor: 1,
             tick_count: std::sync::atomic::AtomicU64::new(0),
+            reconcile_notify: tokio::sync::Notify::new(),
         }
     }
 }
@@ -407,6 +414,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     let started = Instant::now();
                     self.do_tick();
                     self.loop_metrics.observe(started.elapsed());
+                }
+                _ = self.reconcile_notify.notified() => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                    self.reconcile_placement();
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {

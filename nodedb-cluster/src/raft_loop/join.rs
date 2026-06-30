@@ -330,6 +330,11 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // 9. Broadcast topology to everyone so peers learn the new addr.
         health::broadcast_topology(self.node_id, &self.topology, &self.transport);
 
+        // Kick placement reconcile immediately now that the joining node's
+        // membership has applied and topology is persisted, instead of waiting
+        // for the next throttled tick.
+        self.reconcile_notify.notify_one();
+
         // 10. Build the final response from the post-AddLearner state.
         info!(
             joining_node = req.node_id,

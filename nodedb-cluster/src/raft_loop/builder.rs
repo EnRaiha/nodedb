@@ -59,6 +59,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             // `with_plan_executor` is a construction-time builder, called before
             // `run()` ever ticks — `tick_count` is still 0, so reset is exact.
             tick_count: std::sync::atomic::AtomicU64::new(0),
+            // Construction-time builder, before `run()` and any join kick — a
+            // fresh `Notify` has no pending permit, so this loses nothing.
+            reconcile_notify: tokio::sync::Notify::new(),
         }
     }
 
