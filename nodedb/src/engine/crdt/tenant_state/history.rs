@@ -157,7 +157,17 @@ fn json_to_vv(json: &str) -> crate::Result<loro::VersionVector> {
                 detail: format!("invalid peer_id hex '{peer_hex}': {e}"),
             }
         })?;
-        vv.insert(peer, *counter as i32);
+        // Loro's VersionVector counter is `i32`. The envelope carries `i64`
+        // (and version JSON is client-supplied), so a value past `i32::MAX`
+        // cannot be represented — reject it instead of silently truncating.
+        let counter = i32::try_from(*counter).map_err(|_| crate::Error::BadRequest {
+            detail: format!(
+                "version vector counter {counter} for peer '{peer_hex}' exceeds the \
+                 representable range (Loro counters are 32-bit; max {})",
+                i32::MAX
+            ),
+        })?;
+        vv.insert(peer, counter);
     }
     Ok(vv)
 }
@@ -220,6 +230,35 @@ mod tests {
     #[test]
     fn vv_json_rejects_invalid_peer_hex() {
         let json = make_vv_json(LORO_VV_FORMAT_VERSION, &[("not-hex-at-all!!", 1)]);
+        let err = json_to_vv(&json).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::BadRequest { .. }),
+            "expected BadRequest, got: {err}"
+        );
+    }
+
+    #[test]
+    fn vv_json_accepts_i32_max_counter() {
+        let json = make_vv_json(
+            LORO_VV_FORMAT_VERSION,
+            &[("000000000000001a", i32::MAX as i64)],
+        );
+        let vv = json_to_vv(&json).unwrap();
+        let found = vv
+            .iter()
+            .find(|&(peer, _)| *peer == 0x1a_u64)
+            .map(|(_, c)| *c);
+        assert_eq!(found, Some(i32::MAX));
+    }
+
+    #[test]
+    fn vv_json_rejects_counter_exceeding_i32_max() {
+        // A counter past i32::MAX cannot be represented by Loro's 32-bit
+        // counter — it must be rejected, not silently truncated.
+        let json = make_vv_json(
+            LORO_VV_FORMAT_VERSION,
+            &[("000000000000001a", i32::MAX as i64 + 1)],
+        );
         let err = json_to_vv(&json).unwrap_err();
         assert!(
             matches!(err, crate::Error::BadRequest { .. }),
