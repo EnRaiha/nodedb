@@ -433,10 +433,7 @@ mod tests {
     #[test]
     fn learner_in_placement_is_kept() {
         // Learner 3 is in placement {1,2,3} → nothing to remove.
-        assert_eq!(
-            plan_leaving_learners(&[3], &[1, 2, 3]),
-            Vec::<u64>::new()
-        );
+        assert_eq!(plan_leaving_learners(&[3], &[1, 2, 3]), Vec::<u64>::new());
     }
 
     #[test]
@@ -462,9 +459,6 @@ mod tests {
 
     #[test]
     fn no_learners_returns_empty() {
-        assert_eq!(
-            plan_leaving_learners(&[], &[1, 2, 3]),
-            Vec::<u64>::new()
-        );
+        assert_eq!(plan_leaving_learners(&[], &[1, 2, 3]), Vec::<u64>::new());
     }
 }
