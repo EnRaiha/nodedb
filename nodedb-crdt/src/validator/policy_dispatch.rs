@@ -48,8 +48,13 @@ impl Validator {
                 ))
             }
             ValidationOutcome::Rejected(violations) => {
-                // Exactly one violation per constraint (current design)
-                let v = &violations[0];
+                // Exactly one violation per constraint (current design).
+                let Some(v) = violations.first() else {
+                    // Safety net: Rejected is only constructed when violations is non-empty.
+                    return Ok(PolicyResolution::AutoResolved(
+                        ResolvedAction::OverwriteExisting,
+                    ));
+                };
                 let constraint = self
                     .constraints
                     .all()
@@ -147,6 +152,7 @@ impl Validator {
                         Ok(PolicyResolution::Deferred {
                             retry_after_ms: first_retry_after_ms,
                             attempt: 0,
+                            violations,
                         })
                     }
 
@@ -163,6 +169,7 @@ impl Validator {
                         Ok(PolicyResolution::WebhookRequired {
                             webhook_url: webhook_url.clone(),
                             timeout_secs: *timeout_secs,
+                            violations,
                         })
                     }
 
@@ -183,7 +190,7 @@ impl Validator {
                             "escalated to DLQ"
                         );
 
-                        Ok(PolicyResolution::Escalate)
+                        Ok(PolicyResolution::Escalate { violations })
                     }
                 }
             }

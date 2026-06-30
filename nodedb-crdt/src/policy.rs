@@ -22,6 +22,7 @@
 //! ALTER COLLECTION posts SET ON CONFLICT CASCADE_DEFER FOR FOREIGN_KEY;
 //! ```
 
+use crate::validator::Violation;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -70,16 +71,21 @@ pub enum PolicyResolution {
     /// Conflict deferred for retry; caller should enqueue to DeferredQueue.
     /// `retry_after_ms`: milliseconds to wait before retry
     /// `attempt`: current attempt number
-    Deferred { retry_after_ms: u64, attempt: u32 },
+    Deferred {
+        retry_after_ms: u64,
+        attempt: u32,
+        violations: Vec<Violation>,
+    },
 
     /// Requires async webhook call; caller must POST conflict and await response.
     WebhookRequired {
         webhook_url: String,
         timeout_secs: u64,
+        violations: Vec<Violation>,
     },
 
     /// Escalate to dead-letter queue.
-    Escalate,
+    Escalate { violations: Vec<Violation> },
 }
 
 /// The specific action taken to resolve a conflict.

@@ -8,7 +8,31 @@ use crate::policy::PolicyResolution;
 use crate::row_lookup::RowLookup;
 
 use super::core::Validator;
-use super::types::{ProposedChange, ValidationOutcome};
+use super::types::{ProposedChange, ValidationOutcome, Violation};
+
+/// Convert the first violation into a [`CrdtError::ConstraintViolation`], appending
+/// `suffix` (e.g. `"deferred for retry"`) to the reason when provided.
+///
+/// Returns `Ok(())` when `violations` is empty — this branch is unreachable in
+/// practice (only reachable from `PolicyResolution` variants that are only ever
+/// constructed from a non-empty violation list) but is kept as a safe fallback.
+fn first_violation_err(
+    violations: Vec<Violation>,
+    collection: &str,
+    suffix: Option<&str>,
+) -> Result<()> {
+    match violations.into_iter().next() {
+        Some(v) => Err(CrdtError::ConstraintViolation {
+            constraint: v.constraint_name,
+            collection: collection.to_string(),
+            detail: match suffix {
+                Some(s) => format!("{} ({})", v.reason, s),
+                None => v.reason,
+            },
+        }),
+        None => Ok(()),
+    }
+}
 
 impl Validator {
     /// Validate a proposed change against all applicable constraints.
@@ -106,57 +130,18 @@ impl Validator {
 
         match self.validate_with_policy(state, peer_id, auth, change, delta_bytes, hlc_timestamp)? {
             PolicyResolution::AutoResolved(_) => Ok(()),
-            PolicyResolution::Deferred { .. } => {
-                // Violation was deferred for retry; return error to signal this
-                // The deferred entry was already enqueued by validate_with_policy
-                let violations = match self.validate(state, change) {
-                    ValidationOutcome::Rejected(v) => v,
-                    _ => vec![],
-                };
-                if !violations.is_empty() {
-                    let v = &violations[0];
-                    Err(CrdtError::ConstraintViolation {
-                        constraint: v.constraint_name.clone(),
-                        collection: change.collection.clone(),
-                        detail: format!("{} (deferred for retry)", v.reason),
-                    })
-                } else {
-                    Ok(())
-                }
+            PolicyResolution::Deferred { violations, .. } => {
+                // Violation was deferred for retry; return error to signal this.
+                // The deferred entry was already enqueued by validate_with_policy.
+                first_violation_err(violations, &change.collection, Some("deferred for retry"))
             }
-            PolicyResolution::WebhookRequired { .. } => {
-                // Webhook decision required; return error
-                let violations = match self.validate(state, change) {
-                    ValidationOutcome::Rejected(v) => v,
-                    _ => vec![],
-                };
-                if !violations.is_empty() {
-                    let v = &violations[0];
-                    Err(CrdtError::ConstraintViolation {
-                        constraint: v.constraint_name.clone(),
-                        collection: change.collection.clone(),
-                        detail: format!("{} (webhook required)", v.reason),
-                    })
-                } else {
-                    Ok(())
-                }
+            PolicyResolution::WebhookRequired { violations, .. } => {
+                // Webhook decision required; return error.
+                first_violation_err(violations, &change.collection, Some("webhook required"))
             }
-            PolicyResolution::Escalate => {
-                // Already enqueued to DLQ by validate_with_policy
-                let violations = match self.validate(state, change) {
-                    ValidationOutcome::Rejected(v) => v,
-                    _ => vec![],
-                };
-                if !violations.is_empty() {
-                    let v = &violations[0];
-                    Err(CrdtError::ConstraintViolation {
-                        constraint: v.constraint_name.clone(),
-                        collection: change.collection.clone(),
-                        detail: v.reason.clone(),
-                    })
-                } else {
-                    Ok(())
-                }
+            PolicyResolution::Escalate { violations } => {
+                // Already enqueued to DLQ by validate_with_policy.
+                first_violation_err(violations, &change.collection, None)
             }
         }
     }

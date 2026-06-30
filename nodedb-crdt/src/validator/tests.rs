@@ -298,6 +298,7 @@ fn validate_with_policy_cascade_defer() {
         PolicyResolution::Deferred {
             retry_after_ms,
             attempt,
+            ..
         } => {
             assert_eq!(attempt, 0);
             assert_eq!(retry_after_ms, 500);
@@ -341,6 +342,6 @@ fn validate_with_policy_escalate_to_dlq() {
         )
         .unwrap();
 
-    assert!(matches!(resolution, PolicyResolution::Escalate));
+    assert!(matches!(resolution, PolicyResolution::Escalate { .. }));
     assert_eq!(validator.dlq().len(), 1);
 }
