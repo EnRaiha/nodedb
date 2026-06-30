@@ -7,14 +7,14 @@
 
 use crate::constraint::{Constraint, ConstraintKind};
 use crate::dead_letter::CompensationHint;
-use crate::state::CrdtState;
+use crate::row_lookup::RowLookup;
 use crate::validator::{ProposedChange, Validator, Violation};
 use loro::LoroValue;
 
 impl Validator {
     pub(crate) fn check_constraint(
         &self,
-        state: &CrdtState,
+        state: &impl RowLookup,
         change: &ProposedChange,
         constraint: &Constraint,
     ) -> Option<Violation> {
@@ -39,7 +39,7 @@ impl Validator {
 
     pub(crate) fn check_unique(
         &self,
-        state: &CrdtState,
+        state: &impl RowLookup,
         change: &ProposedChange,
         constraint: &Constraint,
     ) -> Option<Violation> {
@@ -77,7 +77,7 @@ impl Validator {
 
     pub(crate) fn check_foreign_key(
         &self,
-        state: &CrdtState,
+        state: &impl RowLookup,
         change: &ProposedChange,
         constraint: &Constraint,
         ref_collection: &str,
@@ -141,6 +141,7 @@ impl Validator {
 mod bitemporal_fk_tests {
     use super::*;
     use crate::constraint::ConstraintKind;
+    use crate::state::CrdtState;
     use crate::validator::Validator;
     use loro::LoroValue;
 

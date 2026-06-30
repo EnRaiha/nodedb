@@ -14,7 +14,7 @@
 //! so deltas that pass pre-validation might still fail at commit time. But
 //! deltas that fail pre-validation would definitely fail at commit time.
 
-use crate::state::CrdtState;
+use crate::row_lookup::RowLookup;
 use crate::validator::{ProposedChange, ValidationOutcome, Validator};
 
 /// Result of pre-validation.
@@ -33,7 +33,7 @@ pub enum PreValidationResult {
 /// for actual commit-time rejections.
 pub fn pre_validate(
     validator: &Validator,
-    state: &CrdtState,
+    state: &impl RowLookup,
     change: &ProposedChange,
 ) -> PreValidationResult {
     match validator.validate(state, change) {
@@ -52,6 +52,7 @@ pub fn pre_validate(
 mod tests {
     use super::*;
     use crate::constraint::ConstraintSet;
+    use crate::state::CrdtState;
     use loro::LoroValue;
 
     #[test]

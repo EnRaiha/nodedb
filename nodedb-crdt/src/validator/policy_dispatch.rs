@@ -6,7 +6,7 @@ use crate::CrdtAuthContext;
 use crate::constraint::{Constraint, ConstraintKind};
 use crate::error::Result;
 use crate::policy::{ConflictPolicy, PolicyResolution, ResolvedAction};
-use crate::state::CrdtState;
+use crate::row_lookup::RowLookup;
 
 use super::core::Validator;
 use super::types::{ProposedChange, ValidationOutcome};
@@ -33,7 +33,7 @@ impl Validator {
     /// - `Err(_)` if an internal error occurred
     pub fn validate_with_policy(
         &mut self,
-        state: &CrdtState,
+        state: &impl RowLookup,
         peer_id: u64,
         auth: CrdtAuthContext,
         change: &ProposedChange,

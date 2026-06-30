@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use loro::{LoroDoc, LoroMap, LoroValue, ValueOrContainer};
 
 use crate::error::{CrdtError, Result};
+use crate::row_lookup::RowLookup;
 use crate::validator::bitemporal::{VALID_UNTIL, VALID_UNTIL_OPEN};
 
 /// A row is live when its `_ts_valid_until` field is absent, null, or the
@@ -242,5 +243,19 @@ impl CrdtState {
     /// Peer ID of this state.
     pub fn peer_id(&self) -> u64 {
         self.peer_id
+    }
+}
+
+impl RowLookup for CrdtState {
+    fn row_exists(&self, collection: &str, row_id: &str) -> bool {
+        self.row_exists(collection, row_id)
+    }
+
+    fn field_value_exists(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
+        self.field_value_exists(collection, field, value)
+    }
+
+    fn field_value_exists_live(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
+        self.field_value_exists_live(collection, field, value)
     }
 }

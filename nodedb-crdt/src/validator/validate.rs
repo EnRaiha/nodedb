@@ -5,7 +5,7 @@
 use crate::CrdtAuthContext;
 use crate::error::{CrdtError, Result};
 use crate::policy::PolicyResolution;
-use crate::state::CrdtState;
+use crate::row_lookup::RowLookup;
 
 use super::core::Validator;
 use super::types::{ProposedChange, ValidationOutcome};
@@ -15,7 +15,7 @@ impl Validator {
     ///
     /// Returns `Accepted` if all constraints pass, or `Rejected` with
     /// detailed violation information.
-    pub fn validate(&self, state: &CrdtState, change: &ProposedChange) -> ValidationOutcome {
+    pub fn validate(&self, state: &impl RowLookup, change: &ProposedChange) -> ValidationOutcome {
         let constraints = self.constraints.for_collection(&change.collection);
         let mut violations = Vec::new();
 
@@ -50,7 +50,7 @@ impl Validator {
     /// - If Deferred/Webhook/Escalate: returns appropriate error
     pub fn validate_or_reject(
         &mut self,
-        state: &CrdtState,
+        state: &impl RowLookup,
         peer_id: u64,
         auth: CrdtAuthContext,
         change: &ProposedChange,
