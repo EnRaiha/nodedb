@@ -329,6 +329,28 @@ impl TenantCrdtEngine {
         Ok(removed)
     }
 
+    /// Count archived (superseded) bitemporal versions for a row.
+    /// Returns `0` when the collection has no local state.
+    pub fn archive_version_count(&self, collection: &str, row_id: &str) -> usize {
+        self.collections
+            .get(collection)
+            .map(|state| state.archive_version_count(collection, row_id))
+            .unwrap_or(0)
+    }
+
+    /// Read the row as it was at `asof_ms` (system-time). Returns `None` when
+    /// the collection is absent or no version existed at or before that time.
+    pub fn read_row_as_of(
+        &self,
+        collection: &str,
+        row_id: &str,
+        asof_ms: i64,
+    ) -> Option<LoroValue> {
+        self.collections
+            .get(collection)
+            .and_then(|state| state.read_row_as_of(collection, row_id, asof_ms))
+    }
+
     /// Check if a row exists in a collection's document store.
     pub fn row_exists(&self, collection: &str, row_id: &str) -> bool {
         self.collections

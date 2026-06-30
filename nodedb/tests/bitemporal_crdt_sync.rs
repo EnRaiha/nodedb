@@ -167,12 +167,11 @@ fn bitemporal_crdt_preserves_multi_version_history() {
     }
 
     // Two archived versions expected (v1, v2); v3 is the live row.
-    let state = eng.state();
-    let archived = state.archive_version_count(USERS, "u1");
+    let archived = eng.archive_version_count(USERS, "u1");
     assert_eq!(archived, 2, "v1 and v2 must be archived when v3 overwrites");
 
     // Live row holds v3.
-    let live = state.read_row(USERS, "u1").unwrap();
+    let live = eng.read_row(USERS, "u1").unwrap();
     if let LoroValue::Map(m) = live {
         let email = match m.get("email").unwrap() {
             LoroValue::String(s) => s.to_string(),
@@ -206,8 +205,7 @@ fn bitemporal_crdt_purge_drops_superseded_below_cutoff() {
         )
         .unwrap();
     }
-    let state = eng.state();
-    assert_eq!(state.archive_version_count(USERS, "u1"), 3);
+    assert_eq!(eng.archive_version_count(USERS, "u1"), 3);
 
     // Capture the stamps the receiver assigned, then purge everything
     // strictly below the stamp of the second-oldest archived version.
@@ -221,10 +219,10 @@ fn bitemporal_crdt_purge_drops_superseded_below_cutoff() {
     let cutoff = now_ms + 1;
     let dropped = eng.purge_history_before(USERS, cutoff).unwrap();
     assert_eq!(dropped, 3, "every archived version must be reclaimed");
-    assert_eq!(state.archive_version_count(USERS, "u1"), 0);
+    assert_eq!(eng.archive_version_count(USERS, "u1"), 0);
 
     // Live row still readable — purge never touches the current state.
-    let live = state.read_row(USERS, "u1").unwrap();
+    let live = eng.read_row(USERS, "u1").unwrap();
     if let LoroValue::Map(m) = live {
         let email = match m.get("email").unwrap() {
             LoroValue::String(s) => s.to_string(),
@@ -252,7 +250,7 @@ fn bitemporal_crdt_divergence_preserves_both_versions_via_archive() {
     )
     .unwrap();
     let ts_a = {
-        let LoroValue::Map(live_a) = eng.state().read_row(USERS, "u1").unwrap() else {
+        let LoroValue::Map(live_a) = eng.read_row(USERS, "u1").unwrap() else {
             panic!("expected map");
         };
         match live_a.get("_ts_system").unwrap() {
@@ -272,9 +270,8 @@ fn bitemporal_crdt_divergence_preserves_both_versions_via_archive() {
     )
     .unwrap();
 
-    let state = eng.state();
     // AS OF ts_a returns the peer-A version.
-    let at_a = state.read_row_as_of(USERS, "u1", ts_a).expect("v1 as-of");
+    let at_a = eng.read_row_as_of(USERS, "u1", ts_a).expect("v1 as-of");
     if let LoroValue::Map(m) = at_a {
         let email = match m.get("email").unwrap() {
             LoroValue::String(s) => s.to_string(),
@@ -286,7 +283,7 @@ fn bitemporal_crdt_divergence_preserves_both_versions_via_archive() {
     }
 
     // Current live row is peer-B's write.
-    let LoroValue::Map(live_b) = state.read_row(USERS, "u1").unwrap() else {
+    let LoroValue::Map(live_b) = eng.read_row(USERS, "u1").unwrap() else {
         panic!("expected map");
     };
     let email_b = match live_b.get("email").unwrap() {
