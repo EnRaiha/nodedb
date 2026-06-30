@@ -7,7 +7,9 @@ use crate::vector_dtype::VectorStorageDtype;
 use serde::{Deserialize, Serialize};
 
 /// HNSW index parameters shared between Origin and Lite.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
+)]
 pub struct HnswParams {
     /// Max bidirectional connections per node at layers > 0.
     pub m: usize,

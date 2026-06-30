@@ -5,7 +5,17 @@
 use crate::hnsw::HnswParams;
 
 /// Index type selection for vector collections.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
 #[non_exhaustive]
 pub enum IndexType {
     /// Pure HNSW with FP32 vectors. Best recall (~99%), highest memory.
@@ -29,7 +39,14 @@ impl IndexType {
 }
 
 /// Unified vector index configuration.
-#[derive(Debug, Clone)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
 pub struct IndexConfig {
     /// HNSW parameters (used for Hnsw and HnswPq types).
     pub hnsw: HnswParams,

@@ -170,6 +170,16 @@ impl DataPlaneSnapshotBuilder {
                 merged.columnar_engines.push((k, v));
             }
         }
+        for (k, v) in snap.vector_params {
+            if in_group_db_tenant_scoped(&k) {
+                merged.vector_params.push((k, v));
+            }
+        }
+        for (k, v) in snap.index_configs {
+            if in_group_db_tenant_scoped(&k) {
+                merged.index_configs.push((k, v));
+            }
+        }
 
         // Graph edges: the versioned edge key embeds the collection as its
         // FIRST `\x00`-delimited component, and edge writes are homed at

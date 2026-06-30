@@ -116,6 +116,47 @@ impl CoreLoop {
                 }
             }
 
+            // Restore vector_params: re-populate HnswParams before the vector
+            // collection restore so `restore_vector_collection` finds real params
+            // instead of falling back to `HnswParams::default()`.
+            for (key, bytes) in &snap.vector_params {
+                let params: crate::engine::vector::hnsw::HnswParams =
+                    match zerompk::from_msgpack(bytes) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(key, error = %e, "failed to decode vector_params snapshot entry");
+                            continue;
+                        }
+                    };
+                let (vp_db, coll_key) = parse_vector_snapshot_key(key, tenant_id);
+                let map_key = (
+                    nodedb_types::DatabaseId::new(vp_db),
+                    crate::types::TenantId::new(tenant_id),
+                    coll_key.to_string(),
+                );
+                self.vector_params.insert(map_key, params);
+            }
+
+            // Restore index_configs: re-populate IndexConfig before the vector
+            // collection restore so index routing uses the correct type.
+            for (key, bytes) in &snap.index_configs {
+                let cfg: crate::engine::vector::index_config::IndexConfig =
+                    match zerompk::from_msgpack(bytes) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!(key, error = %e, "failed to decode index_configs snapshot entry");
+                            continue;
+                        }
+                    };
+                let (ic_db, coll_key) = parse_vector_snapshot_key(key, tenant_id);
+                let map_key = (
+                    nodedb_types::DatabaseId::new(ic_db),
+                    crate::types::TenantId::new(tenant_id),
+                    coll_key.to_string(),
+                );
+                self.index_configs.insert(map_key, cfg);
+            }
+
             // Restore vector collections.
             // Snapshot keys are `"{db}:{tid}:{coll_key}"` (new format) or, for
             // legacy snapshots, `"{tid}:{coll_key}"`. Parse the leading numeric

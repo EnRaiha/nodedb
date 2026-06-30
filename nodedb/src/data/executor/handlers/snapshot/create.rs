@@ -75,6 +75,34 @@ impl CoreLoop {
             }
         }
 
+        // 3b. Vector params: export HnswParams per collection.
+        for (key, params) in &self.vector_params {
+            if key.1 != tid_obj {
+                continue;
+            }
+            let key_str = format!("{}:{}:{}", key.0.as_u64(), key.1.as_u64(), key.2);
+            match zerompk::to_msgpack_vec(params) {
+                Ok(bytes) => snapshot.vector_params.push((key_str, bytes)),
+                Err(e) => {
+                    warn!(key = &key.2, error = %e, "snapshot: vector_params serialization failed")
+                }
+            }
+        }
+
+        // 3c. Index configs: export IndexConfig per collection.
+        for (key, cfg) in &self.index_configs {
+            if key.1 != tid_obj {
+                continue;
+            }
+            let key_str = format!("{}:{}:{}", key.0.as_u64(), key.1.as_u64(), key.2);
+            match zerompk::to_msgpack_vec(cfg) {
+                Ok(bytes) => snapshot.index_configs.push((key_str, bytes)),
+                Err(e) => {
+                    warn!(key = &key.2, error = %e, "snapshot: index_configs serialization failed")
+                }
+            }
+        }
+
         // 4. KV tables: export all entries per tenant table.
         for (&hash, table) in &self.kv_engine.tables {
             let Some(&tid) = self.kv_engine.hash_to_tenant.get(&hash) else {
@@ -166,6 +194,8 @@ impl CoreLoop {
             timeseries = snapshot.timeseries.len(),
             flushed_ts_collections = snapshot.flushed_ts_segments.len(),
             columnar_engines = snapshot.columnar_engines.len(),
+            vector_params = snapshot.vector_params.len(),
+            index_configs = snapshot.index_configs.len(),
             "full tenant snapshot created"
         );
 

@@ -70,6 +70,34 @@ pub struct TenantDataSnapshot {
     #[serde(default)]
     pub columnar_engines: Vec<(String, Vec<u8>)>,
 
+    /// Per-collection HNSW parameters set via DDL, carried through snapshots
+    /// so snapshot-installed followers rebuild vector collections with the
+    /// original params instead of silently falling back to defaults.
+    ///
+    /// Key format: `"{db}:{tid}:{collection_key}"` (same as `vectors`).
+    /// Value: msgpack-serialized `HnswParams`.
+    ///
+    /// `#[msgpack(default)]`: snapshots written before this field decode with
+    /// an empty Vec — the restore path falls back to `HnswParams::default()`,
+    /// which matches the pre-fix behavior.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub vector_params: Vec<(String, Vec<u8>)>,
+
+    /// Per-collection index config (index type, PQ/IVF params) carried through
+    /// snapshots. Without this a snapshot-installed node gets wrong index routing
+    /// (`IndexType::Hnsw` default instead of the configured type).
+    ///
+    /// Key format: `"{db}:{tid}:{collection_key}"` (same as `vectors`).
+    /// Value: msgpack-serialized `IndexConfig`.
+    ///
+    /// `#[msgpack(default)]`: snapshots written before this field decode with
+    /// an empty Vec — the restore path skips the loop, leaving the collection
+    /// to use default index routing, matching pre-fix behavior.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub index_configs: Vec<(String, Vec<u8>)>,
+
     /// PK → surrogate identity bindings for the snapshotted collections.
     ///
     /// The surrogate map (`surrogate_pk_v3` / `surrogate_pk_rev_v3` catalog
@@ -383,5 +411,125 @@ mod tests {
         assert_eq!(p.files[0].0, "schema.json");
         assert_eq!(p.files[1].0, "col_ts.col");
         assert_eq!(p.files[1].1, b"\x00\x01\x02");
+    }
+
+    /// Round-trip: `vector_params` and `index_configs` survive msgpack
+    /// encode → decode with non-default values.
+    ///
+    /// This test FAILS without the two new fields on `TenantDataSnapshot`
+    /// because the fields simply do not exist and there is nothing to assert.
+    /// With the fix, both sections are present, carry non-default values, and
+    /// decode back intact. The test does NOT pre-seed params on a live CoreLoop
+    /// so it exercises the struct wire format in isolation — the appropriate
+    /// level since `TenantDataSnapshot` is the boundary type.
+    #[test]
+    fn vector_params_and_index_configs_round_trip() {
+        use nodedb_types::hnsw::HnswParams;
+        use nodedb_vector::index_config::{IndexConfig, IndexType};
+
+        // Non-default HnswParams (m=32 vs default 16, ef_construction=400 vs 200).
+        let non_default_params = HnswParams {
+            m: 32,
+            m0: 64,
+            ef_construction: 400,
+            metric: nodedb_types::vector_distance::DistanceMetric::Cosine,
+            dtype: nodedb_types::vector_dtype::VectorStorageDtype::F32,
+        };
+        let non_default_cfg = IndexConfig {
+            hnsw: non_default_params.clone(),
+            index_type: IndexType::HnswPq,
+            pq_m: 16,
+            ivf_cells: 512,
+            ivf_nprobe: 32,
+        };
+
+        let params_bytes = zerompk::to_msgpack_vec(&non_default_params).expect("encode HnswParams");
+        let cfg_bytes = zerompk::to_msgpack_vec(&non_default_cfg).expect("encode IndexConfig");
+
+        let snap = TenantDataSnapshot {
+            vector_params: vec![("1:42:embeddings".to_string(), params_bytes)],
+            index_configs: vec![("1:42:embeddings".to_string(), cfg_bytes)],
+            ..Default::default()
+        };
+
+        let encoded = zerompk::to_msgpack_vec(&snap).expect("encode snapshot");
+        let decoded: TenantDataSnapshot = zerompk::from_msgpack(&encoded).expect("decode snapshot");
+
+        assert_eq!(
+            decoded.vector_params.len(),
+            1,
+            "vector_params must survive round-trip"
+        );
+        assert_eq!(decoded.vector_params[0].0, "1:42:embeddings");
+        let decoded_params: HnswParams =
+            zerompk::from_msgpack(&decoded.vector_params[0].1).expect("decode HnswParams");
+        assert_eq!(decoded_params.m, 32, "non-default m must be preserved");
+        assert_eq!(
+            decoded_params.ef_construction, 400,
+            "non-default ef_construction must be preserved"
+        );
+
+        assert_eq!(
+            decoded.index_configs.len(),
+            1,
+            "index_configs must survive round-trip"
+        );
+        assert_eq!(decoded.index_configs[0].0, "1:42:embeddings");
+        let decoded_cfg: IndexConfig =
+            zerompk::from_msgpack(&decoded.index_configs[0].1).expect("decode IndexConfig");
+        assert_eq!(
+            decoded_cfg.index_type,
+            IndexType::HnswPq,
+            "non-default index_type must be preserved"
+        );
+        assert_eq!(decoded_cfg.pq_m, 16, "non-default pq_m must be preserved");
+    }
+
+    /// Backward-compat: a snapshot written WITHOUT `vector_params` and
+    /// `index_configs` (old wire format) must still decode with both fields
+    /// defaulting to empty — matching the `#[msgpack(default)]` contract.
+    #[test]
+    fn backward_compat_missing_vector_params_and_index_configs_default_to_empty() {
+        // Old schema: the 11-field struct that existed before the two new fields.
+        #[derive(zerompk::ToMessagePack)]
+        #[msgpack(map)]
+        struct OldSnapshot {
+            documents: Vec<(String, Vec<u8>)>,
+            indexes: Vec<(String, Vec<u8>)>,
+            edges: Vec<(String, Vec<u8>)>,
+            vectors: Vec<(String, Vec<u8>)>,
+            kv_tables: Vec<(String, Vec<u8>)>,
+            crdt_state: Vec<(u64, String, Vec<u8>)>,
+            timeseries: Vec<(String, Vec<u8>)>,
+            flushed_ts_segments: Vec<TsFlushedCollectionBlob>,
+            columnar_engines: Vec<(String, Vec<u8>)>,
+            surrogate_pk: Vec<SurrogateBindEntry>,
+            tenant_edges: Vec<(u64, String, Vec<u8>)>,
+        }
+        let old = OldSnapshot {
+            documents: vec![("k".to_string(), b"v".to_vec())],
+            indexes: Vec::<(String, Vec<u8>)>::new(),
+            edges: Vec::<(String, Vec<u8>)>::new(),
+            vectors: Vec::<(String, Vec<u8>)>::new(),
+            kv_tables: Vec::<(String, Vec<u8>)>::new(),
+            crdt_state: Vec::<(u64, String, Vec<u8>)>::new(),
+            timeseries: Vec::<(String, Vec<u8>)>::new(),
+            flushed_ts_segments: Vec::<TsFlushedCollectionBlob>::new(),
+            columnar_engines: Vec::<(String, Vec<u8>)>::new(),
+            surrogate_pk: Vec::<SurrogateBindEntry>::new(),
+            tenant_edges: Vec::<(u64, String, Vec<u8>)>::new(),
+        };
+        let bytes = zerompk::to_msgpack_vec(&old).expect("encode old snapshot");
+        let decoded: TenantDataSnapshot =
+            zerompk::from_msgpack(&bytes).expect("decode old snapshot as new schema");
+        assert_eq!(decoded.documents.len(), 1);
+        assert!(
+            decoded.vector_params.is_empty(),
+            "vector_params must default to empty for old snapshot"
+        );
+        assert!(
+            decoded.index_configs.is_empty(),
+            "index_configs must default to empty for old snapshot"
+        );
     }
 }
