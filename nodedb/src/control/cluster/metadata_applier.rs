@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
-use nodedb_cluster::{MetadataApplier, MetadataCache, MetadataEntry, decode_entry};
+use nodedb_cluster::{MetadataApplier, MetadataCache, MetadataEntry, RoutingChange, decode_entry};
 
 use crate::control::catalog_entry;
 use crate::control::security::credential::CredentialStore;
@@ -410,6 +410,35 @@ impl MetadataCommitApplier {
                         });
                     }
                     debug!(lite_id = %lite_id, new_epoch, raft_index, "sync producer fenced via raft");
+                }
+                return Ok(());
+            }
+            MetadataEntry::RoutingChange(RoutingChange::SetPlacement {
+                group_id,
+                placement,
+            }) => {
+                // Group membership and leadership converge through the Raft
+                // conf-change path (which mutates the shared routing table on
+                // every node). `SetPlacement` carries the *intended* voter set
+                // for a group and has no conf-change equivalent, so it must be
+                // written through to the live shared routing table here — the
+                // same `RwLock<RoutingTable>` the reconciler and the
+                // learner-promotion gate read. Without this write the placement
+                // never leaves the metadata log and N>RF voter-cap convergence
+                // is inert. The other `RoutingChange` variants are intentionally
+                // not handled here to avoid double-applying the conf-change path.
+                if let Some(weak) = self.shared.get()
+                    && let Some(shared) = weak.upgrade()
+                    && let Some(routing) = shared.cluster_routing.as_ref()
+                {
+                    routing
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .set_placement(*group_id, placement.clone());
+                    debug!(
+                        group_id,
+                        raft_index, "set_placement applied to live routing table"
+                    );
                 }
                 return Ok(());
             }
