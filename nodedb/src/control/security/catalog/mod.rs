@@ -15,6 +15,7 @@ pub mod collection;
 pub mod collection_constraints;
 pub mod collections;
 pub mod column_stats;
+pub mod constraint_translate;
 pub mod consumer_groups;
 pub mod continuous_aggregate;
 pub mod continuous_aggregates;
@@ -69,6 +70,7 @@ pub use collection_constraints::{
     BalancedConstraintDef, CheckConstraintDef, EventDefinition, FieldDefinition, LegalHold,
     MaterializedSumDef, PeriodLockDef, StateTransitionDef, TransitionCheckDef, TransitionRule,
 };
+pub use constraint_translate::collection_constraints;
 pub use custom_types::{CompositeField, CustomTypeDef, StoredCustomType};
 pub use database_grants::DatabaseGrant;
 pub use database_quotas::GlobalQuotaCeiling;

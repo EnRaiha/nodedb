@@ -12,6 +12,25 @@ use crate::types::TenantId;
 use super::SharedState;
 
 impl SharedState {
+    /// Whether this node is the leader of the metadata Raft group.
+    ///
+    /// Reuses the installed `raft_status_fn` snapshot (set by `start_raft`),
+    /// looks up the metadata group (`METADATA_GROUP_ID == 0`), and reports
+    /// whether its role string is `"Leader"`. Returns `false` in single-node
+    /// mode, where `raft_status_fn` is never installed — there is no metadata
+    /// Raft group to lead.
+    ///
+    /// Not unit-tested in isolation: it requires a live `raft_status_fn`, so
+    /// it is exercised by the cluster-level constraint-reconcile test.
+    pub fn is_metadata_leader(&self) -> bool {
+        let Some(status_fn) = self.raft_status_fn.get() else {
+            return false;
+        };
+        status_fn()
+            .into_iter()
+            .any(|g| g.group_id == nodedb_cluster::METADATA_GROUP_ID && g.role == "Leader")
+    }
+
     /// Snapshot the configured global quota ceiling.
     ///
     /// Callers (notably `ALTER DATABASE … SET QUOTA`) pass the result to

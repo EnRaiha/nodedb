@@ -296,7 +296,7 @@ fn parse_column_type_str(type_str: &str) -> (String, bool, bool) {
 /// Returns `(bare_type, is_primary_key, is_not_null, default_expr)`.
 /// The `default_expr` is the raw expression text following the `DEFAULT` keyword,
 /// trimmed of surrounding whitespace.
-fn parse_column_type_str_full(type_str: &str) -> (String, bool, bool, Option<String>) {
+pub fn parse_column_type_str_full(type_str: &str) -> (String, bool, bool, Option<String>) {
     let upper = type_str.to_uppercase();
     let is_pk = upper.contains("PRIMARY KEY");
     let is_not_null = upper.contains("NOT NULL");
