@@ -64,11 +64,14 @@ pub struct ConfChange {
 
 impl ConfChange {
     /// Serialize to bytes for a Raft log entry (prefixed with CONF_CHANGE_PREFIX).
-    pub fn to_entry_data(&self) -> Vec<u8> {
+    pub fn to_entry_data(&self) -> crate::error::Result<Vec<u8>> {
         let mut data = vec![CONF_CHANGE_PREFIX];
-        let payload = zerompk::to_msgpack_vec(self).expect("ConfChange serialization cannot fail");
+        let payload =
+            zerompk::to_msgpack_vec(self).map_err(|e| crate::error::ClusterError::Codec {
+                detail: format!("conf_change encode: {e}"),
+            })?;
         data.extend_from_slice(&payload);
-        data
+        Ok(data)
     }
 
     /// Try to deserialize from a Raft log entry's data bytes.
@@ -97,7 +100,7 @@ mod tests {
             change_type: ConfChangeType::AddNode,
             node_id: 42,
         };
-        let data = cc.to_entry_data();
+        let data = cc.to_entry_data().unwrap();
         assert_eq!(data[0], CONF_CHANGE_PREFIX);
 
         let decoded = ConfChange::from_entry_data(&data).unwrap();
@@ -111,7 +114,7 @@ mod tests {
             change_type: ConfChangeType::RemoveNode,
             node_id: 7,
         };
-        let data = cc.to_entry_data();
+        let data = cc.to_entry_data().unwrap();
         let decoded = ConfChange::from_entry_data(&data).unwrap();
         assert_eq!(decoded.change_type, ConfChangeType::RemoveNode);
         assert_eq!(decoded.node_id, 7);
@@ -158,7 +161,7 @@ mod tests {
                 change_type: ct,
                 node_id: 1,
             };
-            let data = cc.to_entry_data();
+            let data = cc.to_entry_data().unwrap();
             let decoded = ConfChange::from_entry_data(&data).unwrap();
             assert_eq!(decoded.change_type, ct);
         }

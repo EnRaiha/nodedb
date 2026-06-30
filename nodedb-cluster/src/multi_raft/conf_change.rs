@@ -67,7 +67,7 @@ impl MultiRaft {
                 .groups
                 .get_mut(&group_id)
                 .ok_or(ClusterError::GroupNotFound { group_id })?;
-            let data = change.to_entry_data();
+            let data = change.to_entry_data()?;
             let log_index = node.propose(data)?;
             // A single-voter group self-commits inside `propose`:
             // its `commit_index` is bumped to the new `log_index`

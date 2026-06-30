@@ -224,7 +224,9 @@ pub fn alter_raft_group(
         change_type,
         node_id,
     };
-    let data = change.to_entry_data();
+    let data = change
+        .to_entry_data()
+        .map_err(|e| sqlstate_error("XX000", &format!("conf_change encode: {e}")))?;
 
     // Find a vShard that maps to this group to propose through Raft.
     let routing = match &state.cluster_routing {
