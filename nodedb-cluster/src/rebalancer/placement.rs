@@ -122,7 +122,7 @@ mod tests {
         let active = nodes(&[1, 2, 3, 4]);
         let gids = groups(&[10, 11, 12, 13]);
         let placement = compute_placement(&active, &gids, 3);
-        for (_, voters) in &placement {
+        for voters in placement.values() {
             assert_eq!(voters.len(), 3);
         }
     }
@@ -132,7 +132,7 @@ mod tests {
         let active = nodes(&[1, 2, 3, 4]);
         let gids = groups(&[10, 11, 12]);
         let placement = compute_placement(&active, &gids, 2);
-        for (_, voters) in &placement {
+        for voters in placement.values() {
             assert_eq!(voters.len(), 2);
         }
     }
@@ -144,7 +144,7 @@ mod tests {
         let active = nodes(&[1, 2, 3]);
         let gids = groups(&[10, 11, 12]);
         let placement = compute_placement(&active, &gids, 3);
-        for (_, voters) in &placement {
+        for voters in placement.values() {
             assert_eq!(voters, &[1u64, 2, 3]);
         }
     }
@@ -154,7 +154,7 @@ mod tests {
         let active = nodes(&[1, 2]);
         let gids = groups(&[10, 11]);
         let placement = compute_placement(&active, &gids, 5);
-        for (_, voters) in &placement {
+        for voters in placement.values() {
             assert_eq!(voters, &[1u64, 2]);
         }
     }
@@ -167,7 +167,7 @@ mod tests {
         let gids: Vec<u64> = (100..120).collect();
         let placement = compute_placement(&active, &gids, 3);
         let active_set: std::collections::BTreeSet<u64> = active.iter().copied().collect();
-        for (_, voters) in &placement {
+        for voters in placement.values() {
             // subset
             for &v in voters {
                 assert!(active_set.contains(&v), "voter {v} not in active set");
@@ -187,7 +187,7 @@ mod tests {
         let active = nodes(&[1, 2, 3]);
         let gids = groups(&[10, 11]);
         let placement = compute_placement(&active, &gids, 0);
-        for (_, voters) in &placement {
+        for voters in placement.values() {
             assert!(voters.is_empty());
         }
     }
@@ -196,7 +196,7 @@ mod tests {
     fn empty_active_nodes_yields_empty_placements() {
         let gids = groups(&[10, 11, 12]);
         let placement = compute_placement(&[], &gids, 3);
-        for (_, voters) in &placement {
+        for voters in placement.values() {
             assert!(voters.is_empty());
         }
     }
