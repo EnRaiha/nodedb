@@ -86,6 +86,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_get_version_vector(
         &mut self,
         task: &ExecutionTask,
+        _collection: &str,
     ) -> Response {
         let tenant_id = task.request.tenant_id;
         let engine = match self.get_crdt_engine(tenant_id) {
@@ -114,6 +115,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_export_delta(
         &mut self,
         task: &ExecutionTask,
+        _collection: &str,
         from_version_json: &str,
     ) -> Response {
         let tenant_id = task.request.tenant_id;
@@ -175,6 +177,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_compact(
         &mut self,
         task: &ExecutionTask,
+        _collection: &str,
         target_version_json: &str,
     ) -> Response {
         debug!(core = self.core_id, "crdt compact at version");
@@ -348,6 +351,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_apply(
         &mut self,
         task: &ExecutionTask,
+        _collection: &str,
         delta: &[u8],
         provenance: Option<&SyncProvenance>,
     ) -> Response {

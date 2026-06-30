@@ -181,8 +181,8 @@ impl CoreLoop {
 
     /// Replay WAL CRDT delta records to rebuild Loro tenant state after crash.
     ///
-    /// CRDT records use `RecordType::CrdtDelta`; the payload is
-    /// `(delta_bytes, provenance)` as written by `append_crdt_delta` for both
+    /// CRDT records use `RecordType::CrdtDelta`; the payload is a
+    /// `CrdtDeltaWalPayload` as written by `append_crdt_delta` for both
     /// `CrdtOp::Apply` and `CrdtOp::ImportSnapshot`. Loro `import` is
     /// idempotent and commutative, so there is no LSN gate: re-importing a
     /// delta already folded into a loaded checkpoint is a safe no-op.
@@ -219,16 +219,18 @@ impl CoreLoop {
 
             let tid = crate::types::TenantId::new(record.header.tenant_id);
 
-            let Ok((delta_bytes, _prov)) = zerompk::from_msgpack::<(
-                Vec<u8>,
-                Option<nodedb_types::sync::wire::SyncProvenance>,
-            )>(&record.payload) else {
+            // Single self-describing decode. `collection` is present in the
+            // payload for future per-collection dispatch but is not acted upon
+            // during replay; Loro import is collection-agnostic.
+            let Ok(payload) =
+                zerompk::from_msgpack::<crate::wal::CrdtDeltaWalPayload>(&record.payload)
+            else {
                 continue;
             };
 
             match self.get_crdt_engine(tid) {
                 Ok(engine) => {
-                    if let Err(e) = engine.import_snapshot_bytes(&delta_bytes) {
+                    if let Err(e) = engine.import_snapshot_bytes(&payload.bytes) {
                         warn!(
                             core = self.core_id,
                             tenant = tid.as_u64(),
@@ -399,7 +401,7 @@ mod crdt_replay_tests {
 
     /// Build a CRDT snapshot for `tid` containing one row, then wrap it in a
     /// `CrdtDelta` WAL record exactly as `append_crdt_delta` does
-    /// (`(delta_bytes, provenance)` msgpack payload). Snapshot import and delta
+    /// (`CrdtDeltaWalPayload` msgpack payload). Snapshot import and delta
     /// apply share the same idempotent Loro `state.import`, so a snapshot rides
     /// the delta record identically.
     fn make_crdt_record(
@@ -420,8 +422,12 @@ mod crdt_replay_tests {
         let snapshot = producer.export_snapshot_bytes().expect("export");
         assert!(!snapshot.is_empty(), "snapshot must be non-empty");
 
-        let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
-        let payload = zerompk::to_msgpack_vec(&(snapshot, prov)).expect("encode payload");
+        let wal_payload = crate::wal::CrdtDeltaWalPayload {
+            bytes: snapshot,
+            collection: None,
+            provenance: None,
+        };
+        let payload = zerompk::to_msgpack_vec(&wal_payload).expect("encode payload");
         nodedb_wal::WalRecord::new(
             RecordType::CrdtDelta as u32,
             1,

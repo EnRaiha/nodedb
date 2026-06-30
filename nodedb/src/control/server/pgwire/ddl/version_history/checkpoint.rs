@@ -32,7 +32,9 @@ pub async fn create_checkpoint(
     let tenant_id = identity.tenant_id;
 
     // Dispatch to Data Plane to get current version vector.
-    let plan = PhysicalPlan::Crdt(CrdtOp::GetVersionVector);
+    let plan = PhysicalPlan::Crdt(CrdtOp::GetVersionVector {
+        collection: collection.clone(),
+    });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
     let vv_bytes = super::super::sync_dispatch::dispatch_async(
         state,

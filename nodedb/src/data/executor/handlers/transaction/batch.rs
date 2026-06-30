@@ -41,7 +41,7 @@ impl CoreLoop {
         );
 
         let mut undo_log: Vec<UndoEntry> = Vec::with_capacity(plans.len());
-        let mut crdt_deltas: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut crdt_deltas: Vec<(Vec<u8>, u64, String)> = Vec::new();
         let mut last_response = self.response_ok(task);
 
         for (i, plan) in plans.iter().enumerate() {
@@ -175,7 +175,7 @@ impl CoreLoop {
         // Failure here means the CRDT state is inconsistent with the already-committed
         // forward writes — return RollbackFailed so the client knows the shard needs
         // a restart to restore consistency via WAL replay. Never warn-and-continue.
-        for (crdt_idx, (delta, peer_id)) in crdt_deltas.into_iter().enumerate() {
+        for (crdt_idx, (delta, _peer_id, _collection)) in crdt_deltas.into_iter().enumerate() {
             // Second crash-injection point — between forward-write commit and
             // CRDT apply. WAL replay must roll the CRDT side forward (or roll
             // forward writes back) to restore consistency.
@@ -184,7 +184,6 @@ impl CoreLoop {
             let tenant_id = crate::types::TenantId::new(tid);
             match self.get_crdt_engine(tenant_id) {
                 Ok(engine) => {
-                    let _ = peer_id; // peer_id used for dedup in future
                     if let Err(e) = engine.apply_committed_delta(&delta) {
                         error!(
                             core = self.core_id,

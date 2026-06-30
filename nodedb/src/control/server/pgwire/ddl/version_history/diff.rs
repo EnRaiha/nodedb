@@ -56,6 +56,7 @@ pub async fn select_diff(
 
     // Export delta from version_a to current via Data Plane.
     let plan = PhysicalPlan::Crdt(CrdtOp::ExportDelta {
+        collection: collection.clone(),
         from_version_json: from_vv,
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);

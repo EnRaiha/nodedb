@@ -27,7 +27,7 @@ impl CoreLoop {
         tid: u64,
         plan: &PhysicalPlan,
         undo_log: &mut Vec<UndoEntry>,
-        crdt_deltas: &mut Vec<(Vec<u8>, u64)>,
+        crdt_deltas: &mut Vec<(Vec<u8>, u64, String)>,
         user_roles: &[String],
     ) -> Result<Response, ErrorCode> {
         // Temporary task used for sub-plan response construction.
@@ -281,8 +281,13 @@ impl CoreLoop {
             }
 
             // ── CRDT (buffered until commit) ──────────────────────────────────
-            PhysicalPlan::Crdt(CrdtOp::Apply { delta, peer_id, .. }) => {
-                crdt_deltas.push((delta.clone(), *peer_id));
+            PhysicalPlan::Crdt(CrdtOp::Apply {
+                collection,
+                delta,
+                peer_id,
+                ..
+            }) => {
+                crdt_deltas.push((delta.clone(), *peer_id, collection.clone()));
                 Ok(self.response_ok(&dummy_task))
             }
 

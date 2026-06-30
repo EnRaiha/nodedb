@@ -148,18 +148,23 @@ pub fn wal_append_if_write_with_creds(
             wal.append_vector_delete(tenant_id, vshard_id, database_id, &entry)?;
         }
         PhysicalPlan::Crdt(CrdtOp::Apply {
-            delta, provenance, ..
+            collection,
+            delta,
+            provenance,
+            ..
         }) => {
-            // Wrap delta bytes with provenance so the replay decoder can
-            // reconstruct idempotency context. Older decoders that treated
-            // the payload as raw bytes will fail to msgpack-decode and fall
-            // back to the legacy raw-bytes path.
-            let crdt_payload = zerompk::to_msgpack_vec(&(delta, provenance)).map_err(|e| {
-                crate::Error::Serialization {
+            // Wrap delta bytes with collection and provenance so the replay decoder can
+            // reconstruct idempotency context and route to the correct collection.
+            let payload = crate::wal::CrdtDeltaWalPayload {
+                bytes: delta.clone(),
+                collection: Some(collection.clone()),
+                provenance: provenance.clone(),
+            };
+            let crdt_payload =
+                zerompk::to_msgpack_vec(&payload).map_err(|e| crate::Error::Serialization {
                     format: "msgpack".into(),
                     detail: format!("wal crdt delta: {e}"),
-                }
-            })?;
+                })?;
             wal.append_crdt_delta(tenant_id, vshard_id, database_id, &crdt_payload)?;
         }
         PhysicalPlan::Crdt(CrdtOp::ImportSnapshot { bytes, .. }) => {
@@ -167,13 +172,16 @@ pub fn wal_append_if_write_with_creds(
             // `apply_committed_delta` are the same idempotent Loro `state.import`,
             // so the snapshot rides the CRDT delta record and replays identically.
             // No provenance to carry (whole-tenant import, not a per-doc sync op).
-            let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
-            let crdt_payload = zerompk::to_msgpack_vec(&(bytes, prov)).map_err(|e| {
-                crate::Error::Serialization {
+            let payload = crate::wal::CrdtDeltaWalPayload {
+                bytes: bytes.clone(),
+                collection: None,
+                provenance: None,
+            };
+            let crdt_payload =
+                zerompk::to_msgpack_vec(&payload).map_err(|e| crate::Error::Serialization {
                     format: "msgpack".into(),
                     detail: format!("wal crdt snapshot import: {e}"),
-                }
-            })?;
+                })?;
             wal.append_crdt_delta(tenant_id, vshard_id, database_id, &crdt_payload)?;
         }
         PhysicalPlan::Graph(GraphOp::EdgePut {

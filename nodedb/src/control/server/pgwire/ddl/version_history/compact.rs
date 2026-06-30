@@ -45,6 +45,7 @@ pub async fn compact_history(
 
     // Dispatch compact to Data Plane.
     let plan = PhysicalPlan::Crdt(CrdtOp::CompactAtVersion {
+        collection: collection.clone(),
         target_version_json: record.version_vector_json.clone(),
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);

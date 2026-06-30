@@ -17,14 +17,14 @@ impl CoreLoop {
             } => self.execute_crdt_read(task, collection, document_id),
 
             CrdtOp::Apply {
-                collection: _,
+                collection,
                 document_id: _,
                 delta,
                 peer_id: _,
                 mutation_id: _,
                 surrogate: _,
                 provenance,
-            } => self.execute_crdt_apply(task, delta, provenance.as_ref()),
+            } => self.execute_crdt_apply(task, collection, delta, provenance.as_ref()),
 
             CrdtOp::ImportSnapshot { tenant_id, bytes } => {
                 self.execute_crdt_import_snapshot(task, *tenant_id, bytes)
@@ -50,11 +50,14 @@ impl CoreLoop {
                 version_vector_json,
             ),
 
-            CrdtOp::GetVersionVector => self.execute_crdt_get_version_vector(task),
-
-            CrdtOp::ExportDelta { from_version_json } => {
-                self.execute_crdt_export_delta(task, from_version_json)
+            CrdtOp::GetVersionVector { collection } => {
+                self.execute_crdt_get_version_vector(task, collection)
             }
+
+            CrdtOp::ExportDelta {
+                collection,
+                from_version_json,
+            } => self.execute_crdt_export_delta(task, collection, from_version_json),
 
             CrdtOp::RestoreToVersion {
                 collection,
@@ -64,8 +67,9 @@ impl CoreLoop {
             } => self.execute_crdt_restore(task, collection, document_id, target_version_json),
 
             CrdtOp::CompactAtVersion {
+                collection,
                 target_version_json,
-            } => self.execute_crdt_compact(task, target_version_json),
+            } => self.execute_crdt_compact(task, collection, target_version_json),
 
             CrdtOp::ListInsert {
                 collection,

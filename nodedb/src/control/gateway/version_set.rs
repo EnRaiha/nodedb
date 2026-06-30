@@ -312,9 +312,9 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | ListDelete { collection, .. }
                 | ListMove { collection, .. } => out.push(collection.clone()),
 
-                // No collection field. `ImportSnapshot` is a whole-tenant Loro
-                // import keyed by tenant id, not a per-collection op.
-                GetVersionVector
+                // `ImportSnapshot` is a whole-tenant Loro import — no per-collection
+                // version contribution.
+                GetVersionVector { .. }
                 | ExportDelta { .. }
                 | CompactAtVersion { .. }
                 | ImportSnapshot { .. } => {}

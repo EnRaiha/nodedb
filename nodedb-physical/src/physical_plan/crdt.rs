@@ -73,11 +73,12 @@ pub enum CrdtOp {
 
     /// Get the current oplog version vector for a tenant's CRDT state.
     /// Returns version vector as JSON string.
-    GetVersionVector,
+    GetVersionVector { collection: String },
 
     /// Export oplog delta from a version to current.
     /// Returns raw Loro delta bytes.
     ExportDelta {
+        collection: String,
         /// JSON-serialized version vector to start from.
         from_version_json: String,
     },
@@ -95,6 +96,7 @@ pub enum CrdtOp {
 
     /// Compact history at a specific version.
     CompactAtVersion {
+        collection: String,
         /// JSON-serialized version vector. Oplog before this is discarded.
         target_version_json: String,
     },
