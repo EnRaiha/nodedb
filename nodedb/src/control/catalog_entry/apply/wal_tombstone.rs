@@ -20,7 +20,6 @@ pub fn record(tenant_id: u64, collection: &str, purge_lsn: u64, catalog: &System
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::control::catalog_entry::apply::apply_to;
     use crate::control::catalog_entry::entry::CatalogEntry;
     use crate::control::security::credential::CredentialStore;

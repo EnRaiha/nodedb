@@ -108,15 +108,15 @@ async fn snapshot_round_trip_crdt() {
     let decoded: nodedb::types::TenantDataSnapshot =
         zerompk::from_msgpack(&bytes).expect("decode group snapshot");
     assert_eq!(
-        decoded.tenant_crdt_state.len(),
+        decoded.crdt_state.len(),
         1,
         "builder must carry the in-group tenant CRDT doc; got {}",
-        decoded.tenant_crdt_state.len()
+        decoded.crdt_state.len()
     );
     assert!(
-        decoded.tenant_crdt_state[0].1.iter().any(|c| c == COLL),
+        decoded.crdt_state[0].1 == COLL,
         "carried CRDT entry must be tagged with collection {COLL}; got {:?}",
-        decoded.tenant_crdt_state[0].1
+        decoded.crdt_state[0].1
     );
 
     // ── TARGET node: fresh server, NO routing. The applier needs none (the

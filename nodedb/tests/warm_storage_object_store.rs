@@ -211,6 +211,7 @@ async fn snapshot_bytes_roundtrip_write_and_restore() {
         crdt_snapshots: vec![CrdtSnapshot {
             tenant_id: 1,
             peer_id: 42,
+            collection: "testcoll".into(),
             snapshot_bytes: crdt_bytes.clone(),
         }],
     };
@@ -280,7 +281,7 @@ async fn snapshot_bytes_roundtrip_write_and_restore() {
     );
 
     // ── Verify HNSW checkpoint file ──────────────────────────────────────────
-    let ckpt_dir = data_dir.join("vector-ckpt");
+    let ckpt_dir = data_dir.join("vector-ckpt").join("core-0");
     let hnsw_ckpt = ckpt_dir.join("0:1:embeddings:emb.ckpt");
     assert!(
         hnsw_ckpt.exists(),
@@ -290,8 +291,14 @@ async fn snapshot_bytes_roundtrip_write_and_restore() {
     assert_eq!(on_disk, hnsw_bytes, "HNSW checkpoint bytes must match");
 
     // ── Verify CRDT checkpoint file ──────────────────────────────────────────
-    let crdt_dir = data_dir.join("crdt-ckpt");
-    let crdt_ckpt = crdt_dir.join("tenant-1.ckpt");
+    // CRDT checkpoints are per-collection and per-core:
+    // `crdt-ckpt/core-{id}/tenant-{tid}-coll-{hex(collection)}.ckpt`. The hex
+    // encoding mirrors the engine's filename scheme (collection bytes, lowercase).
+    let crdt_coll_hex: String = "testcoll".bytes().map(|b| format!("{b:02x}")).collect();
+    let crdt_ckpt = data_dir
+        .join("crdt-ckpt")
+        .join("core-0")
+        .join(format!("tenant-1-coll-{crdt_coll_hex}.ckpt"));
     assert!(
         crdt_ckpt.exists(),
         "CRDT checkpoint file must exist after restore"
