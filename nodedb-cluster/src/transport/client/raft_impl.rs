@@ -74,11 +74,7 @@ impl RaftTransport for NexarTransport {
         }
     }
 
-    async fn timeout_now(
-        &self,
-        target: u64,
-        req: TimeoutNowRequest,
-    ) -> nodedb_raft::Result<()> {
+    async fn timeout_now(&self, target: u64, req: TimeoutNowRequest) -> nodedb_raft::Result<()> {
         // Fire-and-forget: the receiver sends no reply (it either campaigns or
         // ignores per its term/leader guard). Loss is tolerated — the transfer
         // aborts on its deadline and is retried by the next convergence pass.

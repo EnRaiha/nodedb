@@ -251,6 +251,19 @@ impl RoutingTable {
         }
     }
 
+    /// Remove a learner from a group's learner list only. Voters (members) are
+    /// not touched. Returns `true` if the group existed and the learner was
+    /// actually present and removed; `false` for unknown groups or absent peers.
+    pub fn remove_group_learner(&mut self, group_id: u64, peer: u64) -> bool {
+        if let Some(info) = self.group_members.get_mut(&group_id) {
+            let before = info.learners.len();
+            info.learners.retain(|&id| id != peer);
+            info.learners.len() != before
+        } else {
+            false
+        }
+    }
+
     /// Promote a learner to a voter within a group. Returns `true` if the
     /// learner was found and promoted.
     pub fn promote_group_learner(&mut self, group_id: u64, peer: u64) -> bool {
@@ -395,6 +408,38 @@ mod tests {
     fn remove_group_member_unknown_group_returns_false() {
         let mut rt = RoutingTable::uniform(1, &[1, 2], 2);
         assert!(!rt.remove_group_member(99, 1));
+    }
+
+    #[test]
+    fn remove_group_learner_removes_from_learners_only() {
+        let mut rt = RoutingTable::uniform(2, &[1, 2, 3], 3);
+        rt.add_group_learner(1, 9);
+        let members_before = rt.group_info(1).unwrap().members.clone();
+
+        assert!(rt.remove_group_learner(1, 9));
+
+        let info = rt.group_info(1).unwrap();
+        assert!(!info.learners.contains(&9), "learner must be removed");
+        assert_eq!(info.members, members_before, "voters must not be affected");
+    }
+
+    #[test]
+    fn remove_group_learner_noop_for_voter_and_absent() {
+        let mut rt = RoutingTable::uniform(2, &[1, 2, 3], 3);
+        let members_before = rt.group_info(1).unwrap().members.clone();
+
+        // Voter node — remove_group_learner must not touch it.
+        assert!(!rt.remove_group_learner(1, members_before[0]));
+        assert_eq!(rt.group_info(1).unwrap().members, members_before);
+
+        // Absent learner — returns false without panic.
+        assert!(!rt.remove_group_learner(1, 999));
+    }
+
+    #[test]
+    fn remove_group_learner_unknown_group_returns_false() {
+        let mut rt = RoutingTable::uniform(1, &[1, 2], 2);
+        assert!(!rt.remove_group_learner(99, 1));
     }
 
     #[test]

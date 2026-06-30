@@ -17,6 +17,8 @@
 //! - `PromoteLearner` → learner moved from `learners` to `members` in both;
 //!   if the promoted peer is *this* node, also flips the local role from
 //!   `Learner` to `Follower`.
+//! - `RemoveLearner` → learner removed from `RaftNode.learners` and
+//!   `routing.learners`; voters (members) are not touched.
 
 use tracing::debug;
 
@@ -155,6 +157,15 @@ impl MultiRaft {
                     .unwrap_or_else(|p| p.into_inner())
                     .promote_group_learner(group_id, change.node_id);
             }
+            ConfChangeType::RemoveLearner => {
+                // Non-voting removal: safe at any time — learners are not in
+                // quorum, commit, or election paths.
+                node.remove_learner(change.node_id);
+                self.routing
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove_group_learner(group_id, change.node_id);
+            }
         }
 
         debug!(
@@ -266,5 +277,79 @@ mod tests {
         let info = rt.group_info(0).unwrap();
         assert_eq!(info.members, vec![1, 2]);
         assert!(info.learners.is_empty());
+    }
+
+    #[test]
+    fn apply_remove_learner_drops_from_learners_only() {
+        let mut mr = new_mr(1, &[0]);
+        // Add learner first.
+        mr.apply_conf_change(
+            0,
+            &ConfChange {
+                change_type: ConfChangeType::AddLearner,
+                node_id: 2,
+            },
+        )
+        .unwrap();
+
+        // Confirm it's present.
+        assert_eq!(mr.groups.get(&0).unwrap().learners(), &[2]);
+
+        // Remove the learner.
+        mr.apply_conf_change(
+            0,
+            &ConfChange {
+                change_type: ConfChangeType::RemoveLearner,
+                node_id: 2,
+            },
+        )
+        .unwrap();
+
+        // RaftNode: learner gone, voters untouched.
+        let node = mr.groups.get(&0).unwrap();
+        assert!(node.learners().is_empty());
+        assert!(node.voters().is_empty());
+
+        // Routing: learners empty, members (self) untouched.
+        let rt = mr.routing();
+        let rt = rt.read().unwrap();
+        let info = rt.group_info(0).unwrap();
+        assert!(info.learners.is_empty());
+        assert_eq!(info.members, vec![1]);
+    }
+
+    #[test]
+    fn apply_remove_learner_noop_for_voter_and_absent() {
+        let mut mr = new_mr(1, &[0]);
+
+        // Removing a voter via RemoveLearner must be a no-op (does not
+        // touch the voter list).
+        mr.apply_conf_change(
+            0,
+            &ConfChange {
+                change_type: ConfChangeType::RemoveLearner,
+                node_id: 1,
+            },
+        )
+        .unwrap();
+        let rt = mr.routing();
+        let rt = rt.read().unwrap();
+        let info = rt.group_info(0).unwrap();
+        assert_eq!(
+            info.members,
+            vec![1],
+            "voter must not be removed by RemoveLearner"
+        );
+
+        // Removing an absent peer must also be a no-op.
+        drop(rt);
+        mr.apply_conf_change(
+            0,
+            &ConfChange {
+                change_type: ConfChangeType::RemoveLearner,
+                node_id: 99,
+            },
+        )
+        .unwrap();
     }
 }

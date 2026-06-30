@@ -41,6 +41,10 @@ pub enum ConfChangeType {
     AddLearner = 2,
     /// Promote a learner to a full voting member.
     PromoteLearner = 3,
+    /// Remove a non-voting learner from the Raft group.
+    ///
+    /// Safe at any time: learners are not in quorum, commit, or election paths.
+    RemoveLearner = 4,
 }
 
 /// A configuration change for a Raft group.
@@ -148,6 +152,7 @@ mod tests {
             ConfChangeType::RemoveNode,
             ConfChangeType::AddLearner,
             ConfChangeType::PromoteLearner,
+            ConfChangeType::RemoveLearner,
         ] {
             let cc = ConfChange {
                 change_type: ct,
