@@ -184,6 +184,11 @@ impl CoreLoop {
             let tenant_id = crate::types::TenantId::new(tid);
             match self.get_crdt_engine(tenant_id) {
                 Ok(engine) => {
+                    // NOTE: applies committed CRDT deltas via a bare import, with NO
+                    // constraint validation. If deterministic apply-time validation is
+                    // ever added, it MUST also gate this path (and the WAL replay path) —
+                    // otherwise a delta rejected on one path could persist here and
+                    // diverge from peers.
                     if let Err(e) = engine.apply_committed_delta(&collection, &delta) {
                         error!(
                             core = self.core_id,

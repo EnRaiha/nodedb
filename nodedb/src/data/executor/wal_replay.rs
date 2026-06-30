@@ -243,6 +243,11 @@ impl CoreLoop {
 
             match self.get_crdt_engine(tid) {
                 Ok(engine) => {
+                    // NOTE: replays committed CRDT deltas via a bare import, with NO
+                    // constraint validation. If deterministic apply-time validation is
+                    // ever added to the live apply path, it MUST also gate this replay
+                    // path (and the batch apply path) — otherwise a delta rejected live
+                    // could be re-imported here on restart and diverge from peers.
                     if let Err(e) = engine.apply_committed_delta(collection, &payload.bytes) {
                         warn!(
                             core = self.core_id,
