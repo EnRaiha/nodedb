@@ -50,6 +50,53 @@ fn replicated_entry_roundtrip() {
 }
 
 #[test]
+fn constraint_change_roundtrip() {
+    let entry = ReplicatedEntry::new(
+        7,
+        3,
+        ReplicatedWrite::ConstraintChange {
+            collection: "orders".into(),
+            op: ConstraintChangeOp::Set,
+            constraints: vec![vec![1, 2, 3], vec![4, 5, 6]],
+        },
+    );
+    let original_key = entry.idempotency_key;
+
+    let bytes = entry.to_bytes();
+    let decoded = ReplicatedEntry::from_bytes(&bytes).expect("decode failed");
+    assert_eq!(decoded.tenant_id, 7);
+    assert_eq!(decoded.vshard_id, 3);
+    assert_eq!(decoded.idempotency_key, original_key);
+    match decoded.write {
+        ReplicatedWrite::ConstraintChange {
+            collection,
+            op,
+            constraints,
+        } => {
+            assert_eq!(collection, "orders");
+            assert_eq!(op, ConstraintChangeOp::Set);
+            assert_eq!(constraints, vec![vec![1u8, 2, 3], vec![4u8, 5, 6]]);
+        }
+        other => panic!("expected ConstraintChange, got {other:?}"),
+    }
+}
+
+#[test]
+fn constraint_change_encoding_is_deterministic() {
+    let write = ReplicatedWrite::ConstraintChange {
+        collection: "orders".into(),
+        op: ConstraintChangeOp::Drop,
+        constraints: vec![vec![1, 2, 3], vec![4, 5, 6]],
+    };
+    let a = zerompk::to_msgpack_vec(&write).expect("encode a failed");
+    let b = zerompk::to_msgpack_vec(&write).expect("encode b failed");
+    assert_eq!(
+        a, b,
+        "encoding the same ConstraintChange must be byte-identical"
+    );
+}
+
+#[test]
 fn all_write_variants_serialize() {
     let writes = vec![
         ReplicatedWrite::PointPut {
@@ -106,6 +153,11 @@ fn all_write_variants_serialize() {
             array: "genome".into(),
             snapshot_payload: vec![0xbe, 0xef],
             schema_hlc_bytes: [1u8; 18],
+        },
+        ReplicatedWrite::ConstraintChange {
+            collection: "orders".into(),
+            op: ConstraintChangeOp::Set,
+            constraints: vec![vec![1, 2, 3]],
         },
     ];
 

@@ -86,6 +86,23 @@ pub struct ReplicatedBatchEdge {
     pub dst_surrogate: u32,
 }
 
+/// Whether a `ConstraintChange` installs (`Set`) or removes (`Drop`) a
+/// collection's constraint set on every replica.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub enum ConstraintChangeOp {
+    Set,
+    Drop,
+}
+
 /// A write operation serialized for Raft replication.
 ///
 /// Mirrors the write variants of [`PhysicalPlan`] but uses only types that
@@ -478,6 +495,20 @@ pub enum ReplicatedWrite {
         tenant_id: u64,
         /// Msgpack-encoded `Vec<(PassiveReadKeyId, Value)>`.
         values: Vec<u8>,
+    },
+
+    /// Carries a collection's constraint set onto the per-vshard data Raft
+    /// log so every replica installs the same constraints deterministically.
+    ///
+    /// `constraints` is an opaque list of zerompk-encoded constraint blobs:
+    /// this crate stays decoupled from the constraint wire layout (mirroring
+    /// the opaque-payload precedent of `op_bytes` / `geometry_bytes`) and
+    /// never interprets the bytes. `op` selects whether the set is installed
+    /// (`Set`) or removed (`Drop`) for `collection`.
+    ConstraintChange {
+        collection: String,
+        op: ConstraintChangeOp,
+        constraints: Vec<Vec<u8>>,
     },
 }
 

@@ -33,7 +33,9 @@ pub fn from_replicated_entry(
     // function is called. Return None so the applier skips the generic dispatch
     // path for them.
     match &entry.write {
-        ReplicatedWrite::ArrayOp { .. } | ReplicatedWrite::ArraySchema { .. } => {
+        ReplicatedWrite::ArrayOp { .. }
+        | ReplicatedWrite::ArraySchema { .. }
+        | ReplicatedWrite::ConstraintChange { .. } => {
             return Ok(None);
         }
         _ => {}
@@ -700,6 +702,12 @@ fn to_physical_plan(
         ReplicatedWrite::CalvinReadResult { .. } => {
             return Err(crate::Error::Internal {
                 detail: "CalvinReadResult reached to_physical_plan (should have been intercepted)"
+                    .into(),
+            });
+        }
+        ReplicatedWrite::ConstraintChange { .. } => {
+            return Err(crate::Error::Internal {
+                detail: "ConstraintChange reached to_physical_plan (should have been intercepted)"
                     .into(),
             });
         }
