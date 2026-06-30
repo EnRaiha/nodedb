@@ -20,6 +20,8 @@
 //! while placement is `None` (the bootstrap window) — the `let Some` guard
 //! ensures the bootstrap invariant is never violated.
 
+use std::collections::HashSet;
+
 use tracing::debug;
 
 use crate::conf_change::{ConfChange, ConfChangeType};
@@ -43,6 +45,44 @@ pub(super) fn plan_entering_learners(
         .collect();
     out.sort_unstable();
     out.dedup();
+    out
+}
+
+/// Groups this running node should host (mount a Raft replica for) but does
+/// not yet. The signal is the replicated `placement` set: a node that does NOT
+/// host group G is not in G's Raft fan-out and never applies G's conf-changes,
+/// so `members`/`learners` for self are NOT populated on it. `placement`, by
+/// contrast, is authored on the metadata group — which every node hosts and
+/// applies — so it is the only authoritative, always-visible signal that this
+/// node is meant to host G.
+///
+/// Returns gids G where `placement` is `Some(p)` and `p.contains(&self_id)` and
+/// `!hosted.contains(&G)`, skipping the metadata and sequencer groups (handled
+/// elsewhere). Returned sorted ascending. Pure and deterministic.
+pub(super) fn plan_entering_mounts(
+    self_id: u64,
+    hosted: &HashSet<u64>,
+    routing: &crate::routing::RoutingTable,
+) -> Vec<u64> {
+    let mut out: Vec<u64> = routing
+        .group_members()
+        .iter()
+        .filter_map(|(&gid, info)| {
+            if gid == crate::metadata_group::METADATA_GROUP_ID
+                || gid == crate::calvin::sequencer::SEQUENCER_GROUP_ID
+            {
+                return None;
+            }
+            if hosted.contains(&gid) {
+                return None;
+            }
+            match &info.placement {
+                Some(p) if p.contains(&self_id) => Some(gid),
+                _ => None,
+            }
+        })
+        .collect();
+    out.sort_unstable();
     out
 }
 
@@ -87,6 +127,81 @@ pub(super) fn plan_leaving_voters(actual_voters: &[u64], placement: &[u64], rf: 
 }
 
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
+    /// Mount a Raft replica for a group this node should host (per the
+    /// replicated `placement` set) but does not yet.
+    ///
+    /// This is the missing link for groups whose join-time `AddLearner(self)`
+    /// was deferred (a group led by a node other than the seed/metadata leader
+    /// handling the join): the group leader later authors `AddLearner(self)`
+    /// via `converge_entering_learners`, but until this node actually mounts a
+    /// replica, every AppendEntries / InstallSnapshot to it is rejected with
+    /// `GroupNotFound` and the node never catches up or gets promoted. Mounting
+    /// here lets the existing replication → snapshot → promotion machinery
+    /// converge the group to `members == placement`.
+    ///
+    /// At most ONE group is mounted per tick. `add_group_as_learner` opens a
+    /// per-group redb file synchronously while holding the `multi_raft` lock;
+    /// capping at one bounds that work so a burst of newly-placed groups cannot
+    /// stall the reactor past an election timeout. The phase is idempotent and
+    /// runs every tick, so remaining groups mount on subsequent ticks.
+    pub(super) fn mount_entering_groups(&self) {
+        // Phase 1: snapshot the hosted set and the first planned mount under one
+        // lock acquisition. Lock order is multi_raft THEN routing (the
+        // established order); both guards are dropped before any mount.
+        let mount: Option<(u64, Vec<u64>, Vec<u64>)> = {
+            let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+            let hosted: HashSet<u64> = mr.group_ids().into_iter().collect();
+            let routing = mr.routing();
+            let routing = routing.read().unwrap_or_else(|p| p.into_inner());
+            plan_entering_mounts(self.node_id, &hosted, &routing)
+                .into_iter()
+                .next()
+                .and_then(|gid| {
+                    routing.group_info(gid).map(|info| {
+                        let voters: Vec<u64> = info
+                            .members
+                            .iter()
+                            .copied()
+                            .filter(|&id| id != self.node_id)
+                            .collect();
+                        let other_learners: Vec<u64> = info
+                            .learners
+                            .iter()
+                            .copied()
+                            .filter(|&id| id != self.node_id)
+                            .collect();
+                        (gid, voters, other_learners)
+                    })
+                })
+        };
+
+        // Phase 2: mount under a re-acquired lock, re-checking `contains_group`
+        // to stay idempotent against a race with the join-time mount.
+        if let Some((gid, voters, other_learners)) = mount {
+            let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+            if mr.contains_group(gid) {
+                return;
+            }
+            match mr.add_group_as_learner(gid, voters, other_learners) {
+                Ok(()) => {
+                    debug!(
+                        group_id = gid,
+                        node_id = self.node_id,
+                        "mount: added local learner replica for placed group"
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        group_id = gid,
+                        node_id = self.node_id,
+                        error = %e,
+                        "mount: add_group_as_learner failed; retrying next tick"
+                    );
+                }
+            }
+        }
+    }
+
     /// For each group this node leads that has an authored placement set,
     /// propose `AddLearner` for placement nodes not yet voters or learners.
     ///
@@ -331,7 +446,91 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_entering_learners, plan_leaving_learners, plan_leaving_voters};
+    use super::{
+        plan_entering_learners, plan_entering_mounts, plan_leaving_learners, plan_leaving_voters,
+    };
+    use crate::routing::{GroupInfo, RoutingTable};
+    use std::collections::HashSet;
+
+    fn group(members: Vec<u64>, learners: Vec<u64>, placement: Option<Vec<u64>>) -> GroupInfo {
+        GroupInfo {
+            leader: members.first().copied().unwrap_or(0),
+            members,
+            learners,
+            placement,
+        }
+    }
+
+    fn routing(groups: Vec<(u64, GroupInfo)>) -> RoutingTable {
+        RoutingTable::from_parts(Vec::new(), groups.into_iter().collect())
+    }
+
+    fn hosted(ids: &[u64]) -> HashSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn mount_when_placement_contains_self_and_not_hosted() {
+        let rt = routing(vec![(5, group(vec![1, 3], vec![], Some(vec![1, 3, 4])))]);
+        assert_eq!(plan_entering_mounts(4, &hosted(&[]), &rt), vec![5]);
+    }
+
+    #[test]
+    fn skip_already_hosted_group() {
+        let rt = routing(vec![(5, group(vec![1, 3], vec![], Some(vec![1, 3, 4])))]);
+        assert_eq!(
+            plan_entering_mounts(4, &hosted(&[5]), &rt),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn skip_metadata_and_sequencer_groups() {
+        let meta = crate::metadata_group::METADATA_GROUP_ID;
+        let seq = crate::calvin::sequencer::SEQUENCER_GROUP_ID;
+        let rt = routing(vec![
+            (meta, group(vec![1], vec![], Some(vec![1, 4]))),
+            (seq, group(vec![1], vec![], Some(vec![1, 4]))),
+        ]);
+        assert_eq!(
+            plan_entering_mounts(4, &hosted(&[]), &rt),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn skip_when_placement_none() {
+        let rt = routing(vec![(5, group(vec![1, 3], vec![], None))]);
+        assert_eq!(
+            plan_entering_mounts(4, &hosted(&[]), &rt),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn skip_when_placement_excludes_self() {
+        let rt = routing(vec![(5, group(vec![1, 3], vec![], Some(vec![1, 3, 2])))]);
+        assert_eq!(
+            plan_entering_mounts(4, &hosted(&[]), &rt),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn mount_self_only_placement() {
+        let rt = routing(vec![(7, group(vec![], vec![], Some(vec![4])))]);
+        assert_eq!(plan_entering_mounts(4, &hosted(&[]), &rt), vec![7]);
+    }
+
+    #[test]
+    fn mount_output_is_sorted() {
+        let rt = routing(vec![
+            (9, group(vec![1], vec![], Some(vec![1, 4]))),
+            (3, group(vec![1], vec![], Some(vec![1, 4]))),
+            (6, group(vec![1], vec![], Some(vec![1, 4]))),
+        ]);
+        assert_eq!(plan_entering_mounts(4, &hosted(&[]), &rt), vec![3, 6, 9]);
+    }
 
     #[test]
     fn entering_nodes_not_yet_in_membership() {

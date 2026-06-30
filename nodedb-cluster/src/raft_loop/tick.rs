@@ -406,6 +406,13 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             }
         }
 
+        // Mount a local replica for any group this node should host (per the
+        // replicated placement set) but does not yet — the recovery path for a
+        // group whose join-time AddLearner(self) was deferred. Runs before the
+        // convergence phases so a freshly-mounted group is visible to the rest
+        // of the pipeline on the same tick. At most one mount per tick.
+        self.mount_entering_groups();
+
         // Add placement nodes as learners so `promote_ready_learners` can
         // pick them up once they catch up. Re-proposals while a conf-change
         // is already pending are harmlessly rejected by Raft. Runs every tick.
