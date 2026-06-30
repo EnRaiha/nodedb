@@ -19,13 +19,12 @@
 //!      member of `P` drawn from the live node set `{1,2,3,4}`.
 //!   2. Every node in `P` has been promoted to a voter (entering learners are
 //!      promoted into membership) — `P ⊆ members`.
-//!   3. Voters not in `P` have left, with ONE exception: a placement-excluded
-//!      voter that is the group's current leader is NOT removed. Removing a
-//!      voter is a Raft `RemoveNode`; a leader removing itself would require a
-//!      leadership-transfer primitive the cluster does not yet have, so that
-//!      single removal is deferred. The steady state per group is therefore
-//!      EITHER `members == P` (the extra voter was a follower and left) OR
-//!      `members == P ∪ {leader}` (the extra voter is the leader, deferred).
+//!   3. Voters not in `P` have left — with NO exception. The steady state per
+//!      group is exactly `members == P`. A placement-excluded voter that is the
+//!      group leader cannot `RemoveNode` itself, so leadership is first
+//!      transferred to an in-placement voter; on a later tick the ex-leader is
+//!      a follower and is removed like any other leaving voter. There is no
+//!      surviving "extra voter is the leader" carve-out.
 //!
 //! ## Shape
 //!
@@ -109,15 +108,16 @@ fn data_group_ids(cluster: &TestCluster) -> Vec<u64> {
 /// Has group `gid` reached the converged steady state on `node`?
 ///
 /// Converged iff: placement is `Some(P)` with `|P| == min(RF, N)`, `P` is a
-/// subset of the live node set, `P ⊆ members`, and every voter outside `P` is
-/// the leader (at most one such voter, the deferred leader removal).
+/// subset of the live node set, and the group's voter set is EXACTLY `P`
+/// (entering learners promoted, every leaving voter — leader included via
+/// step-aside — removed).
 fn group_converged(
     node: &common::cluster_harness::TestClusterNode,
     gid: u64,
     live: &[u64],
     expected_len: usize,
 ) -> bool {
-    let (placement, leader) = placement_and_leader(node, gid);
+    let (placement, _leader) = placement_and_leader(node, gid);
     let Some(p) = placement else {
         return false;
     };
@@ -127,14 +127,9 @@ fn group_converged(
     if !p.iter().all(|n| live.contains(n)) {
         return false;
     }
-    let members = voters_seen_by(node, gid);
-    // Entering learners promoted: every placement node is a voter.
-    if !p.iter().all(|n| members.contains(n)) {
-        return false;
-    }
-    // Down-convergence modulo the deferred leader removal: any voter not in P
-    // must be the current leader.
-    members.iter().all(|m| p.contains(m) || *m == leader)
+    // Voter set is exactly the placement set: every placement node promoted and
+    // every leaving voter (including a stepped-aside ex-leader) removed.
+    voters_seen_by(node, gid) == p
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -222,25 +217,16 @@ async fn placement_converges_to_min_rf_when_node_count_exceeds_rf() {
              leader={leader}"
         );
 
-        // (3) Down-convergence modulo the deferred leader removal. Any voter
-        // outside placement must be the current leader (a leader cannot remove
-        // itself without a leadership-transfer primitive, so that one removal
-        // is deferred). Hence steady state is members == P, or members == P plus
-        // the leader.
-        let extra: Vec<u64> = members.iter().copied().filter(|m| !p.contains(m)).collect();
-        assert!(
-            extra.len() <= 1,
-            "data group {gid}: more than one voter outside placement {p:?}: \
-             extra={extra:?}, members={members:?}, leader={leader}"
+        // (3) Full down-convergence: the voter set is EXACTLY the placement set.
+        // No voter outside placement survives — a placement-excluded leader
+        // steps aside (leadership transfers to an in-placement voter) and is
+        // then removed like any other leaving voter.
+        assert_eq!(
+            members, p,
+            "data group {gid}: voter set {members:?} did not converge to exactly \
+             placement {p:?} (leader={leader}); a placement-excluded voter — leader \
+             or follower — must be removed"
         );
-        if let Some(&only) = extra.first() {
-            assert_eq!(
-                only, leader,
-                "data group {gid}: voter {only} is outside placement {p:?} but is not the \
-                 leader ({leader}) — only a placement-excluded leader may legitimately remain; \
-                 members={members:?}"
-            );
-        }
 
         // (4) Cross-node agreement: every live node's routing view agrees on
         // this group's voter set.

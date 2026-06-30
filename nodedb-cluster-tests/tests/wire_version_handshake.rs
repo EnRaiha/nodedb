@@ -27,6 +27,8 @@ use nodedb_raft::message::{AppendEntriesRequest, AppendEntriesResponse};
 struct EchoHandler;
 
 impl RaftRpcHandler for EchoHandler {
+    async fn on_timeout_now(&self, _req: nodedb_raft::TimeoutNowRequest) {}
+
     async fn handle_rpc(&self, rpc: RaftRpc) -> nodedb_cluster::Result<RaftRpc> {
         match rpc {
             RaftRpc::AppendEntriesRequest(req) => {
@@ -138,6 +140,8 @@ struct SentinelHandler {
 }
 
 impl RaftRpcHandler for SentinelHandler {
+    async fn on_timeout_now(&self, _req: nodedb_raft::TimeoutNowRequest) {}
+
     async fn handle_rpc(&self, _rpc: RaftRpc) -> nodedb_cluster::Result<RaftRpc> {
         self.invoked.store(true, Ordering::SeqCst);
         Err(ClusterError::Transport {

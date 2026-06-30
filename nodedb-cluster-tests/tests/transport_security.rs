@@ -51,6 +51,8 @@ use nodedb_raft::transport::RaftTransport;
 struct EchoHandler;
 
 impl RaftRpcHandler for EchoHandler {
+    async fn on_timeout_now(&self, _req: nodedb_raft::TimeoutNowRequest) {}
+
     async fn handle_rpc(
         &self,
         rpc: nodedb_cluster::RaftRpc,

@@ -405,6 +405,14 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // `members` and `ready_learners` no longer returns it.
         self.promote_ready_learners();
 
+        // Step aside before the leaving-voter removal below: if this node is the
+        // leader yet placement says it must leave, transfer leadership to an
+        // in-placement voter so a later tick can remove this node cleanly. Runs
+        // after promotion (so a freshly-promoted voter can be a target) and
+        // before `converge_leaving_voters` (whose leader-skip defers self-removal
+        // until this transfer takes effect).
+        self.transfer_leadership_for_leaving_voters();
+
         // Remove committed voters no longer in a group's placement set, once
         // their replacement has been promoted (RF floor on committed voters).
         // At most one removal per group per pass; never removes the leader.
