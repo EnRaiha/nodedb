@@ -67,6 +67,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 BatchMap::new();
             let mut vote_batches: BatchMap<u64, Vec<(u64, nodedb_raft::RequestVoteRequest)>> =
                 BatchMap::new();
+            let mut timeout_now_msgs: Vec<(u64, nodedb_raft::TimeoutNowRequest)> = Vec::new();
 
             for (group_id, group_ready) in &ready.groups {
                 for (peer, req) in &group_ready.messages {
@@ -80,6 +81,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                         .entry(*peer)
                         .or_default()
                         .push((*group_id, req.clone()));
+                }
+                for (dest, req) in &group_ready.timeout_now {
+                    timeout_now_msgs.push((*dest, req.clone()));
                 }
             }
 
@@ -156,6 +160,26 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                                         break;
                                     }
                                 }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Dispatch TimeoutNow — one task per message (one-way, no response).
+            for (dest, req) in timeout_now_msgs {
+                let transport = self.transport.clone();
+                let mut shutdown_rx = self.shutdown_watch.subscribe();
+                tokio::spawn(async move {
+                    if *shutdown_rx.borrow() {
+                        return;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.changed() => {}
+                        result = transport.timeout_now(dest, req) => {
+                            if let Err(e) = result {
+                                warn!(dest, error = %e, "timeout_now RPC failed");
                             }
                         }
                     }

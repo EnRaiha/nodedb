@@ -105,6 +105,10 @@ pub const RPC_SUBMIT_CALVIN_TXN_RESP: u8 = 37;
 pub const RPC_SUBMIT_CALVIN_INBOX_REQ: u8 = 38;
 pub const RPC_SUBMIT_CALVIN_INBOX_RESP: u8 = 39;
 
+/// TimeoutNow (leadership transfer). One-way — sender does not await a reply.
+/// The receiver immediately starts an election for the addressed Raft group.
+pub const RPC_TIMEOUT_NOW_REQ: u8 = 40;
+
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared
 // here so external code can reference them without importing the full enum.

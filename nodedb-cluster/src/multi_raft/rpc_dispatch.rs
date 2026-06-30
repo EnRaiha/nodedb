@@ -8,7 +8,7 @@
 
 use nodedb_raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse,
+    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 
 use crate::error::{ClusterError, Result};
@@ -53,6 +53,18 @@ impl MultiRaft {
                 group_id: req.group_id,
             })?;
         Ok(node.handle_install_snapshot(req))
+    }
+
+    /// Route a TimeoutNow RPC to the correct group.
+    ///
+    /// One-way — no response is produced. Silently ignored if the group is
+    /// not mounted on this node (mirrors `handle_request_vote` for absent
+    /// groups). The term+leader_id guard inside `RaftNode::handle_timeout_now`
+    /// remains in place as an additional correctness check.
+    pub fn handle_timeout_now(&mut self, req: &TimeoutNowRequest) {
+        if let Some(node) = self.groups.get_mut(&req.group_id) {
+            node.handle_timeout_now(req);
+        }
     }
 
     /// Get the current term and snapshot metadata for a group (for building

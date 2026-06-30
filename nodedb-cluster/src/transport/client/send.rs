@@ -155,6 +155,27 @@ impl NexarTransport {
         }))
     }
 
+    /// Fire-and-forget one-way RPC: encode, send, and return without reading a
+    /// reply. For best-effort notifications (e.g. `TimeoutNow`) where the caller
+    /// expects no response and tolerates loss — no retry or circuit-breaker, so
+    /// a dropped frame is the caller's concern to recover from.
+    pub async fn send_rpc_oneway(&self, target: u64, rpc: RaftRpc) -> Result<()> {
+        let envelope = self.wrap_outbound(&rpc)?;
+        let conn = self.get_or_connect(target).await?;
+        let (mut send, _recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
+            detail: format!("oneway open_bi to node {target}: {e}"),
+        })?;
+        send.write_all(&envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("oneway write to node {target}: {e}"),
+            })?;
+        send.finish().map_err(|e| ClusterError::Transport {
+            detail: format!("oneway finish to node {target}: {e}"),
+        })?;
+        Ok(())
+    }
+
     /// Open a streaming RPC to `target` and return a stream of result chunks.
     ///
     /// Sibling of [`try_send_once`](Self::try_send_once) for multi-frame

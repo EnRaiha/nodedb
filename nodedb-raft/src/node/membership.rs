@@ -252,6 +252,7 @@ impl<S: LogStorage> RaftNode<S> {
             TimeoutNowRequest {
                 term: self.hard_state.current_term,
                 leader_id: self.config.node_id,
+                group_id: self.config.group_id,
             },
         ));
 

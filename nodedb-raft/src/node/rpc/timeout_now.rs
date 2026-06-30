@@ -116,6 +116,7 @@ mod tests {
         assert_eq!(dest, 2);
         assert_eq!(req.leader_id, 1);
         assert_eq!(req.term, 1);
+        assert_eq!(req.group_id, 1);
 
         let mut target = follower_of_leader1();
         let term_before = target.current_term();
@@ -148,6 +149,7 @@ mod tests {
         f.handle_timeout_now(&TimeoutNowRequest {
             term: 2,
             leader_id: 1,
+            group_id: 1,
         });
         assert_eq!(f.role(), NodeRole::Follower);
         assert_eq!(f.current_term(), 1);
@@ -157,6 +159,7 @@ mod tests {
         f.handle_timeout_now(&TimeoutNowRequest {
             term: 1,
             leader_id: 9,
+            group_id: 1,
         });
         assert_eq!(f.role(), NodeRole::Follower);
         assert_eq!(f.current_term(), 1);
@@ -164,7 +167,11 @@ mod tests {
         // Not a follower (a leader).
         let mut l = leader_3voter();
         let term = l.current_term();
-        l.handle_timeout_now(&TimeoutNowRequest { term, leader_id: 1 });
+        l.handle_timeout_now(&TimeoutNowRequest {
+            term,
+            leader_id: 1,
+            group_id: 1,
+        });
         assert_eq!(l.role(), NodeRole::Leader);
         assert_eq!(l.current_term(), term);
     }

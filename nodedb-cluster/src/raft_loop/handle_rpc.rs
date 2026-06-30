@@ -10,6 +10,8 @@
 use crate::error::{ClusterError, Result};
 use crate::forward::{ChunkSink, PlanExecutor};
 use crate::health;
+use nodedb_raft::message::TimeoutNowRequest;
+
 use crate::rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
@@ -532,6 +534,11 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                 }),
             },
         }
+    }
+
+    async fn on_timeout_now(&self, req: TimeoutNowRequest) {
+        let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+        mr.handle_timeout_now(&req);
     }
 }
 

@@ -4,7 +4,7 @@
 
 use nodedb_raft::message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse,
+    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 
 use super::calvin_submit::{
@@ -40,6 +40,7 @@ pub enum RaftRpc {
     AppendEntriesResponse(AppendEntriesResponse),
     RequestVoteRequest(RequestVoteRequest),
     RequestVoteResponse(RequestVoteResponse),
+    TimeoutNowRequest(TimeoutNowRequest),
     InstallSnapshotRequest(InstallSnapshotRequest),
     InstallSnapshotResponse(InstallSnapshotResponse),
     // Cluster management
@@ -128,6 +129,7 @@ pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
         RaftRpc::AppendEntriesResponse(m) => raft_msgs::encode_append_entries_resp(m, &mut out),
         RaftRpc::RequestVoteRequest(m) => raft_msgs::encode_request_vote_req(m, &mut out),
         RaftRpc::RequestVoteResponse(m) => raft_msgs::encode_request_vote_resp(m, &mut out),
+        RaftRpc::TimeoutNowRequest(m) => raft_msgs::encode_timeout_now_req(m, &mut out),
         RaftRpc::InstallSnapshotRequest(m) => raft_msgs::encode_install_snapshot_req(m, &mut out),
         RaftRpc::InstallSnapshotResponse(m) => raft_msgs::encode_install_snapshot_resp(m, &mut out),
         RaftRpc::JoinRequest(m) => cluster_mgmt::encode_join_req(m, &mut out),
@@ -211,6 +213,7 @@ pub fn decode(data: &[u8]) -> Result<RaftRpc> {
         RPC_APPEND_ENTRIES_RESP => raft_msgs::decode_append_entries_resp(payload),
         RPC_REQUEST_VOTE_REQ => raft_msgs::decode_request_vote_req(payload),
         RPC_REQUEST_VOTE_RESP => raft_msgs::decode_request_vote_resp(payload),
+        RPC_TIMEOUT_NOW_REQ => raft_msgs::decode_timeout_now_req(payload),
         RPC_INSTALL_SNAPSHOT_REQ => raft_msgs::decode_install_snapshot_req(payload),
         RPC_INSTALL_SNAPSHOT_RESP => raft_msgs::decode_install_snapshot_resp(payload),
         RPC_JOIN_REQ => cluster_mgmt::decode_join_req(payload),

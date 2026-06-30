@@ -4,7 +4,7 @@
 
 use nodedb_raft::message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse,
+    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 
 use super::discriminants::*;
@@ -106,10 +106,22 @@ pub(super) fn decode_install_snapshot_resp(payload: &[u8]) -> Result<RaftRpc> {
     )?))
 }
 
+pub(super) fn encode_timeout_now_req(msg: &TimeoutNowRequest, out: &mut Vec<u8>) -> Result<()> {
+    write_frame(RPC_TIMEOUT_NOW_REQ, &rkyv_to_bytes!(msg)?, out)
+}
+
+pub(super) fn decode_timeout_now_req(payload: &[u8]) -> Result<RaftRpc> {
+    Ok(RaftRpc::TimeoutNowRequest(rkyv_from_bytes!(
+        payload,
+        TimeoutNowRequest,
+        "TimeoutNowRequest"
+    )?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nodedb_raft::message::LogEntry;
+    use nodedb_raft::message::{LogEntry, TimeoutNowRequest};
 
     fn roundtrip(rpc: RaftRpc) -> RaftRpc {
         let encoded = super::super::encode(&rpc).unwrap();
@@ -274,6 +286,23 @@ mod tests {
         match roundtrip(RaftRpc::InstallSnapshotResponse(resp)) {
             RaftRpc::InstallSnapshotResponse(d) => assert_eq!(d.term, 7),
             other => panic!("expected InstallSnapshotResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_timeout_now_request() {
+        let req = TimeoutNowRequest {
+            term: 7,
+            leader_id: 3,
+            group_id: 42,
+        };
+        match roundtrip(RaftRpc::TimeoutNowRequest(req)) {
+            RaftRpc::TimeoutNowRequest(d) => {
+                assert_eq!(d.term, 7);
+                assert_eq!(d.leader_id, 3);
+                assert_eq!(d.group_id, 42);
+            }
+            other => panic!("expected TimeoutNowRequest, got {other:?}"),
         }
     }
 

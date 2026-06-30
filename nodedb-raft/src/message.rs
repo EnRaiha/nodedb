@@ -145,6 +145,8 @@ pub struct TimeoutNowRequest {
     pub term: u64,
     /// The leader initiating the transfer.
     pub leader_id: u64,
+    /// Raft group ID for Multi-Raft routing.
+    pub group_id: u64,
 }
 
 /// InstallSnapshot RPC (Raft paper Figure 13).

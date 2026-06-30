@@ -559,6 +559,8 @@ mod tests {
 
             async fn on_shuffle_request(&self, _req: crate::rpc_codec::ShufflePushRequest) {}
 
+            async fn on_timeout_now(&self, _req: nodedb_raft::TimeoutNowRequest) {}
+
             async fn on_shuffle_chunk(
                 &self,
                 _shuffle_id: u64,

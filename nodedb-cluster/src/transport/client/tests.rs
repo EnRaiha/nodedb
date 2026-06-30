@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use nodedb_raft::message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    LogEntry, RequestVoteRequest, RequestVoteResponse,
+    LogEntry, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 use nodedb_raft::transport::RaftTransport;
 
@@ -144,6 +144,8 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_timeout_now(&self, _req: TimeoutNowRequest) {}
 }
 
 fn make_transport(node_id: u64) -> NexarTransport {

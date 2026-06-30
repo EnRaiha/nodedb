@@ -5,6 +5,8 @@
 
 use crate::error::Result;
 use crate::forward::ChunkSink;
+use nodedb_raft::message::TimeoutNowRequest;
+
 use crate::rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
@@ -118,6 +120,13 @@ pub trait RaftRpcHandler: Send + Sync + 'static {
         &self,
         req: SubmitCalvinTxnRequest,
     ) -> impl std::future::Future<Output = SubmitCalvinTxnResponse> + Send;
+
+    /// TimeoutNow (leadership transfer). One-way — the receiver immediately
+    /// starts an election for the matching group. No reply is written.
+    fn on_timeout_now(
+        &self,
+        req: TimeoutNowRequest,
+    ) -> impl std::future::Future<Output = ()> + Send;
 
     /// Routed Calvin-INBOX submit (Cv1). The OLLP dependent sibling of
     /// [`on_submit_calvin_txn`](Self::on_submit_calvin_txn). This node is the

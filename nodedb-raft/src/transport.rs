@@ -3,7 +3,7 @@
 use crate::error::Result;
 use crate::message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse,
+    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 
 /// Trait for Raft network transport.
@@ -31,4 +31,14 @@ pub trait RaftTransport: Send + Sync {
         target: u64,
         req: InstallSnapshotRequest,
     ) -> impl std::future::Future<Output = Result<InstallSnapshotResponse>> + Send;
+
+    /// Send a TimeoutNow RPC to a peer (one-way — no response).
+    ///
+    /// The recipient immediately starts an election, bypassing its election
+    /// timeout. The sender does not wait for any reply.
+    fn timeout_now(
+        &self,
+        target: u64,
+        req: TimeoutNowRequest,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
 }

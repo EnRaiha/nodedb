@@ -7,7 +7,7 @@
 
 use nodedb_raft::message::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse,
+    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 use nodedb_raft::transport::RaftTransport;
 
@@ -72,5 +72,18 @@ impl RaftTransport for NexarTransport {
                 detail: format!("expected InstallSnapshotResponse, got {other:?}"),
             }),
         }
+    }
+
+    async fn timeout_now(
+        &self,
+        target: u64,
+        req: TimeoutNowRequest,
+    ) -> nodedb_raft::Result<()> {
+        // Fire-and-forget: the receiver sends no reply (it either campaigns or
+        // ignores per its term/leader guard). Loss is tolerated — the transfer
+        // aborts on its deadline and is retried by the next convergence pass.
+        self.send_rpc_oneway(target, RaftRpc::TimeoutNowRequest(req))
+            .await
+            .map_err(to_raft_err)
     }
 }

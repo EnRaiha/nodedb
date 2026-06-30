@@ -234,5 +234,16 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
         return Ok(None);
     }
 
+    // 4j. TimeoutNow (leadership transfer): one-way — the receiver dispatches the
+    //     trigger to its matching group and finishes the send stream with no
+    //     response frame. The sender does not await a reply (it discards recv).
+    if let RaftRpc::TimeoutNowRequest(req) = request {
+        handler.on_timeout_now(req).await;
+        send.finish().map_err(|e| ClusterError::Transport {
+            detail: format!("finish timeout_now (no-response): {e}"),
+        })?;
+        return Ok(None);
+    }
+
     Ok(Some(request))
 }
