@@ -119,9 +119,6 @@ async fn handle_sql_inner(
     if upper.starts_with("SET ") {
         return resp(handle_set_sql(ctx, seq, sql_trimmed));
     }
-    if upper.starts_with("SHOW ") && is_session_show(&upper) {
-        return resp(handle_show_sql(ctx, seq, sql_trimmed));
-    }
     if upper.starts_with("RESET ") {
         let param = sql_trimmed[6..].trim().to_lowercase();
         ctx.sessions
@@ -153,6 +150,12 @@ async fn handle_sql_inner(
     .await
     {
         return resp(pgwire_result_to_native(seq, result).await);
+    }
+
+    // SHOW falls through to the session-variable handler only after the
+    // DDL/admin router declines it.
+    if upper.starts_with("SHOW ") && is_session_show(&upper) {
+        return resp(handle_show_sql(ctx, seq, sql_trimmed));
     }
 
     // Quota check.
