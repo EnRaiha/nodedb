@@ -13,6 +13,7 @@ pub mod checkpoints;
 pub mod clone_catalog;
 pub mod collection;
 pub mod collection_constraints;
+pub mod collection_descriptor_convert;
 pub mod collections;
 pub mod column_stats;
 pub mod constraint_translate;
