@@ -367,4 +367,26 @@ mod tests {
             }
         );
     }
+
+    /// Contract guard: the peer-delta apply module stays deterministic.
+    ///
+    /// The Raft-committed apply path (`apply_committed_delta_validated` →
+    /// pure `Validator::validate`) must never reach for the local write
+    /// path's signed/seq-gated check (the `validate` + `or_reject` helper on
+    /// `core.rs`), which is nondeterministic per replica (SystemTime + HMAC
+    /// signature + seq monotonicity). Pinning this to the source stops a
+    /// future edit from silently diverging replicas at identical log indices.
+    #[test]
+    fn apply_module_stays_deterministic() {
+        const SRC: &str = include_str!("apply_validated.rs");
+        // Concatenated so this test's own source carries no contiguous token
+        // that would self-match the guard.
+        let forbidden = concat!("validate", "_or_", "reject");
+        assert!(
+            !SRC.contains(forbidden),
+            "apply_validated.rs must not reference the local write path's \
+             signed/seq-gated check — the Raft-applied peer-delta path must \
+             stay deterministic (pure Validator::validate only)"
+        );
+    }
 }

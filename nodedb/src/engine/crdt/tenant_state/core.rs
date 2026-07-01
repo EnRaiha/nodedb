@@ -409,7 +409,7 @@ impl TenantCrdtEngine {
     /// 3. The collection's installed constraints and their version fence
     ///    are cleared — otherwise a re-created collection of the same name
     ///    would be validated against the dropped collection's constraints,
-    ///    and (because its descriptor version restarts at 1) its fresh
+    ///    and (because its constraint version restarts at 1) its fresh
     ///    constraint install would be rejected as stale by the fence.
     /// 4. Any dead-letter entries (rejected deltas) scoped to this
     ///    collection are dropped — otherwise a re-created collection

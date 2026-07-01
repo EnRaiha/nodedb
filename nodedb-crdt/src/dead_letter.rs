@@ -90,6 +90,15 @@ pub struct DeadLetter {
     pub hint: CompensationHint,
 
     /// Timestamp when the rejection occurred (unix millis).
+    ///
+    /// Node-local and NON-DETERMINISTIC: sourced from `SystemTime::now()` at
+    /// enqueue time, so two replicas that reject the same delta will record
+    /// different values. Safe today because the DLQ is a per-replica in-memory
+    /// structure that is never replicated or compared across nodes. If the DLQ
+    /// is ever replicated, snapshotted into shared state, or diffed between
+    /// replicas, this field MUST first be switched to a deterministic stamp
+    /// (HLC or the applying log index) — comparing the current value across
+    /// replicas will spuriously diverge.
     pub rejected_at: u64,
 
     /// Number of times this delta has been retried.
