@@ -292,6 +292,10 @@ impl NodeDbPgHandler {
                 .await;
         }
 
+        if upper.starts_with("SELECT CURRENT_SETTING") {
+            return self.handle_current_setting(addr, sql_trimmed);
+        }
+
         // ── USE DATABASE — session reset ──────────────────────────────
         // Intercepted before the DDL router because it requires access to both
         // `self.sessions` and `addr` for the per-connection state reset.

@@ -44,6 +44,42 @@ async fn pgwire_show_server_version_num_returns_pg_compat_number() {
     );
 }
 
+#[tokio::test]
+async fn pgwire_current_setting_server_version_num() {
+    let srv = TestServer::start().await;
+    let rows = srv
+        .query_text("SELECT current_setting('server_version_num')")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "got {rows:?}");
+    assert!(
+        rows[0].trim().parse::<i64>().is_ok(),
+        "must be numeric, got {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn pgwire_current_setting_server_version_is_nodedb() {
+    let srv = TestServer::start().await;
+    let rows = srv
+        .query_text("SELECT current_setting('server_version')")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].contains("NodeDB"), "got {rows:?}");
+}
+
+#[tokio::test]
+async fn pgwire_current_setting_unknown_missing_ok_true_is_null() {
+    let srv = TestServer::start().await;
+    // missing_ok = true → NULL (empty text over the wire), not an error.
+    let rows = srv
+        .query_text("SELECT current_setting('nodedb.does_not_exist', true)")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "got {rows:?}");
+}
+
 /// No file under `src/control/server/` may embed digits directly inside a
 /// `"NodeDB ..."`, `"NodeDB/..."`, or `nodedb_version:...` literal — every
 /// wire-surface version must format `crate::version::VERSION` in.

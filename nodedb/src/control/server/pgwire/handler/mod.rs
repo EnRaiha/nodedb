@@ -2,6 +2,7 @@
 
 mod copy_handler;
 mod core;
+mod current_setting;
 mod cursor_cmds;
 mod cursor_query;
 mod dispatch;
