@@ -84,12 +84,16 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                 let resp = mr.handle_request_vote(&req)?;
                 Ok(RaftRpc::RequestVoteResponse(resp))
             }
-            RaftRpc::InstallSnapshotRequest(req) => {
-                // Validate snapshot framing for any non-empty chunk.
+            RaftRpc::InstallSnapshotRequest(mut req) => {
+                // Validate snapshot framing for any non-empty chunk, then STRIP
+                // the frame header so everything below this RPC boundary
+                // (`receiver::handle_chunk`, `finalize::commit`, the
+                // `SnapshotApplier`) sees the raw payload it expects — the
+                // partial-file bytes, the whole-snapshot CRC, and the applier's
+                // `zerompk::from_msgpack` all operate on the unframed payload.
                 // Empty data is the bootstrap stub (no engine data yet); skip
-                // framing in that case. When a real engine ships data it calls
-                // `encode_snapshot_chunk` on the sender side and enforcement
-                // happens here automatically.
+                // framing in that case. The sender frames every non-empty chunk
+                // with `encode_snapshot_chunk`.
                 if !req.data.is_empty() {
                     // Short-circuit immediately if this chunk has already been
                     // quarantined after two consecutive CRC failures. Without
@@ -108,13 +112,18 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                     }
 
                     match nodedb_raft::decode_snapshot_chunk(&req.data) {
-                        Ok(_) => {
+                        Ok((_engine_id, payload)) => {
                             // Successful decode — reset any prior strike so a
                             // single transient CRC error does not permanently
                             // count against a healthy peer.
+                            let stripped = payload.to_vec();
                             if let Some(ref hook) = self.snapshot_quarantine_hook {
                                 hook.record_success(req.group_id, req.last_included_index);
                             }
+                            // Replace the framed chunk with its raw payload so the
+                            // accumulator writes unframed bytes (offsets/CRC below
+                            // are payload-space).
+                            req.data = stripped;
                         }
                         Err(e) => {
                             let is_crc_class = matches!(

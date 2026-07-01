@@ -63,6 +63,12 @@ pub enum SnapshotEngineId {
     Fts = 7,
     Spatial = 8,
     Crdt = 9,
+    /// Whole-tenant DataPlane snapshot spanning every engine (a serialized
+    /// `TenantDataSnapshot`), as shipped by the cluster InstallSnapshot path.
+    /// Not a single storage engine — tags the composite payload so the frame
+    /// header carries a meaningful engine id instead of borrowing another
+    /// engine's discriminant.
+    Composite = 10,
 }
 
 impl SnapshotEngineId {
@@ -78,6 +84,7 @@ impl SnapshotEngineId {
             7 => Ok(Self::Fts),
             8 => Ok(Self::Spatial),
             9 => Ok(Self::Crdt),
+            10 => Ok(Self::Composite),
             other => Err(SnapshotFramingError::UnknownEngineId(other)),
         }
     }
@@ -191,6 +198,7 @@ mod tests {
         SnapshotEngineId::Fts,
         SnapshotEngineId::Spatial,
         SnapshotEngineId::Crdt,
+        SnapshotEngineId::Composite,
     ];
 
     #[test]

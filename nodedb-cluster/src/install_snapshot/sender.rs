@@ -13,7 +13,9 @@
 //! (as the existing tick loop already does) so the RPC does not block the
 //! tick pipeline.
 
-use nodedb_raft::{InstallSnapshotRequest, transport::RaftTransport};
+use nodedb_raft::{
+    InstallSnapshotRequest, SnapshotEngineId, encode_snapshot_chunk, transport::RaftTransport,
+};
 
 use crate::error::ClusterError;
 use crate::transport::NexarTransport;
@@ -86,21 +88,15 @@ pub async fn send_chunked(
         let chunk_payload = &snapshot_bytes[offset..end];
         let done = end == snapshot_bytes.len();
 
-        // Framing: each chunk is wrapped with the snapshot frame header so the
-        // receiver can validate per-chunk CRC and engine ID. We use a sentinel
-        // engine ID for the accumulator transport layer — per-engine IDs are
-        // assigned by the engines themselves when they write real snapshot data.
-        // For now (empty snapshot stub path is handled above) we use Vector=1
-        // as a placeholder. Real engines will supply their own engine_id when
-        // they call into this function.
-        //
-        // NOTE: When engines fill in real data, they must call
-        // `encode_snapshot_chunk(their_engine_id, payload_bytes)` themselves
-        // and pass the resulting bytes here. For the current stub (empty bytes
-        // handled above) this branch is only reached if a caller passes
-        // non-empty bytes that are already framed — we pass them through as-is.
-        // The receiver's `decode_snapshot_chunk` will validate framing.
-        let framed = chunk_payload.to_vec();
+        // Framing: wrap each chunk with the snapshot frame header (magic +
+        // version + engine id + CRC) so the receiver's `handle_rpc` boundary can
+        // validate per-chunk integrity before stripping the header and
+        // accumulating the raw payload. The DataPlane snapshot payload is a
+        // whole-tenant composite (`TenantDataSnapshot` spanning every engine),
+        // so it is tagged with the `Composite` engine id rather than any single
+        // engine's. `offset`/`total_size` below are payload-space (into
+        // `snapshot_bytes`); the receiver reassembles the stripped payloads.
+        let framed = encode_snapshot_chunk(SnapshotEngineId::Composite, chunk_payload);
 
         let req = InstallSnapshotRequest {
             term,
