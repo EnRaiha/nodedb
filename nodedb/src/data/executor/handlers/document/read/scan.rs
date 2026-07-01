@@ -99,6 +99,15 @@ impl CoreLoop {
             }
         });
 
+        // Bitemporal collections keep every write on the versioned redb table
+        // (see `versioned_put_in_txn`). The current-state scan must therefore
+        // read the newest live version per doc_id from that same namespace —
+        // reading the plain DOCUMENTS table would return zero rows. The
+        // versioned store holds the document body in the SAME encoding the
+        // non-bitemporal path filters on (MessagePack for schemaless, Binary
+        // Tuple for strict), so the same push-down predicates apply unchanged.
+        let bitemporal = self.is_bitemporal(tid, collection);
+
         // Scan strategy:
         // 1. Try sparse engine first (with optimized push-down filters when present).
         // 2. If sparse returns empty, fall back to scan_collection which routes
@@ -108,69 +117,109 @@ impl CoreLoop {
         // Strict (Binary Tuple) collections need JSON-level filter evaluation
         // because `matches_binary` operates on MessagePack, not Binary Tuples.
         let scan_result = if filter_predicates.is_empty() {
-            let sparse_result = self.sparse.scan_documents(
-                task.request.database_id.as_u64(),
-                tid,
-                collection,
-                fetch_limit,
-            );
-            match &sparse_result {
-                Ok(docs) if docs.is_empty() => {
-                    let fallback = self.scan_collection(
-                        task.request.database_id.as_u64(),
-                        tid,
-                        collection,
-                        fetch_limit,
-                    );
-                    if let Ok(ref docs) = fallback
-                        && !docs.is_empty()
-                    {
-                        warn!(
-                            core = self.core_id,
-                            %collection,
-                            count = docs.len(),
-                            "document scan fallback to scan_collection"
+            if bitemporal {
+                self.sparse.versioned_scan_as_of(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    None,
+                    None,
+                    fetch_limit,
+                    &|_| true,
+                )
+            } else {
+                let sparse_result = self.sparse.scan_documents(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    fetch_limit,
+                );
+                match &sparse_result {
+                    Ok(docs) if docs.is_empty() => {
+                        let fallback = self.scan_collection(
+                            task.request.database_id.as_u64(),
+                            tid,
+                            collection,
+                            fetch_limit,
                         );
+                        if let Ok(ref docs) = fallback
+                            && !docs.is_empty()
+                        {
+                            warn!(
+                                core = self.core_id,
+                                %collection,
+                                count = docs.len(),
+                                "document scan fallback to scan_collection"
+                            );
+                        }
+                        fallback
                     }
-                    fallback
+                    _ => sparse_result,
                 }
-                _ => sparse_result,
             }
         } else if let Some(ref schema) = strict_schema {
-            self.sparse.scan_documents_filtered(
-                task.request.database_id.as_u64(),
-                tid,
-                collection,
-                fetch_limit,
-                &|value: &[u8]| match strict_format::binary_tuple_to_msgpack(value, schema) {
+            let predicate =
+                |value: &[u8]| match strict_format::binary_tuple_to_msgpack(value, schema) {
                     Some(mp) => filter_predicates.iter().all(|f| f.matches_binary(&mp)),
                     None => false,
-                },
-            )
+                };
+            if bitemporal {
+                self.sparse.versioned_scan_as_of(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    None,
+                    None,
+                    fetch_limit,
+                    &predicate,
+                )
+            } else {
+                self.sparse.scan_documents_filtered(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    fetch_limit,
+                    &predicate,
+                )
+            }
         } else {
-            let sparse_result = self.sparse.scan_documents_filtered(
-                task.request.database_id.as_u64(),
-                tid,
-                collection,
-                fetch_limit,
-                &|value: &[u8]| filter_predicates.iter().all(|f| f.matches_binary(value)),
-            );
-            match &sparse_result {
-                Ok(docs) if docs.is_empty() => self
-                    .scan_collection(
-                        task.request.database_id.as_u64(),
-                        tid,
-                        collection,
-                        fetch_limit,
-                    )
-                    .map(|docs| {
-                        docs.into_iter()
-                            .filter(|(_, data)| {
-                                filter_predicates.iter().all(|f| f.matches_binary(data))
-                            })
-                            .collect()
-                    }),
-                _ => sparse_result,
+            let predicate =
+                |value: &[u8]| filter_predicates.iter().all(|f| f.matches_binary(value));
+            if bitemporal {
+                self.sparse.versioned_scan_as_of(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    None,
+                    None,
+                    fetch_limit,
+                    &predicate,
+                )
+            } else {
+                let sparse_result = self.sparse.scan_documents_filtered(
+                    task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    fetch_limit,
+                    &predicate,
+                );
+                match &sparse_result {
+                    Ok(docs) if docs.is_empty() => self
+                        .scan_collection(
+                            task.request.database_id.as_u64(),
+                            tid,
+                            collection,
+                            fetch_limit,
+                        )
+                        .map(|docs| {
+                            docs.into_iter()
+                                .filter(|(_, data)| {
+                                    filter_predicates.iter().all(|f| f.matches_binary(data))
+                                })
+                                .collect()
+                        }),
+                    _ => sparse_result,
+                }
             }
         };
 

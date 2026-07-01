@@ -245,12 +245,29 @@ impl CoreLoop {
         }
 
         // ── Streaming aggregation (per-shard collection scan) ──────────────
-        let docs = match self.scan_collection(
-            task.request.database_id.as_u64(),
-            tid,
-            collection,
-            scan_limit,
-        ) {
+        // Bitemporal collections keep every write on the versioned sparse
+        // table; the plain `scan_collection` reads the non-versioned namespace
+        // and would return zero rows (making COUNT/SUM/etc. see nothing). Route
+        // the current-state scan to the versioned table for those collections.
+        // Both paths return the same normalized `(doc_id, msgpack)` shape, so
+        // the downstream aggregation is identical. Non-bitemporal collections
+        // keep the exact `scan_collection` path unchanged.
+        let scan_result = if self.is_bitemporal(tid, collection) {
+            self.scan_collection_versioned_current(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                scan_limit,
+            )
+        } else {
+            self.scan_collection(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                scan_limit,
+            )
+        };
+        let docs = match scan_result {
             Ok(d) => d,
             Err(e) => {
                 return self.response_error(

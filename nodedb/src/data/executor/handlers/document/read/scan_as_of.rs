@@ -105,10 +105,27 @@ impl CoreLoop {
             return self.send_document_rows_raw(task, &sliced, 1024);
         }
 
+        // `versioned_scan_as_of` returns each version's stored body verbatim —
+        // schemaless bodies may be (legacy) JSON and strict bodies are Binary
+        // Tuples. `apply_projection_msgpack` extracts fields via zero-copy
+        // msgpack scanning, so the body must first be normalized to a standard
+        // msgpack map exactly as the default (current-state) document scan does,
+        // otherwise projection extracts nothing and the raw document leaks
+        // through as a single column.
+        let strict_schema = self.strict_schema_for(crate::types::TenantId::new(tid), collection);
         let transformed: Vec<_> = sliced
             .into_iter()
             .map(|(doc_id, body)| {
-                let projected = apply_projection_msgpack(&body, &[], projection);
+                let normalized = match strict_schema {
+                    Some(ref schema) => {
+                        crate::data::executor::strict_format::binary_tuple_to_msgpack(&body, schema)
+                            .unwrap_or_else(|| {
+                                crate::data::executor::doc_format::json_to_msgpack(&body)
+                            })
+                    }
+                    None => crate::data::executor::doc_format::json_to_msgpack(&body),
+                };
+                let projected = apply_projection_msgpack(&normalized, &[], projection);
                 (doc_id, projected)
             })
             .collect();

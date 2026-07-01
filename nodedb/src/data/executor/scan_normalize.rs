@@ -327,17 +327,7 @@ impl CoreLoop {
         limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
         let docs = self.sparse.scan_documents(did, tid, collection, limit)?;
-
-        let config_key = (crate::types::TenantId::new(tid), collection.to_string());
-        let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
-            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                c.storage_mode
-            {
-                Some(schema.clone())
-            } else {
-                None
-            }
-        });
+        let strict_schema = self.strict_schema_for(crate::types::TenantId::new(tid), collection);
 
         let mut normalized = Vec::with_capacity(docs.len());
         for (id, raw) in docs {
@@ -367,7 +357,7 @@ fn kv_row_to_doc(key: &[u8], value: &[u8]) -> (String, Vec<u8>) {
 /// are normalised from (possibly legacy JSON) to standard msgpack. In both
 /// cases the `id` field is injected identically. Shared by the materializing
 /// scan and the streaming scan so both paths produce byte-identical output.
-fn sparse_row_to_doc(
+pub(in crate::data::executor) fn sparse_row_to_doc(
     id: &str,
     raw: &[u8],
     strict_schema: Option<&StrictSchema>,
