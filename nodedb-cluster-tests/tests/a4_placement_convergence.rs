@@ -299,7 +299,10 @@ async fn placement_converges_when_excluded_voter_leads_group() {
             let p = future.get(&gid)?;
             if p.contains(&4) {
                 // The single voter in {1,2,3} absent from the new placement.
-                [1u64, 2, 3].into_iter().find(|x| !p.contains(x)).map(|x| (gid, x))
+                [1u64, 2, 3]
+                    .into_iter()
+                    .find(|x| !p.contains(x))
+                    .map(|x| (gid, x))
             } else {
                 None
             }
@@ -326,16 +329,13 @@ async fn placement_converges_when_excluded_voter_leads_group() {
             .nodes
             .iter()
             .find_map(|node| {
-                node.shared
-                    .cluster_observer
-                    .get()
-                    .and_then(|obs| {
-                        obs.group_status
-                            .group_statuses()
-                            .into_iter()
-                            .find(|s| s.group_id == target_gid && s.leader_id != 0)
-                            .map(|s| s.term)
-                    })
+                node.shared.cluster_observer.get().and_then(|obs| {
+                    obs.group_status
+                        .group_statuses()
+                        .into_iter()
+                        .find(|s| s.group_id == target_gid && s.leader_id != 0)
+                        .map(|s| s.term)
+                })
             })
             .unwrap_or(0);
         if leader != 0 && term != 0 {
