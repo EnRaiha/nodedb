@@ -34,6 +34,138 @@ async fn create_spatial_collection_and_insert() {
     assert_eq!(rows[0][1], "SF");
 }
 
+// ── Geometry constructors on the write path ─────────────────────────────────
+// ST_Point and ST_GeomFromGeoJSON were the only wired INSERT constructors;
+// ST_MakePoint / ST_GeomFromText (WKT) / ST_GeomFromWKB (WKB) fell through to
+// "unsupported value expression". These must produce storable geometry that
+// round-trips back through a SELECT of the GEOMETRY column.
+
+#[tokio::test]
+async fn insert_st_makepoint_constructor_roundtrips() {
+    let srv = TestServer::start().await;
+    srv.exec(
+        "CREATE COLLECTION sp_makepoint \
+         COLUMNS (id TEXT, location GEOMETRY, name TEXT) \
+         WITH (engine='spatial')",
+    )
+    .await
+    .unwrap();
+
+    srv.exec(
+        "INSERT INTO sp_makepoint (id, location, name) \
+         VALUES ('p1', ST_MakePoint(-122.4, 37.8), 'via MakePoint')",
+    )
+    .await
+    .unwrap();
+
+    let rows = srv
+        .query_rows("SELECT name, location FROM sp_makepoint WHERE id = 'p1'")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "row must be retrievable, got {rows:?}");
+    assert_eq!(rows[0][0], "via MakePoint");
+    let geom = &rows[0][1];
+    assert!(
+        geom.contains("-122.4") && geom.contains("37.8"),
+        "ST_MakePoint geometry must round-trip its coordinates, got: {geom}"
+    );
+}
+
+#[tokio::test]
+async fn insert_st_geomfromtext_point_roundtrips() {
+    let srv = TestServer::start().await;
+    srv.exec(
+        "CREATE COLLECTION sp_wkt_pt \
+         COLUMNS (id TEXT, location GEOMETRY, name TEXT) \
+         WITH (engine='spatial')",
+    )
+    .await
+    .unwrap();
+
+    srv.exec(
+        "INSERT INTO sp_wkt_pt (id, location, name) \
+         VALUES ('p1', ST_GeomFromText('POINT(-122.4 37.8)'), 'via WKT')",
+    )
+    .await
+    .unwrap();
+
+    let rows = srv
+        .query_rows("SELECT location FROM sp_wkt_pt WHERE id = 'p1'")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "row must be retrievable, got {rows:?}");
+    let geom = &rows[0][0];
+    assert!(
+        geom.contains("-122.4") && geom.contains("37.8"),
+        "ST_GeomFromText(POINT) must round-trip its coordinates, got: {geom}"
+    );
+}
+
+#[tokio::test]
+async fn insert_st_geomfromtext_linestring_roundtrips() {
+    let srv = TestServer::start().await;
+    srv.exec(
+        "CREATE COLLECTION sp_wkt_ls \
+         COLUMNS (id TEXT, location GEOMETRY) \
+         WITH (engine='spatial')",
+    )
+    .await
+    .unwrap();
+
+    srv.exec(
+        "INSERT INTO sp_wkt_ls (id, location) \
+         VALUES ('l1', ST_GeomFromText('LINESTRING(-122.4 37.8, -121.0 36.5)'))",
+    )
+    .await
+    .unwrap();
+
+    let rows = srv
+        .query_rows("SELECT location FROM sp_wkt_ls WHERE id = 'l1'")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "row must be retrievable, got {rows:?}");
+    let geom = &rows[0][0].to_lowercase();
+    assert!(
+        geom.contains("linestring") || geom.contains("coordinates"),
+        "ST_GeomFromText(LINESTRING) must round-trip as a geometry, got: {geom}"
+    );
+    assert!(
+        rows[0][0].contains("-121"),
+        "LINESTRING second vertex must survive, got: {}",
+        rows[0][0]
+    );
+}
+
+#[tokio::test]
+async fn insert_st_geomfromwkb_constructor_roundtrips() {
+    let srv = TestServer::start().await;
+    srv.exec(
+        "CREATE COLLECTION sp_wkb \
+         COLUMNS (id TEXT, location GEOMETRY) \
+         WITH (engine='spatial')",
+    )
+    .await
+    .unwrap();
+
+    // WKB for POINT(2 1): little-endian (01), type 1 point, x=2.0, y=1.0.
+    srv.exec(
+        "INSERT INTO sp_wkb (id, location) \
+         VALUES ('w1', ST_GeomFromWKB(X'01010000000000000000000040000000000000F03F'))",
+    )
+    .await
+    .unwrap();
+
+    let rows = srv
+        .query_rows("SELECT location FROM sp_wkb WHERE id = 'w1'")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "row must be retrievable, got {rows:?}");
+    assert!(
+        !rows[0][0].is_empty(),
+        "ST_GeomFromWKB geometry must be stored, got empty"
+    );
+}
+
 #[tokio::test]
 async fn st_geohash_encode_decode_roundtrip() {
     let srv = TestServer::start().await;

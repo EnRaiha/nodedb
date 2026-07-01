@@ -20,6 +20,7 @@ pub mod select;
 
 pub use select::qualified_name;
 pub mod sort;
+pub mod spatial_ctor;
 pub mod subquery;
 pub mod union;
 pub mod window;

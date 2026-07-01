@@ -34,10 +34,36 @@ pub fn convert_value(val: &Value) -> Result<SqlValue> {
         Value::SingleQuotedString(s) => Ok(SqlValue::String(s.clone())),
         Value::Boolean(b) => Ok(SqlValue::Bool(*b)),
         Value::Null => Ok(SqlValue::Null),
+        // `X'...'` hex-string literal → raw bytes. Enables byte-typed
+        // arguments such as WKB geometry (`ST_GeomFromWKB(X'01...')`).
+        Value::HexStringLiteral(s) => Ok(SqlValue::Bytes(decode_hex_literal(s)?)),
         _ => Err(SqlError::Unsupported {
             detail: format!("value literal: {val}"),
         }),
     }
+}
+
+/// Decode an even-length ASCII hex string (the inner text of an `X'...'`
+/// literal) into its byte sequence.
+fn decode_hex_literal(s: &str) -> Result<Vec<u8>> {
+    parse_hex_bytes(s).map_err(|reason| SqlError::Parse {
+        detail: format!("hex literal {reason}: X'{s}'"),
+    })
+}
+
+/// Parse an even-length ASCII hex string into bytes. Shared by `X'...'`
+/// literal decoding here and plain hex-string WKB arguments in
+/// `planner::spatial_ctor`, so the two surfaces never drift. Returns the
+/// failure reason as a fragment; callers wrap it into their own contextual
+/// `SqlError` variant.
+pub(crate) fn parse_hex_bytes(s: &str) -> std::result::Result<Vec<u8>, &'static str> {
+    if !s.len().is_multiple_of(2) {
+        return Err("must have an even number of digits");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| "contains an invalid hex digit"))
+        .collect()
 }
 
 /// Parse an interval string to microseconds.
