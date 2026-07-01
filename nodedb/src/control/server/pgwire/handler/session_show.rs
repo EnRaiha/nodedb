@@ -85,6 +85,7 @@ impl NodeDbPgHandler {
         // router before this handler is reached.
         let builtin = match param.as_str() {
             "server_version" => Some(format!("NodeDB {}", crate::version::VERSION)),
+            "server_version_num" => Some(nodedb_types::pg_compat::PG_COMPAT_VERSION_NUM.to_owned()),
             "server_encoding" => Some("UTF8".into()),
             _ => None,
         };

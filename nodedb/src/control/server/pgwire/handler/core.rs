@@ -2,7 +2,7 @@
 
 //! NodeDB pgwire handler: struct definition, identity resolution,
 //! permission checks, and pgwire trait impls (SimpleQueryHandler,
-//! ExtendedQueryHandler, NoopStartupHandler).
+//! ExtendedQueryHandler).
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use futures::SinkExt;
 use futures::sink::Sink;
 
-use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
@@ -20,7 +19,6 @@ use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::messages::PgWireFrontendMessage;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::config::auth::AuthMode;
@@ -29,10 +27,10 @@ use crate::control::security::audit::{
     AuditEmitContext, AuditEmitter, AuditEvent, NoopAuditEmitter,
 };
 use crate::control::security::identity::{
-    AuthMethod, AuthenticatedIdentity, Role, required_permission, role_grants_permission,
+    AuthMethod, AuthenticatedIdentity, required_permission, role_grants_permission,
 };
 use crate::control::state::SharedState;
-use crate::types::{RequestId, TenantId};
+use crate::types::RequestId;
 
 use super::super::session::{SessionStore, TransactionState};
 use super::super::types::notice_warning;
@@ -51,7 +49,7 @@ pub struct NodeDbPgHandler {
     pub(crate) state: Arc<SharedState>,
     pub(super) query_ctx: QueryContext,
     query_parser: Arc<NodeDbQueryParser>,
-    auth_mode: AuthMode,
+    pub(super) auth_mode: AuthMode,
     /// Per-connection session state (transaction blocks, parameters).
     pub(crate) sessions: SessionStore,
     /// Per-connection in-flight COPY IN restore accumulators.
@@ -106,8 +104,8 @@ impl NodeDbPgHandler {
 
         let mut identity = match self.auth_mode {
             AuthMode::Trust => {
-                // Strict resolution: `post_startup` has already ensured the
-                // user exists (either because it was already in the store
+                // Strict resolution: `resolve_trust_user` has already ensured
+                // the user exists (either because it was already in the store
                 // or via the bootstrap auto-create path on an empty store),
                 // so any miss here is a genuine unknown user.
                 self.state
@@ -478,69 +476,5 @@ impl ExtendedQueryHandler for NodeDbPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.describe_portal_impl(client, target).await
-    }
-}
-
-// Trust mode: NoopStartupHandler skips password verification but still
-// resolves the connecting username against the credential store, matching
-// PostgreSQL's `trust` method semantics. Unknown users are rejected before
-// the server sends ReadyForQuery.
-#[async_trait]
-impl NoopStartupHandler for NodeDbPgHandler {
-    async fn post_startup<C>(
-        &self,
-        client: &mut C,
-        _message: PgWireFrontendMessage,
-    ) -> PgWireResult<()>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        if !matches!(self.auth_mode, AuthMode::Trust) {
-            return Ok(());
-        }
-
-        let username = client
-            .metadata()
-            .get("user")
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        if self
-            .state
-            .credentials
-            .to_identity(&username, AuthMethod::Trust)
-            .is_some()
-        {
-            return Ok(());
-        }
-
-        // Bootstrap: an empty credential store admits the first connecting
-        // user as a tenant-1 superuser and persists them so subsequent
-        // queries on the same connection (and any reconnect) resolve
-        // through the normal strict path.
-        if self.state.credentials.is_empty() {
-            let _ = self.state.credentials.create_user(
-                &username,
-                "",
-                TenantId::new(1),
-                vec![Role::Superuser],
-            );
-            return Ok(());
-        }
-
-        let source = client.socket_addr().to_string();
-        self.state.audit_record(
-            AuditEvent::AuthFailure,
-            None,
-            &source,
-            &format!("trust auth: user '{username}' does not exist"),
-        );
-        Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-            "FATAL".to_owned(),
-            "28000".to_owned(),
-            format!("trust auth: user '{username}' does not exist"),
-        ))))
     }
 }

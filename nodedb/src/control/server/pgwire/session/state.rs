@@ -136,6 +136,10 @@ impl PgSession {
             "server_version".into(),
             format!("NodeDB {}", crate::version::VERSION),
         );
+        parameters.insert(
+            "server_version_num".into(),
+            nodedb_types::pg_compat::PG_COMPAT_VERSION_NUM.into(),
+        );
         // NodeDB-specific defaults.
         parameters.insert("nodedb.consistency".into(), "strong".into());
         parameters.insert("rounding_mode".into(), "HALF_EVEN".into());

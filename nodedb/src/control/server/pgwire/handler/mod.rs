@@ -24,6 +24,7 @@ mod sql_split;
 mod stream_response;
 mod transaction_cmds;
 mod transaction_savepoint;
+mod trust_auth;
 mod wal_dispatch;
 
 pub use self::copy_handler::NodeDbCopyHandler;
