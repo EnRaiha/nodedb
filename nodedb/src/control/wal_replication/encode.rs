@@ -145,12 +145,14 @@ pub fn to_replicated_entry(
             mutation_id: _,
             surrogate: _,
             provenance,
+            descriptor_version_required,
         }) => ReplicatedWrite::CrdtApply {
             collection: collection.clone(),
             document_id: document_id.clone(),
             delta: delta.clone(),
             peer_id: *peer_id,
             provenance: encode_provenance(provenance),
+            descriptor_version_required: *descriptor_version_required,
         },
         PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
             tenant_id,

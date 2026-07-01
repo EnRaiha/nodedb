@@ -207,6 +207,12 @@ pub enum ReplicatedWrite {
         /// the same high-water mark as the leader.
         #[serde(default)]
         provenance: Option<Vec<u8>>,
+        /// Constraint descriptor version this delta was admitted against
+        /// (stamped by the leader at admission from the catalog). Followers
+        /// carry it verbatim so the apply-time write-gate (U5e) runs
+        /// identically on every replica. `0` means "no fence" (gate open).
+        #[serde(default)]
+        descriptor_version_required: u64,
     },
     /// A columnar batch insert from a Lite peer, to be applied on all replicas.
     ///

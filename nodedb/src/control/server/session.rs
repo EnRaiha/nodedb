@@ -603,6 +603,8 @@ impl Session {
                     mutation_id: 0,
                     surrogate,
                     provenance: None,
+                    // Direct session write, not a replicated peer sync.
+                    descriptor_version_required: 0,
                 })
             }
             "graph_rag_fusion" => {

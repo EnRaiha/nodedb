@@ -141,6 +141,8 @@ pub async fn crdt_apply(
         mutation_id: 0,
         surrogate,
         provenance: None,
+        // Local pgwire write, not a replicated peer sync — no constraint fence.
+        descriptor_version_required: 0,
     });
 
     // Route through the Raft proposer gate so the delta is quorum-durable under

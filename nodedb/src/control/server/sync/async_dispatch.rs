@@ -312,6 +312,36 @@ pub(super) async fn apply_delta_and_finalize(
         seq: delta_msg.seq,
     };
 
+    // Stamp the constraint descriptor version this delta is admitted against.
+    // The apply-time write-gate (U5e) compares it on every replica against the
+    // constraint version that replica has installed, rejecting a delta that
+    // outran its `SetConstraints` (the reconcile loop installs constraints
+    // asynchronously, so a create-race delta can commit first). Read the raw
+    // `descriptor_version` field from the catalog under the session tenant —
+    // the exact value the constraint reconcile loop
+    // (`bootstrap::constraint_reconcile`) replicates via `ConstraintChange`
+    // and every replica installs into its validator. Admission and install
+    // MUST use identical normalization or the gate mis-fences, so this takes
+    // the value verbatim — no `.max(1)` (the install side applies none). A
+    // collection at version `0` therefore stamps `0` (no fence), which is
+    // harmless: constraints only ever exist on a DDL-stamped (version `>= 1`)
+    // collection. Missing collection ⇒ `0` (gate open; safe).
+    let descriptor_version_required = shared
+        .credentials
+        .catalog()
+        .as_ref()
+        .and_then(|c| {
+            c.get_collection(
+                crate::types::DatabaseId::DEFAULT,
+                tenant_id.as_u64(),
+                &delta_msg.collection,
+            )
+            .ok()
+        })
+        .flatten()
+        .map(|col| col.descriptor_version)
+        .unwrap_or(0);
+
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: delta_msg.collection.clone(),
         document_id: delta_msg.document_id.clone(),
@@ -320,6 +350,7 @@ pub(super) async fn apply_delta_and_finalize(
         mutation_id: delta_msg.mutation_id,
         surrogate,
         provenance: Some(prov),
+        descriptor_version_required,
     });
 
     shared.tenant_request_start(tenant_id);
