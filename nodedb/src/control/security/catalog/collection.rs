@@ -228,6 +228,19 @@ pub struct StoredCollection {
     /// a pre-existing collection with no edges needs no edge-delete derivation.
     #[msgpack(default)]
     pub has_implicit_edges: bool,
+
+    /// Declared `PRIMARY KEY` column name from the `CREATE COLLECTION` /
+    /// `CREATE TABLE` column list, when one was present. May differ from
+    /// the built-in `id` field on schemaless document collections (which
+    /// otherwise always uses `id` as its document key). `None` means no
+    /// PRIMARY KEY was declared and the engine falls back to its default
+    /// (`id` for schemaless documents).
+    ///
+    /// Defaults to `None` on deserialization so catalog entries written
+    /// before this field was added continue to use the built-in `id` key —
+    /// the safe, zero-migration value.
+    #[msgpack(default)]
+    pub declared_primary_key: Option<String>,
 }
 
 impl StoredCollection {
@@ -282,6 +295,7 @@ impl StoredCollection {
             cloned_from: None,
             clone_status: CloneStatus::default(),
             has_implicit_edges: false,
+            declared_primary_key: None,
         }
     }
 

@@ -102,6 +102,7 @@ pub trait PlanVisitor {
         column_defaults: &[(String, String)],
         if_absent: bool,
         column_schema: &[(String, String)],
+        primary_key: Option<&str>,
     ) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::KvInsert`].
@@ -123,6 +124,7 @@ pub trait PlanVisitor {
         column_defaults: &[(String, String)],
         on_conflict_updates: &[(String, SqlExpr)],
         column_schema: &[(String, String)],
+        primary_key: Option<&str>,
     ) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::InsertSelect`].

@@ -108,6 +108,11 @@ pub enum SqlPlan {
         /// converters to reconstruct the exact `ColumnType` for columns whose
         /// `SqlDataType` is ambiguous (e.g. JSON and Bytes both map to Bytes).
         column_schema: Vec<(String, String)>,
+        /// Declared `PRIMARY KEY` column name (if any), from
+        /// `InsertParams::primary_key`. Used by the conversion layer to
+        /// extract the document id from the correct column instead of
+        /// guessing at `id`/`document_id`/`key`.
+        primary_key: Option<String>,
     },
     /// KV INSERT: key and value are fundamentally separate.
     /// Each entry is `(key, value_columns)`.
@@ -143,6 +148,8 @@ pub enum SqlPlan {
         /// Raw column type strings from the catalog: `(column_name, type_str)`.
         /// Mirrors `Insert::column_schema` — see that field for rationale.
         column_schema: Vec<(String, String)>,
+        /// Declared `PRIMARY KEY` column name (if any). See `Insert::primary_key`.
+        primary_key: Option<String>,
     },
     InsertSelect {
         target: String,

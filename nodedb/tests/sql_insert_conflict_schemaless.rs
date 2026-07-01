@@ -101,3 +101,38 @@ async fn schemaless_insert_on_conflict_do_nothing_is_noop() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0], "1", "got: {}", rows[0]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schemaless_natural_key_pk_on_non_id_column_accepts_distinct_rows() {
+    // Sibling-surface guard for the strict-engine natural-key fix: the
+    // schemaless arm shares the same `convert_insert` doc_id extraction, so a
+    // user PRIMARY KEY on a non-`id` column must drive uniqueness here too.
+    // Distinct natural keys must both persist — no phantom empty-`id` collision.
+    let server = TestServer::start().await;
+
+    server
+        .exec("CREATE COLLECTION nk (sku STRING NOT NULL PRIMARY KEY, name STRING)")
+        .await
+        .unwrap();
+
+    server
+        .exec("INSERT INTO nk (sku, name) VALUES ('a', 'first')")
+        .await
+        .unwrap();
+
+    server
+        .exec("INSERT INTO nk (sku, name) VALUES ('b', 'second')")
+        .await
+        .unwrap();
+
+    let rows = server
+        .query_text("SELECT name FROM nk ORDER BY sku")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "both natural-key rows must persist, got {rows:?}"
+    );
+    assert_eq!(rows, vec!["first".to_string(), "second".to_string()]);
+}

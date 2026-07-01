@@ -267,6 +267,93 @@ async fn columnar_order_by_sort_key_accepted() {
     );
 }
 
+// ── Natural-key PRIMARY KEY on a non-`id` column ────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn columnar_natural_key_pk_on_non_id_column_keeps_distinct_rows() {
+    // A PRIMARY KEY declared on a non-`id` column must drive row identity on
+    // columnar too. Two rows with DISTINCT natural keys must both stay visible
+    // — the built-in synthetic `id` (NULL for every row) must NOT make them
+    // collide into a single tombstoned row (silent data loss).
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION metrics (\
+                sku TEXT PRIMARY KEY, region TEXT, value FLOAT\
+            ) WITH (engine='columnar')",
+        )
+        .await
+        .unwrap();
+    server
+        .exec("CREATE UNIQUE INDEX metrics_pk ON metrics (sku)")
+        .await
+        .unwrap();
+
+    server
+        .exec("INSERT INTO metrics (sku, region, value) VALUES ('a', 'us-east', 1.0)")
+        .await
+        .unwrap();
+    // Distinct natural key: must NOT collide on an empty synthetic `id`.
+    server
+        .exec("INSERT INTO metrics (sku, region, value) VALUES ('b', 'us-west', 2.0)")
+        .await
+        .unwrap();
+
+    let rows = server
+        .query_rows("SELECT sku, region FROM metrics ORDER BY sku")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "both distinct natural-key rows must stay visible, got: {rows:?}"
+    );
+    assert_eq!(rows[0][0], "a", "got: {rows:?}");
+    assert_eq!(rows[1][0], "b", "got: {rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spatial_natural_key_pk_on_non_id_column_keeps_distinct_rows() {
+    // Spatial inherits columnar identity: a non-`id` PRIMARY KEY must keep
+    // distinct natural-key rows distinct rather than colliding on synthetic id.
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION places (\
+                code TEXT PRIMARY KEY, geom GEOMETRY SPATIAL_INDEX, label TEXT\
+            ) WITH (engine='spatial')",
+        )
+        .await
+        .unwrap();
+    server
+        .exec("CREATE UNIQUE INDEX places_pk ON places (code)")
+        .await
+        .unwrap();
+
+    server
+        .exec("INSERT INTO places (code, geom, label) VALUES ('p1', ST_Point(0.0, 0.0), 'origin')")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO places (code, geom, label) VALUES ('p2', ST_Point(1.0, 1.0), 'other')")
+        .await
+        .unwrap();
+
+    let rows = server
+        .query_rows("SELECT code, label FROM places ORDER BY code")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "both distinct natural-key rows must stay visible, got: {rows:?}"
+    );
+    assert_eq!(rows[0][0], "p1", "got: {rows:?}");
+    assert_eq!(rows[1][0], "p2", "got: {rows:?}");
+}
+
 // ── Spatial inherits columnar PK semantics ──────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

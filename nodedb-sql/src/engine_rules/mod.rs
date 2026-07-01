@@ -25,6 +25,10 @@ pub struct InsertParams {
     /// columns whose `SqlDataType` is ambiguous (e.g. both JSON and Bytes map
     /// to `SqlDataType::Bytes`). Empty for engines that don't need it.
     pub column_schema: Vec<(String, String)>,
+    /// Declared `PRIMARY KEY` column name (if any), from `CollectionInfo::primary_key`.
+    /// Used by the conversion layer to extract the document id from the
+    /// correct column instead of guessing at `id`/`document_id`/`key`.
+    pub primary_key: Option<String>,
 }
 
 /// Parameters for planning a SCAN operation.
@@ -118,6 +122,8 @@ pub struct UpsertParams {
     /// Raw column type strings from the catalog: `(column_name, type_str)`.
     /// Mirrors `InsertParams::column_schema` — see that field for rationale.
     pub column_schema: Vec<(String, String)>,
+    /// Declared `PRIMARY KEY` column name (if any). See `InsertParams::primary_key`.
+    pub primary_key: Option<String>,
 }
 
 /// Parameters for planning an AGGREGATE operation.

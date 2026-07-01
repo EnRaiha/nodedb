@@ -202,6 +202,7 @@ pub async fn create_continuous_aggregate(
             cloned_from: None,
             clone_status: nodedb_types::CloneStatus::default(),
             has_implicit_edges: false,
+            declared_primary_key: None,
         };
         let coll_entry =
             crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(target.clone()));

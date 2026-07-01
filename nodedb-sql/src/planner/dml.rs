@@ -162,6 +162,7 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
         column_defaults,
         if_absent,
         column_schema,
+        primary_key: info.primary_key.clone(),
     })
 }
 
@@ -229,6 +230,7 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
         column_defaults,
         on_conflict_updates: Vec::new(),
         column_schema,
+        primary_key: info.primary_key.clone(),
     })
 }
 
@@ -300,5 +302,6 @@ fn plan_upsert_with_on_conflict(
         column_defaults,
         on_conflict_updates,
         column_schema,
+        primary_key: info.primary_key.clone(),
     })
 }

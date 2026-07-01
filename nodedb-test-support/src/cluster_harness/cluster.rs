@@ -244,8 +244,7 @@ impl TestCluster {
         }
 
         let seeds = vec![node1.listen_addr];
-        let node2 =
-            TestClusterNode::spawn_with_full_config(2, seeds.clone(), &config).await?;
+        let node2 = TestClusterNode::spawn_with_full_config(2, seeds.clone(), &config).await?;
 
         // Wait for node 2's join to be reflected before spawning node 3.
         // Under load, spawning both peers simultaneously can overwhelm the
@@ -469,8 +468,7 @@ impl TestCluster {
         let seeds = vec![self.nodes[0].listen_addr];
         let cfg = self.spawn_config.clone();
 
-        let learner =
-            TestClusterNode::spawn_with_full_config(new_node_id, seeds, &cfg).await?;
+        let learner = TestClusterNode::spawn_with_full_config(new_node_id, seeds, &cfg).await?;
 
         self.nodes.push(learner);
         let expected = self.nodes.len();

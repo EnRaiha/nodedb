@@ -12,6 +12,7 @@ macro_rules! impl_dml_arms_for_convert_visitor {
             column_defaults: &[(String, String)],
             if_absent: bool,
             column_schema: &[(String, String)],
+            primary_key: Option<&str>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
             super::super::dml::convert_insert(
                 collection,
@@ -20,6 +21,7 @@ macro_rules! impl_dml_arms_for_convert_visitor {
                 column_defaults,
                 column_schema,
                 if_absent,
+                primary_key,
                 self.tenant_id,
                 self.ctx,
             )
@@ -33,6 +35,7 @@ macro_rules! impl_dml_arms_for_convert_visitor {
             column_defaults: &[(String, String)],
             on_conflict_updates: &[(String, nodedb_sql::types_expr::SqlExpr)],
             column_schema: &[(String, String)],
+            primary_key: Option<&str>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
             super::super::dml::convert_upsert(
                 collection,
@@ -41,6 +44,7 @@ macro_rules! impl_dml_arms_for_convert_visitor {
                 column_defaults,
                 column_schema,
                 on_conflict_updates,
+                primary_key,
                 self.tenant_id,
                 self.ctx,
             )

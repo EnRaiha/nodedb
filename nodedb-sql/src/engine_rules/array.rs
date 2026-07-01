@@ -94,6 +94,7 @@ mod tests {
             column_defaults: vec![],
             if_absent: false,
             column_schema: vec![],
+            primary_key: None,
         }
     }
 
@@ -112,6 +113,7 @@ mod tests {
                 column_defaults: vec![],
                 on_conflict_updates: vec![],
                 column_schema: vec![],
+                primary_key: None,
             })
             .unwrap_err(),
             SqlError::Unsupported { .. }

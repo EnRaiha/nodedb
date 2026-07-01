@@ -101,6 +101,7 @@ pub fn create_timeseries(
         cloned_from: None,
         clone_status: nodedb_types::CloneStatus::default(),
         has_implicit_edges: false,
+        declared_primary_key: None,
     };
 
     if let Some(catalog) = state.credentials.catalog() {

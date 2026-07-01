@@ -66,6 +66,19 @@ fn build_schema_bytes(column_schema: &[(String, String)]) -> Vec<u8> {
     zerompk::to_msgpack_vec(&schema).unwrap_or_default()
 }
 
+/// Extract the document-id value from a row, keyed off the declared
+/// `primary_key` column when present, falling back to the legacy
+/// `id`/`document_id`/`key` convention otherwise.
+fn extract_doc_id(row: &[(String, SqlValue)], primary_key: Option<&str>) -> String {
+    row.iter()
+        .find(|(k, _)| match primary_key {
+            Some(pk) => k == pk,
+            None => k == "id" || k == "document_id" || k == "key",
+        })
+        .map(|(_, v)| sql_value_to_string(v))
+        .unwrap_or_default()
+}
+
 pub(super) fn assign_for_pk(
     ctx: &ConvertContext,
     collection: &str,
@@ -117,6 +130,7 @@ pub(in super::super) fn convert_insert(
     column_defaults: &[(String, String)],
     column_schema: &[(String, String)],
     if_absent: bool,
+    primary_key: Option<&str>,
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
@@ -147,11 +161,7 @@ pub(in super::super) fn convert_insert(
     }
 
     for (i, row) in expanded_rows.iter().enumerate() {
-        let doc_id = row
-            .iter()
-            .find(|(k, _)| k == "id" || k == "document_id" || k == "key")
-            .map(|(_, v)| sql_value_to_string(v))
-            .unwrap_or_default();
+        let doc_id = extract_doc_id(row, primary_key);
 
         match engine {
             EngineType::KeyValue => {
@@ -235,6 +245,7 @@ pub(in super::super) fn convert_upsert(
     column_defaults: &[(String, String)],
     column_schema: &[(String, String)],
     on_conflict_updates: &[(String, SqlExpr)],
+    primary_key: Option<&str>,
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
@@ -252,11 +263,7 @@ pub(in super::super) fn convert_upsert(
     let mut columnar_rows: Vec<&Vec<(String, SqlValue)>> = Vec::new();
 
     for row in rows {
-        let doc_id = row
-            .iter()
-            .find(|(k, _)| k == "id" || k == "document_id" || k == "key")
-            .map(|(_, v)| sql_value_to_string(v))
-            .unwrap_or_default();
+        let doc_id = extract_doc_id(row, primary_key);
 
         match engine {
             EngineType::DocumentSchemaless | EngineType::DocumentStrict => {

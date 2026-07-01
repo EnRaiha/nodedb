@@ -17,6 +17,7 @@ impl EngineRules for ColumnarRules {
             column_defaults: p.column_defaults,
             if_absent: p.if_absent,
             column_schema: p.column_schema,
+            primary_key: p.primary_key,
         }])
     }
 
@@ -32,6 +33,7 @@ impl EngineRules for ColumnarRules {
             column_defaults: p.column_defaults,
             on_conflict_updates: p.on_conflict_updates,
             column_schema: p.column_schema,
+            primary_key: p.primary_key,
         }])
     }
 

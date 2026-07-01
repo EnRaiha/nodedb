@@ -195,3 +195,89 @@ async fn strict_upsert_keyword_overwrites() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0], "2", "got: {}", rows[0]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_natural_key_pk_on_non_id_column_accepts_distinct_rows() {
+    // A user-declared PRIMARY KEY on a column other than the built-in `id`
+    // must make that column the uniqueness target. Two rows with DISTINCT
+    // natural keys must both persist — the built-in `id` slot must not create
+    // a phantom empty-string collision between them.
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION nk  \
+             (sku STRING NOT NULL PRIMARY KEY, name STRING) WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+
+    server
+        .exec("INSERT INTO nk (sku, name) VALUES ('a', 'first')")
+        .await
+        .unwrap();
+
+    // Distinct natural key: must succeed, must NOT collide on an empty `id`.
+    server
+        .exec("INSERT INTO nk (sku, name) VALUES ('b', 'second')")
+        .await
+        .unwrap();
+
+    let rows = server
+        .query_text("SELECT name FROM nk ORDER BY sku")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "both natural-key rows must persist, got {rows:?}"
+    );
+    assert_eq!(rows, vec!["first".to_string(), "second".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_natural_key_upsert_targets_declared_pk_column() {
+    // The UPSERT doc_id path (`convert_upsert`) must also key off the declared
+    // natural PK, not the built-in empty `id`. A distinct natural key inserts a
+    // new row; a repeated natural key overwrites in place.
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION nk  \
+             (sku STRING NOT NULL PRIMARY KEY, name STRING) WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+
+    server
+        .exec("UPSERT INTO nk (sku, name) VALUES ('a', 'first')")
+        .await
+        .unwrap();
+
+    // Distinct natural key → second row, no empty-`id` collision.
+    server
+        .exec("UPSERT INTO nk (sku, name) VALUES ('b', 'second')")
+        .await
+        .unwrap();
+
+    // Repeated natural key → overwrite in place, still two rows total.
+    server
+        .exec("UPSERT INTO nk (sku, name) VALUES ('a', 'first-updated')")
+        .await
+        .unwrap();
+
+    let rows = server
+        .query_text("SELECT name FROM nk ORDER BY sku")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected two distinct natural-key rows, got {rows:?}"
+    );
+    assert_eq!(
+        rows,
+        vec!["first-updated".to_string(), "second".to_string()]
+    );
+}

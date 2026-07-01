@@ -83,6 +83,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             column_defaults,
             if_absent,
             column_schema,
+            primary_key,
         } => visitor.insert(
             collection,
             *engine,
@@ -90,6 +91,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             column_defaults,
             *if_absent,
             column_schema,
+            primary_key.as_deref(),
         ),
         SqlPlan::KvInsert {
             collection,
@@ -105,6 +107,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             column_defaults,
             on_conflict_updates,
             column_schema,
+            primary_key,
         } => visitor.upsert(
             collection,
             *engine,
@@ -112,6 +115,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             column_defaults,
             on_conflict_updates,
             column_schema,
+            primary_key.as_deref(),
         ),
         SqlPlan::InsertSelect {
             target,

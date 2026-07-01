@@ -440,8 +440,16 @@ fn convert_collection_type(
         }
 
         CollectionType::Document(DocumentMode::Schemaless) => {
+            // Schemaless collections normally key documents off the
+            // built-in `id` field, but `CREATE COLLECTION` may have
+            // declared an explicit `PRIMARY KEY` column instead (e.g.
+            // `sku STRING PRIMARY KEY`); fall back to `id` when absent.
+            let pk_name = stored
+                .declared_primary_key
+                .clone()
+                .unwrap_or_else(|| "id".to_string());
             let mut columns = vec![ColumnInfo {
-                name: "id".into(),
+                name: pk_name.clone(),
                 data_type: SqlDataType::String,
                 nullable: false,
                 is_primary_key: true,
@@ -450,6 +458,9 @@ fn convert_collection_type(
             }];
             // Add tracked fields from catalog.
             for (name, type_str) in &stored.fields {
+                if name.eq_ignore_ascii_case(&pk_name) {
+                    continue;
+                }
                 columns.push(ColumnInfo {
                     name: name.clone(),
                     data_type: parse_type_str(type_str),
@@ -459,7 +470,7 @@ fn convert_collection_type(
                     raw_type: None,
                 });
             }
-            (EngineType::DocumentSchemaless, columns, Some("id".into()))
+            (EngineType::DocumentSchemaless, columns, Some(pk_name))
         }
 
         CollectionType::KeyValue(config) => {

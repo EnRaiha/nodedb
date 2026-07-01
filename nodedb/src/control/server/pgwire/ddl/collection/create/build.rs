@@ -144,6 +144,17 @@ pub async fn build_and_persist(
 
     let partition_strategy =
         nodedb_types::PartitionStrategy::default_for_collection_type(&collection_type);
+
+    // Extract the declared PRIMARY KEY column name (if any) from the raw
+    // column list. Recorded on every engine so schemaless collections can
+    // key their document id off it instead of the hardcoded `id` field;
+    // harmless for strict/KV, which already track the PK on their schema.
+    let declared_primary_key = columns.iter().find_map(|(col_name, type_str)| {
+        let (_, is_pk, _, _) =
+            nodedb_sql::ddl_ast::collection_type::parse_column_type_str_full(type_str);
+        is_pk.then(|| col_name.clone())
+    });
+
     let coll = StoredCollection {
         tenant_id: tenant_id.as_u64(),
         name: name.to_string(),
@@ -182,6 +193,7 @@ pub async fn build_and_persist(
         cloned_from: None,
         clone_status: nodedb_types::CloneStatus::default(),
         has_implicit_edges: false,
+        declared_primary_key,
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
