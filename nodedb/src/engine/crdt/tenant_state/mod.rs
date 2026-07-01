@@ -8,6 +8,7 @@
 pub mod core;
 pub mod history;
 pub mod policy;
+pub mod validate;
 
 #[cfg(test)]
 mod tests;

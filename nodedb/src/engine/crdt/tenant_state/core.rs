@@ -28,9 +28,9 @@ use crate::types::TenantId;
 /// by the tenant's array-surrogate registry (cross-engine FK referents).
 /// Field-value uniqueness probes are per-collection only — array surrogates are
 /// not document rows and never participate in UNIQUE checks.
-struct TenantRowLookup<'a> {
-    collections: &'a HashMap<String, CrdtState>,
-    array_surrogate_ids: &'a HashSet<String>,
+pub(super) struct TenantRowLookup<'a> {
+    pub(super) collections: &'a HashMap<String, CrdtState>,
+    pub(super) array_surrogate_ids: &'a HashSet<String>,
 }
 
 impl RowLookup for TenantRowLookup<'_> {

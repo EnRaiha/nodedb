@@ -10,6 +10,7 @@ pub mod bitemporal_archive;
 pub mod core;
 pub mod history;
 pub mod snapshot;
+pub mod write_set;
 
 #[cfg(test)]
 mod tests;
