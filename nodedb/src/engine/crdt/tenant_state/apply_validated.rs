@@ -148,6 +148,7 @@ impl TenantCrdtEngine {
                     collection: collection.to_string(),
                     field: String::new(),
                     kind: nodedb_crdt::ConstraintKind::Check {
+                        expr: String::new(),
                         description: "unresolved constraint".to_string(),
                     },
                 };

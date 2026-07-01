@@ -45,11 +45,56 @@ impl Validator {
                 ref_key,
             } => self.check_foreign_key(state, change, constraint, ref_collection, ref_key),
             ConstraintKind::NotNull => self.check_not_null(change, constraint),
-            ConstraintKind::Check { .. } => {
-                // Custom checks are application-defined; we can't evaluate them
-                // generically. They'd be registered as closures in a real impl.
-                None
+            ConstraintKind::Check { expr, .. } => self.check_expr(change, constraint, expr),
+        }
+    }
+
+    /// Evaluate a stored CHECK predicate against a proposed row.
+    ///
+    /// Mirrors the Data-Plane CHECK semantics: `Bool(true)` and `Null` PASS,
+    /// anything else FAILS. A malformed stored expression rejects loudly
+    /// (never silently passes) so a corrupt catalog entry can't bypass the
+    /// invariant it claims to enforce.
+    pub(crate) fn check_expr(
+        &self,
+        change: &ProposedChange,
+        constraint: &Constraint,
+        expr: &str,
+    ) -> Option<Violation> {
+        // Build a row Value::Object from the proposed change's fields so the
+        // expression evaluator can resolve column references by name.
+        let mut row = std::collections::HashMap::with_capacity(change.fields.len());
+        for (name, val) in &change.fields {
+            row.insert(name.clone(), crate::loro_value::loro_to_value(val));
+        }
+        let row_value = nodedb_types::Value::Object(row);
+
+        let parsed = match nodedb_query::expr_parse::parse_generated_expr(expr) {
+            Ok((expr, _deps)) => expr,
+            Err(e) => {
+                return Some(Violation {
+                    constraint_name: constraint.name.clone(),
+                    reason: format!("invalid CHECK expression `{expr}`: {e}"),
+                    hint: CompensationHint::ManualIntervention {
+                        reason: format!(
+                            "CHECK constraint `{}` has an unparseable predicate",
+                            constraint.name
+                        ),
+                    },
+                });
             }
+        };
+
+        match parsed.eval(&row_value) {
+            nodedb_types::Value::Bool(true) => None,
+            nodedb_types::Value::Null => None,
+            _ => Some(Violation {
+                constraint_name: constraint.name.clone(),
+                reason: format!("CHECK `{}` failed: {expr}", constraint.name),
+                hint: CompensationHint::ManualIntervention {
+                    reason: format!("row violates CHECK predicate `{expr}`"),
+                },
+            }),
         }
     }
 

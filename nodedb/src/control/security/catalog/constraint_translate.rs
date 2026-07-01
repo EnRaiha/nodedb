@@ -3,9 +3,10 @@
 //! Translate a stored collection descriptor into the CRDT constraint set the
 //! commit-time validator enforces.
 //!
-//! Scope today: `UNIQUE` (from secondary indexes) and `NOT NULL` (from strict /
-//! KV typed schemas, columnar type strings, and schemaless type guards).
-//! Foreign keys and CHECK predicates are deliberately out of scope here.
+//! Scope today: `UNIQUE` (from secondary indexes), `NOT NULL` (from strict /
+//! KV typed schemas, columnar type strings, and schemaless type guards), and
+//! `CHECK` (from schemaless type-guard predicates). Foreign keys are
+//! deliberately out of scope here.
 
 use nodedb_crdt::{Constraint, ConstraintKind};
 use nodedb_types::CollectionType;
@@ -63,10 +64,21 @@ pub fn collection_constraints(stored: &StoredCollection) -> Vec<Constraint> {
         }
     }
 
-    // NOT NULL — schemaless REQUIRED type guards.
+    // NOT NULL / CHECK — schemaless type guards.
     for guard in &stored.type_guards {
         if guard.required {
             out.push(not_null(collection, &guard.field));
+        }
+        if let Some(expr) = &guard.check_expr {
+            out.push(Constraint {
+                name: format!("{collection}_{}_check", guard.field),
+                collection: collection.to_string(),
+                field: guard.field.clone(),
+                kind: ConstraintKind::Check {
+                    expr: expr.clone(),
+                    description: expr.clone(),
+                },
+            });
         }
     }
 
@@ -199,6 +211,45 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "docs_title_notnull");
         assert_eq!(got[0].kind, ConstraintKind::NotNull);
+    }
+
+    #[test]
+    fn schemaless_check_expr_yields_check() {
+        let mut c = base("people");
+        c.type_guards.push(TypeGuardFieldDef {
+            field: "age".to_string(),
+            type_expr: "INT".to_string(),
+            required: false,
+            check_expr: Some("age > 0".to_string()),
+            default_expr: None,
+            value_expr: None,
+        });
+        let got = collection_constraints(&c);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "people_age_check");
+        assert_eq!(got[0].field, "age");
+        match &got[0].kind {
+            ConstraintKind::Check { expr, .. } => assert_eq!(expr, "age > 0"),
+            other => panic!("expected Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schemaless_required_and_check_yields_two_constraints() {
+        let mut c = base("people");
+        c.type_guards.push(TypeGuardFieldDef {
+            field: "age".to_string(),
+            type_expr: "INT".to_string(),
+            required: true,
+            check_expr: Some("age > 0".to_string()),
+            default_expr: None,
+            value_expr: None,
+        });
+        let got = collection_constraints(&c);
+        assert_eq!(got.len(), 2);
+        let names: Vec<&str> = got.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"people_age_notnull"));
+        assert!(names.contains(&"people_age_check"));
     }
 
     #[test]

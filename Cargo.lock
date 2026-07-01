@@ -4410,6 +4410,7 @@ dependencies = [
  "hkdf",
  "hmac 0.12.1",
  "loro",
+ "nodedb-query",
  "nodedb-types",
  "serde",
  "serde_json",

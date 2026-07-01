@@ -19,6 +19,7 @@ loro = { workspace = true }
 serde = { workspace = true }
 zerompk = { workspace = true }
 nodedb-types = { workspace = true }
+nodedb-query = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 hkdf = { workspace = true }

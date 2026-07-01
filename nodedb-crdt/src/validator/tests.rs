@@ -345,3 +345,73 @@ fn validate_with_policy_escalate_to_dlq() {
     assert!(matches!(resolution, PolicyResolution::Escalate { .. }));
     assert_eq!(validator.dlq().len(), 1);
 }
+
+#[test]
+fn check_constraint_passes_when_predicate_true() {
+    let state = CrdtState::new(1).unwrap();
+    let mut cs = ConstraintSet::new();
+    cs.add_check("people_age_check", "people", "age", "age > 0", "age > 0");
+    let validator = Validator::new(cs, 100);
+
+    let change = ProposedChange {
+        collection: "people".into(),
+        row_id: "p1".into(),
+        surrogate: nodedb_types::Surrogate::ZERO,
+        fields: vec![("age".into(), LoroValue::I64(5))],
+    };
+
+    assert!(matches!(
+        validator.validate(&state, &change),
+        ValidationOutcome::Accepted
+    ));
+}
+
+#[test]
+fn check_constraint_rejects_when_predicate_false() {
+    let state = CrdtState::new(1).unwrap();
+    let mut cs = ConstraintSet::new();
+    cs.add_check("people_age_check", "people", "age", "age > 0", "age > 0");
+    let validator = Validator::new(cs, 100);
+
+    let change = ProposedChange {
+        collection: "people".into(),
+        row_id: "p1".into(),
+        surrogate: nodedb_types::Surrogate::ZERO,
+        fields: vec![("age".into(), LoroValue::I64(-1))],
+    };
+
+    match validator.validate(&state, &change) {
+        ValidationOutcome::Rejected(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].constraint_name, "people_age_check");
+            assert!(matches!(
+                v[0].hint,
+                CompensationHint::ManualIntervention { .. }
+            ));
+        }
+        _ => panic!("expected rejection"),
+    }
+}
+
+#[test]
+fn check_constraint_rejects_malformed_expr() {
+    let state = CrdtState::new(1).unwrap();
+    let mut cs = ConstraintSet::new();
+    cs.add_check("people_age_check", "people", "age", "age >", "age >");
+    let validator = Validator::new(cs, 100);
+
+    let change = ProposedChange {
+        collection: "people".into(),
+        row_id: "p1".into(),
+        surrogate: nodedb_types::Surrogate::ZERO,
+        fields: vec![("age".into(), LoroValue::I64(5))],
+    };
+
+    match validator.validate(&state, &change) {
+        ValidationOutcome::Rejected(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].constraint_name, "people_age_check");
+        }
+        _ => panic!("expected rejection for malformed CHECK expression"),
+    }
+}

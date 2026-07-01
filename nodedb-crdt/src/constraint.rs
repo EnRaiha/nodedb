@@ -50,6 +50,8 @@ pub enum ConstraintKind {
     /// Custom predicate — evaluated as a boolean expression on the row.
     /// Analogous to SQL `CHECK(expression)`.
     Check {
+        /// The CHECK predicate as SQL expression text (evaluated on the row).
+        expr: String,
         /// Human-readable description of the check.
         description: String,
     },
@@ -153,6 +155,26 @@ impl ConstraintSet {
         });
     }
 
+    /// Add a CHECK constraint carrying an evaluable SQL predicate.
+    pub fn add_check(
+        &mut self,
+        name: &str,
+        collection: &str,
+        field: &str,
+        expr: &str,
+        description: &str,
+    ) {
+        self.add(Constraint {
+            name: name.to_string(),
+            collection: collection.to_string(),
+            field: field.to_string(),
+            kind: ConstraintKind::Check {
+                expr: expr.to_string(),
+                description: description.to_string(),
+            },
+        });
+    }
+
     /// Replace every constraint scoped to `collection` with `new`.
     /// Constraints belonging to other collections are left untouched.
     pub fn set_for_collection(&mut self, collection: &str, new: Vec<Constraint>) {
@@ -208,6 +230,22 @@ mod tests {
 
         let btfk = cs.for_collection("orders")[0];
         assert!(matches!(btfk.kind, ConstraintKind::BiTemporalFK { .. }));
+    }
+
+    #[test]
+    fn add_check_constraint() {
+        let mut cs = ConstraintSet::new();
+        cs.add_check("people_age_check", "people", "age", "age > 0", "age > 0");
+
+        assert_eq!(cs.len(), 1);
+        let c = cs.for_collection("people")[0];
+        assert_eq!(c.name, "people_age_check");
+        assert_eq!(c.field, "age");
+        assert!(matches!(c.kind, ConstraintKind::Check { .. }));
+        if let ConstraintKind::Check { expr, description } = &c.kind {
+            assert_eq!(expr, "age > 0");
+            assert_eq!(description, "age > 0");
+        }
     }
 
     #[test]
