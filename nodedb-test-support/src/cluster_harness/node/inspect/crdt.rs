@@ -79,6 +79,68 @@ impl TestClusterNode {
             .unwrap_or_default()
     }
 
+    /// Clear a collection's installed CRDT constraint set from THIS node's
+    /// local per-core validator.
+    ///
+    /// Test hook used to prove snapshot RESTORE reinstalls a constraint set:
+    /// a test captures a snapshot while a constraint is installed, drops it
+    /// via this method, then restores the snapshot and asserts the
+    /// constraint reappears in `crdt_constraints`. Dispatches
+    /// `CrdtOp::DropConstraints` to the local data core that homes the
+    /// collection's vshard. Returns `true` iff the response status is `Ok`.
+    pub async fn crdt_drop_constraints(
+        &self,
+        tenant: nodedb_types::TenantId,
+        collection: &str,
+        constraint_version: u64,
+    ) -> bool {
+        use nodedb::bridge::envelope::{Priority, Request, Status};
+        use nodedb::event::EventSource;
+        use nodedb::types::{DatabaseId, ReadConsistency, RequestId, VShardId};
+        use nodedb_physical::physical_plan::{CrdtOp, PhysicalPlan};
+
+        let request_id = RequestId::new(HARNESS_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
+        let vshard_id = VShardId::new(nodedb_cluster::routing::vshard_for_collection(
+            DatabaseId::DEFAULT,
+            collection,
+        ));
+        let request = Request {
+            request_id,
+            tenant_id: tenant,
+            database_id: DatabaseId::DEFAULT,
+            vshard_id,
+            plan: PhysicalPlan::Crdt(CrdtOp::DropConstraints {
+                collection: collection.to_string(),
+                constraint_version,
+            }),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: nodedb_types::TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+        };
+
+        let mut rx = self.shared.tracker.register(request_id);
+        let dispatched = match self.shared.dispatcher.lock() {
+            Ok(mut d) => d.dispatch(request),
+            Err(poisoned) => poisoned.into_inner().dispatch(request),
+        };
+        if dispatched.is_err() {
+            return false;
+        }
+
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(resp)) => resp,
+                _ => return false,
+            };
+        response.status == Status::Ok
+    }
+
     /// Drive ONE constraint-reconcile pass on this node (no-op unless this node
     /// is the metadata leader). Uses a fresh delivered-map so every changed
     /// collection is re-proposed, letting a test install constraints on demand

@@ -11,4 +11,5 @@
 mod catalog;
 mod crdt;
 mod lease;
+mod snapshot;
 mod topology;

@@ -61,6 +61,7 @@ impl CoreLoop {
         let mut vectors_written = 0u64;
         let mut kv_written = 0u64;
         let mut crdt_written = 0u64;
+        let mut crdt_constraints_written = 0u64;
         let mut ts_written = 0u64;
 
         {
@@ -210,6 +211,23 @@ impl CoreLoop {
                 }
             }
 
+            // Restore CRDT constraint state per collection: reconstructs the
+            // validator's installed constraint set + `installed_constraint_version`
+            // so a snapshot-installed follower does not come up empty and
+            // retry-fence every peer delta on constrained collections. Fail-safe
+            // on error — warn and continue, matching the `crdt_state` loop, since
+            // a failed reconstruction only reverts to the pre-fix (over-rejecting)
+            // behavior rather than corrupting state.
+            for (tid_raw, collection, version, encoded) in &snap.crdt_constraints {
+                if let Err(e) =
+                    self.restore_crdt_constraints(*tid_raw, collection, *version, encoded)
+                {
+                    warn!(tid_raw, %collection, error = %e, "failed to restore crdt constraints");
+                } else {
+                    crdt_constraints_written += 1;
+                }
+            }
+
             // Restore timeseries memtables and flush each to an on-disk segment
             // for durability. A flush failure is fatal to the whole restore —
             // consistent with how `restore_flushed_ts_segments` treats durability
@@ -261,6 +279,7 @@ impl CoreLoop {
             vectors_written,
             kv_written,
             crdt_written,
+            crdt_constraints_written,
             ts_written,
             flushed_ts_collections = snap.flushed_ts_segments.len(),
             columnar_engines = snap.columnar_engines.len(),
@@ -275,6 +294,7 @@ impl CoreLoop {
             "vectors_restored": vectors_written,
             "kv_entries_restored": kv_written,
             "crdt_restored": crdt_written,
+            "crdt_constraints_restored": crdt_constraints_written,
             "timeseries_restored": ts_written,
             "columnar_engines_restored": snap.columnar_engines.len(),
         });
@@ -402,6 +422,31 @@ impl CoreLoop {
         // target collection's per-collection LoroDoc.
         let engine = self.get_crdt_engine(tid)?;
         engine.import_snapshot_bytes(collection, bytes)
+    }
+
+    /// Reconstructs a collection's installed constraint set + version from a
+    /// snapshot entry. Version-fenced via `set_collection_constraints`
+    /// (`>=`), so this is idempotent against later replay/reconcile.
+    fn restore_crdt_constraints(
+        &mut self,
+        tenant_id: u64,
+        collection: &str,
+        constraint_version: u64,
+        encoded: &[Vec<u8>],
+    ) -> crate::Result<()> {
+        let tid = crate::types::TenantId::new(tenant_id);
+        let engine = self.get_crdt_engine(tid)?;
+        let mut constraints = Vec::with_capacity(encoded.len());
+        for blob in encoded {
+            let c: nodedb_crdt::Constraint =
+                zerompk::from_msgpack(blob).map_err(|e| crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: e.to_string(),
+                })?;
+            constraints.push(c);
+        }
+        engine.set_collection_constraints(collection, constraint_version, constraints);
+        Ok(())
     }
 
     fn restore_timeseries(&mut self, key: &str, bytes: &[u8]) -> crate::Result<()> {

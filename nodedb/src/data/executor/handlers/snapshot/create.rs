@@ -137,6 +137,41 @@ impl CoreLoop {
                 }
                 Err(e) => warn!(tenant_id, error = %e, "snapshot: crdt export failed"),
             }
+
+            // 5b. CRDT constraint state: capture the installed constraint set
+            // + version per collection so a snapshot-installed follower
+            // reconstructs its validator instead of coming up empty and
+            // retry-fencing every peer delta on constrained collections.
+            for collection in crdt.collections_with_constraints() {
+                let version = crdt.installed_constraint_version(&collection);
+                if version == 0 {
+                    continue;
+                }
+                let constraints = crdt.constraints_for_collection(&collection);
+                let mut encoded = Vec::with_capacity(constraints.len());
+                let mut failed = false;
+                for constraint in &constraints {
+                    match zerompk::to_msgpack_vec(constraint) {
+                        Ok(bytes) => encoded.push(bytes),
+                        Err(e) => {
+                            warn!(
+                                tenant_id,
+                                collection,
+                                error = %e,
+                                "snapshot: crdt constraint serialization failed"
+                            );
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                if failed || encoded.is_empty() {
+                    continue;
+                }
+                snapshot
+                    .crdt_constraints
+                    .push((tenant_id, collection, version, encoded));
+            }
         }
 
         // 6. Timeseries memtables: serialize column data.
@@ -191,6 +226,7 @@ impl CoreLoop {
             vectors = snapshot.vectors.len(),
             kv_tables = snapshot.kv_tables.len(),
             crdt = snapshot.crdt_state.len(),
+            crdt_constraints = snapshot.crdt_constraints.len(),
             timeseries = snapshot.timeseries.len(),
             flushed_ts_collections = snapshot.flushed_ts_segments.len(),
             columnar_engines = snapshot.columnar_engines.len(),

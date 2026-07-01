@@ -301,17 +301,41 @@ async fn fan_tenant_snapshot_all_cores(
             zerompk::from_msgpack(resp.payload.as_ref()).map_err(|e| crate::Error::Codec {
                 detail: format!("tenant-snapshot gather: part decode: {e}"),
             })?;
-        merged.documents.extend(part.documents);
-        merged.indexes.extend(part.indexes);
-        merged.edges.extend(part.edges);
-        merged.vectors.extend(part.vectors);
-        merged.kv_tables.extend(part.kv_tables);
-        merged.crdt_state.extend(part.crdt_state);
-        merged.timeseries.extend(part.timeseries);
-        merged.flushed_ts_segments.extend(part.flushed_ts_segments);
-        merged.columnar_engines.extend(part.columnar_engines);
-        merged.surrogate_pk.extend(part.surrogate_pk);
-        merged.tenant_edges.extend(part.tenant_edges);
+        // Destructure exhaustively so a NEW field added to `TenantDataSnapshot`
+        // fails to compile here rather than being silently dropped from the
+        // cross-core merge. Every per-core data-bearing section MUST be
+        // concatenated — a forgotten field ships an incomplete snapshot and a
+        // snapshot-installed follower comes up missing that state.
+        let TenantDataSnapshot {
+            documents,
+            indexes,
+            edges,
+            vectors,
+            kv_tables,
+            crdt_state,
+            crdt_constraints,
+            timeseries,
+            flushed_ts_segments,
+            columnar_engines,
+            vector_params,
+            index_configs,
+            surrogate_pk,
+            tenant_edges,
+        } = part;
+        merged.documents.extend(documents);
+        merged.indexes.extend(indexes);
+        merged.edges.extend(edges);
+        merged.vectors.extend(vectors);
+        merged.kv_tables.extend(kv_tables);
+        merged.crdt_state.extend(crdt_state);
+        merged.crdt_constraints.extend(crdt_constraints);
+        merged.timeseries.extend(timeseries);
+        merged.flushed_ts_segments.extend(flushed_ts_segments);
+        merged.columnar_engines.extend(columnar_engines);
+        merged.vector_params.extend(vector_params);
+        merged.index_configs.extend(index_configs);
+        merged.surrogate_pk.extend(surrogate_pk);
+        merged.tenant_edges.extend(tenant_edges);
     }
 
     let payload = zerompk::to_msgpack_vec(&merged).map_err(|e| crate::Error::Serialization {

@@ -134,6 +134,29 @@ pub struct TenantDataSnapshot {
     #[msgpack(default)]
     #[serde(default)]
     pub tenant_edges: Vec<(u64, String, Vec<u8>)>,
+
+    /// CRDT constraint state, one entry per `(tenant, collection)` that has an
+    /// installed constraint set: `[(tenant_id, collection, constraint_version,
+    /// per_constraint_zerompk_bytes), ...]`. Each inner `Vec<u8>` is one
+    /// zerompk-encoded `nodedb_crdt::Constraint`. Stored as opaque bytes (NOT
+    /// typed) to keep this type decoupled from the crdt wire layout — the same
+    /// reason `crdt_state` stores raw loro bytes.
+    ///
+    /// Without this field a snapshot-installed follower ends up with
+    /// `installed_constraint_version == 0` on every constrained collection,
+    /// even though the leader has constraints installed, and the apply-time
+    /// write-gate fences (rejects) every peer delta on that collection
+    /// forever, since the delta's `constraint_version_required` can never be
+    /// `<=` an installed version that never advances. Carrying the constraint
+    /// set + version through the snapshot lets `restore_crdt_constraints`
+    /// reconstruct the validator and the installed version in one shot.
+    ///
+    /// `#[msgpack(default)]`: snapshots written before this field decode with
+    /// an empty Vec — the restore path skips the loop, reproducing the
+    /// pre-fix (fail-safe, over-rejecting) behavior rather than a hard error.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub crdt_constraints: Vec<(u64, String, u64, Vec<Vec<u8>>)>,
 }
 
 /// A single PK → surrogate identity binding carried in a snapshot/backup.
@@ -483,6 +506,103 @@ mod tests {
             "non-default index_type must be preserved"
         );
         assert_eq!(decoded_cfg.pq_m, 16, "non-default pq_m must be preserved");
+    }
+
+    /// Round-trip: `crdt_constraints` survives msgpack encode → decode intact,
+    /// and each inner blob decodes back into the exact `nodedb_crdt::Constraint`
+    /// it was encoded from.
+    #[test]
+    fn crdt_constraints_round_trip() {
+        let unique = nodedb_crdt::Constraint {
+            name: "users_email_unique".to_string(),
+            collection: "users".to_string(),
+            field: "email".to_string(),
+            kind: nodedb_crdt::ConstraintKind::Unique,
+        };
+        let not_null = nodedb_crdt::Constraint {
+            name: "users_email_not_null".to_string(),
+            collection: "users".to_string(),
+            field: "email".to_string(),
+            kind: nodedb_crdt::ConstraintKind::NotNull,
+        };
+        let unique_bytes = zerompk::to_msgpack_vec(&unique).expect("encode Unique constraint");
+        let not_null_bytes = zerompk::to_msgpack_vec(&not_null).expect("encode NotNull constraint");
+
+        let snap = TenantDataSnapshot {
+            crdt_constraints: vec![(
+                7,
+                "users".to_string(),
+                3,
+                vec![unique_bytes, not_null_bytes],
+            )],
+            ..Default::default()
+        };
+
+        let bytes = zerompk::to_msgpack_vec(&snap).expect("encode snapshot with crdt_constraints");
+        let decoded: TenantDataSnapshot =
+            zerompk::from_msgpack(&bytes).expect("decode snapshot with crdt_constraints");
+
+        assert_eq!(decoded.crdt_constraints.len(), 1);
+        let (tid, collection, version, encoded) = &decoded.crdt_constraints[0];
+        assert_eq!(*tid, 7);
+        assert_eq!(collection, "users");
+        assert_eq!(*version, 3);
+        assert_eq!(encoded.len(), 2);
+
+        let decoded_unique: nodedb_crdt::Constraint =
+            zerompk::from_msgpack(&encoded[0]).expect("decode Unique constraint");
+        assert_eq!(decoded_unique, unique);
+        let decoded_not_null: nodedb_crdt::Constraint =
+            zerompk::from_msgpack(&encoded[1]).expect("decode NotNull constraint");
+        assert_eq!(decoded_not_null, not_null);
+    }
+
+    /// Backward-compat: a `TenantDataSnapshot` serialized WITHOUT the
+    /// `crdt_constraints` field (the schema that existed before this field
+    /// was added) must decode successfully with `crdt_constraints` defaulting
+    /// to `Vec::new()`.
+    #[test]
+    fn backward_compat_missing_crdt_constraints_defaults_to_empty() {
+        #[derive(zerompk::ToMessagePack)]
+        #[msgpack(map)]
+        struct OldSnapshot {
+            documents: Vec<(String, Vec<u8>)>,
+            indexes: Vec<(String, Vec<u8>)>,
+            edges: Vec<(String, Vec<u8>)>,
+            vectors: Vec<(String, Vec<u8>)>,
+            kv_tables: Vec<(String, Vec<u8>)>,
+            crdt_state: Vec<(u64, String, Vec<u8>)>,
+            timeseries: Vec<(String, Vec<u8>)>,
+            flushed_ts_segments: Vec<TsFlushedCollectionBlob>,
+            columnar_engines: Vec<(String, Vec<u8>)>,
+            vector_params: Vec<(String, Vec<u8>)>,
+            index_configs: Vec<(String, Vec<u8>)>,
+            surrogate_pk: Vec<SurrogateBindEntry>,
+            tenant_edges: Vec<(u64, String, Vec<u8>)>,
+        }
+        let old = OldSnapshot {
+            documents: vec![("k".to_string(), b"v".to_vec())],
+            indexes: Vec::<(String, Vec<u8>)>::new(),
+            edges: Vec::<(String, Vec<u8>)>::new(),
+            vectors: Vec::<(String, Vec<u8>)>::new(),
+            kv_tables: Vec::<(String, Vec<u8>)>::new(),
+            crdt_state: Vec::<(u64, String, Vec<u8>)>::new(),
+            timeseries: Vec::<(String, Vec<u8>)>::new(),
+            flushed_ts_segments: Vec::<TsFlushedCollectionBlob>::new(),
+            columnar_engines: Vec::<(String, Vec<u8>)>::new(),
+            vector_params: Vec::<(String, Vec<u8>)>::new(),
+            index_configs: Vec::<(String, Vec<u8>)>::new(),
+            surrogate_pk: Vec::<SurrogateBindEntry>::new(),
+            tenant_edges: Vec::<(u64, String, Vec<u8>)>::new(),
+        };
+        let bytes = zerompk::to_msgpack_vec(&old).expect("encode old snapshot");
+        let decoded: TenantDataSnapshot =
+            zerompk::from_msgpack(&bytes).expect("decode old snapshot as new schema");
+        assert_eq!(decoded.documents.len(), 1);
+        assert!(
+            decoded.crdt_constraints.is_empty(),
+            "crdt_constraints must default to empty for old snapshot"
+        );
     }
 
     /// Backward-compat: a snapshot written WITHOUT `vector_params` and

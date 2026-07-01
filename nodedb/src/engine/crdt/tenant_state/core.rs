@@ -372,6 +372,18 @@ impl TenantCrdtEngine {
         true
     }
 
+    /// Names of collections that currently have an installed constraint set
+    /// (constraint_version > 0). Used by the snapshot builder to capture
+    /// constraint state so a snapshot-installed follower reconstructs its
+    /// validator instead of coming up empty.
+    pub fn collections_with_constraints(&self) -> Vec<String> {
+        self.constraint_versions
+            .iter()
+            .filter(|&(_, &v)| v > 0)
+            .map(|(c, _)| c.clone())
+            .collect()
+    }
+
     /// Clone the constraints currently scoped to `collection` from this
     /// tenant's validator. Empty when the collection has no constraints.
     pub fn constraints_for_collection(&self, collection: &str) -> Vec<nodedb_crdt::Constraint> {
