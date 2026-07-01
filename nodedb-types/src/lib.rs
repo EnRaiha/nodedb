@@ -42,6 +42,7 @@ pub mod lsn;
 pub mod mirror;
 pub mod multi_vector;
 pub mod namespace;
+pub mod pg_compat;
 pub mod protocol;
 pub mod result;
 pub mod sparse_vector;

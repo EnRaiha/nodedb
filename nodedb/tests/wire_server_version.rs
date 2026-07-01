@@ -17,6 +17,18 @@ async fn pgwire_show_server_version_tracks_workspace_version() {
     assert_eq!(rows, vec![format!("NodeDB {VERSION}")]);
 }
 
+#[tokio::test]
+async fn pgwire_version_function_returns_postgres_compatible_string() {
+    let srv = TestServer::start().await;
+    let rows = srv.query_text("SELECT version()").await.unwrap();
+    assert_eq!(rows.len(), 1, "version() must return one row, got {rows:?}");
+    assert!(rows[0].starts_with("PostgreSQL"), "got {rows:?}");
+    assert!(
+        rows[0].contains("15"),
+        "must advertise PG major, got {rows:?}"
+    );
+}
+
 /// No file under `src/control/server/` may embed digits directly inside a
 /// `"NodeDB ..."`, `"NodeDB/..."`, or `nodedb_version:...` literal — every
 /// wire-surface version must format `crate::version::VERSION` in.

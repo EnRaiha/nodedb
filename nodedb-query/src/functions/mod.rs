@@ -14,6 +14,7 @@ mod json;
 mod math;
 pub(crate) mod shared;
 mod string;
+mod system;
 mod types;
 
 use nodedb_types::Value;
@@ -45,6 +46,9 @@ pub fn eval_function(name: &str, args: &[Value]) -> Value {
         return v;
     }
     if let Some(v) = fts::try_eval_fts(name, args) {
+        return v;
+    }
+    if let Some(v) = system::try_eval(name, args) {
         return v;
     }
     // Geo / Spatial functions — delegated to geo_functions module.
@@ -323,5 +327,13 @@ mod tests {
             ],
         );
         assert!(result.as_geometry().is_some());
+    }
+
+    #[test]
+    fn version_returns_postgres_compatible_string() {
+        match eval_fn("version", vec![]) {
+            Value::String(s) => assert!(s.contains("PostgreSQL")),
+            other => panic!("expected Value::String, got {other:?}"),
+        }
     }
 }

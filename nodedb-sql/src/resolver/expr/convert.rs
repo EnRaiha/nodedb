@@ -32,6 +32,7 @@ fn is_zero_arg_keyword_function(name: &str) -> bool {
             | "current_schema"
             | "session_user"
             | "user"
+            | "version"
     )
 }
 

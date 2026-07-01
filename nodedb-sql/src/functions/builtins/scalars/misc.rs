@@ -47,5 +47,14 @@ pub(super) fn misc_functions() -> Vec<FunctionMeta> {
             Some(ColumnType::Array),
             arg_types::NDB_CHUNK_TEXT_ARGS,
         ),
+        m(
+            "version",
+            Scalar,
+            0,
+            0,
+            no_trigger(),
+            Some(ColumnType::String),
+            arg_types::NO_ARGS,
+        ),
     ]
 }
