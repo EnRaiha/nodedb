@@ -10,6 +10,7 @@
 //! - `0x10` DeltaPush (client → server)
 //! - `0x11` DeltaAck (server → client)
 //! - `0x12` DeltaReject (server → client)
+//! - `0x13` CollectionSchema (bidirectional)
 //! - `0x14` CollectionPurged (server → client)
 //! - `0x20` ShapeSubscribe (client → server)
 //! - `0x21` ShapeSnapshot (server → client)
@@ -53,6 +54,7 @@
 pub mod ack_result;
 pub mod ack_status;
 pub mod array;
+pub mod collection_schema;
 pub mod columnar;
 pub mod delta;
 pub mod frame;
@@ -76,6 +78,7 @@ pub use array::{
     ArrayAckMsg, ArrayCatchupRequestMsg, ArrayDeltaBatchMsg, ArrayDeltaMsg, ArrayRejectMsg,
     ArrayRejectReason, ArraySchemaSyncMsg, ArraySnapshotChunkMsg, ArraySnapshotMsg,
 };
+pub use collection_schema::{CollectionDescriptor, CollectionSchemaSyncMsg};
 pub use columnar::{ColumnarInsertAckMsg, ColumnarInsertMsg};
 pub use delta::{CollectionPurgedMsg, DeltaAckMsg, DeltaPushMsg, DeltaRejectMsg};
 pub use frame::{SyncFrame, SyncMessageType};

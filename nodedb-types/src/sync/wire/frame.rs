@@ -26,6 +26,10 @@ pub enum SyncMessageType {
     DeltaPush = 0x10,
     DeltaAck = 0x11,
     DeltaReject = 0x12,
+    /// Collection schema descriptor announcement (bidirectional, 0x13).
+    /// Carries a `CollectionDescriptor` so any peer can materialize the
+    /// collection in its catalog with the correct engine + config.
+    CollectionSchema = 0x13,
     /// Collection purged notification (server → client, 0x14).
     /// Sent when an Origin collection is hard-deleted (UNDROP window
     /// expired or explicit `DROP COLLECTION ... PURGE`). The client
@@ -115,6 +119,7 @@ impl SyncMessageType {
             0x10 => Some(Self::DeltaPush),
             0x11 => Some(Self::DeltaAck),
             0x12 => Some(Self::DeltaReject),
+            0x13 => Some(Self::CollectionSchema),
             0x14 => Some(Self::CollectionPurged),
             0x20 => Some(Self::ShapeSubscribe),
             0x21 => Some(Self::ShapeSnapshot),
