@@ -19,10 +19,17 @@ use nodedb_types::sync::wire::array::{
 use super::super::wire::{SyncFrame, SyncMessageType};
 use crate::control::state::SharedState;
 
-/// Build the per-session inbound array engine, or `None` when `SharedState`
-/// is absent (the no-op listener path used in tests).
+/// Build the per-session inbound array engine bound to `tenant_id`, or `None`
+/// when `SharedState` is absent (the no-op listener path used in tests).
+///
+/// `tenant_id` MUST be the session's handshake-authenticated tenant: the
+/// inbound engine stamps it onto every replicated array write (Raft-log
+/// routing) and the fan-out uses it to match subscriber shapes. The caller
+/// therefore builds this lazily, only after authentication — building it under
+/// a placeholder tenant would misroute every inbound array delta.
 pub(super) fn build_array_inbound(
     shared: &Option<Arc<SharedState>>,
+    tenant_id: crate::types::TenantId,
 ) -> Option<Arc<crate::control::array_sync::OriginArrayInbound>> {
     shared.as_ref().map(|s| {
         let engine = Arc::new(crate::control::array_sync::OriginApplyEngine::new(
@@ -36,13 +43,13 @@ pub(super) fn build_array_inbound(
             Arc::clone(&s.array_snapshot_hlcs),
             Arc::clone(&s.array_merger_registry),
             0,
-            0,
+            tenant_id.as_u64(),
         ));
         let inbound = crate::control::array_sync::OriginArrayInbound::new(
             engine,
             Arc::clone(&s.array_sync_schemas),
             Arc::clone(s),
-            crate::types::TenantId::new(0),
+            tenant_id,
         )
         .with_observer(fanout);
         Arc::new(inbound)

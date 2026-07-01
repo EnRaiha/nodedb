@@ -49,7 +49,10 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
     let mut presence_rx: Option<tokio::sync::mpsc::Receiver<std::sync::Arc<Vec<u8>>>> = None;
     let mut presence_registered = false;
 
-    let array_inbound = build_array_inbound(&shared);
+    // Built lazily on the first array frame, once the handshake has established
+    // the session's tenant — the inbound engine binds that tenant for Raft-log
+    // routing and shape fan-out (see `build_array_inbound`).
+    let mut array_inbound: Option<Arc<crate::control::array_sync::OriginArrayInbound>> = None;
 
     let mut array_delivery_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>> = None;
     let mut array_delivery_registered = false;
@@ -172,6 +175,18 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
                     }
 
                     if is_array_frame(frame.msg_type) {
+                        // Bind the inbound array engine to the session's
+                        // authenticated tenant, lazily, on first use. The gate is
+                        // the tenant itself (not `authenticated`): the handshake
+                        // sets `tenant_id = Some(..)` in the same step it marks the
+                        // session authenticated, so a present tenant IS proof of
+                        // authentication — and there is no placeholder-tenant
+                        // fallback that could misroute writes under tenant 0.
+                        if array_inbound.is_none()
+                            && let Some(tenant) = session.tenant_id
+                        {
+                            array_inbound = build_array_inbound(&shared, tenant);
+                        }
                         if let Some(inbound) = &array_inbound {
                             // Stamp the session's handshake-assigned identity so
                             // inbound array provenance is server-authoritative.
