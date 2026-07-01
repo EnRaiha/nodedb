@@ -39,6 +39,8 @@ use nodedb::event::{EventPlane, create_event_bus};
 use nodedb::wal::WalManager;
 use nodedb_types::config::tuning::ClusterTransportTuning;
 
+use crate::cluster_harness::cluster::ClusterSpawnConfig;
+
 /// Running cluster node.
 pub struct TestClusterNode {
     pub node_id: u64,
@@ -146,17 +148,15 @@ impl TestClusterNode {
         query_tuning: nodedb_types::config::tuning::QueryTuning,
         num_cores: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::spawn_with_full_config(
-            node_id,
-            seed_nodes,
+        let config = ClusterSpawnConfig {
             tuning,
             graph_tuning,
             query_tuning,
             num_cores,
-            None,
-            3,
-        )
-        .await
+            log_compaction_threshold: None,
+            replication_factor: 3,
+        };
+        Self::spawn_with_full_config(node_id, seed_nodes, &config).await
     }
 
     /// Lowest-level cluster-node spawn. In addition to the tuning knobs of
@@ -178,16 +178,18 @@ impl TestClusterNode {
     ///
     /// Every other spawn entry point delegates here with `None` /
     /// `replication_factor = 3`.
-    pub async fn spawn_with_full_config(
+    pub(crate) async fn spawn_with_full_config(
         node_id: u64,
         seed_nodes: Vec<SocketAddr>,
-        tuning: ClusterTransportTuning,
-        graph_tuning: nodedb_types::config::tuning::GraphTuning,
-        query_tuning: nodedb_types::config::tuning::QueryTuning,
-        num_cores: usize,
-        log_compaction_threshold: Option<u64>,
-        replication_factor: usize,
+        config: &ClusterSpawnConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let tuning = &config.tuning;
+        let graph_tuning = &config.graph_tuning;
+        let query_tuning = &config.query_tuning;
+        let num_cores = config.num_cores;
+        let log_compaction_threshold = config.log_compaction_threshold;
+        let replication_factor = config.replication_factor;
+
         let data_dir = tempfile::tempdir()?;
         let data_dir_path: PathBuf = data_dir.path().to_path_buf();
 
@@ -244,7 +246,7 @@ impl TestClusterNode {
             &cluster_settings,
             transport.clone(),
             &data_dir_path,
-            &tuning,
+            tuning,
         )
         .await?;
 
@@ -344,7 +346,7 @@ impl TestClusterNode {
             Arc::clone(&shared),
             &data_dir_path,
             cluster_shutdown_rx.clone(),
-            &tuning,
+            tuning,
         )?;
 
         // CRDT constraint reconcile loop (leader-gated). The production server
@@ -361,7 +363,7 @@ impl TestClusterNode {
         // so this returns Some in practice for cluster tests).
         let _lease_renewal = nodedb::control::lease::LeaseRenewalLoop::spawn(
             Arc::clone(&shared),
-            &tuning,
+            tuning,
             cluster_shutdown_rx,
         )
         .map(|(join, metrics)| {

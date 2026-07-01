@@ -16,17 +16,17 @@ use super::wait::wait_for;
 /// same Raft `log_compaction_threshold`, so the learner behaves
 /// identically to the original members.
 #[derive(Clone)]
-struct ClusterSpawnConfig {
-    tuning: ClusterTransportTuning,
-    graph_tuning: nodedb_types::config::tuning::GraphTuning,
-    query_tuning: nodedb_types::config::tuning::QueryTuning,
-    num_cores: usize,
-    log_compaction_threshold: Option<u64>,
+pub(crate) struct ClusterSpawnConfig {
+    pub(crate) tuning: ClusterTransportTuning,
+    pub(crate) graph_tuning: nodedb_types::config::tuning::GraphTuning,
+    pub(crate) query_tuning: nodedb_types::config::tuning::QueryTuning,
+    pub(crate) num_cores: usize,
+    pub(crate) log_compaction_threshold: Option<u64>,
     /// Raft replication factor used for every original member AND any
     /// later `add_learner_node()` call (HRW placement takes
     /// `min(replication_factor, node_count)`). Defaults to 3 for every
     /// spawn entry point except [`TestCluster::spawn_three_with_compaction_threshold_and_rf`].
-    replication_factor: usize,
+    pub(crate) replication_factor: usize,
 }
 
 /// An in-process cluster of `TestClusterNode`s.
@@ -219,17 +219,16 @@ impl TestCluster {
         log_compaction_threshold: Option<u64>,
         replication_factor: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let node1 = TestClusterNode::spawn_with_full_config(
-            1,
-            vec![],
-            tuning.clone(),
-            graph_tuning.clone(),
-            query_tuning.clone(),
+        let config = ClusterSpawnConfig {
+            tuning,
+            graph_tuning,
+            query_tuning,
             num_cores,
             log_compaction_threshold,
             replication_factor,
-        )
-        .await?;
+        };
+
+        let node1 = TestClusterNode::spawn_with_full_config(1, vec![], &config).await?;
 
         // Wait until node 1 has bootstrapped (topology shows itself)
         // before peers try to join. The old fixed 200ms sleep was too
@@ -245,17 +244,8 @@ impl TestCluster {
         }
 
         let seeds = vec![node1.listen_addr];
-        let node2 = TestClusterNode::spawn_with_full_config(
-            2,
-            seeds.clone(),
-            tuning.clone(),
-            graph_tuning.clone(),
-            query_tuning.clone(),
-            num_cores,
-            log_compaction_threshold,
-            replication_factor,
-        )
-        .await?;
+        let node2 =
+            TestClusterNode::spawn_with_full_config(2, seeds.clone(), &config).await?;
 
         // Wait for node 2's join to be reflected before spawning node 3.
         // Under load, spawning both peers simultaneously can overwhelm the
@@ -269,28 +259,11 @@ impl TestCluster {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let node3 = TestClusterNode::spawn_with_full_config(
-            3,
-            seeds,
-            tuning.clone(),
-            graph_tuning.clone(),
-            query_tuning.clone(),
-            num_cores,
-            log_compaction_threshold,
-            replication_factor,
-        )
-        .await?;
+        let node3 = TestClusterNode::spawn_with_full_config(3, seeds, &config).await?;
 
         let cluster = Self {
             nodes: vec![node1, node2, node3],
-            spawn_config: ClusterSpawnConfig {
-                tuning,
-                graph_tuning,
-                query_tuning,
-                num_cores,
-                log_compaction_threshold,
-                replication_factor,
-            },
+            spawn_config: config,
         };
 
         wait_for(
@@ -496,17 +469,8 @@ impl TestCluster {
         let seeds = vec![self.nodes[0].listen_addr];
         let cfg = self.spawn_config.clone();
 
-        let learner = TestClusterNode::spawn_with_full_config(
-            new_node_id,
-            seeds,
-            cfg.tuning,
-            cfg.graph_tuning,
-            cfg.query_tuning,
-            cfg.num_cores,
-            cfg.log_compaction_threshold,
-            cfg.replication_factor,
-        )
-        .await?;
+        let learner =
+            TestClusterNode::spawn_with_full_config(new_node_id, seeds, &cfg).await?;
 
         self.nodes.push(learner);
         let expected = self.nodes.len();
