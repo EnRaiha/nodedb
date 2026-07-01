@@ -87,12 +87,35 @@ pub async fn build_and_persist(
     // Check if the object already exists.
     if let Some(catalog) = state.credentials.catalog()
         && let Ok(Some(existing)) = catalog.get_collection(database_id, tenant_id.as_u64(), name)
-        && existing.is_active
     {
-        return Err(sqlstate_error(
-            "42P07",
-            &format!("{} '{name}' already exists", variant.label),
-        ));
+        if existing.is_active {
+            return Err(sqlstate_error(
+                "42P07",
+                &format!("{} '{name}' already exists", variant.label),
+            ));
+        }
+
+        // Soft-deleted collection with the same name. A re-CREATE is an
+        // explicit request for a FRESH collection, distinct from UNDROP
+        // recovery — so the old catalog row and its Data Plane storage
+        // keys must be gone before the new collection registers over the
+        // reused `{db}:{tenant}:{name}:` storage prefix. Otherwise the
+        // stale rows resurrect until the retention GC runs (days later).
+        //
+        // Hard-purge synchronously through the SAME path DROP ... PURGE
+        // uses: remove the catalog row + reclaim every engine's storage
+        // on the Data Plane, awaiting completion before we proceed. The
+        // WAL tombstone boundary is the current `next_lsn`: every pre-drop
+        // row sits below it and is shadowed on replay, while every row the
+        // new collection writes sits at or above it and survives.
+        let purge_lsn = state.wal.next_lsn().as_u64();
+        // Fail closed: if the hard-purge could not remove the old
+        // catalog row, ABORT the CREATE rather than build a new
+        // collection over un-purged data (which would resurrect the
+        // stale rows). Surface as an internal error to the client.
+        super::super::purge::hard_purge_collection(state, tenant_id.as_u64(), name, purge_lsn)
+            .await
+            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
     }
 
     let now = std::time::SystemTime::now()

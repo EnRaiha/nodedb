@@ -41,5 +41,6 @@ mod async_dispatch;
 pub(crate) mod gateway_invalidation;
 mod sync;
 
+pub(crate) use async_dispatch::collection::reclaim_collection_storage;
 pub use async_dispatch::spawn_post_apply_async_side_effects;
 pub use sync::apply_post_apply_side_effects_sync;

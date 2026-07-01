@@ -26,7 +26,17 @@ pub fn put(stored: &StoredCollection, catalog: &SystemCatalog) {
     );
 }
 
-pub fn purge(tenant_id: u64, name: &str, catalog: &SystemCatalog) {
+/// Hard-delete the catalog metadata for a collection: primary
+/// `StoredCollection` row, owner row, and surrogate ↔ PK map.
+///
+/// Returns `Err` if any storage step that actually removes data
+/// fails. Callers with different failure semantics decide what to do:
+/// the raft applier (`apply_to_inner`) runs symmetrically on every
+/// node and log-and-continues, while the interactive re-CREATE
+/// hard-purge propagates so a `CREATE COLLECTION` never builds over
+/// data that was not actually purged. Reporting the error rather than
+/// swallowing it is what lets each caller make that choice.
+pub fn purge(tenant_id: u64, name: &str, catalog: &SystemCatalog) -> crate::Result<()> {
     // Hard delete of the primary StoredCollection row. Symmetric
     // with `apply/function.rs::delete` and the other hard-delete
     // peers: remove the primary, then remove the owner row.
@@ -38,40 +48,25 @@ pub fn purge(tenant_id: u64, name: &str, catalog: &SystemCatalog) {
     // in that case, which is fine — we still call
     // `delete_parent_owner` because the owner row may linger
     // independently.
-    match catalog.delete_collection(DatabaseId::DEFAULT, tenant_id, name) {
-        Ok(removed) => {
-            debug!(
-                collection = %name,
-                tenant = tenant_id,
-                removed,
-                "catalog_entry: purge_collection primary row removed"
-            );
-        }
-        Err(e) => warn!(
-            collection = %name,
-            tenant = tenant_id,
-            error = %e,
-            "catalog_entry: purge_collection delete failed"
-        ),
-    }
+    let removed = catalog.delete_collection(DatabaseId::DEFAULT, tenant_id, name)?;
+    debug!(
+        collection = %name,
+        tenant = tenant_id,
+        removed,
+        "catalog_entry: purge_collection primary row removed"
+    );
     super::owner::delete_parent_owner(object_type::COLLECTION, tenant_id, name, catalog);
     // Wipe the surrogate ↔ PK map for this collection. Surrogates are
     // collection-scoped; once the primary row is gone they can never
     // be observed again, so leaving the catalog rows behind would
     // just be allocator-bloat. Mirrors the array-drop cleanup in
     // `array_convert::convert_drop_array`.
-    if let Err(e) = catalog.delete_all_surrogates_for_collection(
+    catalog.delete_all_surrogates_for_collection(
         DatabaseId::DEFAULT,
         nodedb_types::TenantId::new(tenant_id),
         name,
-    ) {
-        warn!(
-            collection = %name,
-            tenant = tenant_id,
-            error = %e,
-            "catalog_entry: purge_collection surrogate-map cleanup failed"
-        );
-    }
+    )?;
+    Ok(())
 }
 
 pub fn deactivate(tenant_id: u64, name: &str, catalog: &SystemCatalog) {

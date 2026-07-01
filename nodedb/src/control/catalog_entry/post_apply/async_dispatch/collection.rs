@@ -37,9 +37,28 @@ pub async fn put_async(stored: StoredCollection, shared: Arc<SharedState>) {
 /// 3. Dispatch `MetaOp::UnregisterCollection` into the Data Plane to
 ///    reclaim engine-local storage.
 pub async fn purge_async(tenant_id: u64, name: String, purge_lsn: u64, shared: Arc<SharedState>) {
+    reclaim_collection_storage(&shared, tenant_id, &name, purge_lsn).await;
+}
+
+/// Borrowed core of [`purge_async`]: reclaim every engine's storage for
+/// `(tenant_id, name)` on this node — WAL tombstone, redb tombstone,
+/// optional L2 cleanup enqueue, quiesce drain, `MetaOp::UnregisterCollection`
+/// dispatch to the local Data Plane, and Lite `CollectionPurged` broadcast.
+///
+/// Split out from `purge_async` so the synchronous re-CREATE hard-purge
+/// (`ddl::collection::purge::hard_purge_collection`) can reuse the exact
+/// same reclaim body against a `&SharedState` without an owned `Arc`, and
+/// so the raft post-apply path and the re-CREATE path share one
+/// implementation rather than a copy.
+pub(crate) async fn reclaim_collection_storage(
+    shared: &SharedState,
+    tenant_id: u64,
+    name: &str,
+    purge_lsn: u64,
+) {
     // 1. Persist to redb (every node has its own catalog).
     if let Some(catalog) = shared.credentials.catalog()
-        && let Err(e) = catalog.record_wal_tombstone(tenant_id, &name, purge_lsn)
+        && let Err(e) = catalog.record_wal_tombstone(tenant_id, name, purge_lsn)
     {
         warn!(
             collection = %name,
@@ -55,7 +74,7 @@ pub async fn purge_async(tenant_id: u64, name: String, purge_lsn: u64, shared: A
     if let Err(e) =
         shared
             .wal
-            .append_collection_tombstone(TenantId::new(tenant_id), &name, purge_lsn)
+            .append_collection_tombstone(TenantId::new(tenant_id), name, purge_lsn)
     {
         warn!(
             collection = %name,
@@ -82,7 +101,7 @@ pub async fn purge_async(tenant_id: u64, name: String, purge_lsn: u64, shared: A
             .unwrap_or(0);
         let entry = StoredL2CleanupEntry {
             tenant_id,
-            name: name.clone(),
+            name: name.to_string(),
             purge_lsn,
             enqueued_at_ns: now_ns,
             bytes_pending: 0,
@@ -106,12 +125,12 @@ pub async fn purge_async(tenant_id: u64, name: String, purge_lsn: u64, shared: A
     //    files while a scan is touching an mmap page faults the
     //    whole TPC reactor — drain ordering is a correctness, not
     //    performance, requirement.
-    shared.quiesce.begin_drain(tenant_id, &name);
-    shared.quiesce.wait_until_drained(tenant_id, &name).await;
+    shared.quiesce.begin_drain(tenant_id, name);
+    shared.quiesce.wait_until_drained(tenant_id, name).await;
 
     // 4. Reclaim on local Data Plane.
     crate::control::server::pgwire::ddl::collection::purge::dispatch_unregister_collection(
-        &shared, tenant_id, &name, purge_lsn,
+        shared, tenant_id, name, purge_lsn,
     )
     .await;
 
@@ -122,11 +141,11 @@ pub async fn purge_async(tenant_id: u64, name: String, purge_lsn: u64, shared: A
     //     picks it up on reconnect via the offline-replay path).
     shared
         .crdt_sync_delivery
-        .broadcast_collection_purged(tenant_id, &name, purge_lsn);
+        .broadcast_collection_purged(tenant_id, name, purge_lsn);
 
     // 5. Drop the quiesce entry. From here on, the catalog has no
     //    record of the collection; queries return `collection_not_found`.
-    shared.quiesce.forget(tenant_id, &name);
+    shared.quiesce.forget(tenant_id, name);
     debug!(
         collection = %name,
         tenant = tenant_id,

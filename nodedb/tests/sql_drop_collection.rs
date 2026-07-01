@@ -96,3 +96,40 @@ async fn drop_collection_without_if_exists_on_absent_collection_errors() {
     srv.expect_error("DROP COLLECTION never_created_plain", "does not exist")
         .await;
 }
+
+/// DROP (soft-delete) then CREATE the same name must yield a FRESH,
+/// EMPTY collection — the old rows must not resurrect. Soft-delete keeps
+/// old rows under the same `{db}:{tenant}:{name}:` storage prefix for the
+/// retention window; re-creating the name before GC runs must not expose
+/// those stale rows. Re-CREATE is an explicit request for a new
+/// collection (distinct from `UNDROP` recovery), so the old data must be
+/// purged synchronously before the new collection is registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_then_recreate_same_name_starts_empty() {
+    let srv = TestServer::start().await;
+
+    srv.exec("CREATE COLLECTION recycled").await.unwrap();
+    srv.exec("INSERT INTO recycled (id, data) VALUES ('a', 'stale')")
+        .await
+        .unwrap();
+
+    // Sanity: the row is there before the drop.
+    let before = srv.query_text("SELECT data FROM recycled").await.unwrap();
+    assert_eq!(
+        before.len(),
+        1,
+        "row must exist before DROP, got {before:?}"
+    );
+
+    srv.exec("DROP COLLECTION recycled").await.unwrap();
+
+    // Re-create the same name (before GC purges the soft-deleted data).
+    srv.exec("CREATE COLLECTION recycled").await.unwrap();
+
+    let after = srv.query_text("SELECT data FROM recycled").await.unwrap();
+    assert_eq!(
+        after.len(),
+        0,
+        "re-created collection must start empty; old rows resurrected: {after:?}"
+    );
+}

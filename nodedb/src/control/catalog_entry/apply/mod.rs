@@ -81,7 +81,20 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             collection::deactivate(*tenant_id, name, catalog)
         }
         CatalogEntry::PurgeCollection { tenant_id, name } => {
-            collection::purge(*tenant_id, name, catalog)
+            // Raft apply runs symmetrically on every node and must not
+            // abort on a per-node catalog storage hiccup — log and
+            // continue, exactly as before. The swallow is now an
+            // explicit choice at the call site rather than hidden
+            // inside `purge`; the interactive re-CREATE caller makes
+            // the opposite choice and propagates.
+            if let Err(e) = collection::purge(*tenant_id, name, catalog) {
+                tracing::warn!(
+                    collection = %name,
+                    tenant = tenant_id,
+                    error = %e,
+                    "catalog_entry: purge_collection apply failed"
+                );
+            }
         }
         CatalogEntry::PutSequence(stored) => sequence::put(stored, catalog),
         CatalogEntry::DeleteSequence { tenant_id, name } => {
