@@ -4588,6 +4588,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "tokio-tungstenite",
  "uuid",
  "zerompk",
 ]

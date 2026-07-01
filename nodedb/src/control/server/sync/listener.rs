@@ -88,6 +88,14 @@ pub async fn start_sync_listener(
                 detail: format!("bind sync listener to {}: {e}", config.listen_addr),
             })?;
 
+    // Surface the actually-bound address. For a fixed port this is a no-op; for
+    // an ephemeral port (`:0`) it records the OS-assigned port so the caller can
+    // discover where the listener is reachable.
+    let mut config = config;
+    if let Ok(bound) = listener.local_addr() {
+        config.listen_addr = bound;
+    }
+
     let state = Arc::new(SyncListenerState::new(config));
 
     info!(addr = %state.config.listen_addr, "sync WebSocket listener started");

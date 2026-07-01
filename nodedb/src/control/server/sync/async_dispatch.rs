@@ -13,6 +13,7 @@ use tracing::{info, warn};
 use nodedb_types::sync::wire::{EngineKind, SyncProvenance, stream_id_for};
 
 use crate::control::state::SharedState;
+use crate::types::TenantId;
 
 use super::wire::{CompensationHint, DeltaPushMsg, DeltaRejectMsg, SyncFrame, SyncMessageType};
 
@@ -226,26 +227,44 @@ pub(super) async fn handle_resync_request_async(
 /// client frame.
 ///
 /// The in-memory session already produced a `DeltaAck`; this step performs the
-/// actual durable apply (`CrdtOp::Apply`) and, if the Data Plane rejects it,
-/// rewrites the ack into a `DeltaReject` carrying a typed [`CompensationHint`]
-/// classified from the Data Plane's typed error code (never from a substring of
-/// the message). On success it rebuilds the ack with the gate's `applied_seq`
-/// and status.
-pub(super) async fn validate_delta_constraints(
+/// actual durable apply (`CrdtOp::Apply`) and finalizes the client frame.
+///
+/// A delta can be refused in two structurally different ways:
+///
+/// 1. **Applied-then-rejected by the validator.** The delta is Raft-committed and
+///    imported on every replica (a committed CRDT delta cannot be un-imported),
+///    but the post-import constraint check (UNIQUE / NOT NULL) found a violation.
+///    The Data Plane surfaces this as a structured [`ViolationType`] in
+///    `SyncAckResult.reject`; we map it precisely to a typed
+///    [`CompensationHint`] via [`ViolationType::to_compensation_hint`] — this is
+///    the only path that can name the offending field and conflicting value.
+/// 2. **Never applied (dispatch failure).** Quota, surrogate assignment, timeout,
+///    or transport error — the apply never reached (or never left) the Data
+///    Plane. These carry only a typed error code, classified by
+///    [`compensation_hint_for_dispatch_error`] (never by substring-matching).
+///
+/// On a clean apply it rebuilds the ack with the gate's `applied_seq` and status.
+pub(super) async fn apply_delta_and_finalize(
     shared: &SharedState,
     delta_msg: &DeltaPushMsg,
     ack_frame: SyncFrame,
+    session_tenant: TenantId,
     session_producer_id: u64,
     session_epoch: u64,
 ) -> Option<SyncFrame> {
     use crate::bridge::envelope::PhysicalPlan;
-    use crate::types::TenantId;
     use nodedb_physical::physical_plan::CrdtOp;
 
     // Dispatch a CrdtApply plan to the Data Plane. If the CRDT engine
     // rejects it (constraint violation), we get an error back.
     // Uses EventSource::CrdtSync so triggers are NOT fired on replicated deltas.
-    let tenant_id = TenantId::new(0); // Trust mode default tenant.
+    //
+    // The tenant comes from the session's handshake-assigned identity — NOT a
+    // hardcoded default. Constraints (and the per-tenant CRDT validator) are
+    // installed under the session's tenant by DDL + the reconcile loop; applying
+    // the delta under a different tenant would validate it against an empty
+    // constraint set and silently bypass enforcement.
+    let tenant_id = session_tenant;
 
     // Quota enforcement — reject before dispatch.
     if let Err(e) = shared.check_tenant_quota(tenant_id) {
@@ -337,6 +356,27 @@ pub(super) async fn validate_delta_constraints(
                 }
             };
 
+            // Applied-then-rejected: the delta committed and imported, but the
+            // post-import validator flagged a constraint violation and enqueued a
+            // DLQ compensation. Rewrite the ack into a DeltaReject carrying the
+            // precise, structured hint (field + conflicting value) — this is the
+            // only place that information is available.
+            if let Some(violation) = gate_result.reject {
+                let hint = violation.to_compensation_hint();
+                warn!(
+                    collection = %delta_msg.collection,
+                    doc = %delta_msg.document_id,
+                    violation = %violation,
+                    "sync: delta applied but rejected by CRDT validator"
+                );
+                let reject = DeltaRejectMsg {
+                    mutation_id: delta_msg.mutation_id,
+                    reason: violation.to_string(),
+                    compensation: Some(hint),
+                };
+                return SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject);
+            }
+
             // Extract mutation_id and clock_skew_warning_ms from the pre-built ack_frame
             // so we don't lose them when rebuilding.
             let (mutation_id, clock_skew_warning_ms) =
@@ -384,15 +424,16 @@ pub(super) async fn validate_delta_constraints(
 /// sync path) or as a typed [`crate::Error`] (Raft path / Control-Plane checks);
 /// both are handled.
 ///
-/// Each arm carries only what the typed error actually tells us. In particular
-/// the precise [`CompensationHint::UniqueViolation`] /
-/// [`CompensationHint::ForeignKeyMissing`] variants are intentionally **not**
-/// fabricated here: they require the offending field and conflicting/referenced
-/// value, which the flattened constraint error does not carry. Surfacing those
-/// requires threading the structured violation produced by the CRDT validator
-/// through the apply path; until then `Custom { constraint, detail }` is the
-/// honest, machine-readable representation (it preserves the constraint name and
-/// human detail without inventing values).
+/// This path handles only **dispatch failures** — the apply never completed
+/// (quota, surrogate assignment, timeout, transport). Constraint violations from
+/// a *successful* apply do NOT arrive here: they come back as a structured
+/// [`ViolationType`] in `SyncAckResult.reject` and are mapped by the caller via
+/// [`ViolationType::to_compensation_hint`], which is the only path with the
+/// offending field and conflicting value. Accordingly, the precise
+/// [`CompensationHint::UniqueViolation`] / [`CompensationHint::ForeignKeyMissing`]
+/// variants are intentionally **not** fabricated here — a flattened dispatch
+/// error does not carry those values — so `Custom { constraint, detail }` is the
+/// honest, machine-readable representation.
 fn compensation_hint_for_dispatch_error(e: &crate::Error) -> CompensationHint {
     use crate::bridge::envelope::ErrorCode;
 

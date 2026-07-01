@@ -208,10 +208,13 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
                             && let Some(shared) = shared.as_ref()
                             && let Some(delta_msg) = frame.decode_body::<DeltaPushMsg>()
                         {
-                            super::super::async_dispatch::validate_delta_constraints(
+                            super::super::async_dispatch::apply_delta_and_finalize(
                                 shared,
                                 &delta_msg,
                                 response,
+                                session
+                                    .tenant_id
+                                    .unwrap_or_else(|| crate::types::TenantId::new(0)),
                                 session.producer_id,
                                 session.accepted_epoch,
                             )

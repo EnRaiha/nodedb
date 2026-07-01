@@ -25,6 +25,7 @@ nodedb-wal = { workspace = true }
 # Runtime + wire deps used by the harness itself.
 tokio = { workspace = true, features = ["test-util"] }
 tokio-postgres = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tempfile = "3"
 serde_json = { workspace = true }
 sonic-rs = { workspace = true }
