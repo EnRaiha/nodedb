@@ -11,6 +11,22 @@ use crate::row_lookup::RowLookup;
 use crate::validator::{ProposedChange, Validator, Violation};
 use loro::LoroValue;
 
+/// Render a field value as a clean, client-facing string.
+///
+/// Scalars render as their bare value (`x@y.com`, `42`) rather than the Rust
+/// debug form (`String(LoroStringValue("x@y.com"))`), so violation messages and
+/// compensation hints carry a value the caller can act on directly.
+fn render_value(value: &LoroValue) -> String {
+    match value {
+        LoroValue::String(s) => s.to_string(),
+        LoroValue::I64(n) => n.to_string(),
+        LoroValue::Double(f) => f.to_string(),
+        LoroValue::Bool(b) => b.to_string(),
+        LoroValue::Null => "null".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 impl Validator {
     pub(crate) fn check_constraint(
         &self,
@@ -61,7 +77,7 @@ impl Validator {
         };
 
         if exists {
-            let value_str = format!("{:?}", value);
+            let value_str = render_value(value);
             Some(Violation {
                 constraint_name: constraint.name.clone(),
                 reason: format!(
@@ -90,11 +106,7 @@ impl Validator {
         let field_value = change.fields.iter().find(|(f, _)| f == &constraint.field)?;
 
         // The FK value should reference an existing row_id in the ref collection.
-        let ref_id = match &field_value.1 {
-            LoroValue::String(s) => s.to_string(),
-            LoroValue::I64(n) => n.to_string(),
-            other => format!("{:?}", other),
-        };
+        let ref_id = render_value(&field_value.1);
 
         if !state.row_exists(ref_collection, &ref_id) {
             Some(Violation {

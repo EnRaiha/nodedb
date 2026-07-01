@@ -5,6 +5,7 @@
 //! Manages the loro-backed CRDT state, constraint validation, and dead-letter
 //! queue for a single tenant. Lives on the Data Plane (one per tenant per core).
 
+pub mod apply_validated;
 pub mod core;
 pub mod history;
 pub mod policy;
@@ -13,4 +14,5 @@ pub mod validate;
 #[cfg(test)]
 mod tests;
 
+pub use apply_validated::ValidatedApplyOutcome;
 pub use core::TenantCrdtEngine;

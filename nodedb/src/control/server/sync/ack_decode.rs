@@ -40,6 +40,7 @@ pub(super) fn decode_sync_ack(
             SyncAckResult {
                 status: AckStatus::Applied,
                 applied_seq: fallback_seq,
+                reject: None,
             }
         }
     }

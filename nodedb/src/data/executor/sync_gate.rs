@@ -187,9 +187,26 @@ impl CoreLoop {
         status: AckStatus,
         applied_seq: u64,
     ) -> Response {
+        self.sync_ack_response_ext(task, status, applied_seq, None)
+    }
+
+    /// Like [`Self::sync_ack_response`] but carries an optional constraint
+    /// rejection alongside the idempotency ack. Used by the CRDT apply path,
+    /// where a delta can be durably applied yet violate a constraint — the
+    /// high-water-mark still advances (status `Applied`), and the deterministic
+    /// [`ViolationType`](nodedb_types::sync::violation::ViolationType) rides
+    /// back in `reject` for the Control Plane to surface.
+    pub(in crate::data::executor) fn sync_ack_response_ext(
+        &self,
+        task: &ExecutionTask,
+        status: AckStatus,
+        applied_seq: u64,
+        reject: Option<nodedb_types::sync::violation::ViolationType>,
+    ) -> Response {
         let gate_result = SyncAckResult {
             status,
             applied_seq,
+            reject,
         };
         match zerompk::to_msgpack_vec(&gate_result) {
             Ok(bytes) => self.response_with_payload(task, bytes),

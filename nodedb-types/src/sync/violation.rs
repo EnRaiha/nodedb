@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
     rkyv::Archive,
     rkyv::Serialize,
     rkyv::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
 )]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]

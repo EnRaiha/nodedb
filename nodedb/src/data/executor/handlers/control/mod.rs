@@ -6,6 +6,7 @@ pub mod calvin;
 pub mod convert;
 pub mod crdt;
 pub mod crdt_constraints;
+pub mod crdt_list;
 pub mod move_tenant;
 pub mod reindex;
 mod reindex_apply;

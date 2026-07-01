@@ -14,6 +14,7 @@ pub(super) fn mock_applied_ack(result: &crate::Result<()>, seq: u64) -> crate::R
             let ack = nodedb_types::sync::wire::SyncAckResult {
                 status: nodedb_types::sync::wire::AckStatus::Applied,
                 applied_seq: seq,
+                reject: None,
             };
             zerompk::to_msgpack_vec(&ack).map_err(|e| crate::Error::Internal {
                 detail: e.to_string(),

@@ -5,10 +5,12 @@
 
 use tracing::{debug, warn};
 
+use nodedb_types::Surrogate;
 use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::sync_gate::SyncAdmit;
+use crate::engine::crdt::tenant_state::ValidatedApplyOutcome;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
@@ -204,187 +206,23 @@ impl CoreLoop {
         }
     }
 
-    /// Insert a block (LoroMap) into a document's block list.
-    pub(in crate::data::executor) fn execute_crdt_list_insert(
-        &mut self,
-        task: &ExecutionTask,
-        collection: &str,
-        document_id: &str,
-        list_path: &str,
-        index: usize,
-        fields_json: &str,
-    ) -> Response {
-        debug!(core = self.core_id, %collection, %document_id, list_path, index, "crdt list insert");
-        let tenant_id = task.request.tenant_id;
-        let engine = match self.get_crdt_engine(tenant_id) {
-            Ok(e) => e,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-        let doc = match engine.collection_doc(collection) {
-            Ok(d) => d,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-
-        // Parse fields and insert as LoroMap container.
-        let map = match nodedb_crdt::list_ops::list_insert_container(
-            doc,
-            collection,
-            document_id,
-            list_path,
-            index,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-
-        // Populate fields from JSON.
-        if let Ok(fields) =
-            sonic_rs::from_str::<serde_json::Map<String, serde_json::Value>>(fields_json)
-        {
-            for (key, val) in &fields {
-                let loro_val = super::convert::json_to_loro_value(val);
-                if let Err(e) = map.insert(key, loro_val) {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
-                }
-            }
-        }
-
-        self.response_ok(task)
-    }
-
-    /// Delete a block from a document's block list.
-    pub(in crate::data::executor) fn execute_crdt_list_delete(
-        &mut self,
-        task: &ExecutionTask,
-        collection: &str,
-        document_id: &str,
-        list_path: &str,
-        index: usize,
-    ) -> Response {
-        debug!(core = self.core_id, %collection, %document_id, list_path, index, "crdt list delete");
-        let tenant_id = task.request.tenant_id;
-        let engine = match self.get_crdt_engine(tenant_id) {
-            Ok(e) => e,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-        let doc = match engine.collection_doc(collection) {
-            Ok(d) => d,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-        match nodedb_crdt::list_ops::list_delete(doc, collection, document_id, list_path, index) {
-            Ok(()) => self.response_ok(task),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
-        }
-    }
-
-    /// Move a block within a document's block list.
-    pub(in crate::data::executor) fn execute_crdt_list_move(
-        &mut self,
-        task: &ExecutionTask,
-        collection: &str,
-        document_id: &str,
-        list_path: &str,
-        from_index: usize,
-        to_index: usize,
-    ) -> Response {
-        debug!(core = self.core_id, %collection, %document_id, list_path, from_index, to_index, "crdt list move");
-        let tenant_id = task.request.tenant_id;
-        let engine = match self.get_crdt_engine(tenant_id) {
-            Ok(e) => e,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-        let doc = match engine.collection_doc(collection) {
-            Ok(d) => d,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-        match nodedb_crdt::list_ops::list_move(
-            doc,
-            collection,
-            document_id,
-            list_path,
-            from_index,
-            to_index,
-        ) {
-            Ok(()) => self.response_ok(task),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
-        }
-    }
-
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_crdt_apply(
         &mut self,
         task: &ExecutionTask,
         collection: &str,
+        document_id: &str,
         delta: &[u8],
+        surrogate: Surrogate,
+        peer_id: u64,
         provenance: Option<&SyncProvenance>,
     ) -> Response {
         let tenant_id = task.request.tenant_id;
 
         let Some(prov) = provenance else {
-            // Non-sync path (SQL / native client): apply unconditionally, no gate.
+            // Non-sync path (SQL / native client): validate + apply, no gate.
+            // There is no client to reject here, so the validated outcome is
+            // only observed for its DLQ side effect and logged.
             let engine = match self.get_crdt_engine(tenant_id) {
                 Ok(e) => e,
                 Err(e) => {
@@ -397,21 +235,24 @@ impl CoreLoop {
                     );
                 }
             };
-            return match engine.apply_committed_delta(collection, delta) {
-                Ok(()) => {
-                    self.checkpoint_coordinator.mark_dirty("crdt", 1);
-                    self.response_ok(task)
+            let outcome = engine.apply_committed_delta_validated(
+                collection,
+                delta,
+                surrogate,
+                document_id,
+                peer_id,
+            );
+            match outcome {
+                ValidatedApplyOutcome::Clean => {}
+                ValidatedApplyOutcome::Rejected(vt) => {
+                    debug!(core = self.core_id, %collection, reason = %vt, "crdt apply violated constraint (DLQ)");
                 }
-                Err(e) => {
-                    warn!(core = self.core_id, error = %e, "crdt apply failed");
-                    self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    )
+                ValidatedApplyOutcome::Malformed => {
+                    warn!(core = self.core_id, %collection, "crdt apply skipped malformed delta");
                 }
-            };
+            }
+            self.checkpoint_coordinator.mark_dirty("crdt", 1);
+            return self.response_ok(task);
         };
 
         // Sync path: run the idempotency gate before touching the engine.
@@ -422,11 +263,14 @@ impl CoreLoop {
         // before any engine borrow.
         let current_hwm = self.sync_hwm_value(prov.producer_id, prov.stream_id);
 
-        let (status, applied_seq) = match admit {
+        let (status, applied_seq, reject) = match admit {
             SyncAdmit::Apply => {
                 // Borrow the engine in a nested block so the &mut borrow is
                 // dropped before sync_commit takes &mut self for sync_hwm.
-                let apply_result = {
+                // The validated apply never fails: a violation is DLQ'd and a
+                // corrupt blob is a no-op, so the HWM always advances and the
+                // stream cannot wedge.
+                let outcome = {
                     let engine = match self.get_crdt_engine(tenant_id) {
                         Ok(e) => e,
                         Err(e) => {
@@ -439,33 +283,41 @@ impl CoreLoop {
                             );
                         }
                     };
-                    engine.apply_committed_delta(collection, delta)
+                    engine.apply_committed_delta_validated(
+                        collection,
+                        delta,
+                        surrogate,
+                        document_id,
+                        peer_id,
+                    )
                 };
-                match apply_result {
-                    Ok(()) => {
+                // engine borrow is dropped here; mark_dirty / sync_commit take
+                // &mut self.
+                let reject = match outcome {
+                    ValidatedApplyOutcome::Clean => {
                         self.checkpoint_coordinator.mark_dirty("crdt", 1);
+                        None
                     }
-                    Err(e) => {
-                        warn!(core = self.core_id, error = %e, "crdt apply failed");
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: e.to_string(),
-                            },
-                        );
+                    ValidatedApplyOutcome::Rejected(vt) => {
+                        self.checkpoint_coordinator.mark_dirty("crdt", 1);
+                        Some(vt)
                     }
-                }
-                // Advance the HWM only after the engine apply succeeds.
-                // engine borrow is already dropped at this point.
+                    ValidatedApplyOutcome::Malformed => {
+                        warn!(core = self.core_id, %collection, "crdt apply skipped malformed delta");
+                        None
+                    }
+                };
+                // Advance the HWM unconditionally after apply — a rejected or
+                // malformed delta must not wedge the sync stream.
                 self.sync_commit(prov);
-                (AckStatus::Applied, prov.seq)
+                (AckStatus::Applied, prov.seq, reject)
             }
-            SyncAdmit::Duplicate => (AckStatus::Duplicate, current_hwm),
-            SyncAdmit::Fenced => (AckStatus::Fenced, current_hwm),
-            SyncAdmit::Gap { expected } => (AckStatus::Gap { expected }, current_hwm),
+            SyncAdmit::Duplicate => (AckStatus::Duplicate, current_hwm, None),
+            SyncAdmit::Fenced => (AckStatus::Fenced, current_hwm, None),
+            SyncAdmit::Gap { expected } => (AckStatus::Gap { expected }, current_hwm, None),
         };
 
-        self.sync_ack_response(task, status, applied_seq)
+        self.sync_ack_response_ext(task, status, applied_seq, reject)
     }
 
     /// Import a per-collection Loro snapshot into the tenant CRDT engine.

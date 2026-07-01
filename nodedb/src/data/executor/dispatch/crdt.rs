@@ -18,13 +18,21 @@ impl CoreLoop {
 
             CrdtOp::Apply {
                 collection,
-                document_id: _,
+                document_id,
                 delta,
-                peer_id: _,
+                peer_id,
                 mutation_id: _,
-                surrogate: _,
+                surrogate,
                 provenance,
-            } => self.execute_crdt_apply(task, collection, delta, provenance.as_ref()),
+            } => self.execute_crdt_apply(
+                task,
+                collection,
+                document_id,
+                delta,
+                *surrogate,
+                *peer_id,
+                provenance.as_ref(),
+            ),
 
             CrdtOp::ImportSnapshot {
                 tenant_id,

@@ -375,6 +375,7 @@ mod tests {
             let ack_result = nodedb_types::sync::wire::SyncAckResult {
                 status: AckStatus::Applied,
                 applied_seq: n,
+                reject: None,
             };
             let payload = zerompk::to_msgpack_vec(&ack_result).expect("encode SyncAckResult");
             (
