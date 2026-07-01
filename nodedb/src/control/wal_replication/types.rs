@@ -512,7 +512,9 @@ pub enum ReplicatedWrite {
     /// never interprets the bytes. `op` selects whether the set is installed
     /// (`Set`) or removed (`Drop`) for `collection`.
     ///
-    /// `descriptor_version` is the collection's catalog descriptor version at
+    /// `constraint_version` is the collection's derived constraint-set
+    /// version (bumped only when the constraint set itself changes — NOT the
+    /// catalog descriptor version, which bumps on every unrelated ALTER) at
     /// the time the change was proposed. The apply path uses it as a monotonic
     /// fence: a replica installs (or drops) only when the incoming version is
     /// `>=` the version it last installed for the collection, so a stale set
@@ -521,7 +523,7 @@ pub enum ReplicatedWrite {
     ConstraintChange {
         collection: String,
         op: ConstraintChangeOp,
-        descriptor_version: u64,
+        constraint_version: u64,
         constraints: Vec<Vec<u8>>,
     },
 }

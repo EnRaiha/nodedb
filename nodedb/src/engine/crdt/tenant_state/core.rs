@@ -83,9 +83,9 @@ pub struct TenantCrdtEngine {
     /// Per-collection committed CRDT state — one `LoroDoc` per collection.
     pub(super) collections: HashMap<String, CrdtState>,
 
-    /// Last catalog descriptor version installed per collection. Acts as a
+    /// Last constraint-set version installed per collection. Acts as a
     /// monotonic fence on constraint installs: a constraint change is applied
-    /// only when its `descriptor_version` is `>=` the version last installed
+    /// only when its `constraint_version` is `>=` the version last installed
     /// for the collection. This makes proposer-ordering races harmless — a
     /// stale set re-proposed at a higher data-log index can never clobber a
     /// newer one. Collections absent from the map are treated as version `0`.
@@ -298,20 +298,20 @@ impl TenantCrdtEngine {
         self.validator.policies_mut().set(collection, policy);
     }
 
-    /// Checks whether `descriptor_version >= installed` for `collection` and,
-    /// if so, advances the stored version to `descriptor_version`. Returns
+    /// Checks whether `constraint_version >= installed` for `collection` and,
+    /// if so, advances the stored version to `constraint_version`. Returns
     /// `true` when the caller should proceed with the constraint mutation,
     /// `false` when the incoming version is stale and the call should be
     /// ignored.
-    fn advance_constraint_version(&mut self, collection: &str, descriptor_version: u64) -> bool {
+    fn advance_constraint_version(&mut self, collection: &str, constraint_version: u64) -> bool {
         let installed = self
             .constraint_versions
             .get(collection)
             .copied()
             .unwrap_or(0);
-        if descriptor_version >= installed {
+        if constraint_version >= installed {
             self.constraint_versions
-                .insert(collection.to_owned(), descriptor_version);
+                .insert(collection.to_owned(), constraint_version);
             true
         } else {
             false
@@ -323,7 +323,7 @@ impl TenantCrdtEngine {
     /// only the validator — no per-collection CRDT state is created, since
     /// constraints govern future writes rather than existing rows.
     ///
-    /// Fenced by `descriptor_version`: the install proceeds only when the
+    /// Fenced by `constraint_version`: the install proceeds only when the
     /// incoming version is `>=` the version last installed for `collection`.
     /// An older version is rejected as stale and the existing constraints are
     /// left untouched. The `>=` (rather than `>`) lets an idempotent
@@ -332,10 +332,10 @@ impl TenantCrdtEngine {
     pub fn set_collection_constraints(
         &mut self,
         collection: &str,
-        descriptor_version: u64,
+        constraint_version: u64,
         constraints: Vec<nodedb_crdt::Constraint>,
     ) -> bool {
-        if !self.advance_constraint_version(collection, descriptor_version) {
+        if !self.advance_constraint_version(collection, constraint_version) {
             return false;
         }
         self.validator
@@ -345,15 +345,15 @@ impl TenantCrdtEngine {
 
     /// Remove every constraint scoped to `collection` from this tenant's
     /// validator. Fenced identically to [`set_collection_constraints`]:
-    /// applies only when `descriptor_version` is `>=` the version last
+    /// applies only when `constraint_version` is `>=` the version last
     /// installed for `collection`. Returns `true` when applied, `false` when
     /// rejected as stale.
     pub fn drop_collection_constraints(
         &mut self,
         collection: &str,
-        descriptor_version: u64,
+        constraint_version: u64,
     ) -> bool {
-        if !self.advance_constraint_version(collection, descriptor_version) {
+        if !self.advance_constraint_version(collection, constraint_version) {
             return false;
         }
         self.validator.clear_collection_constraints(collection);

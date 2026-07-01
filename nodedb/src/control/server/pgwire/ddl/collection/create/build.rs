@@ -150,6 +150,7 @@ pub async fn build_and_persist(
         owner: identity.username.clone(),
         created_at: now,
         descriptor_version: 0,
+        constraint_version: 0,
         modification_hlc: nodedb_types::Hlc::ZERO,
         fields,
         field_defs: Vec::new(),

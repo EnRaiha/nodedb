@@ -25,10 +25,10 @@ impl CoreLoop {
         &mut self,
         task: &ExecutionTask,
         collection: &str,
-        descriptor_version: u64,
+        constraint_version: u64,
         constraints: &[Vec<u8>],
     ) -> Response {
-        debug!(core = self.core_id, %collection, descriptor_version, count = constraints.len(), "crdt set constraints");
+        debug!(core = self.core_id, %collection, constraint_version, count = constraints.len(), "crdt set constraints");
         let mut decoded = Vec::with_capacity(constraints.len());
         for blob in constraints {
             match zerompk::from_msgpack::<nodedb_crdt::Constraint>(blob) {
@@ -60,10 +60,10 @@ impl CoreLoop {
         // A `false` return means the incoming version is older than the one
         // already installed: a stale duplicate was correctly ignored by the
         // fence, which is success, not an error.
-        if engine.set_collection_constraints(collection, descriptor_version, decoded) {
+        if engine.set_collection_constraints(collection, constraint_version, decoded) {
             self.checkpoint_coordinator.mark_dirty("crdt", 1);
         } else {
-            debug!(core = self.core_id, %collection, descriptor_version, "stale constraint version ignored");
+            debug!(core = self.core_id, %collection, constraint_version, "stale constraint version ignored");
         }
         self.response_ok(task)
     }
@@ -74,9 +74,9 @@ impl CoreLoop {
         &mut self,
         task: &ExecutionTask,
         collection: &str,
-        descriptor_version: u64,
+        constraint_version: u64,
     ) -> Response {
-        debug!(core = self.core_id, %collection, descriptor_version, "crdt drop constraints");
+        debug!(core = self.core_id, %collection, constraint_version, "crdt drop constraints");
         let tenant_id = task.request.tenant_id;
         let engine = match self.get_crdt_engine(tenant_id) {
             Ok(e) => e,
@@ -92,10 +92,10 @@ impl CoreLoop {
         };
         // `false` means a stale (older-version) drop was correctly ignored by
         // the fence — success, not an error.
-        if engine.drop_collection_constraints(collection, descriptor_version) {
+        if engine.drop_collection_constraints(collection, constraint_version) {
             self.checkpoint_coordinator.mark_dirty("crdt", 1);
         } else {
-            debug!(core = self.core_id, %collection, descriptor_version, "stale constraint version ignored");
+            debug!(core = self.core_id, %collection, constraint_version, "stale constraint version ignored");
         }
         self.response_ok(task)
     }

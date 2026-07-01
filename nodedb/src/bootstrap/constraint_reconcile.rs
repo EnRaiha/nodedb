@@ -6,7 +6,10 @@
 //! constraint set from the catalog and replicates it to every data-group
 //! replica via a `ConstraintChange` entry on the collection's vshard data
 //! Raft log. Each replica installs the set into its per-core CRDT validator,
-//! fenced by `descriptor_version` so a stale set can never clobber a newer one.
+//! fenced by `constraint_version` so a stale set can never clobber a newer
+//! one. `constraint_version` bumps only when the derived constraint set
+//! actually changes (not on every catalog descriptor bump), so an unrelated
+//! ALTER never re-proposes.
 //!
 //! Why a recurring reconcile rather than a one-shot DDL hook: leadership can
 //! move (election, crash). A new metadata leader re-derives and re-delivers
@@ -50,7 +53,7 @@ pub fn spawn_constraint_reconcile(shared: Arc<SharedState>) {
         move |mut shutdown| async move {
             let shared = task_shared;
             // Task-local delivered-version map, persisted across ticks (NOT in
-            // SharedState): records the highest `descriptor_version` already
+            // SharedState): records the highest `constraint_version` already
             // accepted by Raft for each `(tenant, collection)`. Skipping equal
             // or older versions keeps steady-state ticks proposal-free.
             let mut delivered: HashMap<(TenantId, String), u64> = HashMap::new();
@@ -100,7 +103,7 @@ pub fn spawn_constraint_reconcile(shared: Arc<SharedState>) {
                     // Already delivered this version (or newer) — fence skip.
                     if delivered
                         .get(&key)
-                        .is_some_and(|&v| v >= stored.descriptor_version)
+                        .is_some_and(|&v| v >= stored.constraint_version)
                     {
                         continue;
                     }
@@ -134,7 +137,7 @@ pub fn spawn_constraint_reconcile(shared: Arc<SharedState>) {
                         ReplicatedWrite::ConstraintChange {
                             collection: stored.name.clone(),
                             op: ConstraintChangeOp::Set,
-                            descriptor_version: stored.descriptor_version,
+                            constraint_version: stored.constraint_version,
                             constraints: blobs,
                         },
                     );
@@ -143,7 +146,7 @@ pub fn spawn_constraint_reconcile(shared: Arc<SharedState>) {
                         Ok(_) => {
                             // Record only on commit. A transient / NotLeader error
                             // leaves the map untouched so the next tick retries.
-                            delivered.insert(key, stored.descriptor_version);
+                            delivered.insert(key, stored.constraint_version);
                             proposed += 1;
                         }
                         Err(e) => {

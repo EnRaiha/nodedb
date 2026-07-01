@@ -72,6 +72,15 @@ pub struct StoredCollection {
     /// forces resolvers to re-fetch.
     #[msgpack(default)]
     pub descriptor_version: u64,
+    /// Monotonic constraint-set version. Bumped by the metadata stamp
+    /// ONLY when the DERIVED CRDT constraint set (`collection_constraints`)
+    /// actually changes — NOT on every `PutCollection` like
+    /// `descriptor_version`. `0` means the collection has no constraints
+    /// (or predates this field); `N` is constraint-set revision N. This is
+    /// the fence key the CRDT apply path uses so an unrelated ALTER never
+    /// transiently rejects in-flight deltas.
+    #[msgpack(default)]
+    pub constraint_version: u64,
     /// Hybrid Logical Clock timestamp assigned by the metadata
     /// applier at commit time. Strictly monotonic per descriptor.
     #[msgpack(default)]
@@ -239,6 +248,7 @@ impl StoredCollection {
             owner: owner.to_string(),
             created_at: now,
             descriptor_version: 0,
+            constraint_version: 0,
             modification_hlc: Hlc::ZERO,
             fields: Vec::new(),
             field_defs: Vec::new(),

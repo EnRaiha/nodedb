@@ -8,7 +8,7 @@
 //! component that rejects constraint-violating peer deltas at commit. The
 //! metadata leader's reconcile loop re-derives each collection's constraint set
 //! and replicates it via a `ConstraintChange` entry on the collection's vshard
-//! data Raft log; each replica installs it, fenced by `descriptor_version`.
+//! data Raft log; each replica installs it, fenced by `constraint_version`.
 //!
 //! Reading the catalog row on a follower would only prove the catalog
 //! replicated — NOT that the validator installed. These tests read the

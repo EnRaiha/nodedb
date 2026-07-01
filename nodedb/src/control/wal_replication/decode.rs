@@ -708,17 +708,17 @@ fn to_physical_plan(
         ReplicatedWrite::ConstraintChange {
             collection,
             op,
-            descriptor_version,
+            constraint_version,
             constraints,
         } => match op {
             super::types::ConstraintChangeOp::Set => PhysicalPlan::Crdt(CrdtOp::SetConstraints {
                 collection: collection.clone(),
-                descriptor_version: *descriptor_version,
+                constraint_version: *constraint_version,
                 constraints: constraints.clone(),
             }),
             super::types::ConstraintChangeOp::Drop => PhysicalPlan::Crdt(CrdtOp::DropConstraints {
                 collection: collection.clone(),
-                descriptor_version: *descriptor_version,
+                constraint_version: *constraint_version,
             }),
         },
     })

@@ -57,7 +57,7 @@ fn constraint_change_roundtrip() {
         ReplicatedWrite::ConstraintChange {
             collection: "orders".into(),
             op: ConstraintChangeOp::Set,
-            descriptor_version: 9,
+            constraint_version: 9,
             constraints: vec![vec![1, 2, 3], vec![4, 5, 6]],
         },
     );
@@ -72,12 +72,12 @@ fn constraint_change_roundtrip() {
         ReplicatedWrite::ConstraintChange {
             collection,
             op,
-            descriptor_version,
+            constraint_version,
             constraints,
         } => {
             assert_eq!(collection, "orders");
             assert_eq!(op, ConstraintChangeOp::Set);
-            assert_eq!(descriptor_version, 9);
+            assert_eq!(constraint_version, 9);
             assert_eq!(constraints, vec![vec![1u8, 2, 3], vec![4u8, 5, 6]]);
         }
         other => panic!("expected ConstraintChange, got {other:?}"),
@@ -89,7 +89,7 @@ fn constraint_change_encoding_is_deterministic() {
     let write = ReplicatedWrite::ConstraintChange {
         collection: "orders".into(),
         op: ConstraintChangeOp::Drop,
-        descriptor_version: 4,
+        constraint_version: 4,
         constraints: vec![vec![1, 2, 3], vec![4, 5, 6]],
     };
     let a = zerompk::to_msgpack_vec(&write).expect("encode a failed");
@@ -162,7 +162,7 @@ fn all_write_variants_serialize() {
         ReplicatedWrite::ConstraintChange {
             collection: "orders".into(),
             op: ConstraintChangeOp::Set,
-            descriptor_version: 1,
+            constraint_version: 1,
             constraints: vec![vec![1, 2, 3]],
         },
     ];
@@ -736,7 +736,7 @@ fn constraint_change_set_decodes_to_set_constraints() {
         ReplicatedWrite::ConstraintChange {
             collection: "users".into(),
             op: ConstraintChangeOp::Set,
-            descriptor_version: 12,
+            constraint_version: 12,
             constraints: vec![vec![1, 2, 3]],
         },
     );
@@ -747,11 +747,11 @@ fn constraint_change_set_decodes_to_set_constraints() {
     match plan {
         PhysicalPlan::Crdt(CrdtOp::SetConstraints {
             collection,
-            descriptor_version,
+            constraint_version,
             constraints,
         }) => {
             assert_eq!(collection, "users");
-            assert_eq!(descriptor_version, 12);
+            assert_eq!(constraint_version, 12);
             assert_eq!(constraints.len(), 1);
             assert_eq!(constraints[0], vec![1, 2, 3]);
         }
@@ -767,7 +767,7 @@ fn constraint_change_drop_decodes_to_drop_constraints() {
         ReplicatedWrite::ConstraintChange {
             collection: "users".into(),
             op: ConstraintChangeOp::Drop,
-            descriptor_version: 8,
+            constraint_version: 8,
             constraints: Vec::new(),
         },
     );
@@ -778,10 +778,10 @@ fn constraint_change_drop_decodes_to_drop_constraints() {
     match plan {
         PhysicalPlan::Crdt(CrdtOp::DropConstraints {
             collection,
-            descriptor_version,
+            constraint_version,
         }) => {
             assert_eq!(collection, "users");
-            assert_eq!(descriptor_version, 8);
+            assert_eq!(constraint_version, 8);
         }
         other => panic!("expected Crdt(DropConstraints), got {other:?}"),
     }
