@@ -6,6 +6,7 @@
 use tracing::{debug, warn};
 
 use nodedb_types::Surrogate;
+use nodedb_types::sync::violation::ViolationType;
 use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
 
 use crate::bridge::envelope::{ErrorCode, Response};
@@ -216,6 +217,7 @@ impl CoreLoop {
         surrogate: Surrogate,
         peer_id: u64,
         provenance: Option<&SyncProvenance>,
+        constraint_version_required: u64,
     ) -> Response {
         let tenant_id = task.request.tenant_id;
 
@@ -270,6 +272,18 @@ impl CoreLoop {
                 // The validated apply never fails: a violation is DLQ'd and a
                 // corrupt blob is a no-op, so the HWM always advances and the
                 // stream cannot wedge.
+                //
+                // Before validating, fence the delta against the constraint
+                // version it was admitted against. `SetConstraints` rides the
+                // same per-vshard data Raft log as this `CrdtApply`, so at
+                // this log index every replica has applied the identical log
+                // prefix and therefore has the identical installed
+                // `constraint_versions[collection]` — the gate decision is
+                // deterministic across replicas, no divergence.
+                enum GateOutcome {
+                    Pending { installed: u64 },
+                    Applied(ValidatedApplyOutcome),
+                }
                 let outcome = {
                     let engine = match self.get_crdt_engine(tenant_id) {
                         Ok(e) => e,
@@ -283,32 +297,59 @@ impl CoreLoop {
                             );
                         }
                     };
-                    engine.apply_committed_delta_validated(
-                        collection,
-                        delta,
-                        surrogate,
-                        document_id,
-                        peer_id,
-                    )
+                    let installed = engine.installed_constraint_version(collection);
+                    if constraint_version_required > installed {
+                        GateOutcome::Pending { installed }
+                    } else {
+                        GateOutcome::Applied(engine.apply_committed_delta_validated(
+                            collection,
+                            delta,
+                            surrogate,
+                            document_id,
+                            peer_id,
+                        ))
+                    }
                 };
                 // engine borrow is dropped here; mark_dirty / sync_commit take
                 // &mut self.
                 let reject = match outcome {
-                    ValidatedApplyOutcome::Clean => {
+                    GateOutcome::Pending { installed } => {
+                        // Create-race: the constraints this delta was admitted
+                        // against are not yet installed on THIS replica (the
+                        // reconcile loop delivers SetConstraints
+                        // asynchronously). Do NOT import an unvalidated delta
+                        // — that is exactly the hole this fence closes.
+                        // Carry a retryable reject; the client re-pushes once
+                        // the install catches up. This is NOT a dead letter,
+                        // so it is not DLQ'd.
+                        debug!(
+                            core = self.core_id,
+                            %collection,
+                            required = constraint_version_required,
+                            installed,
+                            "crdt apply fenced: constraint version pending (retryable)"
+                        );
+                        Some(ViolationType::ConstraintVersionPending {
+                            collection: collection.to_string(),
+                            required: constraint_version_required,
+                            installed,
+                        })
+                    }
+                    GateOutcome::Applied(ValidatedApplyOutcome::Clean) => {
                         self.checkpoint_coordinator.mark_dirty("crdt", 1);
                         None
                     }
-                    ValidatedApplyOutcome::Rejected(vt) => {
+                    GateOutcome::Applied(ValidatedApplyOutcome::Rejected(vt)) => {
                         self.checkpoint_coordinator.mark_dirty("crdt", 1);
                         Some(vt)
                     }
-                    ValidatedApplyOutcome::Malformed => {
+                    GateOutcome::Applied(ValidatedApplyOutcome::Malformed) => {
                         warn!(core = self.core_id, %collection, "crdt apply skipped malformed delta");
                         None
                     }
                 };
-                // Advance the HWM unconditionally after apply — a rejected or
-                // malformed delta must not wedge the sync stream.
+                // Advance the HWM unconditionally after apply — a rejected,
+                // fenced, or malformed delta must not wedge the sync stream.
                 self.sync_commit(prov);
                 (AckStatus::Applied, prov.seq, reject)
             }

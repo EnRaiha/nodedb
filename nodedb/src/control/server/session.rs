@@ -604,7 +604,7 @@ impl Session {
                     surrogate,
                     provenance: None,
                     // Direct session write, not a replicated peer sync.
-                    descriptor_version_required: 0,
+                    constraint_version_required: 0,
                 })
             }
             "graph_rag_fusion" => {

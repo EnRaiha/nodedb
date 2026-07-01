@@ -595,6 +595,16 @@ impl TestClusterNode {
             .unwrap_or_default()
     }
 
+    /// Drive ONE constraint-reconcile pass on this node (no-op unless this node
+    /// is the metadata leader). Uses a fresh delivered-map so every changed
+    /// collection is re-proposed, letting a test install constraints on demand
+    /// instead of waiting on the background reconcile timer. Returns the number
+    /// of proposals accepted.
+    pub async fn run_constraint_reconcile_once(&self) -> usize {
+        let mut delivered = std::collections::HashMap::new();
+        nodedb::bootstrap::constraint_reconcile::reconcile_once(&self.shared, &mut delivered).await
+    }
+
     /// Read the current `not_leader_retry_count` from this node's shared gateway.
     ///
     /// Returns 0 if the gateway has not been constructed yet (shouldn't happen

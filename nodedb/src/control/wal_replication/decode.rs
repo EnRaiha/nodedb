@@ -350,7 +350,7 @@ fn to_physical_plan(
             delta,
             peer_id,
             provenance: prov_bytes,
-            descriptor_version_required,
+            constraint_version_required,
         } => {
             let surrogate = assign_or_zero(
                 assigner,
@@ -368,7 +368,7 @@ fn to_physical_plan(
                 mutation_id: 0,
                 surrogate,
                 provenance,
-                descriptor_version_required: *descriptor_version_required,
+                constraint_version_required: *constraint_version_required,
             })
         }
         ReplicatedWrite::CrdtImportCollection {

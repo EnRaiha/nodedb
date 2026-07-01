@@ -368,7 +368,7 @@ fn rollback_matrix_crdt_buffered_then_vector_fail() {
                     mutation_id: 42,
                     surrogate: nodedb_types::Surrogate::ZERO,
                     provenance: None,
-                    descriptor_version_required: 0,
+                    constraint_version_required: 0,
                 }),
                 doc_put("docs", b"modified"),
                 vector_fail("vec"),

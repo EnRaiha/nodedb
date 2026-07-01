@@ -299,7 +299,7 @@ pub fn crdt_apply(collection: &str, doc_id: &str) -> PhysicalPlan {
         mutation_id: 42,
         surrogate: nodedb_types::Surrogate::ZERO,
         provenance: None,
-        descriptor_version_required: 0,
+        constraint_version_required: 0,
     })
 }
 

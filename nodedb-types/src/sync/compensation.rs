@@ -79,6 +79,15 @@ pub enum CompensationHint {
     /// The client should re-send the delta.
     #[serde(rename = "integrity_violation")]
     IntegrityViolation,
+
+    /// Transient rejection — the delta was admitted against a constraint
+    /// version not yet installed on the accepting replica. Not a failure:
+    /// re-push the delta as a new sequence after the suggested delay.
+    #[serde(rename = "retry")]
+    Retry {
+        /// Suggested delay before re-pushing (milliseconds).
+        retry_after_ms: u64,
+    },
 }
 
 impl CompensationHint {
@@ -92,6 +101,7 @@ impl CompensationHint {
             Self::SchemaViolation { .. } => "SCHEMA_VIOLATION",
             Self::Custom { .. } => "CUSTOM",
             Self::IntegrityViolation => "INTEGRITY_VIOLATION",
+            Self::Retry { .. } => "RETRY",
         }
     }
 }
@@ -120,6 +130,9 @@ impl std::fmt::Display for CompensationHint {
                 constraint, detail, ..
             } => write!(f, "CUSTOM({constraint}): {detail}"),
             Self::IntegrityViolation => write!(f, "INTEGRITY_VIOLATION: CRC32C mismatch"),
+            Self::Retry { retry_after_ms } => {
+                write!(f, "RETRY: retry after {retry_after_ms}ms")
+            }
         }
     }
 }
@@ -159,6 +172,15 @@ mod tests {
         };
         assert!(hint.to_string().contains("alice"));
         assert!(hint.to_string().contains("username"));
+    }
+
+    #[test]
+    fn retry_code_and_display() {
+        let hint = CompensationHint::Retry {
+            retry_after_ms: 1000,
+        };
+        assert_eq!(hint.code(), "RETRY");
+        assert!(hint.to_string().contains("1000"));
     }
 
     #[test]

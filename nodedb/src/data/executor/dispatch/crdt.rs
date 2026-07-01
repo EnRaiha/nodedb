@@ -24,8 +24,7 @@ impl CoreLoop {
                 mutation_id: _,
                 surrogate,
                 provenance,
-                // Bound + threaded into the apply-time write-gate in U5e.
-                descriptor_version_required: _,
+                constraint_version_required,
             } => self.execute_crdt_apply(
                 task,
                 collection,
@@ -34,6 +33,7 @@ impl CoreLoop {
                 *surrogate,
                 *peer_id,
                 provenance.as_ref(),
+                *constraint_version_required,
             ),
 
             CrdtOp::ImportSnapshot {

@@ -250,7 +250,7 @@ fn crdt_apply_byte_identical() {
                 mutation_id: i as u64,
                 surrogate: nodedb_types::Surrogate::ZERO,
                 provenance: None,
-                descriptor_version_required: 0,
+                constraint_version_required: 0,
             })
         })
         .collect();

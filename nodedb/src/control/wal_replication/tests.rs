@@ -129,7 +129,7 @@ fn all_write_variants_serialize() {
             delta: vec![0xAB],
             peer_id: 7,
             provenance: None,
-            descriptor_version_required: 0,
+            constraint_version_required: 0,
         },
         ReplicatedWrite::EdgePut {
             collection: "col".into(),
@@ -356,7 +356,7 @@ fn crdt_apply_provenance_roundtrip() {
         mutation_id: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
         provenance: Some(prov.clone()),
-        descriptor_version_required: 42,
+        constraint_version_required: 42,
     });
     let entry = to_replicated_entry(tenant, vshard, &plan)
         .expect("CrdtApply should produce a ReplicatedEntry");
@@ -367,7 +367,7 @@ fn crdt_apply_provenance_roundtrip() {
     match decoded_plan {
         PhysicalPlan::Crdt(CrdtOp::Apply {
             provenance,
-            descriptor_version_required,
+            constraint_version_required,
             ..
         }) => {
             assert_eq!(
@@ -376,8 +376,8 @@ fn crdt_apply_provenance_roundtrip() {
                 "CrdtApply provenance should round-trip"
             );
             assert_eq!(
-                descriptor_version_required, 42,
-                "CrdtApply descriptor_version_required should round-trip"
+                constraint_version_required, 42,
+                "CrdtApply constraint_version_required should round-trip"
             );
         }
         other => panic!("expected CrdtApply, got {other:?}"),
@@ -392,7 +392,7 @@ fn crdt_apply_provenance_roundtrip() {
         mutation_id: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
         provenance: None,
-        descriptor_version_required: 0,
+        constraint_version_required: 0,
     });
     let entry_none = to_replicated_entry(tenant, vshard, &plan_none)
         .expect("CrdtApply(no provenance) should produce a ReplicatedEntry");

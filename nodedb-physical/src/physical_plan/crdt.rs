@@ -39,15 +39,15 @@ pub enum CrdtOp {
         /// Sync provenance: identifies the originating peer and sequence for idempotency.
         #[serde(default)]
         provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
-        /// Descriptor version of the collection's constraint set that this
-        /// delta was admitted against. Stamped at admission (Control Plane,
-        /// which can read the catalog) so the apply-time write-gate (U5e) can
-        /// reject a delta that reaches a replica before that replica has
-        /// installed the matching constraint version. `0` means "no fence"
-        /// (gate open): used by replay/native/internal construction sites that
-        /// do not admit against a catalog descriptor.
+        /// The collection's constraint-set version (`constraint_version`)
+        /// that this delta was admitted against. Stamped at admission
+        /// (Control Plane, which can read the catalog) so the apply-time
+        /// write-gate can reject a delta that reaches a replica before that
+        /// replica has installed the matching constraint version. `0` means
+        /// "no fence" (gate open): no constraints installed, or the
+        /// construction site does not admit against a catalog record.
         #[serde(default)]
-        descriptor_version_required: u64,
+        constraint_version_required: u64,
     },
 
     /// Import a per-collection Loro snapshot into the tenant CRDT engine.

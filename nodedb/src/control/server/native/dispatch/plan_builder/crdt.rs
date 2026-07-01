@@ -60,7 +60,7 @@ pub(crate) fn build_apply(
         // Native admission does not yet stamp a constraint fence; `0` leaves
         // the apply-time write-gate open. Catalog-based stamping here is a
         // tracked follow-up (parity with the sync admission path).
-        descriptor_version_required: 0,
+        constraint_version_required: 0,
     }))
 }
 

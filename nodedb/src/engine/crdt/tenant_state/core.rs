@@ -318,6 +318,18 @@ impl TenantCrdtEngine {
         }
     }
 
+    /// The constraint-set version this replica has installed for `collection`
+    /// (via `SetConstraints`/`DropConstraints` on the per-vshard data Raft
+    /// log). `0` means no constraints are installed. The apply-time write-gate
+    /// compares a delta's admitted `constraint_version_required` against this
+    /// to fence a delta that outran its constraint install.
+    pub fn installed_constraint_version(&self, collection: &str) -> u64 {
+        self.constraint_versions
+            .get(collection)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Install the constraint set for `collection` into this tenant's
     /// validator, replacing any constraints previously scoped to it. Mutates
     /// only the validator — no per-collection CRDT state is created, since

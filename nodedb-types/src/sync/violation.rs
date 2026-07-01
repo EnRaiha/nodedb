@@ -53,7 +53,22 @@ pub enum ViolationType {
     /// Generic constraint violation (catch-all).
     #[serde(rename = "constraint_violation")]
     ConstraintViolation { detail: String },
+    /// Delta admitted against a constraint-set version this replica has not
+    /// installed yet (constraint install still propagating on the data Raft
+    /// log). Transient: the client should retry after the install catches up.
+    #[serde(rename = "constraint_version_pending")]
+    ConstraintVersionPending {
+        collection: String,
+        required: u64,
+        installed: u64,
+    },
 }
+
+/// Suggested delay (milliseconds) before re-pushing a delta rejected by
+/// `ConstraintVersionPending`. Matches the ~1s tick of the constraint
+/// reconcile loop, so a single retry after this delay typically finds the
+/// install has caught up.
+pub const CONSTRAINT_RETRY_AFTER_MS: u64 = 1000;
 
 impl std::fmt::Display for ViolationType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -74,6 +89,16 @@ impl std::fmt::Display for ViolationType {
                 write!(f, "schema:{field}={reason}")
             }
             Self::ConstraintViolation { detail } => write!(f, "constraint:{detail}"),
+            Self::ConstraintVersionPending {
+                collection,
+                required,
+                installed,
+            } => {
+                write!(
+                    f,
+                    "constraint_version_pending:{collection} req={required} installed={installed}"
+                )
+            }
         }
     }
 }
@@ -107,6 +132,9 @@ impl ViolationType {
             Self::ConstraintViolation { detail } => CompensationHint::Custom {
                 constraint: "constraint".into(),
                 detail: detail.clone(),
+            },
+            Self::ConstraintVersionPending { .. } => CompensationHint::Retry {
+                retry_after_ms: CONSTRAINT_RETRY_AFTER_MS,
             },
         }
     }
@@ -171,6 +199,20 @@ mod tests {
         assert!(matches!(
             hint,
             super::super::compensation::CompensationHint::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn constraint_version_pending_maps_to_retry() {
+        let v = ViolationType::ConstraintVersionPending {
+            collection: "orders".into(),
+            required: 3,
+            installed: 2,
+        };
+        let hint = v.to_compensation_hint();
+        assert!(matches!(
+            hint,
+            super::super::compensation::CompensationHint::Retry { .. }
         ));
     }
 }

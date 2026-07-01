@@ -57,7 +57,11 @@ pub fn spawn_constraint_reconcile(shared: Arc<SharedState>) {
             // accepted by Raft for each `(tenant, collection)`. Skipping equal
             // or older versions keeps steady-state ticks proposal-free.
             let mut delivered: HashMap<(TenantId, String), u64> = HashMap::new();
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let interval_ms = std::env::var("NODEDB_CONSTRAINT_RECONCILE_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1000);
+            let mut tick = tokio::time::interval(Duration::from_millis(interval_ms));
             loop {
                 tokio::select! {
                     _ = shutdown.wait_cancelled() => break,
@@ -66,101 +70,117 @@ pub fn spawn_constraint_reconcile(shared: Arc<SharedState>) {
                 if shutdown.is_cancelled() {
                     break;
                 }
-                // Only the metadata leader reconciles — every replica installing
-                // would duplicate proposals onto the data log for no gain.
-                if !shared.is_metadata_leader() {
-                    continue;
-                }
-                let Some(catalog) = shared.credentials.catalog().clone() else {
-                    continue;
-                };
-                // Read every owned database's collections off the reactor.
-                let loaded =
-                    match tokio::task::spawn_blocking(move || load_collections(&catalog)).await {
-                        Ok(Ok(rows)) => rows,
-                        Ok(Err(e)) => {
-                            warn!(error = %e, "constraint reconcile: catalog read failed");
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "constraint reconcile: catalog read task panicked");
-                            continue;
-                        }
-                    };
-                // No proposer installed yet (still bootstrapping the Raft layer):
-                // skip this pass and retry next tick.
-                let Some(proposer) = shared.async_raft_proposer.get() else {
-                    continue;
-                };
-                let proposer = Arc::clone(proposer);
-
-                let mut proposed = 0usize;
-                for (database_id, stored) in loaded {
-                    if proposed >= MAX_RECONCILE_PROPOSALS_PER_PASS {
-                        break;
-                    }
-                    let key = (TenantId::new(stored.tenant_id), stored.name.clone());
-                    // Already delivered this version (or newer) — fence skip.
-                    if delivered
-                        .get(&key)
-                        .is_some_and(|&v| v >= stored.constraint_version)
-                    {
-                        continue;
-                    }
-
-                    let constraints = collection_constraints(&stored);
-                    let mut blobs = Vec::with_capacity(constraints.len());
-                    let mut encode_failed = false;
-                    for constraint in &constraints {
-                        match zerompk::to_msgpack_vec(constraint) {
-                            Ok(bytes) => blobs.push(bytes),
-                            Err(e) => {
-                                warn!(
-                                    collection = %stored.name,
-                                    error = %e,
-                                    "constraint reconcile: encode failed; skipping collection"
-                                );
-                                encode_failed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if encode_failed {
-                        continue;
-                    }
-
-                    let vshard_id =
-                        nodedb_cluster::routing::vshard_for_collection(database_id, &stored.name);
-                    let entry = ReplicatedEntry::new(
-                        stored.tenant_id,
-                        vshard_id,
-                        ReplicatedWrite::ConstraintChange {
-                            collection: stored.name.clone(),
-                            op: ConstraintChangeOp::Set,
-                            constraint_version: stored.constraint_version,
-                            constraints: blobs,
-                        },
-                    );
-
-                    match propose_replicated_entry(&shared, &proposer, entry).await {
-                        Ok(_) => {
-                            // Record only on commit. A transient / NotLeader error
-                            // leaves the map untouched so the next tick retries.
-                            delivered.insert(key, stored.constraint_version);
-                            proposed += 1;
-                        }
-                        Err(e) => {
-                            debug!(
-                                collection = %stored.name,
-                                error = %e,
-                                "constraint reconcile: propose failed; will retry next tick"
-                            );
-                        }
-                    }
-                }
+                reconcile_once(&shared, &mut delivered).await;
             }
         },
     );
+}
+
+/// Run one reconcile pass: if this node is the metadata leader, re-derive every
+/// collection's constraint set from the catalog and propose a `ConstraintChange`
+/// for each collection whose `constraint_version` exceeds what `delivered`
+/// records. `delivered` is updated in place on each accepted proposal. Returns
+/// the number of proposals accepted this pass. A no-op (returns 0) when this
+/// node is not the metadata leader, the catalog is absent, or the async Raft
+/// proposer is not yet installed.
+///
+/// Exposed (crate-public) so tests can drive constraint installation
+/// deterministically instead of waiting on the background timer.
+pub async fn reconcile_once(
+    shared: &Arc<SharedState>,
+    delivered: &mut HashMap<(TenantId, String), u64>,
+) -> usize {
+    // Only the metadata leader reconciles — every replica installing
+    // would duplicate proposals onto the data log for no gain.
+    if !shared.is_metadata_leader() {
+        return 0;
+    }
+    let Some(catalog) = shared.credentials.catalog().clone() else {
+        return 0;
+    };
+    // Read every owned database's collections off the reactor.
+    let loaded = match tokio::task::spawn_blocking(move || load_collections(&catalog)).await {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            warn!(error = %e, "constraint reconcile: catalog read failed");
+            return 0;
+        }
+        Err(e) => {
+            warn!(error = %e, "constraint reconcile: catalog read task panicked");
+            return 0;
+        }
+    };
+    // No proposer installed yet (still bootstrapping the Raft layer):
+    // skip this pass and retry next tick.
+    let Some(proposer) = shared.async_raft_proposer.get() else {
+        return 0;
+    };
+    let proposer = Arc::clone(proposer);
+
+    let mut proposed = 0usize;
+    for (database_id, stored) in loaded {
+        if proposed >= MAX_RECONCILE_PROPOSALS_PER_PASS {
+            break;
+        }
+        let key = (TenantId::new(stored.tenant_id), stored.name.clone());
+        // Already delivered this version (or newer) — fence skip.
+        if delivered
+            .get(&key)
+            .is_some_and(|&v| v >= stored.constraint_version)
+        {
+            continue;
+        }
+
+        let constraints = collection_constraints(&stored);
+        let mut blobs = Vec::with_capacity(constraints.len());
+        let mut encode_failed = false;
+        for constraint in &constraints {
+            match zerompk::to_msgpack_vec(constraint) {
+                Ok(bytes) => blobs.push(bytes),
+                Err(e) => {
+                    warn!(
+                        collection = %stored.name,
+                        error = %e,
+                        "constraint reconcile: encode failed; skipping collection"
+                    );
+                    encode_failed = true;
+                    break;
+                }
+            }
+        }
+        if encode_failed {
+            continue;
+        }
+
+        let vshard_id = nodedb_cluster::routing::vshard_for_collection(database_id, &stored.name);
+        let entry = ReplicatedEntry::new(
+            stored.tenant_id,
+            vshard_id,
+            ReplicatedWrite::ConstraintChange {
+                collection: stored.name.clone(),
+                op: ConstraintChangeOp::Set,
+                constraint_version: stored.constraint_version,
+                constraints: blobs,
+            },
+        );
+
+        match propose_replicated_entry(shared, &proposer, entry).await {
+            Ok(_) => {
+                // Record only on commit. A transient / NotLeader error
+                // leaves the map untouched so the next tick retries.
+                delivered.insert(key, stored.constraint_version);
+                proposed += 1;
+            }
+            Err(e) => {
+                debug!(
+                    collection = %stored.name,
+                    error = %e,
+                    "constraint reconcile: propose failed; will retry next tick"
+                );
+            }
+        }
+    }
+    proposed
 }
 
 /// Load every collection across every database the node owns, tagged with its
