@@ -47,7 +47,16 @@ pub(super) fn parse_select_projection(sql: &str) -> Option<Vec<ProjectionItem>> 
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
-    let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok()?;
+    // NodeDB temporal clauses (`AS OF SYSTEM TIME`, `FOR SYSTEM_TIME`,
+    // `AS OF VALID TIME`, ...) are extensions sqlparser cannot parse. Strip
+    // them first — reusing the same preprocessing the planner uses — so the
+    // SELECT list still reprojects into flat columns. Without this, a temporal
+    // SELECT skips column projection and leaks the raw `{id,data}` envelope.
+    let stripped = match nodedb_sql::parser::preprocess::temporal::extract(sql) {
+        Ok(Some(extracted)) => extracted.sql,
+        _ => sql.to_string(),
+    };
+    let stmts = Parser::parse_sql(&PostgreSqlDialect {}, &stripped).ok()?;
     let stmt = stmts.into_iter().next()?;
     let Statement::Query(query) = stmt else {
         return None;

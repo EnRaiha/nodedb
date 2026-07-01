@@ -56,15 +56,20 @@ async fn bitemporal_insert_visible_via_as_of_system_time() {
         ))
         .await
         .unwrap();
-    // Visibility: the INSERTed row must be reachable via AS OF SYSTEM TIME —
-    // i.e. the write and the temporal read agree on the versioned namespace.
-    // NOTE: the AS OF *projection shape* (returning projected columns rather
-    // than the raw `{id,data}` envelope) is a separate cross-plane result-path
-    // defect tracked as a follow-up; this test pins visibility only.
+    // Visibility AND projection shape: AS OF must return the same projected
+    // columns as a plain SELECT, not the raw `{id,data}` versioned envelope.
     assert_eq!(
         as_of.len(),
         1,
         "AS OF SYSTEM TIME must see the INSERTed row (write/read namespace must agree), got {as_of:?}"
+    );
+    assert_eq!(
+        as_of[0][0], "r1",
+        "AS OF must project the `id` column, not the raw envelope, got {as_of:?}"
+    );
+    assert_eq!(
+        as_of[0][1], "v1",
+        "AS OF must project the `value` column, not the raw envelope, got {as_of:?}"
     );
 }
 
