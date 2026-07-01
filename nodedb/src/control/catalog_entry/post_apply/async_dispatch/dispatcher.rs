@@ -50,15 +50,43 @@ pub fn spawn_post_apply_async_side_effects(
             });
         }
         CatalogEntry::PutCollectionIfAbsent(stored) => {
-            // SYNCHRONOUS: Register must complete before the applied-index
-            // watcher bumps so any subsequent scan on this node finds the
-            // collection in doc_configs. block_in_place is valid because
-            // the raft tick loop runs on a tokio worker thread.
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    collection::put_async(*stored, shared).await;
-                });
+            // Register from the CANONICAL collection read back from the
+            // catalog after apply — never from the carried entry. On the
+            // no-op path (the collection already existed) the carried
+            // `stored` may hold a divergent incoming config; the catalog
+            // holds the authoritative pre-existing one. Post-apply the
+            // collection always exists (created or pre-existing), so the
+            // read-back is always Some; a None here would mean the redb
+            // write silently failed, so warn and skip rather than register
+            // a divergent config.
+            let canonical = shared.credentials.catalog().as_ref().and_then(|catalog| {
+                catalog
+                    .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                    .ok()
+                    .flatten()
             });
+            match canonical {
+                Some(canonical) => {
+                    // SYNCHRONOUS: Register must complete before the
+                    // applied-index watcher bumps so any subsequent scan on
+                    // this node finds the collection in doc_configs.
+                    // block_in_place is valid because the raft tick loop
+                    // runs on a tokio worker thread.
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async move {
+                            collection::put_async(canonical, shared).await;
+                        });
+                    });
+                }
+                None => {
+                    tracing::warn!(
+                        collection = %stored.name,
+                        tenant = stored.tenant_id,
+                        "PutCollectionIfAbsent post-apply: canonical collection not found in \
+                         catalog after apply; skipping Data Plane register"
+                    );
+                }
+            }
         }
         CatalogEntry::PurgeCollection { tenant_id, name } => {
             tokio::spawn(async move {

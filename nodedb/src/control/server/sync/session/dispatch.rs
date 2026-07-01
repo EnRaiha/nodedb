@@ -216,6 +216,14 @@ impl SyncSession {
                 );
                 None
             }
+            SyncMessageType::CollectionSchema => {
+                // A peer announces a collection descriptor. Materialize it
+                // into the local catalog (create-only) so it becomes
+                // catalog-visible and queryable cluster-wide; the handler
+                // handles the permissive `shared == None` path by warn+skip.
+                let msg: CollectionSchemaSyncMsg = frame.decode_body()?;
+                self.handle_collection_schema(&msg, shared)
+            }
             _ => {
                 warn!(
                     session = %self.session_id,

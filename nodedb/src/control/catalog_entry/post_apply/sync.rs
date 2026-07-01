@@ -45,9 +45,23 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             collection::put_owner_sync(stored, Arc::clone(shared));
         }
         CatalogEntry::PutCollectionIfAbsent(stored) => {
+            // Install owner from the CANONICAL catalog collection, not the
+            // carried entry: a no-op re-announce must not overwrite the
+            // pre-existing owner. Post-apply the collection always exists,
+            // so the read-back is Some; the carried entry is only a
+            // best-effort fallback if the redb write silently failed.
             // Owner record install is sync; Data Plane register is
             // the async part, handled by `spawn_post_apply_async_side_effects`.
-            collection::put_owner_sync(stored, Arc::clone(shared));
+            let canonical = shared.credentials.catalog().as_ref().and_then(|catalog| {
+                catalog
+                    .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                    .ok()
+                    .flatten()
+            });
+            match canonical {
+                Some(canonical) => collection::put_owner_sync(&canonical, Arc::clone(shared)),
+                None => collection::put_owner_sync(stored, Arc::clone(shared)),
+            }
         }
         CatalogEntry::DeactivateCollection { tenant_id, name } => {
             collection::deactivate(*tenant_id, name.clone(), Arc::clone(shared));

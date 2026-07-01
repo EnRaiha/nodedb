@@ -16,9 +16,10 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
+use nodedb_types::Hlc;
 use nodedb_types::sync::wire::{
-    DeltaAckMsg, DeltaPushMsg, DeltaRejectMsg, HandshakeAckMsg, HandshakeMsg, SyncFrame,
-    SyncMessageType,
+    CollectionDescriptor, CollectionSchemaSyncMsg, DeltaAckMsg, DeltaPushMsg, DeltaRejectMsg,
+    HandshakeAckMsg, HandshakeMsg, SyncFrame, SyncMessageType,
 };
 
 /// Bound on how long a single frame receive may take before the test client
@@ -132,6 +133,27 @@ impl SyncTestClient {
                 _ => continue,
             }
         }
+    }
+
+    /// Announce a collection descriptor to the server. Fire-and-forget:
+    /// the CollectionSchema announce has no ack frame, so this only sends
+    /// the frame and returns once it is flushed onto the socket.
+    pub async fn push_collection_schema(
+        &mut self,
+        descriptor: CollectionDescriptor,
+        creation_hlc: Hlc,
+    ) -> Result<(), String> {
+        let msg = CollectionSchemaSyncMsg {
+            descriptor,
+            creation_hlc,
+        };
+        let frame = SyncFrame::new_msgpack(SyncMessageType::CollectionSchema, &msg)
+            .ok_or_else(|| "failed to encode CollectionSchemaSyncMsg".to_string())?;
+        self.ws
+            .send(Message::Binary(frame.to_bytes().into()))
+            .await
+            .map_err(|e| format!("failed to send CollectionSchema frame: {e}"))?;
+        Ok(())
     }
 }
 

@@ -41,9 +41,6 @@ impl From<&StoredCollection> for CollectionDescriptor {
 /// sync-wire one. All fields not carried by the descriptor (field_defs,
 /// event_defs, indexes, constraints, `is_active`, etc.) are left at the
 /// [`StoredCollection::new`] defaults.
-// Consumed by the sync receive handler that materializes announced
-// collections into the catalog; only the round-trip tests call it today.
-#[allow(dead_code)]
 pub(crate) fn stored_from_descriptor(
     descriptor: &CollectionDescriptor,
     owner: &str,

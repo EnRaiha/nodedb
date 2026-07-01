@@ -15,6 +15,7 @@
 //! - `dispatch.rs` — `process_frame` (match on `msg_type`, route).
 
 pub mod clock_ping;
+pub mod collection_schema;
 pub mod delta;
 pub mod dispatch;
 pub mod handshake;
