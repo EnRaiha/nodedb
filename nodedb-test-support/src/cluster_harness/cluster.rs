@@ -22,6 +22,11 @@ struct ClusterSpawnConfig {
     query_tuning: nodedb_types::config::tuning::QueryTuning,
     num_cores: usize,
     log_compaction_threshold: Option<u64>,
+    /// Raft replication factor used for every original member AND any
+    /// later `add_learner_node()` call (HRW placement takes
+    /// `min(replication_factor, node_count)`). Defaults to 3 for every
+    /// spawn entry point except [`TestCluster::spawn_three_with_compaction_threshold_and_rf`].
+    replication_factor: usize,
 }
 
 /// An in-process cluster of `TestClusterNode`s.
@@ -153,6 +158,37 @@ impl TestCluster {
             nodedb_types::config::tuning::QueryTuning::default(),
             1,
             Some(threshold),
+            3,
+        )
+        .await
+    }
+
+    /// Spawn a 3-node cluster with a low Raft `log_compaction_threshold`
+    /// (see [`Self::spawn_three_with_compaction_threshold`]) AND a custom
+    /// Raft `replication_factor`.
+    ///
+    /// Used by the InstallSnapshot end-to-end test: HRW placement assigns
+    /// `take = min(replication_factor, node_count)` nodes to each Raft
+    /// group, so with the default `replication_factor = 3` a 4th node added
+    /// via `add_learner_node()` is NOT guaranteed to be placed on the
+    /// collection's data group at all. Passing `replication_factor` equal
+    /// to the POST-JOIN node count (4, for a 3-node cluster plus one
+    /// learner) makes `take = min(4, 4) = 4`, so placement deterministically
+    /// assigns every node — including the learner — to every group. Without
+    /// this, an assertion on the learner's local hosting/snapshot state
+    /// could fail (or vacuously pass) depending on unrelated hash placement,
+    /// not on whether InstallSnapshot actually ran.
+    pub async fn spawn_three_with_compaction_threshold_and_rf(
+        threshold: u64,
+        replication_factor: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_inner(
+            fast_cluster_tuning(),
+            nodedb_types::config::tuning::GraphTuning::default(),
+            nodedb_types::config::tuning::QueryTuning::default(),
+            1,
+            Some(threshold),
+            replication_factor,
         )
         .await
     }
@@ -168,18 +204,20 @@ impl TestCluster {
         query_tuning: nodedb_types::config::tuning::QueryTuning,
         num_cores: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::spawn_three_inner(tuning, graph_tuning, query_tuning, num_cores, None).await
+        Self::spawn_three_inner(tuning, graph_tuning, query_tuning, num_cores, None, 3).await
     }
 
     /// Shared 3-node spawn body. Threads an optional Raft
-    /// `log_compaction_threshold` into every node's spawn; all public
-    /// `spawn_three_*` entry points funnel here.
+    /// `log_compaction_threshold` and a Raft `replication_factor` into
+    /// every node's spawn; all public `spawn_three_*` entry points funnel
+    /// here.
     async fn spawn_three_inner(
         tuning: ClusterTransportTuning,
         graph_tuning: nodedb_types::config::tuning::GraphTuning,
         query_tuning: nodedb_types::config::tuning::QueryTuning,
         num_cores: usize,
         log_compaction_threshold: Option<u64>,
+        replication_factor: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let node1 = TestClusterNode::spawn_with_full_config(
             1,
@@ -189,6 +227,7 @@ impl TestCluster {
             query_tuning.clone(),
             num_cores,
             log_compaction_threshold,
+            replication_factor,
         )
         .await?;
 
@@ -214,6 +253,7 @@ impl TestCluster {
             query_tuning.clone(),
             num_cores,
             log_compaction_threshold,
+            replication_factor,
         )
         .await?;
 
@@ -237,6 +277,7 @@ impl TestCluster {
             query_tuning.clone(),
             num_cores,
             log_compaction_threshold,
+            replication_factor,
         )
         .await?;
 
@@ -248,6 +289,7 @@ impl TestCluster {
                 query_tuning,
                 num_cores,
                 log_compaction_threshold,
+                replication_factor,
             },
         };
 
@@ -462,6 +504,7 @@ impl TestCluster {
             cfg.query_tuning,
             cfg.num_cores,
             cfg.log_compaction_threshold,
+            cfg.replication_factor,
         )
         .await?;
 

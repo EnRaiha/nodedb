@@ -2,6 +2,8 @@
 
 //! Raft / topology / routing inspector methods on [`TestClusterNode`].
 
+use nodedb_types::DatabaseId;
+
 use crate::cluster_harness::node::lifecycle::TestClusterNode;
 
 impl TestClusterNode {
@@ -111,6 +113,90 @@ impl TestClusterNode {
             .map(|g| g.snapshot_index)
             .max()
             .unwrap_or(0)
+    }
+
+    /// True iff this node LOCALLY hosts (has mounted) a replica of Raft
+    /// data group `group_id` — i.e. `group_id` appears in this node's own
+    /// `group_statuses()`, which (unlike a pgwire query) only reflects
+    /// groups actually running on this node and can NEVER be satisfied by
+    /// the gateway forwarding a read to some other hosting node.
+    /// `METADATA_GROUP_ID` never counts, even if passed in by mistake.
+    pub fn hosts_data_group(&self, group_id: u64) -> bool {
+        if group_id == nodedb_cluster::METADATA_GROUP_ID {
+            return false;
+        }
+        let Some(observer) = self.shared.cluster_observer.get() else {
+            return false;
+        };
+        observer
+            .group_status
+            .group_statuses()
+            .into_iter()
+            .any(|g| g.group_id == group_id)
+    }
+
+    /// The local `snapshot_index` for `group_id` from this node's own Raft
+    /// state, or `0` if the group isn't hosted here.
+    ///
+    /// A non-zero value observed on a freshly-joined node whose log starts
+    /// beyond the compacted region proves it was caught up by a real
+    /// `InstallSnapshot` — `AppendEntries` alone cannot advance a
+    /// compacted-past log, so the only way a learner ends up with a
+    /// non-zero local snapshot_index for a group it never saw as log
+    /// entries is that it applied a snapshot built by the leader's
+    /// `DataPlaneSnapshotBuilder`.
+    pub fn local_snapshot_index_for_group(&self, group_id: u64) -> u64 {
+        self.group_snapshot_index(group_id)
+    }
+
+    /// One-line dump of this node's `GroupStatus` for `group_id`
+    /// (role/leader/term/commit/applied/last_log/snapshot/members/learners), or
+    /// `"<not hosted>"` if the group isn't mounted here. Used to enrich cluster
+    /// test failure messages with the full per-node Raft-group picture (e.g. the
+    /// install-snapshot end-to-end oracle dumps every node's view on timeout).
+    pub fn group_status_line(&self, group_id: u64) -> String {
+        let Some(observer) = self.shared.cluster_observer.get() else {
+            return format!("node {}: <no observer>", self.node_id);
+        };
+        match observer
+            .group_status
+            .group_statuses()
+            .into_iter()
+            .find(|g| g.group_id == group_id)
+        {
+            Some(g) => format!(
+                "node {} g{}: role={} leader={} term={} commit={} applied={} last_log={} snap={} members={} learners={}",
+                self.node_id,
+                g.group_id,
+                g.role,
+                g.leader_id,
+                g.term,
+                g.commit_index,
+                g.last_applied,
+                g.last_log_index,
+                g.snapshot_index,
+                g.member_count,
+                g.learner_count,
+            ),
+            None => format!("node {} g{}: <not hosted>", self.node_id, group_id),
+        }
+    }
+
+    /// Resolve the Raft data group id that `collection` maps to, via this
+    /// node's own routing table view. Returns `None` if `cluster_routing`
+    /// isn't wired (non-cluster node) or the collection's vshard has no
+    /// group mapping yet (e.g. before the CREATE COLLECTION DDL has
+    /// propagated).
+    pub fn group_id_for_collection(&self, collection: &str) -> Option<u64> {
+        let vshard =
+            nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, collection);
+        self.shared
+            .cluster_routing
+            .as_ref()?
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .group_for_vshard(vshard)
+            .ok()
     }
 
     /// Observed data-group (group 1) leader id from this node's local Raft

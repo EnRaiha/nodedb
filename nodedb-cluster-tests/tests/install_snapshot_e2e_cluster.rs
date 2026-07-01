@@ -6,27 +6,50 @@
 //! `install_snapshot_chunked.rs` (which exercises the chunk framing), this
 //! test drives the REAL snapshot round-trip across a running cluster:
 //!
-//!   1. Spawn a 3-node cluster with a LOW `log_compaction_threshold`. The
+//!   1. Spawn a 3-node cluster with a LOW `log_compaction_threshold` AND
+//!      `replication_factor` set to the POST-JOIN node count (4). The
 //!      cluster boots via `start_raft`, so the production
 //!      `DataPlaneSnapshotBuilder` (leader) and `DataPlaneSnapshotApplier`
-//!      (follower) hooks are installed and active.
+//!      (follower) hooks are installed and active. HRW placement assigns
+//!      `take = min(replication_factor, node_count)` nodes to each Raft
+//!      group — with the default `replication_factor = 3`, a 4th node
+//!      added later is NOT guaranteed to be placed on the collection's
+//!      data group at all, which would make any assertion about it
+//!      vacuous. `replication_factor = 4` makes `take = min(4, 4) = 4` at
+//!      every node count from 3 (pre-join) through 4 (post-join), so
+//!      placement deterministically assigns the learner to the group too.
 //!   2. Write enough rows that the leader's data-group Raft log compacts
 //!      past the start (its `snapshot_index` advances). Wait for the whole
 //!      cluster to converge on the data.
 //!   3. ASSERT compaction actually happened on the leader BEFORE any new
 //!      node joins — this is what makes `AppendEntries` catch-up impossible
 //!      for a fresh peer, forcing the leader down the `InstallSnapshot`
-//!      path.
+//!      path. Resolve and record the collection's data group id here too.
 //!   4. Add a FRESH 4th node as a learner via the production join /
 //!      `AddLearner` conf-change path (`TestCluster::add_learner_node`).
 //!      Because the leader's log is already compacted, the only way the
 //!      learner can be made whole is a real `InstallSnapshot` built by the
 //!      `DataPlaneSnapshotBuilder` and applied by the
 //!      `DataPlaneSnapshotApplier`.
-//!   5. ASSERT the learner — which never saw the original writes as log
-//!      entries — returns the FULL dataset when queried through its own
-//!      pgwire client. That proves the snapshot path restored real engine
-//!      state on a node caught up purely by snapshot.
+//!   5. PRIMARY ASSERTION: poll the learner's OWN local Raft state
+//!      (`hosts_data_group` / `local_snapshot_index_for_group`) until it
+//!      LOCALLY mounts the collection's data group AND its local
+//!      `snapshot_index` is non-zero. This is deliberately NOT a pgwire
+//!      `SELECT COUNT(*)` — the pgwire gateway on a cluster node FORWARDS
+//!      reads to whichever node actually hosts the group whenever the
+//!      local node isn't a member, so a `SELECT COUNT(*)` against the
+//!      learner would return the right answer whether or not the learner
+//!      itself ever mounted the group or applied a snapshot. It is a
+//!      pure forwarding artifact and proves nothing about InstallSnapshot.
+//!      Reading the learner's own local Raft state cannot be satisfied by
+//!      forwarding: it either mounted the group and applied a snapshot, or
+//!      it didn't.
+//!   6. SECONDARY (kept as functional confirmation, not proof): the
+//!      existing pgwire `COUNT(*)` and PK point-lookup checks against the
+//!      learner's own client. These still pass, and remain useful as an
+//!      end-user-visible confirmation of the data — but the local-hosting
+//!      assertion above is what actually proves the InstallSnapshot path
+//!      ran, since these queries could pass via forwarding alone.
 
 use std::time::{Duration, Instant};
 
@@ -135,10 +158,14 @@ async fn count_rows_when_ready(
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn learner_caught_up_via_real_install_snapshot() {
     // 1. Cluster with a low compaction threshold — production snapshot
-    //    builder/applier hooks are wired by `start_raft`.
-    let mut cluster = TestCluster::spawn_three_with_compaction_threshold(COMPACTION_THRESHOLD)
-        .await
-        .expect("3-node cluster with low compaction threshold");
+    //    builder/applier hooks are wired by `start_raft`. `replication_factor
+    //    = 4` (the post-join node count) so HRW placement deterministically
+    //    assigns every node, including the learner added in step 5, to the
+    //    collection's data group.
+    let mut cluster =
+        TestCluster::spawn_three_with_compaction_threshold_and_rf(COMPACTION_THRESHOLD, 4)
+            .await
+            .expect("3-node cluster with low compaction threshold and rf=4");
 
     // 2. Create a strict-document collection (queryable via SELECT, carries a
     //    primary key, survives a snapshot round-trip).
@@ -178,10 +205,15 @@ async fn learner_caught_up_via_real_install_snapshot() {
 
     // Wait for the writes to fully propagate to all three original members.
     cluster
-        .wait_for_full_apply_convergence(Duration::from_secs(20))
+        .wait_for_full_apply_convergence(Duration::from_secs(30))
         .await;
     for node in &cluster.nodes {
-        let n = count_rows_when_ready(&node.client, COLLECTION, ROW_COUNT, Duration::from_secs(15))
+        // Generous per-node visibility budget: this 4-node test is heavy, and
+        // when it runs back-to-back after another cluster test (serialized by
+        // the nextest `cluster` group) the machine is under port/process
+        // pressure that slows the first pgwire round-trips. Standalone this
+        // resolves in <1s.
+        let n = count_rows_when_ready(&node.client, COLLECTION, ROW_COUNT, Duration::from_secs(30))
             .await;
         assert_eq!(n, ROW_COUNT, "node {} must see all rows", node.node_id);
     }
@@ -204,6 +236,17 @@ async fn learner_caught_up_via_real_install_snapshot() {
          learner joins, so catch-up cannot be via AppendEntries; saw 0 on every node"
     );
 
+    // Resolve the collection's data group id from an original node's own
+    // routing view. This is the group we'll assert the learner LOCALLY
+    // mounts and snapshot-applies below.
+    let gid = cluster.nodes[0]
+        .group_id_for_collection(COLLECTION)
+        .expect("collection maps to a data group");
+    assert!(
+        gid != 0,
+        "collection must map to a data group, not metadata"
+    );
+
     // 5. Add a brand-new node as a learner via the production join /
     //    AddLearner conf-change path. The leader must InstallSnapshot it.
     let learner_id = {
@@ -211,21 +254,61 @@ async fn learner_caught_up_via_real_install_snapshot() {
         learner.node_id
     };
 
-    // 6. ASSERT (b): the learner — which never received the original writes as
-    //    log entries — returns the FULL dataset through its OWN pgwire client.
-    //    Its data-group log starts beyond the compacted region, so the only
-    //    way it has this data is the applied InstallSnapshot.
     let learner = cluster
         .nodes
         .iter()
         .find(|n| n.node_id == learner_id)
         .expect("learner present in cluster");
 
+    // PRIMARY ASSERTION: poll the learner's OWN local Raft state until it
+    // LOCALLY mounts the collection's data group AND its local
+    // `snapshot_index` for that group is non-zero. Unlike a pgwire query,
+    // this cannot be satisfied by the gateway forwarding reads to some
+    // other hosting node — `hosts_data_group` / `local_snapshot_index_for_group`
+    // only ever reflect this node's own Raft state. A non-zero local
+    // snapshot_index on a node whose log starts beyond the compacted region
+    // (asserted above via `max_snap_before > 0`) can ONLY be explained by a
+    // real `InstallSnapshot`: `AppendEntries` alone cannot advance a
+    // compacted-past log. A timeout here means the joined over-RF node
+    // never mounted the group and/or never applied a snapshot for it — a
+    // real regression, not a flake, since `replication_factor = 4` makes
+    // placement of every node on every group deterministic.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let hosts = learner.hosts_data_group(gid);
+        let snap = learner.local_snapshot_index_for_group(gid);
+        if hosts && snap > 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let dump: Vec<String> = cluster
+                .nodes
+                .iter()
+                .map(|n| n.group_status_line(gid))
+                .collect();
+            panic!(
+                "learner node {learner_id} never locally mounted data group {gid} with a \
+                 non-zero local snapshot_index within 30s (hosts_data_group={hosts}, \
+                 local_snapshot_index_for_group={snap}); this proves the joined node never \
+                 received a real InstallSnapshot for the collection's group — a regression, \
+                 since replication_factor=4 makes placement on this group deterministic for \
+                 every node.\nGROUP {gid} STATUS DUMP:\n{}",
+                dump.join("\n")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // 6. SECONDARY (functional confirmation, not proof — see module docs):
+    //    the learner — which never received the original writes as
+    //    log entries — returns the FULL dataset through its OWN pgwire client.
+    //    Its data-group log starts beyond the compacted region, so the only
+    //    way it has this data is the applied InstallSnapshot.
     let learner_count = count_rows_when_ready(
         &learner.client,
         COLLECTION,
         ROW_COUNT,
-        Duration::from_secs(20),
+        Duration::from_secs(30),
     )
     .await;
     assert_eq!(

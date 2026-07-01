@@ -154,6 +154,7 @@ impl TestClusterNode {
             query_tuning,
             num_cores,
             None,
+            3,
         )
         .await
     }
@@ -167,7 +168,16 @@ impl TestClusterNode {
     /// which is what makes a freshly-joined learner unreachable via
     /// `AppendEntries` and forces a real `InstallSnapshot`.
     ///
-    /// Every other spawn entry point delegates here with `None`.
+    /// `replication_factor` controls how many nodes HRW placement assigns to
+    /// each Raft group (`take = min(replication_factor, node_count)`). Tests
+    /// that need EVERY node to host EVERY group deterministically (e.g. the
+    /// InstallSnapshot end-to-end test, which asserts on a learner's LOCAL
+    /// hosting state rather than a forwardable pgwire query) must pass the
+    /// post-join node count here — otherwise placement may never assign the
+    /// joining node to the collection's data group at all.
+    ///
+    /// Every other spawn entry point delegates here with `None` /
+    /// `replication_factor = 3`.
     pub async fn spawn_with_full_config(
         node_id: u64,
         seed_nodes: Vec<SocketAddr>,
@@ -176,6 +186,7 @@ impl TestClusterNode {
         query_tuning: nodedb_types::config::tuning::QueryTuning,
         num_cores: usize,
         log_compaction_threshold: Option<u64>,
+        replication_factor: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let data_dir = tempfile::tempdir()?;
         let data_dir_path: PathBuf = data_dir.path().to_path_buf();
@@ -201,7 +212,7 @@ impl TestClusterNode {
             listen: listen_addr,
             seed_nodes: seeds,
             num_groups: 2,
-            replication_factor: 3,
+            replication_factor,
             force_bootstrap: false,
             tls: None,
             max_active_sessions: 0,
