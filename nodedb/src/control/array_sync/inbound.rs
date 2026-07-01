@@ -123,7 +123,11 @@ impl OriginArrayInbound {
         &self.shared
     }
 
-    pub(super) fn tenant_id(&self) -> TenantId {
+    /// The tenant this inbound engine is bound to. `pub(crate)` so the sync
+    /// session builder's guard test can assert the session tenant was threaded
+    /// through (see `session_handler::array`), not just the sibling propose
+    /// path.
+    pub(crate) fn tenant_id(&self) -> TenantId {
         self.tenant_id
     }
 

@@ -162,3 +162,44 @@ pub(super) async fn dispatch_array_frame(
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::wal::WalManager;
+
+    /// Regression guard for the tenant-isolation bug: `build_array_inbound`
+    /// must bind the inbound array engine to the tenant it is GIVEN, never a
+    /// hardcoded placeholder. The engine's tenant flows into every replicated
+    /// array write (`ReplicatedEntry`) and into `ArrayId::new(tenant, array)`,
+    /// so a reverted-to-0 tenant here silently routes one tenant's array
+    /// writes under another. Building a real `SharedState` (no cluster) is
+    /// enough — the tenant threading is entirely local to this function.
+    #[tokio::test]
+    async fn build_array_inbound_binds_given_tenant_not_placeholder() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test wal"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let shared = SharedState::new(dispatcher, wal);
+
+        // A deliberately non-zero, non-default tenant so a placeholder-0
+        // regression is unmistakable.
+        let tenant = crate::types::TenantId::new(7);
+        let inbound = build_array_inbound(&Some(shared), tenant)
+            .expect("SharedState present => engine built");
+        assert_eq!(
+            inbound.tenant_id(),
+            tenant,
+            "inbound array engine must bind the session tenant, not a placeholder"
+        );
+
+        // No SharedState (the no-op listener path) => no engine.
+        assert!(build_array_inbound(&None, tenant).is_none());
+
+        drop(dir);
+    }
+}
