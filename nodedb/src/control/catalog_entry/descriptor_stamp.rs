@@ -78,6 +78,33 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             stored.modification_hlc = hlc;
             CatalogEntry::PutCollection(stored)
         }
+        CatalogEntry::PutCollectionIfAbsent(mut stored) => {
+            let prior = catalog
+                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            let prior_descriptor = prior.as_ref().map(|c| c.descriptor_version).unwrap_or(0);
+            stored.descriptor_version = prior_descriptor.saturating_add(1);
+            // Constraint version bumps ONLY when the derived constraint set
+            // actually changes, so an unrelated ALTER never advances the
+            // apply-time fence key and never transiently rejects in-flight
+            // CRDT deltas. `Constraint: Eq` + name-sorted translator make the
+            // set comparison exact and order-stable.
+            let prior_constraint_version =
+                prior.as_ref().map(|c| c.constraint_version).unwrap_or(0);
+            let prior_set = prior
+                .as_ref()
+                .map(crate::control::security::catalog::collection_constraints)
+                .unwrap_or_default();
+            let new_set = crate::control::security::catalog::collection_constraints(&stored);
+            stored.constraint_version = if new_set != prior_set {
+                prior_constraint_version.saturating_add(1)
+            } else {
+                prior_constraint_version
+            };
+            stored.modification_hlc = hlc;
+            CatalogEntry::PutCollectionIfAbsent(stored)
+        }
         CatalogEntry::PutMaterializedView(mut stored) => {
             let prior = catalog
                 .get_materialized_view(stored.tenant_id, &stored.name)

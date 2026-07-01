@@ -30,6 +30,11 @@ pub enum CatalogEntry {
     /// (strict schema changes, retention / legal_hold / LVC /
     /// append_only toggles, materialized_sum bindings).
     PutCollection(Box<StoredCollection>),
+    /// Create-only collection upsert: applies iff the collection is
+    /// absent, and never clobbers an existing schema. Used by CRDT
+    /// sync to materialize announced collections without racing or
+    /// overwriting a locally-authored definition of the same name.
+    PutCollectionIfAbsent(Box<StoredCollection>),
     /// Mark a collection as `is_active = false`. Record is
     /// preserved for audit + undrop. The soft-delete step in the
     /// two-step DROP → retention-expiry → PURGE flow.
@@ -332,6 +337,7 @@ impl CatalogEntry {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::PutCollection(_) => "put_collection",
+            Self::PutCollectionIfAbsent(_) => "put_collection_if_absent",
             Self::DeactivateCollection { .. } => "deactivate_collection",
             Self::PurgeCollection { .. } => "purge_collection",
             Self::PutSequence(_) => "put_sequence",

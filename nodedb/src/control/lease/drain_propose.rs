@@ -256,6 +256,11 @@ pub fn descriptor_id_for_implicit_clear(entry: &CatalogEntry) -> Option<Descript
             DescriptorKind::Collection,
             stored.name.clone(),
         )),
+        CatalogEntry::PutCollectionIfAbsent(stored) => Some(DescriptorId::new(
+            stored.tenant_id,
+            DescriptorKind::Collection,
+            stored.name.clone(),
+        )),
         CatalogEntry::PutMaterializedView(stored) => Some(DescriptorId::new(
             stored.tenant_id,
             DescriptorKind::MaterializedView,
@@ -304,6 +309,22 @@ pub fn descriptor_id_and_prior_version(
     let catalog = catalog.as_ref()?;
     match entry {
         CatalogEntry::PutCollection(stored) => {
+            let prior = catalog
+                .get_collection(DatabaseId::DEFAULT, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten()
+                .map(|c| c.descriptor_version)
+                .unwrap_or(0);
+            Some((
+                DescriptorId::new(
+                    stored.tenant_id,
+                    DescriptorKind::Collection,
+                    stored.name.clone(),
+                ),
+                prior,
+            ))
+        }
+        CatalogEntry::PutCollectionIfAbsent(stored) => {
             let prior = catalog
                 .get_collection(DatabaseId::DEFAULT, stored.tenant_id, &stored.name)
                 .ok()

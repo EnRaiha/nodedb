@@ -138,6 +138,11 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             c.descriptor_version,
             format!("{:?}", c.modification_hlc),
         ),
+        E::PutCollectionIfAbsent(c) => (
+            c.name.clone(),
+            c.descriptor_version,
+            format!("{:?}", c.modification_hlc),
+        ),
         E::DeactivateCollection { name, .. } => (name.clone(), 0, String::new()),
         E::PurgeCollection { name, .. } => (name.clone(), 0, String::new()),
         E::RecordWalTombstone { collection, .. } => (collection.clone(), 0, String::new()),

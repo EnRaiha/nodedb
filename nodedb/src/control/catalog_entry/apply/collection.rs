@@ -26,6 +26,49 @@ pub fn put(stored: &StoredCollection, catalog: &SystemCatalog) {
     );
 }
 
+/// Create-only variant of [`put`]: writes the collection (and its
+/// owner row) exactly as `put` does, but ONLY when no collection with
+/// the same `(database_id, tenant_id, name)` already exists. If one is
+/// present, this is a no-op — the existing schema is never clobbered.
+///
+/// The existence check is the ONLY behavioral difference from `put`;
+/// the create path mirrors `put`'s body precisely so replay/snapshot
+/// re-application stays idempotent.
+pub fn put_if_absent(stored: &StoredCollection, catalog: &SystemCatalog) {
+    match catalog.get_collection(stored.database_id, stored.tenant_id, &stored.name) {
+        Ok(Some(_)) => {
+            debug!(
+                collection = %stored.name,
+                tenant = stored.tenant_id,
+                "catalog_entry: put_collection_if_absent skipped existing collection"
+            );
+        }
+        Ok(None) => {
+            if let Err(e) = catalog.put_collection(stored.database_id, stored) {
+                warn!(
+                    collection = %stored.name,
+                    tenant = stored.tenant_id,
+                    error = %e,
+                    "catalog_entry: put_collection_if_absent put_collection failed"
+                );
+            }
+            super::owner::put_parent_owner(
+                object_type::COLLECTION,
+                stored.tenant_id,
+                &stored.name,
+                &stored.owner,
+                catalog,
+            );
+        }
+        Err(e) => warn!(
+            collection = %stored.name,
+            tenant = stored.tenant_id,
+            error = %e,
+            "catalog_entry: put_collection_if_absent get failed"
+        ),
+    }
+}
+
 /// Hard-delete the catalog metadata for a collection: primary
 /// `StoredCollection` row, owner row, and surrogate ↔ PK map.
 ///

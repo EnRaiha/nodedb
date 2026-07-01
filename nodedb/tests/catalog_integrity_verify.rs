@@ -159,6 +159,7 @@ enum VariantClass {
 fn classify(entry: &CatalogEntry) -> VariantClass {
     match entry {
         CatalogEntry::PutCollection(_) => VariantClass::ParentReplicated,
+        CatalogEntry::PutCollectionIfAbsent(_) => VariantClass::ParentReplicated,
         CatalogEntry::PutFunction(_) => VariantClass::ParentReplicated,
         CatalogEntry::PutProcedure(_) => VariantClass::ParentReplicated,
         CatalogEntry::PutTrigger(_) => VariantClass::ParentReplicated,

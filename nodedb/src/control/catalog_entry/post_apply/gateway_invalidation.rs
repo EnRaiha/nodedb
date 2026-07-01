@@ -50,6 +50,9 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         CatalogEntry::PutCollection(stored) => {
             inv.invalidate(&stored.name, stored.descriptor_version.max(1));
         }
+        CatalogEntry::PutCollectionIfAbsent(stored) => {
+            inv.invalidate(&stored.name, stored.descriptor_version.max(1));
+        }
         CatalogEntry::DeactivateCollection { name, .. } => {
             // Treat deactivation as version 0 (collection gone — any cached
             // plan for it is stale).

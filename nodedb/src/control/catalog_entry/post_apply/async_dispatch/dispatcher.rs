@@ -49,6 +49,17 @@ pub fn spawn_post_apply_async_side_effects(
                 });
             });
         }
+        CatalogEntry::PutCollectionIfAbsent(stored) => {
+            // SYNCHRONOUS: Register must complete before the applied-index
+            // watcher bumps so any subsequent scan on this node finds the
+            // collection in doc_configs. block_in_place is valid because
+            // the raft tick loop runs on a tokio worker thread.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    collection::put_async(*stored, shared).await;
+                });
+            });
+        }
         CatalogEntry::PurgeCollection { tenant_id, name } => {
             tokio::spawn(async move {
                 collection::purge_async(tenant_id, name, raft_index, shared).await;

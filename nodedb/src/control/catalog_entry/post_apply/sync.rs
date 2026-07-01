@@ -44,6 +44,11 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             // the async part, handled by `spawn_post_apply_async_side_effects`.
             collection::put_owner_sync(stored, Arc::clone(shared));
         }
+        CatalogEntry::PutCollectionIfAbsent(stored) => {
+            // Owner record install is sync; Data Plane register is
+            // the async part, handled by `spawn_post_apply_async_side_effects`.
+            collection::put_owner_sync(stored, Arc::clone(shared));
+        }
         CatalogEntry::DeactivateCollection { tenant_id, name } => {
             collection::deactivate(*tenant_id, name.clone(), Arc::clone(shared));
         }

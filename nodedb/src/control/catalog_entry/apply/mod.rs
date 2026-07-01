@@ -77,6 +77,7 @@ pub fn apply_to(entry: &CatalogEntry, catalog: &SystemCatalog) {
 fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
     match entry {
         CatalogEntry::PutCollection(stored) => collection::put(stored, catalog),
+        CatalogEntry::PutCollectionIfAbsent(stored) => collection::put_if_absent(stored, catalog),
         CatalogEntry::DeactivateCollection { tenant_id, name } => {
             collection::deactivate(*tenant_id, name, catalog)
         }
