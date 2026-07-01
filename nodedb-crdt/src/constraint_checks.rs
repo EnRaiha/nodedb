@@ -50,10 +50,14 @@ impl Validator {
         // Bitemporal collections: only consider live (non-superseded) rows,
         // so a new version of the same logical row with the same value does
         // not spuriously collide with its prior version.
+        // Exclude the row's own already-committed version so re-validating a
+        // committed row does not falsely collide with itself; a second, distinct
+        // row carrying the same value still collides.
+        let exclude = Some(change.row_id.as_str());
         let exists = if self.is_bitemporal(&change.collection) {
-            state.field_value_exists_live(&change.collection, &constraint.field, value)
+            state.field_value_exists_live(&change.collection, &constraint.field, value, exclude)
         } else {
-            state.field_value_exists(&change.collection, &constraint.field, value)
+            state.field_value_exists(&change.collection, &constraint.field, value, exclude)
         };
 
         if exists {
@@ -178,16 +182,25 @@ mod bitemporal_fk_tests {
         fn row_exists(&self, collection: &str, row_id: &str) -> bool {
             self.state.row_exists(collection, row_id) || self.surrogates.contains(row_id)
         }
-        fn field_value_exists(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
-            self.state.field_value_exists(collection, field, value)
+        fn field_value_exists(
+            &self,
+            collection: &str,
+            field: &str,
+            value: &LoroValue,
+            exclude_row_id: Option<&str>,
+        ) -> bool {
+            self.state
+                .field_value_exists(collection, field, value, exclude_row_id)
         }
         fn field_value_exists_live(
             &self,
             collection: &str,
             field: &str,
             value: &LoroValue,
+            exclude_row_id: Option<&str>,
         ) -> bool {
-            self.state.field_value_exists_live(collection, field, value)
+            self.state
+                .field_value_exists_live(collection, field, value, exclude_row_id)
         }
     }
 

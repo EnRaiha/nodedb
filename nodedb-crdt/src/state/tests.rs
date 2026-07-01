@@ -67,13 +67,64 @@ fn field_value_uniqueness_check() {
     assert!(state.field_value_exists(
         "users",
         "email",
-        &LoroValue::String("alice@example.com".into())
+        &LoroValue::String("alice@example.com".into()),
+        None,
     ));
     assert!(!state.field_value_exists(
         "users",
         "email",
-        &LoroValue::String("bob@example.com".into())
+        &LoroValue::String("bob@example.com".into()),
+        None,
     ));
+}
+
+#[test]
+fn field_value_exists_self_exclusion() {
+    let state = CrdtState::new(1).unwrap();
+    state
+        .upsert(
+            "users",
+            "u1",
+            &[("email", LoroValue::String("a@example.com".into()))],
+        )
+        .unwrap();
+
+    let value = LoroValue::String("a@example.com".into());
+
+    // Re-validating the very row that holds the value, while excluding it,
+    // must NOT report a collision — a committed row cannot conflict with its
+    // own just-written version.
+    assert!(!state.field_value_exists("users", "email", &value, Some("u1")));
+
+    // A DIFFERENT row carrying the same value (excluding only itself) still
+    // collides with the existing u1.
+    assert!(state.field_value_exists("users", "email", &value, Some("u2")));
+
+    // With no exclusion the value is plainly present.
+    assert!(state.field_value_exists("users", "email", &value, None));
+}
+
+#[test]
+fn field_value_exists_live_self_exclusion() {
+    let state = CrdtState::new(1).unwrap();
+    // Live rows (no `_ts_valid_until`) — the live probe treats them as active.
+    state
+        .upsert(
+            "users",
+            "u1",
+            &[("email", LoroValue::String("a@example.com".into()))],
+        )
+        .unwrap();
+
+    let value = LoroValue::String("a@example.com".into());
+
+    // Excluding the holder row → no self-collision.
+    assert!(!state.field_value_exists_live("users", "email", &value, Some("u1")));
+
+    // A distinct row with the same value → collision against the live u1.
+    assert!(state.field_value_exists_live("users", "email", &value, Some("u2")));
+
+    assert!(state.field_value_exists_live("users", "email", &value, None));
 }
 
 #[test]

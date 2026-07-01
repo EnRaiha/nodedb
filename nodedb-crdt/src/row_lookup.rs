@@ -20,13 +20,26 @@ pub trait RowLookup {
 
     /// Return `true` if any row in `collection` has `field` equal to `value`.
     ///
+    /// When `exclude_row_id` is `Some`, the row with that id is skipped, so a
+    /// row does not collide with its own already-committed version. Pass `None`
+    /// to consider every row.
+    ///
     /// Used for UNIQUE constraint checking on non-bitemporal collections.
-    fn field_value_exists(&self, collection: &str, field: &str, value: &loro::LoroValue) -> bool;
+    fn field_value_exists(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &loro::LoroValue,
+        exclude_row_id: Option<&str>,
+    ) -> bool;
 
     /// Return `true` if any *live* row in `collection` has `field` equal to
     /// `value`.
     ///
     /// A row is live when its `_ts_valid_until` is absent or `i64::MAX`.
+    /// When `exclude_row_id` is `Some`, the row with that id is skipped so a
+    /// row does not collide with its own already-committed version; pass `None`
+    /// to consider every live row.
     /// Used for UNIQUE constraint checking on bitemporal collections so that
     /// superseded versions of the same logical row do not cause spurious
     /// collisions.
@@ -35,5 +48,6 @@ pub trait RowLookup {
         collection: &str,
         field: &str,
         value: &loro::LoroValue,
+        exclude_row_id: Option<&str>,
     ) -> bool;
 }

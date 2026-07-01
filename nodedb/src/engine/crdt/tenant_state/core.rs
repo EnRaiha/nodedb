@@ -41,16 +41,28 @@ impl RowLookup for TenantRowLookup<'_> {
             || self.array_surrogate_ids.contains(row_id)
     }
 
-    fn field_value_exists(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
+    fn field_value_exists(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &LoroValue,
+        exclude_row_id: Option<&str>,
+    ) -> bool {
         self.collections
             .get(collection)
-            .is_some_and(|s| s.field_value_exists(collection, field, value))
+            .is_some_and(|s| s.field_value_exists(collection, field, value, exclude_row_id))
     }
 
-    fn field_value_exists_live(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
+    fn field_value_exists_live(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &LoroValue,
+        exclude_row_id: Option<&str>,
+    ) -> bool {
         self.collections
             .get(collection)
-            .is_some_and(|s| s.field_value_exists_live(collection, field, value))
+            .is_some_and(|s| s.field_value_exists_live(collection, field, value, exclude_row_id))
     }
 }
 

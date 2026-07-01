@@ -139,9 +139,22 @@ impl CrdtState {
 
     /// Check if a value exists for the given field across all rows in a collection.
     /// Used for UNIQUE constraint checking.
-    pub fn field_value_exists(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
+    ///
+    /// When `exclude_row_id` is `Some`, the row with that id is skipped so a row
+    /// does not collide with its own already-committed version. `None` scans
+    /// every row.
+    pub fn field_value_exists(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &LoroValue,
+        exclude_row_id: Option<&str>,
+    ) -> bool {
         let coll = self.doc.get_map(collection);
         for key in coll.keys() {
+            if exclude_row_id == Some(key.as_ref()) {
+                continue;
+            }
             let path = format!("{collection}/{key}/{field}");
             if let Some(voc) = self.doc.get_by_str_path(&path) {
                 let field_val = match voc {
@@ -169,9 +182,13 @@ impl CrdtState {
         collection: &str,
         field: &str,
         value: &LoroValue,
+        exclude_row_id: Option<&str>,
     ) -> bool {
         let coll = self.doc.get_map(collection);
         for key in coll.keys() {
+            if exclude_row_id == Some(key.as_ref()) {
+                continue;
+            }
             let row_map = match coll.get(&key) {
                 Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
                 _ => continue,
@@ -224,11 +241,23 @@ impl RowLookup for CrdtState {
         self.row_exists(collection, row_id)
     }
 
-    fn field_value_exists(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
-        self.field_value_exists(collection, field, value)
+    fn field_value_exists(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &LoroValue,
+        exclude_row_id: Option<&str>,
+    ) -> bool {
+        self.field_value_exists(collection, field, value, exclude_row_id)
     }
 
-    fn field_value_exists_live(&self, collection: &str, field: &str, value: &LoroValue) -> bool {
-        self.field_value_exists_live(collection, field, value)
+    fn field_value_exists_live(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &LoroValue,
+        exclude_row_id: Option<&str>,
+    ) -> bool {
+        self.field_value_exists_live(collection, field, value, exclude_row_id)
     }
 }
