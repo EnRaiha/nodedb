@@ -348,7 +348,7 @@ impl SharedState {
             ),
             sequence_registry: Arc::new(crate::control::sequence::SequenceRegistry::new()),
             dml_counter:
-                crate::control::server::pgwire::ddl::maintenance::auto_analyze::DmlCounter::new(),
+                crate::control::server::shared::ddl::neutral::maintenance::auto_analyze::DmlCounter::new(),
             wal_catchup_lsn: AtomicU64::new(0),
             presence: Arc::new(tokio::sync::RwLock::new(
                 crate::control::server::sync::presence::PresenceManager::new(

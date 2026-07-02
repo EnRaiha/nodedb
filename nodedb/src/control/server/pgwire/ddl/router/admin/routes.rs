@@ -24,26 +24,9 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // Sequences (CREATE/DROP/ALTER/SHOW/DESCRIBE) are served by the
     // protocol-neutral DDL router; the pgwire router no longer routes them.
 
-    // Maintenance: ANALYZE, COMPACT, REINDEX, SHOW STORAGE, SHOW COMPACTION
-    if upper.starts_with("ANALYZE ") {
-        return Some(super::super::super::maintenance::handle_analyze(state, identity, sql).await);
-    }
-    if upper.starts_with("COMPACT ") {
-        return Some(super::super::super::maintenance::handle_compact(
-            state, identity, parts,
-        ));
-    }
-    // REINDEX is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("SHOW STORAGE ") {
-        return Some(super::super::super::maintenance::handle_show_storage(
-            state, identity, parts,
-        ));
-    }
-    if upper == "SHOW COMPACTION STATUS" || upper.starts_with("SHOW COMPACTION STATUS ") {
-        return Some(
-            super::super::super::maintenance::handle_show_compaction_status(state, identity),
-        );
-    }
+    // Maintenance (ANALYZE, COMPACT, REINDEX, SHOW STORAGE, SHOW COMPACTION
+    // STATUS, SHOW/ALTER VECTOR INDEX) is served by the protocol-neutral DDL
+    // router; the pgwire router no longer routes it.
 
     // Alerts (CREATE/DROP/ALTER ALERT, SHOW ALERTS, SHOW ALERT STATUS) are
     // served by the protocol-neutral DDL router; the pgwire router no longer

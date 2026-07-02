@@ -6,31 +6,36 @@
 //! - `ALTER VECTOR INDEX ON collection.column SEAL` — force-seal growing segment
 //! - `ALTER VECTOR INDEX ON collection.column COMPACT` — tombstone compaction
 //! - `ALTER VECTOR INDEX ON collection.column SET (m = 32, ef_construction = 400, ...)`
+//!
+//! Ported from the pgwire maintenance handlers. The `SHOW` result set is
+//! all-text columns (`text_field`), so the protocol-neutral [`ShapedRows`]
+//! carries `DdlColType::Text` per column and each cell as its `String` form —
+//! the same bytes `DataRowEncoder::encode_field(&str)` produced. The Data Plane
+//! dispatch paths (`dispatch_to_data_plane`, plan construction, ordering) are
+//! preserved verbatim.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use crate::types::TraceId;
 use nodedb_physical::physical_plan::VectorOp;
 
-use super::super::super::types::{sqlstate_error, text_field};
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 /// Handle `SHOW VECTOR INDEX status ON collection.column`.
 ///
 /// Dispatches `VectorOp::QueryStats` to the Data Plane, awaits the response,
-/// and formats the `VectorIndexStats` payload as a pgwire result set.
+/// and formats the `VectorIndexStats` payload as a result set.
 pub async fn handle_show_vector_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // Parse: SHOW VECTOR INDEX status ON <collection>.<column>
     // or:   SHOW VECTOR INDEX status ON <collection>
     let (collection, field_name) = parse_collection_column(sql, " ON ")?;
@@ -52,21 +57,22 @@ pub async fn handle_show_vector_index(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     if resp.payload.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42P01",
-            &format!("no vector index found for \"{collection}.{field_name}\""),
+            format!("no vector index found for \"{collection}.{field_name}\""),
         ));
     }
 
     let stats: nodedb_types::VectorIndexStats = zerompk::from_msgpack(&resp.payload)
-        .map_err(|e| sqlstate_error("XX000", &format!("decode vector stats: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("decode vector stats: {e}")))?;
 
-    let schema = Arc::new(vec![text_field("property"), text_field("value")]);
+    let columns = vec!["property".to_string(), "value".to_string()];
+    let column_types = vec![DdlColType::Text; 2];
 
-    let rows: Vec<(&str, String)> = vec![
+    let pairs: Vec<(&str, String)> = vec![
         ("dimensions", stats.dimensions.to_string()),
         ("metric", stats.metric.clone()),
         ("index_type", stats.index_type.to_string()),
@@ -97,20 +103,22 @@ pub async fn handle_show_vector_index(
         ("mmap_segments", stats.mmap_segment_count.to_string()),
     ];
 
-    let encoded_rows: Vec<_> = rows
+    let rows: Vec<Map<String, JsonValue>> = pairs
         .into_iter()
         .map(|(prop, val)| {
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            let _ = encoder.encode_field(&prop);
-            let _ = encoder.encode_field(&val);
-            Ok(encoder.take_row())
+            let mut row = Map::new();
+            row.insert("property".to_string(), JsonValue::String(prop.to_string()));
+            row.insert("value".to_string(), JsonValue::String(val));
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(encoded_rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
 
 /// Handle `ALTER VECTOR INDEX ON collection.column SEAL`.
@@ -118,7 +126,7 @@ pub async fn handle_alter_vector_index_seal(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, field_name) = parse_collection_column(sql, " ON ")?;
     let tenant_id = identity.tenant_id;
     let vshard =
@@ -138,9 +146,12 @@ pub async fn handle_alter_vector_index_seal(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
-    Ok(vec![Response::Execution(Tag::new("SEAL"))])
+    Ok(vec![DdlResult::Status {
+        command: "SEAL".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Handle `ALTER VECTOR INDEX ON collection.column COMPACT`.
@@ -148,7 +159,7 @@ pub async fn handle_alter_vector_index_compact(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, field_name) = parse_collection_column(sql, " ON ")?;
     let tenant_id = identity.tenant_id;
     let vshard =
@@ -168,9 +179,12 @@ pub async fn handle_alter_vector_index_compact(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
-    Ok(vec![Response::Execution(Tag::new("COMPACT"))])
+    Ok(vec![DdlResult::Status {
+        command: "COMPACT".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Handle `ALTER VECTOR INDEX ON collection.column SET (...)`.
@@ -188,13 +202,13 @@ pub async fn handle_alter_vector_index_set(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, field_name) = parse_collection_column(sql, " ON ")?;
 
     // Parse SET (...) parameters.
     let upper = sql.to_uppercase();
     let set_pos = upper.find(" SET ").ok_or_else(|| {
-        sqlstate_error(
+        ddl_err(
             "42601",
             "ALTER VECTOR INDEX ... SET (...) requires SET clause",
         )
@@ -223,54 +237,49 @@ pub async fn handle_alter_vector_index_set(
             let val = val.trim().trim_matches('\'').trim_matches('"');
             match key.as_str() {
                 "m" => {
-                    m = val.parse().map_err(|_| {
-                        sqlstate_error("22023", &format!("invalid value for m: {val}"))
-                    })?;
+                    m = val
+                        .parse()
+                        .map_err(|_| ddl_err("22023", format!("invalid value for m: {val}")))?;
                 }
                 "m0" => {
-                    m0 = val.parse().map_err(|_| {
-                        sqlstate_error("22023", &format!("invalid value for m0: {val}"))
-                    })?;
+                    m0 = val
+                        .parse()
+                        .map_err(|_| ddl_err("22023", format!("invalid value for m0: {val}")))?;
                 }
                 "ef_construction" => {
                     ef_construction = val.parse().map_err(|_| {
-                        sqlstate_error(
-                            "22023",
-                            &format!("invalid value for ef_construction: {val}"),
-                        )
+                        ddl_err("22023", format!("invalid value for ef_construction: {val}"))
                     })?;
                 }
                 "index_type" => {
                     let lower = val.to_lowercase();
                     if !matches!(lower.as_str(), "hnsw" | "hnsw_pq" | "ivf_pq") {
-                        return Err(sqlstate_error(
+                        return Err(ddl_err(
                             "42601",
-                            &format!(
-                                "unknown index_type '{val}'; supported: hnsw, hnsw_pq, ivf_pq"
-                            ),
+                            format!("unknown index_type '{val}'; supported: hnsw, hnsw_pq, ivf_pq"),
                         ));
                     }
                     index_type = Some(lower);
                 }
                 "pq_m" => {
-                    pq_m = val.parse().map_err(|_| {
-                        sqlstate_error("22023", &format!("invalid value for pq_m: {val}"))
-                    })?;
+                    pq_m = val
+                        .parse()
+                        .map_err(|_| ddl_err("22023", format!("invalid value for pq_m: {val}")))?;
                 }
                 "ivf_cells" => {
                     ivf_cells = val.parse().map_err(|_| {
-                        sqlstate_error("22023", &format!("invalid value for ivf_cells: {val}"))
+                        ddl_err("22023", format!("invalid value for ivf_cells: {val}"))
                     })?;
                 }
                 "ivf_nprobe" => {
                     ivf_nprobe = val.parse().map_err(|_| {
-                        sqlstate_error("22023", &format!("invalid value for ivf_nprobe: {val}"))
+                        ddl_err("22023", format!("invalid value for ivf_nprobe: {val}"))
                     })?;
                 }
                 other => {
-                    return Err(sqlstate_error(
+                    return Err(ddl_err(
                         "42601",
-                        &format!(
+                        format!(
                             "unknown parameter '{other}'; supported: m, m0, ef_construction, \
                              index_type, pq_m, ivf_cells, ivf_nprobe"
                         ),
@@ -284,7 +293,7 @@ pub async fn handle_alter_vector_index_set(
     let has_quantization = index_type.is_some() || pq_m > 0 || ivf_cells > 0 || ivf_nprobe > 0;
 
     if !has_rebuild && !has_quantization {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "SET clause must specify at least one parameter (m, m0, ef_construction, \
              index_type, pq_m, ivf_cells, ivf_nprobe)",
@@ -326,7 +335,7 @@ pub async fn handle_alter_vector_index_set(
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
     }
 
     if has_rebuild {
@@ -347,27 +356,30 @@ pub async fn handle_alter_vector_index_set(
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
     }
 
-    Ok(vec![Response::Execution(Tag::new("ALTER VECTOR INDEX"))])
+    Ok(vec![DdlResult::Status {
+        command: "ALTER VECTOR INDEX".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Parse `collection.column` or `collection` after a keyword like " ON ".
 ///
 /// Returns `(collection, field_name)`. If no dot, field_name is empty (default field).
-fn parse_collection_column(sql: &str, keyword: &str) -> PgWireResult<(String, String)> {
+fn parse_collection_column(sql: &str, keyword: &str) -> Result<(String, String), DdlError> {
     let upper = sql.to_uppercase();
     let pos = upper
         .find(keyword)
-        .ok_or_else(|| sqlstate_error("42601", &format!("expected '{keyword}' in statement")))?;
+        .ok_or_else(|| ddl_err("42601", format!("expected '{keyword}' in statement")))?;
 
     let after = sql[pos + keyword.len()..].trim();
     // Take the next token (ends at space or end of string).
     let token = after
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "expected collection[.column] after ON"))?
+        .ok_or_else(|| ddl_err("42601", "expected collection[.column] after ON"))?
         .to_lowercase();
 
     if let Some((coll, col)) = token.split_once('.') {

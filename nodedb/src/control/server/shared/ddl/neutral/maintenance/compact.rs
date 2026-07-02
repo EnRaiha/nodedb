@@ -6,24 +6,21 @@
 //! dispatch path. The Data Plane merges segments for the receiving core.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 /// Handle `COMPACT collection [PARTITION 'name']`.
 pub fn handle_compact(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 2 {
-        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_owned(),
-            "42601".to_owned(),
-            "COMPACT requires a collection name".to_owned(),
-        ))));
+        return Err(ddl_err("42601", "COMPACT requires a collection name"));
     }
 
     let collection = parts[1].to_lowercase();
@@ -37,11 +34,10 @@ pub fn handle_compact(
             .flatten()
             .is_none()
     {
-        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_owned(),
-            "42P01".to_owned(),
+        return Err(ddl_err(
+            "42P01",
             format!("collection \"{collection}\" does not exist"),
-        ))));
+        ));
     }
 
     // Dispatch MetaOp::Compact to all Data Plane cores via distributed helper.
@@ -53,5 +49,8 @@ pub fn handle_compact(
 
     tracing::info!(%collection, "COMPACT dispatched");
 
-    Ok(vec![Response::Execution(Tag::new("COMPACT"))])
+    Ok(vec![DdlResult::Status {
+        command: "COMPACT".to_string(),
+        rows_affected: None,
+    }])
 }

@@ -8,12 +8,13 @@
 //! DataFusion cost-based optimization.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::TraceId;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 /// Handle `ANALYZE collection [(col1, col2)]`.
 ///
@@ -23,46 +24,31 @@ pub async fn handle_analyze(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
     let collection = parts
         .get(1)
-        .ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "42601".to_owned(),
-                "ANALYZE requires a collection name".to_owned(),
-            )))
-        })?
+        .ok_or_else(|| ddl_err("42601", "ANALYZE requires a collection name"))?
         .to_lowercase();
 
     let specific_columns = parse_column_list(sql);
 
-    let catalog = state.credentials.catalog().as_ref().ok_or_else(|| {
-        PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_owned(),
-            "XX000".to_owned(),
-            "catalog not available".to_owned(),
-        )))
-    })?;
+    let catalog = state
+        .credentials
+        .catalog()
+        .as_ref()
+        .ok_or_else(|| ddl_err("XX000", "catalog not available"))?;
 
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &collection)
-        .map_err(|e| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "XX000".to_owned(),
-                format!("catalog error: {e}"),
-            )))
-        })?
+        .map_err(|e| ddl_err("XX000", format!("catalog error: {e}")))?
         .ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "42P01".to_owned(),
+            ddl_err(
+                "42P01",
                 format!("collection \"{collection}\" does not exist"),
-            )))
+            )
         })?;
 
     let columns_to_analyze: Vec<String> = if specific_columns.is_empty() {
@@ -120,13 +106,9 @@ pub async fn handle_analyze(
             now,
         );
         for stats in &computed {
-            catalog.put_column_stats(stats).map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "XX000".to_owned(),
-                    format!("failed to store column stats: {e}"),
-                )))
-            })?;
+            catalog
+                .put_column_stats(stats)
+                .map_err(|e| ddl_err("XX000", format!("failed to store column stats: {e}")))?;
         }
     } else {
         // No rows or no fields — store metadata-only stats.
@@ -170,7 +152,10 @@ pub async fn handle_analyze(
         rows_scanned = rows.len(),
         "ANALYZE completed"
     );
-    Ok(vec![Response::Execution(Tag::new("ANALYZE"))])
+    Ok(vec![DdlResult::Status {
+        command: "ANALYZE".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Parse optional `(col1, col2)` column list from ANALYZE statement.

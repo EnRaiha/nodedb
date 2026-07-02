@@ -135,22 +135,8 @@ pub(super) async fn try_dispatch_async(
             Some(show_conflict_policy(state, identity, database_id, collection).await)
         }
 
-        NodedbStatement::Collection(CollectionStmt::Reindex {
-            collection,
-            index_name,
-            concurrent,
-        }) => Some(
-            super::super::super::maintenance::handle_reindex(
-                state,
-                identity,
-                collection,
-                index_name.as_deref(),
-                *concurrent,
-                database_id,
-            )
-            .await,
-        ),
-
+        // REINDEX (CollectionStmt::Reindex) is served by the protocol-neutral
+        // DDL router; the pgwire router no longer routes it.
         NodedbStatement::Misc(MiscStmt::CopyFromFile {
             collection,
             path,

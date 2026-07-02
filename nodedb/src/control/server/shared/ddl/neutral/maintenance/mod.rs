@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+//! Protocol-neutral maintenance DDL family — ANALYZE / COMPACT / REINDEX,
+//! SHOW STORAGE / SHOW COMPACTION STATUS, and vector-index lifecycle
+//! (SHOW / ALTER VECTOR INDEX).
+
 pub mod analyze;
 pub mod auto_analyze;
 pub mod compact;
@@ -7,6 +11,7 @@ pub mod distributed;
 pub mod reindex;
 pub mod stats_collector;
 pub mod storage_info;
+pub mod support;
 pub mod vector_index;
 
 pub use analyze::handle_analyze;

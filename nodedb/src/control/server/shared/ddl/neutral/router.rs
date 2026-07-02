@@ -23,6 +23,7 @@ use super::continuous_agg;
 use super::custom_type;
 use super::function;
 use super::grant;
+use super::maintenance;
 use super::materialized_view;
 use super::oidc;
 use super::procedure;
@@ -336,6 +337,50 @@ pub async fn try_dispatch(
         );
     }
 
+    // Maintenance: ANALYZE / COMPACT / SHOW STORAGE / SHOW COMPACTION STATUS.
+    // These parse into typed `ClusterStmt` variants, but the pgwire router
+    // dispatched all four by string prefix from the raw SQL / token slice (the
+    // pgwire typed-AST path has no arm for them). Replicate that exactly here,
+    // before the parse gate, so the prefix recognition (trailing space on
+    // `ANALYZE ` / `COMPACT `, and the `SHOW COMPACTION STATUS` exact / prefix
+    // forms) and the `parts`-based name extraction stay byte-identical. The
+    // `COMPACT ` prefix is placed after the version-history `COMPACT HISTORY ON`
+    // guard above, preserving that `COMPACT HISTORY ON …` routes to
+    // version_history exactly as the pgwire dispatch (neutral-first) did.
+    if upper.starts_with("ANALYZE ") {
+        return Some(maintenance::handle_analyze(state, identity, sql).await);
+    }
+    if upper.starts_with("COMPACT ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(maintenance::handle_compact(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW STORAGE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(maintenance::handle_show_storage(state, identity, &parts));
+    }
+    if upper == "SHOW COMPACTION STATUS" || upper.starts_with("SHOW COMPACTION STATUS ") {
+        return Some(maintenance::handle_show_compaction_status(state, identity));
+    }
+
+    // Vector index lifecycle: SHOW VECTOR INDEX / ALTER VECTOR INDEX. None of
+    // these are dispatched from a typed AST arm — the pgwire engine_ops router
+    // recognized all four by string prefix from the raw SQL. Replicate that
+    // exactly here, before the parse gate, so the prefix recognition (and the
+    // ` SEAL` / ` COMPACT` / ` SET ` sub-clause guards, checked in this order)
+    // stays byte-identical.
+    if upper.starts_with("SHOW VECTOR INDEX ") {
+        return Some(maintenance::handle_show_vector_index(state, identity, sql).await);
+    }
+    if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" SEAL") {
+        return Some(maintenance::handle_alter_vector_index_seal(state, identity, sql).await);
+    }
+    if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" COMPACT") {
+        return Some(maintenance::handle_alter_vector_index_compact(state, identity, sql).await);
+    }
+    if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" SET ") {
+        return Some(maintenance::handle_alter_vector_index_set(state, identity, sql).await);
+    }
+
     // Materialized views (HTAP). `REFRESH MATERIALIZED VIEW` parses into no typed
     // AST variant, and `SHOW MATERIALIZED VIEWS` parses into a typed
     // `StreamViewStmt::ShowMaterializedViews` but the pgwire admin router
@@ -625,6 +670,22 @@ pub async fn try_dispatch(
         NodedbStatement::Collection(CollectionStmt::DescribeSequence { name }) => {
             Some(sequence::describe_sequence(state, identity, name))
         }
+
+        NodedbStatement::Collection(CollectionStmt::Reindex {
+            collection,
+            index_name,
+            concurrent,
+        }) => Some(
+            maintenance::handle_reindex(
+                state,
+                identity,
+                collection,
+                index_name.as_deref(),
+                *concurrent,
+                database_id,
+            )
+            .await,
+        ),
 
         NodedbStatement::Policy(PolicyStmt::CreateRlsPolicy {
             name,

@@ -14,13 +14,14 @@
 //! fields and never re-tokenises the SQL string.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::TraceId;
 use nodedb_physical::physical_plan::MetaOp;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 /// Execute a parsed `REINDEX [INDEX name] [CONCURRENTLY] collection` statement.
 pub async fn handle_reindex(
@@ -30,7 +31,7 @@ pub async fn handle_reindex(
     index_name: Option<&str>,
     concurrent: bool,
     database_id: DatabaseId,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let collection = collection.to_lowercase();
     let index_name = index_name.map(str::to_lowercase);
     let tenant_id = identity.tenant_id;
@@ -43,11 +44,10 @@ pub async fn handle_reindex(
             .flatten()
             .is_none()
     {
-        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_owned(),
-            "42P01".to_owned(),
+        return Err(ddl_err(
+            "42P01",
             format!("collection \"{collection}\" does not exist"),
-        ))));
+        ));
     }
 
     if concurrent {
@@ -66,13 +66,7 @@ pub async fn handle_reindex(
             trace_id,
         )
         .await
-        .map_err(|e| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "XX000".to_owned(),
-                format!("REINDEX CONCURRENTLY failed: {e}"),
-            )))
-        })?;
+        .map_err(|e| ddl_err("XX000", format!("REINDEX CONCURRENTLY failed: {e}")))?;
 
         tracing::info!(
             %collection,
@@ -85,5 +79,8 @@ pub async fn handle_reindex(
         tracing::info!(%collection, concurrent = false, "REINDEX dispatched");
     }
 
-    Ok(vec![Response::Execution(Tag::new("REINDEX"))])
+    Ok(vec![DdlResult::Status {
+        command: "REINDEX".to_string(),
+        rows_affected: None,
+    }])
 }

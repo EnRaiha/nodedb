@@ -365,7 +365,8 @@ pub struct SharedState {
     /// In-memory sequence registry (nextval/currval/setval).
     pub sequence_registry: Arc<crate::control::sequence::SequenceRegistry>,
     /// Per-collection DML counter for auto-ANALYZE triggering.
-    pub dml_counter: crate::control::server::pgwire::ddl::maintenance::auto_analyze::DmlCounter,
+    pub dml_counter:
+        crate::control::server::shared::ddl::neutral::maintenance::auto_analyze::DmlCounter,
     /// Highest WAL LSN confirmed delivered to Data Plane for timeseries catch-up.
     pub wal_catchup_lsn: AtomicU64,
     /// Presence/Awareness manager: ephemeral user state broadcast channels.

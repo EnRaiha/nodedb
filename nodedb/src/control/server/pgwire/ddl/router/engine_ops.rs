@@ -14,28 +14,9 @@ pub(super) async fn dispatch(
     parts: &[&str],
     database_id: crate::types::DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
-    // Vector index lifecycle: SHOW VECTOR INDEX, ALTER VECTOR INDEX.
-    if upper.starts_with("SHOW VECTOR INDEX ") {
-        return Some(
-            super::super::maintenance::handle_show_vector_index(state, identity, sql).await,
-        );
-    }
-    if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" SEAL") {
-        return Some(
-            super::super::maintenance::handle_alter_vector_index_seal(state, identity, sql).await,
-        );
-    }
-    if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" COMPACT") {
-        return Some(
-            super::super::maintenance::handle_alter_vector_index_compact(state, identity, sql)
-                .await,
-        );
-    }
-    if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" SET ") {
-        return Some(
-            super::super::maintenance::handle_alter_vector_index_set(state, identity, sql).await,
-        );
-    }
+    // Vector index lifecycle (SHOW VECTOR INDEX, ALTER VECTOR INDEX SEAL /
+    // COMPACT / SET) is served by the protocol-neutral DDL router; the pgwire
+    // router no longer routes it.
 
     // Vector model metadata: ALTER COLLECTION ... SET VECTOR METADATA ON ...
     if upper.starts_with("ALTER COLLECTION ") && upper.contains("SET VECTOR METADATA ON") {
