@@ -1,0 +1,359 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Protocol-neutral RLS policy DDL — CREATE / DROP / SHOW.
+//!
+//! Ported from the pgwire `ddl::rls` handlers. All non-return logic
+//! (permission checks, predicate compilation, duplicate pre-checks, catalog
+//! proposes, in-memory `RlsPolicyStore` install/drop, `audit_record`, tenant
+//! scoping, and the token-based `parts` parsing for DROP / SHOW) is preserved
+//! verbatim; only the result construction changed from pgwire `Response` /
+//! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
+
+use serde_json::{Map, Value as JsonValue};
+
+use crate::control::catalog_entry::CatalogEntry;
+use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::security::audit::AuditEvent;
+use crate::control::security::catalog::StoredRlsPolicy;
+use crate::control::security::deny::{self, DenyMode};
+use crate::control::security::identity::{AuthenticatedIdentity, Role};
+use crate::control::security::predicate::RlsPredicate;
+use crate::control::security::predicate_parser::{parse_predicate, validate_auth_refs};
+use crate::control::security::rls::RlsPolicy;
+use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::state::SharedState;
+
+use super::super::result::{DdlError, DdlResult};
+
+/// Parsed `CREATE RLS POLICY` request. Fields mirror the typed
+/// `PolicyStmt::CreateRlsPolicy` AST variant.
+#[derive(Clone, Copy)]
+pub struct CreateRlsPolicyRequest<'a> {
+    pub name: &'a str,
+    pub collection: &'a str,
+    pub policy_type_raw: &'a str,
+    pub predicate_raw: &'a str,
+    pub is_restrictive: bool,
+    pub on_deny_raw: Option<&'a str>,
+    pub tenant_id_override: Option<u64>,
+}
+
+/// Result of compiling an RLS predicate string.
+struct CompiledPredicate {
+    /// Compiled predicate AST. Substituted at query time via `AuthContext`.
+    compiled_predicate: Option<RlsPredicate>,
+    /// Deny-mode derived from the `ON DENY` clause.
+    on_deny: DenyMode,
+}
+
+/// Compile a predicate string and optional `ON DENY` raw clause into a
+/// `CompiledPredicate`. Called by [`create_rls_policy`] after the typed AST
+/// fields have been validated.
+fn compile_rls_predicate(
+    predicate_str: &str,
+    on_deny_raw: Option<&str>,
+) -> Result<CompiledPredicate, DdlError> {
+    let compiled = parse_predicate(predicate_str).map_err(|e| DdlError {
+        sqlstate: "42601".to_string(),
+        message: format!("predicate parse error: {e}"),
+    })?;
+    validate_auth_refs(&compiled).map_err(|e| DdlError {
+        sqlstate: "42601".to_string(),
+        message: e.to_string(),
+    })?;
+
+    let on_deny = if let Some(deny_text) = on_deny_raw {
+        let deny_parts: Vec<&str> = deny_text.split_whitespace().collect();
+        // Strip leading DENY token if present.
+        let slice = if deny_parts
+            .first()
+            .map(|s| s.eq_ignore_ascii_case("DENY"))
+            .unwrap_or(false)
+        {
+            &deny_parts[1..]
+        } else {
+            &deny_parts[..]
+        };
+        deny::parse_on_deny(slice).map_err(|e| DdlError {
+            sqlstate: "42601".to_string(),
+            message: e.to_string(),
+        })?
+    } else {
+        DenyMode::default()
+    };
+
+    Ok(CompiledPredicate {
+        compiled_predicate: Some(compiled),
+        on_deny,
+    })
+}
+
+/// Build a single-tag status result.
+fn status(command: &str) -> Vec<DdlResult> {
+    vec![DdlResult::Status {
+        command: command.to_string(),
+        rows_affected: None,
+    }]
+}
+
+/// `CREATE RLS POLICY <name> ON <collection> FOR <read|write|all>
+///     USING (<predicate>) [RESTRICTIVE] [TENANT <id>] [ON DENY ...]`
+///
+/// All fields are pre-parsed by the `nodedb-sql` AST layer; this handler
+/// only performs predicate compilation and catalog mutation.
+pub fn create_rls_policy(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    req: &CreateRlsPolicyRequest<'_>,
+) -> Result<Vec<DdlResult>, DdlError> {
+    let CreateRlsPolicyRequest {
+        name,
+        collection,
+        policy_type_raw,
+        predicate_raw,
+        is_restrictive,
+        on_deny_raw,
+        tenant_id_override,
+    } = *req;
+    if !identity.is_superuser && !identity.roles.contains(&Role::TenantAdmin) {
+        return Err(DdlError {
+            sqlstate: "42501".to_string(),
+            message: "permission denied: requires superuser or tenant_admin".to_string(),
+        });
+    }
+
+    let tenant_id = tenant_id_override.unwrap_or(identity.tenant_id.as_u64());
+
+    let policy_type_label = policy_type_raw.to_uppercase();
+    let policy_type = match policy_type_label.as_str() {
+        "READ" => crate::control::security::rls::PolicyType::Read,
+        "WRITE" => crate::control::security::rls::PolicyType::Write,
+        "ALL" => crate::control::security::rls::PolicyType::All,
+        other => {
+            return Err(DdlError {
+                sqlstate: "42601".to_string(),
+                message: format!("invalid policy type: {other}. Expected READ, WRITE, or ALL"),
+            });
+        }
+    };
+
+    let mode = if is_restrictive {
+        crate::control::security::predicate::PolicyMode::Restrictive
+    } else {
+        crate::control::security::predicate::PolicyMode::Permissive
+    };
+
+    let compiled = compile_rls_predicate(predicate_raw, on_deny_raw)?;
+
+    // Pre-check duplicate so the proposing node fails fast with a
+    // clean SQLSTATE instead of going through raft only to be a
+    // silent overwrite.
+    if state.rls.policy_exists(tenant_id, collection, name) {
+        return Err(DdlError {
+            sqlstate: "42710".to_string(),
+            message: format!("RLS policy '{}' already exists on '{}'", name, collection),
+        });
+    }
+
+    let policy = RlsPolicy {
+        name: name.to_string(),
+        collection: collection.to_string(),
+        tenant_id,
+        policy_type,
+        compiled_predicate: compiled.compiled_predicate,
+        mode,
+        on_deny: compiled.on_deny,
+        enabled: true,
+        created_by: identity.username.clone(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
+    let stored = StoredRlsPolicy::from_runtime(&policy).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("rls serialize: {e}"),
+    })?;
+
+    let entry = CatalogEntry::PutRlsPolicy(Box::new(stored.clone()));
+    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("metadata propose: {e}"),
+    })?;
+    if log_index == 0 {
+        if let Some(catalog) = state.credentials.catalog() {
+            catalog.put_rls_policy(&stored).map_err(|e| DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("catalog write: {e}"),
+            })?;
+        }
+        state.rls.install_replicated_policy(policy);
+    }
+
+    let mode_str = if is_restrictive { " RESTRICTIVE" } else { "" };
+    state.audit_record(
+        AuditEvent::AdminAction,
+        Some(identity.tenant_id),
+        &identity.username,
+        &format!(
+            "RLS policy '{}' created on '{}' for {}{}",
+            name, collection, policy_type_label, mode_str
+        ),
+    );
+
+    Ok(status("CREATE RLS POLICY"))
+}
+
+/// `DROP RLS POLICY <name> ON <collection> [TENANT <id>]`
+///
+/// Token-based `parts` parsing is preserved verbatim from the pgwire handler:
+/// `parts[3]` is the name, `parts[5]` the collection, and an optional `TENANT
+/// <id>` token overrides the tenant.
+pub fn drop_rls_policy(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    parts: &[&str],
+) -> Result<Vec<DdlResult>, DdlError> {
+    if !identity.is_superuser && !identity.roles.contains(&Role::TenantAdmin) {
+        return Err(DdlError {
+            sqlstate: "42501".to_string(),
+            message: "permission denied".to_string(),
+        });
+    }
+
+    if parts.len() < 6 {
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "syntax: DROP RLS POLICY <name> ON <collection>".to_string(),
+        });
+    }
+
+    let name = parts[3];
+    let collection = parts[5];
+
+    let tenant_id = parts
+        .iter()
+        .position(|p| p.to_uppercase() == "TENANT")
+        .and_then(|i| parts.get(i + 1))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| identity.tenant_id.as_u64());
+
+    if !state.rls.policy_exists(tenant_id, collection, name) {
+        return Err(DdlError {
+            sqlstate: "42704".to_string(),
+            message: format!("RLS policy '{name}' not found on '{collection}'"),
+        });
+    }
+
+    let entry = CatalogEntry::DeleteRlsPolicy {
+        tenant_id,
+        collection: collection.to_string(),
+        name: name.to_string(),
+    };
+    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("metadata propose: {e}"),
+    })?;
+    if log_index == 0 {
+        if let Some(catalog) = state.credentials.catalog() {
+            catalog
+                .delete_rls_policy(tenant_id, collection, name)
+                .map_err(|e| DdlError {
+                    sqlstate: "XX000".to_string(),
+                    message: format!("catalog write: {e}"),
+                })?;
+        }
+        state
+            .rls
+            .install_replicated_drop_policy(tenant_id, collection, name);
+    }
+
+    state.audit_record(
+        AuditEvent::AdminAction,
+        Some(identity.tenant_id),
+        &identity.username,
+        &format!("RLS policy '{name}' dropped from '{collection}'"),
+    );
+
+    Ok(status("DROP RLS POLICY"))
+}
+
+/// `SHOW RLS POLICIES [ON <collection>] [TENANT <id>]`
+///
+/// Token-based `parts` parsing is preserved verbatim from the pgwire handler:
+/// an optional `ON <collection>` token filters by collection and an optional
+/// `TENANT <id>` token overrides the tenant.
+pub fn show_rls_policies(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    parts: &[&str],
+) -> Result<Vec<DdlResult>, DdlError> {
+    let collection = parts
+        .iter()
+        .position(|p| p.to_uppercase() == "ON")
+        .and_then(|i| parts.get(i + 1))
+        .map(|s| s.to_string());
+
+    let tenant_id = parts
+        .iter()
+        .position(|p| p.to_uppercase() == "TENANT")
+        .and_then(|i| parts.get(i + 1))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| identity.tenant_id.as_u64());
+
+    let policies = if let Some(coll) = &collection {
+        state.rls.all_policies(tenant_id, coll)
+    } else {
+        state.rls.all_policies_for_tenant(tenant_id)
+    };
+
+    let columns = vec![
+        "name".to_string(),
+        "collection".to_string(),
+        "type".to_string(),
+        "mode".to_string(),
+        "has_auth_refs".to_string(),
+        "enabled".to_string(),
+        "created_by".to_string(),
+    ];
+
+    let mut rows = Vec::with_capacity(policies.len());
+    for p in &policies {
+        let mut row = Map::new();
+        row.insert("name".to_string(), JsonValue::String(p.name.clone()));
+        row.insert(
+            "collection".to_string(),
+            JsonValue::String(p.collection.clone()),
+        );
+        row.insert(
+            "type".to_string(),
+            JsonValue::String(format!("{:?}", p.policy_type)),
+        );
+        row.insert(
+            "mode".to_string(),
+            JsonValue::String(format!("{:?}", p.mode)),
+        );
+        row.insert(
+            "has_auth_refs".to_string(),
+            JsonValue::String(p.compiled_predicate.is_some().to_string()),
+        );
+        row.insert(
+            "enabled".to_string(),
+            JsonValue::String(p.enabled.to_string()),
+        );
+        row.insert(
+            "created_by".to_string(),
+            JsonValue::String(p.created_by.clone()),
+        );
+        rows.push(row);
+    }
+
+    let column_types = ShapedRows::text_types(columns.len());
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
+}

@@ -24,7 +24,6 @@ use crate::control::server::pgwire::ddl::grant::permission::{grant_permission, r
 use crate::control::server::pgwire::ddl::grant::role::{grant_role, revoke_role};
 use crate::control::server::pgwire::ddl::inspect::show_permissions;
 use crate::control::server::pgwire::ddl::retention_policy::alter_retention_policy;
-use crate::control::server::pgwire::ddl::rls::{CreateRlsPolicyRequest, create_rls_policy};
 use crate::control::server::pgwire::ddl::role::alter_role_typed;
 use crate::control::server::pgwire::ddl::schedule::alter_schedule;
 use crate::control::server::pgwire::ddl::trigger::alter_trigger;
@@ -224,28 +223,6 @@ pub(super) fn try_dispatch_sync(
                 severity,
                 notify_targets_raw,
                 database_id,
-            },
-        )),
-
-        NodedbStatement::Policy(PolicyStmt::CreateRlsPolicy {
-            name,
-            collection,
-            policy_type,
-            predicate_raw,
-            is_restrictive,
-            on_deny_raw,
-            tenant_id_override,
-        }) => Some(create_rls_policy(
-            state,
-            identity,
-            &CreateRlsPolicyRequest {
-                name,
-                collection,
-                policy_type_raw: policy_type,
-                predicate_raw,
-                is_restrictive: *is_restrictive,
-                on_deny_raw: on_deny_raw.as_deref(),
-                tenant_id_override: *tenant_id_override,
             },
         )),
 

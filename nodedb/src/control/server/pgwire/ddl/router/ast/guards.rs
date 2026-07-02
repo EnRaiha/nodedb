@@ -138,18 +138,6 @@ pub(super) fn try_dispatch_guards(
             None
         }
 
-        NodedbStatement::Policy(PolicyStmt::DropRlsPolicy {
-            name,
-            collection,
-            if_exists: true,
-        }) => {
-            let tid = identity.tenant_id.as_u64();
-            if !state.rls.policy_exists(tid, collection, name) {
-                return Some(Ok(vec![Response::Execution(Tag::new("DROP RLS POLICY"))]));
-            }
-            None
-        }
-
         NodedbStatement::StreamView(StreamViewStmt::DropConsumerGroup {
             name,
             stream,

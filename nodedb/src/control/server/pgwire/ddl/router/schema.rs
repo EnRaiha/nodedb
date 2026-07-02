@@ -35,7 +35,7 @@ pub(super) async fn dispatch(
     // CREATE COLLECTION — fully dispatched via typed AST (ast.rs).
     // CREATE INDEX / CREATE UNIQUE INDEX — fully dispatched via typed AST (ast.rs).
     // CREATE SEQUENCE — served by the protocol-neutral DDL router.
-    // CREATE RLS POLICY — fully dispatched via typed AST (ast.rs).
+    // CREATE RLS POLICY — served by the protocol-neutral DDL router.
     // ALTER COLLECTION (all sub-operations) — fully dispatched via typed AST (ast.rs).
 
     // DROP { COLLECTION | TABLE } — fully dispatched via typed AST (ast.rs
@@ -63,12 +63,7 @@ pub(super) async fn dispatch(
     // ALTER TABLE ADD COLUMN — handled via typed AST (ast.rs AlterCollection).
     // The only remaining ALTER TABLE path is undirected fallthrough.
 
-    if upper.starts_with("DROP RLS POLICY ") {
-        return Some(super::super::rls::drop_rls_policy(state, identity, parts));
-    }
-    if upper.starts_with("SHOW RLS POLICIES") || upper.starts_with("SHOW RLS POLICY") {
-        return Some(super::super::rls::show_rls_policies(state, identity, parts));
-    }
+    // DROP RLS POLICY / SHOW RLS POLICIES — served by the protocol-neutral DDL router.
 
     // DEFINE FIELD <name> ON <collection> [TYPE <type>] [DEFAULT <expr>] [VALUE <expr>] [ASSERT <expr>] [READONLY]
     if upper.starts_with("DEFINE FIELD ") {

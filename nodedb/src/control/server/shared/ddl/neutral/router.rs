@@ -6,13 +6,14 @@
 //! other statement returns `None` so the transitional pgwire delegation in the
 //! parent [`super::super::dispatch`] handles it.
 
-use nodedb_sql::ddl_ast::statement::{CollectionStmt, NodedbStatement};
+use nodedb_sql::ddl_ast::statement::{CollectionStmt, NodedbStatement, PolicyStmt};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::result::{DdlError, DdlResult};
+use super::rls::{self, CreateRlsPolicyRequest};
 use super::sequence::{self, CreateSequenceRequest};
 
 /// Try to handle `sql` with a migrated protocol-neutral DDL family handler.
@@ -98,6 +99,63 @@ pub async fn try_dispatch(
 
         NodedbStatement::Collection(CollectionStmt::DescribeSequence { name }) => {
             Some(sequence::describe_sequence(state, identity, name))
+        }
+
+        NodedbStatement::Policy(PolicyStmt::CreateRlsPolicy {
+            name,
+            collection,
+            policy_type,
+            predicate_raw,
+            is_restrictive,
+            on_deny_raw,
+            tenant_id_override,
+        }) => Some(rls::create_rls_policy(
+            state,
+            identity,
+            &CreateRlsPolicyRequest {
+                name,
+                collection,
+                policy_type_raw: policy_type,
+                predicate_raw,
+                is_restrictive: *is_restrictive,
+                on_deny_raw: on_deny_raw.as_deref(),
+                tenant_id_override: *tenant_id_override,
+            },
+        )),
+
+        NodedbStatement::Policy(PolicyStmt::DropRlsPolicy {
+            name,
+            collection,
+            if_exists,
+        }) => {
+            // IF EXISTS on a non-existing policy short-circuits to the tag,
+            // folded from the pgwire guard (which checks existence against the
+            // identity tenant). The existing case and the non-IF-EXISTS case
+            // fall through to the token-based handler, which re-derives the name
+            // / collection / TENANT override from `parts` exactly as the pgwire
+            // string dispatch did.
+            let tid = identity.tenant_id.as_u64();
+            if *if_exists && !state.rls.policy_exists(tid, collection, name) {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "DROP RLS POLICY".to_string(),
+                    rows_affected: None,
+                }]));
+            }
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(rls::drop_rls_policy(state, identity, &parts))
+        }
+
+        NodedbStatement::Policy(PolicyStmt::ShowRlsPolicies { .. }) => {
+            // The AST recognizes the broader `SHOW RLS POLI…` prefix, but the
+            // pgwire string dispatch only handled `SHOW RLS POLICIES` /
+            // `SHOW RLS POLICY`; narrower inputs fell through to the planner.
+            // Replicate that exact prefix guard by returning None otherwise.
+            let upper = sql.to_uppercase();
+            if !(upper.starts_with("SHOW RLS POLICIES") || upper.starts_with("SHOW RLS POLICY")) {
+                return None;
+            }
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(rls::show_rls_policies(state, identity, &parts))
         }
 
         _ => None,

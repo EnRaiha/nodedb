@@ -48,7 +48,6 @@ pub mod pubsub;
 pub mod query_functions;
 pub mod rate_gate;
 pub mod retention_policy;
-pub mod rls;
 pub mod role;
 #[path = "router/mod.rs"]
 pub mod router;
