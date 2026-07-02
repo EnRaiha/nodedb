@@ -24,6 +24,7 @@ use super::function;
 use super::grant;
 use super::materialized_view;
 use super::oidc;
+use super::retention_policy;
 use super::rls::{self, CreateRlsPolicyRequest};
 use super::role;
 use super::schedule::{self, CreateScheduleRequest};
@@ -345,6 +346,25 @@ pub async fn try_dispatch(
         return Some(
             continuous_agg::show_continuous_aggregates(state, identity, database_id, &parts).await,
         );
+    }
+
+    // Retention policies (timeseries). `SHOW RETENTION POLICIES` parses into a
+    // typed `PolicyStmt::ShowRetentionPolicies`, but the pgwire admin router
+    // dispatched it from the raw token slice by the `SHOW RETENTION POLIC`
+    // prefix (trailing-space-less, captures both the plural `SHOW RETENTION
+    // POLICIES` and the singular `SHOW RETENTION POLICY ON <collection>`).
+    // Replicate that exactly here, before the parse gate, so the prefix
+    // recognition and the `parts`-based `ON <collection>` filter stay
+    // byte-identical. `CREATE` / `ALTER` / `DROP RETENTION POLICY` are handled in
+    // the typed match below (they parse into typed Policy variants).
+    if upper.starts_with("SHOW RETENTION POLIC") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(retention_policy::show_retention_policy(
+            state,
+            identity,
+            database_id,
+            &parts,
+        ));
     }
 
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,
@@ -905,6 +925,67 @@ pub async fn try_dispatch(
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
             Some(alert::drop_alert(state, identity, database_id, &parts))
+        }
+
+        NodedbStatement::Policy(PolicyStmt::CreateRetentionPolicy {
+            name,
+            collection,
+            body_raw,
+            eval_interval_raw,
+        }) => Some(
+            retention_policy::create_retention_policy(
+                state,
+                identity,
+                database_id,
+                name,
+                collection,
+                body_raw,
+                eval_interval_raw.as_deref(),
+            )
+            .await,
+        ),
+
+        NodedbStatement::Policy(PolicyStmt::AlterRetentionPolicy {
+            name,
+            action,
+            set_key,
+            set_value,
+        }) => Some(retention_policy::alter_retention_policy(
+            state,
+            identity,
+            database_id,
+            name,
+            action,
+            set_key.as_deref(),
+            set_value.as_deref(),
+        )),
+
+        NodedbStatement::Policy(PolicyStmt::DropRetentionPolicy { name, if_exists }) => {
+            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // non-existing retention policy returns the tag before the token
+            // handler runs (and before the tenant-admin gate). The existence
+            // check reads the in-memory `retention_policy_registry` for the
+            // identity tenant scoped to the session database, exactly as the
+            // pgwire guard (`retention_policy_exists`) did. The `if_exists:
+            // false` case and the existing-policy case fall through to
+            // `drop_retention_policy`, which re-derives the name from `parts[3]`
+            // exactly as the pgwire admin string dispatch did.
+            let tid = identity.tenant_id.as_u64();
+            if *if_exists
+                && state
+                    .retention_policy_registry
+                    .get(database_id.as_u64(), tid, name)
+                    .is_none()
+            {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "DROP RETENTION POLICY".to_string(),
+                    rows_affected: None,
+                }]));
+            }
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(
+                retention_policy::drop_retention_policy(state, identity, database_id, &parts).await,
+            )
         }
 
         _ => None,

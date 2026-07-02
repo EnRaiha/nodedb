@@ -49,30 +49,8 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // served by the protocol-neutral DDL router; the pgwire router no longer
     // routes them.
 
-    // Retention policies.
-    // CREATE RETENTION POLICY is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("DROP RETENTION POLICY ") {
-        return Some(
-            super::super::super::retention_policy::drop_retention_policy(
-                state,
-                identity,
-                database_id,
-                parts,
-            )
-            .await,
-        );
-    }
-    // ALTER RETENTION POLICY is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("SHOW RETENTION POLIC") {
-        return Some(
-            super::super::super::retention_policy::show_retention_policy(
-                state,
-                identity,
-                database_id,
-                parts,
-            ),
-        );
-    }
+    // Retention policies (CREATE/DROP/ALTER/SHOW RETENTION POLICY) are served by
+    // the protocol-neutral DDL router; the pgwire router no longer routes them.
 
     // Continuous aggregates (CREATE/DROP/SHOW CONTINUOUS AGGREGATE) are served by
     // the protocol-neutral DDL router; the pgwire router no longer routes them.

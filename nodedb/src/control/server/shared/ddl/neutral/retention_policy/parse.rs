@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! SQL parsing helpers for retention policy DDL.
-
-use pgwire::error::PgWireResult;
+//!
+//! Ported verbatim from the pgwire `ddl::retention_policy::parse` helper; only
+//! the error type changed from pgwire `PgWireError` to the protocol-neutral
+//! [`DdlError`]. Every parse rule, SQLSTATE, and message is preserved.
 
 use crate::engine::timeseries::continuous_agg::{AggFunction, AggregateExpr};
 use crate::engine::timeseries::retention_policy::types::{
     ArchiveTarget, RetentionPolicyDef, TierDef,
 };
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::DdlError;
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 pub(super) struct ParsedRetentionPolicy {
     pub name: String,
@@ -20,55 +29,55 @@ pub(super) struct ParsedRetentionPolicy {
 }
 
 /// Parse the CREATE RETENTION POLICY SQL.
-pub(super) fn parse_create_retention_policy(sql: &str) -> PgWireResult<ParsedRetentionPolicy> {
+pub(super) fn parse_create_retention_policy(sql: &str) -> Result<ParsedRetentionPolicy, DdlError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_uppercase();
 
     // Extract name: "CREATE RETENTION POLICY <name> ON ..."
     let prefix = "CREATE RETENTION POLICY ";
     if !upper.starts_with(prefix) {
-        return Err(sqlstate_error("42601", "expected CREATE RETENTION POLICY"));
+        return Err(err("42601", "expected CREATE RETENTION POLICY".to_string()));
     }
     let after_prefix = &trimmed[prefix.len()..];
     let name = after_prefix
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "missing policy name"))?
+        .ok_or_else(|| err("42601", "missing policy name".to_string()))?
         .to_lowercase();
 
     // Extract collection: "... ON <collection> (...)"
     let upper_after = upper[prefix.len()..].to_string();
     let on_pos = upper_after
         .find(" ON ")
-        .ok_or_else(|| sqlstate_error("42601", "expected ON <collection>"))?;
+        .ok_or_else(|| err("42601", "expected ON <collection>".to_string()))?;
     let after_on = after_prefix[on_pos + 4..].trim_start();
     let collection = after_on
         .split(|c: char| c.is_whitespace() || c == '(')
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "missing collection name"))?
+        .ok_or_else(|| err("42601", "missing collection name".to_string()))?
         .to_lowercase();
 
     // Find the tier body between balanced outer parentheses.
     let body_start = trimmed
         .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected '(' after collection name"))?;
+        .ok_or_else(|| err("42601", "expected '(' after collection name".to_string()))?;
     let body_end = find_matching_paren(trimmed, body_start)
-        .ok_or_else(|| sqlstate_error("42601", "missing closing ')'"))?;
+        .ok_or_else(|| err("42601", "missing closing ')'".to_string()))?;
     if body_end <= body_start {
-        return Err(sqlstate_error("42601", "empty tier definition body"));
+        return Err(err("42601", "empty tier definition body".to_string()));
     }
     let body = &trimmed[body_start + 1..body_end];
 
     // Parse tiers from body.
     let tiers = parse_tiers(body)?;
     if tiers.is_empty() {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
-            "at least one tier (RAW) is required",
+            "at least one tier (RAW) is required".to_string(),
         ));
     }
     if !tiers[0].is_raw() {
-        return Err(sqlstate_error("42601", "first tier must be RAW"));
+        return Err(err("42601", "first tier must be RAW".to_string()));
     }
 
     let tier_count = tiers.len();
@@ -89,7 +98,7 @@ pub(super) fn parse_create_retention_policy(sql: &str) -> PgWireResult<ParsedRet
 ///
 /// Handles: RAW RETAIN, DOWNSAMPLE TO, ARCHIVE TO.
 /// Splits on top-level commas (respecting nested parentheses).
-fn parse_tiers(body: &str) -> PgWireResult<Vec<TierDef>> {
+fn parse_tiers(body: &str) -> Result<Vec<TierDef>, DdlError> {
     let clauses = split_top_level_commas(body);
     let mut tiers = Vec::new();
     let mut tier_index = 0u32;
@@ -115,9 +124,9 @@ fn parse_tiers(body: &str) -> PgWireResult<Vec<TierDef>> {
             let resolution_ms = extract_downsample_interval(clause)?;
             let aggregates = extract_tier_aggregates(clause)?;
             if aggregates.is_empty() {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42601",
-                    "DOWNSAMPLE tier requires at least one AGGREGATE",
+                    "DOWNSAMPLE tier requires at least one AGGREGATE".to_string(),
                 ));
             }
             let retain_ms = extract_retain(clause)?;
@@ -134,15 +143,15 @@ fn parse_tiers(body: &str) -> PgWireResult<Vec<TierDef>> {
             if let Some(last) = tiers.last_mut() {
                 last.archive = Some(ArchiveTarget::S3 { url });
             } else {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42601",
-                    "ARCHIVE TO must follow at least one tier",
+                    "ARCHIVE TO must follow at least one tier".to_string(),
                 ));
             }
         } else {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42601",
-                &format!(
+                format!(
                     "unexpected tier clause: {}",
                     &clause[..clause.len().min(40)]
                 ),
@@ -177,11 +186,11 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 }
 
 /// Extract RETAIN '<duration>' → milliseconds.
-fn extract_retain(clause: &str) -> PgWireResult<u64> {
+fn extract_retain(clause: &str) -> Result<u64, DdlError> {
     let upper = clause.to_uppercase();
     let pos = upper
         .find("RETAIN")
-        .ok_or_else(|| sqlstate_error("42601", "missing RETAIN clause"))?;
+        .ok_or_else(|| err("42601", "missing RETAIN clause".to_string()))?;
     let after = clause[pos + 6..].trim_start();
     let val = extract_quoted_string(after)?;
 
@@ -190,38 +199,34 @@ fn extract_retain(clause: &str) -> PgWireResult<u64> {
     }
 
     nodedb_types::kv_parsing::parse_interval_to_ms(&val)
-        .map_err(|e| sqlstate_error("42601", &format!("invalid retain duration '{val}': {e}")))
+        .map_err(|e| err("42601", format!("invalid retain duration '{val}': {e}")))
 }
 
 /// Extract DOWNSAMPLE TO '<interval>' → milliseconds.
-fn extract_downsample_interval(clause: &str) -> PgWireResult<u64> {
+fn extract_downsample_interval(clause: &str) -> Result<u64, DdlError> {
     let upper = clause.to_uppercase();
     let pos = upper
         .find("TO")
-        .ok_or_else(|| sqlstate_error("42601", "expected DOWNSAMPLE TO '<interval>'"))?;
+        .ok_or_else(|| err("42601", "expected DOWNSAMPLE TO '<interval>'".to_string()))?;
     let after = clause[pos + 2..].trim_start();
     let val = extract_quoted_string(after)?;
 
-    nodedb_types::kv_parsing::parse_interval_to_ms(&val).map_err(|e| {
-        sqlstate_error(
-            "42601",
-            &format!("invalid downsample interval '{val}': {e}"),
-        )
-    })
+    nodedb_types::kv_parsing::parse_interval_to_ms(&val)
+        .map_err(|e| err("42601", format!("invalid downsample interval '{val}': {e}")))
 }
 
 /// Extract ARCHIVE TO '<url>'.
-fn extract_archive_url(clause: &str) -> PgWireResult<String> {
+fn extract_archive_url(clause: &str) -> Result<String, DdlError> {
     let upper = clause.to_uppercase();
     let pos = upper
         .find("TO")
-        .ok_or_else(|| sqlstate_error("42601", "expected ARCHIVE TO '<url>'"))?;
+        .ok_or_else(|| err("42601", "expected ARCHIVE TO '<url>'".to_string()))?;
     let after = clause[pos + 2..].trim_start();
     extract_quoted_string(after)
 }
 
 /// Extract aggregate expressions from AGGREGATE (...) in a tier clause.
-fn extract_tier_aggregates(clause: &str) -> PgWireResult<Vec<AggregateExpr>> {
+fn extract_tier_aggregates(clause: &str) -> Result<Vec<AggregateExpr>, DdlError> {
     let upper = clause.to_uppercase();
     let agg_pos = match upper.find("AGGREGATE") {
         Some(p) => p,
@@ -231,12 +236,16 @@ fn extract_tier_aggregates(clause: &str) -> PgWireResult<Vec<AggregateExpr>> {
 
     let open = after_agg
         .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected '(' after AGGREGATE"))?;
+        .ok_or_else(|| err("42601", "expected '(' after AGGREGATE".to_string()))?;
 
-    let close = find_matching_paren(after_agg, open)
-        .ok_or_else(|| sqlstate_error("42601", "missing ')' after AGGREGATE expressions"))?;
+    let close = find_matching_paren(after_agg, open).ok_or_else(|| {
+        err(
+            "42601",
+            "missing ')' after AGGREGATE expressions".to_string(),
+        )
+    })?;
     if close <= open + 1 {
-        return Err(sqlstate_error("42601", "empty AGGREGATE expression list"));
+        return Err(err("42601", "empty AGGREGATE expression list".to_string()));
     }
 
     let inner = &after_agg[open + 1..close];
@@ -273,7 +282,7 @@ fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
 }
 
 /// Parse a single aggregate expression: `func(col)` or `func(col) AS alias`.
-pub(super) fn parse_agg_expr(s: &str) -> PgWireResult<AggregateExpr> {
+pub(super) fn parse_agg_expr(s: &str) -> Result<AggregateExpr, DdlError> {
     let upper = s.to_uppercase();
 
     let (func_part, alias) = if let Some(as_pos) = upper.find(" AS ") {
@@ -285,10 +294,10 @@ pub(super) fn parse_agg_expr(s: &str) -> PgWireResult<AggregateExpr> {
 
     let open = func_part
         .find('(')
-        .ok_or_else(|| sqlstate_error("42601", &format!("expected func(col): {s}")))?;
+        .ok_or_else(|| err("42601", format!("expected func(col): {s}")))?;
     let close = func_part
         .rfind(')')
-        .ok_or_else(|| sqlstate_error("42601", &format!("missing ')': {s}")))?;
+        .ok_or_else(|| err("42601", format!("missing ')': {s}")))?;
 
     let func_name = func_part[..open].trim().to_lowercase();
     let col_name = func_part[open + 1..close].trim().to_lowercase();
@@ -303,10 +312,7 @@ pub(super) fn parse_agg_expr(s: &str) -> PgWireResult<AggregateExpr> {
         "last" => AggFunction::Last,
         "count_distinct" => AggFunction::CountDistinct,
         other => {
-            return Err(sqlstate_error(
-                "42601",
-                &format!("unknown aggregate function: {other}"),
-            ));
+            return Err(err("42601", format!("unknown aggregate function: {other}")));
         }
     };
 
@@ -326,13 +332,13 @@ pub(super) fn parse_agg_expr(s: &str) -> PgWireResult<AggregateExpr> {
 }
 
 /// Extract a single-quoted string value.
-fn extract_quoted_string(s: &str) -> PgWireResult<String> {
+fn extract_quoted_string(s: &str) -> Result<String, DdlError> {
     let start = s
         .find('\'')
-        .ok_or_else(|| sqlstate_error("42601", "expected quoted string"))?;
+        .ok_or_else(|| err("42601", "expected quoted string".to_string()))?;
     let end = s[start + 1..]
         .find('\'')
-        .ok_or_else(|| sqlstate_error("42601", "missing closing quote"))?;
+        .ok_or_else(|| err("42601", "missing closing quote".to_string()))?;
     Ok(s[start + 1..start + 1 + end].to_string())
 }
 

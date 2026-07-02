@@ -6,14 +6,13 @@ use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use nodedb_sql::ddl_ast::statement::{
-    AuthStmt, ClusterStmt, CollectionStmt, DatabaseStmt, NodedbStatement, PolicyStmt,
+    AuthStmt, ClusterStmt, CollectionStmt, DatabaseStmt, NodedbStatement,
 };
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::ddl::cluster::alter_raft_group;
 use crate::control::server::pgwire::ddl::collection::drop_collection;
 use crate::control::server::pgwire::ddl::inspect::show_permissions;
-use crate::control::server::pgwire::ddl::retention_policy::alter_retention_policy;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -25,7 +24,7 @@ pub(super) fn try_dispatch_sync(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     stmt: &NodedbStatement,
-    database_id: DatabaseId,
+    _database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     // Database DDL (all synchronous — catalog reads/writes only).
     if let Some(result) = try_dispatch_database(state, identity, stmt) {
@@ -73,21 +72,6 @@ pub(super) fn try_dispatch_sync(
             action,
             node_id,
         }) => Some(alter_raft_group(state, identity, group_id, action, node_id)),
-
-        NodedbStatement::Policy(PolicyStmt::AlterRetentionPolicy {
-            name,
-            action,
-            set_key,
-            set_value,
-        }) => Some(alter_retention_policy(
-            state,
-            identity,
-            database_id,
-            name,
-            action,
-            set_key.as_deref(),
-            set_value.as_deref(),
-        )),
 
         NodedbStatement::Auth(AuthStmt::ShowPermissions {
             on_collection,

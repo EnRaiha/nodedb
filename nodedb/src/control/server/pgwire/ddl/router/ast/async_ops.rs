@@ -19,7 +19,6 @@ use crate::control::server::pgwire::ddl::conflict_policy::show_conflict_policy;
 use crate::control::server::pgwire::ddl::custom_type::{
     alter_type_add_value, create_composite_type, create_enum_type, drop_type, show_types,
 };
-use crate::control::server::pgwire::ddl::retention_policy::create_retention_policy;
 use crate::control::server::pgwire::ddl::synonym_group::{
     create_synonym_group, drop_synonym_group, show_synonym_groups,
 };
@@ -38,24 +37,6 @@ pub(super) async fn try_dispatch_async(
     database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     match stmt {
-        NodedbStatement::Policy(PolicyStmt::CreateRetentionPolicy {
-            name,
-            collection,
-            body_raw,
-            eval_interval_raw,
-        }) => Some(
-            create_retention_policy(
-                state,
-                identity,
-                database_id,
-                name,
-                collection,
-                body_raw,
-                eval_interval_raw.as_deref(),
-            )
-            .await,
-        ),
-
         NodedbStatement::Collection(CollectionStmt::CreateIndex {
             unique,
             index_name,

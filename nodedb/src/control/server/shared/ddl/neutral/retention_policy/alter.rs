@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `ALTER RETENTION POLICY` DDL handler.
+//! Protocol-neutral `ALTER RETENTION POLICY` DDL handler.
+//!
+//! Ported from the pgwire `ddl::retention_policy::alter` handler. The registry
+//! load, the ENABLE / DISABLE / SET (AUTO_TIER, EVAL_INTERVAL) mutations, the
+//! direct catalog write (`put_retention_policy`), the in-memory registry update,
+//! and the audit record are preserved verbatim; only the result construction
+//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
@@ -10,18 +17,24 @@
 //! ```
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::require_tenant_admin;
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 /// Handle `ALTER RETENTION POLICY <name> ENABLE | DISABLE | SET <key> = <value>`.
 ///
 /// `name`, `action`, `set_key`, and `set_value` come from the typed
-/// [`NodedbStatement::AlterRetentionPolicy`] variant. `database_id` scopes
+/// [`PolicyStmt::AlterRetentionPolicy`] variant. `database_id` scopes
 /// the in-memory registry lookup to the session's database.
 pub fn alter_retention_policy(
     state: &SharedState,
@@ -31,7 +44,7 @@ pub fn alter_retention_policy(
     action: &str,
     set_key: Option<&str>,
     set_value: Option<&str>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "alter retention policies")?;
 
     let tenant_id = identity.tenant_id.as_u64();
@@ -40,12 +53,7 @@ pub fn alter_retention_policy(
     let mut def = state
         .retention_policy_registry
         .get(database_id.as_u64(), tenant_id, name)
-        .ok_or_else(|| {
-            sqlstate_error(
-                "42704",
-                &format!("retention policy '{name}' does not exist"),
-            )
-        })?;
+        .ok_or_else(|| err("42704", format!("retention policy '{name}' does not exist")))?;
 
     match action {
         "ENABLE" => def.enabled = true,
@@ -59,19 +67,19 @@ pub fn alter_retention_policy(
                 }
                 "EVAL_INTERVAL" => {
                     let ms = nodedb_types::kv_parsing::parse_interval_to_ms(val)
-                        .map_err(|e| sqlstate_error("42601", &format!("invalid interval: {e}")))?;
+                        .map_err(|e| err("42601", format!("invalid interval: {e}")))?;
                     def.eval_interval_ms = ms;
                 }
                 _ => {
-                    return Err(sqlstate_error(
+                    return Err(err(
                         "42601",
-                        "ALTER RETENTION POLICY SET supports: AUTO_TIER, EVAL_INTERVAL",
+                        "ALTER RETENTION POLICY SET supports: AUTO_TIER, EVAL_INTERVAL".to_string(),
                     ));
                 }
             }
         }
         _ => {
-            return Err(sqlstate_error("42601", "expected ENABLE, DISABLE, or SET"));
+            return Err(err("42601", "expected ENABLE, DISABLE, or SET".to_string()));
         }
     }
 
@@ -80,11 +88,11 @@ pub fn alter_retention_policy(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
 
     catalog
         .put_retention_policy(&def)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+        .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
 
     // Update in-memory registry.
     state.retention_policy_registry.register(def);
@@ -96,7 +104,8 @@ pub fn alter_retention_policy(
         &format!("ALTER RETENTION POLICY {name}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new(
-        "ALTER RETENTION POLICY",
-    ))])
+    Ok(vec![DdlResult::Status {
+        command: "ALTER RETENTION POLICY".to_string(),
+        rows_affected: None,
+    }])
 }

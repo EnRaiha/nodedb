@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+//! Protocol-neutral retention policy DDL — CREATE / DROP / ALTER / SHOW.
+
 pub mod alter;
 pub mod create;
 pub mod drop;

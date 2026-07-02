@@ -18,16 +18,3 @@ pub(super) fn collection_exists(
     let tid = identity.tenant_id.as_u64();
     matches!(catalog.get_collection(database_id, tid, name), Ok(Some(_)))
 }
-
-pub(super) fn retention_policy_exists(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    database_id: DatabaseId,
-    name: &str,
-) -> bool {
-    let tid = identity.tenant_id.as_u64();
-    state
-        .retention_policy_registry
-        .get(database_id.as_u64(), tid, name)
-        .is_some()
-}

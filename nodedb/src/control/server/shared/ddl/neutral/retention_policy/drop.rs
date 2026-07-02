@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `DROP RETENTION POLICY` DDL handler.
+//! Protocol-neutral `DROP RETENTION POLICY` DDL handler.
+//!
+//! Ported from the pgwire `ddl::retention_policy::drop` handler. The registry
+//! existence check, the direct catalog delete (`delete_retention_policy`), the
+//! CRDT tombstone delta emission, the best-effort continuous-aggregate
+//! auto-wire unregistration (warn-and-continue on failure, preserved verbatim
+//! because the pgwire handler treated it identically), the in-memory registry
+//! unregister, and the audit record are preserved verbatim; only the result
+//! construction changed from pgwire `Response` / `PgWireError` to the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
@@ -8,27 +17,33 @@
 //! ```
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::require_tenant_admin;
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 pub async fn drop_retention_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop retention policies")?;
 
     // DROP RETENTION POLICY <name>
     if parts.len() < 4 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
-            "syntax: DROP RETENTION POLICY <name>",
+            "syntax: DROP RETENTION POLICY <name>".to_string(),
         ));
     }
     let name = parts[3].to_lowercase();
@@ -38,23 +53,18 @@ pub async fn drop_retention_policy(
     let policy_def = state
         .retention_policy_registry
         .get(database_id.as_u64(), tenant_id, &name)
-        .ok_or_else(|| {
-            sqlstate_error(
-                "42704",
-                &format!("retention policy '{name}' does not exist"),
-            )
-        })?;
+        .ok_or_else(|| err("42704", format!("retention policy '{name}' does not exist")))?;
 
     // Delete from catalog.
     let catalog = state
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
 
     catalog
         .delete_retention_policy(database_id.as_u64(), tenant_id, &name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog delete: {e}")))?;
+        .map_err(|e| err("XX000", format!("catalog delete: {e}")))?;
 
     // Emit CRDT tombstone delta.
     {
@@ -102,5 +112,8 @@ pub async fn drop_retention_policy(
 
     tracing::info!(name, %collection, "retention policy dropped");
 
-    Ok(vec![Response::Execution(Tag::new("DROP RETENTION POLICY"))])
+    Ok(vec![DdlResult::Status {
+        command: "DROP RETENTION POLICY".to_string(),
+        rows_affected: None,
+    }])
 }

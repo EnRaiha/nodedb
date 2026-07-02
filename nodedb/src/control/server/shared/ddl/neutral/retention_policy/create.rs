@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE RETENTION POLICY` DDL handler.
+//! Protocol-neutral `CREATE RETENTION POLICY` DDL handler.
+//!
+//! Ported from the pgwire `ddl::retention_policy::create` handler. The direct
+//! catalog write (`put_retention_policy`), the CRDT sync delta emission, the
+//! in-memory registry registration, the continuous-aggregate auto-wiring with
+//! catalog+registry rollback on failure, the collection / duplicate-name /
+//! per-collection checks, and the audit record are preserved verbatim; only the
+//! result construction changed from pgwire `Response` / `PgWireError` to the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
@@ -15,15 +23,21 @@
 //! ```
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::require_tenant_admin;
 use super::RETENTION_POLICIES_CRDT_COLLECTION;
 use super::parse::parse_create_retention_policy;
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 /// Handle `CREATE RETENTION POLICY` from typed AST fields extracted by nodedb-sql parser.
 ///
@@ -37,7 +51,7 @@ pub async fn create_retention_policy(
     collection: &str,
     body_raw: &str,
     eval_interval_raw: Option<&str>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create retention policies")?;
 
     // Reconstruct minimal SQL for the existing complex parser.
@@ -56,15 +70,15 @@ pub async fn create_retention_policy(
         match catalog.get_collection(database_id, tenant_id, &parsed.collection) {
             Ok(Some(coll)) if coll.collection_type.is_timeseries() => {}
             Ok(Some(_)) => {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42809",
-                    &format!("'{}' is not a timeseries collection", parsed.collection),
+                    format!("'{}' is not a timeseries collection", parsed.collection),
                 ));
             }
             _ => {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42P01",
-                    &format!("collection '{}' does not exist", parsed.collection),
+                    format!("collection '{}' does not exist", parsed.collection),
                 ));
             }
         }
@@ -76,9 +90,9 @@ pub async fn create_retention_policy(
         .get(database_id.as_u64(), tenant_id, &parsed.name)
         .is_some()
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "42710",
-            &format!("retention policy '{}' already exists", parsed.name),
+            format!("retention policy '{}' already exists", parsed.name),
         ));
     }
 
@@ -88,9 +102,9 @@ pub async fn create_retention_policy(
         .get_for_collection(database_id.as_u64(), tenant_id, &parsed.collection)
         .is_some()
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "42710",
-            &format!(
+            format!(
                 "collection '{}' already has a retention policy",
                 parsed.collection
             ),
@@ -99,7 +113,7 @@ pub async fn create_retention_policy(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock error"))?
+        .map_err(|_| err("XX000", "system clock error".to_string()))?
         .as_secs();
 
     let def = crate::engine::timeseries::retention_policy::types::RetentionPolicyDef {
@@ -120,11 +134,11 @@ pub async fn create_retention_policy(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
 
     catalog
         .put_retention_policy(&def)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+        .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
 
     // Emit CRDT sync delta for Lite visibility.
     {
@@ -157,7 +171,7 @@ pub async fn create_retention_policy(
                     &def.name,
                 );
                 let _ = catalog.delete_retention_policy(database_id.as_u64(), tenant_id, &def.name);
-                sqlstate_error("XX000", &format!("failed to auto-wire aggregates: {e}"))
+                err("XX000", format!("failed to auto-wire aggregates: {e}"))
             })?;
     }
 
@@ -178,7 +192,8 @@ pub async fn create_retention_policy(
         "retention policy created"
     );
 
-    Ok(vec![Response::Execution(Tag::new(
-        "CREATE RETENTION POLICY",
-    ))])
+    Ok(vec![DdlResult::Status {
+        command: "CREATE RETENTION POLICY".to_string(),
+        rows_affected: None,
+    }])
 }

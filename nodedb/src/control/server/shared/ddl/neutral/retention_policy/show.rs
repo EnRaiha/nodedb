@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `SHOW RETENTION POLICY` DDL handler.
+//! Protocol-neutral `SHOW RETENTION POLICY` DDL handler.
+//!
+//! Ported from the pgwire `ddl::retention_policy::show` handler. The registry
+//! listing, the optional `ON <collection>` filter, the tier / duration
+//! formatting, and the exact column set are preserved verbatim; only the result
+//! construction changed from pgwire `Response` / `QueryResponse` /
+//! `DataRowEncoder` to the protocol-neutral [`DdlResult::Rows`] over
+//! [`ShapedRows`]. The mixed text/`int8` column OIDs (`tier_count` and
+//! `created_at` are `int8`, every other column is text) are reproduced by
+//! building `column_types` manually so the RowDescription stays byte-identical;
+//! the `int8` cells are emitted as their decimal text form, the same bytes the
+//! pgwire `DataRowEncoder::encode_field(&i64)` produced.
 //!
 //! Syntax:
 //! ```sql
@@ -8,17 +19,14 @@
 //! SHOW RETENTION POLICIES
 //! ```
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 use crate::engine::timeseries::retention_policy::types::ArchiveTarget;
 
-use super::super::super::types::{int8_field, sqlstate_error, text_field};
+use super::super::super::result::{DdlError, DdlResult};
 
 /// SHOW RETENTION POLICY ON <collection>
 /// SHOW RETENTION POLICIES
@@ -27,7 +35,7 @@ pub fn show_retention_policy(
     identity: &AuthenticatedIdentity,
     database_id: nodedb_types::DatabaseId,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
     // Determine if filtering by collection.
     let collection_filter = if parts.len() >= 5 && parts[3].eq_ignore_ascii_case("ON") {
@@ -40,17 +48,28 @@ pub fn show_retention_policy(
         .retention_policy_registry
         .list_for_tenant_in_database(database_id.as_u64(), tenant_id);
 
-    let schema = Arc::new(vec![
-        text_field("policy_name"),
-        text_field("collection"),
-        text_field("enabled"),
-        text_field("auto_tier"),
-        int8_field("tier_count"),
-        text_field("tiers"),
-        text_field("eval_interval"),
-        text_field("owner"),
-        int8_field("created_at"),
-    ]);
+    let columns = vec![
+        "policy_name".to_string(),
+        "collection".to_string(),
+        "enabled".to_string(),
+        "auto_tier".to_string(),
+        "tier_count".to_string(),
+        "tiers".to_string(),
+        "eval_interval".to_string(),
+        "owner".to_string(),
+        "created_at".to_string(),
+    ];
+    let column_types = vec![
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Int8,
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Int8,
+    ];
 
     let mut rows = Vec::new();
     for policy in &policies {
@@ -64,41 +83,46 @@ pub fn show_retention_policy(
         let tiers_desc = format_tiers(&policy.tiers);
         let eval_interval = format_duration_ms(policy.eval_interval_ms);
 
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        encoder
-            .encode_field(&policy.name)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&policy.collection)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&policy.enabled.to_string())
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&policy.auto_tier.to_string())
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&(policy.tiers.len() as i64))
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&tiers_desc)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&eval_interval)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&policy.owner)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&(policy.created_at as i64))
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert(
+            "policy_name".to_string(),
+            JsonValue::String(policy.name.clone()),
+        );
+        row.insert(
+            "collection".to_string(),
+            JsonValue::String(policy.collection.clone()),
+        );
+        row.insert(
+            "enabled".to_string(),
+            JsonValue::String(policy.enabled.to_string()),
+        );
+        row.insert(
+            "auto_tier".to_string(),
+            JsonValue::String(policy.auto_tier.to_string()),
+        );
+        row.insert(
+            "tier_count".to_string(),
+            JsonValue::String((policy.tiers.len() as i64).to_string()),
+        );
+        row.insert("tiers".to_string(), JsonValue::String(tiers_desc));
+        row.insert(
+            "eval_interval".to_string(),
+            JsonValue::String(eval_interval),
+        );
+        row.insert("owner".to_string(), JsonValue::String(policy.owner.clone()));
+        row.insert(
+            "created_at".to_string(),
+            JsonValue::String((policy.created_at as i64).to_string()),
+        );
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
 
 /// Format tiers into a compact human-readable string.

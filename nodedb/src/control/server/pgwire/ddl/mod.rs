@@ -38,7 +38,6 @@ pub mod procedure;
 pub mod pubsub;
 pub mod query_functions;
 pub mod rate_gate;
-pub mod retention_policy;
 #[path = "router/mod.rs"]
 pub mod router;
 pub mod schema_validation;

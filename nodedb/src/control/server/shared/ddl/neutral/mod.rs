@@ -17,6 +17,7 @@ pub mod function;
 pub mod grant;
 pub mod materialized_view;
 pub mod oidc;
+pub mod retention_policy;
 pub mod rls;
 pub mod role;
 pub mod router;
