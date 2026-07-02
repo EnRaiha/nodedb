@@ -16,9 +16,6 @@ use crate::control::server::pgwire::ddl::collection::{
     create_index, create_table, dispatch_register_by_name,
 };
 use crate::control::server::pgwire::ddl::conflict_policy::show_conflict_policy;
-use crate::control::server::pgwire::ddl::synonym_group::{
-    create_synonym_group, drop_synonym_group, show_synonym_groups,
-};
 use crate::control::server::pgwire::ddl::tenant::handle_move_tenant;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
@@ -136,18 +133,6 @@ pub(super) async fn try_dispatch_async(
 
         NodedbStatement::Policy(PolicyStmt::ShowConflictPolicy { collection }) => {
             Some(show_conflict_policy(state, identity, database_id, collection).await)
-        }
-
-        NodedbStatement::Policy(PolicyStmt::CreateSynonymGroup { name, terms }) => {
-            Some(create_synonym_group(state, identity, database_id, name, terms).await)
-        }
-
-        NodedbStatement::Policy(PolicyStmt::DropSynonymGroup { name, if_exists }) => {
-            Some(drop_synonym_group(state, identity, database_id, name, *if_exists).await)
-        }
-
-        NodedbStatement::Policy(PolicyStmt::ShowSynonymGroups) => {
-            Some(show_synonym_groups(state, identity))
         }
 
         NodedbStatement::Collection(CollectionStmt::Reindex {

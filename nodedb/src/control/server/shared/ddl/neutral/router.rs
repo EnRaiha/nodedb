@@ -33,6 +33,7 @@ use super::role;
 use super::schedule::{self, CreateScheduleRequest};
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
+use super::synonym_group;
 use super::topic;
 use super::trigger;
 use super::typeguard;
@@ -1038,6 +1039,18 @@ pub async fn try_dispatch(
             Some(
                 retention_policy::drop_retention_policy(state, identity, database_id, &parts).await,
             )
+        }
+
+        NodedbStatement::Policy(PolicyStmt::CreateSynonymGroup { name, terms }) => Some(
+            synonym_group::create_synonym_group(state, identity, database_id, name, terms).await,
+        ),
+
+        NodedbStatement::Policy(PolicyStmt::DropSynonymGroup { name, if_exists }) => Some(
+            synonym_group::drop_synonym_group(state, identity, database_id, name, *if_exists).await,
+        ),
+
+        NodedbStatement::Policy(PolicyStmt::ShowSynonymGroups) => {
+            Some(synonym_group::show_synonym_groups(state, identity))
         }
 
         _ => None,

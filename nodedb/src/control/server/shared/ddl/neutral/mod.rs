@@ -27,6 +27,7 @@ pub mod router;
 pub mod schedule;
 pub mod sequence;
 pub mod service_account;
+pub mod synonym_group;
 pub mod topic;
 pub mod trigger;
 pub mod typeguard;
