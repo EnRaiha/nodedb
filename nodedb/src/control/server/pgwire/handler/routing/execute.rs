@@ -10,13 +10,13 @@ use crate::control::planner::calvin::{
     DispatchClass, classify_dispatch, plan_needs_implicit_edge_recon,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::kv::apply_kv_wrap;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::super::types::{error_to_sqlstate, response_status_to_sqlstate};
 use super::super::core::NodeDbPgHandler;
 use super::super::plan::{describe_plan, extract_collection, payload_to_response};
-use super::kv_wrapping::maybe_wrap_kv_point_get;
 use super::planning::consistency_for_tasks;
 use super::set_ops;
 
@@ -468,7 +468,7 @@ impl NodeDbPgHandler {
                     dedup_set_op = resp_post_set_op;
                 }
             } else {
-                let payload = maybe_wrap_kv_point_get(&plan_for_response, &resp.payload);
+                let payload = apply_kv_wrap(&plan_for_response, &resp.payload);
                 let payload = crate::control::server::response_translate::translate_if_vector(
                     &payload,
                     &plan_for_response,

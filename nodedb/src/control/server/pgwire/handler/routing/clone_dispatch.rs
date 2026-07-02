@@ -17,10 +17,9 @@ use crate::control::clone::resolver::{
     CloneReadParams, ResolveOutcome, filter_tombstoned_rows, resolve_read,
 };
 use crate::control::server::pgwire::handler::plan::{PlanKind, payload_to_response};
+use crate::control::server::response_shape::kv::apply_kv_wrap;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
-
-use super::kv_wrapping::maybe_wrap_kv_point_get;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
@@ -190,7 +189,7 @@ impl NodeDbPgHandler {
                     // For KvOp::Get: inject the primary key field into the raw map response
                     // so that projection and column-name assertions work correctly.
                     let normalized_payload =
-                        maybe_wrap_kv_point_get(&source_task.plan, source_resp.payload.as_ref());
+                        apply_kv_wrap(&source_task.plan, source_resp.payload.as_ref());
 
                     // KvOp::Get responses arrive as a single msgpack map (not an array).
                     // Normalize to a 1-element array so tombstone filters and merge work
@@ -367,7 +366,7 @@ fn merge_msgpack_arrays(a: &[u8], b: &[u8]) -> crate::Result<Vec<u8>> {
 /// `tombstoned`.
 ///
 /// KV scan responses are msgpack arrays of maps.  Each row map may have a `"key"`
-/// field (injected by `maybe_wrap_kv_point_get` for point-get responses, or
+/// field (injected by `apply_kv_wrap` for point-get responses, or
 /// already present for typed KV scans).  Rows whose `"key"` value is in the
 /// tombstoned set are excluded from the result.
 ///
@@ -403,7 +402,7 @@ fn filter_kv_tombstoned_rows(
 
         // Extract the "key" field from this row map. A KV row without a
         // "key" field is a protocol contract violation (every KV scan/point-get
-        // response is expected to carry a key after `maybe_wrap_kv_point_get`
+        // response is expected to carry a key after `apply_kv_wrap`
         // normalization). Log a warn and treat as not-tombstoned so we err on
         // the side of returning the row to the user — silent drop would be
         // worse than silent include.

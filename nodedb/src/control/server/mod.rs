@@ -15,6 +15,7 @@ pub mod payload_merge;
 pub mod pgwire;
 pub mod post_aggregate;
 pub mod resp;
+pub mod response_shape;
 pub mod response_translate;
 pub mod result_stream;
 pub mod session;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! KV point-get response shaping: inject the primary key into the
-//! stored value map before the pgwire layer turns it into a SQL row.
+//! stored value map before the protocol layer turns it into a SQL row.
 
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::KvOp;
@@ -19,7 +19,7 @@ use nodedb_query::msgpack_scan;
 ///   (key, value)` or RESP `SET`). Wrap as `{key: <key>, value: <bytes>}`.
 ///
 /// For every non-KV-point-get plan, return the payload unchanged.
-pub(super) fn maybe_wrap_kv_point_get(plan: &PhysicalPlan, payload: &[u8]) -> Vec<u8> {
+pub fn apply_kv_wrap(plan: &PhysicalPlan, payload: &[u8]) -> Vec<u8> {
     if payload.is_empty() {
         return payload.to_vec();
     }

@@ -16,7 +16,6 @@ mod clone_write_dispatch;
 mod execute;
 mod execute_dml_hooks;
 mod gateway_dispatch;
-mod kv_wrapping;
 mod planning;
 mod set_ops;
 mod streaming;
