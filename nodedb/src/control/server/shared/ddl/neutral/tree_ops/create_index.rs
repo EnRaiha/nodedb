@@ -30,59 +30,59 @@
 //!    destination-shard for batched dispatch.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+
+use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::broadcast::broadcast_to_all_cores;
-use crate::control::server::pgwire::types::{sqlstate_error, text_field};
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
-use futures::stream;
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp};
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
 
+use super::super::super::result::{DdlError, DdlResult};
 use super::parse::parse_edge_columns;
+use super::support::ddl_err;
 
 pub async fn create_graph_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
     // CREATE GRAPH INDEX <name> ON <collection> (<parent_col> -> <id_col>)
     let index_name = parts
         .get(3)
-        .ok_or_else(|| sqlstate_error("42601", "missing graph index name"))?
+        .ok_or_else(|| ddl_err("42601", "missing graph index name"))?
         .to_lowercase();
 
     let on_idx = parts
         .iter()
         .position(|p| p.eq_ignore_ascii_case("ON"))
-        .ok_or_else(|| sqlstate_error("42601", "CREATE GRAPH INDEX requires ON <collection>"))?;
+        .ok_or_else(|| ddl_err("42601", "CREATE GRAPH INDEX requires ON <collection>"))?;
 
     let collection = parts
         .get(on_idx + 1)
-        .ok_or_else(|| sqlstate_error("42601", "missing collection name after ON"))?
+        .ok_or_else(|| ddl_err("42601", "missing collection name after ON"))?
         .to_lowercase();
 
     let (parent_col, id_col) = parse_edge_columns(sql)?;
 
     let Some(catalog) = state.credentials.catalog() else {
-        return Err(sqlstate_error("XX000", "no catalog available"));
+        return Err(ddl_err("XX000", "no catalog available"));
     };
     if catalog
         .get_collection(database_id, tenant_id.as_u64(), &collection)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
+        .map_err(|e| ddl_err("XX000", e.to_string()))?
         .is_none()
     {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42P01",
-            &format!("collection '{collection}' not found"),
+            format!("collection '{collection}' not found"),
         ));
     }
 
@@ -103,12 +103,12 @@ pub async fn create_graph_index(
     });
     let scan_resp = broadcast_to_all_cores(state, tenant_id, database_id, scan_plan, TraceId::ZERO)
         .await
-        .map_err(|e| sqlstate_error("XX000", &format!("scan failed: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("scan failed: {e}")))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
     let docs: Vec<serde_json::Value> = sonic_rs::from_str(&payload_json)
-        .map_err(|e| sqlstate_error("22P02", &format!("invalid JSON in scan response: {e}")))?;
+        .map_err(|e| ddl_err("22P02", format!("invalid JSON in scan response: {e}")))?;
 
     // ── Build edge list partitioned by destination vshard ────────────
     //
@@ -126,9 +126,9 @@ pub async fn create_graph_index(
             continue;
         };
         let Some(obj) = obj_outer.get("data").and_then(|v| v.as_object()) else {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "XX000",
-                &format!(
+                format!(
                     "CREATE GRAPH INDEX: document scan returned a row without a `data` field: {doc}"
                 ),
             ));
@@ -149,9 +149,9 @@ pub async fn create_graph_index(
                 let parent = match parent_v.as_str() {
                     Some(s) => s,
                     None => {
-                        return Err(sqlstate_error(
+                        return Err(ddl_err(
                             "22P02",
-                            &format!(
+                            format!(
                                 "collection '{collection}' doc '{child}': parent field '{parent_col}' \
                                  must be a string, got {parent_v:?}"
                             ),
@@ -165,11 +165,11 @@ pub async fn create_graph_index(
                 let src_surrogate = state
                     .surrogate_assigner
                     .assign(database_id, tenant_id, &collection, parent.as_bytes())
-                    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+                    .map_err(|e| ddl_err("XX000", e.to_string()))?;
                 let dst_surrogate = state
                     .surrogate_assigner
                     .assign(database_id, tenant_id, &collection, child.as_bytes())
-                    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+                    .map_err(|e| ddl_err("XX000", e.to_string()))?;
                 edges_by_shard.entry(shard).or_default().push(BatchEdge {
                     collection: collection.to_string(),
                     src_id: parent.to_string(),
@@ -221,15 +221,18 @@ pub async fn create_graph_index(
     // Only now is the index atomically complete.
     state.schema_version.bump();
 
-    let schema = Arc::new(vec![text_field("edges_created")]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    encoder
-        .encode_field(&total_edges.to_string())
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(encoder.take_row())]),
-    ))])
+    let mut row = Map::new();
+    row.insert(
+        "edges_created".to_string(),
+        JsonValue::String(total_edges.to_string()),
+    );
+
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["edges_created".to_string()],
+        column_types: ShapedRows::text_types(1),
+        rows: vec![row],
+        notice: None,
+    })])
 }
 
 /// Surface a build-time failure.
@@ -250,7 +253,7 @@ async fn surface_failure(
     tenant_id: TenantId,
     committed: &[(VShardId, Vec<BatchEdge>)],
     cause: String,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let committed_count = committed.len();
     let rollback_futures = committed.iter().map(|(shard, edges)| {
         let plan = PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch {
@@ -283,18 +286,18 @@ async fn surface_failure(
         .collect();
 
     if failed.is_empty() {
-        Err(sqlstate_error(
+        Err(ddl_err(
             "XX000",
-            &format!(
+            format!(
                 "CREATE GRAPH INDEX failed: {cause}; reverted {committed_count} committed shards"
             ),
         ))
     } else {
         // Distinct SQLSTATE so clients / operators can distinguish
         // "failed cleanly" from "failed and left the graph broken".
-        Err(sqlstate_error(
+        Err(ddl_err(
             "XX001",
-            &format!(
+            format!(
                 "CREATE GRAPH INDEX failed: {cause}; rollback also failed on {}/{} shards \
                  ({:?}); GRAPH INDEX LEFT IN INCONSISTENT STATE — operator intervention required",
                 failed.len(),

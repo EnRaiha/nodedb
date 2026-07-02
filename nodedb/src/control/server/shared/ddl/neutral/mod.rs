@@ -31,6 +31,7 @@ pub mod sequence;
 pub mod service_account;
 pub mod synonym_group;
 pub mod topic;
+pub mod tree_ops;
 pub mod trigger;
 pub mod typeguard;
 pub mod user;

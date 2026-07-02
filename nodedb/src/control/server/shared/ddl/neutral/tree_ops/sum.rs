@@ -7,35 +7,32 @@
 //! lookups scan all tenant collections (O(N×C)) — pass the collection
 //! name for production use.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
-use sonic_rs;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::{sqlstate_error, text_field};
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
+use super::super::super::result::{DdlError, DdlResult};
 use super::parse::{extract_function_args, extract_number_after, json_to_decimal};
+use super::support::ddl_err;
 
 pub async fn tree_sum(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let upper = sql.to_uppercase();
 
     // Parse: TREE_SUM(<column>, <graph_index>, '<root_id>' [, '<collection>'])
     let args = extract_function_args(&upper, sql, "TREE_SUM")?;
     if args.len() < 3 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "TREE_SUM requires (column, graph_index, root_id [, collection])",
         ));
@@ -66,7 +63,7 @@ pub async fn tree_sum(
         &GraphTraversalOptions::default(),
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &format!("BFS failed: {e}")))?;
+    .map_err(|e| ddl_err("XX000", format!("BFS failed: {e}")))?;
 
     // Parse BFS result as JSON array of node IDs.
     let bfs_json =
@@ -119,7 +116,7 @@ pub async fn tree_sum(
             let surrogate = state
                 .surrogate_assigner
                 .lookup(database_id, tenant_id, coll_name, &pk_bytes)
-                .map_err(|e| sqlstate_error("XX000", &format!("surrogate lookup: {e}")))?
+                .map_err(|e| ddl_err("XX000", format!("surrogate lookup: {e}")))?
                 .unwrap_or(nodedb_types::Surrogate::ZERO);
             let get_plan =
                 PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
@@ -153,13 +150,13 @@ pub async fn tree_sum(
         }
     }
 
-    let schema = Arc::new(vec![text_field("tree_sum")]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    encoder
-        .encode_field(&total.to_string())
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(encoder.take_row())]),
-    ))])
+    let mut row = Map::new();
+    row.insert("tree_sum".to_string(), JsonValue::String(total.to_string()));
+
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["tree_sum".to_string()],
+        column_types: ShapedRows::text_types(1),
+        rows: vec![row],
+        notice: None,
+    })])
 }

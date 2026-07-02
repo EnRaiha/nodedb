@@ -4,33 +4,30 @@
 //!
 //! BFS traversal from `root_id`, returns all descendant IDs.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
-use sonic_rs;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::{sqlstate_error, text_field};
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
 use crate::types::DatabaseId;
 
+use super::super::super::result::{DdlError, DdlResult};
 use super::parse::{extract_function_args, extract_number_after};
+use super::support::ddl_err;
 
 pub async fn tree_children(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let upper = sql.to_uppercase();
 
     let args = extract_function_args(&upper, sql, "TREE_CHILDREN")?;
     if args.len() < 2 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "TREE_CHILDREN requires (graph_index, root_id)",
         ));
@@ -56,7 +53,7 @@ pub async fn tree_children(
         &GraphTraversalOptions::default(),
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &format!("BFS failed: {e}")))?;
+    .map_err(|e| ddl_err("XX000", format!("BFS failed: {e}")))?;
 
     let bfs_json =
         crate::data::executor::response_codec::decode_payload_to_json(&bfs_result.payload);
@@ -66,21 +63,20 @@ pub async fn tree_children(
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
 
-    let schema = Arc::new(vec![text_field("child_id")]);
-    let mut rows = Vec::with_capacity(node_ids.len());
+    let mut rows: Vec<Map<String, JsonValue>> = Vec::with_capacity(node_ids.len());
     for id in &node_ids {
         if id.is_empty() {
             continue;
         }
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        encoder
-            .encode_field(&id.to_string())
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert("child_id".to_string(), JsonValue::String(id.to_string()));
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["child_id".to_string()],
+        column_types: ShapedRows::text_types(1),
+        rows,
+        notice: None,
+    })])
 }

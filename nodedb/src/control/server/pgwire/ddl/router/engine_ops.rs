@@ -128,20 +128,9 @@ pub(super) async fn dispatch(
         return Some(super::super::kv_atomic::kv_getset(state, identity, sql).await);
     }
 
-    // Graph index and tree operations.
-    if upper.starts_with("CREATE GRAPH INDEX ") {
-        return Some(
-            super::super::tree_ops::create_graph_index(state, identity, database_id, sql).await,
-        );
-    }
-    if upper.starts_with("SELECT TREE_SUM") || upper.starts_with("TREE_SUM") {
-        return Some(super::super::tree_ops::tree_sum(state, identity, database_id, sql).await);
-    }
-    if upper.starts_with("SELECT TREE_CHILDREN") || upper.starts_with("TREE_CHILDREN") {
-        return Some(
-            super::super::tree_ops::tree_children(state, identity, database_id, sql).await,
-        );
-    }
+    // Graph index and tree operations (CREATE GRAPH INDEX / TREE_SUM /
+    // TREE_CHILDREN) are served by the protocol-neutral DDL router; the pgwire
+    // router no longer routes them.
 
     // Timeseries: CREATE TIMESERIES, SHOW PARTITIONS, ALTER TIMESERIES.
     if upper.starts_with("CREATE TIMESERIES ") {

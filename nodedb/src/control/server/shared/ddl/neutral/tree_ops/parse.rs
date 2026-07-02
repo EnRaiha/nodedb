@@ -2,9 +2,8 @@
 
 //! Parsing helpers shared across the tree-ops DDL entry points.
 
-use pgwire::error::PgWireResult;
-
-use crate::control::server::pgwire::types::sqlstate_error;
+use super::super::super::result::DdlError;
+use super::support::ddl_err;
 
 /// Largest accepted value for tree MAX_DEPTH. Prevents a single
 /// statement from saturating `cross_core_bfs` with an unbounded
@@ -12,13 +11,13 @@ use crate::control::server::pgwire::types::sqlstate_error;
 pub(super) const TREE_MAX_DEPTH_CAP: usize = 1024;
 
 /// Parse `(parent_col -> id_col)` from CREATE GRAPH INDEX DDL.
-pub(super) fn parse_edge_columns(sql: &str) -> PgWireResult<(String, String)> {
+pub(super) fn parse_edge_columns(sql: &str) -> Result<(String, String), DdlError> {
     let paren_start = sql
         .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "missing (parent_col -> id_col)"))?;
+        .ok_or_else(|| ddl_err("42601", "missing (parent_col -> id_col)"))?;
     let paren_end = sql
         .rfind(')')
-        .ok_or_else(|| sqlstate_error("42601", "missing closing ')'"))?;
+        .ok_or_else(|| ddl_err("42601", "missing closing ')'"))?;
     let inner = &sql[paren_start + 1..paren_end];
 
     // Split on -> or →
@@ -27,7 +26,7 @@ pub(super) fn parse_edge_columns(sql: &str) -> PgWireResult<(String, String)> {
     } else if let Some(pos) = inner.find('→') {
         (&inner[..pos], &inner[pos + '→'.len_utf8()..])
     } else {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "edge definition requires '->' or '→' between columns",
         ));
@@ -37,7 +36,7 @@ pub(super) fn parse_edge_columns(sql: &str) -> PgWireResult<(String, String)> {
     let child = child.trim().to_lowercase();
 
     if parent.is_empty() || child.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "both parent and child columns required in (parent -> child)",
         ));
@@ -51,17 +50,17 @@ pub(super) fn extract_function_args<'a>(
     upper: &str,
     original: &'a str,
     func_name: &str,
-) -> PgWireResult<Vec<&'a str>> {
+) -> Result<Vec<&'a str>, DdlError> {
     let pos = upper
         .find(func_name)
-        .ok_or_else(|| sqlstate_error("42601", &format!("missing {func_name}")))?;
+        .ok_or_else(|| ddl_err("42601", format!("missing {func_name}")))?;
     let after = &original[pos + func_name.len()..];
     let paren_start = after
         .find('(')
-        .ok_or_else(|| sqlstate_error("42601", &format!("{func_name} requires (...) arguments")))?;
+        .ok_or_else(|| ddl_err("42601", format!("{func_name} requires (...) arguments")))?;
     let paren_end = after
         .find(')')
-        .ok_or_else(|| sqlstate_error("42601", "missing closing ')'"))?;
+        .ok_or_else(|| ddl_err("42601", "missing closing ')'"))?;
     let inner = &after[paren_start + 1..paren_end];
     Ok(inner.split(',').collect())
 }
@@ -71,7 +70,7 @@ pub(super) fn extract_function_args<'a>(
 /// Returns `Ok(None)` when the keyword is absent; the caller supplies
 /// its own default. Rejects out-of-range values with SQLSTATE 22023
 /// instead of forwarding them to the BFS loop.
-pub(super) fn extract_number_after(upper: &str, keyword: &str) -> PgWireResult<Option<usize>> {
+pub(super) fn extract_number_after(upper: &str, keyword: &str) -> Result<Option<usize>, DdlError> {
     let Some(pos) = upper.find(keyword) else {
         return Ok(None);
     };
@@ -79,16 +78,13 @@ pub(super) fn extract_number_after(upper: &str, keyword: &str) -> PgWireResult<O
     let Some(tok) = after.split_whitespace().next() else {
         return Ok(None);
     };
-    let v: usize = tok.parse().map_err(|_| {
-        sqlstate_error(
-            "22023",
-            &format!("{keyword} must be a non-negative integer"),
-        )
-    })?;
+    let v: usize = tok
+        .parse()
+        .map_err(|_| ddl_err("22023", format!("{keyword} must be a non-negative integer")))?;
     if v > TREE_MAX_DEPTH_CAP {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "22023",
-            &format!("{keyword} {v} exceeds maximum allowed value {TREE_MAX_DEPTH_CAP}"),
+            format!("{keyword} {v} exceeds maximum allowed value {TREE_MAX_DEPTH_CAP}"),
         ));
     }
     Ok(Some(v))

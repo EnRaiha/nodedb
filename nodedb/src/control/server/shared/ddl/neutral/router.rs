@@ -38,6 +38,7 @@ use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
 use super::synonym_group;
 use super::topic;
+use super::tree_ops;
 use super::trigger;
 use super::typeguard;
 use super::user;
@@ -432,6 +433,23 @@ pub async fn try_dispatch(
     }
     if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" SET ") {
         return Some(maintenance::handle_alter_vector_index_set(state, identity, sql).await);
+    }
+
+    // Graph index and tree operations: CREATE GRAPH INDEX / TREE_SUM /
+    // TREE_CHILDREN. None of these are dispatched from a typed AST arm — the
+    // pgwire engine_ops router recognized all three by string prefix from the
+    // raw SQL (the `SELECT TREE_SUM` / bare `TREE_SUM` and `SELECT
+    // TREE_CHILDREN` / bare `TREE_CHILDREN` forms never parse into a typed DDL
+    // AST). Replicate that exactly here, before the parse gate, so the prefix
+    // recognition and syntax messages stay byte-identical.
+    if upper.starts_with("CREATE GRAPH INDEX ") {
+        return Some(tree_ops::create_graph_index(state, identity, database_id, sql).await);
+    }
+    if upper.starts_with("SELECT TREE_SUM") || upper.starts_with("TREE_SUM") {
+        return Some(tree_ops::tree_sum(state, identity, database_id, sql).await);
+    }
+    if upper.starts_with("SELECT TREE_CHILDREN") || upper.starts_with("TREE_CHILDREN") {
+        return Some(tree_ops::tree_children(state, identity, database_id, sql).await);
     }
 
     // Materialized views (HTAP). `REFRESH MATERIALIZED VIEW` parses into no typed

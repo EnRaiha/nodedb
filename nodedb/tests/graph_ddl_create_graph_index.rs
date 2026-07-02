@@ -2,7 +2,7 @@
 
 //! `CREATE GRAPH INDEX` DDL correctness contracts.
 //!
-//! The tree-index builder (`nodedb/src/control/server/pgwire/ddl/tree_ops.rs`)
+//! The tree-index builder (`nodedb/src/control/server/shared/ddl/neutral/tree_ops/`)
 //! must satisfy three invariants that the current implementation violates:
 //!
 //! 1. Edge dispatch is batched per hop, not one awaited RPC per document.
@@ -90,7 +90,7 @@ async fn create_graph_index_batches_edge_dispatch() {
 
 /// Spec: `schema_version` advances only on a fully successful build.
 /// The current implementation calls `state.schema_version.bump()`
-/// unconditionally at line 154 of tree_ops.rs, so the catalog reports
+/// unconditionally in the tree_ops `create_index` module, so the catalog reports
 /// a new version even when zero edges were inserted (e.g. scan returned
 /// no docs). Consumers observing schema_version to invalidate caches
 /// then refetch state that claims an index exists which is actually empty.
@@ -143,7 +143,7 @@ async fn create_graph_index_does_not_silently_succeed_on_empty_collection() {
 /// test is dependent on that fix landing (or at least, on the index
 /// populating correctly). If the DDL silently fails, this test will
 /// fail for the same root cause, which is fine — both bugs live in
-/// `tree_ops.rs` and the skill expands within the module.
+/// the tree_ops module and the skill expands within the module.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tree_sum_batches_dispatch_on_wide_trees() {
     let server = TestServer::start().await;
@@ -186,8 +186,8 @@ async fn tree_sum_batches_dispatch_on_wide_trees() {
 /// Spec: when a source document has a non-string `parent` field (e.g.
 /// an integer), the DDL must either coerce it or surface an explicit
 /// error — never silently skip. The current code does
-/// `obj.get(&parent_col).and_then(|v| v.as_str())` at line 117 of
-/// tree_ops.rs, which returns `None` for non-string types and drops
+/// `obj.get(&parent_col).and_then(|v| v.as_str())` in the tree_ops
+/// `create_index` module, which returns `None` for non-string types and drops
 /// the edge without logging.
 ///
 /// Regression guard: insert one doc with a string parent and one doc
