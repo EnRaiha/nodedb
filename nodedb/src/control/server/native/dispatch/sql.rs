@@ -11,7 +11,6 @@ use crate::control::planner::calvin::{
 };
 use crate::control::server::shared::session::TransactionState;
 
-use super::pgwire_bridge::pgwire_result_to_native;
 use super::sql_admin::{handle_explain, handle_set_sql, handle_show_sql, is_session_show};
 use super::sql_loop::run_dispatch_loop;
 use super::streaming::{SqlOutcome, try_open_sql_stream};
@@ -134,7 +133,7 @@ async fn handle_sql_inner(
 
     // DDL: try DDL router first.
     let database_id = ctx.database_id();
-    if let Some(result) = super::super::super::pgwire::ddl::dispatch(
+    if let Some(result) = crate::control::server::shared::ddl::dispatch(
         ctx.state,
         ctx.identity,
         sql_trimmed,
@@ -142,7 +141,7 @@ async fn handle_sql_inner(
     )
     .await
     {
-        return resp(pgwire_result_to_native(seq, result).await);
+        return resp(super::ddl_result_to_native(seq, result));
     }
 
     // SHOW falls through to the session-variable handler only after the

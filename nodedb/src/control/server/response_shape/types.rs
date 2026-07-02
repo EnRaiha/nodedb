@@ -162,6 +162,7 @@ use PlanKind::DmlResult;
 /// Protocol-neutral shaped row set: columns + row objects + an optional
 /// client-facing notice. Not yet constructed anywhere — a later relocation
 /// unit wires this into a shared composed entry point.
+#[derive(Debug, Clone)]
 pub struct ShapedRows {
     pub columns: Vec<String>,
     pub rows: Vec<serde_json::Map<String, serde_json::Value>>,

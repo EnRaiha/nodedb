@@ -7,6 +7,7 @@ use nodedb_types::conversion::json_to_value_display;
 use nodedb_types::protocol::NativeResponse;
 
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::{DdlError, DdlResult};
 
 /// Convert a crate-level error into a NativeResponse.
 pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
@@ -26,6 +27,44 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
 /// NativeResponse error frame.
 pub(crate) fn shape_error_to_native(seq: u64, e: &nodedb_types::NodeDbError) -> NativeResponse {
     NativeResponse::error(seq, "XX000", e.message().to_string())
+}
+
+/// Encode a protocol-neutral DDL dispatch result into a single
+/// `NativeResponse`.
+///
+/// Reduction mirrors the previous pgwire→native bridge: on error, an error
+/// frame carrying the neutral SQLSTATE + message; otherwise the first
+/// row-returning / status / empty result determines the response (a status tag
+/// becomes a single-column status row, a row result becomes a columns+rows
+/// frame, an empty result or an empty vec becomes a bare OK).
+pub(crate) fn ddl_result_to_native(
+    seq: u64,
+    result: Result<Vec<DdlResult>, DdlError>,
+) -> NativeResponse {
+    match result {
+        Err(DdlError { sqlstate, message }) => NativeResponse::error(seq, sqlstate, message),
+        // Unknown pgwire response variants are dropped during translation, so
+        // the first element is the first meaningful result — mirroring the
+        // previous bridge, which returned on the first known variant.
+        Ok(results) => match results.into_iter().next() {
+            Some(DdlResult::Status { command, .. }) => NativeResponse::status_row(seq, command),
+            Some(DdlResult::Rows(shaped)) => {
+                let (columns, rows) = to_native_columns_rows(&shaped);
+                NativeResponse {
+                    seq,
+                    status: nodedb_types::protocol::ResponseStatus::Ok,
+                    columns: Some(columns),
+                    rows: Some(rows),
+                    rows_affected: None,
+                    watermark_lsn: 0,
+                    error: None,
+                    auth: None,
+                    warnings: Vec::new(),
+                }
+            }
+            Some(DdlResult::Empty) | None => NativeResponse::ok(seq),
+        },
+    }
 }
 
 /// Convert protocol-neutral `ShapedRows` (produced by

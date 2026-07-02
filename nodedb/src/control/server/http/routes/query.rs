@@ -92,7 +92,7 @@ pub async fn query(
     let sql = body.sql.as_str();
 
     // Try DDL commands first (same as pgwire handler).
-    if let Some(result) = crate::control::server::pgwire::ddl::dispatch(
+    if let Some(result) = crate::control::server::shared::ddl::dispatch(
         &state.shared,
         &identity,
         sql.trim(),
@@ -101,11 +101,11 @@ pub async fn query(
     .await
     {
         return match result {
-            Ok(responses) => {
-                let json_rows = responses_to_json(responses);
+            Ok(results) => {
+                let json_rows = ddl_results_to_json(results);
                 Ok(axum::Json(HttpQueryResponse::ok(json_rows)))
             }
-            Err(e) => Err(ApiError::BadRequest(e.to_string())),
+            Err(e) => Err(ApiError::BadRequest(e.message)),
         };
     }
 
@@ -290,29 +290,34 @@ fn decode_payload_to_json(payload: &[u8]) -> Result<serde_json::Value, ()> {
     Err(())
 }
 
-/// Convert pgwire Response vec to JSON rows (for DDL results).
-fn responses_to_json(responses: Vec<pgwire::api::results::Response>) -> Vec<serde_json::Value> {
-    use pgwire::api::results::Response;
+/// Render protocol-neutral DDL results to JSON rows.
+///
+/// Status and empty results keep their prior JSON shapes (`{type, tag}` /
+/// `{type: "empty"}`). Row-returning results (SHOW / EXPLAIN / introspection)
+/// now emit one JSON object per row instead of a stub note — HTTP can return
+/// DDL/SHOW rows directly.
+fn ddl_results_to_json(
+    results: Vec<crate::control::server::shared::ddl::DdlResult>,
+) -> Vec<serde_json::Value> {
+    use crate::control::server::shared::ddl::DdlResult;
 
     let mut rows = Vec::new();
-    for resp in responses {
-        match resp {
-            Response::Execution(tag) => {
+    for result in results {
+        match result {
+            DdlResult::Status { command, .. } => {
                 rows.push(serde_json::json!({
                     "type": "execution",
-                    "tag": format!("{:?}", tag),
+                    "tag": command,
                 }));
             }
-            Response::Query(_) => {
-                rows.push(serde_json::json!({
-                    "type": "query",
-                    "note": "query results available via pgwire protocol",
-                }));
+            DdlResult::Rows(shaped) => {
+                for row in shaped.rows {
+                    rows.push(serde_json::Value::Object(row));
+                }
             }
-            Response::EmptyQuery => {
+            DdlResult::Empty => {
                 rows.push(serde_json::json!({ "type": "empty" }));
             }
-            _ => {}
         }
     }
     rows
