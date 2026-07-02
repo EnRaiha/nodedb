@@ -6,8 +6,7 @@ use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use nodedb_sql::ddl_ast::statement::{
-    AutomationStmt, CollectionStmt, DatabaseStmt, MiscStmt, NodedbStatement, PolicyStmt,
-    StreamViewStmt,
+    CollectionStmt, DatabaseStmt, MiscStmt, NodedbStatement, PolicyStmt, StreamViewStmt,
 };
 
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -26,7 +25,6 @@ use crate::control::server::pgwire::ddl::custom_type::{
 };
 use crate::control::server::pgwire::ddl::materialized_view::create_materialized_view;
 use crate::control::server::pgwire::ddl::retention_policy::create_retention_policy;
-use crate::control::server::pgwire::ddl::schedule::{CreateScheduleRequest, create_schedule};
 use crate::control::server::pgwire::ddl::synonym_group::{
     create_synonym_group, drop_synonym_group, show_synonym_groups,
 };
@@ -45,26 +43,6 @@ pub(super) async fn try_dispatch_async(
     database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     match stmt {
-        NodedbStatement::Automation(AutomationStmt::CreateSchedule {
-            name,
-            cron_expr,
-            body_sql,
-            scope,
-            missed_policy,
-            allow_overlap,
-        }) => Some(create_schedule(
-            state,
-            identity,
-            &CreateScheduleRequest {
-                name,
-                cron_expr,
-                body_sql,
-                scope,
-                missed_policy,
-                allow_overlap: *allow_overlap,
-            },
-        )),
-
         NodedbStatement::StreamView(StreamViewStmt::CreateChangeStream {
             name,
             collection,

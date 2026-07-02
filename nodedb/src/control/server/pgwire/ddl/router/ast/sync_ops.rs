@@ -19,7 +19,6 @@ use crate::control::server::pgwire::ddl::collection::drop_collection;
 use crate::control::server::pgwire::ddl::consumer_group::create_consumer_group;
 use crate::control::server::pgwire::ddl::inspect::show_permissions;
 use crate::control::server::pgwire::ddl::retention_policy::alter_retention_policy;
-use crate::control::server::pgwire::ddl::schedule::alter_schedule;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -87,18 +86,6 @@ pub(super) fn try_dispatch_sync(
             action,
             node_id,
         }) => Some(alter_raft_group(state, identity, group_id, action, node_id)),
-
-        NodedbStatement::Automation(AutomationStmt::AlterSchedule {
-            name,
-            action,
-            cron_expr,
-        }) => Some(alter_schedule(
-            state,
-            identity,
-            name,
-            action,
-            cron_expr.as_deref(),
-        )),
 
         NodedbStatement::Policy(PolicyStmt::AlterRetentionPolicy {
             name,

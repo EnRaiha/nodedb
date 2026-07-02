@@ -15,6 +15,7 @@ pub mod oidc;
 pub mod rls;
 pub mod role;
 pub mod router;
+pub mod schedule;
 pub mod sequence;
 pub mod service_account;
 pub mod trigger;

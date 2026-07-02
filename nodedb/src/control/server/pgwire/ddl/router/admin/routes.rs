@@ -17,25 +17,9 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
 ) -> Option<PgWireResult<Vec<Response>>> {
     // BACKUP/RESTORE TENANT are fully dispatched via typed AST (ast.rs).
 
-    // Schedules: CREATE/DROP/ALTER/SHOW SCHEDULE
-    // CREATE SCHEDULE is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("DROP SCHEDULE ") {
-        return Some(super::super::super::schedule::drop_schedule(
-            state, identity, parts,
-        ));
-    }
-    // ALTER SCHEDULE is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("SHOW SCHEDULE HISTORY ") {
-        let name = parts.get(3).unwrap_or(&"");
-        return Some(super::super::super::schedule::show_schedule_history(
-            state, identity, name,
-        ));
-    }
-    if upper.starts_with("SHOW SCHEDULE") {
-        return Some(super::super::super::schedule::show_schedules(
-            state, identity,
-        ));
-    }
+    // Schedules (CREATE/DROP/ALTER/SHOW SCHEDULE + SHOW SCHEDULE HISTORY) are
+    // served by the protocol-neutral DDL router; the pgwire router no longer
+    // routes them.
 
     // Sequences (CREATE/DROP/ALTER/SHOW/DESCRIBE) are served by the
     // protocol-neutral DDL router; the pgwire router no longer routes them.

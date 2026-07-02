@@ -46,7 +46,6 @@ pub mod rate_gate;
 pub mod retention_policy;
 #[path = "router/mod.rs"]
 pub mod router;
-pub mod schedule;
 pub mod schema_validation;
 pub mod scope_ddl;
 pub mod scope_query_ddl;

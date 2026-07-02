@@ -21,6 +21,7 @@ use super::grant;
 use super::oidc;
 use super::rls::{self, CreateRlsPolicyRequest};
 use super::role;
+use super::schedule::{self, CreateScheduleRequest};
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
 use super::trigger;
@@ -169,6 +170,22 @@ pub async fn try_dispatch(
     }
     if upper == "SHOW TYPEGUARDS" || upper.starts_with("SHOW TYPEGUARDS") {
         return Some(typeguard::show_typeguards(state, identity, sql));
+    }
+
+    // Schedule SHOW. `SHOW SCHEDULE HISTORY <name>` parses into a typed
+    // `AutomationStmt::ShowScheduleHistory` and `SHOW SCHEDULES` into
+    // `AutomationStmt::ShowSchedules`, but the pgwire router dispatched both from
+    // the raw token slice by string prefix (the `SHOW SCHEDULE` prefix also
+    // captures the bare-singular `SHOW SCHEDULE` input, which parses into no
+    // typed variant). Replicate that exactly here, before the parse gate, so the
+    // prefix recognition and `parts.get(3)` name extraction stay byte-identical.
+    if upper.starts_with("SHOW SCHEDULE HISTORY ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let name = parts.get(3).copied().unwrap_or("");
+        return Some(schedule::show_schedule_history(state, identity, name));
+    }
+    if upper.starts_with("SHOW SCHEDULE") {
+        return Some(schedule::show_schedules(state, identity));
     }
 
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,
@@ -477,6 +494,55 @@ pub async fn try_dispatch(
         NodedbStatement::Automation(AutomationStmt::ShowTriggers { .. }) => {
             let parts: Vec<&str> = sql.split_whitespace().collect();
             Some(trigger::show_triggers(state, identity, &parts))
+        }
+
+        NodedbStatement::Automation(AutomationStmt::CreateSchedule {
+            name,
+            cron_expr,
+            body_sql,
+            scope,
+            missed_policy,
+            allow_overlap,
+        }) => Some(schedule::create_schedule(
+            state,
+            identity,
+            &CreateScheduleRequest {
+                name,
+                cron_expr,
+                body_sql,
+                scope,
+                missed_policy,
+                allow_overlap: *allow_overlap,
+            },
+        )),
+
+        NodedbStatement::Automation(AutomationStmt::AlterSchedule {
+            name,
+            action,
+            cron_expr,
+        }) => Some(schedule::alter_schedule(
+            state,
+            identity,
+            name,
+            action,
+            cron_expr.as_deref(),
+        )),
+
+        NodedbStatement::Automation(AutomationStmt::DropSchedule { name, if_exists }) => {
+            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // non-existing schedule returns the tag before the token handler runs
+            // (and before the tenant-admin gate). The `if_exists: false` case and
+            // the existing-schedule case fall through to `drop_schedule`, which
+            // re-derives the name / IF EXISTS from `parts` exactly as the pgwire
+            // admin string dispatch did.
+            if *if_exists && !schedule::schedule_exists(state, identity, name) {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "DROP SCHEDULE".to_string(),
+                    rows_affected: None,
+                }]));
+            }
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(schedule::drop_schedule(state, identity, &parts))
         }
 
         _ => None,

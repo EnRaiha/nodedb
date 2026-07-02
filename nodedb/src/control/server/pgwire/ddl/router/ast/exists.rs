@@ -19,15 +19,6 @@ pub(super) fn collection_exists(
     matches!(catalog.get_collection(database_id, tid, name), Ok(Some(_)))
 }
 
-pub(super) fn schedule_exists(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    name: &str,
-) -> bool {
-    let tid = identity.tenant_id.as_u64();
-    state.schedule_registry.get(tid, name).is_some()
-}
-
 pub(super) fn alert_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,

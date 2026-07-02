@@ -1,36 +1,43 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `ALTER SCHEDULE` DDL handler.
+//! Protocol-neutral `ALTER SCHEDULE` DDL handler.
+//!
+//! Ported from the pgwire `ddl::schedule::alter` handler. The registry lookup,
+//! the `propose_and_apply` catalog write, and the in-memory registry update are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
+//! [`DdlError`].
 //!
 //! Supports: ENABLE, DISABLE, SET CRON 'expr'.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::event::scheduler::cron::CronExpr;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::status;
 
 /// Handle `ALTER SCHEDULE <name> ENABLE | DISABLE | SET CRON '<expr>'`.
 ///
 /// `name`, `action`, and `cron_expr` come from the typed
-/// [`NodedbStatement::AlterSchedule`] variant.
+/// `AutomationStmt::AlterSchedule` variant.
 pub fn alter_schedule(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
     action: &str,
     cron_expr: Option<&str>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
     // Look up the schedule in the registry.
     let mut def = state
         .schedule_registry
         .get(tenant_id, name)
-        .ok_or_else(|| sqlstate_error("42704", &format!("schedule \"{name}\" does not exist")))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "42704".to_string(),
+            message: format!("schedule \"{name}\" does not exist"),
+        })?;
 
     match action {
         "ENABLE" => {
@@ -40,23 +47,23 @@ pub fn alter_schedule(
             def.enabled = false;
         }
         "SET" => {
-            let new_cron = cron_expr.ok_or_else(|| {
-                sqlstate_error(
-                    "42601",
-                    "ALTER SCHEDULE SET CRON requires a quoted cron expression",
-                )
+            let new_cron = cron_expr.ok_or_else(|| DdlError {
+                sqlstate: "42601".to_string(),
+                message: "ALTER SCHEDULE SET CRON requires a quoted cron expression".to_string(),
             })?;
 
-            CronExpr::parse(new_cron)
-                .map_err(|e| sqlstate_error("22023", &format!("invalid cron expression: {e}")))?;
+            CronExpr::parse(new_cron).map_err(|e| DdlError {
+                sqlstate: "22023".to_string(),
+                message: format!("invalid cron expression: {e}"),
+            })?;
 
             def.cron_expr = new_cron.to_string();
         }
         _ => {
-            return Err(sqlstate_error(
-                "42601",
-                "ALTER SCHEDULE supports: ENABLE, DISABLE, SET CRON 'expr'",
-            ));
+            return Err(DdlError {
+                sqlstate: "42601".to_string(),
+                message: "ALTER SCHEDULE supports: ENABLE, DISABLE, SET CRON 'expr'".to_string(),
+            });
         }
     }
 
@@ -67,10 +74,10 @@ pub fn alter_schedule(
     // OWNERS row. The earlier direct `catalog.put_schedule(&def)`
     // call did neither — divergence on replicas, orphan on disk.
     let entry = crate::control::catalog_entry::CatalogEntry::PutSchedule(Box::new(def.clone()));
-    super::super::catalog_propose::propose_and_apply(state, &entry)?;
+    super::super::super::catalog::propose_and_apply(state, &entry)?;
 
     // Update in-memory registry.
     state.schedule_registry.update(def);
 
-    Ok(vec![Response::Execution(Tag::new("ALTER SCHEDULE"))])
+    Ok(status("ALTER SCHEDULE"))
 }

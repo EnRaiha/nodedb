@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE SCHEDULE` DDL handler.
+//! Protocol-neutral `CREATE SCHEDULE` DDL handler.
+//!
+//! Ported from the pgwire `ddl::schedule::create` handler. The catalog path
+//! (`propose_and_apply` + `log_index == 0` local registry refresh, the
+//! `_schedules` CRDT-sync delta enqueue, and the `audit_record` call) is
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
+//! [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
@@ -9,15 +16,13 @@
 //!   AS <sql_body>
 //! ```
 
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
-
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::event::scheduler::cron::CronExpr;
 use crate::event::scheduler::types::{MissedPolicy, ScheduleDef, ScheduleScope};
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
 
 /// Parsed `CREATE SCHEDULE` request.
 ///
@@ -37,7 +42,7 @@ pub fn create_schedule(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     req: &CreateScheduleRequest<'_>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let CreateScheduleRequest {
         name,
         cron_expr,
@@ -51,24 +56,31 @@ pub fn create_schedule(
     let tenant_id = identity.tenant_id.as_u64();
 
     // Validate cron expression.
-    CronExpr::parse(cron_expr)
-        .map_err(|e| sqlstate_error("42601", &format!("invalid cron expression: {e}")))?;
+    CronExpr::parse(cron_expr).map_err(|e| DdlError {
+        sqlstate: "42601".to_string(),
+        message: format!("invalid cron expression: {e}"),
+    })?;
 
     // Validate SQL body parses.
-    crate::control::planner::procedural::parse_block(body_sql)
-        .map_err(|e| sqlstate_error("42601", &format!("schedule body parse error: {e}")))?;
+    crate::control::planner::procedural::parse_block(body_sql).map_err(|e| DdlError {
+        sqlstate: "42601".to_string(),
+        message: format!("schedule body parse error: {e}"),
+    })?;
 
     // Check for duplicate.
     if state.schedule_registry.get(tenant_id, name).is_some() {
-        return Err(sqlstate_error(
-            "42710",
-            &format!("schedule '{name}' already exists"),
-        ));
+        return Err(DdlError {
+            sqlstate: "42710".to_string(),
+            message: format!("schedule '{name}' already exists"),
+        });
     }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock error"))?
+        .map_err(|_| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system clock error".to_string(),
+        })?
         .as_secs();
 
     let target_collection = extract_target_collection(body_sql);
@@ -97,11 +109,14 @@ pub fn create_schedule(
     };
 
     if state.credentials.catalog().is_none() {
-        return Err(sqlstate_error("XX000", "system catalog not available"));
+        return Err(DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        });
     }
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutSchedule(Box::new(def.clone()));
-    let log_index = super::super::catalog_propose::propose_and_apply(state, &entry)?;
+    let log_index = super::super::super::catalog::propose_and_apply(state, &entry)?;
     if log_index == 0 {
         state.schedule_registry.register(def.clone());
     }
@@ -128,7 +143,7 @@ pub fn create_schedule(
         &format!("CREATE SCHEDULE {name}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE SCHEDULE"))])
+    Ok(status("CREATE SCHEDULE"))
 }
 
 /// Extract the target collection from a schedule's SQL body.
