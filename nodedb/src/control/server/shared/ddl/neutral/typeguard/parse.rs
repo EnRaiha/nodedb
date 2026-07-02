@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Parsing helpers for TYPEGUARD DDL field definitions.
+//!
+//! Ported verbatim from the pgwire `ddl::typeguard::parse` helpers; only the
+//! error construction changed from pgwire `PgWireError` to the protocol-neutral
+//! [`DdlError`].
 
 use nodedb_types::TypeGuardFieldDef;
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+
+use super::super::super::result::DdlError;
 
 /// Extract collection name from `... TYPEGUARD [IF EXISTS] ON <collection> ...`.
-pub(super) fn extract_collection_name(sql: &str) -> PgWireResult<String> {
+pub(super) fn extract_collection_name(sql: &str) -> Result<String, DdlError> {
     let upper = sql.to_uppercase();
     let on_pos = upper
         .find(" ON ")
@@ -24,7 +29,7 @@ pub(super) fn extract_collection_name(sql: &str) -> PgWireResult<String> {
 }
 
 /// Extract the content between the outermost `(` and matching `)` in `sql`.
-pub(super) fn extract_outer_parens(sql: &str) -> PgWireResult<String> {
+pub(super) fn extract_outer_parens(sql: &str) -> Result<String, DdlError> {
     let start = sql
         .find('(')
         .ok_or_else(|| err("42601", "TYPEGUARD requires ( ... ) field list"))?;
@@ -56,7 +61,7 @@ pub(super) fn extract_outer_parens(sql: &str) -> PgWireResult<String> {
 /// Parse a comma-separated list of field definitions.
 ///
 /// Each definition: `field_name type_expr [REQUIRED] [CHECK (expr)]`
-pub(super) fn parse_field_list(list: &str) -> PgWireResult<Vec<TypeGuardFieldDef>> {
+pub(super) fn parse_field_list(list: &str) -> Result<Vec<TypeGuardFieldDef>, DdlError> {
     let mut guards = Vec::new();
     // Split on commas that are not inside parentheses.
     let mut depth = 0i32;
@@ -86,7 +91,7 @@ pub(super) fn parse_field_list(list: &str) -> PgWireResult<Vec<TypeGuardFieldDef
 }
 
 /// Parse one field definition: `field_name type_expr [REQUIRED] [CHECK (expr)]`.
-pub(super) fn parse_single_field(s: &str) -> PgWireResult<TypeGuardFieldDef> {
+pub(super) fn parse_single_field(s: &str) -> Result<TypeGuardFieldDef, DdlError> {
     let s = s.trim();
     if s.is_empty() {
         return Err(err("42601", "empty field definition"));
@@ -240,10 +245,10 @@ fn find_next_keyword(s: &str) -> usize {
     end
 }
 
-pub(super) fn err(code: &str, msg: &str) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_owned(),
-        code.to_owned(),
-        msg.to_owned(),
-    )))
+/// Build a protocol-neutral [`DdlError`] with the given SQLSTATE + message.
+pub(super) fn err(code: &str, msg: &str) -> DdlError {
+    DdlError {
+        sqlstate: code.to_owned(),
+        message: msg.to_owned(),
+    }
 }

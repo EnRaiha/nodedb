@@ -18,6 +18,7 @@ pub mod router;
 pub mod sequence;
 pub mod service_account;
 pub mod trigger;
+pub mod typeguard;
 pub mod user;
 
 pub use self::router::try_dispatch;

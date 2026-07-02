@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! DDL handlers for type guard field constraints on schemaless collections.
+//! Protocol-neutral DDL handlers for type guard field constraints on
+//! schemaless collections.
+//!
+//! Ported from the pgwire `ddl::typeguard::handlers`. All catalog logic
+//! (get/put collection, schemaless check, duplicate pre-checks, `type_guards`
+//! mutation, `schema_version.bump()`) is preserved verbatim; only the result
+//! construction changed from pgwire `Response` / `PgWireError` to the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
@@ -23,20 +30,25 @@
 //! ```
 
 use nodedb_types::DatabaseId;
-use std::sync::Arc;
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
-use crate::control::server::pgwire::types::text_field;
-
+use super::super::super::result::{DdlError, DdlResult};
 use super::parse::{
     err, extract_collection_name, extract_outer_parens, parse_field_list, parse_single_field,
 };
+
+/// Build a single-tag status result.
+fn status(command: &str) -> Vec<DdlResult> {
+    vec![DdlResult::Status {
+        command: command.to_string(),
+        rows_affected: None,
+    }]
+}
 
 // ── CREATE TYPEGUARD ──────────────────────────────────────────────────────────
 
@@ -45,7 +57,7 @@ pub fn create_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
     let or_replace = upper.contains("OR REPLACE");
 
@@ -95,7 +107,7 @@ pub fn create_typeguard(
 
     state.schema_version.bump();
 
-    Ok(vec![Response::Execution(Tag::new("CREATE TYPEGUARD"))])
+    Ok(status("CREATE TYPEGUARD"))
 }
 
 // ── ALTER TYPEGUARD ───────────────────────────────────────────────────────────
@@ -105,7 +117,7 @@ pub fn alter_typeguard_add(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
 
     let coll_name = extract_collection_name(sql)?;
@@ -153,7 +165,7 @@ pub fn alter_typeguard_add(
 
     state.schema_version.bump();
 
-    Ok(vec![Response::Execution(Tag::new("ALTER TYPEGUARD"))])
+    Ok(status("ALTER TYPEGUARD"))
 }
 
 /// Handle `ALTER TYPEGUARD ON <collection> DROP field`.
@@ -161,7 +173,7 @@ pub fn alter_typeguard_drop(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
 
     let coll_name = extract_collection_name(sql)?;
@@ -201,7 +213,7 @@ pub fn alter_typeguard_drop(
 
     state.schema_version.bump();
 
-    Ok(vec![Response::Execution(Tag::new("ALTER TYPEGUARD"))])
+    Ok(status("ALTER TYPEGUARD"))
 }
 
 /// Dispatch `ALTER TYPEGUARD ON <collection> ADD|DROP ...`.
@@ -209,7 +221,7 @@ pub fn alter_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
     if upper.contains(" ADD ") {
         alter_typeguard_add(state, identity, sql)
@@ -230,7 +242,7 @@ pub fn drop_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
     let if_exists = upper.contains("IF EXISTS");
 
@@ -248,7 +260,7 @@ pub fn drop_typeguard(
 
     if coll.type_guards.is_empty() {
         if if_exists {
-            return Ok(vec![Response::Execution(Tag::new("DROP TYPEGUARD"))]);
+            return Ok(status("DROP TYPEGUARD"));
         }
         return Err(err(
             "42704",
@@ -263,7 +275,7 @@ pub fn drop_typeguard(
 
     state.schema_version.bump();
 
-    Ok(vec![Response::Execution(Tag::new("DROP TYPEGUARD"))])
+    Ok(status("DROP TYPEGUARD"))
 }
 
 // ── SHOW TYPEGUARD / SHOW TYPEGUARDS ──────────────────────────────────────────
@@ -273,7 +285,7 @@ pub fn show_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let coll_name = extract_collection_name(sql)?;
 
     let Some(catalog) = state.credentials.catalog() else {
@@ -286,28 +298,37 @@ pub fn show_typeguard(
         .map_err(|e| err("XX000", &e.to_string()))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
-    let schema = Arc::new(vec![
-        text_field("field"),
-        text_field("type"),
-        text_field("required"),
-        text_field("check"),
-    ]);
+    let columns = vec![
+        "field".to_string(),
+        "type".to_string(),
+        "required".to_string(),
+        "check".to_string(),
+    ];
 
     let mut rows = Vec::with_capacity(coll.type_guards.len());
     for guard in &coll.type_guards {
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        let _ = encoder.encode_field(&guard.field);
-        let _ = encoder.encode_field(&guard.type_expr);
-        let _ = encoder.encode_field(&guard.required.to_string());
         let check_str = guard.check_expr.clone().unwrap_or_default();
-        let _ = encoder.encode_field(&check_str);
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert("field".to_string(), JsonValue::String(guard.field.clone()));
+        row.insert(
+            "type".to_string(),
+            JsonValue::String(guard.type_expr.clone()),
+        );
+        row.insert(
+            "required".to_string(),
+            JsonValue::String(guard.required.to_string()),
+        );
+        row.insert("check".to_string(), JsonValue::String(check_str));
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    let column_types = ShapedRows::text_types(columns.len());
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
 
 /// Handle `SHOW TYPEGUARDS` — list all collections with active type guards.
@@ -315,7 +336,7 @@ pub fn show_typeguards(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     _sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let Some(catalog) = state.credentials.catalog() else {
         return Err(err("XX000", "no catalog available"));
     };
@@ -325,7 +346,7 @@ pub fn show_typeguards(
         .load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id)
         .map_err(|e| err("XX000", &e.to_string()))?;
 
-    let schema = Arc::new(vec![text_field("collection"), text_field("fields")]);
+    let columns = vec!["collection".to_string(), "fields".to_string()];
 
     let mut rows = Vec::new();
     for coll in collections {
@@ -334,14 +355,20 @@ pub fn show_typeguards(
         }
         let field_names: Vec<&str> = coll.type_guards.iter().map(|g| g.field.as_str()).collect();
         let fields_str = field_names.join(", ");
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        let _ = encoder.encode_field(&coll.name);
-        let _ = encoder.encode_field(&fields_str);
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert(
+            "collection".to_string(),
+            JsonValue::String(coll.name.clone()),
+        );
+        row.insert("fields".to_string(), JsonValue::String(fields_str));
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    let column_types = ShapedRows::text_types(columns.len());
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }

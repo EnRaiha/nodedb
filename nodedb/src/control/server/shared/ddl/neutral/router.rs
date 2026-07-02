@@ -24,6 +24,7 @@ use super::role;
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
 use super::trigger;
+use super::typeguard;
 use super::user;
 
 /// Try to handle `sql` with a migrated protocol-neutral DDL family handler.
@@ -143,6 +144,31 @@ pub async fn try_dispatch(
     if upper.starts_with("DROP CONSTRAINT ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(constraint::drop_constraint(state, identity, &parts));
+    }
+
+    // TYPEGUARD DDL. None of these statements are dispatched from a typed AST
+    // variant — the pgwire router recognized all of them by string prefix from
+    // the raw SQL (the `SHOW TYPEGUARD…` prefix does parse into a typed
+    // `MiscStmt::ShowTypeGuards`, but the pgwire string dispatch claimed it
+    // before the parse gate). Replicate that exactly here, before the parse
+    // gate, so the prefix recognition and syntax messages stay byte-identical.
+    if upper.starts_with("CREATE TYPEGUARD ") || upper.starts_with("CREATE OR REPLACE TYPEGUARD ") {
+        return Some(typeguard::create_typeguard(state, identity, sql));
+    }
+    if upper.starts_with("ALTER TYPEGUARD ") {
+        return Some(typeguard::alter_typeguard(state, identity, sql));
+    }
+    if upper.starts_with("DROP TYPEGUARD ") {
+        return Some(typeguard::drop_typeguard(state, identity, sql));
+    }
+    if upper.starts_with("VALIDATE TYPEGUARD ON ") {
+        return Some(typeguard::validate_typeguard(state, identity, sql).await);
+    }
+    if upper.starts_with("SHOW TYPEGUARD ON ") {
+        return Some(typeguard::show_typeguard(state, identity, sql));
+    }
+    if upper == "SHOW TYPEGUARDS" || upper.starts_with("SHOW TYPEGUARDS") {
+        return Some(typeguard::show_typeguards(state, identity, sql));
     }
 
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,

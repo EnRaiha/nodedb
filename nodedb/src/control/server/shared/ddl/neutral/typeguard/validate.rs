@@ -5,18 +5,22 @@
 //! Scans all documents in the collection, evaluates each against the active
 //! type guards, and returns a result set of violations (field, document_id, detail).
 //! Does NOT modify or reject data — read-only audit.
+//!
+//! Ported from the pgwire `ddl::typeguard::validate` handler. The scan planning,
+//! Data Plane dispatch, JSON decode, and per-guard enforcement logic are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use nodedb_types::DatabaseId;
-use std::sync::Arc;
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::text_field;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::types::TraceId;
+
+use super::super::super::result::{DdlError, DdlResult};
 
 /// Handle `VALIDATE TYPEGUARD ON <collection>`.
 ///
@@ -27,7 +31,7 @@ pub async fn validate_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let coll_name = super::parse::extract_collection_name(sql)?;
     let tenant_id = identity.tenant_id;
 
@@ -44,17 +48,21 @@ pub async fn validate_typeguard(
             super::parse::err("42P01", &format!("collection '{coll_name}' not found"))
         })?;
 
+    let columns = vec![
+        "document_id".to_string(),
+        "field".to_string(),
+        "violation".to_string(),
+    ];
+
     if coll.type_guards.is_empty() {
         // No type guards — return empty result.
-        let schema = Arc::new(vec![
-            text_field("document_id"),
-            text_field("field"),
-            text_field("violation"),
-        ]);
-        return Ok(vec![Response::Query(QueryResponse::new(
-            schema,
-            stream::iter(Vec::new()),
-        ))]);
+        let column_types = ShapedRows::text_types(columns.len());
+        return Ok(vec![DdlResult::Rows(ShapedRows {
+            columns,
+            column_types,
+            rows: Vec::new(),
+            notice: None,
+        })]);
     }
 
     let guards = coll.type_guards.clone();
@@ -138,25 +146,22 @@ pub async fn validate_typeguard(
     }
 
     // Build result set.
-    let schema = Arc::new(vec![
-        text_field("document_id"),
-        text_field("field"),
-        text_field("violation"),
-    ]);
-
-    let rows: Vec<_> = violations
+    let rows: Vec<Map<String, JsonValue>> = violations
         .into_iter()
         .map(|(doc_id, field, detail)| {
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            let _ = encoder.encode_field(&doc_id);
-            let _ = encoder.encode_field(&field);
-            let _ = encoder.encode_field(&detail);
-            Ok(encoder.take_row())
+            let mut row = Map::new();
+            row.insert("document_id".to_string(), JsonValue::String(doc_id));
+            row.insert("field".to_string(), JsonValue::String(field));
+            row.insert("violation".to_string(), JsonValue::String(detail));
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    let column_types = ShapedRows::text_types(columns.len());
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
