@@ -11,7 +11,6 @@ pub mod collection;
 pub mod conflict_policy;
 pub mod convert;
 pub mod crdt_ops;
-pub mod custom_type;
 pub mod database;
 pub mod dsl;
 pub mod emergency_ddl;

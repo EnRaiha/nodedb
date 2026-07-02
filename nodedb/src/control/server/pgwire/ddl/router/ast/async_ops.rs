@@ -16,9 +16,6 @@ use crate::control::server::pgwire::ddl::collection::{
     create_index, create_table, dispatch_register_by_name,
 };
 use crate::control::server::pgwire::ddl::conflict_policy::show_conflict_policy;
-use crate::control::server::pgwire::ddl::custom_type::{
-    alter_type_add_value, create_composite_type, create_enum_type, drop_type, show_types,
-};
 use crate::control::server::pgwire::ddl::synonym_group::{
     create_synonym_group, drop_synonym_group, show_synonym_groups,
 };
@@ -152,24 +149,6 @@ pub(super) async fn try_dispatch_async(
         NodedbStatement::Policy(PolicyStmt::ShowSynonymGroups) => {
             Some(show_synonym_groups(state, identity))
         }
-
-        NodedbStatement::Policy(PolicyStmt::CreateEnumType { name, labels }) => {
-            Some(create_enum_type(state, identity, name, labels).await)
-        }
-
-        NodedbStatement::Policy(PolicyStmt::CreateCompositeType { name, fields }) => {
-            Some(create_composite_type(state, identity, name, fields).await)
-        }
-
-        NodedbStatement::Policy(PolicyStmt::DropType { name, if_exists }) => {
-            Some(drop_type(state, identity, name, *if_exists).await)
-        }
-
-        NodedbStatement::Policy(PolicyStmt::AlterTypeAddValue { type_name, label }) => {
-            Some(alter_type_add_value(state, identity, type_name, label).await)
-        }
-
-        NodedbStatement::Policy(PolicyStmt::ShowTypes) => Some(show_types(state, identity)),
 
         NodedbStatement::Collection(CollectionStmt::Reindex {
             collection,

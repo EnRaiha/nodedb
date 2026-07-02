@@ -20,6 +20,7 @@ use super::change_stream;
 use super::constraint;
 use super::consumer_group;
 use super::continuous_agg;
+use super::custom_type;
 use super::function;
 use super::grant;
 use super::materialized_view;
@@ -679,6 +680,26 @@ pub async fn try_dispatch(
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
             Some(rls::show_rls_policies(state, identity, &parts))
+        }
+
+        NodedbStatement::Policy(PolicyStmt::CreateEnumType { name, labels }) => {
+            Some(custom_type::create_enum_type(state, identity, name, labels))
+        }
+
+        NodedbStatement::Policy(PolicyStmt::CreateCompositeType { name, fields }) => Some(
+            custom_type::create_composite_type(state, identity, name, fields),
+        ),
+
+        NodedbStatement::Policy(PolicyStmt::DropType { name, if_exists }) => {
+            Some(custom_type::drop_type(state, identity, name, *if_exists))
+        }
+
+        NodedbStatement::Policy(PolicyStmt::AlterTypeAddValue { type_name, label }) => Some(
+            custom_type::alter_type_add_value(state, identity, type_name, label),
+        ),
+
+        NodedbStatement::Policy(PolicyStmt::ShowTypes) => {
+            Some(custom_type::show_types(state, identity))
         }
 
         NodedbStatement::Auth(AuthStmt::CreateUser {
