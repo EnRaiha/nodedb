@@ -1,25 +1,30 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `COMMIT OFFSET` DDL handler.
+//! Protocol-neutral `COMMIT OFFSET` DDL handler.
+//!
+//! Ported from the pgwire `ddl::consumer_group::commit` handler. The two-form
+//! token parsing, the group-existence checks, the per-partition tail-tracker
+//! batch-commit path (NOT a full `read_from_lsn(0, MAX)` scan — preserved
+//! verbatim), and the `OffsetRegression` error mapping are preserved verbatim;
+//! only the result construction changed from pgwire `Response` / `PgWireError`
+//! to the protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
 //! - `COMMIT OFFSET PARTITION <p> AT <lsn> ON <stream> CONSUMER GROUP <name>`
 //! - `COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>` (batch: commit all at latest)
 
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
-
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::status;
 
 /// Handle `COMMIT OFFSET PARTITION <p> AT <lsn> ON <stream> CONSUMER GROUP <name>`
 pub fn commit_offset(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
     // Single partition: COMMIT OFFSET PARTITION <p> AT <lsn> ON <stream> CONSUMER GROUP <name>
@@ -32,12 +37,14 @@ pub fn commit_offset(
         && parts[8].eq_ignore_ascii_case("CONSUMER")
         && parts[9].eq_ignore_ascii_case("GROUP")
     {
-        let partition_id: u32 = parts[3]
-            .parse()
-            .map_err(|_| sqlstate_error("42601", &format!("invalid partition: '{}'", parts[3])))?;
-        let lsn: u64 = parts[5]
-            .parse()
-            .map_err(|_| sqlstate_error("42601", &format!("invalid LSN: '{}'", parts[5])))?;
+        let partition_id: u32 = parts[3].parse().map_err(|_| DdlError {
+            sqlstate: "42601".to_string(),
+            message: format!("invalid partition: '{}'", parts[3]),
+        })?;
+        let lsn: u64 = parts[5].parse().map_err(|_| DdlError {
+            sqlstate: "42601".to_string(),
+            message: format!("invalid LSN: '{}'", parts[5]),
+        })?;
         let stream_name = parts[7].to_lowercase();
         let group_name = parts[10].to_lowercase();
 
@@ -47,21 +54,29 @@ pub fn commit_offset(
             .get(tenant_id, &stream_name, &group_name)
             .is_none()
         {
-            return Err(sqlstate_error(
-                "42704",
-                &format!("consumer group '{group_name}' does not exist on stream '{stream_name}'"),
-            ));
+            return Err(DdlError {
+                sqlstate: "42704".to_string(),
+                message: format!(
+                    "consumer group '{group_name}' does not exist on stream '{stream_name}'"
+                ),
+            });
         }
 
         state
             .offset_store
             .commit_offset(tenant_id, &stream_name, &group_name, partition_id, lsn)
             .map_err(|e| match e {
-                crate::Error::OffsetRegression { .. } => sqlstate_error("22023", &e.to_string()),
-                _ => sqlstate_error("XX000", &format!("offset commit: {e}")),
+                crate::Error::OffsetRegression { .. } => DdlError {
+                    sqlstate: "22023".to_string(),
+                    message: e.to_string(),
+                },
+                _ => DdlError {
+                    sqlstate: "XX000".to_string(),
+                    message: format!("offset commit: {e}"),
+                },
             })?;
 
-        return Ok(vec![Response::Execution(Tag::new("COMMIT OFFSET"))]);
+        return Ok(status("COMMIT OFFSET"));
     }
 
     // Batch: COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>
@@ -81,10 +96,12 @@ pub fn commit_offset(
             .get(tenant_id, &stream_name, &group_name)
             .is_none()
         {
-            return Err(sqlstate_error(
-                "42704",
-                &format!("consumer group '{group_name}' does not exist on stream '{stream_name}'"),
-            ));
+            return Err(DdlError {
+                sqlstate: "42704".to_string(),
+                message: format!(
+                    "consumer group '{group_name}' does not exist on stream '{stream_name}'"
+                ),
+            });
         }
 
         // Use the buffer's per-partition tail tracker — NOT a full
@@ -107,16 +124,21 @@ pub fn commit_offset(
                 state
                     .offset_store
                     .commit_offset(tenant_id, &stream_name, &group_name, partition_id, lsn)
-                    .map_err(|e| sqlstate_error("XX000", &format!("offset commit: {e}")))?;
+                    .map_err(|e| DdlError {
+                        sqlstate: "XX000".to_string(),
+                        message: format!("offset commit: {e}"),
+                    })?;
             }
         }
 
-        return Ok(vec![Response::Execution(Tag::new("COMMIT OFFSETS"))]);
+        return Ok(status("COMMIT OFFSETS"));
     }
 
-    Err(sqlstate_error(
-        "42601",
-        "expected COMMIT OFFSET PARTITION <p> AT <lsn> ON <stream> CONSUMER GROUP <name>, \
-         or COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>",
-    ))
+    Err(DdlError {
+        sqlstate: "42601".to_string(),
+        message:
+            "expected COMMIT OFFSET PARTITION <p> AT <lsn> ON <stream> CONSUMER GROUP <name>, \
+         or COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>"
+                .to_string(),
+    })
 }

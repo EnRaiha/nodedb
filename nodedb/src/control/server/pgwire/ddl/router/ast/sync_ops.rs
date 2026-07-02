@@ -7,7 +7,7 @@ use pgwire::error::PgWireResult;
 
 use nodedb_sql::ddl_ast::statement::{
     AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, DatabaseStmt, NodedbStatement,
-    PolicyStmt, StreamViewStmt,
+    PolicyStmt,
 };
 
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -15,7 +15,6 @@ use crate::control::server::pgwire::ddl::alert::alter_alert;
 use crate::control::server::pgwire::ddl::alert::{CreateAlertRequest, create_alert};
 use crate::control::server::pgwire::ddl::cluster::alter_raft_group;
 use crate::control::server::pgwire::ddl::collection::drop_collection;
-use crate::control::server::pgwire::ddl::consumer_group::create_consumer_group;
 use crate::control::server::pgwire::ddl::inspect::show_permissions;
 use crate::control::server::pgwire::ddl::retention_policy::alter_retention_policy;
 use crate::control::state::SharedState;
@@ -95,16 +94,6 @@ pub(super) fn try_dispatch_sync(
             action,
             set_key.as_deref(),
             set_value.as_deref(),
-        )),
-
-        NodedbStatement::StreamView(StreamViewStmt::CreateConsumerGroup {
-            group_name,
-            stream_name,
-        }) => Some(create_consumer_group(
-            state,
-            identity,
-            group_name,
-            stream_name,
         )),
 
         NodedbStatement::Automation(AutomationStmt::CreateAlert {

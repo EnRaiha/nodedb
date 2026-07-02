@@ -17,6 +17,7 @@ use crate::types::DatabaseId;
 use super::super::result::{DdlError, DdlResult};
 use super::change_stream;
 use super::constraint;
+use super::consumer_group;
 use super::function;
 use super::grant;
 use super::oidc;
@@ -199,6 +200,31 @@ pub async fn try_dispatch(
         return Some(change_stream::show_change_streams(state, identity));
     }
 
+    // Consumer groups: `SHOW CONSUMER GROUPS ON <stream>`, `SHOW PARTITIONS ON
+    // <stream>`, and `COMMIT OFFSET(S) …`. The pgwire streaming router dispatched
+    // all four by string prefix from the raw token slice. `SHOW CONSUMER GROUPS`
+    // parses into a typed `StreamViewStmt::ShowConsumerGroups`, but the pgwire
+    // string dispatch claimed it before any typed arm ran; `SHOW PARTITIONS` and
+    // `COMMIT OFFSET(S)` parse into no typed variant at all. Replicate that
+    // exactly here, before the parse gate, so the prefix recognition and the
+    // `parts`-based syntax messages stay byte-identical. (`SHOW PARTITIONS ` also
+    // shadows the timeseries `show_partitions` handler exactly as the pgwire
+    // streaming router — which ran before engine_ops — did.)
+    if upper.starts_with("SHOW CONSUMER GROUPS ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(consumer_group::show_consumer_groups(
+            state, identity, &parts,
+        ));
+    }
+    if upper.starts_with("SHOW PARTITIONS ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(consumer_group::show_partitions(state, identity, &parts));
+    }
+    if upper.starts_with("COMMIT OFFSET ") || upper.starts_with("COMMIT OFFSETS ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(consumer_group::commit_offset(state, identity, &parts));
+    }
+
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,
     // which re-parses and reproduces the exact error handling for those inputs.
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
@@ -238,6 +264,39 @@ pub async fn try_dispatch(
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
             Some(change_stream::drop_change_stream(state, identity, &parts))
+        }
+
+        NodedbStatement::StreamView(StreamViewStmt::CreateConsumerGroup {
+            group_name,
+            stream_name,
+        }) => Some(consumer_group::create_consumer_group(
+            state,
+            identity,
+            group_name,
+            stream_name,
+        )),
+
+        NodedbStatement::StreamView(StreamViewStmt::DropConsumerGroup {
+            name,
+            stream,
+            if_exists,
+        }) => {
+            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // non-existing consumer group returns the tag before the token
+            // handler runs. The `if_exists: false` case and the existing-group
+            // case fall through to `drop_consumer_group`, which re-derives the
+            // name / stream from `parts` exactly as the pgwire streaming string
+            // dispatch did. The guard checks the in-memory group registry for the
+            // identity tenant using the parsed name / stream verbatim.
+            let tid = identity.tenant_id.as_u64();
+            if *if_exists && state.group_registry.get(tid, stream, name).is_none() {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "DROP CONSUMER GROUP".to_string(),
+                    rows_affected: None,
+                }]));
+            }
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(consumer_group::drop_consumer_group(state, identity, &parts))
         }
 
         NodedbStatement::Collection(CollectionStmt::CreateSequence {

@@ -1,28 +1,34 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE CONSUMER GROUP` DDL handler.
+//! Protocol-neutral `CREATE CONSUMER GROUP` DDL handler.
+//!
+//! Ported from the pgwire `ddl::consumer_group::create` handler. The stream /
+//! topic existence check, the duplicate-group check, the `ConsumerGroupDef`
+//! build, the direct `catalog.put_consumer_group` + `group_registry.register`
+//! path (NOT `propose_and_apply` — this family writes the catalog directly), and
+//! the `audit_record` call are preserved verbatim; only the result construction
+//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax: `CREATE CONSUMER GROUP <name> ON <stream>`
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::event::cdc::consumer_group::ConsumerGroupDef;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
 
 /// Handle `CREATE CONSUMER GROUP <name> ON <stream>`.
 ///
 /// `group_name` and `stream_name` come from the typed
-/// [`NodedbStatement::CreateConsumerGroup`] variant.
+/// [`nodedb_sql::ddl_ast::statement::StreamViewStmt::CreateConsumerGroup`] variant.
 pub fn create_consumer_group(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     group_name: &str,
     stream_name: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create consumer groups")?;
 
     let group_name = group_name.to_lowercase();
@@ -40,10 +46,10 @@ pub fn create_consumer_group(
     let topic_bare = stream_name.strip_prefix("topic:").unwrap_or(&stream_name);
     let is_topic = is_topic || state.ep_topic_registry.get(tenant_id, topic_bare).is_some();
     if !is_stream && !is_topic {
-        return Err(sqlstate_error(
-            "42704",
-            &format!("change stream or topic '{stream_name}' does not exist"),
-        ));
+        return Err(DdlError {
+            sqlstate: "42704".to_string(),
+            message: format!("change stream or topic '{stream_name}' does not exist"),
+        });
     }
 
     // Check for duplicate group.
@@ -52,15 +58,20 @@ pub fn create_consumer_group(
         .get(tenant_id, &stream_name, &group_name)
         .is_some()
     {
-        return Err(sqlstate_error(
-            "42710",
-            &format!("consumer group '{group_name}' already exists on stream '{stream_name}'"),
-        ));
+        return Err(DdlError {
+            sqlstate: "42710".to_string(),
+            message: format!(
+                "consumer group '{group_name}' already exists on stream '{stream_name}'"
+            ),
+        });
     }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock error"))?
+        .map_err(|_| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system clock error".to_string(),
+        })?
         .as_secs();
 
     let def = ConsumerGroupDef {
@@ -75,11 +86,15 @@ pub fn create_consumer_group(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        })?;
 
-    catalog
-        .put_consumer_group(&def)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+    catalog.put_consumer_group(&def).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("catalog write: {e}"),
+    })?;
 
     state.group_registry.register(def);
 
@@ -90,5 +105,5 @@ pub fn create_consumer_group(
         &format!("CREATE CONSUMER GROUP {group_name} ON {stream_name}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE CONSUMER GROUP"))])
+    Ok(status("CREATE CONSUMER GROUP"))
 }

@@ -13,29 +13,6 @@ pub(super) async fn dispatch(
     upper: &str,
     parts: &[&str],
 ) -> Option<PgWireResult<Vec<Response>>> {
-    // Consumer Groups: CREATE/DROP/SHOW CONSUMER GROUP + COMMIT OFFSET(S)
-    // CREATE CONSUMER GROUP is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("DROP CONSUMER GROUP ") {
-        return Some(super::super::consumer_group::drop_consumer_group(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW CONSUMER GROUPS ") {
-        return Some(super::super::consumer_group::show_consumer_groups(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW PARTITIONS ") {
-        return Some(super::super::consumer_group::show_partitions(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("COMMIT OFFSET ") || upper.starts_with("COMMIT OFFSETS ") {
-        return Some(super::super::consumer_group::commit_offset(
-            state, identity, parts,
-        ));
-    }
-
     // Stream consumption: SELECT * FROM STREAM <name> CONSUMER GROUP <group>
     if upper.starts_with("SELECT ")
         && upper.contains("FROM STREAM ")

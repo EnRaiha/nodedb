@@ -105,20 +105,6 @@ pub(super) fn try_dispatch_guards(
             None
         }
 
-        NodedbStatement::StreamView(StreamViewStmt::DropConsumerGroup {
-            name,
-            stream,
-            if_exists: true,
-        }) => {
-            let tid = identity.tenant_id.as_u64();
-            if state.group_registry.get(tid, stream, name).is_none() {
-                return Some(Ok(vec![Response::Execution(Tag::new(
-                    "DROP CONSUMER GROUP",
-                ))]));
-            }
-            None
-        }
-
         _ => None,
     }
 }

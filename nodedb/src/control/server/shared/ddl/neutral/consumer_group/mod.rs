@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+//! Protocol-neutral consumer group DDL — CREATE / DROP / SHOW + COMMIT OFFSET(S).
+
 pub mod commit;
 pub mod create;
 pub mod drop;
