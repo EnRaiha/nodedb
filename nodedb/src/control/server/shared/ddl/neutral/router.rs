@@ -30,6 +30,7 @@ use super::topic;
 use super::trigger;
 use super::typeguard;
 use super::user;
+use super::version_history;
 
 /// Try to handle `sql` with a migrated protocol-neutral DDL family handler.
 ///
@@ -41,7 +42,7 @@ pub async fn try_dispatch(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-    _database_id: DatabaseId,
+    database_id: DatabaseId,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     // String-recognized user/role families. `DROP USER` parses into a typed
     // `AuthStmt::DropUser` that carries no `if_exists` flag (so it mishandles
@@ -246,6 +247,48 @@ pub async fn try_dispatch(
     }
     if upper.starts_with("PUBLISH TO ") {
         return Some(topic::handle_publish(state, identity, sql).await);
+    }
+
+    // Version history. None of `CREATE CHECKPOINT`, `DROP CHECKPOINT`, `SHOW
+    // VERSIONS OF`, `SELECT … AT VERSION`, `SELECT DIFF(…)`, `RESTORE … SET
+    // VERSION`, or `COMPACT HISTORY ON` parse into any typed AST variant — the
+    // pgwire collaborative router dispatched all of them by string prefix from
+    // the raw SQL. Replicate that exactly here, before the parse gate, so the
+    // prefix recognition (including the `RESTORE … SET VERSION` guard that keeps
+    // `RESTORE TENANT` / `RESTORE DATABASE` on the typed path) and syntax
+    // messages stay byte-identical. Guard ordering mirrors the pgwire router.
+    if upper.starts_with("CREATE CHECKPOINT ") {
+        return Some(
+            version_history::checkpoint::create_checkpoint(state, identity, database_id, sql).await,
+        );
+    }
+    if upper.starts_with("DROP CHECKPOINT ") {
+        return Some(version_history::checkpoint::drop_checkpoint(
+            state, identity, sql,
+        ));
+    }
+    if upper.starts_with("SHOW VERSIONS OF ") {
+        return Some(version_history::show_versions::show_versions(
+            state, identity, sql,
+        ));
+    }
+    if upper.contains("AT VERSION") && upper.starts_with("SELECT") {
+        return Some(
+            version_history::at_version::select_at_version(state, identity, database_id, sql).await,
+        );
+    }
+    if upper.starts_with("SELECT DIFF(") || upper.starts_with("SELECT DIFF (") {
+        return Some(version_history::diff::select_diff(state, identity, database_id, sql).await);
+    }
+    if upper.starts_with("RESTORE ") && upper.contains("SET VERSION") {
+        return Some(
+            version_history::restore::restore_version(state, identity, database_id, sql).await,
+        );
+    }
+    if upper.starts_with("COMPACT HISTORY ON ") {
+        return Some(
+            version_history::compact::compact_history(state, identity, database_id, sql).await,
+        );
     }
 
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,

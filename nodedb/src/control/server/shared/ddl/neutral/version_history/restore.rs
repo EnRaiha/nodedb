@@ -4,16 +4,21 @@
 
 use std::time::Duration;
 
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
-
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 /// RESTORE collection SET VERSION = 'checkpoint' WHERE id = 'doc-id'
 ///
@@ -24,7 +29,7 @@ pub async fn restore_version(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, checkpoint_name, doc_id) = parse_restore(sql)?;
     let tenant_id = identity.tenant_id;
 
@@ -39,7 +44,7 @@ pub async fn restore_version(
     let surrogate = state
         .surrogate_assigner
         .assign(database_id, tenant_id, &collection, doc_id.as_bytes())
-        .map_err(|e| sqlstate_error("XX000", &format!("surrogate assign: {e}")))?;
+        .map_err(|e| err("XX000", format!("surrogate assign: {e}")))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
         collection: collection.clone(),
@@ -48,16 +53,9 @@ pub async fn restore_version(
         surrogate,
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    super::super::sync_dispatch::dispatch_async(
-        state,
-        tenant_id,
-        database_id,
-        &collection,
-        plan,
-        timeout,
-    )
-    .await
-    .map_err(|e| sqlstate_error("XX000", &format!("restore dispatch: {e}")))?;
+    dispatch_async(state, tenant_id, database_id, &collection, plan, timeout)
+        .await
+        .map_err(|e| err("XX000", format!("restore dispatch: {e}")))?;
 
     state
         .audit
@@ -70,31 +68,34 @@ pub async fn restore_version(
             &format!("RESTORE {collection}/{doc_id} to version '{checkpoint_name}'"),
         );
 
-    Ok(vec![Response::Execution(Tag::new("RESTORE"))])
+    Ok(vec![DdlResult::Status {
+        command: "RESTORE".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Parse: RESTORE collection SET VERSION = 'checkpoint' WHERE id = 'doc-id'
-fn parse_restore(sql: &str) -> PgWireResult<(String, String, String)> {
+fn parse_restore(sql: &str) -> Result<(String, String, String), DdlError> {
     let rest = sql["RESTORE ".len()..].trim();
 
     // Collection: before "SET VERSION"
     let set_pos = rest
         .to_uppercase()
         .find("SET VERSION")
-        .ok_or_else(|| sqlstate_error("42601", "expected SET VERSION"))?;
+        .ok_or_else(|| err("42601", "expected SET VERSION".to_string()))?;
     let collection = rest[..set_pos].trim().to_lowercase();
 
     // Checkpoint: between "=" and "WHERE"
     let after_set = rest[set_pos + 11..].trim(); // After "SET VERSION"
     let eq_pos = after_set
         .find('=')
-        .ok_or_else(|| sqlstate_error("42601", "expected '=' after SET VERSION"))?;
+        .ok_or_else(|| err("42601", "expected '=' after SET VERSION".to_string()))?;
     let after_eq = after_set[eq_pos + 1..].trim();
 
     let where_pos = after_eq
         .to_uppercase()
         .find("WHERE")
-        .ok_or_else(|| sqlstate_error("42601", "expected WHERE id = '<doc_id>'"))?;
+        .ok_or_else(|| err("42601", "expected WHERE id = '<doc_id>'".to_string()))?;
     let checkpoint = after_eq[..where_pos]
         .trim()
         .trim_matches('\'')
@@ -105,7 +106,7 @@ fn parse_restore(sql: &str) -> PgWireResult<(String, String, String)> {
     let where_clause = after_eq[where_pos + 5..].trim();
     let id_eq = where_clause
         .find('=')
-        .ok_or_else(|| sqlstate_error("42601", "expected 'id = <value>'"))?;
+        .ok_or_else(|| err("42601", "expected 'id = <value>'".to_string()))?;
     let value_part = where_clause[id_eq + 1..]
         .trim()
         .trim_end_matches(';')

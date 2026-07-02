@@ -24,5 +24,6 @@ pub mod topic;
 pub mod trigger;
 pub mod typeguard;
 pub mod user;
+pub mod version_history;
 
 pub use self::router::try_dispatch;

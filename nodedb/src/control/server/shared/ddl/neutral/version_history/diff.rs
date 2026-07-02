@@ -2,20 +2,26 @@
 
 //! SELECT DIFF(collection, 'doc-id', version_a, version_b)
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
-use super::super::super::types::{int8_field, sqlstate_error, text_field};
+use super::super::super::result::{DdlError, DdlResult};
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 /// SELECT DIFF(collection, 'doc-id', 'version_a', 'version_b')
 ///
@@ -30,12 +36,12 @@ pub async fn select_diff(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_diff_args(sql)?;
     if args.len() < 4 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
-            "syntax: SELECT DIFF('collection', 'doc_id', 'version_a', 'version_b')",
+            "syntax: SELECT DIFF('collection', 'doc_id', 'version_a', 'version_b')".to_string(),
         ));
     }
 
@@ -60,57 +66,59 @@ pub async fn select_diff(
         from_version_json: from_vv,
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let delta_bytes = super::super::sync_dispatch::dispatch_async(
-        state,
-        tenant_id,
-        database_id,
-        collection,
-        plan,
-        timeout,
-    )
-    .await
-    .map_err(|e| sqlstate_error("XX000", &format!("dispatch: {e}")))?;
+    let delta_bytes = dispatch_async(state, tenant_id, database_id, collection, plan, timeout)
+        .await
+        .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
 
-    let schema = Arc::new(vec![
-        text_field("from_version"),
-        text_field("to_version"),
-        int8_field("delta_size_bytes"),
-        text_field("delta_hex"),
-    ]);
-
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    encoder
-        .encode_field(version_a_name)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    encoder
-        .encode_field(version_b_name)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    encoder
-        .encode_field(&(delta_bytes.len() as i64))
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    let columns = vec![
+        "from_version".to_string(),
+        "to_version".to_string(),
+        "delta_size_bytes".to_string(),
+        "delta_hex".to_string(),
+    ];
+    let column_types = vec![
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Int8,
+        DdlColType::Text,
+    ];
 
     // Encode delta as hex for SQL-safe transport.
     let hex: String = delta_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    encoder
-        .encode_field(&hex)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(encoder.take_row())]),
-    ))])
+    let mut row = Map::new();
+    row.insert(
+        "from_version".to_string(),
+        JsonValue::String(version_a_name.clone()),
+    );
+    row.insert(
+        "to_version".to_string(),
+        JsonValue::String(version_b_name.clone()),
+    );
+    row.insert(
+        "delta_size_bytes".to_string(),
+        JsonValue::String((delta_bytes.len() as i64).to_string()),
+    );
+    row.insert("delta_hex".to_string(), JsonValue::String(hex));
+
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows: vec![row],
+        notice: None,
+    })])
 }
 
 /// Parse function arguments from `SELECT DIFF('a', 'b', 'c', 'd')`.
-fn parse_diff_args(sql: &str) -> PgWireResult<Vec<String>> {
+fn parse_diff_args(sql: &str) -> Result<Vec<String>, DdlError> {
     let start = sql
         .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected '(' in DIFF call"))?;
+        .ok_or_else(|| err("42601", "expected '(' in DIFF call".to_string()))?;
     let end = sql
         .rfind(')')
-        .ok_or_else(|| sqlstate_error("42601", "expected ')' in DIFF call"))?;
+        .ok_or_else(|| err("42601", "expected ')' in DIFF call".to_string()))?;
     if start >= end {
-        return Err(sqlstate_error("42601", "empty DIFF arguments"));
+        return Err(err("42601", "empty DIFF arguments".to_string()));
     }
     let args_str = &sql[start + 1..end];
     Ok(args_str

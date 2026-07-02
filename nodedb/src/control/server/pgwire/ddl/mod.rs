@@ -61,7 +61,6 @@ pub mod timeseries;
 mod timeseries_helpers;
 pub mod transfer;
 pub mod tree_ops;
-pub mod version_history;
 pub mod weighted_pick;
 
 pub use router::dispatch;

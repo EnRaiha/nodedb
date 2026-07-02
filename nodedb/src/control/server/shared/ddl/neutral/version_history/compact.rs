@@ -4,16 +4,21 @@
 
 use std::time::Duration;
 
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
-
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 /// COMPACT HISTORY ON collection WHERE id = 'doc-id' BEFORE 'checkpoint'
 ///
@@ -25,21 +30,21 @@ pub async fn compact_history(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, doc_id, checkpoint_name) = parse_compact(sql)?;
     let tenant_id = identity.tenant_id;
 
     // Resolve checkpoint to version vector + timestamp.
     let Some(catalog) = state.credentials.catalog() else {
-        return Err(sqlstate_error("XX000", "catalog unavailable"));
+        return Err(err("XX000", "catalog unavailable".to_string()));
     };
     let record = catalog
         .get_checkpoint(tenant_id.as_u64(), &collection, &doc_id, &checkpoint_name)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
+        .map_err(|e| err("XX000", e.to_string()))?
         .ok_or_else(|| {
-            sqlstate_error(
+            err(
                 "42704",
-                &format!("checkpoint '{checkpoint_name}' not found for {collection}/{doc_id}"),
+                format!("checkpoint '{checkpoint_name}' not found for {collection}/{doc_id}"),
             )
         })?;
 
@@ -49,21 +54,14 @@ pub async fn compact_history(
         target_version_json: record.version_vector_json.clone(),
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    super::super::sync_dispatch::dispatch_async(
-        state,
-        tenant_id,
-        database_id,
-        &collection,
-        plan,
-        timeout,
-    )
-    .await
-    .map_err(|e| sqlstate_error("XX000", &format!("compact dispatch: {e}")))?;
+    dispatch_async(state, tenant_id, database_id, &collection, plan, timeout)
+        .await
+        .map_err(|e| err("XX000", format!("compact dispatch: {e}")))?;
 
     // Delete checkpoints created before the cutoff.
     let deleted = catalog
         .delete_checkpoints_before(tenant_id.as_u64(), &collection, &doc_id, record.created_at)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     state
         .audit
@@ -78,18 +76,21 @@ pub async fn compact_history(
             ),
         );
 
-    Ok(vec![Response::Execution(Tag::new("COMPACT HISTORY"))])
+    Ok(vec![DdlResult::Status {
+        command: "COMPACT HISTORY".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Parse: COMPACT HISTORY ON collection WHERE id = 'doc-id' BEFORE 'checkpoint'
-fn parse_compact(sql: &str) -> PgWireResult<(String, String, String)> {
+fn parse_compact(sql: &str) -> Result<(String, String, String), DdlError> {
     let rest = sql["COMPACT HISTORY ON ".len()..].trim();
 
     // Collection: before WHERE.
     let where_pos = rest
         .to_uppercase()
         .find("WHERE")
-        .ok_or_else(|| sqlstate_error("42601", "expected WHERE"))?;
+        .ok_or_else(|| err("42601", "expected WHERE".to_string()))?;
     let collection = rest[..where_pos].trim().to_lowercase();
     let after_where = rest[where_pos + 5..].trim();
 
@@ -97,7 +98,7 @@ fn parse_compact(sql: &str) -> PgWireResult<(String, String, String)> {
     let before_pos = after_where
         .to_uppercase()
         .find("BEFORE")
-        .ok_or_else(|| sqlstate_error("42601", "expected BEFORE '<checkpoint>'"))?;
+        .ok_or_else(|| err("42601", "expected BEFORE '<checkpoint>'".to_string()))?;
     let id_clause = after_where[..before_pos].trim();
     let checkpoint_part = after_where[before_pos + 6..]
         .trim()
@@ -110,7 +111,7 @@ fn parse_compact(sql: &str) -> PgWireResult<(String, String, String)> {
 
     let eq_pos = id_clause
         .find('=')
-        .ok_or_else(|| sqlstate_error("42601", "expected 'id = <value>'"))?;
+        .ok_or_else(|| err("42601", "expected 'id = <value>'".to_string()))?;
     let value_part = id_clause[eq_pos + 1..].trim();
     let doc_id = value_part.trim_matches('\'').trim_matches('"').to_owned();
 
