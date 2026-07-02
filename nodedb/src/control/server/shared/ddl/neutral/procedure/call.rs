@@ -2,28 +2,30 @@
 
 //! `CALL <procedure>(args)` execution handler.
 //!
-//! Parses the CALL statement, resolves the procedure from the catalog,
-//! binds arguments to parameters, and executes the body via the statement
-//! executor with fuel metering and timeout.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Ported from the pgwire `ddl::procedure::call` handler. The CALL parsing,
+//! catalog resolution, argument binding, budgeted body execution, and OUT
+//! parameter extraction are preserved verbatim; only the result construction
+//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
+//! [`DdlResult`] / [`DdlError`]. The OUT-parameter result set carries the same
+//! text columns and per-row values as the pgwire `QueryResponse` it replaces.
 
 use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::planner::procedural::executor::core::StatementExecutor;
 use crate::control::planner::procedural::executor::fuel::ExecutionBudget;
 use crate::control::security::catalog::procedure_types::ParamDirection;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+use super::parens::find_matching_paren;
 
 /// Handle `CALL <procedure>(arg1, arg2, ...)`
 pub async fn call_procedure(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (name, args) = parse_call(sql)?;
     let tenant_id = identity.tenant_id;
 
@@ -31,12 +33,21 @@ pub async fn call_procedure(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        })?;
 
     let proc = catalog
         .get_procedure(tenant_id.as_u64(), &name)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
-        .ok_or_else(|| sqlstate_error("42883", &format!("procedure '{name}' does not exist")))?;
+        .map_err(|e| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: e.to_string(),
+        })?
+        .ok_or_else(|| DdlError {
+            sqlstate: "42883".to_string(),
+            message: format!("procedure '{name}' does not exist"),
+        })?;
 
     // Validate argument count matches IN parameters.
     let in_params: Vec<_> = proc
@@ -46,15 +57,15 @@ pub async fn call_procedure(
         .collect();
 
     if args.len() != in_params.len() {
-        return Err(sqlstate_error(
-            "42601",
-            &format!(
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: format!(
                 "procedure '{}' expects {} argument(s), got {}",
                 name,
                 in_params.len(),
                 args.len()
             ),
-        ));
+        });
     }
 
     // Build parameter bindings: param_name → argument value (as SQL literal).
@@ -65,8 +76,11 @@ pub async fn call_procedure(
     let bindings = RowBindings::with_params(param_map);
 
     // Parse the procedure body.
-    let block = crate::control::planner::procedural::parse_block(&proc.body_sql)
-        .map_err(|e| sqlstate_error("42601", &format!("procedure body parse error: {e}")))?;
+    let block =
+        crate::control::planner::procedural::parse_block(&proc.body_sql).map_err(|e| DdlError {
+            sqlstate: "42601".to_string(),
+            message: format!("procedure body parse error: {e}"),
+        })?;
 
     // Execute with fuel metering, timeout, and transaction context.
     let mut budget = ExecutionBudget::new(proc.max_iterations, proc.timeout_secs);
@@ -76,7 +90,10 @@ pub async fn call_procedure(
     executor
         .execute_block_with_budget(&block, &bindings, &mut budget)
         .await
-        .map_err(|e| sqlstate_error("P0001", &e.to_string()))?;
+        .map_err(|e| DdlError {
+            sqlstate: "P0001".to_string(),
+            message: e.to_string(),
+        })?;
 
     // Check for OUT parameter values.
     let out_params: Vec<_> = proc
@@ -86,30 +103,25 @@ pub async fn call_procedure(
         .collect();
 
     if out_params.is_empty() {
-        return Ok(vec![Response::Execution(Tag::new("CALL"))]);
+        return Ok(vec![DdlResult::Status {
+            command: "CALL".to_string(),
+            rows_affected: None,
+        }]);
     }
 
     // Return OUT values as a single-row result set.
     let out_values = executor.take_out_values();
-    build_out_response(&out_params, &out_values)
+    Ok(build_out_response(&out_params, &out_values))
 }
 
 /// Build a single-row result set from OUT parameter values.
 fn build_out_response(
     out_params: &[&crate::control::security::catalog::procedure_types::ProcedureParam],
     out_values: &std::collections::HashMap<String, nodedb_types::Value>,
-) -> PgWireResult<Vec<Response>> {
-    use futures::stream;
-    use pgwire::api::results::{DataRowEncoder, QueryResponse};
+) -> Vec<DdlResult> {
+    let columns: Vec<String> = out_params.iter().map(|p| p.name.clone()).collect();
 
-    let schema = std::sync::Arc::new(
-        out_params
-            .iter()
-            .map(|p| super::super::super::types::text_field(&p.name))
-            .collect::<Vec<_>>(),
-    );
-
-    let mut encoder = DataRowEncoder::new(schema.clone());
+    let mut row = serde_json::Map::new();
     for param in out_params {
         let value = out_values
             .get(&param.name)
@@ -126,41 +138,52 @@ fn build_out_response(
             Some(nodedb_types::Value::String(s)) => s.clone(),
             Some(v) => v.to_sql_literal(),
         };
-        let _ = encoder.encode_field(&text);
+        row.insert(param.name.clone(), serde_json::Value::String(text));
     }
-    let row = encoder.take_row();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(row)]),
-    ))])
+    let column_types = ShapedRows::text_types(columns.len());
+    vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows: vec![row],
+        notice: None,
+    })]
 }
 
 /// Parse `CALL <name>(arg1, arg2, ...)`.
 ///
 /// Returns (procedure_name, argument_values_as_sql_strings).
-fn parse_call(sql: &str) -> PgWireResult<(String, Vec<String>)> {
+fn parse_call(sql: &str) -> Result<(String, Vec<String>), DdlError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_uppercase();
 
     if !upper.starts_with("CALL ") {
-        return Err(sqlstate_error("42601", "expected CALL <procedure>(...)"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected CALL <procedure>(...)".to_string(),
+        });
     }
     let after_call = &trimmed["CALL ".len()..].trim();
 
     // Find the paren that starts the argument list.
-    let paren_pos = after_call
-        .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected '(' after procedure name in CALL"))?;
+    let paren_pos = after_call.find('(').ok_or_else(|| DdlError {
+        sqlstate: "42601".to_string(),
+        message: "expected '(' after procedure name in CALL".to_string(),
+    })?;
 
     let name = after_call[..paren_pos].trim().to_lowercase();
     if name.is_empty() {
-        return Err(sqlstate_error("42601", "procedure name required in CALL"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "procedure name required in CALL".to_string(),
+        });
     }
 
     // Extract arguments between parens.
-    let close_paren = super::super::parse_utils::find_matching_paren(after_call, paren_pos)
-        .ok_or_else(|| sqlstate_error("42601", "unmatched '(' in CALL"))?;
+    let close_paren = find_matching_paren(after_call, paren_pos).ok_or_else(|| DdlError {
+        sqlstate: "42601".to_string(),
+        message: "unmatched '(' in CALL".to_string(),
+    })?;
 
     let args_str = &after_call[paren_pos + 1..close_paren];
     let args = if args_str.trim().is_empty() {

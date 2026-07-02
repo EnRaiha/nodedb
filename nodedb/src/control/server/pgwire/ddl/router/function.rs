@@ -11,26 +11,8 @@ pub(super) async fn dispatch(
     identity: &AuthenticatedIdentity,
     sql: &str,
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
 ) -> Option<PgWireResult<Vec<Response>>> {
-    // Stored procedures.
-    if upper.starts_with("CREATE OR REPLACE PROCEDURE ") || upper.starts_with("CREATE PROCEDURE ") {
-        return Some(super::super::procedure::create_procedure(
-            state, identity, sql,
-        ));
-    }
-    if upper.starts_with("DROP PROCEDURE ") {
-        return Some(super::super::procedure::drop_procedure(
-            state, identity, parts,
-        ));
-    }
-    if upper == "SHOW PROCEDURES" || upper.starts_with("SHOW PROCEDURES") {
-        return Some(super::super::procedure::show_procedures(state, identity));
-    }
-    if upper.starts_with("CALL ") {
-        return Some(super::super::procedure::call_procedure(state, identity, sql).await);
-    }
-
     // Query functions.
     if upper.contains("VERIFY_AUDIT_CHAIN") {
         return Some(super::super::query_functions::verify_audit_chain(state, identity, sql).await);

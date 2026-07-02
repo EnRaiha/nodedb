@@ -7,12 +7,15 @@
 //! main SQL parser doesn't yet tokenise as a single statement; the
 //! parser here lifts the body verbatim and lets the procedural-SQL
 //! parser handle it downstream.
-
-use pgwire::error::PgWireResult;
+//!
+//! Ported from the pgwire `ddl::procedure::create::parse` module; only the
+//! error type changed from pgwire `PgWireError` to the protocol-neutral
+//! [`DdlError`].
 
 use crate::control::security::catalog::procedure_types::{ParamDirection, ProcedureParam};
 
-use super::super::super::super::types::sqlstate_error;
+use super::super::super::super::result::DdlError;
+use super::super::parens::find_matching_paren;
 
 /// Output of [`parse_create_procedure`] — every field needed to
 /// assemble a `StoredProcedure`.
@@ -27,7 +30,7 @@ pub struct ParsedCreateProcedure {
 
 /// Parse `CREATE [OR REPLACE] PROCEDURE <name>(<params>)
 /// [WITH (...)] AS BEGIN ... END;`.
-pub fn parse_create_procedure(sql: &str) -> PgWireResult<ParsedCreateProcedure> {
+pub fn parse_create_procedure(sql: &str) -> Result<ParsedCreateProcedure, DdlError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_uppercase();
 
@@ -36,20 +39,29 @@ pub fn parse_create_procedure(sql: &str) -> PgWireResult<ParsedCreateProcedure> 
     } else if upper.starts_with("CREATE PROCEDURE ") {
         (false, &trimmed["CREATE PROCEDURE ".len()..])
     } else {
-        return Err(sqlstate_error("42601", "expected CREATE PROCEDURE"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected CREATE PROCEDURE".to_string(),
+        });
     };
 
     // Find param list in parens.
-    let paren_open = rest
-        .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected '(' after procedure name"))?;
+    let paren_open = rest.find('(').ok_or_else(|| DdlError {
+        sqlstate: "42601".to_string(),
+        message: "expected '(' after procedure name".to_string(),
+    })?;
     let name = rest[..paren_open].trim().to_lowercase();
     if name.is_empty() {
-        return Err(sqlstate_error("42601", "procedure name required"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "procedure name required".to_string(),
+        });
     }
 
-    let paren_close = super::super::super::parse_utils::find_matching_paren(rest, paren_open)
-        .ok_or_else(|| sqlstate_error("42601", "unmatched '(' in parameter list"))?;
+    let paren_close = find_matching_paren(rest, paren_open).ok_or_else(|| DdlError {
+        sqlstate: "42601".to_string(),
+        message: "unmatched '(' in parameter list".to_string(),
+    })?;
     let params_str = &rest[paren_open + 1..paren_close];
     let parameters = parse_procedure_params(params_str)?;
 
@@ -68,10 +80,10 @@ pub fn parse_create_procedure(sql: &str) -> PgWireResult<ParsedCreateProcedure> 
 
     let body_sql = body_start.trim().trim_end_matches(';').trim().to_string();
     if body_sql.is_empty() || !body_sql.to_uppercase().starts_with("BEGIN") {
-        return Err(sqlstate_error(
-            "42601",
-            "procedure body must start with BEGIN",
-        ));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "procedure body must start with BEGIN".to_string(),
+        });
     }
 
     Ok(ParsedCreateProcedure {
@@ -86,7 +98,7 @@ pub fn parse_create_procedure(sql: &str) -> PgWireResult<ParsedCreateProcedure> 
 
 /// Parse a comma-separated parameter list with optional `IN`/`OUT`/`INOUT`
 /// direction prefixes.
-fn parse_procedure_params(params_str: &str) -> PgWireResult<Vec<ProcedureParam>> {
+fn parse_procedure_params(params_str: &str) -> Result<Vec<ProcedureParam>, DdlError> {
     let trimmed = params_str.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
@@ -108,10 +120,10 @@ fn parse_procedure_params(params_str: &str) -> PgWireResult<Vec<ProcedureParam>>
         };
 
         if name_idx + 1 >= tokens.len() {
-            return Err(sqlstate_error(
-                "42601",
-                &format!("parameter must have name and type: '{}'", part.trim()),
-            ));
+            return Err(DdlError {
+                sqlstate: "42601".to_string(),
+                message: format!("parameter must have name and type: '{}'", part.trim()),
+            });
         }
 
         let name = tokens[name_idx].to_lowercase();
@@ -129,7 +141,7 @@ fn parse_procedure_params(params_str: &str) -> PgWireResult<Vec<ProcedureParam>>
 /// Parse the optional `WITH (MAX_ITERATIONS = N, TIMEOUT = N)` clause.
 /// Returns `(max_iterations, timeout_secs, rest)` where `rest` is the
 /// unconsumed tail of the input.
-fn parse_with_clause(s: &str) -> PgWireResult<(u64, u64, &str)> {
+fn parse_with_clause(s: &str) -> Result<(u64, u64, &str), DdlError> {
     let upper = s.to_uppercase();
     if !upper.starts_with("WITH") {
         return Ok((1_000_000, 60, s));
@@ -140,9 +152,10 @@ fn parse_with_clause(s: &str) -> PgWireResult<(u64, u64, &str)> {
         return Ok((1_000_000, 60, s));
     }
 
-    let close = after_with
-        .find(')')
-        .ok_or_else(|| sqlstate_error("42601", "unmatched '(' in WITH clause"))?;
+    let close = after_with.find(')').ok_or_else(|| DdlError {
+        sqlstate: "42601".to_string(),
+        message: "unmatched '(' in WITH clause".to_string(),
+    })?;
     let inner = &after_with[1..close];
     let rest = after_with[close + 1..].trim();
 
@@ -156,14 +169,16 @@ fn parse_with_clause(s: &str) -> PgWireResult<(u64, u64, &str)> {
         }
         match kv[0].to_uppercase().as_str() {
             "MAX_ITERATIONS" => {
-                max_iter = kv[1]
-                    .parse()
-                    .map_err(|_| sqlstate_error("42601", "invalid MAX_ITERATIONS value"))?;
+                max_iter = kv[1].parse().map_err(|_| DdlError {
+                    sqlstate: "42601".to_string(),
+                    message: "invalid MAX_ITERATIONS value".to_string(),
+                })?;
             }
             "TIMEOUT" => {
-                timeout = kv[1]
-                    .parse()
-                    .map_err(|_| sqlstate_error("42601", "invalid TIMEOUT value"))?;
+                timeout = kv[1].parse().map_err(|_| DdlError {
+                    sqlstate: "42601".to_string(),
+                    message: "invalid TIMEOUT value".to_string(),
+                })?;
             }
             _ => {}
         }

@@ -24,6 +24,7 @@ use super::function;
 use super::grant;
 use super::materialized_view;
 use super::oidc;
+use super::procedure;
 use super::retention_policy;
 use super::rls::{self, CreateRlsPolicyRequest};
 use super::role;
@@ -91,6 +92,26 @@ pub async fn try_dispatch(
         return Some(service_account::alter_service_account_set_databases(
             state, identity, &parts,
         ));
+    }
+
+    // Stored procedures. None of `CREATE [OR REPLACE] PROCEDURE`, `DROP
+    // PROCEDURE`, `SHOW PROCEDURES`, or `CALL <procedure>(...)` parse into any
+    // typed AST variant — the pgwire router dispatched all of them by string
+    // prefix from the raw SQL / token slice. Replicate that exactly here, before
+    // the parse gate, so the prefix recognition and syntax messages stay
+    // byte-identical.
+    if upper.starts_with("CREATE OR REPLACE PROCEDURE ") || upper.starts_with("CREATE PROCEDURE ") {
+        return Some(procedure::create_procedure(state, identity, sql));
+    }
+    if upper.starts_with("DROP PROCEDURE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(procedure::drop_procedure(state, identity, &parts));
+    }
+    if upper == "SHOW PROCEDURES" || upper.starts_with("SHOW PROCEDURES") {
+        return Some(procedure::show_procedures(state, identity));
+    }
+    if upper.starts_with("CALL ") {
+        return Some(procedure::call_procedure(state, identity, sql).await);
     }
 
     // User-defined functions. None of `CREATE [OR REPLACE] [AGGREGATE] FUNCTION`,

@@ -1,22 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE [OR REPLACE] PROCEDURE` pgwire handler.
+//! The protocol-neutral `create_procedure` handler.
 //!
-//! Grammar:
-//! ```text
-//! CREATE [OR REPLACE] PROCEDURE <name>(<param> <type> [, ...])
-//!   [WITH (MAX_ITERATIONS = N, TIMEOUT = N)]
-//!   AS BEGIN ... END;
-//! ```
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Ported from the pgwire `ddl::procedure::create::handler`. All non-return
+//! logic (privilege gate, parsing, or-replace pre-check, body parse validation,
+//! StoredProcedure build, catalog propose-and-apply, routability extraction,
+//! Lite definition-sync broadcast, and the `audit_record` call) is preserved
+//! verbatim; only the result construction changed from pgwire `Response` /
+//! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::catalog::procedure_types::StoredProcedure;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::catalog::propose_and_apply;
+use crate::control::server::shared::ddl::neutral::auth_support::{require_tenant_admin, status};
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::super::super::super::types::{require_tenant_admin, sqlstate_error};
 use super::parse::parse_create_procedure;
 use super::routability::extract_routability;
 
@@ -25,7 +24,7 @@ pub fn create_procedure(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create procedures")?;
 
     let parsed = parse_create_procedure(sql)?;
@@ -35,24 +34,32 @@ pub fn create_procedure(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        })?;
 
     if !parsed.or_replace
         && let Ok(Some(_)) = catalog.get_procedure(tenant_id, &parsed.name)
     {
-        return Err(sqlstate_error(
-            "42723",
-            &format!("procedure '{}' already exists", parsed.name),
-        ));
+        return Err(DdlError {
+            sqlstate: "42723".to_string(),
+            message: format!("procedure '{}' already exists", parsed.name),
+        });
     }
 
     // Validate body parses as procedural SQL.
-    crate::control::planner::procedural::parse_block(&parsed.body_sql)
-        .map_err(|e| sqlstate_error("42601", &format!("procedure body parse error: {e}")))?;
+    crate::control::planner::procedural::parse_block(&parsed.body_sql).map_err(|e| DdlError {
+        sqlstate: "42601".to_string(),
+        message: format!("procedure body parse error: {e}"),
+    })?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock before UNIX epoch"))?
+        .map_err(|_| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system clock before UNIX epoch".to_string(),
+        })?
         .as_secs();
 
     let routability = extract_routability(&parsed.body_sql);
@@ -75,7 +82,7 @@ pub fn create_procedure(
     // applier writes the record to local redb and clears the
     // parsed block cache so the next CALL re-parses the new body.
     let entry = crate::control::catalog_entry::CatalogEntry::PutProcedure(Box::new(stored.clone()));
-    super::super::super::catalog_propose::propose_and_apply(state, &entry)?;
+    propose_and_apply(state, &entry)?;
 
     // Broadcast to connected Lite sessions after the catalog commit is durable.
     emit_procedure_put(state, &stored);
@@ -87,7 +94,7 @@ pub fn create_procedure(
         &format!("CREATE PROCEDURE {}", stored.name),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE PROCEDURE"))])
+    Ok(status("CREATE PROCEDURE"))
 }
 
 /// Encode the stored procedure and broadcast a `DefinitionSyncMsg` to all

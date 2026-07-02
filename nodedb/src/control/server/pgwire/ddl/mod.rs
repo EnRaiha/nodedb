@@ -34,7 +34,6 @@ pub mod ownership;
 pub(crate) mod parse_utils;
 pub mod period_lock;
 pub mod permission_tree;
-pub mod procedure;
 pub mod pubsub;
 pub mod query_functions;
 pub mod rate_gate;
