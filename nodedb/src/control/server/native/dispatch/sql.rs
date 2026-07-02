@@ -300,14 +300,14 @@ async fn execute_planned(
     // scan child is a plain user-collection read, and `plan_sql_with_rls`
     // already applied RLS + permission planning, so it is safe to stream.
     if allow_stream {
-        match try_open_sql_stream(ctx, seq, &tasks, database_id).await {
+        match try_open_sql_stream(ctx, seq, &tasks, database_id, sql).await {
             Ok(Some(stream)) => return SqlOutcome::Stream(stream),
             Ok(None) => {}
             Err(e) => return resp(error_to_native(seq, &e)),
         }
     }
 
-    run_dispatch_loop(ctx, seq, tasks).await
+    run_dispatch_loop(ctx, seq, tasks, sql, database_id).await
 }
 
 // ─── Bound parameter substitution ────────────────────────────────────

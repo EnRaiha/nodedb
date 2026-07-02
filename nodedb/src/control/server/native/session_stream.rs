@@ -8,13 +8,48 @@
 
 use futures::StreamExt;
 
+use nodedb_types::Value;
 use nodedb_types::protocol::{NativeResponse, ResponseStatus};
 
 use crate::control::server::conn_stream::ConnStream;
+use crate::control::server::response_shape::compose::shape_decoded_rows;
+use crate::control::server::response_shape::project::ProjectionItem;
 use crate::data::executor::response_codec::decode_payload_to_json;
 
 use super::codec::{self, FrameFormat};
-use super::dispatch::{self, SqlStream};
+use super::dispatch::{self, SqlStream, to_native_columns_rows};
+
+/// Decode one streamed row-batch's JSON text into columns/rows.
+///
+/// Streamable plans are always plain unordered scans (`streamable_gather_child`
+/// only matches `Query(Exchange(Gather{as_aggregate:false}))` over a
+/// streamable scan) — never a KV point-get or vector search — so a batch
+/// here only needs decode + scan-envelope unwrap + the statement's
+/// SELECT-list projection, exactly the pure [`shape_decoded_rows`] core the
+/// materialized dispatch loop also uses (via
+/// `response_shape::compose::shape_response_materialized`). `apply_kv_wrap`
+/// / `translate_if_vector` do not apply to a streamed batch and are
+/// deliberately not called here, matching pgwire's own streamed responses,
+/// which likewise only ever get column projection, never kv_wrap/vector.
+///
+/// A JSON-parse failure (non-JSON/malformed batch text) falls back to a
+/// single "result" text column, matching the shape this decoder has always
+/// produced for an undecodable batch.
+fn decode_batch_to_columns_rows(
+    json_text: &str,
+    projection: Option<&[ProjectionItem]>,
+) -> (Vec<String>, Vec<Vec<Value>>) {
+    match sonic_rs::from_str::<serde_json::Value>(json_text) {
+        Ok(decoded) => {
+            let shaped = shape_decoded_rows(&decoded, projection);
+            to_native_columns_rows(&shaped)
+        }
+        Err(_) => (
+            vec!["result".into()],
+            vec![vec![Value::String(json_text.to_string())]],
+        ),
+    }
+}
 
 /// Drive a lazy SQL row stream to `stream` as multiple frames.
 ///
@@ -36,6 +71,7 @@ pub(super) async fn emit_sql_stream(
         seq,
         limit,
         stream: mut rows_stream,
+        projection,
     } = sql_stream;
 
     let mut emitted: usize = 0;
@@ -58,7 +94,8 @@ pub(super) async fn emit_sql_stream(
         last_lsn = batch.watermark_lsn.as_u64();
 
         let json_text = decode_payload_to_json(&batch.payload);
-        let (cols, mut batch_rows) = dispatch::parse_json_to_columns_rows(&json_text);
+        let (cols, mut batch_rows) =
+            decode_batch_to_columns_rows(&json_text, projection.as_deref());
         if batch_rows.is_empty() {
             continue;
         }
@@ -169,6 +206,7 @@ mod tests {
                 seq: 7,
                 limit,
                 stream,
+                projection: None,
             };
             emit_sql_stream(&mut conn, sql_stream, FrameFormat::MessagePack)
                 .await

@@ -21,6 +21,7 @@ use crate::control::gateway::core::QueryContext;
 use crate::control::server::exchange::gather::gather_all_cores_stream;
 use crate::control::server::exchange::streamable::streamable_gather_child;
 use crate::control::server::pgwire::session::TransactionState;
+use crate::control::server::response_shape::project::{ProjectionItem, parse_select_projection};
 use crate::control::server::result_stream::ResultStream;
 
 use super::DispatchCtx;
@@ -62,6 +63,12 @@ pub(crate) struct SqlStream {
     pub limit: usize,
     /// The row-batch stream fanned out across cores / routes.
     pub stream: ResultStream,
+    /// The statement's parsed SELECT-list projection, computed once up
+    /// front. Streamable plans are always plain unordered scans (never a
+    /// KV point-get or vector search — see `streamable_gather_child`), so
+    /// each batch only needs decode + scan-envelope unwrap + this
+    /// projection; no `apply_kv_wrap` / `translate_if_vector` applies here.
+    pub projection: Option<Vec<ProjectionItem>>,
 }
 
 /// If `task`-list is an eligible streamable SELECT, open its row stream.
@@ -80,6 +87,7 @@ pub(crate) async fn try_open_sql_stream(
     seq: u64,
     tasks: &[nodedb_physical::physical_task::PhysicalTask],
     database_id: crate::types::DatabaseId,
+    sql: &str,
 ) -> crate::Result<Option<SqlStream>> {
     let [task] = tasks else {
         return Ok(None);
@@ -92,6 +100,10 @@ pub(crate) async fn try_open_sql_stream(
     let Some((child_plan, limit)) = streamable_gather_child(&task.plan) else {
         return Ok(None);
     };
+
+    // Parsed once up front — mirrors the materialized dispatch loop, which
+    // parses the SELECT projection list once per statement.
+    let projection = parse_select_projection(sql);
 
     let stream = if let Some(gw) = ctx.state.gateway.as_ref() {
         let gw_ctx = QueryContext {
@@ -110,5 +122,10 @@ pub(crate) async fn try_open_sql_stream(
         )?
     };
 
-    Ok(Some(SqlStream { seq, limit, stream }))
+    Ok(Some(SqlStream {
+        seq,
+        limit,
+        stream,
+        projection,
+    }))
 }

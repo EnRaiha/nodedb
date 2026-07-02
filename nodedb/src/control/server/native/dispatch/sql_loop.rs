@@ -11,12 +11,15 @@ use nodedb_types::value::Value;
 
 use crate::bridge::envelope::{Response, Status};
 use crate::control::server::pgwire::session::TransactionState;
-use crate::data::executor::response_codec;
+use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
+use crate::control::server::response_shape::project::parse_select_projection;
+use crate::control::server::response_shape::types::describe_plan;
+use crate::types::DatabaseId;
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::sql_gateway::dispatch_task_via_gateway;
 use super::streaming::SqlOutcome;
-use super::{DispatchCtx, error_to_native};
+use super::{DispatchCtx, error_to_native, shape_error_to_native, to_native_columns_rows};
 use crate::control::server::broadcast::broadcast_count_to_all_cores;
 use crate::control::server::exchange::resolve::{Resolved, resolve_and_materialize};
 
@@ -37,9 +40,17 @@ pub(super) async fn run_dispatch_loop(
     ctx: &DispatchCtx<'_>,
     seq: u64,
     tasks: Vec<PhysicalTask>,
+    sql: &str,
+    database_id: DatabaseId,
 ) -> SqlOutcome {
+    // Parsed once, up front — mirrors pgwire's `execute_planned_sql`, which
+    // parses the SELECT projection list once per statement and applies it to
+    // every task's response.
+    let projection = parse_select_projection(sql);
+
     let mut all_columns: Option<Vec<String>> = None;
     let mut all_rows: Vec<Vec<Value>> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     let mut last_lsn = 0u64;
     let mut total_affected = 0u64;
 
@@ -67,6 +78,7 @@ pub(super) async fn run_dispatch_loop(
             }
         }
 
+        let plan_for_response = task.plan.clone();
         let task_resp = match dispatch_task(ctx, task).await {
             Ok(r) => r,
             Err(e) => return resp(error_to_native(seq, &e)),
@@ -90,12 +102,31 @@ pub(super) async fn run_dispatch_loop(
         if task_resp.payload.is_empty() {
             total_affected += 1;
         } else {
-            let json_text = response_codec::decode_payload_to_json(&task_resp.payload);
-            let (cols, rows) = super::parse_json_to_columns_rows(&json_text);
-            if !cols.is_empty() && all_columns.is_none() {
-                all_columns = Some(cols);
+            let plan_kind = describe_plan(&plan_for_response);
+            match shape_response_materialized(
+                &task_resp.payload,
+                &plan_for_response,
+                plan_kind,
+                projection.as_deref(),
+                ctx.state,
+                database_id,
+                ctx.tenant_id(),
+            ) {
+                Ok(ShapeOutcome::Rows(mut shaped)) => {
+                    if let Some(notice) = shaped.notice.take() {
+                        warnings.push(notice);
+                    }
+                    let (cols, rows) = to_native_columns_rows(&shaped);
+                    if !cols.is_empty() && all_columns.is_none() {
+                        all_columns = Some(cols);
+                    }
+                    all_rows.extend(rows);
+                }
+                Ok(ShapeOutcome::Passthrough) => {
+                    total_affected += 1;
+                }
+                Err(e) => return resp(shape_error_to_native(seq, &e)),
             }
-            all_rows.extend(rows);
         }
     }
 
@@ -103,6 +134,7 @@ pub(super) async fn run_dispatch_loop(
         let mut r = NativeResponse::ok(seq);
         r.rows_affected = Some(total_affected);
         r.watermark_lsn = last_lsn;
+        r.warnings = warnings;
         resp(r)
     } else {
         resp(NativeResponse {
@@ -114,7 +146,7 @@ pub(super) async fn run_dispatch_loop(
             watermark_lsn: last_lsn,
             error: None,
             auth: None,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 }

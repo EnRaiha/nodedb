@@ -13,8 +13,8 @@ use crate::data::executor::response_codec::{
     ArraySliceResponse, RowsPayload, decode_payload_to_json,
 };
 use nodedb_physical::physical_plan::{
-    ColumnarOp, CrdtOp, DocumentOp, GraphOp, MetaOp, QueryOp, SpatialOp, TextOp,
-    TimeseriesOp, VectorOp,
+    ColumnarOp, CrdtOp, DocumentOp, GraphOp, MetaOp, QueryOp, SpatialOp, TextOp, TimeseriesOp,
+    VectorOp,
 };
 use zerompk;
 

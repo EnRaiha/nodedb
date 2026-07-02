@@ -19,7 +19,7 @@ mod streaming;
 mod transaction;
 
 pub(crate) use auth::{handle_auth, handle_ping};
-pub(crate) use conversion::{error_to_native, parse_json_to_columns_rows};
+pub(crate) use conversion::{error_to_native, shape_error_to_native, to_native_columns_rows};
 pub(crate) use ctx::DispatchCtx;
 pub(crate) use direct_ops::{handle_direct_op, handle_graph_match};
 pub(crate) use session_ops::{handle_reset, handle_set, handle_show};

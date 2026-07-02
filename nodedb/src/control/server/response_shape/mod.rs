@@ -2,6 +2,7 @@
 
 //! Shared, protocol-neutral response shaping helpers.
 
+pub mod compose;
 pub mod kv;
 pub mod project;
 pub mod types;

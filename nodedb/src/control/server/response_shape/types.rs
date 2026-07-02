@@ -7,8 +7,8 @@
 
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::{
-    ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, QueryOp, SpatialOp, TextOp,
-    TimeseriesOp, VectorOp,
+    ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, QueryOp, SpatialOp, TextOp, TimeseriesOp,
+    VectorOp,
 };
 
 #[derive(Debug, Clone, Copy)]

@@ -10,14 +10,15 @@ use crate::control::gateway::core::QueryContext as GatewayQueryContext;
 use crate::control::planner::calvin::{
     CrossShardTxnMode, DispatchClass, classify_dispatch, dispatch_tasks_to_calvin,
 };
-use crate::data::executor::response_codec;
+use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
+use crate::control::server::response_shape::types::describe_plan;
 use crate::types::{DatabaseId, Lsn, RequestId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use crate::control::server::wal_dispatch;
 
 use super::super::super::dispatch_utils;
-use super::{DispatchCtx, error_to_native};
+use super::{DispatchCtx, error_to_native, shape_error_to_native, to_native_columns_rows};
 
 /// Dispatch a direct Data Plane operation by opcode.
 pub(crate) async fn handle_direct_op(
@@ -192,6 +193,7 @@ pub(crate) async fn handle_graph_match(
         return NativeResponse::error(seq, "42501", e.to_string());
     }
 
+    let plan_for_response = plan.clone();
     ctx.state.tenant_request_start(tenant_id);
     let raw = dispatch_single_task_raw(ctx, tenant_id, vshard_id, plan).await;
     ctx.state.tenant_request_end(tenant_id);
@@ -202,7 +204,7 @@ pub(crate) async fn handle_graph_match(
     };
 
     if resp.status == Status::Error {
-        return data_plane_response_to_native(seq, &resp);
+        return data_plane_response_to_native(ctx, seq, &plan_for_response, &resp);
     }
 
     // Unwrap the `{rows, frontier, resume}` envelope into a bare rows array. The
@@ -217,7 +219,7 @@ pub(crate) async fn handle_graph_match(
             },
             Err(e) => return error_to_native(seq, &e),
         };
-    data_plane_response_to_native(seq, &unwrapped)
+    data_plane_response_to_native(ctx, seq, &plan_for_response, &unwrapped)
 }
 
 /// Dispatch one plan via the gateway (when wired) or the local SPSC path,
@@ -233,8 +235,9 @@ async fn dispatch_single_task(
     vshard_id: VShardId,
     plan: PhysicalPlan,
 ) -> NativeResponse {
+    let plan_for_response = plan.clone();
     match dispatch_single_task_raw(ctx, tenant_id, vshard_id, plan).await {
-        Ok(resp) => data_plane_response_to_native(seq, &resp),
+        Ok(resp) => data_plane_response_to_native(ctx, seq, &plan_for_response, &resp),
         Err(e) => error_to_native(seq, &e),
     }
 }
@@ -312,7 +315,19 @@ fn gateway_payloads_to_response(payloads: Vec<Vec<u8>>) -> Response {
     }
 }
 
-fn data_plane_response_to_native(seq: u64, resp: &Response) -> NativeResponse {
+/// Convert a raw Data-Plane [`Response`] into a [`NativeResponse`], shaping
+/// a non-empty payload through the shared composed shaper.
+///
+/// Direct ops (`OpCode::PointGet`, `VectorSearch`, `GraphMatch`, ...) have no
+/// SQL text, so there is no SELECT-list to project — `projection` is always
+/// `None` here, matching pgwire's own direct-op (`{ }` field syntax / RESP)
+/// handlers, which likewise never apply column projection.
+fn data_plane_response_to_native(
+    ctx: &DispatchCtx<'_>,
+    seq: u64,
+    plan: &PhysicalPlan,
+    resp: &Response,
+) -> NativeResponse {
     if resp.status == Status::Error {
         let msg = if resp.payload.is_empty() {
             resp.error_code
@@ -331,17 +346,35 @@ fn data_plane_response_to_native(seq: u64, resp: &Response) -> NativeResponse {
         return r;
     }
 
-    let json_text = response_codec::decode_payload_to_json(&resp.payload);
-    let (columns, rows) = super::parse_json_to_columns_rows(&json_text);
-    NativeResponse {
-        seq,
-        status: nodedb_types::protocol::ResponseStatus::Ok,
-        columns: Some(columns),
-        rows: Some(rows),
-        rows_affected: None,
-        watermark_lsn: resp.watermark_lsn.as_u64(),
-        error: None,
-        auth: None,
-        warnings: Vec::new(),
+    let plan_kind = describe_plan(plan);
+    match shape_response_materialized(
+        &resp.payload,
+        plan,
+        plan_kind,
+        None,
+        ctx.state,
+        ctx.database_id(),
+        ctx.tenant_id(),
+    ) {
+        Ok(ShapeOutcome::Rows(shaped)) => {
+            let (columns, rows) = to_native_columns_rows(&shaped);
+            NativeResponse {
+                seq,
+                status: nodedb_types::protocol::ResponseStatus::Ok,
+                columns: Some(columns),
+                rows: Some(rows),
+                rows_affected: None,
+                watermark_lsn: resp.watermark_lsn.as_u64(),
+                error: None,
+                auth: None,
+                warnings: shaped.notice.into_iter().collect(),
+            }
+        }
+        Ok(ShapeOutcome::Passthrough) => {
+            let mut r = NativeResponse::ok(seq);
+            r.watermark_lsn = resp.watermark_lsn.as_u64();
+            r
+        }
+        Err(e) => shape_error_to_native(seq, &e),
     }
 }
