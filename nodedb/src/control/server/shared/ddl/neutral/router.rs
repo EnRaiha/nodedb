@@ -6,13 +6,14 @@
 //! other statement returns `None` so the transitional pgwire delegation in the
 //! parent [`super::super::dispatch`] handles it.
 
-use nodedb_sql::ddl_ast::statement::{CollectionStmt, NodedbStatement, PolicyStmt};
+use nodedb_sql::ddl_ast::statement::{AuthStmt, CollectionStmt, NodedbStatement, PolicyStmt};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::result::{DdlError, DdlResult};
+use super::oidc;
 use super::rls::{self, CreateRlsPolicyRequest};
 use super::sequence::{self, CreateSequenceRequest};
 
@@ -156,6 +157,40 @@ pub async fn try_dispatch(
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
             Some(rls::show_rls_policies(state, identity, &parts))
+        }
+
+        NodedbStatement::Auth(AuthStmt::CreateOidcProvider {
+            name,
+            issuer,
+            jwks_uri,
+            audience,
+            claim_mappings,
+        }) => Some(oidc::create_oidc_provider(
+            state,
+            identity,
+            name,
+            issuer,
+            jwks_uri,
+            audience.as_deref(),
+            claim_mappings,
+        )),
+
+        NodedbStatement::Auth(AuthStmt::AlterOidcProviderClaimMapping {
+            name,
+            claim_mappings,
+        }) => Some(oidc::alter_oidc_provider_claim_mapping(
+            state,
+            identity,
+            name,
+            claim_mappings,
+        )),
+
+        NodedbStatement::Auth(AuthStmt::DropOidcProvider { name, if_exists }) => {
+            Some(oidc::drop_oidc_provider(state, identity, name, *if_exists))
+        }
+
+        NodedbStatement::Auth(AuthStmt::ShowOidcProviders) => {
+            Some(oidc::show_oidc_providers(state, identity))
         }
 
         _ => None,

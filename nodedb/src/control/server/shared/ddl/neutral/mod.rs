@@ -7,6 +7,7 @@
 //! to them; every other statement returns `None` so the transitional pgwire
 //! delegation in the parent [`super::dispatch`] handles it.
 
+pub mod oidc;
 pub mod rls;
 pub mod router;
 pub mod sequence;

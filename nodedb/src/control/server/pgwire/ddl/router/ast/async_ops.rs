@@ -6,7 +6,7 @@ use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use nodedb_sql::ddl_ast::statement::{
-    AuthStmt, AutomationStmt, CollectionStmt, DatabaseStmt, MiscStmt, NodedbStatement, PolicyStmt,
+    AutomationStmt, CollectionStmt, DatabaseStmt, MiscStmt, NodedbStatement, PolicyStmt,
     StreamViewStmt,
 };
 
@@ -25,10 +25,6 @@ use crate::control::server::pgwire::ddl::custom_type::{
     alter_type_add_value, create_composite_type, create_enum_type, drop_type, show_types,
 };
 use crate::control::server::pgwire::ddl::materialized_view::create_materialized_view;
-use crate::control::server::pgwire::ddl::oidc::{
-    alter_oidc_provider_claim_mapping, create_oidc_provider, drop_oidc_provider,
-    show_oidc_providers,
-};
 use crate::control::server::pgwire::ddl::retention_policy::create_retention_policy;
 use crate::control::server::pgwire::ddl::schedule::{CreateScheduleRequest, create_schedule};
 use crate::control::server::pgwire::ddl::synonym_group::{
@@ -361,38 +357,6 @@ pub(super) async fn try_dispatch_async(
             from_db,
             to_db,
         }) => Some(handle_move_tenant(state, identity, tenant_name, from_db, to_db).await),
-
-        NodedbStatement::Auth(AuthStmt::CreateOidcProvider {
-            name,
-            issuer,
-            jwks_uri,
-            audience,
-            claim_mappings,
-        }) => Some(
-            create_oidc_provider(
-                state,
-                identity,
-                name,
-                issuer,
-                jwks_uri,
-                audience.as_deref(),
-                claim_mappings,
-            )
-            .await,
-        ),
-
-        NodedbStatement::Auth(AuthStmt::AlterOidcProviderClaimMapping {
-            name,
-            claim_mappings,
-        }) => Some(alter_oidc_provider_claim_mapping(state, identity, name, claim_mappings).await),
-
-        NodedbStatement::Auth(AuthStmt::DropOidcProvider { name, if_exists }) => {
-            Some(drop_oidc_provider(state, identity, name, *if_exists).await)
-        }
-
-        NodedbStatement::Auth(AuthStmt::ShowOidcProviders) => {
-            Some(show_oidc_providers(state, identity))
-        }
 
         _ => None,
     }
