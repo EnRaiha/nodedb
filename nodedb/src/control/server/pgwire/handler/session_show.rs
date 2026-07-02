@@ -20,7 +20,7 @@ impl NodeDbPgHandler {
         addr: &std::net::SocketAddr,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
-        use super::super::session::parse_show_command;
+        use crate::control::server::shared::session::parse_show_command;
         use pgwire::error::ErrorInfo;
 
         let param = match parse_show_command(sql) {
@@ -100,7 +100,7 @@ impl NodeDbPgHandler {
         addr: &std::net::SocketAddr,
         param: &str,
     ) -> PgWireResult<String> {
-        use super::super::session::is_known_pg_runtime_parameter;
+        use crate::control::server::shared::session::is_known_pg_runtime_parameter;
         use pgwire::error::ErrorInfo;
 
         let builtin = match param {

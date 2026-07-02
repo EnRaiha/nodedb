@@ -57,7 +57,7 @@ pub fn enrich_auth_context_with_scopes(
 /// replacing the connection-level identity for RLS purposes.
 pub fn build_auth_context_with_session(
     identity: &AuthenticatedIdentity,
-    sessions: &crate::control::server::pgwire::session::SessionStore,
+    sessions: &crate::control::server::shared::session::SessionStore,
     addr: &std::net::SocketAddr,
 ) -> AuthContext {
     // Per-transaction JWT: SET LOCAL nodedb.auth_token = 'eyJ...'

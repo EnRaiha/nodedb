@@ -20,9 +20,9 @@ use nodedb_types::protocol::NativeResponse;
 use crate::control::gateway::core::QueryContext;
 use crate::control::server::exchange::gather::gather_all_cores_stream;
 use crate::control::server::exchange::streamable::streamable_gather_child;
-use crate::control::server::pgwire::session::TransactionState;
 use crate::control::server::response_shape::project::{ProjectionItem, parse_select_projection};
 use crate::control::server::result_stream::ResultStream;
+use crate::control::server::shared::session::TransactionState;
 
 use super::DispatchCtx;
 

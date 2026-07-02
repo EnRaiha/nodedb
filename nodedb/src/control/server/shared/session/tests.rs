@@ -2,8 +2,8 @@
 
 //! Integration tests for session store (transaction lifecycle, params, cursors, live).
 
-use crate::control::server::pgwire::session::state::TransactionState;
-use crate::control::server::pgwire::session::store::SessionStore;
+use crate::control::server::shared::session::state::TransactionState;
+use crate::control::server::shared::session::store::SessionStore;
 
 #[test]
 fn transaction_lifecycle() {

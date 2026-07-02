@@ -24,7 +24,7 @@ impl NodeDbPgHandler {
             return None;
         }
         if self.sessions.transaction_state(addr)
-            != crate::control::server::pgwire::session::TransactionState::InBlock
+            != crate::control::server::shared::session::TransactionState::InBlock
         {
             return None;
         }

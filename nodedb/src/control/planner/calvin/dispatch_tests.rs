@@ -6,7 +6,7 @@ use super::*;
 use crate::Error;
 use crate::control::planner::calvin::cross_shard_mode::CrossShardTxnMode;
 use crate::control::planner::calvin::types::{DispatchClass, DispatchOutcome};
-use crate::control::server::pgwire::session::TransactionState;
+use crate::control::server::shared::session::TransactionState;
 use crate::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};

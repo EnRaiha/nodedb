@@ -9,7 +9,7 @@ use nodedb_types::value::Value;
 use crate::control::planner::calvin::{
     CrossShardTxnMode, DispatchClass, classify_dispatch, dispatch_tasks_to_calvin,
 };
-use crate::control::server::pgwire::session::TransactionState;
+use crate::control::server::shared::session::TransactionState;
 
 use super::pgwire_bridge::pgwire_result_to_native;
 use super::sql_admin::{handle_explain, handle_set_sql, handle_show_sql, is_session_show};

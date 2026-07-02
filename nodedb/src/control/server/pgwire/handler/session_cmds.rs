@@ -92,7 +92,7 @@ impl NodeDbPgHandler {
         addr: &std::net::SocketAddr,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
-        use super::super::session::parse_set_command;
+        use crate::control::server::shared::session::parse_set_command;
         use pgwire::api::results::Tag;
 
         // Handle SET TRANSACTION ... and SET SESSION CHARACTERISTICS AS TRANSACTION ...
@@ -211,28 +211,30 @@ impl NodeDbPgHandler {
             }
         }
 
-        if key == super::super::session::read_consistency::PARAM_KEY
-            && super::super::session::read_consistency::parse_value(&value).is_none()
+        if key == crate::control::server::shared::session::read_consistency::PARAM_KEY
+            && crate::control::server::shared::session::read_consistency::parse_value(&value)
+                .is_none()
         {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "22023".to_owned(),
                 format!(
                     "invalid value for {}: '{value}'. Valid: strong, bounded_staleness:<secs>, eventual",
-                    super::super::session::read_consistency::PARAM_KEY
+                    crate::control::server::shared::session::read_consistency::PARAM_KEY
                 ),
             ))));
         }
 
-        if key == super::super::session::cross_shard_mode::PARAM_KEY
-            && super::super::session::cross_shard_mode::parse_value(&value).is_none()
+        if key == crate::control::server::shared::session::cross_shard_mode::PARAM_KEY
+            && crate::control::server::shared::session::cross_shard_mode::parse_value(&value)
+                .is_none()
         {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "22023".to_owned(),
                 format!(
                     "invalid value for {}: '{value}'. Valid values: 'strict', 'best_effort_non_atomic'",
-                    super::super::session::cross_shard_mode::PARAM_KEY
+                    crate::control::server::shared::session::cross_shard_mode::PARAM_KEY
                 ),
             ))));
         }
@@ -347,7 +349,7 @@ impl NodeDbPgHandler {
         // unknown keys return `42704 undefined_object` instead of being
         // silently stored — silent storage is the class of bug that allowed
         // `SET TENANT` to look successful while routing nothing.
-        if !super::super::session::is_known_settable_runtime_parameter(&key) {
+        if !crate::control::server::shared::session::is_known_settable_runtime_parameter(&key) {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42704".to_owned(),
@@ -381,7 +383,9 @@ impl NodeDbPgHandler {
                  tenant is identity-bound at CREATE USER time",
             ));
         }
-        if self.sessions.transaction_state(addr) != super::super::session::TransactionState::Idle {
+        if self.sessions.transaction_state(addr)
+            != crate::control::server::shared::session::TransactionState::Idle
+        {
             return Err(sqlstate_error(
                 "25001",
                 "cannot change session tenant inside an active transaction \
@@ -483,7 +487,9 @@ impl NodeDbPgHandler {
             // can't probe whether a tenant override exists.
             return Err(sqlstate_error("42501", "only superuser may RESET TENANT"));
         }
-        if self.sessions.transaction_state(addr) != super::super::session::TransactionState::Idle {
+        if self.sessions.transaction_state(addr)
+            != crate::control::server::shared::session::TransactionState::Idle
+        {
             return Err(sqlstate_error(
                 "25001",
                 "cannot RESET TENANT inside an active transaction",

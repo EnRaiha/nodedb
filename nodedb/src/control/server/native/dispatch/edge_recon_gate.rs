@@ -18,7 +18,7 @@ use nodedb_types::protocol::NativeResponse;
 use crate::control::planner::calvin::{
     dispatch_dependent_edge_recon, plan_needs_implicit_edge_recon,
 };
-use crate::control::server::pgwire::session::TransactionState;
+use crate::control::server::shared::session::TransactionState;
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::{DispatchCtx, SqlOutcome, error_to_native};

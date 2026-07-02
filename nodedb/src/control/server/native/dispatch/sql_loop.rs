@@ -10,10 +10,10 @@ use nodedb_types::protocol::NativeResponse;
 use nodedb_types::value::Value;
 
 use crate::bridge::envelope::{Response, Status};
-use crate::control::server::pgwire::session::TransactionState;
 use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
 use crate::control::server::response_shape::project::parse_select_projection;
 use crate::control::server::response_shape::types::describe_plan;
+use crate::control::server::shared::session::TransactionState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_task::PhysicalTask;
 

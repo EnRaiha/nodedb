@@ -37,7 +37,7 @@ impl NodeDbPgHandler {
             let next = self.state.wal.next_lsn();
             crate::types::Lsn::new(next.as_u64().saturating_sub(1))
         };
-        crate::control::server::pgwire::session::ddl_buffer::activate();
+        crate::control::server::shared::session::ddl_buffer::activate();
         self.sessions.begin(addr, snapshot_lsn).map_err(|msg| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -325,7 +325,7 @@ impl NodeDbPgHandler {
         }
 
         // Flush any buffered DDL entries as a single atomic batch.
-        if let Some(payloads) = crate::control::server::pgwire::session::ddl_buffer::take()
+        if let Some(payloads) = crate::control::server::shared::session::ddl_buffer::take()
             && !payloads.is_empty()
         {
             use nodedb_cluster::{MetadataEntry, encode_entry};
@@ -379,7 +379,7 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         addr: &std::net::SocketAddr,
     ) -> PgWireResult<Vec<Response>> {
-        crate::control::server::pgwire::session::ddl_buffer::discard();
+        crate::control::server::shared::session::ddl_buffer::discard();
         let reservations = self.sessions.rollback(addr).unwrap_or_default();
         for handle in &reservations {
             let key = &handle.sequence_key;

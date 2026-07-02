@@ -22,7 +22,7 @@ use crate::control::planner::context::QueryContext;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::admission::{AdmissionRegistry, ConnectionPermit};
 use crate::control::server::conn_stream::ConnStream;
-use crate::control::server::pgwire::session::SessionStore;
+use crate::control::server::shared::session::SessionStore;
 use crate::control::state::SharedState;
 
 use super::codec::{self, FrameFormat};

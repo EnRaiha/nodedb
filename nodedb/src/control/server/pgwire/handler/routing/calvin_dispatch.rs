@@ -13,7 +13,7 @@ use crate::control::planner::calvin::{
     dispatch_dependent_edge_recon, dispatch_tasks_to_calvin, is_dependent_predicate,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::session::TransactionState;
+use crate::control::server::shared::session::TransactionState;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 

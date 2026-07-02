@@ -5,7 +5,7 @@
 
 use crate::control::planner::context::QueryContext;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::session::SessionStore;
+use crate::control::server::shared::session::SessionStore;
 use crate::control::state::SharedState;
 use crate::types::{TenantId, VShardId};
 

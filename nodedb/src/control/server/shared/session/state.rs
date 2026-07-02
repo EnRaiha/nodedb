@@ -18,17 +18,6 @@ pub enum TransactionState {
     Failed,
 }
 
-impl TransactionState {
-    /// PostgreSQL ReadyForQuery status byte.
-    pub fn status_byte(&self) -> u8 {
-        match self {
-            TransactionState::Idle => b'I',
-            TransactionState::InBlock => b'T',
-            TransactionState::Failed => b'E',
-        }
-    }
-}
-
 /// Server-side cursor state.
 pub struct CursorState {
     /// Pre-fetched result rows as JSON strings.
@@ -42,9 +31,9 @@ pub struct CursorState {
 }
 
 /// Per-connection session state.
-pub struct PgSession {
+pub struct ConnSession {
     pub tx_state: TransactionState,
-    /// Database bound to this pgwire session.
+    /// Database bound to this connection session.
     ///
     /// Set at startup from the `database` parameter in the PostgreSQL StartupMessage
     /// (i.e. `psql -d <name>` or `dbname=<name>` in the connection string). If the
@@ -113,13 +102,13 @@ pub struct PgSession {
     pub temp_tables: super::temp_tables::TempTableRegistry,
     /// Per-session plan cache for prepared statement execution.
     /// Keyed by (sql_hash, schema_version) — auto-invalidates on DDL.
-    pub plan_cache: crate::control::server::pgwire::handler::prepared::plan_cache::PlanCache,
+    pub plan_cache: crate::control::server::shared::session::plan_cache::PlanCache,
     /// GAP_FREE sequence reservations pending commit/rollback.
     /// On COMMIT: each reservation is finalized. On ROLLBACK: counter decremented.
     pub pending_sequence_reservations: Vec<crate::control::sequence::gap_free::ReservationHandle>,
 }
 
-impl PgSession {
+impl ConnSession {
     pub(super) fn new() -> Self {
         let mut parameters = HashMap::new();
         // Default session parameters (PostgreSQL compatibility).
@@ -160,8 +149,7 @@ impl PgSession {
             pending_notices: Vec::new(),
             prepared_stmts: super::prepared_cache::PreparedStatementCache::new(256),
             temp_tables: super::temp_tables::TempTableRegistry::new(),
-            plan_cache:
-                crate::control::server::pgwire::handler::prepared::plan_cache::PlanCache::new(128),
+            plan_cache: crate::control::server::shared::session::plan_cache::PlanCache::new(128),
             pending_sequence_reservations: Vec::new(),
         }
     }

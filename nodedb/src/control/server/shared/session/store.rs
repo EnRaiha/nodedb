@@ -10,11 +10,11 @@ use nodedb_types::DatabaseId;
 
 use crate::types::TenantId;
 
-use super::state::{PgSession, TransactionState};
+use super::state::{ConnSession, TransactionState};
 
 /// Concurrent session store — keyed by socket address.
 pub struct SessionStore {
-    sessions: RwLock<HashMap<SocketAddr, PgSession>>,
+    sessions: RwLock<HashMap<SocketAddr, ConnSession>>,
 }
 
 impl Default for SessionStore {
@@ -33,7 +33,7 @@ impl SessionStore {
     /// Ensure a session exists for this address.
     pub fn ensure_session(&self, addr: SocketAddr) {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        sessions.entry(addr).or_insert_with(PgSession::new);
+        sessions.entry(addr).or_insert_with(ConnSession::new);
     }
 
     /// Remove a session (connection closed).
@@ -179,7 +179,7 @@ impl SessionStore {
     pub(super) fn read_session<R>(
         &self,
         addr: &SocketAddr,
-        f: impl FnOnce(&PgSession) -> R,
+        f: impl FnOnce(&ConnSession) -> R,
     ) -> Option<R> {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions.get(addr).map(f)
@@ -189,7 +189,7 @@ impl SessionStore {
     pub(super) fn write_session<R>(
         &self,
         addr: &SocketAddr,
-        f: impl FnOnce(&mut PgSession) -> R,
+        f: impl FnOnce(&mut ConnSession) -> R,
     ) -> Option<R> {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
         sessions.get_mut(addr).map(f)

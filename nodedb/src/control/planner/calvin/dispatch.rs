@@ -31,7 +31,7 @@ use crate::Error;
 use crate::control::cluster::calvin::executor::ollp::orchestrator::OllpOrchestrator;
 use crate::control::planner::calvin::cross_shard_mode::CrossShardTxnMode;
 use crate::control::planner::calvin::types::{DispatchClass, DispatchOutcome};
-use crate::control::server::pgwire::session::TransactionState;
+use crate::control::server::shared::session::TransactionState;
 use crate::types::VShardId;
 use nodedb_physical::physical_plan::{
     DocumentOp, GraphOp, KvOp, PhysicalPlan, TimeseriesOp, VectorOp,

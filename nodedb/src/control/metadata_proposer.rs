@@ -171,7 +171,7 @@ pub fn propose_catalog_entry_with_timeout(
     // active on this thread (BEGIN ... COMMIT), buffer the payload
     // instead of proposing immediately. The buffered entries will
     // be proposed as a single MetadataEntry::Batch at COMMIT time.
-    if crate::control::server::pgwire::session::ddl_buffer::try_buffer(payload.clone()) {
+    if crate::control::server::shared::session::ddl_buffer::try_buffer(payload.clone()) {
         return Ok(0);
     }
 
@@ -179,7 +179,7 @@ pub fn propose_catalog_entry_with_timeout(
     // installed one. Internal callers (descriptor lease grant/release,
     // drain proposer) run outside that scope and emit the plain
     // `CatalogDdl` variant — they have no SQL text to log.
-    let metadata_entry = match crate::control::server::pgwire::session::audit_context::current() {
+    let metadata_entry = match crate::control::server::shared::session::audit_context::current() {
         Some(ctx) => MetadataEntry::CatalogDdlAudited {
             payload,
             auth_user_id: ctx.auth_user_id,

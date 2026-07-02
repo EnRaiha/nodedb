@@ -2,7 +2,7 @@
 
 //! Per-session DDL transaction buffer.
 //!
-//! When a pgwire session is inside a `BEGIN` block and executes DDL
+//! When a connection session is inside a `BEGIN` block and executes DDL
 //! statements (CREATE, DROP, ALTER), the `propose_catalog_entry`
 //! path checks this buffer. If the buffer is active (non-None), the
 //! entry is pushed into it instead of being proposed immediately.

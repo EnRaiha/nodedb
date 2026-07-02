@@ -16,7 +16,7 @@ use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::session::SessionStore;
+use crate::control::server::shared::session::SessionStore;
 use crate::control::state::SharedState;
 
 use super::super::super::types::sqlstate_error;

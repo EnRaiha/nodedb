@@ -21,8 +21,8 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use crate::control::notify_bus::normalize_channel;
 use crate::control::security::identity::AuthenticatedIdentity;
 
-use super::super::session::TransactionState;
 use super::core::NodeDbPgHandler;
+use crate::control::server::shared::session::TransactionState;
 
 impl NodeDbPgHandler {
     /// Handle `LISTEN <channel>`.

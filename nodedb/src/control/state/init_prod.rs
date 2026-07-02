@@ -470,7 +470,8 @@ impl SharedState {
             tuning,
             scheduler_config: crate::config::server::SchedulerConfig::default(),
             data_dir: std::path::PathBuf::new(),
-            schema_version: crate::control::server::pgwire::handler::prepared::SchemaVersion::new(),
+            schema_version: crate::control::server::shared::session::plan_cache::SchemaVersion::new(
+            ),
             sequence_registry,
             dml_counter:
                 crate::control::server::pgwire::ddl::maintenance::auto_analyze::DmlCounter::new(),

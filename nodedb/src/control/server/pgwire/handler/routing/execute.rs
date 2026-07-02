@@ -179,7 +179,7 @@ impl NodeDbPgHandler {
             // catalog READ error propagates (misrouting a delete on a real I/O
             // fault would silently skip edge cleanup → dangling edges); an absent
             // catalog or collection row falls through as non-edge-bearing.
-            if tx_state != crate::control::server::pgwire::session::TransactionState::InBlock
+            if tx_state != crate::control::server::shared::session::TransactionState::InBlock
                 && self.state.calvin_completion_registry.get().is_some()
                 && plan_needs_implicit_edge_recon(&self.state, &tasks, tenant_id)
                     .map_err(|e| {
@@ -231,7 +231,7 @@ impl NodeDbPgHandler {
                 // dispatch loop.
             }
             DispatchClass::MultiShard { .. } => {
-                if tx_state == crate::control::server::pgwire::session::TransactionState::InBlock {
+                if tx_state == crate::control::server::shared::session::TransactionState::InBlock {
                     let (severity, code, message) =
                         error_to_sqlstate(&crate::Error::CrossShardInExplicitTransaction);
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -243,7 +243,7 @@ impl NodeDbPgHandler {
 
                 let cross_shard_mode = self.sessions.cross_shard_txn_mode(addr);
                 if cross_shard_mode
-                    == crate::control::server::pgwire::session::cross_shard_mode::CrossShardTxnMode::Strict
+                    == crate::control::server::shared::session::cross_shard_mode::CrossShardTxnMode::Strict
                 {
                     return self
                         .dispatch_calvin_multishard(tasks, tenant_id, identity, addr)
@@ -338,7 +338,7 @@ impl NodeDbPgHandler {
             }
 
             if self.sessions.transaction_state(addr)
-                == crate::control::server::pgwire::session::TransactionState::InBlock
+                == crate::control::server::shared::session::TransactionState::InBlock
             {
                 let is_write = crate::control::wal_replication::to_replicated_entry(
                     task.tenant_id,
@@ -455,7 +455,7 @@ impl NodeDbPgHandler {
 
             // Track reads for snapshot isolation conflict detection.
             if self.sessions.transaction_state(addr)
-                == crate::control::server::pgwire::session::TransactionState::InBlock
+                == crate::control::server::shared::session::TransactionState::InBlock
                 && let Some(collection) = collection_for_si
             {
                 self.sessions

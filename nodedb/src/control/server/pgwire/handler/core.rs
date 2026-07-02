@@ -32,10 +32,10 @@ use crate::control::security::identity::{
 use crate::control::state::SharedState;
 use crate::types::RequestId;
 
-use super::super::session::{SessionStore, TransactionState};
 use super::super::types::notice_warning;
 use super::plan::extract_collection;
 use super::prepared::{NodeDbQueryParser, ParsedStatement};
+use crate::control::server::shared::session::{SessionStore, TransactionState};
 
 /// PostgreSQL wire protocol handler for NodeDB.
 ///
@@ -358,8 +358,8 @@ impl SimpleQueryHandler for NodeDbPgHandler {
         // picks up the identity + raw SQL so the applier can emit a
         // full audit record on every replica. The guard auto-clears
         // on scope exit.
-        let _audit_scope = crate::control::server::pgwire::session::audit_context::AuditScope::new(
-            crate::control::server::pgwire::session::audit_context::AuditCtx {
+        let _audit_scope = crate::control::server::shared::session::audit_context::AuditScope::new(
+            crate::control::server::shared::session::audit_context::AuditCtx {
                 auth_user_id: identity.user_id.to_string(),
                 auth_user_name: identity.username.clone(),
                 sql_text: query.to_string(),

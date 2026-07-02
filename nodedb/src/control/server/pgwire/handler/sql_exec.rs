@@ -14,10 +14,10 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 
-use super::super::session::TransactionState;
 use super::super::types::text_field;
 use super::core::NodeDbPgHandler;
 use super::sql_split::split_sql_statements;
+use crate::control::server::shared::session::TransactionState;
 
 impl NodeDbPgHandler {
     /// Execute a SQL query: session state → identity → DDL check → quota → plan → perms → dispatch.
@@ -121,9 +121,9 @@ impl NodeDbPgHandler {
                 {
                     Ok(rows) => {
                         let spill_config =
-                            super::super::session::cursor_spill::CursorSpillConfig::default();
+                            crate::control::server::shared::session::cursor_spill::CursorSpillConfig::default();
                         let (rows, _truncated) =
-                            super::super::session::cursor_spill::enforce_cursor_limit(
+                            crate::control::server::shared::session::cursor_spill::enforce_cursor_limit(
                                 rows,
                                 &spill_config,
                             );

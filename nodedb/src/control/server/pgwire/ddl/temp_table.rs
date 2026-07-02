@@ -12,8 +12,8 @@ use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::session::SessionStore;
-use crate::control::server::pgwire::session::temp_tables::{OnCommitAction, TempTableEntry};
+use crate::control::server::shared::session::SessionStore;
+use crate::control::server::shared::session::temp_tables::{OnCommitAction, TempTableEntry};
 
 /// Handle `CREATE TEMPORARY TABLE name (col1 type1, ...) [ON COMMIT ...]`.
 ///

@@ -43,7 +43,7 @@ impl NodeDbPgHandler {
         if post_set_op != PostSetOp::None
             || !matches!(plan_kind, PlanKind::MultiRow)
             || self.sessions.transaction_state(addr)
-                == crate::control::server::pgwire::session::TransactionState::InBlock
+                == crate::control::server::shared::session::TransactionState::InBlock
         {
             return Ok(None);
         }

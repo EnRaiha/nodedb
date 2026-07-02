@@ -17,6 +17,7 @@ pub mod temp_tables;
 mod tests;
 mod transaction;
 
+pub mod plan_cache;
 pub mod prepared_cache;
 
 pub use self::cross_shard_mode::{CrossShardTxnMode, parse_value as parse_cross_shard_value};
@@ -24,6 +25,6 @@ pub use self::params::{
     is_known_pg_runtime_parameter, is_known_settable_runtime_parameter, parse_set_command,
     parse_show_command,
 };
-pub use self::state::{CursorState, PgSession, TransactionState};
+pub use self::state::{ConnSession, CursorState, TransactionState};
 pub use self::store::SessionStore;
 pub use self::temp_tables::TempTableEntry;

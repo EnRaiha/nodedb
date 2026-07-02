@@ -361,7 +361,7 @@ pub struct SharedState {
     /// On-disk data directory for host-side appliers (CA-trust, audit segments, etc.).
     pub data_dir: std::path::PathBuf,
     /// Schema version counter — bumped on CREATE/DROP/ALTER DDL.
-    pub schema_version: crate::control::server::pgwire::handler::prepared::SchemaVersion,
+    pub schema_version: crate::control::server::shared::session::plan_cache::SchemaVersion,
     /// In-memory sequence registry (nextval/currval/setval).
     pub sequence_registry: Arc<crate::control::sequence::SequenceRegistry>,
     /// Per-collection DML counter for auto-ANALYZE triggering.

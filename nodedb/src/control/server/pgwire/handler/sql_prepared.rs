@@ -15,7 +15,7 @@ use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::session::prepared_cache::SqlPreparedStatement;
+use crate::control::server::shared::session::prepared_cache::SqlPreparedStatement;
 
 use super::core::NodeDbPgHandler;
 
