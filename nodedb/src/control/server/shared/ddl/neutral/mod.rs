@@ -17,6 +17,7 @@ pub mod continuous_agg;
 pub mod custom_type;
 pub mod function;
 pub mod grant;
+pub mod graph_ops;
 pub mod maintenance;
 pub mod materialized_view;
 pub mod oidc;

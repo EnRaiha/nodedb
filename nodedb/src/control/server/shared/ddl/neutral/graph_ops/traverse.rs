@@ -2,14 +2,10 @@
 
 //! Read handlers: GRAPH TRAVERSE, GRAPH NEIGHBORS, GRAPH PATH.
 
-use pgwire::api::results::Response;
-use pgwire::error::PgWireResult;
-
 use nodedb_sql::ddl_ast::GraphDirection;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
@@ -18,7 +14,9 @@ use crate::types::TraceId;
 use nodedb_physical::physical_plan::GraphOp;
 use nodedb_types::DatabaseId;
 
-use super::response::payload_to_query_response;
+use super::super::super::result::{DdlError, DdlResult};
+use super::response::payload_to_rows;
+use super::support::ddl_err;
 
 fn to_engine_direction(d: GraphDirection) -> Direction {
     match d {
@@ -28,11 +26,11 @@ fn to_engine_direction(d: GraphDirection) -> Direction {
     }
 }
 
-fn clamp_depth(value: usize, field: &'static str) -> PgWireResult<usize> {
+fn clamp_depth(value: usize, field: &'static str) -> Result<usize, DdlError> {
     if value > MAX_GRAPH_TRAVERSAL_DEPTH {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "22023",
-            &format!("{field} {value} exceeds maximum allowed value {MAX_GRAPH_TRAVERSAL_DEPTH}"),
+            format!("{field} {value} exceeds maximum allowed value {MAX_GRAPH_TRAVERSAL_DEPTH}"),
         ));
     }
     Ok(value)
@@ -41,16 +39,16 @@ fn clamp_depth(value: usize, field: &'static str) -> PgWireResult<usize> {
 /// Check a requested traversal depth against a tenant depth limit.
 ///
 /// `limit = 0` means unlimited — the same convention as `max_connections`.
-/// Returns a pgwire error if the depth exceeds a finite limit.
+/// Returns a [`DdlError`] if the depth exceeds a finite limit.
 pub(crate) fn check_graph_depth_against_limit(
     depth: usize,
     limit: u32,
     field: &'static str,
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     if limit > 0 && depth as u32 > limit {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42P17",
-            &format!("{field} {depth} exceeds tenant quota max_graph_depth={limit}"),
+            format!("{field} {depth} exceeds tenant quota max_graph_depth={limit}"),
         ));
     }
     Ok(())
@@ -62,7 +60,7 @@ fn check_tenant_graph_depth(
     tenant_id: crate::types::TenantId,
     depth: usize,
     field: &'static str,
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     let tenants = match state.tenants.lock() {
         Ok(t) => t,
         Err(p) => p.into_inner(),
@@ -80,9 +78,9 @@ pub async fn traverse(
     depth: usize,
     edge_label: Option<String>,
     direction: GraphDirection,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if start.is_empty() {
-        return Err(sqlstate_error("42601", "missing FROM '<node_id>'"));
+        return Err(ddl_err("42601", "missing FROM '<node_id>'"));
     }
     let depth = clamp_depth(depth, "DEPTH")?;
     let tenant_id = identity.tenant_id;
@@ -105,8 +103,8 @@ pub async fn traverse(
     )
     .await
     {
-        Ok(resp) => payload_to_query_response(&resp.payload),
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Ok(resp) => Ok(payload_to_rows(&resp.payload)),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
@@ -118,9 +116,9 @@ pub async fn neighbors(
     node: String,
     edge_label: Option<String>,
     direction: GraphDirection,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if node.is_empty() {
-        return Err(sqlstate_error("42601", "missing OF '<node_id>'"));
+        return Err(ddl_err("42601", "missing OF '<node_id>'"));
     }
     let dir = to_engine_direction(direction);
     let tenant_id = identity.tenant_id;
@@ -141,8 +139,8 @@ pub async fn neighbors(
     )
     .await
     {
-        Ok(resp) => payload_to_query_response(&resp.payload),
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Ok(resp) => Ok(payload_to_rows(&resp.payload)),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
@@ -161,9 +159,9 @@ pub async fn shortest_path(
     dst: String,
     max_depth: usize,
     edge_label: Option<String>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if src.is_empty() || dst.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "GRAPH PATH requires FROM '<src>' TO '<dst>'",
         ));
@@ -182,8 +180,8 @@ pub async fn shortest_path(
     )
     .await
     {
-        Ok(resp) => payload_to_query_response(&resp.payload),
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Ok(resp) => Ok(payload_to_rows(&resp.payload)),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
@@ -201,9 +199,11 @@ mod tests {
     fn tenant_graph_depth_exceeded_rejected() {
         let err = check_graph_depth_against_limit(11, 10, "DEPTH")
             .expect_err("depth > limit must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("11"), "error must include the requested depth");
-        assert!(msg.contains("10"), "error must include the limit");
+        assert!(
+            err.message.contains("11"),
+            "error must include the requested depth"
+        );
+        assert!(err.message.contains("10"), "error must include the limit");
     }
 
     #[test]

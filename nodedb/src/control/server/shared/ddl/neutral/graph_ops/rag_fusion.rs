@@ -7,12 +7,9 @@
 //! this single function, so caps and defaults cannot drift between the
 //! two surfaces.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use nodedb_sql::ddl_ast::FusionParams;
 use nodedb_sql::ddl_ast::GraphDirection;
@@ -20,13 +17,16 @@ use nodedb_sql::ddl_ast::GraphDirection;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::ddl::sync_dispatch;
-use crate::control::server::pgwire::types::{sqlstate_error, text_field};
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::{GraphTraversalOptions, MAX_GRAPH_TRAVERSAL_DEPTH};
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::GraphOp;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 const FUSION_VECTOR_TOP_K_CAP: usize = 10_000;
 const FUSION_TOP_CAP: usize = 10_000;
@@ -37,19 +37,19 @@ pub async fn rag_fusion(
     database_id: DatabaseId,
     collection: String,
     params: FusionParams,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let query_vector = params
         .query_vector
-        .ok_or_else(|| sqlstate_error("42601", "fusion query requires ARRAY[…] vector payload"))?;
+        .ok_or_else(|| ddl_err("42601", "fusion query requires ARRAY[…] vector payload"))?;
     if query_vector.is_empty() {
-        return Err(sqlstate_error("42601", "query vector must not be empty"));
+        return Err(ddl_err("42601", "query vector must not be empty"));
     }
 
     let vector_top_k = params.vector_top_k.unwrap_or(20);
     if vector_top_k > FUSION_VECTOR_TOP_K_CAP {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "22023",
-            &format!(
+            format!(
                 "VECTOR_TOP_K {vector_top_k} exceeds maximum allowed value \
                  {FUSION_VECTOR_TOP_K_CAP}"
             ),
@@ -58,9 +58,9 @@ pub async fn rag_fusion(
 
     let expansion_depth = params.expansion_depth.unwrap_or(2);
     if expansion_depth > MAX_GRAPH_TRAVERSAL_DEPTH {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "22023",
-            &format!(
+            format!(
                 "EXPANSION_DEPTH {expansion_depth} exceeds maximum allowed value \
                  {MAX_GRAPH_TRAVERSAL_DEPTH}"
             ),
@@ -69,9 +69,9 @@ pub async fn rag_fusion(
 
     let final_top_k = params.final_top_k.unwrap_or(10);
     if final_top_k > FUSION_TOP_CAP {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "22023",
-            &format!("FINAL_TOP_K {final_top_k} exceeds maximum allowed value {FUSION_TOP_CAP}"),
+            format!("FINAL_TOP_K {final_top_k} exceeds maximum allowed value {FUSION_TOP_CAP}"),
         ));
     }
 
@@ -118,17 +118,16 @@ pub async fn rag_fusion(
         Duration::from_secs(state.tuning.network.default_deadline_secs),
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
-    let schema = Arc::new(vec![text_field("result")]);
     let json_text = response_codec::decode_payload_to_json(&payload);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    encoder
-        .encode_field(&json_text)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    let row = encoder.take_row();
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(row)]),
-    ))])
+    let mut row = Map::new();
+    row.insert("result".to_string(), JsonValue::String(json_text));
+
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["result".to_string()],
+        column_types: vec![DdlColType::Text],
+        rows: vec![row],
+        notice: None,
+    })])
 }

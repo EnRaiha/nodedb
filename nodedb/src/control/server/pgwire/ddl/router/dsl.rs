@@ -67,15 +67,12 @@ pub(super) async fn dispatch(
         return Some(super::super::crdt_ops::crdt_apply(state, identity, database_id, sql).await);
     }
 
-    // Graph DSL (`GRAPH ...`) and `MATCH` flow through the typed
-    // AST. Parsing is done by `nodedb_sql::ddl_ast::graph_parse`,
-    // which is quote- and brace-aware — handlers never see raw SQL.
-    //
-    // `SHOW GRAPH STATS` is recognised here too even though its
-    // leading keyword is `SHOW`: the typed-AST family treats it as a
-    // graph-overlay statement, and the parser dispatches it to a
-    // graph-area family before any generic SHOW handler can claim
-    // the `SHOW` prefix.
+    // `MATCH` graph pattern queries flow through the typed AST to `match_ops`.
+    // Parsing is done by `nodedb_sql::ddl_ast::graph_parse`, which is quote- and
+    // brace-aware — handlers never see raw SQL. The other graph-overlay
+    // statements (GRAPH INSERT/DELETE EDGE, LABEL/UNLABEL, TRAVERSE/NEIGHBORS/
+    // PATH, ALGO, RAG FUSION, SHOW GRAPH STATS) are handled on the typed path by
+    // the protocol-neutral router before this pgwire delegation runs.
     if upper.starts_with("GRAPH ")
         || upper.starts_with("MATCH ")
         || upper.starts_with("OPTIONAL MATCH ")
@@ -99,12 +96,6 @@ pub(super) async fn dispatch(
                         super::super::match_ops::match_query(state, identity, database_id, sql)
                             .await,
                     );
-                }
-                if let Some(resp) =
-                    super::super::graph_ops::dispatch_typed(state, identity, database_id, stmt)
-                        .await
-                {
-                    return Some(resp);
                 }
             }
             None => {}

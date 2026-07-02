@@ -7,20 +7,19 @@
 //! `nodedb_sql::ddl_ast::NodedbStatement`. Raw-SQL tokenising lives
 //! in the AST parser — handlers never touch `&str` parse paths.
 
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
-
 use nodedb_sql::ddl_ast::GraphProperties;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::planner::calvin::{build_static_tx_class, submit_calvin_routed};
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::server::surrogate_exchange::assign_surrogate_routed;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::GraphOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 /// Maximum byte length for an edge label string. Keeps a single `TYPE`
 /// clause from bloating the CSR label table and the msgpack wire payload.
@@ -31,21 +30,21 @@ const MAX_EDGE_LABEL_BYTES: usize = 256;
 ///
 /// Runs at every DSL ingress so the CSR interner never sees degenerate
 /// input — a complement to the `u32` widening of the label id space.
-fn validate_edge_label(label: &str) -> PgWireResult<()> {
+fn validate_edge_label(label: &str) -> Result<(), DdlError> {
     if label.is_empty() {
-        return Err(sqlstate_error("42601", "edge TYPE label must not be empty"));
+        return Err(ddl_err("42601", "edge TYPE label must not be empty"));
     }
     if label.len() > MAX_EDGE_LABEL_BYTES {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
-            &format!(
+            format!(
                 "edge TYPE label is {} bytes; maximum is {MAX_EDGE_LABEL_BYTES}",
                 label.len()
             ),
         ));
     }
     if label.chars().any(|c| c.is_control() || c == '\u{007F}') {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "edge TYPE label must not contain control characters",
         ));
@@ -64,18 +63,15 @@ pub async fn insert_edge(
     dst: String,
     label: String,
     properties: GraphProperties,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if collection.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "GRAPH INSERT EDGE requires IN <collection>",
         ));
     }
     if src.is_empty() || dst.is_empty() {
-        return Err(sqlstate_error(
-            "42601",
-            "GRAPH INSERT EDGE requires FROM and TO",
-        ));
+        return Err(ddl_err("42601", "GRAPH INSERT EDGE requires FROM and TO"));
     }
     validate_edge_label(&label)?;
     let properties_json = properties_to_json(properties)?;
@@ -91,7 +87,7 @@ pub async fn insert_edge(
         &collection,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     // Dual-home routing (F1b-dualhome): an edge is reachable from BOTH endpoints
     // (forward from src, reverse from dst), so a cross-shard edge must be written
@@ -112,7 +108,7 @@ pub async fn insert_edge(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let dst_surrogate = assign_surrogate_routed(
         state,
         vdst,
@@ -123,7 +119,7 @@ pub async fn insert_edge(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     let edge_put = GraphOp::EdgePut {
         collection,
@@ -159,7 +155,7 @@ pub async fn insert_edge(
             crate::event::EventSource::User,
         )
         .await
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
     } else {
         // Cross-shard edge: dual-home it ATOMICALLY via Calvin. `build_static_tx_class`
         // enumerates {vsrc, vdst} as the participating vShards (the dh-1 substrate),
@@ -175,13 +171,16 @@ pub async fn insert_edge(
             post_set_op: PostSetOp::None,
         };
         let tx_class = build_static_tx_class(&[task], tenant_id)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
         submit_calvin_routed(state, tx_class)
             .await
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
     }
 
-    Ok(vec![Response::Execution(Tag::new("INSERT EDGE"))])
+    Ok(vec![DdlResult::Status {
+        command: "INSERT EDGE".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// `GRAPH DELETE EDGE IN '<collection>' FROM '<src>' TO '<dst>' TYPE '<label>'`
@@ -193,18 +192,15 @@ pub async fn delete_edge(
     src: String,
     dst: String,
     label: String,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if collection.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "GRAPH DELETE EDGE requires IN <collection>",
         ));
     }
     if src.is_empty() || dst.is_empty() {
-        return Err(sqlstate_error(
-            "42601",
-            "GRAPH DELETE EDGE requires FROM and TO",
-        ));
+        return Err(ddl_err("42601", "GRAPH DELETE EDGE requires FROM and TO"));
     }
     validate_edge_label(&label)?;
     let tenant_id = identity.tenant_id;
@@ -230,7 +226,7 @@ pub async fn delete_edge(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let dst_surrogate = assign_surrogate_routed(
         state,
         vdst,
@@ -241,7 +237,7 @@ pub async fn delete_edge(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     let edge_delete = GraphOp::EdgeDelete {
         collection,
@@ -273,7 +269,7 @@ pub async fn delete_edge(
             crate::event::EventSource::User,
         )
         .await
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
     } else {
         // Cross-shard edge: dual-home the delete ATOMICALLY via Calvin, mirroring
         // the insert path. `build_static_tx_class` enumerates {vsrc, vdst} as the
@@ -289,13 +285,16 @@ pub async fn delete_edge(
             post_set_op: PostSetOp::None,
         };
         let tx_class = build_static_tx_class(&[task], tenant_id)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
         submit_calvin_routed(state, tx_class)
             .await
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+            .map_err(|e| ddl_err("XX000", e.to_string()))?;
     }
 
-    Ok(vec![Response::Execution(Tag::new("DELETE EDGE"))])
+    Ok(vec![DdlResult::Status {
+        command: "DELETE EDGE".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// `GRAPH LABEL '<node_id>' AS '<label>' [, '<label2>']`
@@ -306,18 +305,15 @@ pub async fn set_node_labels(
     node_id: String,
     labels: Vec<String>,
     remove: bool,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if node_id.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "GRAPH LABEL/UNLABEL requires a quoted node id",
         ));
     }
     if labels.is_empty() {
-        return Err(sqlstate_error(
-            "42601",
-            "missing AS '<label>' [, '<label2>']",
-        ));
+        return Err(ddl_err("42601", "missing AS '<label>' [, '<label2>']"));
     }
 
     let tenant_id = identity.tenant_id;
@@ -344,10 +340,13 @@ pub async fn set_node_labels(
         crate::event::EventSource::User,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     let tag = if remove { "UNLABEL" } else { "LABEL" };
-    Ok(vec![Response::Execution(Tag::new(tag))])
+    Ok(vec![DdlResult::Status {
+        command: tag.to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Convert a parsed `PROPERTIES` clause to the JSON string stored
@@ -355,19 +354,17 @@ pub async fn set_node_labels(
 /// existing `nodedb_sql::parser::object_literal::parse_object_literal`
 /// so the type coercions (numbers, bools, nested objects) match
 /// every other object-literal ingress (INSERT { ... }, UPSERT).
-fn properties_to_json(properties: GraphProperties) -> PgWireResult<String> {
+fn properties_to_json(properties: GraphProperties) -> Result<String, DdlError> {
     match properties {
         GraphProperties::None => Ok(String::new()),
         GraphProperties::Quoted(s) => Ok(s),
         GraphProperties::Object(obj_str) => {
             match nodedb_sql::parser::object_literal::parse_object_literal(&obj_str) {
                 Some(Ok(fields)) => sonic_rs::to_string(&nodedb_types::Value::Object(fields))
-                    .map_err(|e| {
-                        sqlstate_error("XX000", &format!("PROPERTIES serialize error: {e}"))
-                    }),
-                Some(Err(msg)) => Err(sqlstate_error(
+                    .map_err(|e| ddl_err("XX000", format!("PROPERTIES serialize error: {e}"))),
+                Some(Err(msg)) => Err(ddl_err(
                     "42601",
-                    &format!("PROPERTIES object literal error: {msg}"),
+                    format!("PROPERTIES object literal error: {msg}"),
                 )),
                 None => Ok(String::new()),
             }

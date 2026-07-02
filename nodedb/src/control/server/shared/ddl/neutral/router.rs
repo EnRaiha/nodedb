@@ -25,6 +25,7 @@ use super::continuous_agg;
 use super::custom_type;
 use super::function;
 use super::grant;
+use super::graph_ops;
 use super::maintenance;
 use super::materialized_view;
 use super::oidc;
@@ -522,6 +523,18 @@ pub async fn try_dispatch(
         Some(Err(_)) => return None,
         None => return query_functions::try_dispatch(state, identity, sql).await,
     };
+
+    // Graph-overlay statements (GRAPH INSERT/DELETE EDGE, GRAPH LABEL/UNLABEL,
+    // GRAPH TRAVERSE/NEIGHBORS/PATH, GRAPH ALGO, GRAPH RAG FUSION, SHOW GRAPH
+    // STATS) parse into typed `GraphStmt` variants. In the pgwire router these
+    // were dispatched from the typed AST by the `dsl` string router (last),
+    // after the `MATCH` pattern query was split off to `match_ops`. Recognizing
+    // them here on the typed path preserves that: `dispatch_graph` returns
+    // `Some` for the graph-overlay variants and `None` for `GraphStmt::MatchQuery`
+    // (which stays on the pgwire `match_ops` path) so it falls through unchanged.
+    if let NodedbStatement::Graph(_) = &stmt {
+        return graph_ops::dispatch_graph(state, identity, database_id, stmt).await;
+    }
 
     match &stmt {
         NodedbStatement::StreamView(StreamViewStmt::CreateChangeStream {

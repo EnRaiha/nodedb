@@ -1,23 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Graph DSL commands: GRAPH INSERT EDGE, GRAPH DELETE EDGE,
-//! GRAPH LABEL/UNLABEL, GRAPH TRAVERSE, GRAPH NEIGHBORS, GRAPH PATH,
-//! GRAPH ALGO.
-//!
-//! Every handler consumes already-parsed typed fields from
-//! `nodedb_sql::ddl_ast::NodedbStatement`. Raw-SQL tokenising lives
-//! in `nodedb-sql::ddl_ast::graph_parse` — no handler in this
-//! directory does string-prefix parsing.
-
-mod algo;
-mod edge;
-pub(super) mod rag_fusion;
-mod response;
-mod stats;
-mod traverse;
-
-use pgwire::api::results::Response;
-use pgwire::error::PgWireResult;
+//! Dispatch a parsed graph-overlay statement to its protocol-neutral handler.
 
 use nodedb_sql::ddl_ast::statement::{GraphStmt, NodedbStatement};
 
@@ -25,16 +8,20 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
-/// Dispatch a parsed graph-DSL variant to its handler.
+use super::super::super::result::{DdlError, DdlResult};
+use super::{algo, edge, rag_fusion, stats, traverse};
+
+/// Dispatch a parsed graph-overlay variant to its handler.
 ///
-/// Returns `None` when the statement is not a graph DSL variant,
-/// so the caller can fall through to other dispatchers.
-pub async fn dispatch_typed(
+/// Returns `None` when the statement is not a graph-overlay variant this family
+/// owns (e.g. `GraphStmt::MatchQuery`, which stays on the pgwire `match_ops`
+/// path), so the caller falls through to the transitional pgwire delegation.
+pub async fn dispatch_graph(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     stmt: NodedbStatement,
-) -> Option<PgWireResult<Vec<Response>>> {
+) -> Option<Result<Vec<DdlResult>, DdlError>> {
     match stmt {
         NodedbStatement::Graph(GraphStmt::GraphInsertEdge {
             collection,
@@ -152,8 +139,8 @@ pub async fn dispatch_typed(
         }) => Some(
             stats::show_graph_stats(state, identity, database_id, collection, verbose, as_of).await,
         ),
-        // Non-graph NodedbStatement variants (CreateCollection, DropCollection,
-        // etc.) return None so the caller can route them to the correct handler.
+        // `MatchQuery` (pgwire `match_ops`) and every non-graph-overlay variant
+        // return None so the caller can route them elsewhere.
         _ => None,
     }
 }

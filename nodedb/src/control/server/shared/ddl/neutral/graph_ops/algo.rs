@@ -2,22 +2,21 @@
 
 //! GRAPH ALGO handler and result-schema rendering.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::broadcast;
-use crate::control::server::pgwire::types::{sqlstate_error, text_field};
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
 use crate::engine::graph::algo::GraphAlgorithm;
 use crate::types::TraceId;
 use nodedb_physical::physical_plan::GraphOp;
 use nodedb_types::DatabaseId;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 const MAX_ITERATIONS_CAP: usize = 1_000;
 const MAX_SAMPLE_CAP: usize = 1_000_000;
@@ -39,7 +38,7 @@ pub async fn algo(
     direction: Option<String>,
     mode: Option<String>,
     personalization: Option<String>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let algorithm = resolve_algorithm(algorithm_name)?;
 
     let max_iterations = clamp_opt(max_iterations, "ITERATIONS", MAX_ITERATIONS_CAP)?;
@@ -68,7 +67,7 @@ pub async fn algo(
     // local partitions. Each coordinator runs its per-shard primitive
     // (`GraphOp::BspSuperstep` for PageRank, `GraphOp::WccSuperstep` for WCC)
     // across every shard and assembles the result into the SAME `AlgoResultBatch`
-    // payload the single-node path produces, so `algo_payload_to_query_response`
+    // payload the single-node path produces, so `algo_payload_to_rows`
     // renders identical output.
     //
     // Single-node (`cluster_routing.is_none()`) and every other algorithm keep
@@ -102,8 +101,8 @@ pub async fn algo(
             }
         };
         return match result {
-            Ok(payload) => algo_payload_to_query_response(&payload, algorithm),
-            Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+            Ok(payload) => Ok(algo_payload_to_rows(&payload, algorithm)?),
+            Err(e) => Err(ddl_err("XX000", e.to_string())),
         };
     }
 
@@ -112,8 +111,8 @@ pub async fn algo(
     match broadcast::broadcast_to_all_cores(state, tenant_id, database_id, plan, TraceId::ZERO)
         .await
     {
-        Ok(resp) => algo_payload_to_query_response(&resp.payload, algorithm),
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Ok(resp) => Ok(algo_payload_to_rows(&resp.payload, algorithm)?),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
@@ -122,10 +121,7 @@ pub async fn algo(
 /// `COMMUNITY` and `LABEL_PROPAGATION` are accepted aliases that both map to
 /// label propagation. Unknown names surface a structured `42601` error rather
 /// than a catch-all default.
-fn resolve_algorithm(
-    algorithm_name: &str,
-) -> PgWireResult<crate::engine::graph::algo::GraphAlgorithm> {
-    use crate::engine::graph::algo::GraphAlgorithm;
+fn resolve_algorithm(algorithm_name: &str) -> Result<GraphAlgorithm, DdlError> {
     Ok(match algorithm_name {
         "PAGERANK" => GraphAlgorithm::PageRank,
         "WCC" => GraphAlgorithm::Wcc,
@@ -141,9 +137,9 @@ fn resolve_algorithm(
         "DIAMETER" => GraphAlgorithm::Diameter,
         "KCORE" => GraphAlgorithm::KCore,
         other => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42601",
-                &format!("unknown graph algorithm '{other}'"),
+                format!("unknown graph algorithm '{other}'"),
             ));
         }
     })
@@ -155,14 +151,14 @@ fn resolve_algorithm(
 /// silently dropped.
 fn parse_personalization(
     raw: Option<&str>,
-) -> PgWireResult<Option<std::collections::HashMap<String, f64>>> {
+) -> Result<Option<std::collections::HashMap<String, f64>>, DdlError> {
     let Some(text) = raw else {
         return Ok(None);
     };
     let map: std::collections::HashMap<String, f64> = sonic_rs::from_str(text).map_err(|e| {
-        sqlstate_error(
+        ddl_err(
             "22023",
-            &format!("invalid PERSONALIZATION object (expected JSON node→weight map): {e}"),
+            format!("invalid PERSONALIZATION object (expected JSON node→weight map): {e}"),
         )
     })?;
     if map.is_empty() {
@@ -171,44 +167,57 @@ fn parse_personalization(
     Ok(Some(map))
 }
 
-fn clamp_opt(value: Option<usize>, field: &'static str, cap: usize) -> PgWireResult<Option<usize>> {
+fn clamp_opt(
+    value: Option<usize>,
+    field: &'static str,
+    cap: usize,
+) -> Result<Option<usize>, DdlError> {
     match value {
-        Some(v) if v > cap => Err(sqlstate_error(
+        Some(v) if v > cap => Err(ddl_err(
             "22023",
-            &format!("{field} {v} exceeds maximum allowed value {cap}"),
+            format!("{field} {v} exceeds maximum allowed value {cap}"),
         )),
         other => Ok(other),
     }
 }
 
-fn algo_payload_to_query_response(
+/// Render an algorithm result payload into a protocol-neutral row set.
+///
+/// Every column is emitted as `Text` with its cell pre-rendered to the exact
+/// string the pgwire handler wrote (all algorithm result columns used
+/// `text_field`): `Text` → the raw string, `Float64` → `format!("{v}")` or the
+/// literal `Infinity` for a non-representable/non-finite score, `Int64` →
+/// decimal or `0`. Pre-rendering keeps the wire bytes byte-identical (a native
+/// float path would change both the column OID and the `Infinity` fallback).
+fn algo_payload_to_rows(
     payload: &crate::bridge::envelope::Payload,
-    algorithm: crate::engine::graph::algo::GraphAlgorithm,
-) -> PgWireResult<Vec<Response>> {
+    algorithm: GraphAlgorithm,
+) -> Result<Vec<DdlResult>, DdlError> {
     use crate::engine::graph::algo::params::AlgoColumnType;
 
     let result_schema = algorithm.result_schema();
-    let schema = Arc::new(
-        result_schema
-            .iter()
-            .map(|&(name, _)| text_field(name))
-            .collect::<Vec<_>>(),
-    );
+    let columns: Vec<String> = result_schema
+        .iter()
+        .map(|&(name, _)| name.to_string())
+        .collect();
+    let column_types = vec![DdlColType::Text; columns.len()];
 
     if payload.is_empty() {
-        return Ok(vec![Response::Query(QueryResponse::new(
-            schema,
-            stream::empty(),
-        ))]);
+        return Ok(vec![DdlResult::Rows(ShapedRows {
+            columns,
+            column_types,
+            rows: Vec::new(),
+            notice: None,
+        })]);
     }
 
     let json_text = response_codec::decode_payload_to_json(payload);
     let rows: Vec<serde_json::Value> = sonic_rs::from_str(&json_text)
-        .map_err(|e| sqlstate_error("XX000", &format!("invalid algorithm result JSON: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("invalid algorithm result JSON: {e}")))?;
 
-    let mut pgwire_rows = Vec::with_capacity(rows.len());
+    let mut shaped_rows = Vec::with_capacity(rows.len());
     for row in &rows {
-        let mut encoder = DataRowEncoder::new(schema.clone());
+        let mut out = Map::new();
         for &(col_name, col_type) in result_schema {
             let field = row.get(col_name).unwrap_or(&serde_json::Value::Null);
             let val_str = match col_type {
@@ -219,17 +228,17 @@ fn algo_payload_to_query_response(
                 },
                 AlgoColumnType::Int64 => field.as_i64().map_or("0".into(), |v| v.to_string()),
             };
-            encoder
-                .encode_field(&val_str)
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+            out.insert(col_name.to_string(), JsonValue::String(val_str));
         }
-        pgwire_rows.push(Ok(encoder.take_row()));
+        shaped_rows.push(out);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(pgwire_rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows: shaped_rows,
+        notice: None,
+    })])
 }
 
 #[cfg(test)]

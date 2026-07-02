@@ -5,7 +5,7 @@
 //! Reads persistent graph-stats counters from every Data-Plane core via
 //! `broadcast_to_all_cores`, aggregates the per-core
 //! [`CollectionStats`](crate::engine::graph::edge_store::stats::CollectionStats)
-//! payloads, and emits a pgwire result row set.
+//! payloads, and emits a protocol-neutral result row set.
 //!
 //! Aggregation rules:
 //! - `edge_count`: summed across cores (each core holds a disjoint partition).
@@ -18,15 +18,11 @@
 //! - `labels`: merged by name; counts summed; output is sorted ascending by name.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use futures::stream;
 use nodedb_types::DatabaseId;
 use nodedb_types::diagnostic::DiagnosticLayer;
-use pgwire::api::Type;
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 use tracing::info_span;
 
 /// Total number of `SHOW GRAPH STATS` calls served since process start.
@@ -44,11 +40,14 @@ pub fn graph_stats_calls_total() -> u64 {
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::broadcast::broadcast_to_all_cores;
-use crate::control::server::pgwire::types::sqlstate_error;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::stats::CollectionStats;
 use crate::types::TraceId;
 use nodedb_physical::physical_plan::GraphOp;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 /// `SHOW GRAPH STATS ['<collection>'] [VERBOSE] [AS OF SYSTEM TIME <ms>]`.
 pub async fn show_graph_stats(
@@ -58,7 +57,7 @@ pub async fn show_graph_stats(
     collection: Option<String>,
     verbose: bool,
     as_of: Option<i64>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     GRAPH_STATS_CALLS.fetch_add(1, Ordering::Relaxed);
     let scope = if collection.is_some() {
         "collection"
@@ -81,21 +80,18 @@ pub async fn show_graph_stats(
     if let Some(ref name) = collection {
         let catalog = match state.credentials.catalog() {
             Some(c) => c,
-            None => return Err(sqlstate_error("XX000", "catalog not available")),
+            None => return Err(ddl_err("XX000", "catalog not available")),
         };
         match catalog.get_collection(database_id, identity.tenant_id.as_u64(), name) {
             Ok(Some(c)) if c.is_active => {}
             Ok(Some(_)) => {
-                return Err(sqlstate_error(
+                return Err(ddl_err(
                     "42P01",
-                    &format!("collection '{name}' is deactivated"),
+                    format!("collection '{name}' is deactivated"),
                 ));
             }
             _ => {
-                return Err(sqlstate_error(
-                    "42P01",
-                    &format!("collection '{name}' not found"),
-                ));
+                return Err(ddl_err("42P01", format!("collection '{name}' not found")));
             }
         }
     }
@@ -107,17 +103,17 @@ pub async fn show_graph_stats(
 
     let resp = broadcast_to_all_cores(state, identity.tenant_id, database_id, plan, TraceId::ZERO)
         .await
-        .map_err(|e| sqlstate_error("58000", &format!("graph stats dispatch failed: {e}")))?;
+        .map_err(|e| ddl_err("58000", format!("graph stats dispatch failed: {e}")))?;
 
     let merged: Vec<CollectionStats> = decode_merged_stats(resp.payload.as_bytes())
-        .map_err(|e| sqlstate_error("XX000", &format!("graph stats decode failed: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("graph stats decode failed: {e}")))?;
 
     let aggregated = aggregate_by_collection(merged);
 
     if verbose {
-        encode_verbose_response(aggregated)
+        Ok(encode_verbose_response(aggregated))
     } else {
-        encode_compact_response(aggregated)
+        Ok(encode_compact_response(aggregated))
     }
 }
 
@@ -165,22 +161,21 @@ fn aggregate_by_collection(entries: Vec<CollectionStats>) -> Vec<CollectionStats
     result
 }
 
-fn text_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_string(), None, None, Type::TEXT, FieldFormat::Text)
-}
-
-fn int8_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_string(), None, None, Type::INT8, FieldFormat::Text)
-}
-
-fn encode_compact_response(rows: Vec<CollectionStats>) -> PgWireResult<Vec<Response>> {
-    let schema = Arc::new(vec![
-        text_field("collection"),
-        int8_field("node_count"),
-        int8_field("edge_count"),
-        int8_field("distinct_label_count"),
-        text_field("labels"),
-    ]);
+fn encode_compact_response(rows: Vec<CollectionStats>) -> Vec<DdlResult> {
+    let columns = vec![
+        "collection".to_string(),
+        "node_count".to_string(),
+        "edge_count".to_string(),
+        "distinct_label_count".to_string(),
+        "labels".to_string(),
+    ];
+    let column_types = vec![
+        DdlColType::Text,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Text,
+    ];
 
     let mut data_rows = Vec::with_capacity(rows.len());
     for r in rows {
@@ -197,47 +192,61 @@ fn encode_compact_response(rows: Vec<CollectionStats>) -> PgWireResult<Vec<Respo
         )
         .to_string();
 
-        let mut enc = DataRowEncoder::new(schema.clone());
-        enc.encode_field(&r.collection)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        enc.encode_field(&(r.distinct_node_count as i64))
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        enc.encode_field(&(r.edge_count as i64))
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        enc.encode_field(&(r.distinct_label_count as i64))
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        enc.encode_field(&labels_json)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        data_rows.push(Ok(enc.take_row()));
+        let mut row = Map::new();
+        row.insert("collection".to_string(), JsonValue::String(r.collection));
+        row.insert(
+            "node_count".to_string(),
+            JsonValue::String((r.distinct_node_count as i64).to_string()),
+        );
+        row.insert(
+            "edge_count".to_string(),
+            JsonValue::String((r.edge_count as i64).to_string()),
+        );
+        row.insert(
+            "distinct_label_count".to_string(),
+            JsonValue::String((r.distinct_label_count as i64).to_string()),
+        );
+        row.insert("labels".to_string(), JsonValue::String(labels_json));
+        data_rows.push(row);
     }
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(data_rows),
-    ))])
+
+    vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows: data_rows,
+        notice: None,
+    })]
 }
 
-fn encode_verbose_response(rows: Vec<CollectionStats>) -> PgWireResult<Vec<Response>> {
-    let schema = Arc::new(vec![
-        text_field("collection"),
-        text_field("label"),
-        int8_field("edge_count"),
-    ]);
+fn encode_verbose_response(rows: Vec<CollectionStats>) -> Vec<DdlResult> {
+    let columns = vec![
+        "collection".to_string(),
+        "label".to_string(),
+        "edge_count".to_string(),
+    ];
+    let column_types = vec![DdlColType::Text, DdlColType::Text, DdlColType::Int8];
 
     let mut data_rows = Vec::new();
     for r in &rows {
         for (label, count) in &r.labels {
-            let mut enc = DataRowEncoder::new(schema.clone());
-            enc.encode_field(&r.collection)
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-            enc.encode_field(label)
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-            enc.encode_field(&(*count as i64))
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-            data_rows.push(Ok(enc.take_row()));
+            let mut row = Map::new();
+            row.insert(
+                "collection".to_string(),
+                JsonValue::String(r.collection.clone()),
+            );
+            row.insert("label".to_string(), JsonValue::String(label.clone()));
+            row.insert(
+                "edge_count".to_string(),
+                JsonValue::String((*count as i64).to_string()),
+            );
+            data_rows.push(row);
         }
     }
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(data_rows),
-    ))])
+
+    vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows: data_rows,
+        notice: None,
+    })]
 }
