@@ -24,7 +24,7 @@ use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::support::{map_pg_err, parse_role, require_tenant_admin, status};
+use super::support::{parse_role, require_tenant_admin, status};
 
 fn current_roles(state: &SharedState, username: &str) -> Result<Vec<Role>, DdlError> {
     state
@@ -155,8 +155,7 @@ fn grant_role_to_role(
         });
     }
     let parent = &role_names[0];
-    crate::control::server::pgwire::ddl::role::set_role_parent(state, child, Some(parent))
-        .map_err(map_pg_err)?;
+    super::super::role::set_role_parent(state, child, Some(parent))?;
 
     state.audit_record(
         AuditEvent::PrivilegeChange,
@@ -267,8 +266,7 @@ fn revoke_role_from_role(
             message: format!("role '{child}' does not inherit from '{parent}'"),
         });
     }
-    crate::control::server::pgwire::ddl::role::set_role_parent(state, child, None)
-        .map_err(map_pg_err)?;
+    super::super::role::set_role_parent(state, child, None)?;
 
     state.audit_record(
         AuditEvent::PrivilegeChange,

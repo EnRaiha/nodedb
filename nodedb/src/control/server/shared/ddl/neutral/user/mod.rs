@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE` / `ALTER` / `DROP USER` DDL handlers.
+//! Protocol-neutral `CREATE` / `ALTER` / `DROP USER` DDL handlers.
 
 mod alter;
 mod create;

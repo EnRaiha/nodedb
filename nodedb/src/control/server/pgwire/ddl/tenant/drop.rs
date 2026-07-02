@@ -193,7 +193,9 @@ fn reconcile_tenant_users(
     // all run — the same guarantees `DROP USER` gives directly.
     if let Some(admin) = lifecycle_admin {
         let parts = ["DROP", "USER", admin.as_str()];
-        super::super::user::drop_user(state, identity, &parts)?;
+        crate::control::server::pgwire::ddl_encode::ddl_results_to_pgwire(
+            crate::control::server::shared::ddl::neutral::user::drop_user(state, identity, &parts),
+        )?;
     }
 
     Ok(())

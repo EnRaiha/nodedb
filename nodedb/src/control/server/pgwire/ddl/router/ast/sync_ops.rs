@@ -19,10 +19,8 @@ use crate::control::server::pgwire::ddl::collection::drop_collection;
 use crate::control::server::pgwire::ddl::consumer_group::create_consumer_group;
 use crate::control::server::pgwire::ddl::inspect::show_permissions;
 use crate::control::server::pgwire::ddl::retention_policy::alter_retention_policy;
-use crate::control::server::pgwire::ddl::role::alter_role_typed;
 use crate::control::server::pgwire::ddl::schedule::alter_schedule;
 use crate::control::server::pgwire::ddl::trigger::alter_trigger;
-use crate::control::server::pgwire::ddl::user::{alter_user, create_user};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -169,26 +167,6 @@ pub(super) fn try_dispatch_sync(
             },
         )),
 
-        NodedbStatement::Auth(AuthStmt::CreateUser {
-            username,
-            password,
-            role,
-            tenant,
-            if_not_exists,
-        }) => Some(create_user(
-            state,
-            identity,
-            username,
-            password,
-            role.as_deref(),
-            tenant.as_ref(),
-            *if_not_exists,
-        )),
-
-        NodedbStatement::Auth(AuthStmt::AlterUser { username, op }) => {
-            Some(alter_user(state, identity, username, op))
-        }
-
         NodedbStatement::Auth(AuthStmt::ShowPermissions {
             on_collection,
             for_grantee,
@@ -198,10 +176,6 @@ pub(super) fn try_dispatch_sync(
             on_collection.as_deref(),
             for_grantee.as_deref(),
         )),
-
-        NodedbStatement::Auth(AuthStmt::AlterRole { name, sub_op }) => {
-            Some(alter_role_typed(state, identity, name, sub_op))
-        }
 
         _ => None,
     }

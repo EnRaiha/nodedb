@@ -15,11 +15,9 @@ pub(super) async fn dispatch(
     parts: &[&str],
     database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
-    // User management.
-    // CREATE USER and ALTER USER are fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("DROP USER ") {
-        return Some(super::super::user::drop_user(state, identity, parts));
-    }
+    // User and role management (CREATE / ALTER / DROP USER, CREATE / ALTER /
+    // DROP ROLE) are handled by the protocol-neutral DDL router, which runs
+    // before this pgwire delegation.
 
     // Service accounts.
     if upper.starts_with("CREATE SERVICE ACCOUNT ") {
@@ -74,17 +72,6 @@ pub(super) async fn dispatch(
     // GRANT / REVOKE (role-membership and object-permission) are parsed
     // into typed `AuthStmt` variants and dispatched via the AST router —
     // no string-prefix branch is needed here.
-
-    // Role management.
-    if upper.starts_with("CREATE ROLE ") {
-        return Some(super::super::role::create_role(state, identity, parts));
-    }
-    if upper.starts_with("ALTER ROLE ") {
-        return Some(super::super::role::alter_role(state, identity, parts));
-    }
-    if upper.starts_with("DROP ROLE ") {
-        return Some(super::super::role::drop_role(state, identity, parts));
-    }
 
     None
 }

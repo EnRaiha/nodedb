@@ -7,10 +7,13 @@
 //! to them; every other statement returns `None` so the transitional pgwire
 //! delegation in the parent [`super::dispatch`] handles it.
 
+mod auth_support;
 pub mod grant;
 pub mod oidc;
 pub mod rls;
+pub mod role;
 pub mod router;
 pub mod sequence;
+pub mod user;
 
 pub use self::router::try_dispatch;

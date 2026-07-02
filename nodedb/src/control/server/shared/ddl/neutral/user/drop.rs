@@ -1,38 +1,47 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `DROP USER` DDL handler.
+//! Protocol-neutral `DROP USER` DDL handler.
+//!
+//! Ported from the pgwire `ddl::user::drop` handler. All non-return logic
+//! (tenant-admin gate, self-drop guard, IF EXISTS short-circuit, owner-tenant
+//! lookup, `DropUser` catalog propose + single-node `log_index == 0` fallback,
+//! collection-ownership reassignment to the tenant admin, and `audit_record`)
+//! is preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `PgWireError` to [`DdlResult`] / [`DdlError`].
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::parse_utils::strip_if_exists;
-use crate::control::server::pgwire::types::{require_tenant_admin, sqlstate_error};
 use crate::control::state::SharedState;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status, strip_if_exists};
 
 /// DROP USER [IF EXISTS] <name>
 pub fn drop_user(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop users")?;
 
     let (if_exists, parts) = strip_if_exists(parts, 2);
 
     if parts.len() < 3 {
-        return Err(sqlstate_error(
-            "42601",
-            "syntax: DROP USER [IF EXISTS] <name>",
-        ));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "syntax: DROP USER [IF EXISTS] <name>".to_string(),
+        });
     }
 
     let username = parts[2];
 
     if username == identity.username {
-        return Err(sqlstate_error("42501", "cannot drop your own user"));
+        return Err(DdlError {
+            sqlstate: "42501".to_string(),
+            message: "cannot drop your own user".to_string(),
+        });
     }
 
     // Look up user's tenant before dropping (for ownership reassignment).
@@ -48,12 +57,12 @@ pub fn drop_user(
     if !exists_before {
         // `IF EXISTS`: dropping a missing user is a no-op success.
         if if_exists {
-            return Ok(vec![Response::Execution(Tag::new("DROP USER"))]);
+            return Ok(status("DROP USER"));
         }
-        return Err(sqlstate_error(
-            "42704",
-            &format!("user '{username}' does not exist"),
-        ));
+        return Err(DdlError {
+            sqlstate: "42704".to_string(),
+            message: format!("user '{username}' does not exist"),
+        });
     }
 
     // `DropUser` fully removes the identity record on every node —
@@ -64,13 +73,19 @@ pub fn drop_user(
         username: username.to_string(),
     };
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: format!("metadata propose: {e}"),
+        })?;
     let dropped = if log_index == 0 {
         // Single-node fallback.
         state
             .credentials
             .drop_user(username)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
+            .map_err(|e| DdlError {
+                sqlstate: "XX000".to_string(),
+                message: e.to_string(),
+            })?
     } else {
         // Cluster mode: the raft entry committed, so the
         // drop WILL be applied on every node. The
@@ -86,8 +101,7 @@ pub fn drop_user(
         // user's tenant. Mutating the parent `StoredCollection`
         // and re-proposing `PutCollection` is the durable path —
         // a bare `PutOwner` would be silently overwritten the
-        // next time anyone re-proposed the parent (see
-        // `pgwire/ddl/ownership.rs` for the same pattern).
+        // next time anyone re-proposed the parent.
         let admin_name = format!("{}_admin", user_tenant.as_u64());
         let grants = state.permissions.grants_for(&format!("user:{username}"));
         if let Some(catalog) = state.credentials.catalog() {
@@ -138,12 +152,12 @@ pub fn drop_user(
             &identity.username,
             &format!("dropped user '{username}' (ownership reassigned to '{admin_name}')"),
         );
-        Ok(vec![Response::Execution(Tag::new("DROP USER"))])
+        Ok(status("DROP USER"))
     } else {
-        Err(sqlstate_error(
-            "42704",
-            &format!("user '{username}' does not exist"),
-        ))
+        Err(DdlError {
+            sqlstate: "42704".to_string(),
+            message: format!("user '{username}' does not exist"),
+        })
     }
 }
 

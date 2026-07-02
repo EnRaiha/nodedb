@@ -46,7 +46,6 @@ pub mod pubsub;
 pub mod query_functions;
 pub mod rate_gate;
 pub mod retention_policy;
-pub mod role;
 #[path = "router/mod.rs"]
 pub mod router;
 pub mod schedule;
@@ -72,7 +71,6 @@ pub mod transfer;
 pub mod tree_ops;
 pub mod trigger;
 pub mod typeguard;
-pub mod user;
 pub mod version_history;
 pub mod weighted_pick;
 

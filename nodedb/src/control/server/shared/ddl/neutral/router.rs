@@ -16,7 +16,9 @@ use super::super::result::{DdlError, DdlResult};
 use super::grant;
 use super::oidc;
 use super::rls::{self, CreateRlsPolicyRequest};
+use super::role;
 use super::sequence::{self, CreateSequenceRequest};
+use super::user;
 
 /// Try to handle `sql` with a migrated protocol-neutral DDL family handler.
 ///
@@ -30,6 +32,27 @@ pub async fn try_dispatch(
     sql: &str,
     _database_id: DatabaseId,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
+    // String-recognized user/role families. `DROP USER` parses into a typed
+    // `AuthStmt::DropUser` that carries no `if_exists` flag (so it mishandles
+    // `DROP USER IF EXISTS`), and `CREATE ROLE` / `DROP ROLE` do not parse into
+    // any typed variant at all — the pgwire router dispatched all three from the
+    // raw token slice. Replicate that exactly here, before the parse gate, so
+    // the token-based `strip_if_exists` / `strip_if_not_exists` handling and the
+    // syntax messages stay byte-identical.
+    let upper = sql.to_uppercase();
+    if upper.starts_with("DROP USER ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(user::drop_user(state, identity, &parts));
+    }
+    if upper.starts_with("CREATE ROLE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(role::create_role(state, identity, &parts));
+    }
+    if upper.starts_with("DROP ROLE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(role::drop_role(state, identity, &parts));
+    }
+
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,
     // which re-parses and reproduces the exact error handling for those inputs.
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
@@ -158,6 +181,30 @@ pub async fn try_dispatch(
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
             Some(rls::show_rls_policies(state, identity, &parts))
+        }
+
+        NodedbStatement::Auth(AuthStmt::CreateUser {
+            username,
+            password,
+            role,
+            tenant,
+            if_not_exists,
+        }) => Some(user::create_user(
+            state,
+            identity,
+            username,
+            password,
+            role.as_deref(),
+            tenant.as_ref(),
+            *if_not_exists,
+        )),
+
+        NodedbStatement::Auth(AuthStmt::AlterUser { username, op }) => {
+            Some(user::alter_user(state, identity, username, op))
+        }
+
+        NodedbStatement::Auth(AuthStmt::AlterRole { name, sub_op }) => {
+            Some(role::alter_role_typed(state, identity, name, sub_op))
         }
 
         NodedbStatement::Auth(AuthStmt::GrantRole { roles, grantee }) => {
