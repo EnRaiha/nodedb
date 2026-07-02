@@ -302,7 +302,9 @@ fn is_numeric_or_bool(s: &str) -> bool {
     s.parse::<f64>().is_ok()
 }
 
-use super::prepared::sql_placeholder::{placeholder_ranges, rewrite_sql_placeholders};
+use crate::control::server::shared::sql::placeholder::{
+    placeholder_ranges, rewrite_sql_placeholders,
+};
 
 #[cfg(test)]
 mod tests {

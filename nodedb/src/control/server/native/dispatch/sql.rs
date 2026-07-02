@@ -334,11 +334,7 @@ fn inline_params(sql: &str, params: &[Value]) -> Result<String, String> {
         .iter()
         .map(value_to_sql_literal)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(
-        crate::control::server::pgwire::handler::prepared::sql_placeholder::rewrite_sql_placeholders(
-            sql, &literals,
-        ),
-    )
+    Ok(crate::control::server::shared::sql::placeholder::rewrite_sql_placeholders(sql, &literals))
 }
 
 /// Render a `nodedb_types::Value` as a SQL literal usable in

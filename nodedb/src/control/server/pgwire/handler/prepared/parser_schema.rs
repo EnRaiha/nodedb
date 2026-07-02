@@ -201,7 +201,7 @@ pub(super) fn plan_collection(plan: &nodedb_sql::SqlPlan) -> Option<&str> {
 /// Used only for Parse-time schema inference — the real bound values
 /// are substituted at Execute time.
 pub(super) fn substitute_placeholders_with_null(sql: &str) -> String {
-    let ranges = super::super::sql_placeholder::placeholder_ranges(sql);
+    let ranges = crate::control::server::shared::sql::placeholder::placeholder_ranges(sql);
     if ranges.is_empty() {
         return sql.to_owned();
     }
@@ -219,7 +219,7 @@ pub(super) fn substitute_placeholders_with_null(sql: &str) -> String {
 /// Count $1, $2, ... placeholders in SQL text.
 pub(super) fn count_placeholders(sql: &str) -> usize {
     let mut max_idx = 0usize;
-    for (_, _, idx) in super::super::sql_placeholder::placeholder_ranges(sql) {
+    for (_, _, idx) in crate::control::server::shared::sql::placeholder::placeholder_ranges(sql) {
         if idx > max_idx {
             max_idx = max_idx.max(idx);
         }
