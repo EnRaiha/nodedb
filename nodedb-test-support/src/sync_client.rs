@@ -155,6 +155,47 @@ impl SyncTestClient {
             .map_err(|e| format!("failed to send CollectionSchema frame: {e}"))?;
         Ok(())
     }
+
+    /// Subscribe to a Document shape covering all documents in `collection`
+    /// (empty predicate). Fire-and-forget: the server's response frames — a
+    /// `CollectionSchema` announce followed by the `ShapeSnapshot` — are read
+    /// by the caller via `recv_next_frame`.
+    pub async fn subscribe_document_shape(
+        &mut self,
+        shape_id: &str,
+        collection: &str,
+        tenant_id: u32,
+    ) -> Result<(), String> {
+        use nodedb_types::sync::shape::{ShapeDefinition, ShapeType};
+        use nodedb_types::sync::wire::ShapeSubscribeMsg;
+
+        let shape = ShapeDefinition {
+            shape_id: shape_id.to_string(),
+            tenant_id,
+            shape_type: ShapeType::Document {
+                collection: collection.to_string(),
+                predicate: Vec::new(),
+            },
+            description: String::new(),
+            field_filter: Vec::new(),
+        };
+        let msg = ShapeSubscribeMsg { shape };
+        let frame = SyncFrame::new_msgpack(SyncMessageType::ShapeSubscribe, &msg)
+            .ok_or_else(|| "failed to encode ShapeSubscribeMsg".to_string())?;
+        self.ws
+            .send(Message::Binary(frame.to_bytes().into()))
+            .await
+            .map_err(|e| format!("failed to send ShapeSubscribe frame: {e}"))?;
+        Ok(())
+    }
+
+    /// Receive the next binary sync frame from the server, decoded as a
+    /// `SyncFrame`. Non-binary frames are skipped. Bounded internally by
+    /// `RECV_TIMEOUT`, so callers do not need to wrap this in a timeout to
+    /// avoid hanging on a silent server.
+    pub async fn recv_next_frame(&mut self) -> Result<SyncFrame, String> {
+        recv_any_frame(&mut self.ws).await
+    }
 }
 
 /// Receive the next binary frame, decode it as a `SyncFrame`, and error out

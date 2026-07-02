@@ -48,6 +48,11 @@ pub struct SyncSession {
     /// Origin `CollectionPurged` broadcast to decide which sessions
     /// need to be notified when a collection is hard-deleted.
     pub tracked_collections: std::collections::HashSet<(u64, String)>,
+    /// Collections whose descriptor has already been announced to the peer
+    /// this session via a `CollectionSchema` frame. Enforces the
+    /// announce-precedes-data guard: a collection's schema is emitted at most
+    /// once per session, strictly before its first shape snapshot or delta.
+    pub announced_collections: std::collections::HashSet<String>,
     /// Last WAL LSN the client advertised in its vector clock at
     /// handshake. Used by offline-client replay to identify
     /// `CollectionPurged` events that committed while the client
@@ -86,6 +91,7 @@ impl SyncSession {
             rate_limiter: SyncRateLimiter::new(rate_config),
             device_metadata: DeviceMetadata::default(),
             tracked_collections: std::collections::HashSet::new(),
+            announced_collections: std::collections::HashSet::new(),
             last_seen_lsn: 0,
             producer_id: 0,
             accepted_epoch: 0,

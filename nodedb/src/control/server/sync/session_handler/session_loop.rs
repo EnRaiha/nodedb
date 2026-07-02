@@ -129,18 +129,46 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
                             )
                             .await
                     {
-                        if session.authenticated
-                            && presence_registered
-                            && let Some(sub_msg) =
-                                frame.decode_body::<super::super::wire::ShapeSubscribeMsg>()
+                        // Decode once, reused for both the presence-channel
+                        // subscribe and the schema-announce below (avoids a
+                        // redundant second msgpack decode of the same body).
+                        let shape_sub_msg = if session.authenticated {
+                            frame.decode_body::<super::super::wire::ShapeSubscribeMsg>()
+                        } else {
+                            None
+                        };
+
+                        if let Some(sub_msg) = shape_sub_msg.as_ref()
                             && let Some(coll) = sub_msg.shape.collection()
                         {
-                            let channel = format!("shape:{coll}");
-                            shared
-                                .presence
-                                .write()
-                                .await
-                                .subscribe_to_channel(&session_id, &channel);
+                            if presence_registered {
+                                let channel = format!("shape:{coll}");
+                                shared
+                                    .presence
+                                    .write()
+                                    .await
+                                    .subscribe_to_channel(&session_id, &channel);
+                            }
+
+                            // Announce the collection descriptor before the shape
+                            // snapshot so schema strictly precedes data on the
+                            // subscription path. Idempotent per session; skips shape
+                            // variants that carry no single collection.
+                            let tenant_id = session.tenant_id.map(|t| t.as_u64()).unwrap_or(0);
+                            if let Some(schema_frame) =
+                                super::announce::build_collection_schema_frame(
+                                    shared, &session, tenant_id, coll,
+                                )
+                            {
+                                if ws
+                                    .send(Message::Binary(schema_frame.to_bytes().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                session.announced_collections.insert(coll.to_string());
+                            }
                         }
 
                         if ws
@@ -351,6 +379,29 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
 
         if let Some(ref mut rx) = crdt_delivery_rx {
             while let Ok(delta) = rx.try_recv() {
+                // Announce the collection descriptor before its first delta so
+                // schema strictly precedes data on the peer. Idempotent per
+                // session; a lookup miss warns and proceeds without marking.
+                if let Some(shared) = shared.as_ref()
+                    && let Some(schema_frame) = super::announce::build_collection_schema_frame(
+                        shared,
+                        &session,
+                        delta.tenant_id,
+                        &delta.collection,
+                    )
+                {
+                    if ws
+                        .send(Message::Binary(schema_frame.to_bytes().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    session
+                        .announced_collections
+                        .insert(delta.collection.clone());
+                }
+
                 let push_msg = nodedb_types::sync::wire::DeltaPushMsg {
                     collection: delta.collection,
                     document_id: delta.document_id,
