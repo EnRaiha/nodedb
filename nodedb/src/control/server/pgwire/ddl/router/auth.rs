@@ -19,24 +19,9 @@ pub(super) async fn dispatch(
     // DROP ROLE) are handled by the protocol-neutral DDL router, which runs
     // before this pgwire delegation.
 
-    // Service accounts.
-    if upper.starts_with("CREATE SERVICE ACCOUNT ") {
-        return Some(super::super::service_account::create_service_account(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("DROP SERVICE ACCOUNT ") {
-        return Some(super::super::service_account::drop_service_account(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("ALTER SERVICE ACCOUNT ") {
-        return Some(
-            super::super::service_account_alter::alter_service_account_set_databases(
-                state, identity, parts,
-            ),
-        );
-    }
+    // Service account management (CREATE / DROP / ALTER SERVICE ACCOUNT) is
+    // handled by the protocol-neutral DDL router, which runs before this pgwire
+    // delegation.
 
     // System-level settings (ALTER SYSTEM SET ...).
     if upper.starts_with("ALTER SYSTEM ") {

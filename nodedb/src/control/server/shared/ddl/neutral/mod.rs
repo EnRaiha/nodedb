@@ -14,6 +14,7 @@ pub mod rls;
 pub mod role;
 pub mod router;
 pub mod sequence;
+pub mod service_account;
 pub mod user;
 
 pub use self::router::try_dispatch;

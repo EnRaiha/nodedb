@@ -18,6 +18,7 @@ use super::oidc;
 use super::rls::{self, CreateRlsPolicyRequest};
 use super::role;
 use super::sequence::{self, CreateSequenceRequest};
+use super::service_account;
 use super::user;
 
 /// Try to handle `sql` with a migrated protocol-neutral DDL family handler.
@@ -51,6 +52,30 @@ pub async fn try_dispatch(
     if upper.starts_with("DROP ROLE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(role::drop_role(state, identity, &parts));
+    }
+
+    // Service accounts. These statements do not parse into any typed AST
+    // variant — the pgwire router dispatched all three from the raw token
+    // slice by string prefix. Replicate that exactly here, before the parse
+    // gate, so the token-based `IF [NOT] EXISTS` stripping and syntax messages
+    // stay byte-identical.
+    if upper.starts_with("CREATE SERVICE ACCOUNT ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(service_account::create_service_account(
+            state, identity, &parts,
+        ));
+    }
+    if upper.starts_with("DROP SERVICE ACCOUNT ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(service_account::drop_service_account(
+            state, identity, &parts,
+        ));
+    }
+    if upper.starts_with("ALTER SERVICE ACCOUNT ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(service_account::alter_service_account_set_databases(
+            state, identity, &parts,
+        ));
     }
 
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,

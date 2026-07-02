@@ -52,8 +52,6 @@ pub mod schedule;
 pub mod schema_validation;
 pub mod scope_ddl;
 pub mod scope_query_ddl;
-pub mod service_account;
-pub mod service_account_alter;
 pub mod session_ddl;
 pub mod spatial;
 pub(crate) mod sql_parse;
