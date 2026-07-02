@@ -1,17 +1,30 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE MATERIALIZED VIEW` handler — replicates through the
+//! Protocol-neutral `CREATE MATERIALIZED VIEW` handler — replicates through the
 //! metadata raft group via `CatalogEntry::PutMaterializedView`.
+//!
+//! Ported from the pgwire `ddl::materialized_view::create` handler. The catalog
+//! path (`propose_and_apply` for the view definition, then `propose_and_apply`
+//! for the target collection, then `dispatch_register_from_stored`), the
+//! duplicate / source-existence checks, and the target-collection descriptor are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::catalog::{StoredCollection, StoredMaterializedView};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::catalog::propose_and_apply;
+use super::super::super::result::{DdlError, DdlResult};
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 /// `CREATE MATERIALIZED VIEW <name> ON <source> AS SELECT ... [WITH (...)]`
 pub async fn create_materialized_view(
@@ -21,7 +34,7 @@ pub async fn create_materialized_view(
     source: &str,
     query_sql: &str,
     refresh_mode: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let name = name.to_string();
     let source = source.to_string();
     let query_sql = query_sql.to_string();
@@ -34,17 +47,17 @@ pub async fn create_materialized_view(
         match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &source) {
             Ok(Some(_)) => {}
             _ => {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42P01",
-                    &format!("source collection '{source}' does not exist"),
+                    format!("source collection '{source}' does not exist"),
                 ));
             }
         }
 
         if let Ok(Some(_)) = catalog.get_materialized_view(tenant_id.as_u64(), &name) {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42P07",
-                &format!("materialized view '{name}' already exists"),
+                format!("materialized view '{name}' already exists"),
             ));
         }
     }
@@ -73,7 +86,7 @@ pub async fn create_materialized_view(
     // it up on its next tick.
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutMaterializedView(Box::new(view.clone()));
-    super::super::catalog_propose::propose_and_apply(state, &entry)?;
+    propose_and_apply(state, &entry)?;
 
     // Create the view's target collection so REFRESH can insert into it
     // and clients can SELECT from it like any other collection. Skipped
@@ -128,12 +141,14 @@ pub async fn create_materialized_view(
         };
         let coll_entry =
             crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(target.clone()));
-        super::super::catalog_propose::propose_and_apply(state, &coll_entry)?;
+        propose_and_apply(state, &coll_entry)?;
         // Register the target with this node's Data Plane so writes
         // encode correctly and scans can find the collection.
-        super::super::collection::dispatch_register_from_stored(state, &target)
-            .await
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        crate::control::server::pgwire::ddl::collection::dispatch_register_from_stored(
+            state, &target,
+        )
+        .await
+        .map_err(|e| err("XX000", e.to_string()))?;
     }
 
     tracing::info!(
@@ -143,7 +158,8 @@ pub async fn create_materialized_view(
         "materialized view created"
     );
 
-    Ok(vec![Response::Execution(Tag::new(
-        "CREATE MATERIALIZED VIEW",
-    ))])
+    Ok(vec![DdlResult::Status {
+        command: "CREATE MATERIALIZED VIEW".to_string(),
+        rows_affected: None,
+    }])
 }

@@ -1,25 +1,50 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `DROP MATERIALIZED VIEW [IF EXISTS]` handler.
+//! Protocol-neutral `DROP MATERIALIZED VIEW [IF EXISTS]` handler.
+//!
+//! Ported from the pgwire `ddl::materialized_view::drop` handler. The DIRECT
+//! catalog path (`propose_catalog_entry` for the `DeleteMaterializedView` entry
+//! with a manual `catalog.delete_materialized_view` fallback on the `log_index
+//! == 0` bypass branch, then a `DeactivateCollection` propose for the view's
+//! target collection), the token-based name / IF EXISTS extraction, and the
+//! pre-check existence gate are preserved verbatim; only the result construction
+//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
+
+/// Whether a materialized view exists in the in-memory registry for the
+/// identity tenant. Used by the router's IF EXISTS short-circuit guard.
+pub fn materialized_view_exists(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    name: &str,
+) -> bool {
+    let tid = identity.tenant_id.as_u64();
+    state.mv_registry.get_def(tid, name).is_some()
+}
 
 pub fn drop_materialized_view(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 4 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
-            "syntax: DROP MATERIALIZED VIEW [IF EXISTS] <name>",
+            "syntax: DROP MATERIALIZED VIEW [IF EXISTS] <name>".to_string(),
         ));
     }
 
@@ -45,15 +70,16 @@ pub fn drop_materialized_view(
         false
     };
     if !exists_before && !if_exists {
-        return Err(sqlstate_error(
+        return Err(err(
             "42P01",
-            &format!("materialized view '{name}' does not exist"),
+            format!("materialized view '{name}' does not exist"),
         ));
     }
     if !exists_before {
-        return Ok(vec![Response::Execution(Tag::new(
-            "DROP MATERIALIZED VIEW",
-        ))]);
+        return Ok(vec![DdlResult::Status {
+            command: "DROP MATERIALIZED VIEW".to_string(),
+            rows_affected: None,
+        }]);
     }
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteMaterializedView {
@@ -61,13 +87,13 @@ pub fn drop_materialized_view(
         name: name.clone(),
     };
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("metadata propose: {e}")))?;
+        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
     if log_index == 0
         && let Some(catalog) = state.credentials.catalog()
     {
         catalog
             .delete_materialized_view(tenant_id.as_u64(), &name)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+            .map_err(|e| err("XX000", e.to_string()))?;
     }
 
     // Also drop the view's target collection created by CREATE MATERIALIZED VIEW.
@@ -85,12 +111,13 @@ pub fn drop_materialized_view(
             name: name.clone(),
         };
         let _ = crate::control::metadata_proposer::propose_catalog_entry(state, &coll_entry)
-            .map_err(|e| sqlstate_error("XX000", &format!("metadata propose: {e}")))?;
+            .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
     }
 
     tracing::info!(view = name, "materialized view dropped");
 
-    Ok(vec![Response::Execution(Tag::new(
-        "DROP MATERIALIZED VIEW",
-    ))])
+    Ok(vec![DdlResult::Status {
+        command: "DROP MATERIALIZED VIEW".to_string(),
+        rows_affected: None,
+    }])
 }

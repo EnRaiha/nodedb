@@ -1,41 +1,52 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `REFRESH MATERIALIZED VIEW` — re-materialize the view target by
-//! executing the view's stored `SELECT` and writing each computed row
-//! to the target collection.
+//! Protocol-neutral `REFRESH MATERIALIZED VIEW` — re-materialize the view target
+//! by executing the view's stored `SELECT` and writing each computed row to the
+//! target collection.
 //!
 //! The refresh runs entirely in the Control Plane:
 //!
 //!   1. Plan the stored `SELECT` through `nodedb-sql`.
-//!   2. Dispatch each produced `PhysicalTask` and collect the rows.
+//!   2. Dispatch each produced `PhysicalTask` to the Data Plane and collect rows.
 //!   3. Clear the target (`DELETE FROM <view>`).
 //!   4. Write each collected row back with `INSERT INTO <view> (cols)
 //!      VALUES (...)` through the same SQL pipeline.
 //!
-//! Decoupling the scan from the insert is what makes projection,
-//! `WHERE`, `GROUP BY`/aggregates, and JOIN work uniformly — the Data
-//! Plane never needs a specialised refresh opcode; every engine
-//! feature reachable by a normal `SELECT` is reachable by refresh.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Decoupling the scan from the insert is what makes projection, `WHERE`,
+//! `GROUP BY`/aggregates, and JOIN work uniformly — the Data Plane never needs a
+//! specialised refresh opcode; every engine feature reachable by a normal
+//! `SELECT` is reachable by refresh.
+//!
+//! Ported from the pgwire `ddl::materialized_view::refresh` handler. The plan /
+//! Data-Plane dispatch path (`plan_sql`, `wal_append_if_write`,
+//! `dispatch_to_data_plane`), the scan-row normalisation, and the INSERT
+//! synthesis are preserved verbatim; only the result construction changed from
+//! pgwire `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
+//! [`DdlError`].
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::decode_payload_to_json;
 use crate::types::TraceId;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 pub async fn refresh_materialized_view(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 4 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
-            "syntax: REFRESH MATERIALIZED VIEW <name>",
+            "syntax: REFRESH MATERIALIZED VIEW <name>".to_string(),
         ));
     }
 
@@ -46,15 +57,15 @@ pub async fn refresh_materialized_view(
         match catalog.get_materialized_view(tenant_id.as_u64(), &name) {
             Ok(Some(v)) => v,
             Ok(None) => {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42P01",
-                    &format!("materialized view '{name}' does not exist"),
+                    format!("materialized view '{name}' does not exist"),
                 ));
             }
-            Err(e) => return Err(sqlstate_error("XX000", &e.to_string())),
+            Err(e) => return Err(err("XX000", e.to_string())),
         }
     } else {
-        return Err(sqlstate_error("XX000", "catalog unavailable"));
+        return Err(err("XX000", "catalog unavailable".to_string()));
     };
 
     // 1) Run the stored SELECT and collect every row.
@@ -90,9 +101,10 @@ pub async fn refresh_materialized_view(
         "materialized view refreshed"
     );
 
-    Ok(vec![Response::Execution(Tag::new(
-        "REFRESH MATERIALIZED VIEW",
-    ))])
+    Ok(vec![DdlResult::Status {
+        command: "REFRESH MATERIALIZED VIEW".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Plan and execute a `SELECT` via the standard SQL pipeline, collect
@@ -103,12 +115,12 @@ async fn execute_select(
     state: &SharedState,
     tenant_id: nodedb_types::TenantId,
     sql: &str,
-) -> PgWireResult<Vec<serde_json::Map<String, serde_json::Value>>> {
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, DdlError> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
     let tasks = query_ctx
         .plan_sql(sql, tenant_id, crate::types::DatabaseId::DEFAULT)
         .await
-        .map_err(|e| sqlstate_error("XX000", &format!("plan '{sql}': {e}")))?;
+        .map_err(|e| err("XX000", format!("plan '{sql}': {e}")))?;
 
     let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
     for task in tasks {
@@ -121,7 +133,7 @@ async fn execute_select(
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| sqlstate_error("XX000", &format!("dispatch: {e}")))?;
+        .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
 
         let payload = response.payload.as_ref();
         if payload.is_empty() {
@@ -132,7 +144,7 @@ async fn execute_select(
             continue;
         }
         let parsed: serde_json::Value = sonic_rs::from_str(&json)
-            .map_err(|e| sqlstate_error("XX000", &format!("decode scan payload: {e}")))?;
+            .map_err(|e| err("XX000", format!("decode scan payload: {e}")))?;
 
         collect_rows(parsed, &mut rows);
     }
@@ -176,11 +188,11 @@ fn collect_rows(
 fn build_insert_sql(
     target: &str,
     row: &serde_json::Map<String, serde_json::Value>,
-) -> PgWireResult<String> {
+) -> Result<String, DdlError> {
     if row.is_empty() {
-        return Err(sqlstate_error(
+        return Err(err(
             "XX000",
-            "materialized view SELECT produced an empty row (no columns)",
+            "materialized view SELECT produced an empty row (no columns)".to_string(),
         ));
     }
     let mut cols: Vec<String> = Vec::with_capacity(row.len());
@@ -199,7 +211,7 @@ fn build_insert_sql(
     ))
 }
 
-fn json_value_to_sql_literal(v: &serde_json::Value) -> PgWireResult<String> {
+fn json_value_to_sql_literal(v: &serde_json::Value) -> Result<String, DdlError> {
     Ok(match v {
         serde_json::Value::Null => "NULL".into(),
         serde_json::Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
@@ -207,7 +219,7 @@ fn json_value_to_sql_literal(v: &serde_json::Value) -> PgWireResult<String> {
         serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
             let s = sonic_rs::to_string(v)
-                .map_err(|e| sqlstate_error("XX000", &format!("encode nested value: {e}")))?;
+                .map_err(|e| err("XX000", format!("encode nested value: {e}")))?;
             format!("'{}'", s.replace('\'', "''"))
         }
     })
@@ -217,12 +229,12 @@ async fn dispatch_sql(
     state: &SharedState,
     tenant_id: nodedb_types::TenantId,
     sql: &str,
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
     let tasks = query_ctx
         .plan_sql(sql, tenant_id, crate::types::DatabaseId::DEFAULT)
         .await
-        .map_err(|e| sqlstate_error("42P20", &format!("plan '{sql}': {e}")))?;
+        .map_err(|e| err("42P20", format!("plan '{sql}': {e}")))?;
     for task in tasks {
         crate::control::server::wal_dispatch::wal_append_if_write(
             &state.wal,
@@ -231,7 +243,7 @@ async fn dispatch_sql(
             task.database_id,
             &task.plan,
         )
-        .map_err(|e| sqlstate_error("58030", &format!("wal append: {e}")))?;
+        .map_err(|e| err("58030", format!("wal append: {e}")))?;
         crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
@@ -241,7 +253,7 @@ async fn dispatch_sql(
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| sqlstate_error("08006", &format!("dispatch: {e}")))?;
+        .map_err(|e| err("08006", format!("dispatch: {e}")))?;
     }
     Ok(())
 }

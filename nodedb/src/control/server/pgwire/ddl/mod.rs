@@ -27,7 +27,6 @@ pub mod kv_sorted_index;
 pub mod last_value;
 pub mod maintenance;
 pub mod match_ops;
-pub mod materialized_view;
 pub mod metering_ddl;
 pub mod observability;
 pub mod org_ddl;

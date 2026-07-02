@@ -22,7 +22,8 @@ pub(super) async fn dispatch(
     }
 
     // Streaming materialized views: CREATE MATERIALIZED VIEW ... STREAMING AS ...
-    // CREATE MATERIALIZED VIEW (including STREAMING mode) is fully dispatched via typed AST (ast.rs).
+    // CREATE MATERIALIZED VIEW (including STREAMING mode) is served by the
+    // protocol-neutral DDL router; the pgwire router no longer routes it.
 
     // Topics (CREATE / DROP / SHOW TOPIC + PUBLISH TO) are served by the
     // protocol-neutral DDL router, which runs before this pgwire router.

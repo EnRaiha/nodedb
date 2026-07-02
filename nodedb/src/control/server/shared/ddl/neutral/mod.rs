@@ -14,6 +14,7 @@ pub mod constraint;
 pub mod consumer_group;
 pub mod function;
 pub mod grant;
+pub mod materialized_view;
 pub mod oidc;
 pub mod rls;
 pub mod role;

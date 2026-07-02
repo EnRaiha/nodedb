@@ -109,26 +109,9 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
         );
     }
 
-    // Materialized views (HTAP).
-    // CREATE MATERIALIZED VIEW is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("DROP MATERIALIZED VIEW ") {
-        return Some(
-            super::super::super::materialized_view::drop_materialized_view(state, identity, parts),
-        );
-    }
-    if upper.starts_with("REFRESH MATERIALIZED VIEW ") {
-        return Some(
-            super::super::super::materialized_view::refresh_materialized_view(
-                state, identity, parts,
-            )
-            .await,
-        );
-    }
-    if upper.starts_with("SHOW MATERIALIZED VIEW") {
-        return Some(
-            super::super::super::materialized_view::show_materialized_views(state, identity, parts),
-        );
-    }
+    // Materialized views (HTAP) — CREATE/DROP/REFRESH/SHOW MATERIALIZED VIEW are
+    // served by the protocol-neutral DDL router; the pgwire router no longer
+    // routes them.
 
     // Blacklist management.
     if upper.starts_with("BLACKLIST ") {

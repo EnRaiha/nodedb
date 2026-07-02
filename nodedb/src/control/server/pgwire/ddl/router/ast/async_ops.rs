@@ -22,7 +22,6 @@ use crate::control::server::pgwire::ddl::continuous_agg::{
 use crate::control::server::pgwire::ddl::custom_type::{
     alter_type_add_value, create_composite_type, create_enum_type, drop_type, show_types,
 };
-use crate::control::server::pgwire::ddl::materialized_view::create_materialized_view;
 use crate::control::server::pgwire::ddl::retention_policy::create_retention_policy;
 use crate::control::server::pgwire::ddl::synonym_group::{
     create_synonym_group, drop_synonym_group, show_synonym_groups,
@@ -42,15 +41,6 @@ pub(super) async fn try_dispatch_async(
     database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     match stmt {
-        NodedbStatement::StreamView(StreamViewStmt::CreateMaterializedView {
-            name,
-            source,
-            query_sql,
-            refresh_mode,
-        }) => Some(
-            create_materialized_view(state, identity, name, source, query_sql, refresh_mode).await,
-        ),
-
         NodedbStatement::StreamView(StreamViewStmt::CreateContinuousAggregate {
             name,
             source,

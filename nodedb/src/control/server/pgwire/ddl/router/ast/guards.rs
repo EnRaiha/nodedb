@@ -11,10 +11,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
-use super::exists::{
-    collection_exists, continuous_aggregate_exists, materialized_view_exists,
-    retention_policy_exists,
-};
+use super::exists::{collection_exists, continuous_aggregate_exists, retention_policy_exists};
 
 /// Handle IF [NOT] EXISTS guard arms. Returns `Some(result)` if the statement
 /// was handled (short-circuit), `None` if it should proceed to typed dispatch.
@@ -64,18 +61,6 @@ pub(super) fn try_dispatch_guards(
             if !retention_policy_exists(state, identity, database_id, name) {
                 return Some(Ok(vec![Response::Execution(Tag::new(
                     "DROP RETENTION POLICY",
-                ))]));
-            }
-            None
-        }
-
-        NodedbStatement::StreamView(StreamViewStmt::DropMaterializedView {
-            name,
-            if_exists: true,
-        }) => {
-            if !materialized_view_exists(state, identity, name) {
-                return Some(Ok(vec![Response::Execution(Tag::new(
-                    "DROP MATERIALIZED VIEW",
                 ))]));
             }
             None

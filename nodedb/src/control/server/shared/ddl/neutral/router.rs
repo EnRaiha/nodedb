@@ -21,6 +21,7 @@ use super::constraint;
 use super::consumer_group;
 use super::function;
 use super::grant;
+use super::materialized_view;
 use super::oidc;
 use super::rls::{self, CreateRlsPolicyRequest};
 use super::role;
@@ -309,6 +310,26 @@ pub async fn try_dispatch(
         );
     }
 
+    // Materialized views (HTAP). `REFRESH MATERIALIZED VIEW` parses into no typed
+    // AST variant, and `SHOW MATERIALIZED VIEWS` parses into a typed
+    // `StreamViewStmt::ShowMaterializedViews` but the pgwire admin router
+    // dispatched it from the raw token slice by string prefix (the `SHOW
+    // MATERIALIZED VIEW` prefix, trailing-space-less, captures both the plural
+    // `SHOW MATERIALIZED VIEWS` and the bare-singular input). Replicate both here,
+    // before the parse gate, so the prefix recognition and the `parts`-based name
+    // extraction stay byte-identical. `CREATE` / `DROP MATERIALIZED VIEW` are
+    // handled in the typed match below (they parse into typed StreamView variants).
+    if upper.starts_with("REFRESH MATERIALIZED VIEW ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(materialized_view::refresh_materialized_view(state, identity, &parts).await);
+    }
+    if upper.starts_with("SHOW MATERIALIZED VIEW") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(materialized_view::show_materialized_views(
+            state, identity, &parts,
+        ));
+    }
+
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,
     // which re-parses and reproduces the exact error handling for those inputs.
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
@@ -381,6 +402,44 @@ pub async fn try_dispatch(
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
             Some(consumer_group::drop_consumer_group(state, identity, &parts))
+        }
+
+        NodedbStatement::StreamView(StreamViewStmt::CreateMaterializedView {
+            name,
+            source,
+            query_sql,
+            refresh_mode,
+        }) => Some(
+            materialized_view::create_materialized_view(
+                state,
+                identity,
+                name,
+                source,
+                query_sql,
+                refresh_mode,
+            )
+            .await,
+        ),
+
+        NodedbStatement::StreamView(StreamViewStmt::DropMaterializedView { name, if_exists }) => {
+            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // non-existing materialized view returns the tag before the token
+            // handler runs. The existence check reads the in-memory registry
+            // (`mv_registry`) for the identity tenant exactly as the pgwire guard
+            // did. The `if_exists: false` case and the existing-view case fall
+            // through to `drop_materialized_view`, which re-derives the name / IF
+            // EXISTS from `parts` (and runs its own catalog-based existence check)
+            // exactly as the pgwire admin string dispatch did.
+            if *if_exists && !materialized_view::materialized_view_exists(state, identity, name) {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "DROP MATERIALIZED VIEW".to_string(),
+                    rows_affected: None,
+                }]));
+            }
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(materialized_view::drop_materialized_view(
+                state, identity, &parts,
+            ))
         }
 
         NodedbStatement::Collection(CollectionStmt::CreateSequence {
