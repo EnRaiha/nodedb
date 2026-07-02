@@ -2,30 +2,29 @@
 
 //! `CREATE SEARCH INDEX` DSL handler (higher-level alias for fulltext).
 
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
-
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::state::SharedState;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 /// CREATE SEARCH INDEX ON <collection> FIELDS <field1>[, <field2>...] [ANALYZER '<name>'] [FUZZY true|false]
 pub fn create_search_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
 
     let on_pos = upper.find(" ON ").ok_or_else(|| {
-        sqlstate_error(
+        ddl_err(
             "42601",
             "syntax: CREATE SEARCH INDEX ON <collection> FIELDS <field> [ANALYZER 'name'] [FUZZY true]",
         )
     })?;
     let after_on = sql[on_pos + 4..].trim_start();
     let fields_pos = upper.find(" FIELDS ").ok_or_else(|| {
-        sqlstate_error(
+        ddl_err(
             "42601",
             "syntax: CREATE SEARCH INDEX ON <collection> FIELDS <field> [ANALYZER 'name'] [FUZZY true]",
         )
@@ -33,7 +32,7 @@ pub fn create_search_index(
 
     let collection = after_on[..fields_pos - on_pos - 4].trim().to_lowercase();
     if collection.is_empty() {
-        return Err(sqlstate_error("42601", "missing collection name"));
+        return Err(ddl_err("42601", "missing collection name"));
     }
 
     let after_fields = &sql[fields_pos + 8..];
@@ -45,7 +44,7 @@ pub fn create_search_index(
     let fields: Vec<&str> = fields_str.split(',').map(|s| s.trim()).collect();
 
     if fields.is_empty() || fields[0].is_empty() {
-        return Err(sqlstate_error("42601", "missing field list"));
+        return Err(ddl_err("42601", "missing field list"));
     }
 
     let tenant_id = identity.tenant_id;
@@ -53,7 +52,7 @@ pub fn create_search_index(
     for field in &fields {
         let index_name = format!("fts_{}_{}", collection, field);
 
-        super::super::owner_propose::propose_owner(
+        crate::control::server::shared::ddl::owner::propose_owner(
             state,
             "fulltext_index",
             tenant_id,
@@ -69,5 +68,8 @@ pub fn create_search_index(
         );
     }
 
-    Ok(vec![Response::Execution(Tag::new("CREATE SEARCH INDEX"))])
+    Ok(vec![DdlResult::Status {
+        command: "CREATE SEARCH INDEX".to_string(),
+        rows_affected: None,
+    }])
 }

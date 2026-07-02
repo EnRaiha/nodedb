@@ -2,21 +2,20 @@
 
 //! `CREATE SPARSE INDEX` DSL handler.
 
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
-
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::state::SharedState;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 /// CREATE SPARSE INDEX [name] ON <collection> (<field>)
 pub fn create_sparse_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 6 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "syntax: CREATE SPARSE INDEX [name] ON <collection> (<field>)",
         ));
@@ -26,14 +25,14 @@ pub fn create_sparse_index(
         ("_auto_sparse".to_string(), 3)
     } else {
         if parts.len() < 7 || !parts[4].eq_ignore_ascii_case("ON") {
-            return Err(sqlstate_error("42601", "expected ON after index name"));
+            return Err(ddl_err("42601", "expected ON after index name"));
         }
         (parts[3].to_string(), 4)
     };
 
     let collection = parts
         .get(on_idx + 1)
-        .ok_or_else(|| sqlstate_error("42601", "expected collection name after ON"))?;
+        .ok_or_else(|| ddl_err("42601", "expected collection name after ON"))?;
 
     let field = parts
         .get(on_idx + 2)
@@ -42,7 +41,7 @@ pub fn create_sparse_index(
 
     let tenant_id = identity.tenant_id;
 
-    super::super::owner_propose::propose_owner(
+    crate::control::server::shared::ddl::owner::propose_owner(
         state,
         "sparse_index",
         tenant_id,
@@ -57,5 +56,8 @@ pub fn create_sparse_index(
         &format!("created sparse index '{index_name}' on '{collection}' ({field})"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE SPARSE INDEX"))])
+    Ok(vec![DdlResult::Status {
+        command: "CREATE SPARSE INDEX".to_string(),
+        rows_affected: None,
+    }])
 }

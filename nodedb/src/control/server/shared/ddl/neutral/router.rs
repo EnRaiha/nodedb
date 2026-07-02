@@ -23,6 +23,7 @@ use super::constraint;
 use super::consumer_group;
 use super::continuous_agg;
 use super::custom_type;
+use super::dsl;
 use super::function;
 use super::grant;
 use super::graph_ops;
@@ -506,6 +507,37 @@ pub async fn try_dispatch(
             database_id,
             &parts,
         ));
+    }
+
+    // DSL extensions (custom SQL-like surfaces). None of these are dispatched
+    // from a typed AST arm — the pgwire dsl router recognized all six by string
+    // prefix from the raw SQL. Replicate that exactly here, before the parse
+    // gate, so the prefix recognition and syntax messages stay byte-identical.
+    // `SEARCH ... USING FUSION` must precede the parse gate because it would
+    // otherwise parse into a typed graph statement and be captured by the graph
+    // dispatch below. `SEARCH ... USING VECTOR(...)` never reaches here — it is
+    // preprocessor-rewritten to a canonical `SELECT ... vector_distance(...)`.
+    if upper.starts_with("SEARCH ") && upper.contains("USING FUSION") {
+        return Some(dsl::search_fusion(state, identity, database_id, sql).await);
+    }
+    if upper.starts_with("CREATE VECTOR INDEX ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(dsl::create_vector_index(state, identity, &parts).await);
+    }
+    if upper.starts_with("CREATE FULLTEXT INDEX ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(dsl::create_fulltext_index(state, identity, &parts));
+    }
+    if upper.starts_with("CREATE SEARCH INDEX ") {
+        return Some(dsl::create_search_index(state, identity, sql));
+    }
+    if upper.starts_with("CREATE SPARSE INDEX ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(dsl::create_sparse_index(state, identity, &parts));
+    }
+    if upper.starts_with("CRDT MERGE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(dsl::crdt_merge(state, identity, database_id, &parts).await);
     }
 
     // Parse errors → let the pgwire path run, which re-parses and reproduces the

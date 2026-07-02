@@ -4,15 +4,14 @@
 
 use std::time::Duration;
 
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
-
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 /// CRDT MERGE INTO <collection> FROM '<source_id>' TO '<target_id>'
 pub async fn crdt_merge(
@@ -20,9 +19,9 @@ pub async fn crdt_merge(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 7 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "syntax: CRDT MERGE INTO <collection> FROM '<source_id>' TO '<target_id>'",
         ));
@@ -34,20 +33,20 @@ pub async fn crdt_merge(
     let from_idx = parts
         .iter()
         .position(|p| p.eq_ignore_ascii_case("FROM"))
-        .ok_or_else(|| sqlstate_error("42601", "expected FROM keyword"))?;
+        .ok_or_else(|| ddl_err("42601", "expected FROM keyword"))?;
     let to_idx = parts
         .iter()
         .position(|p| p.eq_ignore_ascii_case("TO"))
-        .ok_or_else(|| sqlstate_error("42601", "expected TO keyword"))?;
+        .ok_or_else(|| ddl_err("42601", "expected TO keyword"))?;
 
     let source_id = parts
         .get(from_idx + 1)
         .map(|s| s.trim_matches('\'').trim_matches('"'))
-        .ok_or_else(|| sqlstate_error("42601", "missing source document ID"))?;
+        .ok_or_else(|| ddl_err("42601", "missing source document ID"))?;
     let target_id = parts
         .get(to_idx + 1)
         .map(|s| s.trim_matches('\'').trim_matches('"'))
-        .ok_or_else(|| sqlstate_error("42601", "missing target document ID"))?;
+        .ok_or_else(|| ddl_err("42601", "missing target document ID"))?;
 
     let source_plan = PhysicalPlan::Crdt(CrdtOp::Read {
         collection: collection.to_string(),
@@ -63,18 +62,18 @@ pub async fn crdt_merge(
         Duration::from_secs(state.tuning.network.default_deadline_secs),
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
     if source_bytes.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "02000",
-            &format!("source document '{source_id}' not found"),
+            format!("source document '{source_id}' not found"),
         ));
     }
 
     let target_surrogate = state
         .surrogate_assigner
         .assign(database_id, tenant_id, collection, target_id.as_bytes())
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     let apply_plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: collection.to_string(),
@@ -100,7 +99,7 @@ pub async fn crdt_merge(
         crate::event::EventSource::User,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -109,5 +108,8 @@ pub async fn crdt_merge(
         &format!("CRDT merge: {source_id} → {target_id} in '{collection}'"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CRDT MERGE"))])
+    Ok(vec![DdlResult::Status {
+        command: "CRDT MERGE".to_string(),
+        rows_affected: None,
+    }])
 }

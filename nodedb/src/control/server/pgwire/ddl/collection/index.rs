@@ -258,13 +258,14 @@ pub async fn create_index(
     }
 
     // Ownership record backs SHOW INDEXES — keep the existing ledger.
-    super::super::owner_propose::propose_owner(
+    crate::control::server::shared::ddl::owner::propose_owner(
         state,
         "index",
         tenant_id,
         &index_name,
         &index_owner,
-    )?;
+    )
+    .map_err(|e| sqlstate_error(&e.sqlstate, &e.message))?;
 
     let kind = if is_unique { "unique index" } else { "index" };
     let ci = if case_insensitive {
@@ -383,7 +384,13 @@ pub async fn drop_index(
         );
     }
 
-    super::super::owner_propose::propose_delete_owner(state, "index", tenant_id, &index_name)?;
+    crate::control::server::shared::ddl::owner::propose_delete_owner(
+        state,
+        "index",
+        tenant_id,
+        &index_name,
+    )
+    .map_err(|e| sqlstate_error(&e.sqlstate, &e.message))?;
 
     state.audit_record(
         AuditEvent::AdminAction,

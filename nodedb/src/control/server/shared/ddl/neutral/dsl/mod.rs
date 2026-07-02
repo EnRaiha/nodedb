@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! NodeDB DSL extensions — custom SQL-like commands beyond standard SQL.
+//! Protocol-neutral NodeDB DSL extensions — custom SQL-like commands beyond
+//! standard SQL.
 //!
 //! - SEARCH <collection> USING FUSION(vector=..., graph=..., top_k=...)
 //!   (`SEARCH <collection> USING VECTOR(...)` is preprocessor-rewritten to
@@ -12,6 +13,9 @@
 //! - CREATE SEARCH INDEX ON <collection> FIELDS ...
 //! - CREATE SPARSE INDEX [name] ON <collection> (<field>)
 //! - CRDT MERGE INTO <collection> FROM <source_id> TO <target_id>
+//!
+//! Handlers build [`DdlResult`](super::super::result::DdlResult) directly and
+//! carry no pgwire types.
 
 mod crdt_merge;
 mod fulltext_index;
@@ -19,6 +23,7 @@ mod helpers;
 mod search_fusion;
 mod search_index;
 mod sparse_index;
+mod support;
 mod vector_index;
 
 pub use crdt_merge::crdt_merge;

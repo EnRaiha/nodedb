@@ -52,13 +52,14 @@ pub fn create_spatial_index(
         let _precision = 6;
     }
 
-    super::owner_propose::propose_owner(
+    crate::control::server::shared::ddl::owner::propose_owner(
         state,
         "spatial_index",
         tenant_id,
         index_name,
         &identity.username,
-    )?;
+    )
+    .map_err(|e| sqlstate_error(&e.sqlstate, &e.message))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

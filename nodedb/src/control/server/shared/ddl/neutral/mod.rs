@@ -15,6 +15,7 @@ pub mod constraint;
 pub mod consumer_group;
 pub mod continuous_agg;
 pub mod custom_type;
+pub mod dsl;
 pub mod function;
 pub mod grant;
 pub mod graph_ops;

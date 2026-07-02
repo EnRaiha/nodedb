@@ -24,41 +24,6 @@ pub(super) async fn dispatch(
         return Some(super::helpers::execute_chunk_text(sql));
     }
 
-    // DSL: SEARCH commands.
-    //
-    // `SEARCH <coll> USING VECTOR(<field>, ARRAY[...], <k>)` is rewritten to
-    // canonical `SELECT * FROM <coll> ORDER BY vector_distance(...) LIMIT k`
-    // by the SQL preprocessor (`nodedb_sql::parser::preprocess::search_vector`)
-    // so it shares the same response shape as the canonical form. Only the
-    // FUSION variant stays here — it has no canonical SELECT lowering.
-    if upper.starts_with("SEARCH ") && upper.contains("USING FUSION") {
-        return Some(super::super::dsl::search_fusion(state, identity, database_id, sql).await);
-    }
-
-    // DSL: CREATE VECTOR INDEX / CREATE FULLTEXT INDEX.
-    if upper.starts_with("CREATE VECTOR INDEX ") {
-        return Some(super::super::dsl::create_vector_index(state, identity, parts).await);
-    }
-    if upper.starts_with("CREATE FULLTEXT INDEX ") {
-        return Some(super::super::dsl::create_fulltext_index(
-            state, identity, parts,
-        ));
-    }
-    // CREATE SEARCH INDEX ON <collection> FIELDS <field> [ANALYZER 'name'] [FUZZY true]
-    if upper.starts_with("CREATE SEARCH INDEX ") {
-        return Some(super::super::dsl::create_search_index(state, identity, sql));
-    }
-    if upper.starts_with("CREATE SPARSE INDEX ") {
-        return Some(super::super::dsl::create_sparse_index(
-            state, identity, parts,
-        ));
-    }
-
-    // DSL: CRDT MERGE INTO (async — dispatches to Data Plane).
-    if upper.starts_with("CRDT MERGE ") {
-        return Some(super::super::dsl::crdt_merge(state, identity, database_id, parts).await);
-    }
-
     // CRDT operations via SQL-like syntax (async).
     if upper.starts_with("SELECT CRDT_STATE(") || upper.starts_with("SELECT CRDT_STATE (") {
         return Some(super::super::crdt_ops::crdt_state(state, identity, database_id, sql).await);
