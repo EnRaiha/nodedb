@@ -373,114 +373,28 @@ impl NodeDbPgHandler {
                 continue;
             }
 
-            // --- Trigger interception for DML writes ---
-            let mut dml_info = crate::control::trigger::dml_hook::classify_dml_write(&task.plan);
-
-            // Fetch OLD row and fire BEFORE/INSTEAD OF triggers if applicable.
-            let old_row = if let Some(ref info) = dml_info
-                && info.document_id.is_some()
-                && (matches!(
-                    info.event,
-                    crate::control::trigger::DmlEvent::Update
-                        | crate::control::trigger::DmlEvent::Delete
-                ) || info.needs_existence_probe)
+            // --- Pre-dispatch hooks: trigger interception + clone write-path
+            // interception (moved to execute_dml_hooks.rs to keep this file
+            // under the size limit; behavior is unchanged).
+            let (dml_info, old_row, truncate_restart_collection) = match self
+                .run_pre_dispatch_hooks(identity, tenant_id, addr, plan_kind, task)
+                .await?
             {
-                let doc_id = info.document_id.as_deref().unwrap_or("");
-                let row = crate::control::trigger::dml_hook::fetch_old_row(
-                    &self.state,
-                    tenant_id,
-                    &info.collection,
-                    doc_id,
-                )
-                .await;
-                if !row.is_empty() { Some(row) } else { None }
-            } else {
-                None
+                super::execute_dml_hooks::PreDispatchOutcome::Handled(resp) => {
+                    responses.push(resp);
+                    continue;
+                }
+                super::execute_dml_hooks::PreDispatchOutcome::Proceed(proceed) => {
+                    let super::execute_dml_hooks::PreDispatchProceed {
+                        task: proceeding_task,
+                        dml_info,
+                        old_row,
+                        truncate_restart_collection,
+                    } = *proceed;
+                    task = proceeding_task;
+                    (dml_info, old_row, truncate_restart_collection)
+                }
             };
-
-            // Probe-driven reclassification.
-            if let Some(ref mut info) = dml_info
-                && info.needs_existence_probe
-            {
-                info.event = if old_row.is_some() {
-                    crate::control::trigger::DmlEvent::Update
-                } else {
-                    crate::control::trigger::DmlEvent::Insert
-                };
-            }
-
-            if let Some(ref info) = dml_info {
-                use crate::control::trigger::dml_hook_fire::PreDispatchResult;
-                match crate::control::trigger::dml_hook_fire::fire_pre_dispatch_triggers(
-                    &self.state,
-                    identity,
-                    tenant_id,
-                    info,
-                    &old_row,
-                    0,
-                )
-                .await
-                .map_err(|e| {
-                    let (severity, code, message) = error_to_sqlstate(&e);
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        severity.to_owned(),
-                        code.to_owned(),
-                        message,
-                    )))
-                })? {
-                    PreDispatchResult::Handled => {
-                        responses.push(Response::Execution(Tag::new("OK")));
-                        continue;
-                    }
-                    PreDispatchResult::Proceed {
-                        mutated_fields: Some(fields),
-                    } => {
-                        crate::control::trigger::dml_hook::patch_task_with_mutated_fields(
-                            &mut task, &fields,
-                        );
-                    }
-                    PreDispatchResult::Proceed {
-                        mutated_fields: None,
-                    } => {}
-                }
-            }
-
-            // Extract truncate restart_identity info before task is moved.
-            let truncate_restart_collection =
-                if let nodedb_physical::physical_plan::PhysicalPlan::Document(
-                    nodedb_physical::physical_plan::DocumentOp::Truncate {
-                        collection,
-                        restart_identity: true,
-                    },
-                ) = &task.plan
-                {
-                    Some(collection.clone())
-                } else {
-                    None
-                };
-
-            // --- Clone write-path interception ---
-            // For PointUpdate / PointDelete on Shadowed/Materializing clones,
-            // apply copy-up or tombstone before (or instead of) normal dispatch.
-            // Non-cloned collections and Materialized clones short-circuit here.
-            {
-                use super::clone_write_dispatch::CloneWriteOutcome;
-                match self.maybe_intercept_clone_write(&task, tenant_id).await? {
-                    CloneWriteOutcome::Handled(resp) => {
-                        let shaped =
-                            crate::control::server::pgwire::handler::plan::payload_to_response(
-                                resp.payload.as_ref(),
-                                plan_kind,
-                            );
-                        if let Some(notice) = shaped.notice {
-                            self.sessions.push_notice(addr, notice);
-                        }
-                        responses.push(shaped.response);
-                        continue;
-                    }
-                    CloneWriteOutcome::Passthrough => {}
-                }
-            }
 
             // --- Normal dispatch ---
             let user_id: Option<std::sync::Arc<str>> =
