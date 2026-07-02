@@ -59,7 +59,6 @@ pub mod temp_table;
 pub mod tenant;
 pub mod timeseries;
 mod timeseries_helpers;
-pub mod topic;
 pub mod transfer;
 pub mod tree_ops;
 pub mod version_history;

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+//! Protocol-neutral topic DDL — CREATE / DROP / SHOW + PUBLISH TO.
+
 pub mod create;
 pub mod drop;
 pub mod publish;

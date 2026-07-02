@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Protocol-neutral `PUBLISH TO` handler — thin wrapper over the unified SQL
+//! dispatcher.
+//!
+//! Ported from the pgwire `ddl::topic::publish` adapter. Parsing, escape
+//! handling, and cluster-aware forwarding are delegated to the protocol-agnostic
+//! `sql_dispatch::dispatch_sql` verbatim; the success tag, the per-variant
+//! SQLSTATE mapping, and the unrecognized-syntax error are preserved, only the
+//! result construction changed from pgwire `Response` / `PgWireError` to the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
+//!
+//! Syntax: `PUBLISH TO <topic> '<payload>'`
+
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::sql_dispatch::dispatch_sql;
+use crate::control::state::SharedState;
+
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::status;
+
+/// Handle `PUBLISH TO <topic> '<payload>'`.
+///
+/// Delegates parsing, escape handling, and cluster-aware forwarding to the
+/// protocol-agnostic `sql_dispatch::dispatch_sql`.
+pub async fn handle_publish(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    sql: &str,
+) -> Result<Vec<DdlResult>, DdlError> {
+    match dispatch_sql(state, identity, sql).await {
+        Some(Ok(_)) => Ok(status("PUBLISH")),
+        Some(Err(e)) => {
+            let sqlstate = match &e {
+                crate::Error::CollectionNotFound { .. } => "42704",
+                crate::Error::BadRequest { .. } => "42601",
+                crate::Error::Dispatch { .. } => "58000",
+                _ => "XX000",
+            };
+            Err(DdlError {
+                sqlstate: sqlstate.to_string(),
+                message: e.to_string(),
+            })
+        }
+        None => Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected PUBLISH TO <topic> '<payload>'".to_string(),
+        }),
+    }
+}

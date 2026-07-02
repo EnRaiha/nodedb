@@ -26,6 +26,7 @@ use super::role;
 use super::schedule::{self, CreateScheduleRequest};
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
+use super::topic;
 use super::trigger;
 use super::typeguard;
 use super::user;
@@ -223,6 +224,28 @@ pub async fn try_dispatch(
     if upper.starts_with("COMMIT OFFSET ") || upper.starts_with("COMMIT OFFSETS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(consumer_group::commit_offset(state, identity, &parts));
+    }
+
+    // Topics: `CREATE TOPIC`, `DROP TOPIC`, `SHOW TOPIC(S)`, and `PUBLISH TO`.
+    // None of these parse into any typed AST variant — the pgwire streaming
+    // router dispatched all four by string prefix from the raw token slice /
+    // SQL. Replicate that exactly here, before the parse gate, so the prefix
+    // recognition (including the trailing-space-less `SHOW TOPIC`, which
+    // captures both `SHOW TOPICS` and the bare-singular input) and the
+    // `parts`-based syntax messages stay byte-identical.
+    if upper.starts_with("CREATE TOPIC ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(topic::create_topic(state, identity, &parts, sql));
+    }
+    if upper.starts_with("DROP TOPIC ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(topic::drop_topic(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW TOPIC") {
+        return Some(topic::show_topics(state, identity));
+    }
+    if upper.starts_with("PUBLISH TO ") {
+        return Some(topic::handle_publish(state, identity, sql).await);
     }
 
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,

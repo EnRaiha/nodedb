@@ -1,40 +1,49 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE TOPIC` DDL handler.
+//! Protocol-neutral `CREATE TOPIC` DDL handler.
+//!
+//! Ported from the pgwire `ddl::topic::create` handler. The tenant-admin gate,
+//! the duplicate-topic check, the optional `WITH (RETENTION = '…')` parse, the
+//! `TopicDef` build, the direct `catalog.put_ep_topic` + `ep_topic_registry`
+//! registration path (NOT `propose_and_apply` — this family writes the catalog
+//! directly), and the `audit_record` call are preserved verbatim; only the
+//! result construction changed from pgwire `Response` / `PgWireError` to the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax: `CREATE TOPIC <name> [WITH (RETENTION = '1 hour')]`
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::event::cdc::stream_def::RetentionConfig;
 use crate::event::topic::TopicDef;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
 
 pub fn create_topic(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create topics")?;
 
     // parts: ["CREATE", "TOPIC", "<name>", ...]
     if parts.len() < 3 {
-        return Err(sqlstate_error("42601", "expected CREATE TOPIC <name>"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected CREATE TOPIC <name>".to_string(),
+        });
     }
 
     let name = parts[2].to_lowercase();
     let tenant_id = identity.tenant_id.as_u64();
 
     if state.ep_topic_registry.get(tenant_id, &name).is_some() {
-        return Err(sqlstate_error(
-            "42710",
-            &format!("topic '{name}' already exists"),
-        ));
+        return Err(DdlError {
+            sqlstate: "42710".to_string(),
+            message: format!("topic '{name}' already exists"),
+        });
     }
 
     // Parse optional retention from WITH clause.
@@ -66,7 +75,10 @@ pub fn create_topic(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock error"))?
+        .map_err(|_| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system clock error".to_string(),
+        })?
         .as_secs();
 
     let def = TopicDef {
@@ -81,11 +93,15 @@ pub fn create_topic(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        })?;
 
-    catalog
-        .put_ep_topic(&def)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+    catalog.put_ep_topic(&def).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("catalog write: {e}"),
+    })?;
 
     state.ep_topic_registry.register(def);
 
@@ -96,7 +112,7 @@ pub fn create_topic(
         &format!("CREATE TOPIC {name}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE TOPIC"))])
+    Ok(status("CREATE TOPIC"))
 }
 
 /// Parse a human-friendly duration string into seconds.
