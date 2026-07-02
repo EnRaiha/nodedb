@@ -4,11 +4,6 @@
 //!
 //! Returns the row with latest `time_column <= as_of` for the given key.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -17,18 +12,18 @@ use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
-use super::super::super::types::{sqlstate_error, text_field};
-use super::helpers::{clean_arg, extract_function_args};
+use super::super::super::result::{DdlError, DdlResult};
+use super::helpers::{clean_arg, empty_result, err, extract_function_args, single_result};
 
 pub async fn temporal_lookup(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let args = extract_function_args(sql, "TEMPORAL_LOOKUP")?;
     if args.len() < 5 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "TEMPORAL_LOOKUP requires (table, key_value, as_of, key_column, time_column)",
         ));
@@ -66,12 +61,12 @@ pub async fn temporal_lookup(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &format!("scan failed: {e}")))?;
+    .map_err(|e| err("XX000", &format!("scan failed: {e}")))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
     let docs: Vec<serde_json::Value> = sonic_rs::from_str(&payload_json)
-        .map_err(|e| sqlstate_error("22P02", &format!("invalid JSON in scan response: {e}")))?;
+        .map_err(|e| err("22P02", &format!("invalid JSON in scan response: {e}")))?;
 
     // Find the row with latest time_column <= as_of for the given key.
     let mut best_doc: Option<&serde_json::Value> = None;
@@ -100,23 +95,7 @@ pub async fn temporal_lookup(
     }
 
     match best_doc {
-        Some(doc) => {
-            let schema = Arc::new(vec![text_field("result")]);
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            encoder
-                .encode_field(&doc.to_string())
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-            Ok(vec![Response::Query(QueryResponse::new(
-                schema,
-                stream::iter(vec![Ok(encoder.take_row())]),
-            ))])
-        }
-        None => {
-            let schema = Arc::new(vec![text_field("result")]);
-            Ok(vec![Response::Query(QueryResponse::new(
-                schema,
-                stream::empty(),
-            ))])
-        }
+        Some(doc) => Ok(single_result(&doc.to_string())),
+        None => Ok(empty_result()),
     }
 }

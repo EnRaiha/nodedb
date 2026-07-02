@@ -6,7 +6,6 @@ mod auth;
 mod collaborative;
 mod dsl;
 mod engine_ops;
-mod function;
 mod helpers;
 mod schema;
 mod streaming;
@@ -62,10 +61,6 @@ pub async fn dispatch(
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
     if let Some(r) = auth::dispatch(state, identity, sql, &upper, &parts, database_id).await {
-        return Some(r);
-    }
-
-    if let Some(r) = function::dispatch(state, identity, sql, &upper, &parts).await {
         return Some(r);
     }
 

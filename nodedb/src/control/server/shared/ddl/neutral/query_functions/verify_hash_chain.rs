@@ -5,11 +5,6 @@
 //! Scans documents in the collection, verifies each hash chain link.
 //! Returns `{valid: true/false, entries: N, broken_at: index, last_hash: ...}`.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -18,21 +13,18 @@ use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
-use super::super::super::types::{sqlstate_error, text_field};
-use super::helpers::extract_function_args;
+use super::super::super::result::{DdlError, DdlResult};
+use super::helpers::{err, extract_function_args, single_result};
 
 pub async fn verify_hash_chain(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let args = extract_function_args(sql, "VERIFY_HASH_CHAIN")?;
     if args.is_empty() {
-        return Err(sqlstate_error(
-            "42601",
-            "VERIFY_HASH_CHAIN requires (collection)",
-        ));
+        return Err(err("42601", "VERIFY_HASH_CHAIN requires (collection)"));
     }
 
     let collection = args[0]
@@ -67,12 +59,12 @@ pub async fn verify_hash_chain(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &format!("scan failed: {e}")))?;
+    .map_err(|e| err("XX000", &format!("scan failed: {e}")))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
     let docs: Vec<serde_json::Value> = sonic_rs::from_str(&payload_json)
-        .map_err(|e| sqlstate_error("22P02", &format!("invalid JSON in scan response: {e}")))?;
+        .map_err(|e| err("22P02", &format!("invalid JSON in scan response: {e}")))?;
 
     // Walk the chain: each doc should have `_chain_hash` field.
     let mut prev_hash = crate::data::executor::enforcement::hash_chain::GENESIS_HASH.to_string();
@@ -109,7 +101,7 @@ pub async fn verify_hash_chain(
             obj.remove("_chain_hash");
         }
         let doc_bytes = sonic_rs::to_vec(&doc_for_hash)
-            .map_err(|e| sqlstate_error("XX000", &format!("failed to serialize document: {e}")))?;
+            .map_err(|e| err("XX000", &format!("failed to serialize document: {e}")))?;
 
         let expected = crate::data::executor::enforcement::hash_chain::compute_chain_hash(
             &prev_hash, doc_id, &doc_bytes,
@@ -132,13 +124,5 @@ pub async fn verify_hash_chain(
         "last_hash": prev_hash,
     });
 
-    let schema = Arc::new(vec![text_field("result")]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    encoder
-        .encode_field(&result.to_string())
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(encoder.take_row())]),
-    ))])
+    Ok(single_result(&result.to_string()))
 }

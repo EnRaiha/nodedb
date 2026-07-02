@@ -57,7 +57,7 @@ pub(super) fn is_dsl_statement(sql: &str) -> bool {
         return true;
     }
     // Function, procedure, and aggregate DDL handled by the text-based DDL
-    // router (function::dispatch) but not recognised by nodedb_sql::ddl_ast::parse.
+    // router but not recognised by nodedb_sql::ddl_ast::parse.
     // Route through execute_sql so the DDL router intercepts them.
     if may_be_ddl
         && (upper.starts_with("CREATE OR REPLACE FUNCTION ")

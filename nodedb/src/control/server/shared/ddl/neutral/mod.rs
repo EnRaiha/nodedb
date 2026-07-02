@@ -18,6 +18,7 @@ pub mod grant;
 pub mod materialized_view;
 pub mod oidc;
 pub mod procedure;
+pub mod query_functions;
 pub mod retention_policy;
 pub mod rls;
 pub mod role;

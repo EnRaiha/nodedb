@@ -5,11 +5,6 @@
 //! Full integrity check: recomputes each materialized balance from source rows,
 //! compares to the stored balance, and reports discrepancies.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -18,8 +13,8 @@ use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
-use super::super::super::types::{sqlstate_error, text_field};
-use super::helpers::clean_arg;
+use super::super::super::result::{DdlError, DdlResult};
+use super::helpers::{clean_arg, err, extract_function_args, json_to_decimal, single_result};
 
 /// `SELECT VERIFY_BALANCE('collection', 'column')`
 ///
@@ -29,14 +24,11 @@ pub async fn verify_balance(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
-    let args = super::helpers::extract_function_args(sql, "VERIFY_BALANCE")?;
+    let args = extract_function_args(sql, "VERIFY_BALANCE")?;
     if args.len() < 2 {
-        return Err(sqlstate_error(
-            "42601",
-            "VERIFY_BALANCE requires (collection, column)",
-        ));
+        return Err(err("42601", "VERIFY_BALANCE requires (collection, column)"));
     }
 
     let collection = clean_arg(args[0]);
@@ -44,19 +36,19 @@ pub async fn verify_balance(
 
     // Find the materialized sum definition.
     let Some(catalog) = state.credentials.catalog() else {
-        return Err(sqlstate_error("XX000", "no catalog available"));
+        return Err(err("XX000", "no catalog available"));
     };
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
-        .ok_or_else(|| sqlstate_error("42P01", &format!("collection '{collection}' not found")))?;
+        .map_err(|e| err("XX000", &e.to_string()))?
+        .ok_or_else(|| err("42P01", &format!("collection '{collection}' not found")))?;
 
     let Some(mat_def) = coll
         .materialized_sums
         .iter()
         .find(|m| m.target_column == column)
     else {
-        return Err(sqlstate_error(
+        return Err(err(
             "42704",
             &format!("no MATERIALIZED_SUM defined for column '{column}' on '{collection}'"),
         ));
@@ -87,11 +79,11 @@ pub async fn verify_balance(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &format!("target scan failed: {e}")))?;
+    .map_err(|e| err("XX000", &format!("target scan failed: {e}")))?;
     let target_json =
         crate::data::executor::response_codec::decode_payload_to_json(&target_resp.payload);
     let target_docs: Vec<serde_json::Value> = sonic_rs::from_str(&target_json)
-        .map_err(|e| sqlstate_error("22P02", &format!("invalid JSON in target scan: {e}")))?;
+        .map_err(|e| err("22P02", &format!("invalid JSON in target scan: {e}")))?;
 
     // Scan all source rows.
     let source_vshard =
@@ -119,11 +111,11 @@ pub async fn verify_balance(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &format!("source scan failed: {e}")))?;
+    .map_err(|e| err("XX000", &format!("source scan failed: {e}")))?;
     let source_json =
         crate::data::executor::response_codec::decode_payload_to_json(&source_resp.payload);
     let source_docs: Vec<serde_json::Value> = sonic_rs::from_str(&source_json)
-        .map_err(|e| sqlstate_error("22P02", &format!("invalid JSON in source scan: {e}")))?;
+        .map_err(|e| err("22P02", &format!("invalid JSON in source scan: {e}")))?;
 
     // For each target row, recompute balance from source rows.
     let mut discrepancies = 0u64;
@@ -141,7 +133,7 @@ pub async fn verify_balance(
 
         let stored_balance = target_doc
             .get(&column)
-            .and_then(super::helpers::json_to_decimal)
+            .and_then(json_to_decimal)
             .unwrap_or(rust_decimal::Decimal::ZERO);
 
         // Sum value_expr for all source rows where join_column == doc_id.
@@ -153,7 +145,7 @@ pub async fn verify_balance(
             }
             let src_val = nodedb_types::Value::from(src_doc.clone());
             let delta = serde_json::Value::from(mat_def.value_expr.eval(&src_val));
-            if let Some(d) = super::helpers::json_to_decimal(&delta) {
+            if let Some(d) = json_to_decimal(&delta) {
                 computed += d;
             }
         }
@@ -172,13 +164,5 @@ pub async fn verify_balance(
         "valid": discrepancies == 0,
     });
 
-    let schema = Arc::new(vec![text_field("result")]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    encoder
-        .encode_field(&result.to_string())
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(encoder.take_row())]),
-    ))])
+    Ok(single_result(&result.to_string()))
 }

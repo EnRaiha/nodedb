@@ -5,11 +5,6 @@
 //! Convenience overload: performs TEMPORAL_LOOKUP internally to find the rate,
 //! then applies the arithmetic conversion.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -18,8 +13,8 @@ use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
-use super::super::super::types::{sqlstate_error, text_field};
-use super::helpers::clean_arg;
+use super::super::super::result::{DdlError, DdlResult};
+use super::helpers::{clean_arg, err, extract_function_args, json_to_decimal, single_result};
 
 /// Convenience currency conversion with rate table lookup.
 ///
@@ -29,11 +24,11 @@ pub async fn convert_currency_lookup(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
-    let args = super::helpers::extract_function_args(sql, "CONVERT_CURRENCY_LOOKUP")?;
+    let args = extract_function_args(sql, "CONVERT_CURRENCY_LOOKUP")?;
     if args.len() < 9 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "CONVERT_CURRENCY_LOOKUP requires (amount, from, to, rate_table, as_of, key_column, rate_column, time_column, precision)",
         ));
@@ -49,9 +44,9 @@ pub async fn convert_currency_lookup(
     let time_column = clean_arg(args[7]);
     let precision: u32 = clean_arg(args[8])
         .parse()
-        .map_err(|_| sqlstate_error("22023", "precision must be an integer"))?;
+        .map_err(|_| err("22023", "precision must be an integer"))?;
     if precision > 38 {
-        return Err(sqlstate_error(
+        return Err(err(
             "22023",
             &format!("precision must be <= 38, got {precision}"),
         ));
@@ -59,7 +54,7 @@ pub async fn convert_currency_lookup(
 
     let amount: rust_decimal::Decimal = amount_str
         .parse()
-        .map_err(|_| sqlstate_error("22023", &format!("cannot parse amount '{amount_str}'")))?;
+        .map_err(|_| err("22023", &format!("cannot parse amount '{amount_str}'")))?;
 
     // Build the composite key: "{from}/{to}" for the rate table lookup.
     let key_value = format!("{from_ccy}/{to_ccy}");
@@ -90,12 +85,12 @@ pub async fn convert_currency_lookup(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &format!("rate table scan failed: {e}")))?;
+    .map_err(|e| err("XX000", &format!("rate table scan failed: {e}")))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
     let docs: Vec<serde_json::Value> = sonic_rs::from_str(&payload_json)
-        .map_err(|e| sqlstate_error("22P02", &format!("invalid JSON in rate table scan: {e}")))?;
+        .map_err(|e| err("22P02", &format!("invalid JSON in rate table scan: {e}")))?;
 
     // Find latest row where key matches and time <= as_of.
     let mut best_rate: Option<rust_decimal::Decimal> = None;
@@ -116,14 +111,12 @@ pub async fn convert_currency_lookup(
         }
         if time_val > best_time.as_str() {
             best_time = time_val.to_string();
-            best_rate = obj
-                .get(&rate_column)
-                .and_then(super::helpers::json_to_decimal);
+            best_rate = obj.get(&rate_column).and_then(json_to_decimal);
         }
     }
 
     let Some(rate) = best_rate else {
-        return Err(sqlstate_error(
+        return Err(err(
             "02000",
             &format!("no exchange rate found for {from_ccy}/{to_ccy} as of {as_of}"),
         ));
@@ -136,13 +129,5 @@ pub async fn convert_currency_lookup(
         rust_decimal::RoundingStrategy::MidpointNearestEven,
     );
 
-    let schema = Arc::new(vec![text_field("result")]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    encoder
-        .encode_field(&rounded.to_string())
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(encoder.take_row())]),
-    ))])
+    Ok(single_result(&rounded.to_string()))
 }

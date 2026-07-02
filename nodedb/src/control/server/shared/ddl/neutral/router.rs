@@ -25,6 +25,7 @@ use super::grant;
 use super::materialized_view;
 use super::oidc;
 use super::procedure;
+use super::query_functions;
 use super::retention_policy;
 use super::rls::{self, CreateRlsPolicyRequest};
 use super::role;
@@ -388,11 +389,20 @@ pub async fn try_dispatch(
         ));
     }
 
-    // Parse errors / non-DDL / non-migrated families → let the pgwire path run,
-    // which re-parses and reproduces the exact error handling for those inputs.
+    // Parse errors → let the pgwire path run, which re-parses and reproduces the
+    // exact error handling for those inputs.
+    //
+    // Non-DDL statements (`None`) include the temporal / audit query functions —
+    // `SELECT <FUNC>(...)` calls that never parse into a typed DDL AST. In the
+    // pgwire router these were recognized by substring after the typed-AST parse
+    // gate and the auth family; recognizing them here, in the `None` branch,
+    // preserves that ordering exactly (any typed DDL whose body contains one of
+    // the substrings is handled by the typed match above first). A non-match
+    // returns `None` so the transitional pgwire delegation handles it unchanged.
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
         Some(Ok(stmt)) => stmt,
-        _ => return None,
+        Some(Err(_)) => return None,
+        None => return query_functions::try_dispatch(state, identity, sql).await,
     };
 
     match &stmt {

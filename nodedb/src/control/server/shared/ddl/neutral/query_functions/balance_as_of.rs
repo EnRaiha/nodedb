@@ -5,7 +5,6 @@
 //! Returns `current_balance - SUM(value_expr over source rows WHERE created_at > timestamp)`.
 //! Fast: only scans recent rows, not full history.
 
-use pgwire::error::PgWireResult;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -14,20 +13,20 @@ use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
 use super::helpers::{
-    clean_arg, extract_function_args, json_to_decimal, parse_timestamp_secs, return_single_value,
+    clean_arg, err, extract_function_args, json_to_decimal, parse_timestamp_secs, single_result,
 };
 
 pub async fn balance_as_of(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<pgwire::api::results::Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let args = extract_function_args(sql, "BALANCE_AS_OF")?;
     if args.len() < 4 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "BALANCE_AS_OF requires (collection, key, column, timestamp)",
         ));
@@ -46,7 +45,7 @@ pub async fn balance_as_of(
     let surrogate = state
         .surrogate_assigner
         .lookup(DatabaseId::DEFAULT, tenant_id, &collection, &pk_bytes)
-        .map_err(|e| sqlstate_error("XX000", &format!("surrogate lookup failed: {e}")))?
+        .map_err(|e| err("XX000", &format!("surrogate lookup failed: {e}")))?
         .unwrap_or(nodedb_types::Surrogate::ZERO);
     let get_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
         collection: collection.clone(),
@@ -67,7 +66,7 @@ pub async fn balance_as_of(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &format!("point get failed: {e}")))?;
+    .map_err(|e| err("XX000", &format!("point get failed: {e}")))?;
 
     let doc_json = crate::data::executor::response_codec::decode_payload_to_json(&get_resp.payload);
     let doc: serde_json::Value = sonic_rs::from_str(&doc_json).unwrap_or(serde_json::Value::Null);
@@ -79,19 +78,19 @@ pub async fn balance_as_of(
 
     // Find materialized sum definitions to know the source collection and value_expr.
     let Some(catalog) = state.credentials.catalog() else {
-        return Err(sqlstate_error("XX000", "no catalog available"));
+        return Err(err("XX000", "no catalog available"));
     };
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
-        .ok_or_else(|| sqlstate_error("42P01", &format!("collection '{collection}' not found")))?;
+        .map_err(|e| err("XX000", &e.to_string()))?
+        .ok_or_else(|| err("42P01", &format!("collection '{collection}' not found")))?;
 
     let Some(mat_def) = coll
         .materialized_sums
         .iter()
         .find(|m| m.target_column == column)
     else {
-        return return_single_value(&current_balance.to_string());
+        return Ok(single_result(&current_balance.to_string()));
     };
 
     // Scan the source collection for rows where join_column = key AND created_at > as_of.
@@ -121,12 +120,12 @@ pub async fn balance_as_of(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &format!("source scan failed: {e}")))?;
+    .map_err(|e| err("XX000", &format!("source scan failed: {e}")))?;
 
     let source_json =
         crate::data::executor::response_codec::decode_payload_to_json(&source_resp.payload);
     let source_docs: Vec<serde_json::Value> = sonic_rs::from_str(&source_json)
-        .map_err(|e| sqlstate_error("22P02", &format!("invalid JSON in source scan: {e}")))?;
+        .map_err(|e| err("22P02", &format!("invalid JSON in source scan: {e}")))?;
 
     // Sum value_expr for source rows where join_column = key AND created_at > as_of.
     let mut recent_sum = rust_decimal::Decimal::ZERO;
@@ -143,7 +142,7 @@ pub async fn balance_as_of(
 
         let created_at = crate::data::executor::enforcement::retention::extract_created_at_secs(
             &sonic_rs::to_vec(src_doc)
-                .map_err(|e| sqlstate_error("XX000", &format!("serialization failed: {e}")))?,
+                .map_err(|e| err("XX000", &format!("serialization failed: {e}")))?,
         );
         if let Some(ts) = created_at {
             if ts <= as_of_secs {
@@ -161,5 +160,5 @@ pub async fn balance_as_of(
     }
 
     let as_of_balance = current_balance - recent_sum;
-    return_single_value(&as_of_balance.to_string())
+    Ok(single_result(&as_of_balance.to_string()))
 }

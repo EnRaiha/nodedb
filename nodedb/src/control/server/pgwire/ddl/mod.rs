@@ -35,7 +35,6 @@ pub(crate) mod parse_utils;
 pub mod period_lock;
 pub mod permission_tree;
 pub mod pubsub;
-pub mod query_functions;
 pub mod rate_gate;
 #[path = "router/mod.rs"]
 pub mod router;

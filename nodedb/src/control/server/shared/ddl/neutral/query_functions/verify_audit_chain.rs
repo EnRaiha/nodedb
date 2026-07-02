@@ -8,18 +8,12 @@
 //! **Note:** For complete chain verification, pass `from_seq=1`. Partial ranges
 //! validate chain integrity *within* the range but do not verify continuity from genesis.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
-
 use crate::control::security::audit::entry::hash_entry;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{sqlstate_error, text_field};
-use super::helpers::clean_arg;
+use super::super::super::result::{DdlError, DdlResult};
+use super::helpers::{clean_arg, err, extract_function_args, single_result};
 
 /// `SELECT VERIFY_AUDIT_CHAIN(from_seq, to_seq)`
 ///
@@ -30,20 +24,20 @@ pub async fn verify_audit_chain(
     state: &SharedState,
     _identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
-    let args = super::helpers::extract_function_args(sql, "VERIFY_AUDIT_CHAIN")?;
+) -> Result<Vec<DdlResult>, DdlError> {
+    let args = extract_function_args(sql, "VERIFY_AUDIT_CHAIN")?;
 
     let from_seq: u64 = if !args.is_empty() {
         clean_arg(args[0])
             .parse()
-            .map_err(|_| sqlstate_error("22023", "from_seq must be an integer"))?
+            .map_err(|_| err("22023", "from_seq must be an integer"))?
     } else {
         1
     };
     let to_seq: u64 = if args.len() >= 2 {
         clean_arg(args[1])
             .parse()
-            .map_err(|_| sqlstate_error("22023", "to_seq must be an integer"))?
+            .map_err(|_| err("22023", "to_seq must be an integer"))?
     } else {
         u64::MAX
     };
@@ -52,7 +46,7 @@ pub async fn verify_audit_chain(
     let audit_entries = state
         .wal
         .recover_audit_entries()
-        .map_err(|e| sqlstate_error("XX000", &format!("audit WAL recovery failed: {e}")))?;
+        .map_err(|e| err("XX000", &format!("audit WAL recovery failed: {e}")))?;
 
     let mut valid = true;
     let mut checked = 0u64;
@@ -127,13 +121,5 @@ pub async fn verify_audit_chain(
         "last_hash": prev_hash,
     });
 
-    let schema = Arc::new(vec![text_field("result")]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    encoder
-        .encode_field(&result.to_string())
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(encoder.take_row())]),
-    ))])
+    Ok(single_result(&result.to_string()))
 }
