@@ -10,7 +10,7 @@ use futures::StreamExt;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -66,6 +66,10 @@ async fn responses_to_ddl_results(
             PgResponse::Query(mut query_resp) => {
                 let schema = query_resp.row_schema();
                 let columns: Vec<String> = schema.iter().map(|f| f.name().to_string()).collect();
+                let column_types: Vec<DdlColType> = schema
+                    .iter()
+                    .map(|f| pg_type_to_col_type(f.datatype()))
+                    .collect();
                 let ncols = columns.len();
 
                 let mut rows: Vec<Map<String, JsonValue>> = Vec::new();
@@ -86,6 +90,7 @@ async fn responses_to_ddl_results(
 
                 results.push(DdlResult::Rows(ShapedRows {
                     columns,
+                    column_types,
                     rows,
                     notice: None,
                 }));
@@ -97,6 +102,50 @@ async fn responses_to_ddl_results(
         }
     }
     Ok(results)
+}
+
+/// Map a pgwire `Type` (wire OID) to a protocol-neutral [`DdlColType`].
+///
+/// One arm per pgwire field-builder in `pgwire::types::field`, so a schema
+/// produced by those builders round-trips losslessly. Any OID not produced by
+/// those builders falls back to `Text` (the safe default that every entrypoint
+/// can render). Comparison is on `.oid()` because pgwire's `Type` is not a
+/// structural-match enum, so its `Type::INT8` etc. constants cannot be used as
+/// match patterns.
+fn pg_type_to_col_type(t: &pgwire::api::Type) -> DdlColType {
+    use pgwire::api::Type;
+    let oid = t.oid();
+    if oid == Type::INT8.oid() {
+        DdlColType::Int8
+    } else if oid == Type::INT4.oid() {
+        DdlColType::Int4
+    } else if oid == Type::INT2.oid() {
+        DdlColType::Int2
+    } else if oid == Type::FLOAT8.oid() {
+        DdlColType::Float8
+    } else if oid == Type::FLOAT4.oid() {
+        DdlColType::Float4
+    } else if oid == Type::BOOL.oid() {
+        DdlColType::Bool
+    } else if oid == Type::BYTEA.oid() {
+        DdlColType::Bytea
+    } else if oid == Type::JSON.oid() {
+        DdlColType::Json
+    } else if oid == Type::JSONB.oid() {
+        DdlColType::Jsonb
+    } else if oid == Type::TIMESTAMP.oid() {
+        DdlColType::Timestamp
+    } else if oid == Type::TIMESTAMPTZ.oid() {
+        DdlColType::Timestamptz
+    } else if oid == Type::VARCHAR.oid() {
+        DdlColType::Varchar
+    } else if oid == Type::FLOAT4_ARRAY.oid() {
+        DdlColType::Float4Array
+    } else if oid == Type::FLOAT8_ARRAY.oid() {
+        DdlColType::Float8Array
+    } else {
+        DdlColType::Text
+    }
 }
 
 /// Extract a protocol-neutral SQLSTATE + message from a `PgWireError`.

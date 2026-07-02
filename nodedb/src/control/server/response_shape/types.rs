@@ -159,12 +159,48 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
 // Bring the variant into scope for brevity in match arms above.
 use PlanKind::DmlResult;
 
+/// Protocol-neutral SQL column type. Each server entrypoint maps this to its
+/// own wire type (pgwire OID, native type tag, etc.). One variant per pgwire
+/// field-builder in `pgwire::types::field`, so the mapping is lossless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DdlColType {
+    #[default]
+    Text,
+    Int8,
+    Int4,
+    Int2,
+    Float8,
+    Float4,
+    Bool,
+    Bytea,
+    Json,
+    Jsonb,
+    Timestamp,
+    Timestamptz,
+    Varchar,
+    Float4Array,
+    Float8Array,
+}
+
 /// Protocol-neutral shaped row set: columns + row objects + an optional
 /// client-facing notice. Not yet constructed anywhere — a later relocation
 /// unit wires this into a shared composed entry point.
 #[derive(Debug, Clone)]
 pub struct ShapedRows {
     pub columns: Vec<String>,
+    /// Per-column SQL type, parallel to (same length/order as) `columns`.
+    /// Only the pgwire encoder consumes this to reproduce exact RowDescription
+    /// type OIDs; the native and http entrypoints ignore it. `Text` is used
+    /// wherever the source type is unknown.
+    pub column_types: Vec<DdlColType>,
     pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
     pub notice: Option<String>,
+}
+
+impl ShapedRows {
+    /// Build a `column_types` vec of `n` `Text` entries, for the non-DDL
+    /// construction sites whose consumers (native/http) ignore column types.
+    pub fn text_types(n: usize) -> Vec<DdlColType> {
+        vec![DdlColType::Text; n]
+    }
 }

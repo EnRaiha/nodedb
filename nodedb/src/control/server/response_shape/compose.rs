@@ -151,8 +151,10 @@ fn shape_returning_rows(payload: &[u8]) -> ShapedRows {
                     map
                 })
                 .collect();
+            let column_types = ShapedRows::text_types(rp.columns.len());
             ShapedRows {
                 columns: rp.columns,
+                column_types,
                 rows,
                 notice: None,
             }
@@ -220,16 +222,20 @@ pub fn shape_decoded_rows(
                 .iter()
                 .map(|row| project_row(row, &lookup_keys, &display_names))
                 .collect();
+            let column_types = ShapedRows::text_types(display_names.len());
             ShapedRows {
                 columns: display_names,
+                column_types,
                 rows: projected_rows,
                 notice: None,
             }
         }
         _ => {
             let columns = derive_columns(&rows);
+            let column_types = ShapedRows::text_types(columns.len());
             ShapedRows {
                 columns,
+                column_types,
                 rows,
                 notice: None,
             }
@@ -306,6 +312,7 @@ fn derive_columns(rows: &[Map<String, JsonValue>]) -> Vec<String> {
 fn empty_shaped() -> ShapedRows {
     ShapedRows {
         columns: Vec::new(),
+        column_types: Vec::new(),
         rows: Vec::new(),
         notice: None,
     }
@@ -316,6 +323,7 @@ fn single_result_row(text: String) -> ShapedRows {
     map.insert("result".to_string(), JsonValue::String(text));
     ShapedRows {
         columns: vec!["result".to_string()],
+        column_types: ShapedRows::text_types(1),
         rows: vec![map],
         notice: None,
     }
