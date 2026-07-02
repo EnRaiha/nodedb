@@ -90,6 +90,24 @@ pub(super) fn assign_for_pk(
     }
 }
 
+/// Allocate a fresh, unique surrogate for a row whose primary key is the
+/// auto-generated `_rowid` (no `PRIMARY KEY` declared). Content-addressing an
+/// empty pk here would collapse every such row onto one surrogate — a
+/// duplicate-key violation on the second insert.
+pub(super) fn assign_fresh(ctx: &ConvertContext, collection: &str) -> crate::Result<Surrogate> {
+    match ctx.surrogate_assigner.as_ref() {
+        Some(a) => a.assign_fresh(ctx.database_id, ctx.tenant_id, collection),
+        None => Ok(Surrogate::ZERO),
+    }
+}
+
+/// Whether a collection's declared primary key is the auto-generated `_rowid`
+/// sentinel — injected by strict-schema construction when no `PRIMARY KEY` was
+/// declared. Such rows carry no user identity: each needs a fresh surrogate.
+fn is_auto_rowid_pk(primary_key: Option<&str>) -> bool {
+    primary_key == Some("_rowid")
+}
+
 pub(super) fn columnar_row_surrogates(
     ctx: &ConvertContext,
     collection: &str,
@@ -181,7 +199,17 @@ pub(in super::super) fn convert_insert(
             }
             EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
                 let value_bytes = row_to_msgpack(row)?;
-                let surrogate = assign_for_pk(ctx, collection, doc_id.as_bytes())?;
+                // Auto-`_rowid` collections carry no user identity: mint a fresh
+                // surrogate per row and use it as the document id (the Data
+                // Plane sets `_rowid` to the same value). A content-addressed
+                // assign on the empty pk would give every row one surrogate.
+                let (doc_id, surrogate) = if is_auto_rowid_pk(primary_key) {
+                    let s = assign_fresh(ctx, collection)?;
+                    (s.as_u32().to_string(), s)
+                } else {
+                    let s = assign_for_pk(ctx, collection, doc_id.as_bytes())?;
+                    (doc_id, s)
+                };
                 tasks.push(PhysicalTask {
                     tenant_id,
                     vshard_id: vshard,
@@ -268,7 +296,16 @@ pub(in super::super) fn convert_upsert(
         match engine {
             EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
                 let value_bytes = row_to_msgpack(row)?;
-                let surrogate = assign_for_pk(ctx, collection, doc_id.as_bytes())?;
+                // Auto-`_rowid` collections have no user identity to match on,
+                // so an upsert degenerates to an insert with a fresh surrogate;
+                // the on-conflict clause can never match a prior row.
+                let (doc_id, surrogate) = if is_auto_rowid_pk(primary_key) {
+                    let s = assign_fresh(ctx, collection)?;
+                    (s.as_u32().to_string(), s)
+                } else {
+                    let s = assign_for_pk(ctx, collection, doc_id.as_bytes())?;
+                    (doc_id, s)
+                };
                 tasks.push(PhysicalTask {
                     tenant_id,
                     vshard_id: vshard,

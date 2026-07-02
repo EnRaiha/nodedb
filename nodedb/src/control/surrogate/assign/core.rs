@@ -224,6 +224,63 @@ impl SurrogateAssigner {
         }
     }
 
+    /// Allocate a FRESH surrogate for a row with no content primary key — a
+    /// collection whose primary key is the auto-generated `_rowid` (no
+    /// `PRIMARY KEY` was declared). Unlike [`assign`](Self::assign), there is
+    /// no fast-path lookup: every call allocates a new value, so N rows get N
+    /// distinct surrogates instead of collapsing onto the binding for an empty
+    /// key.
+    ///
+    /// The surrogate is self-bound (pk = its own decimal string). The Data
+    /// Plane sets the row's `_rowid` field equal to this surrogate, so the
+    /// self-binding makes a later `WHERE _rowid = N` point lookup resolve back
+    /// to it, and reuses the same durable bind/flush machinery as `assign` so
+    /// the hwm advance is persisted and Raft-proposed identically.
+    pub fn assign_fresh(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        collection: &str,
+    ) -> crate::Result<Surrogate> {
+        let catalog = match self.credential_store.catalog().as_ref() {
+            Some(c) => c,
+            None => return Ok(Surrogate::ZERO),
+        };
+
+        // Allocate + self-bind + maybe-flush under the registry write lock,
+        // with the same empty-batch refill fallback as the `assign` slow path.
+        loop {
+            let registry = self.registry_write()?;
+            let surrogate = match self.alloc_locked(&registry)? {
+                Some(s) => {
+                    self.nudge_refill_if_low(&registry);
+                    s
+                }
+                None => {
+                    drop(registry);
+                    self.refill_notify.notify_one();
+                    self.ensure_batch()?;
+                    continue;
+                }
+            };
+            // Self-bind: pk is the surrogate's own decimal string, matching the
+            // `_rowid` value the Data Plane writes (surrogate as i64) once run
+            // through `sql_value_to_string`, so `WHERE _rowid = N` resolves.
+            let pk = surrogate.as_u32().to_string();
+            let pk_bytes = pk.as_bytes();
+            catalog.put_surrogate(database_id, tenant_id, collection, pk_bytes, surrogate)?;
+            self.wal_appender.record_bind_to_wal(
+                database_id,
+                tenant_id,
+                surrogate.as_u32(),
+                collection,
+                pk_bytes,
+            )?;
+            self.maybe_flush(&registry, catalog)?;
+            return Ok(surrogate);
+        }
+    }
+
     /// Local flush trigger: durably checkpoint the new hwm if the ops or
     /// elapsed-time threshold has tripped. This runs whenever the node is
     /// NOT using the cross-node reservation path — i.e. on a single-node

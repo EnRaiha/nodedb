@@ -136,7 +136,7 @@ fn plan_statements(
         match classify(stmt) {
             StatementKind::Select(query) => {
                 let plan = planner::select::plan_query(query, catalog, &functions, temporal)?;
-                let plan = optimizer::optimize(plan);
+                let plan = optimizer::optimize(plan, catalog);
                 plans.push(plan);
             }
             StatementKind::Insert(ins) => {

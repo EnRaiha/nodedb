@@ -1,11 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Detect equality on primary key → convert Scan to PointGet.
+//! Detect equality on the primary key → convert Scan to PointGet.
 
+use nodedb_types::DatabaseId;
+
+use crate::catalog::SqlCatalog;
 use crate::types::*;
 
-/// If a Scan has a single equality filter on the primary key, convert to PointGet.
-pub fn optimize(plan: SqlPlan) -> SqlPlan {
+/// If a Scan has a single equality filter on the collection's primary key,
+/// convert it to a PointGet.
+///
+/// The primary key is resolved from the catalog rather than assumed to be the
+/// conventional `id` / `document_id` / `key`: a collection created without an
+/// explicit `PRIMARY KEY` gets an auto-generated `_rowid` key, so a filter on a
+/// regular `id` column is NOT a point lookup and must stay a scan (routing it
+/// to PointGet would resolve a surrogate for the wrong key and return zero
+/// rows). When the catalog cannot resolve a primary key (unknown collection),
+/// fall back to the legacy convention so nothing regresses.
+pub fn optimize(plan: SqlPlan, catalog: &dyn SqlCatalog) -> SqlPlan {
     match plan {
         SqlPlan::Scan {
             ref collection,
@@ -21,7 +33,12 @@ pub fn optimize(plan: SqlPlan) -> SqlPlan {
                 .iter()
                 .any(|p| matches!(p, Projection::Computed { .. })) =>
         {
-            if let Some((key_col, key_val)) = extract_pk_equality(&filters[0]) {
+            let pk = catalog
+                .get_collection(DatabaseId::DEFAULT, collection)
+                .ok()
+                .flatten()
+                .and_then(|info| info.primary_key);
+            if let Some((key_col, key_val)) = extract_pk_equality(&filters[0], pk.as_deref()) {
                 return SqlPlan::PointGet {
                     collection: collection.clone(),
                     alias: alias.clone(),
@@ -36,17 +53,33 @@ pub fn optimize(plan: SqlPlan) -> SqlPlan {
     }
 }
 
-/// Extract a simple equality filter on a known PK column.
-fn extract_pk_equality(filter: &Filter) -> Option<(String, SqlValue)> {
+/// Extract a simple equality filter eligible for the point-get rewrite.
+///
+/// Only the conventional document-key columns (`id` / `document_id` / `key`)
+/// are candidates — this pass deliberately does not promote arbitrary declared
+/// primary keys (e.g. `sku`) to point lookups. The refinement over the legacy
+/// name-only check: when the catalog resolves a real primary key, a candidate
+/// column is eligible only if it actually IS that key. This excludes a regular
+/// `id` column on a collection whose real key is the auto-generated `_rowid`
+/// (where a point-get would resolve a surrogate for the wrong key and return
+/// zero rows) while leaving every previously-optimized case unchanged. When the
+/// catalog can't resolve a key, fall back to the name-only convention.
+fn extract_pk_equality(filter: &Filter, pk: Option<&str>) -> Option<(String, SqlValue)> {
+    let is_pk_column = |col: &str| -> bool {
+        let conventional = col == "id" || col == "document_id" || col == "key";
+        match pk {
+            Some(pk) => conventional && col.eq_ignore_ascii_case(pk),
+            None => conventional,
+        }
+    };
     match &filter.expr {
         FilterExpr::Comparison {
             field,
             op: CompareOp::Eq,
             value,
         } => {
-            // Only optimize for known PK columns.
             let f = field.to_lowercase();
-            if f == "id" || f == "document_id" || f == "key" {
+            if is_pk_column(&f) {
                 Some((f, value.clone()))
             } else {
                 None
@@ -61,7 +94,7 @@ fn extract_pk_equality(filter: &Filter) -> Option<(String, SqlValue)> {
                 SqlExpr::Column { name, .. } => name.to_lowercase(),
                 _ => return None,
             };
-            if col != "id" && col != "document_id" && col != "key" {
+            if !is_pk_column(&col) {
                 return None;
             }
             let val = match right.as_ref() {
