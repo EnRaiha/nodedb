@@ -225,33 +225,58 @@ impl CoreLoop {
             // Non-sync path (SQL / native client): validate + apply, no gate.
             // There is no client to reject here, so the validated outcome is
             // only observed for its DLQ side effect and logged.
-            let engine = match self.get_crdt_engine(tenant_id) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+            // Borrow the engine in a nested block so the &mut borrow is dropped
+            // before the sparse write below takes &self. On a Clean apply we
+            // read the merged row back and encode it while the borrow is live,
+            // carrying the materialized bytes out.
+            let materialized = {
+                let engine = match self.get_crdt_engine(tenant_id) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: e.to_string(),
+                            },
+                        );
+                    }
+                };
+                let outcome = engine.apply_committed_delta_validated(
+                    collection,
+                    delta,
+                    surrogate,
+                    document_id,
+                    peer_id,
+                );
+                match outcome {
+                    ValidatedApplyOutcome::Clean => {
+                        if surrogate != Surrogate::ZERO {
+                            Self::encode_crdt_row(engine, collection, document_id)
+                        } else {
+                            None
+                        }
+                    }
+                    ValidatedApplyOutcome::Rejected(vt) => {
+                        debug!(core = self.core_id, %collection, reason = %vt, "crdt apply violated constraint (DLQ)");
+                        None
+                    }
+                    ValidatedApplyOutcome::Malformed => {
+                        warn!(core = self.core_id, %collection, "crdt apply skipped malformed delta");
+                        None
+                    }
                 }
             };
-            let outcome = engine.apply_committed_delta_validated(
-                collection,
-                delta,
-                surrogate,
-                document_id,
-                peer_id,
-            );
-            match outcome {
-                ValidatedApplyOutcome::Clean => {}
-                ValidatedApplyOutcome::Rejected(vt) => {
-                    debug!(core = self.core_id, %collection, reason = %vt, "crdt apply violated constraint (DLQ)");
-                }
-                ValidatedApplyOutcome::Malformed => {
-                    warn!(core = self.core_id, %collection, "crdt apply skipped malformed delta");
-                }
+            // engine borrow dropped here; materialize into the sparse document
+            // store so DocumentScan / ShapeSnapshot see the synced document.
+            if let Some(bytes) = materialized {
+                self.materialize_synced_document(
+                    task.request.database_id.as_u64(),
+                    tenant_id.as_u64(),
+                    collection,
+                    surrogate,
+                    &bytes,
+                );
             }
             self.checkpoint_coordinator.mark_dirty("crdt", 1);
             return self.response_ok(task);
@@ -284,7 +309,7 @@ impl CoreLoop {
                     Pending { installed: u64 },
                     Applied(ValidatedApplyOutcome),
                 }
-                let outcome = {
+                let (outcome, materialized) = {
                     let engine = match self.get_crdt_engine(tenant_id) {
                         Ok(e) => e,
                         Err(e) => {
@@ -299,19 +324,30 @@ impl CoreLoop {
                     };
                     let installed = engine.installed_constraint_version(collection);
                     if constraint_version_required > installed {
-                        GateOutcome::Pending { installed }
+                        (GateOutcome::Pending { installed }, None)
                     } else {
-                        GateOutcome::Applied(engine.apply_committed_delta_validated(
+                        let applied = engine.apply_committed_delta_validated(
                             collection,
                             delta,
                             surrogate,
                             document_id,
                             peer_id,
-                        ))
+                        );
+                        // On a Clean apply, read the merged row back and encode
+                        // it while the engine borrow is still live so the bytes
+                        // can be materialized into the sparse store below.
+                        let mat = if matches!(applied, ValidatedApplyOutcome::Clean)
+                            && surrogate != Surrogate::ZERO
+                        {
+                            Self::encode_crdt_row(engine, collection, document_id)
+                        } else {
+                            None
+                        };
+                        (GateOutcome::Applied(applied), mat)
                     }
                 };
                 // engine borrow is dropped here; mark_dirty / sync_commit take
-                // &mut self.
+                // &mut self, and the sparse materialize takes &self.
                 let reject = match outcome {
                     GateOutcome::Pending { installed } => {
                         // Create-race: the constraints this delta was admitted
@@ -348,6 +384,18 @@ impl CoreLoop {
                         None
                     }
                 };
+                // Materialize the merged document into the sparse store so
+                // DocumentScan / ShapeSnapshot see the synced write. `materialized`
+                // is Some only on a Clean apply with an assigned surrogate.
+                if let Some(bytes) = materialized {
+                    self.materialize_synced_document(
+                        task.request.database_id.as_u64(),
+                        tenant_id.as_u64(),
+                        collection,
+                        surrogate,
+                        &bytes,
+                    );
+                }
                 // Advance the HWM unconditionally after apply — a rejected,
                 // fenced, or malformed delta must not wedge the sync stream.
                 self.sync_commit(prov);
