@@ -15,6 +15,7 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::result::{DdlError, DdlResult};
+use super::alert::{self, CreateAlertRequest};
 use super::change_stream;
 use super::constraint;
 use super::consumer_group;
@@ -190,6 +191,23 @@ pub async fn try_dispatch(
     }
     if upper.starts_with("SHOW SCHEDULE") {
         return Some(schedule::show_schedules(state, identity));
+    }
+
+    // Alert SHOW. `SHOW ALERT STATUS <name>` parses into a typed
+    // `AutomationStmt::ShowAlertStatus` and `SHOW ALERTS` into
+    // `AutomationStmt::ShowAlerts`, but the pgwire admin router dispatched both
+    // from the raw token slice by string prefix (the `SHOW ALERT` prefix also
+    // captures the bare-singular `SHOW ALERT` input, which parses into
+    // `ShowAlerts`). Replicate that exactly here, before the parse gate, so the
+    // prefix recognition (STATUS checked first) and the `parts.get(4)` name
+    // extraction (name after `ON`) stay byte-identical.
+    if upper.starts_with("SHOW ALERT STATUS ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let name = parts.get(4).copied().unwrap_or("");
+        return Some(alert::show_alert_status(state, identity, database_id, name));
+    }
+    if upper.starts_with("SHOW ALERT") {
+        return Some(alert::show_alerts(state, identity, database_id));
     }
 
     // Change streams: `SHOW CHANGE STREAM(S)`. This parses into a typed
@@ -712,6 +730,56 @@ pub async fn try_dispatch(
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
             Some(schedule::drop_schedule(state, identity, &parts))
+        }
+
+        NodedbStatement::Automation(AutomationStmt::CreateAlert {
+            name,
+            collection,
+            where_filter,
+            condition_raw,
+            group_by,
+            window_raw,
+            fire_after,
+            recover_after,
+            severity,
+            notify_targets_raw,
+        }) => Some(alert::create_alert(
+            state,
+            identity,
+            &CreateAlertRequest {
+                name,
+                collection,
+                where_filter: where_filter.as_deref(),
+                condition_raw,
+                group_by,
+                window_raw,
+                fire_after: *fire_after,
+                recover_after: *recover_after,
+                severity,
+                notify_targets_raw,
+                database_id,
+            },
+        )),
+
+        NodedbStatement::Automation(AutomationStmt::AlterAlert { name, action }) => Some(
+            alert::alter_alert(state, identity, database_id, name, action),
+        ),
+
+        NodedbStatement::Automation(AutomationStmt::DropAlert { name, if_exists }) => {
+            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // non-existing alert returns the tag before the token handler runs
+            // (and before the tenant-admin gate). The `if_exists: false` case and
+            // the existing-alert case fall through to `drop_alert`, which
+            // re-derives the name from `parts[2]` exactly as the pgwire admin
+            // string dispatch did.
+            if *if_exists && !alert::alert_exists(state, identity, database_id, name) {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "DROP ALERT".to_string(),
+                    rows_affected: None,
+                }]));
+            }
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(alert::drop_alert(state, identity, database_id, &parts))
         }
 
         _ => None,

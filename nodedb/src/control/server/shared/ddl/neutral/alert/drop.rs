@@ -1,29 +1,59 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `DROP ALERT` DDL handler.
+//! Protocol-neutral `DROP ALERT` DDL handler.
+//!
+//! Ported from the pgwire `ddl::alert::drop` handler. The DIRECT
+//! `catalog.delete_alert_rule` write, the `_alert_rules` CRDT-sync tombstone
+//! delta, the hysteresis-state cleanup, the in-memory registry unregister, and
+//! the `audit_record` call are preserved verbatim; only the result construction
+//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax: `DROP ALERT <name>`
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
-use super::ALERT_RULES_CRDT_COLLECTION;
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
+
+/// CRDT collection name for alert rule sync between Origin and Lite.
+const ALERT_RULES_CRDT_COLLECTION: &str = "_alert_rules";
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
+
+/// Existence check used by the `DROP ALERT IF EXISTS` short-circuit in the
+/// neutral router. Mirrors the pgwire `exists::alert_exists` helper.
+pub fn alert_exists(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    name: &str,
+) -> bool {
+    let tid = identity.tenant_id.as_u64();
+    state
+        .alert_registry
+        .get(database_id.as_u64(), tid, name)
+        .is_some()
+}
 
 pub fn drop_alert(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop alerts")?;
 
     if parts.len() < 3 {
-        return Err(sqlstate_error("42601", "syntax: DROP ALERT <name>"));
+        return Err(err("42601", "syntax: DROP ALERT <name>".to_string()));
     }
     let name = parts[2].to_lowercase();
     let tenant_id = identity.tenant_id.as_u64();
@@ -33,21 +63,18 @@ pub fn drop_alert(
         .get(database_id.as_u64(), tenant_id, &name)
         .is_none()
     {
-        return Err(sqlstate_error(
-            "42704",
-            &format!("alert '{name}' does not exist"),
-        ));
+        return Err(err("42704", format!("alert '{name}' does not exist")));
     }
 
     let catalog = state
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
 
     catalog
         .delete_alert_rule(database_id.as_u64(), tenant_id, &name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog delete: {e}")))?;
+        .map_err(|e| err("XX000", format!("catalog delete: {e}")))?;
 
     // Emit CRDT tombstone delta.
     {
@@ -81,5 +108,5 @@ pub fn drop_alert(
 
     tracing::info!(name, "alert rule dropped");
 
-    Ok(vec![Response::Execution(Tag::new("DROP ALERT"))])
+    Ok(status("DROP ALERT"))
 }

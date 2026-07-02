@@ -1,17 +1,32 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE ALERT` DDL handler.
+//! Protocol-neutral `CREATE ALERT` DDL handler.
+//!
+//! Ported from the pgwire `ddl::alert::create` handler. The catalog path
+//! (DIRECT `catalog.put_alert_rule(&def)` write), the `_alert_rules` CRDT-sync
+//! delta enqueue, the in-memory registry registration, and the `audit_record`
+//! call are preserved verbatim; only the result construction changed from
+//! pgwire `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
+//! [`DdlError`].
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::event::alert::types::{AlertCondition, AlertDef, CompareOp, NotifyTarget};
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
-use super::ALERT_RULES_CRDT_COLLECTION;
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
+
+/// CRDT collection name for alert rule sync between Origin and Lite.
+const ALERT_RULES_CRDT_COLLECTION: &str = "_alert_rules";
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 /// Parsed `CREATE ALERT` request — fields extracted by the nodedb-sql parser.
 ///
@@ -39,7 +54,7 @@ pub fn create_alert(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     req: &CreateAlertRequest<'_>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let CreateAlertRequest {
         name,
         collection,
@@ -65,9 +80,9 @@ pub fn create_alert(
             .flatten()
             .is_none()
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "42P01",
-            &format!("collection '{collection}' does not exist"),
+            format!("collection '{collection}' does not exist"),
         ));
     }
 
@@ -77,10 +92,7 @@ pub fn create_alert(
         .get(database_id.as_u64(), tenant_id, name)
         .is_some()
     {
-        return Err(sqlstate_error(
-            "42710",
-            &format!("alert '{name}' already exists"),
-        ));
+        return Err(err("42710", format!("alert '{name}' already exists")));
     }
 
     // Parse condition from raw string.
@@ -88,7 +100,7 @@ pub fn create_alert(
 
     // Parse WINDOW duration.
     let window_ms = nodedb_types::kv_parsing::parse_interval_to_ms(window_raw)
-        .map_err(|e| sqlstate_error("42601", &format!("invalid window duration: {e}")))?
+        .map_err(|e| err("42601", format!("invalid window duration: {e}")))?
         as u64;
 
     // Parse NOTIFY targets.
@@ -96,7 +108,7 @@ pub fn create_alert(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock error"))?
+        .map_err(|_| err("XX000", "system clock error".to_string()))?
         .as_secs();
 
     let def = AlertDef {
@@ -122,11 +134,11 @@ pub fn create_alert(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
 
     catalog
         .put_alert_rule(&def)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+        .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
 
     // Emit CRDT sync delta for Lite visibility.
     {
@@ -155,18 +167,21 @@ pub fn create_alert(
 
     tracing::info!(name, collection, "alert rule created");
 
-    Ok(vec![Response::Execution(Tag::new("CREATE ALERT"))])
+    Ok(status("CREATE ALERT"))
 }
 
 /// Parse `agg_func(column) op threshold` from raw condition string.
-fn parse_condition_raw(raw: &str) -> PgWireResult<AlertCondition> {
+fn parse_condition_raw(raw: &str) -> Result<AlertCondition, DdlError> {
     let s = raw.trim();
-    let open = s
-        .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected agg_func(column) in CONDITION"))?;
+    let open = s.find('(').ok_or_else(|| {
+        err(
+            "42601",
+            "expected agg_func(column) in CONDITION".to_string(),
+        )
+    })?;
     let close = s
         .find(')')
-        .ok_or_else(|| sqlstate_error("42601", "missing ')' in CONDITION"))?;
+        .ok_or_else(|| err("42601", "missing ')' in CONDITION".to_string()))?;
 
     let agg_func = s[..open].trim().to_lowercase();
     let column = s[open + 1..close].trim().to_lowercase();
@@ -182,18 +197,18 @@ fn parse_condition_raw(raw: &str) -> PgWireResult<AlertCondition> {
     {
         (&remainder[..1], remainder[1..].trim())
     } else {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
-            &format!("expected comparison operator in CONDITION: {remainder}"),
+            format!("expected comparison operator in CONDITION: {remainder}"),
         ));
     };
 
     let op = CompareOp::parse(op_str)
-        .ok_or_else(|| sqlstate_error("42601", &format!("unknown operator: {op_str}")))?;
+        .ok_or_else(|| err("42601", format!("unknown operator: {op_str}")))?;
 
     let threshold: f64 = rest
         .parse()
-        .map_err(|_| sqlstate_error("42601", &format!("expected numeric threshold: {rest}")))?;
+        .map_err(|_| err("42601", format!("expected numeric threshold: {rest}")))?;
 
     Ok(AlertCondition {
         agg_func,
@@ -204,7 +219,7 @@ fn parse_condition_raw(raw: &str) -> PgWireResult<AlertCondition> {
 }
 
 /// Parse NOTIFY targets from raw NOTIFY section text.
-fn parse_notify_targets_raw(raw: &str) -> PgWireResult<Vec<NotifyTarget>> {
+fn parse_notify_targets_raw(raw: &str) -> Result<Vec<NotifyTarget>, DdlError> {
     if raw.is_empty() {
         return Ok(Vec::new());
     }
@@ -250,24 +265,24 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     results
 }
 
-fn extract_inner_quoted(s: &str, offset: usize) -> PgWireResult<String> {
+fn extract_inner_quoted(s: &str, offset: usize) -> Result<String, DdlError> {
     let after = s[offset..].trim_start();
     let start = after
         .find('\'')
-        .ok_or_else(|| sqlstate_error("42601", "expected quoted value"))?;
+        .ok_or_else(|| err("42601", "expected quoted value".to_string()))?;
     let end = after[start + 1..]
         .find('\'')
-        .ok_or_else(|| sqlstate_error("42601", "missing closing quote"))?;
+        .ok_or_else(|| err("42601", "missing closing quote".to_string()))?;
     Ok(after[start + 1..start + 1 + end].to_string())
 }
 
-fn parse_insert_target(s: &str) -> PgWireResult<(String, Vec<String>)> {
+fn parse_insert_target(s: &str) -> Result<(String, Vec<String>), DdlError> {
     let s = s.trim();
     if let Some(paren_start) = s.find('(') {
         let table = s[..paren_start].trim().to_lowercase();
         let paren_end = s
             .rfind(')')
-            .ok_or_else(|| sqlstate_error("42601", "missing ')' in INSERT INTO target"))?;
+            .ok_or_else(|| err("42601", "missing ')' in INSERT INTO target".to_string()))?;
         let cols: Vec<String> = s[paren_start + 1..paren_end]
             .split(',')
             .map(|c| c.trim().to_lowercase())

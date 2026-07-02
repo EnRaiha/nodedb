@@ -7,6 +7,7 @@
 //! to them; every other statement returns `None` so the transitional pgwire
 //! delegation in the parent [`super::dispatch`] handles it.
 
+pub mod alert;
 mod auth_support;
 pub mod change_stream;
 pub mod constraint;

@@ -45,33 +45,9 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
         );
     }
 
-    // Alert rules.
-    // CREATE ALERT is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("DROP ALERT ") {
-        return Some(super::super::super::alert::drop_alert(
-            state,
-            identity,
-            database_id,
-            parts,
-        ));
-    }
-    // ALTER ALERT is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("SHOW ALERT STATUS ") {
-        let name = parts.get(4).unwrap_or(&"");
-        return Some(super::super::super::alert::show_alert_status(
-            state,
-            identity,
-            database_id,
-            name,
-        ));
-    }
-    if upper.starts_with("SHOW ALERT") {
-        return Some(super::super::super::alert::show_alerts(
-            state,
-            identity,
-            database_id,
-        ));
-    }
+    // Alerts (CREATE/DROP/ALTER ALERT, SHOW ALERTS, SHOW ALERT STATUS) are
+    // served by the protocol-neutral DDL router; the pgwire router no longer
+    // routes them.
 
     // Retention policies.
     // CREATE RETENTION POLICY is fully dispatched via typed AST (ast.rs).

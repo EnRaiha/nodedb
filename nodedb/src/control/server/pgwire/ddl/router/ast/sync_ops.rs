@@ -6,13 +6,10 @@ use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use nodedb_sql::ddl_ast::statement::{
-    AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, DatabaseStmt, NodedbStatement,
-    PolicyStmt,
+    AuthStmt, ClusterStmt, CollectionStmt, DatabaseStmt, NodedbStatement, PolicyStmt,
 };
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::alert::alter_alert;
-use crate::control::server::pgwire::ddl::alert::{CreateAlertRequest, create_alert};
 use crate::control::server::pgwire::ddl::cluster::alter_raft_group;
 use crate::control::server::pgwire::ddl::collection::drop_collection;
 use crate::control::server::pgwire::ddl::inspect::show_permissions;
@@ -57,10 +54,6 @@ pub(super) fn try_dispatch_sync(
             *cascade_force,
         )),
 
-        NodedbStatement::Automation(AutomationStmt::AlterAlert { name, action }) => {
-            Some(alter_alert(state, identity, database_id, name, action))
-        }
-
         NodedbStatement::Database(DatabaseStmt::BackupTenant { .. }) => {
             Some(Err(super::super::super::super::types::sqlstate_error(
                 "0A000",
@@ -94,35 +87,6 @@ pub(super) fn try_dispatch_sync(
             action,
             set_key.as_deref(),
             set_value.as_deref(),
-        )),
-
-        NodedbStatement::Automation(AutomationStmt::CreateAlert {
-            name,
-            collection,
-            where_filter,
-            condition_raw,
-            group_by,
-            window_raw,
-            fire_after,
-            recover_after,
-            severity,
-            notify_targets_raw,
-        }) => Some(create_alert(
-            state,
-            identity,
-            &CreateAlertRequest {
-                name,
-                collection,
-                where_filter: where_filter.as_deref(),
-                condition_raw,
-                group_by,
-                window_raw,
-                fire_after: *fire_after,
-                recover_after: *recover_after,
-                severity,
-                notify_targets_raw,
-                database_id,
-            },
         )),
 
         NodedbStatement::Auth(AuthStmt::ShowPermissions {

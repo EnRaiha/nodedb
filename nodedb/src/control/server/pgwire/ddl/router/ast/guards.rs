@@ -5,16 +5,14 @@
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 
-use nodedb_sql::ddl_ast::statement::{
-    AutomationStmt, CollectionStmt, NodedbStatement, PolicyStmt, StreamViewStmt,
-};
+use nodedb_sql::ddl_ast::statement::{CollectionStmt, NodedbStatement, PolicyStmt, StreamViewStmt};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::exists::{
-    alert_exists, collection_exists, continuous_aggregate_exists, materialized_view_exists,
+    collection_exists, continuous_aggregate_exists, materialized_view_exists,
     retention_policy_exists,
 };
 
@@ -58,16 +56,6 @@ pub(super) fn try_dispatch_guards(
         NodedbStatement::Collection(CollectionStmt::DropIndex {
             if_exists: true, ..
         }) => None,
-
-        NodedbStatement::Automation(AutomationStmt::DropAlert {
-            name,
-            if_exists: true,
-        }) => {
-            if !alert_exists(state, identity, database_id, name) {
-                return Some(Ok(vec![Response::Execution(Tag::new("DROP ALERT"))]));
-            }
-            None
-        }
 
         NodedbStatement::Policy(PolicyStmt::DropRetentionPolicy {
             name,

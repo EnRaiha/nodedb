@@ -19,19 +19,6 @@ pub(super) fn collection_exists(
     matches!(catalog.get_collection(database_id, tid, name), Ok(Some(_)))
 }
 
-pub(super) fn alert_exists(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    database_id: DatabaseId,
-    name: &str,
-) -> bool {
-    let tid = identity.tenant_id.as_u64();
-    state
-        .alert_registry
-        .get(database_id.as_u64(), tid, name)
-        .is_some()
-}
-
 pub(super) fn retention_policy_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,

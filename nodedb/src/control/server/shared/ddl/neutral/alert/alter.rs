@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `ALTER ALERT` DDL handler.
+//! Protocol-neutral `ALTER ALERT` DDL handler.
+//!
+//! Ported from the pgwire `ddl::alert::alter` handler. The registry lookup, the
+//! DIRECT `catalog.put_alert_rule` write, the in-memory registry update, and the
+//! `audit_record` call are preserved verbatim; only the result construction
+//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
@@ -9,13 +15,19 @@
 //! ```
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 pub fn alter_alert(
     state: &SharedState,
@@ -23,7 +35,7 @@ pub fn alter_alert(
     database_id: DatabaseId,
     name: &str,
     action: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "alter alerts")?;
 
     let tenant_id = identity.tenant_id.as_u64();
@@ -31,23 +43,23 @@ pub fn alter_alert(
     let mut def = state
         .alert_registry
         .get(database_id.as_u64(), tenant_id, name)
-        .ok_or_else(|| sqlstate_error("42704", &format!("alert '{name}' does not exist")))?;
+        .ok_or_else(|| err("42704", format!("alert '{name}' does not exist")))?;
 
     match action {
         "ENABLE" => def.enabled = true,
         "DISABLE" => def.enabled = false,
-        _ => return Err(sqlstate_error("42601", "expected ENABLE or DISABLE")),
+        _ => return Err(err("42601", "expected ENABLE or DISABLE".to_string())),
     }
 
     let catalog = state
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
 
     catalog
         .put_alert_rule(&def)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+        .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
 
     state.alert_registry.update(def);
 
@@ -58,5 +70,5 @@ pub fn alter_alert(
         &format!("ALTER ALERT {name}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER ALERT"))])
+    Ok(status("ALTER ALERT"))
 }
