@@ -31,12 +31,3 @@ pub(super) fn retention_policy_exists(
         .get(database_id.as_u64(), tid, name)
         .is_some()
 }
-
-pub(super) fn continuous_aggregate_exists(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    name: &str,
-) -> bool {
-    let tid = identity.tenant_id.as_u64();
-    state.mv_registry.get_def(tid, name).is_some()
-}

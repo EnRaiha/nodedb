@@ -19,6 +19,7 @@ use super::alert::{self, CreateAlertRequest};
 use super::change_stream;
 use super::constraint;
 use super::consumer_group;
+use super::continuous_agg;
 use super::function;
 use super::grant;
 use super::materialized_view;
@@ -330,6 +331,22 @@ pub async fn try_dispatch(
         ));
     }
 
+    // Continuous aggregates (timeseries). `SHOW CONTINUOUS AGGREGATES [FOR
+    // <source>]` parses into a typed `StreamViewStmt::ShowContinuousAggregates`
+    // but the pgwire admin router dispatched it from the raw token slice by
+    // string prefix (the `SHOW CONTINUOUS AGGREGATE` prefix, trailing-space-less,
+    // captures both the plural `SHOW CONTINUOUS AGGREGATES` and the bare-singular
+    // input). Replicate that here, before the parse gate, so the prefix
+    // recognition and the `parts`-based `FOR <source>` extraction stay
+    // byte-identical. `CREATE` / `DROP CONTINUOUS AGGREGATE` are handled in the
+    // typed match below (they parse into typed StreamView variants).
+    if upper.starts_with("SHOW CONTINUOUS AGGREGATE") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(
+            continuous_agg::show_continuous_aggregates(state, identity, database_id, &parts).await,
+        );
+    }
+
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,
     // which re-parses and reproduces the exact error handling for those inputs.
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
@@ -440,6 +457,55 @@ pub async fn try_dispatch(
             Some(materialized_view::drop_materialized_view(
                 state, identity, &parts,
             ))
+        }
+
+        NodedbStatement::StreamView(StreamViewStmt::CreateContinuousAggregate {
+            name,
+            source,
+            bucket_raw,
+            aggregate_exprs_raw,
+            group_by,
+            with_clause_raw,
+        }) => Some(
+            continuous_agg::create_continuous_aggregate(
+                state,
+                identity,
+                &continuous_agg::CreateContinuousAggregateRequest {
+                    name,
+                    source,
+                    bucket_raw,
+                    aggregate_exprs_raw,
+                    group_by,
+                    with_clause_raw,
+                    database_id,
+                },
+            )
+            .await,
+        ),
+
+        NodedbStatement::StreamView(StreamViewStmt::DropContinuousAggregate {
+            name,
+            if_exists,
+        }) => {
+            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // non-existing continuous aggregate returns the tag before the token
+            // handler runs. The existence check reads the in-memory registry
+            // (`mv_registry`) for the identity tenant exactly as the pgwire guard
+            // did. The `if_exists: false` case and the existing-aggregate case
+            // fall through to `drop_continuous_aggregate`, which re-derives the
+            // name from `parts[3]` exactly as the pgwire admin string dispatch
+            // did.
+            if *if_exists && !continuous_agg::continuous_aggregate_exists(state, identity, name) {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "DROP CONTINUOUS AGGREGATE".to_string(),
+                    rows_affected: None,
+                }]));
+            }
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(
+                continuous_agg::drop_continuous_aggregate(state, identity, database_id, &parts)
+                    .await,
+            )
         }
 
         NodedbStatement::Collection(CollectionStmt::CreateSequence {

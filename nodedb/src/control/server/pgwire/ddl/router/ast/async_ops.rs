@@ -6,7 +6,7 @@ use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use nodedb_sql::ddl_ast::statement::{
-    CollectionStmt, DatabaseStmt, MiscStmt, NodedbStatement, PolicyStmt, StreamViewStmt,
+    CollectionStmt, DatabaseStmt, MiscStmt, NodedbStatement, PolicyStmt,
 };
 
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -16,9 +16,6 @@ use crate::control::server::pgwire::ddl::collection::{
     create_index, create_table, dispatch_register_by_name,
 };
 use crate::control::server::pgwire::ddl::conflict_policy::show_conflict_policy;
-use crate::control::server::pgwire::ddl::continuous_agg::{
-    CreateContinuousAggregateRequest, create_continuous_aggregate,
-};
 use crate::control::server::pgwire::ddl::custom_type::{
     alter_type_add_value, create_composite_type, create_enum_type, drop_type, show_types,
 };
@@ -41,30 +38,6 @@ pub(super) async fn try_dispatch_async(
     database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     match stmt {
-        NodedbStatement::StreamView(StreamViewStmt::CreateContinuousAggregate {
-            name,
-            source,
-            bucket_raw,
-            aggregate_exprs_raw,
-            group_by,
-            with_clause_raw,
-        }) => Some(
-            create_continuous_aggregate(
-                state,
-                identity,
-                &CreateContinuousAggregateRequest {
-                    name,
-                    source,
-                    bucket_raw,
-                    aggregate_exprs_raw,
-                    group_by,
-                    with_clause_raw,
-                    database_id,
-                },
-            )
-            .await,
-        ),
-
         NodedbStatement::Policy(PolicyStmt::CreateRetentionPolicy {
             name,
             collection,

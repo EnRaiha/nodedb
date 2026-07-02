@@ -5,13 +5,13 @@
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 
-use nodedb_sql::ddl_ast::statement::{CollectionStmt, NodedbStatement, PolicyStmt, StreamViewStmt};
+use nodedb_sql::ddl_ast::statement::{CollectionStmt, NodedbStatement, PolicyStmt};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
-use super::exists::{collection_exists, continuous_aggregate_exists, retention_policy_exists};
+use super::exists::{collection_exists, retention_policy_exists};
 
 /// Handle IF [NOT] EXISTS guard arms. Returns `Some(result)` if the statement
 /// was handled (short-circuit), `None` if it should proceed to typed dispatch.
@@ -61,18 +61,6 @@ pub(super) fn try_dispatch_guards(
             if !retention_policy_exists(state, identity, database_id, name) {
                 return Some(Ok(vec![Response::Execution(Tag::new(
                     "DROP RETENTION POLICY",
-                ))]));
-            }
-            None
-        }
-
-        NodedbStatement::StreamView(StreamViewStmt::DropContinuousAggregate {
-            name,
-            if_exists: true,
-        }) => {
-            if !continuous_aggregate_exists(state, identity, name) {
-                return Some(Ok(vec![Response::Execution(Tag::new(
-                    "DROP CONTINUOUS AGGREGATE",
                 ))]));
             }
             None

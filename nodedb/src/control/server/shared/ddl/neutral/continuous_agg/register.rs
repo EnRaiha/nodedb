@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Startup replay: re-register catalog-persisted continuous aggregates.
+//!
+//! Moved verbatim from the pgwire `ddl::continuous_agg::register` module. This is
+//! a boot-time Data-Plane replay helper, not a DDL statement handler, so it
+//! carries no pgwire response types and is unchanged by the neutral migration.
 
 use std::time::Duration;
 

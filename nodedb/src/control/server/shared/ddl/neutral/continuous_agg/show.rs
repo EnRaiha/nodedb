@@ -1,23 +1,34 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `SHOW CONTINUOUS AGGREGATES [FOR <source>]` handler.
+//! Protocol-neutral `SHOW CONTINUOUS AGGREGATES [FOR <source>]` handler.
+//!
+//! Ported from the pgwire `ddl::continuous_agg::show` handler. The catalog read
+//! (durable source of truth), the best-effort runtime-stats merge from the local
+//! Data Plane manager, the optional `FOR <source>` filter, the decode-failure
+//! skip, and the exact column set are preserved verbatim; only the result
+//! construction changed from pgwire `Response` / `QueryResponse` to the
+//! protocol-neutral [`DdlResult::Rows`] over [`ShapedRows`]. The mixed
+//! text/`int8` column OIDs (`watermark_ts`, `rows_aggregated`,
+//! `materialized_buckets` are `int8`) are reproduced by building `column_types`
+//! manually so the RowDescription stays byte-identical; the `int8` cells are
+//! emitted as their decimal text form, the same bytes the pgwire
+//! `DataRowEncoder::encode_field(&i64)` produced.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::StoredContinuousAggregate;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::ddl::sync_dispatch;
-use crate::control::server::pgwire::types::{int8_field, sqlstate_error, text_field};
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::{AggregateInfo, ContinuousAggregateDef};
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::MetaOp;
+
+use super::super::super::result::{DdlError, DdlResult};
 
 /// `SHOW CONTINUOUS AGGREGATES [FOR <source>]`.
 ///
@@ -32,7 +43,7 @@ pub async fn show_continuous_aggregates(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let source_filter = if parts.len() >= 5 && parts[3].to_uppercase() == "FOR" {
         Some(parts[4].to_lowercase())
     } else {
@@ -68,16 +79,26 @@ pub async fn show_continuous_aggregates(
         Err(_) => Vec::new(),
     };
 
-    let schema = Arc::new(vec![
-        text_field("name"),
-        text_field("source"),
-        text_field("bucket_interval"),
-        text_field("refresh_policy"),
-        int8_field("watermark_ts"),
-        int8_field("rows_aggregated"),
-        int8_field("materialized_buckets"),
-        text_field("stale"),
-    ]);
+    let columns = vec![
+        "name".to_string(),
+        "source".to_string(),
+        "bucket_interval".to_string(),
+        "refresh_policy".to_string(),
+        "watermark_ts".to_string(),
+        "rows_aggregated".to_string(),
+        "materialized_buckets".to_string(),
+        "stale".to_string(),
+    ];
+    let column_types = vec![
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Text,
+    ];
 
     let mut rows = Vec::new();
     for stored in &stored_aggs {
@@ -106,36 +127,40 @@ pub async fn show_continuous_aggregates(
         let buckets = runtime.map(|i| i.materialized_buckets as i64).unwrap_or(0);
         let stale = runtime.map(|i| i.stale).unwrap_or(def.stale).to_string();
 
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        encoder
-            .encode_field(&stored.name)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&stored.source)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&def.bucket_interval)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&format!("{:?}", def.refresh_policy))
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&watermark)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&rows_agg)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&buckets)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        encoder
-            .encode_field(&stale)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert("name".to_string(), JsonValue::String(stored.name.clone()));
+        row.insert(
+            "source".to_string(),
+            JsonValue::String(stored.source.clone()),
+        );
+        row.insert(
+            "bucket_interval".to_string(),
+            JsonValue::String(def.bucket_interval.clone()),
+        );
+        row.insert(
+            "refresh_policy".to_string(),
+            JsonValue::String(format!("{:?}", def.refresh_policy)),
+        );
+        row.insert(
+            "watermark_ts".to_string(),
+            JsonValue::String(watermark.to_string()),
+        );
+        row.insert(
+            "rows_aggregated".to_string(),
+            JsonValue::String(rows_agg.to_string()),
+        );
+        row.insert(
+            "materialized_buckets".to_string(),
+            JsonValue::String(buckets.to_string()),
+        );
+        row.insert("stale".to_string(), JsonValue::String(stale));
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }

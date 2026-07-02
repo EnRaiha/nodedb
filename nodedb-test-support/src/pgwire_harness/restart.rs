@@ -256,7 +256,7 @@ impl TestServer {
         // Re-register every persisted continuous aggregate on the local
         // Data Plane manager: the registry is per-core in-memory state
         // and is otherwise lost across restart.
-        nodedb::control::server::pgwire::ddl::continuous_agg::register_persisted_continuous_aggregates(
+        nodedb::control::server::shared::ddl::neutral::continuous_agg::register_persisted_continuous_aggregates(
             &shared,
         )
         .await;

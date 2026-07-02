@@ -12,6 +12,7 @@ mod auth_support;
 pub mod change_stream;
 pub mod constraint;
 pub mod consumer_group;
+pub mod continuous_agg;
 pub mod function;
 pub mod grant;
 pub mod materialized_view;

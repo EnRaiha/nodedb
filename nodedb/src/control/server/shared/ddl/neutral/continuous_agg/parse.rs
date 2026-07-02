@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! SQL parsing helpers for `CREATE CONTINUOUS AGGREGATE`.
-
-use pgwire::error::PgWireResult;
+//!
+//! Ported from the pgwire `ddl::continuous_agg::parse` helpers. The parsing
+//! logic, keyword tables, auto-alias derivation, and SQLSTATE codes are
+//! preserved verbatim; only the error type changed from pgwire
+//! `PgWireError` (via `sqlstate_error`) to the protocol-neutral [`DdlError`].
 
 use crate::engine::timeseries::continuous_agg::{
     AggFunction, AggregateExpr, ContinuousAggregateDef, RefreshPolicy,
 };
 
-use crate::control::server::pgwire::types::sqlstate_error;
+use super::super::super::result::DdlError;
 
 const KW_CONTINUOUS_AGGREGATE: &str = "CONTINUOUS AGGREGATE ";
 const KW_ON: &str = " ON ";
@@ -16,6 +19,13 @@ const KW_BUCKET: &str = "BUCKET";
 const KW_AGGREGATE: &str = "AGGREGATE ";
 const KW_GROUP_BY: &str = "GROUP BY ";
 const KW_AS: &str = " AS ";
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 /// Parse CREATE CONTINUOUS AGGREGATE SQL.
 ///
@@ -27,47 +37,47 @@ const KW_AS: &str = " AS ";
 ///   [GROUP BY col, ...]
 ///   [WITH (refresh_policy = '...', retention = '...')]
 /// ```
-pub(super) fn parse_create_sql(sql: &str) -> PgWireResult<ContinuousAggregateDef> {
+pub(super) fn parse_create_sql(sql: &str) -> Result<ContinuousAggregateDef, DdlError> {
     let upper = sql.to_uppercase();
 
     // Extract name: word after "CONTINUOUS AGGREGATE"
     let ca_pos = upper
         .find(KW_CONTINUOUS_AGGREGATE)
-        .ok_or_else(|| sqlstate_error("42601", "expected CONTINUOUS AGGREGATE keyword"))?;
+        .ok_or_else(|| err("42601", "expected CONTINUOUS AGGREGATE keyword".to_string()))?;
     let after_ca_start = ca_pos + KW_CONTINUOUS_AGGREGATE.len();
     let after_ca = sql[after_ca_start..].trim_start();
     let name = after_ca
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "missing aggregate name"))?
+        .ok_or_else(|| err("42601", "missing aggregate name".to_string()))?
         .to_lowercase();
 
     // Extract source: word after "ON"
     let on_pos = upper[after_ca_start..]
         .find(KW_ON)
-        .ok_or_else(|| sqlstate_error("42601", "expected ON <source> clause"))?;
+        .ok_or_else(|| err("42601", "expected ON <source> clause".to_string()))?;
     let after_on_start = after_ca_start + on_pos + KW_ON.len();
     let after_on = sql[after_on_start..].trim_start();
     let source = after_on
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "missing source collection name"))?
+        .ok_or_else(|| err("42601", "missing source collection name".to_string()))?
         .to_lowercase();
 
     // Extract bucket interval: between BUCKET ' and '
     let bucket_interval = extract_quoted_value(&upper, sql, KW_BUCKET)
-        .ok_or_else(|| sqlstate_error("42601", "expected BUCKET '<interval>' clause"))?;
+        .ok_or_else(|| err("42601", "expected BUCKET '<interval>' clause".to_string()))?;
 
     let bucket_interval_ms = nodedb_types::kv_parsing::parse_interval_to_ms(&bucket_interval)
-        .map_err(|e| sqlstate_error("42601", &format!("invalid bucket interval: {e}")))?
+        .map_err(|e| err("42601", format!("invalid bucket interval: {e}")))?
         as i64;
 
     // Extract aggregates: between AGGREGATE and GROUP BY / WITH / end
     let aggregates = extract_aggregates(&upper, sql)?;
     if aggregates.is_empty() {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
-            "expected AGGREGATE <func>(col), ... clause",
+            "expected AGGREGATE <func>(col), ... clause".to_string(),
         ));
     }
 
@@ -106,7 +116,7 @@ pub(super) fn extract_quoted_value(upper: &str, sql: &str, keyword: &str) -> Opt
 /// Extract aggregate expressions from AGGREGATE clause.
 ///
 /// Parses: `AGGREGATE sum(value) AS value_sum, count(*) AS row_count, avg(cpu)`
-fn extract_aggregates(upper: &str, sql: &str) -> PgWireResult<Vec<AggregateExpr>> {
+fn extract_aggregates(upper: &str, sql: &str) -> Result<Vec<AggregateExpr>, DdlError> {
     // Find standalone AGGREGATE keyword. Skip past "CONTINUOUS AGGREGATE" by
     // searching after the BUCKET clause (which always precedes AGGREGATE).
     let search_start = upper.find(KW_BUCKET).unwrap_or(0);
@@ -139,7 +149,7 @@ fn extract_aggregates(upper: &str, sql: &str) -> PgWireResult<Vec<AggregateExpr>
 }
 
 /// Parse a single aggregate expression: `func(col) [AS alias]`.
-fn parse_single_aggregate(s: &str) -> PgWireResult<AggregateExpr> {
+fn parse_single_aggregate(s: &str) -> Result<AggregateExpr, DdlError> {
     let upper = s.to_uppercase();
 
     // Split on AS for alias.
@@ -154,12 +164,12 @@ fn parse_single_aggregate(s: &str) -> PgWireResult<AggregateExpr> {
     let func_part = func_part.trim();
 
     // Parse func(col).
-    let open = func_part.find('(').ok_or_else(|| {
-        sqlstate_error("42601", &format!("expected function(column) syntax: {s}"))
-    })?;
+    let open = func_part
+        .find('(')
+        .ok_or_else(|| err("42601", format!("expected function(column) syntax: {s}")))?;
     let close = func_part
         .rfind(')')
-        .ok_or_else(|| sqlstate_error("42601", &format!("missing closing parenthesis: {s}")))?;
+        .ok_or_else(|| err("42601", format!("missing closing parenthesis: {s}")))?;
 
     let func_name = func_part[..open].trim().to_lowercase();
     let col_name = func_part[open + 1..close].trim().to_lowercase();
@@ -174,10 +184,7 @@ fn parse_single_aggregate(s: &str) -> PgWireResult<AggregateExpr> {
         "last" => AggFunction::Last,
         "count_distinct" => AggFunction::CountDistinct,
         other => {
-            return Err(sqlstate_error(
-                "42601",
-                &format!("unknown aggregate function: {other}"),
-            ));
+            return Err(err("42601", format!("unknown aggregate function: {other}")));
         }
     };
 

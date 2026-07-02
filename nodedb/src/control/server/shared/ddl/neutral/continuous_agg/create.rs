@@ -1,23 +1,38 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE CONTINUOUS AGGREGATE` handler.
+//! Protocol-neutral `CREATE CONTINUOUS AGGREGATE` handler.
+//!
+//! Ported from the pgwire `ddl::continuous_agg::create` handler. The catalog
+//! path (`propose_and_apply` for the `PutContinuousAggregate` entry, then the
+//! target-collection `propose_and_apply` + `dispatch_register_from_stored`, then
+//! the `log_index == 0` single-node `RegisterContinuousAggregate` sync dispatch),
+//! the source-existence / timeseries / duplicate checks, the def serialization,
+//! and the target-collection descriptor are preserved verbatim; only the result
+//! construction changed from pgwire `Response` / `PgWireError` to the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use std::time::Duration;
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::Response;
-use pgwire::error::PgWireResult;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::{StoredCollection, StoredContinuousAggregate};
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::{catalog_propose, collection, sync_dispatch};
-use crate::control::server::pgwire::types::sqlstate_error;
+use crate::control::server::pgwire::ddl::{collection, sync_dispatch};
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::ContinuousAggregateDef;
 use nodedb_physical::physical_plan::MetaOp;
 
+use super::super::super::catalog::propose_and_apply;
+use super::super::super::result::{DdlError, DdlResult};
 use super::parse::{extract_with_options, parse_create_sql};
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 /// Parsed `CREATE CONTINUOUS AGGREGATE` request.
 ///
@@ -49,7 +64,7 @@ pub async fn create_continuous_aggregate(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     req: &CreateContinuousAggregateRequest<'_>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let CreateContinuousAggregateRequest {
         name,
         source,
@@ -97,15 +112,15 @@ pub async fn create_continuous_aggregate(
         match catalog.get_collection(database_id, tenant_id.as_u64(), &def.source) {
             Ok(Some(coll)) if coll.collection_type.is_timeseries() => {}
             Ok(Some(_)) => {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42809",
-                    &format!("'{}' is not a timeseries collection", def.source),
+                    format!("'{}' is not a timeseries collection", def.source),
                 ));
             }
             _ => {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42P01",
-                    &format!("collection '{}' does not exist", def.source),
+                    format!("collection '{}' does not exist", def.source),
                 ));
             }
         }
@@ -113,9 +128,9 @@ pub async fn create_continuous_aggregate(
         if let Ok(Some(_)) =
             catalog.get_continuous_aggregate(database_id.as_u64(), tenant_id.as_u64(), &def.name)
         {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42P07",
-                &format!("continuous aggregate '{}' already exists", def.name),
+                format!("continuous aggregate '{}' already exists", def.name),
             ));
         }
     }
@@ -129,9 +144,8 @@ pub async fn create_continuous_aggregate(
     // so the on-disk format does not depend on Data Plane tuning
     // fields — the def is decoded on register dispatch in
     // `post_apply::async_dispatch::continuous_aggregate::put_async`.
-    let def_bytes = zerompk::to_msgpack_vec(&def).map_err(|e| {
-        sqlstate_error("XX000", &format!("serialize continuous aggregate def: {e}"))
-    })?;
+    let def_bytes = zerompk::to_msgpack_vec(&def)
+        .map_err(|e| err("XX000", format!("serialize continuous aggregate def: {e}")))?;
 
     let stored = StoredContinuousAggregate {
         database_id: database_id.as_u64(),
@@ -149,7 +163,7 @@ pub async fn create_continuous_aggregate(
     let entry = crate::control::catalog_entry::CatalogEntry::PutContinuousAggregate(Box::new(
         stored.clone(),
     ));
-    let log_index = catalog_propose::propose_and_apply(state, &entry)?;
+    let log_index = propose_and_apply(state, &entry)?;
 
     // Create the target collection so `SELECT * FROM <ca_name>` resolves
     // like any other relation. Schemaless document by parity with
@@ -206,10 +220,10 @@ pub async fn create_continuous_aggregate(
         };
         let coll_entry =
             crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(target.clone()));
-        catalog_propose::propose_and_apply(state, &coll_entry)?;
+        propose_and_apply(state, &coll_entry)?;
         collection::dispatch_register_from_stored(state, &target)
             .await
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+            .map_err(|e| err("XX000", e.to_string()))?;
     }
 
     // Single-node / no-applier path: the async post-apply dispatcher
@@ -227,7 +241,7 @@ pub async fn create_continuous_aggregate(
             Duration::from_secs(5),
         )
         .await
-        .map_err(|e| sqlstate_error("XX000", &format!("dispatch failed: {e}")))?;
+        .map_err(|e| err("XX000", format!("dispatch failed: {e}")))?;
     }
 
     tracing::info!(
@@ -238,9 +252,10 @@ pub async fn create_continuous_aggregate(
         "continuous aggregate created"
     );
 
-    Ok(vec![Response::Execution(pgwire::api::results::Tag::new(
-        "CREATE CONTINUOUS AGGREGATE",
-    ))])
+    Ok(vec![DdlResult::Status {
+        command: "CREATE CONTINUOUS AGGREGATE".to_string(),
+        rows_affected: None,
+    }])
 }
 
 #[cfg(test)]

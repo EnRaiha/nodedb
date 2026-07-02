@@ -9,7 +9,6 @@ pub mod catalog_propose;
 pub mod cluster;
 pub mod collection;
 pub mod conflict_policy;
-pub mod continuous_agg;
 pub mod convert;
 pub mod crdt_ops;
 pub mod custom_type;

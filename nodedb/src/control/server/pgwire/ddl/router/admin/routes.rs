@@ -74,30 +74,8 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
         );
     }
 
-    // Continuous aggregates.
-    // CREATE CONTINUOUS AGGREGATE is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("DROP CONTINUOUS AGGREGATE ") {
-        return Some(
-            super::super::super::continuous_agg::drop_continuous_aggregate(
-                state,
-                identity,
-                database_id,
-                parts,
-            )
-            .await,
-        );
-    }
-    if upper.starts_with("SHOW CONTINUOUS AGGREGATE") {
-        return Some(
-            super::super::super::continuous_agg::show_continuous_aggregates(
-                state,
-                identity,
-                database_id,
-                parts,
-            )
-            .await,
-        );
-    }
+    // Continuous aggregates (CREATE/DROP/SHOW CONTINUOUS AGGREGATE) are served by
+    // the protocol-neutral DDL router; the pgwire router no longer routes them.
 
     // CONVERT COLLECTION.
     if upper.starts_with("CONVERT COLLECTION ")
