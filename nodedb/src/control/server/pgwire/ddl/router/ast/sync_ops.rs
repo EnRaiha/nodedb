@@ -20,7 +20,6 @@ use crate::control::server::pgwire::ddl::consumer_group::create_consumer_group;
 use crate::control::server::pgwire::ddl::inspect::show_permissions;
 use crate::control::server::pgwire::ddl::retention_policy::alter_retention_policy;
 use crate::control::server::pgwire::ddl::schedule::alter_schedule;
-use crate::control::server::pgwire::ddl::trigger::alter_trigger;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -82,18 +81,6 @@ pub(super) fn try_dispatch_sync(
                 "use `COPY tenant_restore(<id>) FROM STDIN` to stream backup bytes from the client",
             )))
         }
-
-        NodedbStatement::Automation(AutomationStmt::AlterTrigger {
-            name,
-            action,
-            new_owner,
-        }) => Some(alter_trigger(
-            state,
-            identity,
-            name,
-            action,
-            new_owner.as_deref(),
-        )),
 
         NodedbStatement::Cluster(ClusterStmt::AlterRaftGroup {
             group_id,

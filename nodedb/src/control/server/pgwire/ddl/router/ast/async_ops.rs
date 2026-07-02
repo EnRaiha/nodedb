@@ -31,7 +31,6 @@ use crate::control::server::pgwire::ddl::synonym_group::{
     create_synonym_group, drop_synonym_group, show_synonym_groups,
 };
 use crate::control::server::pgwire::ddl::tenant::handle_move_tenant;
-use crate::control::server::pgwire::ddl::trigger::create_trigger;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -46,38 +45,6 @@ pub(super) async fn try_dispatch_async(
     database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     match stmt {
-        NodedbStatement::Automation(AutomationStmt::CreateTrigger {
-            or_replace,
-            execution_mode,
-            name,
-            timing,
-            events_insert,
-            events_update,
-            events_delete,
-            collection,
-            granularity,
-            when_condition,
-            priority,
-            security,
-            body_sql,
-        }) => Some(create_trigger(
-            state,
-            identity,
-            *or_replace,
-            execution_mode,
-            name,
-            timing,
-            *events_insert,
-            *events_update,
-            *events_delete,
-            collection,
-            granularity,
-            when_condition.as_deref(),
-            *priority,
-            security,
-            body_sql,
-        )),
-
         NodedbStatement::Automation(AutomationStmt::CreateSchedule {
             name,
             cron_expr,

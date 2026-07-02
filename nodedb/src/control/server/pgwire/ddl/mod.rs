@@ -66,7 +66,6 @@ mod timeseries_helpers;
 pub mod topic;
 pub mod transfer;
 pub mod tree_ops;
-pub mod trigger;
 pub mod typeguard;
 pub mod version_history;
 pub mod weighted_pick;

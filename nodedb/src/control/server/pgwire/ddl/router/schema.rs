@@ -13,15 +13,7 @@ pub(super) async fn dispatch(
     upper: &str,
     parts: &[&str],
 ) -> Option<PgWireResult<Vec<Response>>> {
-    // Triggers: CREATE [OR REPLACE] [SYNC|DEFERRED] TRIGGER ...
-    // CREATE TRIGGER is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("DROP TRIGGER ") {
-        return Some(super::super::trigger::drop_trigger(state, identity, parts));
-    }
-    // ALTER TRIGGER is fully dispatched via typed AST (ast.rs).
-    if upper == "SHOW TRIGGERS" || upper.starts_with("SHOW TRIGGERS") {
-        return Some(super::super::trigger::show_triggers(state, identity, parts));
-    }
+    // Triggers (CREATE / DROP / ALTER / SHOW) are served by the protocol-neutral DDL router.
 
     // Schema introspection.
     // DESCRIBE SEQUENCE is served by the protocol-neutral DDL router.

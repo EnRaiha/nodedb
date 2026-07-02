@@ -6,7 +6,9 @@
 //! other statement returns `None` so the transitional pgwire delegation in the
 //! parent [`super::super::dispatch`] handles it.
 
-use nodedb_sql::ddl_ast::statement::{AuthStmt, CollectionStmt, NodedbStatement, PolicyStmt};
+use nodedb_sql::ddl_ast::statement::{
+    AuthStmt, AutomationStmt, CollectionStmt, NodedbStatement, PolicyStmt,
+};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -20,6 +22,7 @@ use super::rls::{self, CreateRlsPolicyRequest};
 use super::role;
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
+use super::trigger;
 use super::user;
 
 /// Try to handle `sql` with a migrated protocol-neutral DDL family handler.
@@ -346,6 +349,74 @@ pub async fn try_dispatch(
 
         NodedbStatement::Auth(AuthStmt::ShowOidcProviders) => {
             Some(oidc::show_oidc_providers(state, identity))
+        }
+
+        NodedbStatement::Automation(AutomationStmt::CreateTrigger {
+            or_replace,
+            execution_mode,
+            name,
+            timing,
+            events_insert,
+            events_update,
+            events_delete,
+            collection,
+            granularity,
+            when_condition,
+            priority,
+            security,
+            body_sql,
+        }) => Some(trigger::create_trigger(
+            state,
+            identity,
+            *or_replace,
+            execution_mode,
+            name,
+            timing,
+            *events_insert,
+            *events_update,
+            *events_delete,
+            collection,
+            granularity,
+            when_condition.as_deref(),
+            *priority,
+            security,
+            body_sql,
+        )),
+
+        NodedbStatement::Automation(AutomationStmt::AlterTrigger {
+            name,
+            action,
+            new_owner,
+        }) => Some(trigger::alter_trigger(
+            state,
+            identity,
+            name,
+            action,
+            new_owner.as_deref(),
+        )),
+
+        NodedbStatement::Automation(AutomationStmt::DropTrigger {
+            name, if_exists, ..
+        }) => {
+            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // non-existing trigger returns the tag before the token handler runs
+            // (and before any catalog-read error surfaces). The `if_exists:
+            // false` case and the existing-trigger case fall through to
+            // `drop_trigger`, which re-derives the name / IF EXISTS from `parts`
+            // exactly as the pgwire schema string dispatch did.
+            if *if_exists && !trigger::trigger_exists(state, identity, name) {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "DROP TRIGGER".to_string(),
+                    rows_affected: None,
+                }]));
+            }
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(trigger::drop_trigger(state, identity, &parts))
+        }
+
+        NodedbStatement::Automation(AutomationStmt::ShowTriggers { .. }) => {
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(trigger::show_triggers(state, identity, &parts))
         }
 
         _ => None,

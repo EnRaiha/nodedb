@@ -15,7 +15,7 @@ use crate::types::DatabaseId;
 
 use super::exists::{
     alert_exists, change_stream_exists, collection_exists, continuous_aggregate_exists,
-    materialized_view_exists, retention_policy_exists, schedule_exists, trigger_exists,
+    materialized_view_exists, retention_policy_exists, schedule_exists,
 };
 
 /// Handle IF [NOT] EXISTS guard arms. Returns `Some(result)` if the statement
@@ -58,17 +58,6 @@ pub(super) fn try_dispatch_guards(
         NodedbStatement::Collection(CollectionStmt::DropIndex {
             if_exists: true, ..
         }) => None,
-
-        NodedbStatement::Automation(AutomationStmt::DropTrigger {
-            name,
-            if_exists: true,
-            ..
-        }) => {
-            if !trigger_exists(state, identity, name) {
-                return Some(Ok(vec![Response::Execution(Tag::new("DROP TRIGGER"))]));
-            }
-            None
-        }
 
         NodedbStatement::Automation(AutomationStmt::DropSchedule {
             name,

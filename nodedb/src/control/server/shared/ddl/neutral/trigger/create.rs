@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE TRIGGER` DDL handler.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Protocol-neutral `CREATE TRIGGER` DDL handler.
+//!
+//! Ported from the pgwire `ddl::trigger::create` handler. The catalog path
+//! (`propose_and_apply` + `log_index == 0` local registry refresh, the
+//! `emit_trigger_put` definition-sync broadcast, and the `audit_record` call)
+//! is preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
+//! [`DdlError`].
 
 use crate::control::security::catalog::trigger_types::{
     TriggerEvents, TriggerExecutionMode, TriggerGranularity, TriggerSecurity, TriggerTiming,
@@ -11,7 +15,8 @@ use crate::control::security::catalog::trigger_types::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
 
 /// Handle `CREATE [OR REPLACE] TRIGGER ...` from typed AST fields.
 #[allow(clippy::too_many_arguments)]
@@ -31,7 +36,7 @@ pub fn create_trigger(
     priority: i32,
     security: &str,
     body_sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create triggers")?;
 
     let tenant_id = identity.tenant_id.as_u64();
@@ -40,19 +45,24 @@ pub fn create_trigger(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        })?;
 
     // Check for existing trigger.
     if !or_replace && let Ok(Some(_)) = catalog.get_trigger(tenant_id, name) {
-        return Err(sqlstate_error(
-            "42710",
-            &format!("trigger '{name}' already exists"),
-        ));
+        return Err(DdlError {
+            sqlstate: "42710".to_string(),
+            message: format!("trigger '{name}' already exists"),
+        });
     }
 
     // Validate the trigger body parses as procedural SQL.
-    crate::control::planner::procedural::parse_block(body_sql)
-        .map_err(|e| sqlstate_error("42601", &format!("trigger body parse error: {e}")))?;
+    crate::control::planner::procedural::parse_block(body_sql).map_err(|e| DdlError {
+        sqlstate: "42601".to_string(),
+        message: format!("trigger body parse error: {e}"),
+    })?;
 
     let execution_mode_enum = parse_execution_mode(execution_mode);
     let timing_enum = parse_timing(timing);
@@ -76,7 +86,10 @@ pub fn create_trigger(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock before UNIX epoch"))?
+        .map_err(|_| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system clock before UNIX epoch".to_string(),
+        })?
         .as_secs();
 
     let batch_mode = crate::control::trigger::batch::classify::classify_trigger_body(body_sql);
@@ -108,7 +121,7 @@ pub fn create_trigger(
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(stored.clone()));
-    let log_index = super::super::catalog_propose::propose_and_apply(state, &entry)?;
+    let log_index = super::super::super::catalog::propose_and_apply(state, &entry)?;
     if log_index == 0 {
         // Registry update is local-only — the Raft applier handles
         // the cluster-wide registry refresh on remote nodes.
@@ -131,7 +144,7 @@ pub fn create_trigger(
         ),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE TRIGGER"))])
+    Ok(status("CREATE TRIGGER"))
 }
 
 /// Encode the stored trigger and broadcast a `DefinitionSyncMsg` to all
