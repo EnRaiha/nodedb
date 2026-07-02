@@ -98,9 +98,13 @@ impl CoreLoop {
         self.hlc
             .update_from_remote(epoch_system_ms.saturating_mul(NANOS_PER_MS));
         self.epoch_system_ms = Some(epoch_system_ms);
+        // Scope OLLP verification to this replica's group leadership for the
+        // batch, then restore the resting (authoritative) state so a subsequent
+        // direct single-shard dispatch still verifies.
+        let prev_group_leader = self.ollp_is_group_leader;
         self.ollp_is_group_leader = is_group_leader;
         let result = self.execute_transaction_batch(task, tenant_id.as_u64(), plans);
-        self.ollp_is_group_leader = false;
+        self.ollp_is_group_leader = prev_group_leader;
         self.epoch_system_ms = None;
         result
     }
@@ -217,9 +221,13 @@ impl CoreLoop {
         self.hlc
             .update_from_remote(epoch_system_ms.saturating_mul(NANOS_PER_MS));
         self.epoch_system_ms = Some(epoch_system_ms);
+        // Scope OLLP verification to this replica's group leadership for the
+        // batch, then restore the resting (authoritative) state so a subsequent
+        // direct single-shard dispatch still verifies.
+        let prev_group_leader = self.ollp_is_group_leader;
         self.ollp_is_group_leader = is_group_leader;
         let result = self.execute_transaction_batch(task, tenant_id.as_u64(), plans);
-        self.ollp_is_group_leader = false;
+        self.ollp_is_group_leader = prev_group_leader;
         self.epoch_system_ms = None;
         result
     }

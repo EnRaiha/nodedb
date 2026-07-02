@@ -167,7 +167,13 @@ impl CoreLoop {
             quarantine_registry: None,
             pending_reindex: Vec::new(),
             epoch_system_ms: None,
-            ollp_is_group_leader: false,
+            // Resting state is authoritative: a shard executing a bulk DML
+            // directly (single-shard / non-Calvin dispatch) has no replication
+            // followers, so it MUST run OLLP drift verification. The Calvin
+            // replicated path scopes this to actual group leadership for the
+            // duration of a batch and restores it afterward — followers in a
+            // group skip verification and apply the leader's predicted set.
+            ollp_is_group_leader: true,
         })
     }
 }
