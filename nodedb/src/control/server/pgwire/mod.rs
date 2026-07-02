@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod ddl;
+pub mod ddl_encode;
 pub mod factory;
 pub mod handler;
 pub mod listener;

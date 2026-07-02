@@ -39,9 +39,14 @@ impl NodeDbPgHandler {
             .sessions
             .get_current_database(addr)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
-        if super::super::ddl::dispatch(&self.state, identity, inner_sql, database_id)
-            .await
-            .is_some()
+        if crate::control::server::shared::ddl::dispatch(
+            &self.state,
+            identity,
+            inner_sql,
+            database_id,
+        )
+        .await
+        .is_some()
         {
             let schema = Arc::new(vec![text_field("QUERY PLAN")]);
             let plan_text = format!(

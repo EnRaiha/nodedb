@@ -340,16 +340,26 @@ impl NodeDbPgHandler {
 
         if let Some(rewritten) =
             super::super::system_functions::rewrite_purge_collection(sql_trimmed, &upper)
-            && let Some(result) =
-                super::super::ddl::dispatch(&self.state, identity, &rewritten, database_id).await
+            && let Some(result) = crate::control::server::shared::ddl::dispatch(
+                &self.state,
+                identity,
+                &rewritten,
+                database_id,
+            )
+            .await
         {
-            return result;
+            return crate::control::server::pgwire::ddl_encode::ddl_results_to_pgwire(result);
         }
 
-        if let Some(result) =
-            super::super::ddl::dispatch(&self.state, identity, sql_trimmed, database_id).await
+        if let Some(result) = crate::control::server::shared::ddl::dispatch(
+            &self.state,
+            identity,
+            sql_trimmed,
+            database_id,
+        )
+        .await
         {
-            return result;
+            return crate::control::server::pgwire::ddl_encode::ddl_results_to_pgwire(result);
         }
 
         // SHOW commands the DDL / AST router did not claim are PG
