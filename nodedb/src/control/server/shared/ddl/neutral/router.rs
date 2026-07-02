@@ -13,6 +13,7 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::result::{DdlError, DdlResult};
+use super::grant;
 use super::oidc;
 use super::rls::{self, CreateRlsPolicyRequest};
 use super::sequence::{self, CreateSequenceRequest};
@@ -158,6 +159,58 @@ pub async fn try_dispatch(
             let parts: Vec<&str> = sql.split_whitespace().collect();
             Some(rls::show_rls_policies(state, identity, &parts))
         }
+
+        NodedbStatement::Auth(AuthStmt::GrantRole { roles, grantee }) => {
+            Some(grant::role::grant_role(state, identity, roles, grantee))
+        }
+
+        NodedbStatement::Auth(AuthStmt::RevokeRole { roles, grantee }) => {
+            Some(grant::role::revoke_role(state, identity, roles, grantee))
+        }
+
+        NodedbStatement::Auth(AuthStmt::GrantPermission {
+            permissions,
+            target_type,
+            target_name,
+            grantee,
+        }) => Some(grant::permission::grant_permission(
+            state,
+            identity,
+            permissions,
+            target_type,
+            target_name,
+            grantee,
+        )),
+
+        NodedbStatement::Auth(AuthStmt::RevokePermission {
+            permissions,
+            target_type,
+            target_name,
+            grantee,
+        }) => Some(grant::permission::revoke_permission(
+            state,
+            identity,
+            permissions,
+            target_type,
+            target_name,
+            grantee,
+        )),
+
+        NodedbStatement::Auth(AuthStmt::GrantDatabasePermission {
+            permission,
+            db_name,
+            grantee,
+        }) => Some(grant::database_permission::grant_database(
+            state, identity, permission, db_name, grantee,
+        )),
+
+        NodedbStatement::Auth(AuthStmt::RevokeDatabasePermission {
+            permission,
+            db_name,
+            grantee,
+        }) => Some(grant::database_permission::revoke_database(
+            state, identity, permission, db_name, grantee,
+        )),
 
         NodedbStatement::Auth(AuthStmt::CreateOidcProvider {
             name,

@@ -237,14 +237,19 @@ pub fn alter_role_typed(
             target_type,
             target_name,
         } => {
-            // Delegate to the existing grant handler, using the role name as grantee.
-            super::grant::permission::grant_permission(
-                state,
-                identity,
-                std::slice::from_ref(permission),
-                target_type,
-                target_name,
-                role_name,
+            // Delegate to the migrated protocol-neutral grant handler, using the
+            // role name as grantee, then re-encode its `DdlResult` / `DdlError`
+            // back to pgwire `Response` — byte-identical to the previous direct
+            // call.
+            crate::control::server::pgwire::ddl_encode::ddl_results_to_pgwire(
+                crate::control::server::shared::ddl::neutral::grant::permission::grant_permission(
+                    state,
+                    identity,
+                    std::slice::from_ref(permission),
+                    target_type,
+                    target_name,
+                    role_name,
+                ),
             )
         }
 
@@ -253,14 +258,19 @@ pub fn alter_role_typed(
             target_type,
             target_name,
         } => {
-            // Delegate to the existing revoke handler, using the role name as grantee.
-            super::grant::permission::revoke_permission(
-                state,
-                identity,
-                std::slice::from_ref(permission),
-                target_type,
-                target_name,
-                role_name,
+            // Delegate to the migrated protocol-neutral revoke handler, using the
+            // role name as grantee, then re-encode its `DdlResult` / `DdlError`
+            // back to pgwire `Response` — byte-identical to the previous direct
+            // call.
+            crate::control::server::pgwire::ddl_encode::ddl_results_to_pgwire(
+                crate::control::server::shared::ddl::neutral::grant::permission::revoke_permission(
+                    state,
+                    identity,
+                    std::slice::from_ref(permission),
+                    target_type,
+                    target_name,
+                    role_name,
+                ),
             )
         }
 

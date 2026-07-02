@@ -17,11 +17,6 @@ use crate::control::server::pgwire::ddl::change_stream::alter_change_stream;
 use crate::control::server::pgwire::ddl::cluster::alter_raft_group;
 use crate::control::server::pgwire::ddl::collection::drop_collection;
 use crate::control::server::pgwire::ddl::consumer_group::create_consumer_group;
-use crate::control::server::pgwire::ddl::grant::database_permission::{
-    grant_database, revoke_database,
-};
-use crate::control::server::pgwire::ddl::grant::permission::{grant_permission, revoke_permission};
-use crate::control::server::pgwire::ddl::grant::role::{grant_role, revoke_role};
 use crate::control::server::pgwire::ddl::inspect::show_permissions;
 use crate::control::server::pgwire::ddl::retention_policy::alter_retention_policy;
 use crate::control::server::pgwire::ddl::role::alter_role_typed;
@@ -68,14 +63,6 @@ pub(super) fn try_dispatch_sync(
             *cascade_force,
         )),
 
-        NodedbStatement::Auth(AuthStmt::GrantRole { roles, grantee }) => {
-            Some(grant_role(state, identity, roles, grantee))
-        }
-
-        NodedbStatement::Auth(AuthStmt::RevokeRole { roles, grantee }) => {
-            Some(revoke_role(state, identity, roles, grantee))
-        }
-
         NodedbStatement::Automation(AutomationStmt::AlterAlert { name, action }) => {
             Some(alter_alert(state, identity, database_id, name, action))
         }
@@ -115,50 +102,6 @@ pub(super) fn try_dispatch_sync(
             action,
             node_id,
         }) => Some(alter_raft_group(state, identity, group_id, action, node_id)),
-
-        NodedbStatement::Auth(AuthStmt::GrantPermission {
-            permissions,
-            target_type,
-            target_name,
-            grantee,
-        }) => Some(grant_permission(
-            state,
-            identity,
-            permissions,
-            target_type,
-            target_name,
-            grantee,
-        )),
-
-        NodedbStatement::Auth(AuthStmt::GrantDatabasePermission {
-            permission,
-            db_name,
-            grantee,
-        }) => Some(grant_database(
-            state, identity, permission, db_name, grantee,
-        )),
-
-        NodedbStatement::Auth(AuthStmt::RevokePermission {
-            permissions,
-            target_type,
-            target_name,
-            grantee,
-        }) => Some(revoke_permission(
-            state,
-            identity,
-            permissions,
-            target_type,
-            target_name,
-            grantee,
-        )),
-
-        NodedbStatement::Auth(AuthStmt::RevokeDatabasePermission {
-            permission,
-            db_name,
-            grantee,
-        }) => Some(revoke_database(
-            state, identity, permission, db_name, grantee,
-        )),
 
         NodedbStatement::Automation(AutomationStmt::AlterSchedule {
             name,

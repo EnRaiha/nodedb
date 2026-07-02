@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `GRANT/REVOKE <perm> ON <object> TO/FROM <grantee>` handlers.
+//! Protocol-neutral `GRANT/REVOKE <perm> ON <object> TO/FROM <grantee>`
+//! handlers.
 //!
-//! Migrated to `CatalogEntry::{PutPermission, DeletePermission}`
-//! in phase 1l.6.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Ported from the pgwire `ddl::grant::permission` handlers. All non-return
+//! logic (grantee canonicalization, target resolution incl. the cross-tenant
+//! superuser gate, `ALL` expansion, tenant-admin gate, `prepare_permission`,
+//! catalog propose + single-node fallback, `install_replicated_permission` /
+//! `install_replicated_revoke`, and `audit_record`) is preserved verbatim;
+//! only the result construction changed from pgwire `Response` / `PgWireError`
+//! to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//!
+//! Proposes `CatalogEntry::{PutPermission, DeletePermission}` so every
+//! follower's `PermissionStore` and `OWNERS` redb stay in sync.
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
@@ -18,13 +24,14 @@ use crate::control::security::permission::{
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::{require_tenant_admin, status};
 
 /// Resolve a raw grantee token from the AST into its canonical grant-store
 /// form: `user:<name>` for users, the bare role name for roles. Rejects
 /// names that resolve to neither, so unresolved typos don't sink into the
 /// store as silently unenforceable rows.
-fn canonicalize_grantee(state: &SharedState, raw: &str) -> PgWireResult<String> {
+fn canonicalize_grantee(state: &SharedState, raw: &str) -> Result<String, DdlError> {
     if state.credentials.get_user(raw).is_some() {
         return Ok(format!("user:{raw}"));
     }
@@ -39,10 +46,10 @@ fn canonicalize_grantee(state: &SharedState, raw: &str) -> PgWireResult<String> 
     if is_known_role {
         return Ok(parsed.to_string());
     }
-    Err(sqlstate_error(
-        "42704",
-        &format!("grantee '{raw}' is neither a user nor a role"),
-    ))
+    Err(DdlError {
+        sqlstate: "42704".to_string(),
+        message: format!("grantee '{raw}' is neither a user nor a role"),
+    })
 }
 
 fn propose_grant(
@@ -51,18 +58,21 @@ fn propose_grant(
     grantee: &str,
     perm: Permission,
     granted_by: &str,
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     let stored = state
         .permissions
         .prepare_permission(target, grantee, perm, granted_by);
     let entry = CatalogEntry::PutPermission(Box::new(stored.clone()));
-    let log_index = propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("metadata propose: {e}")))?;
+    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("metadata propose: {e}"),
+    })?;
     if log_index == 0 {
         if let Some(catalog) = state.credentials.catalog() {
-            catalog
-                .put_permission(&stored)
-                .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+            catalog.put_permission(&stored).map_err(|e| DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("catalog write: {e}"),
+            })?;
         }
         state.permissions.install_replicated_permission(&stored);
     }
@@ -74,20 +84,25 @@ fn propose_revoke(
     target: &str,
     grantee: &str,
     perm: Permission,
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     let perm_str = format_permission(perm);
     let entry = CatalogEntry::DeletePermission {
         target: target.to_string(),
         grantee: grantee.to_string(),
         permission: perm_str.clone(),
     };
-    let log_index = propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("metadata propose: {e}")))?;
+    let log_index = propose_catalog_entry(state, &entry).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("metadata propose: {e}"),
+    })?;
     if log_index == 0 {
         if let Some(catalog) = state.credentials.catalog() {
             catalog
                 .delete_permission(target, grantee, &perm_str)
-                .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+                .map_err(|e| DdlError {
+                    sqlstate: "XX000".to_string(),
+                    message: format!("catalog write: {e}"),
+                })?;
         }
         state
             .permissions
@@ -100,24 +115,26 @@ fn propose_revoke(
 ///
 /// A token that parses as an integer is taken as a literal tenant id;
 /// otherwise the catalog is consulted for a tenant with a matching name.
-fn resolve_tenant_id(state: &SharedState, name: &str) -> PgWireResult<TenantId> {
+fn resolve_tenant_id(state: &SharedState, name: &str) -> Result<TenantId, DdlError> {
     if let Ok(id) = name.parse::<u64>() {
         return Ok(TenantId::new(id));
     }
-    let catalog = state.credentials.catalog().as_ref().ok_or_else(|| {
-        sqlstate_error(
-            "XX000",
-            "tenant catalog unavailable — cannot resolve tenant name",
-        )
+    let catalog = state.credentials.catalog().as_ref().ok_or(DdlError {
+        sqlstate: "XX000".to_string(),
+        message: "tenant catalog unavailable — cannot resolve tenant name".to_string(),
     })?;
-    let tenants = catalog
-        .load_all_tenants()
-        .map_err(|e| sqlstate_error("XX000", &format!("tenant lookup: {e}")))?;
+    let tenants = catalog.load_all_tenants().map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("tenant lookup: {e}"),
+    })?;
     tenants
         .into_iter()
         .find(|t| t.name.eq_ignore_ascii_case(name))
         .map(|t| TenantId::new(t.tenant_id))
-        .ok_or_else(|| sqlstate_error("42704", &format!("tenant '{name}' does not exist")))
+        .ok_or_else(|| DdlError {
+            sqlstate: "42704".to_string(),
+            message: format!("tenant '{name}' does not exist"),
+        })
 }
 
 /// Resolve a `(target_type, target_name)` pair into the canonical grant
@@ -130,7 +147,7 @@ fn resolve_target(
     identity: &AuthenticatedIdentity,
     target_type: &str,
     target_name: &str,
-) -> PgWireResult<(String, String)> {
+) -> Result<(String, String), DdlError> {
     if target_type.eq_ignore_ascii_case("FUNCTION") {
         let name = target_name.to_lowercase();
         Ok((
@@ -148,10 +165,12 @@ fn resolve_target(
         // A tenant admin may only manage grants within their own tenant;
         // granting across tenant boundaries requires superuser.
         if tenant_id != identity.tenant_id && !identity.is_superuser {
-            return Err(sqlstate_error(
-                "42501",
-                "permission denied: managing permissions on another tenant requires superuser",
-            ));
+            return Err(DdlError {
+                sqlstate: "42501".to_string(),
+                message:
+                    "permission denied: managing permissions on another tenant requires superuser"
+                        .to_string(),
+            });
         }
         Ok((tenant_target(tenant_id), format!("tenant '{target_name}'")))
     } else {
@@ -164,7 +183,7 @@ fn resolve_target(
 
 /// Resolve a list of permission tokens into concrete `Permission` values,
 /// expanding `ALL`. Returns a typed error for any unknown token.
-fn resolve_permissions(permissions: &[String]) -> PgWireResult<Vec<Permission>> {
+fn resolve_permissions(permissions: &[String]) -> Result<Vec<Permission>, DdlError> {
     let mut out = Vec::new();
     for p in permissions {
         if p.eq_ignore_ascii_case("ALL") {
@@ -176,8 +195,10 @@ fn resolve_permissions(permissions: &[String]) -> PgWireResult<Vec<Permission>> 
                 Permission::Alter,
             ]);
         } else {
-            let perm = parse_permission(p)
-                .ok_or_else(|| sqlstate_error("42601", &format!("unknown permission: {p}")))?;
+            let perm = parse_permission(p).ok_or_else(|| DdlError {
+                sqlstate: "42601".to_string(),
+                message: format!("unknown permission: {p}"),
+            })?;
             out.push(perm);
         }
     }
@@ -194,7 +215,7 @@ pub fn grant_permission(
     target_type: &str,
     target_name: &str,
     grantee: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (target, object_desc) = resolve_target(state, identity, target_type, target_name)?;
 
     require_tenant_admin(identity, "grant permissions")?;
@@ -216,7 +237,7 @@ pub fn grant_permission(
         ),
     );
 
-    Ok(vec![Response::Execution(Tag::new("GRANT"))])
+    Ok(status("GRANT"))
 }
 
 /// `REVOKE <perm>[, ...] ON <collection|FUNCTION|PROCEDURE|TENANT name> FROM <grantee>`
@@ -229,7 +250,7 @@ pub fn revoke_permission(
     target_type: &str,
     target_name: &str,
     grantee: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (target, object_desc) = resolve_target(state, identity, target_type, target_name)?;
 
     require_tenant_admin(identity, "revoke permissions")?;
@@ -251,5 +272,5 @@ pub fn revoke_permission(
         ),
     );
 
-    Ok(vec![Response::Execution(Tag::new("REVOKE"))])
+    Ok(status("REVOKE"))
 }
