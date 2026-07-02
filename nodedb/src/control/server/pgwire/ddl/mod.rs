@@ -6,7 +6,6 @@ pub mod auth_user_ddl;
 pub mod blacklist_ddl;
 pub mod bulk;
 pub mod catalog_propose;
-pub mod cluster;
 pub mod collection;
 pub mod conflict_policy;
 pub mod convert;

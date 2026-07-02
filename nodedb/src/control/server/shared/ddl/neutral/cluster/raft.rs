@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Raft group DDL commands: SHOW RAFT GROUPS, SHOW RAFT GROUP, ALTER RAFT GROUP.
+//! Protocol-neutral raft group DDL commands: SHOW RAFT GROUPS, SHOW RAFT
+//! GROUP, ALTER RAFT GROUP.
+//!
+//! Ported from the pgwire `ddl::cluster::raft` handlers. The raft-status /
+//! routing reads and the `ALTER RAFT GROUP` `ConfChange` propose are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `QueryResponse` to the protocol-neutral `DdlResult` over
+//! `ShapedRows`.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
-use super::super::super::types::{int8_field, sqlstate_error, text_field};
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::ddl_err;
 
 /// SHOW RAFT GROUPS — list all Raft groups with leader, term, and status.
 ///
@@ -19,9 +24,9 @@ use super::super::super::types::{int8_field, sqlstate_error, text_field};
 pub fn show_raft_groups(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can view raft groups",
         ));
@@ -30,7 +35,7 @@ pub fn show_raft_groups(
     let status_fn = match state.raft_status_fn.get() {
         Some(f) => f,
         None => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "55000",
                 "cluster mode not enabled (single-node instance)",
             ));
@@ -39,36 +44,68 @@ pub fn show_raft_groups(
 
     let statuses = status_fn();
 
-    let schema = Arc::new(vec![
-        int8_field("group_id"),
-        text_field("role"),
-        int8_field("leader_id"),
-        int8_field("term"),
-        int8_field("commit_index"),
-        int8_field("last_applied"),
-        int8_field("members"),
-        int8_field("vshards"),
-    ]);
+    let columns = vec![
+        "group_id".to_string(),
+        "role".to_string(),
+        "leader_id".to_string(),
+        "term".to_string(),
+        "commit_index".to_string(),
+        "last_applied".to_string(),
+        "members".to_string(),
+        "vshards".to_string(),
+    ];
+    let column_types = vec![
+        DdlColType::Int8,
+        DdlColType::Text,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Int8,
+    ];
 
     let mut rows = Vec::new();
-    let mut encoder = DataRowEncoder::new(schema.clone());
-
     for s in &statuses {
-        encoder.encode_field(&(s.group_id as i64))?;
-        encoder.encode_field(&s.role)?;
-        encoder.encode_field(&(s.leader_id as i64))?;
-        encoder.encode_field(&(s.term as i64))?;
-        encoder.encode_field(&(s.commit_index as i64))?;
-        encoder.encode_field(&(s.last_applied as i64))?;
-        encoder.encode_field(&(s.member_count as i64))?;
-        encoder.encode_field(&(s.vshard_count as i64))?;
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert(
+            "group_id".to_string(),
+            JsonValue::String((s.group_id as i64).to_string()),
+        );
+        row.insert("role".to_string(), JsonValue::String(s.role.clone()));
+        row.insert(
+            "leader_id".to_string(),
+            JsonValue::String((s.leader_id as i64).to_string()),
+        );
+        row.insert(
+            "term".to_string(),
+            JsonValue::String((s.term as i64).to_string()),
+        );
+        row.insert(
+            "commit_index".to_string(),
+            JsonValue::String((s.commit_index as i64).to_string()),
+        );
+        row.insert(
+            "last_applied".to_string(),
+            JsonValue::String((s.last_applied as i64).to_string()),
+        );
+        row.insert(
+            "members".to_string(),
+            JsonValue::String((s.member_count as i64).to_string()),
+        );
+        row.insert(
+            "vshards".to_string(),
+            JsonValue::String((s.vshard_count as i64).to_string()),
+        );
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
 
 /// SHOW RAFT GROUP <id> — detailed info for a specific Raft group.
@@ -78,29 +115,26 @@ pub fn show_raft_group(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can inspect raft groups",
         ));
     }
 
     if parts.len() < 4 {
-        return Err(sqlstate_error(
-            "42601",
-            "syntax: SHOW RAFT GROUP <group_id>",
-        ));
+        return Err(ddl_err("42601", "syntax: SHOW RAFT GROUP <group_id>"));
     }
 
     let group_id: u64 = parts[3]
         .parse()
-        .map_err(|_| sqlstate_error("42601", &format!("invalid group_id: '{}'", parts[3])))?;
+        .map_err(|_| ddl_err("42601", format!("invalid group_id: '{}'", parts[3])))?;
 
     let status_fn = match state.raft_status_fn.get() {
         Some(f) => f,
         None => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "55000",
                 "cluster mode not enabled (single-node instance)",
             ));
@@ -111,16 +145,15 @@ pub fn show_raft_group(
     let group = match statuses.iter().find(|s| s.group_id == group_id) {
         Some(g) => g,
         None => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42704",
-                &format!("raft group {group_id} not found on this node"),
+                format!("raft group {group_id} not found on this node"),
             ));
         }
     };
 
-    let schema = Arc::new(vec![text_field("property"), text_field("value")]);
-    let mut rows = Vec::new();
-    let mut encoder = DataRowEncoder::new(schema.clone());
+    let columns = vec!["property".to_string(), "value".to_string()];
+    let column_types = vec![DdlColType::Text, DdlColType::Text];
 
     let props = [
         ("group_id", group.group_id.to_string()),
@@ -153,21 +186,29 @@ pub fn show_raft_group(
         }
     }
 
+    let mut rows = Vec::new();
     for (key, value) in &props {
-        encoder.encode_field(key)?;
-        encoder.encode_field(value)?;
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert(
+            "property".to_string(),
+            JsonValue::String((*key).to_string()),
+        );
+        row.insert("value".to_string(), JsonValue::String(value.clone()));
+        rows.push(row);
     }
     for (key, value) in &extra_props {
-        encoder.encode_field(key)?;
-        encoder.encode_field(value)?;
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert("property".to_string(), JsonValue::String(key.clone()));
+        row.insert("value".to_string(), JsonValue::String(value.clone()));
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
 
 /// ALTER RAFT GROUP <id> ADD|REMOVE NODE <node_id>
@@ -182,9 +223,9 @@ pub fn alter_raft_group(
     group_id_str: &str,
     action: &str,
     node_id_str: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can alter raft groups",
         ));
@@ -192,20 +233,20 @@ pub fn alter_raft_group(
 
     let group_id: u64 = group_id_str
         .parse()
-        .map_err(|_| sqlstate_error("42601", &format!("invalid group_id: '{group_id_str}'")))?;
+        .map_err(|_| ddl_err("42601", format!("invalid group_id: '{group_id_str}'")))?;
 
     let action = action.to_uppercase();
     let node_id: u64 = node_id_str
         .parse()
-        .map_err(|_| sqlstate_error("42601", &format!("invalid node_id: '{node_id_str}'")))?;
+        .map_err(|_| ddl_err("42601", format!("invalid node_id: '{node_id_str}'")))?;
 
     let change_type = match action.as_str() {
         "ADD" => nodedb_cluster::ConfChangeType::AddNode,
         "REMOVE" => nodedb_cluster::ConfChangeType::RemoveNode,
         _ => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42601",
-                &format!("expected ADD or REMOVE, got '{action}'"),
+                format!("expected ADD or REMOVE, got '{action}'"),
             ));
         }
     };
@@ -213,7 +254,7 @@ pub fn alter_raft_group(
     let proposer = match state.raft_proposer.get() {
         Some(p) => p,
         None => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "55000",
                 "cluster mode not enabled (single-node instance)",
             ));
@@ -226,29 +267,32 @@ pub fn alter_raft_group(
     };
     let data = change
         .to_entry_data()
-        .map_err(|e| sqlstate_error("XX000", &format!("conf_change encode: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("conf_change encode: {e}")))?;
 
     // Find a vShard that maps to this group to propose through Raft.
     let routing = match &state.cluster_routing {
         Some(r) => r,
         None => {
-            return Err(sqlstate_error("55000", "cluster routing not available"));
+            return Err(ddl_err("55000", "cluster routing not available"));
         }
     };
 
     let routing = routing.read().unwrap_or_else(|p| p.into_inner());
     let vshards = routing.vshards_for_group(group_id);
     if vshards.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42704",
-            &format!("raft group {group_id} has no vShards"),
+            format!("raft group {group_id} has no vShards"),
         ));
     }
     let vshard_id = vshards[0];
     drop(routing);
 
     match proposer(vshard_id, data) {
-        Ok((_gid, _idx)) => Ok(vec![Response::Execution(Tag::new("ALTER RAFT GROUP"))]),
-        Err(e) => Err(sqlstate_error("XX000", &format!("propose failed: {e}"))),
+        Ok((_gid, _idx)) => Ok(vec![DdlResult::Status {
+            command: "ALTER RAFT GROUP".to_string(),
+            rows_affected: None,
+        }]),
+        Err(e) => Err(ddl_err("XX000", format!("propose failed: {e}"))),
     }
 }

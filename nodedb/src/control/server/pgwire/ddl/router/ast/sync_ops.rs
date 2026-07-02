@@ -5,12 +5,9 @@
 use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
-use nodedb_sql::ddl_ast::statement::{
-    AuthStmt, ClusterStmt, CollectionStmt, DatabaseStmt, NodedbStatement,
-};
+use nodedb_sql::ddl_ast::statement::{AuthStmt, CollectionStmt, DatabaseStmt, NodedbStatement};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::cluster::alter_raft_group;
 use crate::control::server::pgwire::ddl::collection::drop_collection;
 use crate::control::server::pgwire::ddl::inspect::show_permissions;
 use crate::control::state::SharedState;
@@ -66,12 +63,6 @@ pub(super) fn try_dispatch_sync(
                 "use `COPY tenant_restore(<id>) FROM STDIN` to stream backup bytes from the client",
             )))
         }
-
-        NodedbStatement::Cluster(ClusterStmt::AlterRaftGroup {
-            group_id,
-            action,
-            node_id,
-        }) => Some(alter_raft_group(state, identity, group_id, action, node_id)),
 
         NodedbStatement::Auth(AuthStmt::ShowPermissions {
             on_collection,

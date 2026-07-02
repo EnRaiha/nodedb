@@ -1,27 +1,22 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Cluster topology DDL commands: SHOW NODES, SHOW NODE, REMOVE NODE, SHOW CLUSTER.
+//! Protocol-neutral cluster topology DDL commands: SHOW NODES, SHOW NODE,
+//! REMOVE NODE, SHOW CLUSTER.
+//!
+//! Ported from the pgwire `ddl::cluster::topology` handlers. The topology /
+//! routing / raft-status reads and the `REMOVE NODE` `set_state` side-effect
+//! are preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `QueryResponse` to the protocol-neutral `DdlResult` over
+//! `ShapedRows`.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
-use super::super::super::types::{int8_field, sqlstate_error, text_field};
-
-pub(super) fn node_state_str(state: nodedb_cluster::NodeState) -> &'static str {
-    match state {
-        nodedb_cluster::NodeState::Joining => "joining",
-        nodedb_cluster::NodeState::Active => "active",
-        nodedb_cluster::NodeState::Draining => "draining",
-        nodedb_cluster::NodeState::Learner => "learner",
-        nodedb_cluster::NodeState::Decommissioned => "decommissioned",
-    }
-}
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::{ddl_err, node_state_str};
 
 /// SHOW NODES — list all cluster members with state.
 ///
@@ -29,23 +24,28 @@ pub(super) fn node_state_str(state: nodedb_cluster::NodeState) -> &'static str {
 pub fn show_nodes(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can list nodes",
         ));
     }
 
-    let schema = Arc::new(vec![
-        int8_field("node_id"),
-        text_field("address"),
-        text_field("state"),
-        text_field("raft_groups"),
-    ]);
+    let columns = vec![
+        "node_id".to_string(),
+        "address".to_string(),
+        "state".to_string(),
+        "raft_groups".to_string(),
+    ];
+    let column_types = vec![
+        DdlColType::Int8,
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Text,
+    ];
 
     let mut rows = Vec::new();
-    let mut encoder = DataRowEncoder::new(schema.clone());
 
     match &state.cluster_topology {
         Some(t) => {
@@ -54,34 +54,50 @@ pub fn show_nodes(
             nodes.sort_by_key(|n| n.node_id);
 
             for node in nodes {
-                encoder.encode_field(&(node.node_id as i64))?;
-                encoder.encode_field(&node.addr)?;
-                let state_str = node_state_str(node.state);
-                encoder.encode_field(&state_str)?;
                 let groups_str: String = node
                     .raft_groups
                     .iter()
                     .map(|g| g.to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                encoder.encode_field(&groups_str)?;
-                rows.push(Ok(encoder.take_row()));
+
+                let mut row = Map::new();
+                row.insert(
+                    "node_id".to_string(),
+                    JsonValue::String((node.node_id as i64).to_string()),
+                );
+                row.insert("address".to_string(), JsonValue::String(node.addr.clone()));
+                row.insert(
+                    "state".to_string(),
+                    JsonValue::String(node_state_str(node.state).to_string()),
+                );
+                row.insert("raft_groups".to_string(), JsonValue::String(groups_str));
+                rows.push(row);
             }
         }
         None => {
             // Single-node mode: show this node as the only member.
-            encoder.encode_field(&(state.node_id as i64))?;
-            encoder.encode_field(&"local")?;
-            encoder.encode_field(&"active")?;
-            encoder.encode_field(&"")?;
-            rows.push(Ok(encoder.take_row()));
+            let mut row = Map::new();
+            row.insert(
+                "node_id".to_string(),
+                JsonValue::String((state.node_id as i64).to_string()),
+            );
+            row.insert(
+                "address".to_string(),
+                JsonValue::String("local".to_string()),
+            );
+            row.insert("state".to_string(), JsonValue::String("active".to_string()));
+            row.insert("raft_groups".to_string(), JsonValue::String(String::new()));
+            rows.push(row);
         }
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
 
 /// SHOW NODE <node_id> — detailed info for a specific node.
@@ -91,25 +107,24 @@ pub fn show_node(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can inspect nodes",
         ));
     }
 
     if parts.len() < 3 {
-        return Err(sqlstate_error("42601", "syntax: SHOW NODE <node_id>"));
+        return Err(ddl_err("42601", "syntax: SHOW NODE <node_id>"));
     }
 
     let node_id: u64 = parts[2]
         .parse()
-        .map_err(|_| sqlstate_error("42601", &format!("invalid node_id: '{}'", parts[2])))?;
+        .map_err(|_| ddl_err("42601", format!("invalid node_id: '{}'", parts[2])))?;
 
-    let schema = Arc::new(vec![text_field("property"), text_field("value")]);
-    let mut rows = Vec::new();
-    let mut encoder = DataRowEncoder::new(schema.clone());
+    let columns = vec!["property".to_string(), "value".to_string()];
+    let column_types = vec![DdlColType::Text, DdlColType::Text];
 
     let props = match &state.cluster_topology {
         Some(t) => {
@@ -117,9 +132,9 @@ pub fn show_node(
             let node = match topo.get_node(node_id) {
                 Some(n) => n,
                 None => {
-                    return Err(sqlstate_error(
+                    return Err(ddl_err(
                         "42704",
-                        &format!("node {node_id} not found in cluster topology"),
+                        format!("node {node_id} not found in cluster topology"),
                     ));
                 }
             };
@@ -140,9 +155,9 @@ pub fn show_node(
         None => {
             // Single-node mode: show self info if node_id matches.
             if node_id != state.node_id {
-                return Err(sqlstate_error(
+                return Err(ddl_err(
                     "42704",
-                    &format!(
+                    format!(
                         "node {node_id} not found (single-node instance, this node is {})",
                         state.node_id
                     ),
@@ -159,16 +174,20 @@ pub fn show_node(
         }
     };
 
+    let mut rows = Vec::new();
     for (key, value) in &props {
-        encoder.encode_field(key)?;
-        encoder.encode_field(value)?;
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert("property".to_string(), JsonValue::String(key.clone()));
+        row.insert("value".to_string(), JsonValue::String(value.clone()));
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
 
 /// REMOVE NODE <node_id> — mark a node as decommissioned.
@@ -178,26 +197,26 @@ pub fn remove_node(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can remove nodes",
         ));
     }
 
     if parts.len() < 3 {
-        return Err(sqlstate_error("42601", "syntax: REMOVE NODE <node_id>"));
+        return Err(ddl_err("42601", "syntax: REMOVE NODE <node_id>"));
     }
 
     let node_id: u64 = parts[2]
         .parse()
-        .map_err(|_| sqlstate_error("42601", &format!("invalid node_id: '{}'", parts[2])))?;
+        .map_err(|_| ddl_err("42601", format!("invalid node_id: '{}'", parts[2])))?;
 
     let topo = match &state.cluster_topology {
         Some(t) => t,
         None => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "55000",
                 "cluster mode not enabled (single-node instance)",
             ));
@@ -207,15 +226,18 @@ pub fn remove_node(
     let mut topo = topo.write().unwrap_or_else(|p| p.into_inner());
 
     if !topo.contains(node_id) {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42704",
-            &format!("node {node_id} not found in cluster topology"),
+            format!("node {node_id} not found in cluster topology"),
         ));
     }
 
     topo.set_state(node_id, nodedb_cluster::NodeState::Decommissioned);
 
-    Ok(vec![Response::Execution(Tag::new("REMOVE NODE"))])
+    Ok(vec![DdlResult::Status {
+        command: "REMOVE NODE".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// SHOW CLUSTER — cluster overview.
@@ -224,17 +246,16 @@ pub fn remove_node(
 pub fn show_cluster(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can view cluster status",
         ));
     }
 
-    let schema = Arc::new(vec![text_field("property"), text_field("value")]);
-    let mut rows = Vec::new();
-    let mut encoder = DataRowEncoder::new(schema.clone());
+    let columns = vec!["property".to_string(), "value".to_string()];
+    let column_types = vec![DdlColType::Text, DdlColType::Text];
 
     let mut props = vec![("node_id", state.node_id.to_string())];
 
@@ -260,14 +281,21 @@ pub fn show_cluster(
         props.push(("groups_following", (statuses.len() - leaders).to_string()));
     }
 
+    let mut rows = Vec::new();
     for (key, value) in &props {
-        encoder.encode_field(key)?;
-        encoder.encode_field(value)?;
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert(
+            "property".to_string(),
+            JsonValue::String((*key).to_string()),
+        );
+        row.insert("value".to_string(), JsonValue::String(value.clone()));
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }

@@ -7,7 +7,8 @@
 //! parent [`super::super::dispatch`] handles it.
 
 use nodedb_sql::ddl_ast::statement::{
-    AuthStmt, AutomationStmt, CollectionStmt, NodedbStatement, PolicyStmt, StreamViewStmt,
+    AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, NodedbStatement, PolicyStmt,
+    StreamViewStmt,
 };
 
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -17,6 +18,7 @@ use crate::types::DatabaseId;
 use super::super::result::{DdlError, DdlResult};
 use super::alert::{self, CreateAlertRequest};
 use super::change_stream;
+use super::cluster;
 use super::constraint;
 use super::consumer_group;
 use super::continuous_agg;
@@ -360,6 +362,57 @@ pub async fn try_dispatch(
     }
     if upper == "SHOW COMPACTION STATUS" || upper.starts_with("SHOW COMPACTION STATUS ") {
         return Some(maintenance::handle_show_compaction_status(state, identity));
+    }
+
+    // Cluster management & observability: SHOW CLUSTER, SHOW RAFT GROUPS,
+    // SHOW RAFT GROUP <id>, SHOW MIGRATIONS, REBALANCE, SHOW PEER HEALTH,
+    // SHOW NODES, SHOW NODE <id>, REMOVE NODE <id>, SHOW RANGES, SHOW
+    // ROUTING, SHOW SCHEMA VERSION. All of these parse into typed
+    // `ClusterStmt` variants, but the pgwire admin router dispatched them by
+    // string prefix from the raw SQL / token slice (the pgwire typed-AST path
+    // only had an arm for `ALTER RAFT GROUP`). Replicate that exactly here,
+    // before the parse gate, so the prefix recognition (order matters: `SHOW
+    // RAFT GROUPS` before `SHOW RAFT GROUP `) and the `parts`-based
+    // extraction stay byte-identical. `ALTER RAFT GROUP` is dispatched via
+    // the typed match below, exactly as the pgwire router did.
+    if upper.starts_with("SHOW CLUSTER") {
+        return Some(cluster::show_cluster(state, identity));
+    }
+    if upper.starts_with("SHOW RAFT GROUPS") {
+        return Some(cluster::show_raft_groups(state, identity));
+    }
+    if upper.starts_with("SHOW RAFT GROUP ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(cluster::show_raft_group(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW MIGRATIONS") {
+        return Some(cluster::show_migrations(state, identity));
+    }
+    if upper.starts_with("REBALANCE") {
+        return Some(cluster::rebalance(state, identity));
+    }
+    if upper.starts_with("SHOW PEER HEALTH") {
+        return Some(cluster::show_peer_health(state, identity));
+    }
+    if upper.starts_with("SHOW NODES") {
+        return Some(cluster::show_nodes(state, identity));
+    }
+    if upper.starts_with("SHOW NODE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(cluster::show_node(state, identity, &parts));
+    }
+    if upper.starts_with("REMOVE NODE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(cluster::remove_node(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW RANGES") {
+        return Some(cluster::show_ranges(state, identity));
+    }
+    if upper.starts_with("SHOW ROUTING") {
+        return Some(cluster::show_routing(state, identity));
+    }
+    if upper.starts_with("SHOW SCHEMA VERSION") {
+        return Some(cluster::show_schema_version(state, identity));
     }
 
     // Vector index lifecycle: SHOW VECTOR INDEX / ALTER VECTOR INDEX. None of
@@ -1113,6 +1166,14 @@ pub async fn try_dispatch(
         NodedbStatement::Policy(PolicyStmt::ShowSynonymGroups) => {
             Some(synonym_group::show_synonym_groups(state, identity))
         }
+
+        NodedbStatement::Cluster(ClusterStmt::AlterRaftGroup {
+            group_id,
+            action,
+            node_id,
+        }) => Some(cluster::alter_raft_group(
+            state, identity, group_id, action, node_id,
+        )),
 
         _ => None,
     }

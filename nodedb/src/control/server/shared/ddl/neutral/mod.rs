@@ -10,6 +10,7 @@
 pub mod alert;
 mod auth_support;
 pub mod change_stream;
+pub mod cluster;
 pub mod constraint;
 pub mod consumer_group;
 pub mod continuous_agg;

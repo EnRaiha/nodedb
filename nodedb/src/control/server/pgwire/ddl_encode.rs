@@ -93,14 +93,33 @@ fn rows_to_response(shaped: ShapedRows) -> PgWireResult<Response> {
         Vec::with_capacity(rows.len());
     for row in &rows {
         let mut encoder = DataRowEncoder::new(schema.clone());
-        for name in &columns {
+        for (idx, name) in columns.iter().enumerate() {
+            let ct = column_types.get(idx).copied().unwrap_or(DdlColType::Text);
             match row.get(name) {
-                // Captured text: re-emit verbatim so the DataRow bytes match.
+                // Captured text (the transitional wrapper path, and text-typed
+                // migrated cells): re-emit verbatim so the DataRow bytes match.
                 Some(JsonValue::String(s)) => encoder.encode_field(&s)?,
                 // Explicit NULL (or absent key) → -1 length field.
                 Some(JsonValue::Null) | None => encoder.encode_field(&None::<&str>)?,
-                // Defensive: the transitional wrapper emits only String/Null,
-                // but any other scalar is rendered to its text form.
+                // A migrated handler may carry a numeric cell typed rather than
+                // pre-rendered. Float columns MUST be encoded through pgwire's
+                // native float path (ryu + extra_float_digits) so the text
+                // bytes match what the original handler's `encode_field(&f64)`
+                // produced — string pre-rendering (`f64::to_string`) diverges
+                // (e.g. `0.0` → "0" vs "0.0"). Integer/other numerics render to
+                // the same decimal text either way.
+                Some(JsonValue::Number(n)) => match ct {
+                    DdlColType::Float8 => match n.as_f64() {
+                        Some(f) => encoder.encode_field(&f)?,
+                        None => encoder.encode_field(&None::<f64>)?,
+                    },
+                    DdlColType::Float4 => match n.as_f64() {
+                        Some(f) => encoder.encode_field(&(f as f32))?,
+                        None => encoder.encode_field(&None::<f32>)?,
+                    },
+                    _ => encoder.encode_field(&n.to_string())?,
+                },
+                // Defensive: any other scalar rendered to its text form.
                 Some(other) => encoder.encode_field(&other.to_string())?,
             }
         }

@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-pub mod health;
-pub mod migration;
-pub mod raft;
-pub mod ranges;
-pub mod rebalance_cmd;
-pub mod routing_hint;
-pub mod schema_version;
-pub mod topology;
+//! Protocol-neutral cluster DDL family: SHOW CLUSTER / SHOW NODES / SHOW
+//! NODE / REMOVE NODE, SHOW RAFT GROUPS / SHOW RAFT GROUP / ALTER RAFT
+//! GROUP, SHOW MIGRATIONS, REBALANCE, SHOW PEER HEALTH, SHOW RANGES, SHOW
+//! ROUTING, SHOW SCHEMA VERSION.
+
+mod health;
+mod migration;
+mod raft;
+mod ranges;
+mod rebalance_cmd;
+mod routing_hint;
+mod schema_version;
+mod support;
+mod topology;
 
 pub use health::show_peer_health;
 pub use migration::show_migrations;

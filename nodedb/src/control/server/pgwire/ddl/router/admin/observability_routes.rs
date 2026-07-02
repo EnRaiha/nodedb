@@ -41,58 +41,9 @@ pub(super) fn dispatch(
         ));
     }
 
-    // Cluster management & observability.
-    if upper.starts_with("SHOW CLUSTER") {
-        return Some(super::super::super::cluster::show_cluster(state, identity));
-    }
-    if upper.starts_with("SHOW RAFT GROUPS") {
-        return Some(super::super::super::cluster::show_raft_groups(
-            state, identity,
-        ));
-    }
-    if upper.starts_with("SHOW RAFT GROUP ") {
-        return Some(super::super::super::cluster::show_raft_group(
-            state, identity, parts,
-        ));
-    }
-    // ALTER RAFT GROUP is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("SHOW MIGRATIONS") {
-        return Some(super::super::super::cluster::show_migrations(
-            state, identity,
-        ));
-    }
-    if upper.starts_with("REBALANCE") {
-        return Some(super::super::super::cluster::rebalance(state, identity));
-    }
-    if upper.starts_with("SHOW PEER HEALTH") {
-        return Some(super::super::super::cluster::show_peer_health(
-            state, identity,
-        ));
-    }
-    if upper.starts_with("SHOW NODES") {
-        return Some(super::super::super::cluster::show_nodes(state, identity));
-    }
-    if upper.starts_with("SHOW NODE ") {
-        return Some(super::super::super::cluster::show_node(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("REMOVE NODE ") {
-        return Some(super::super::super::cluster::remove_node(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW RANGES") {
-        return Some(super::super::super::cluster::show_ranges(state, identity));
-    }
-    if upper.starts_with("SHOW ROUTING") {
-        return Some(super::super::super::cluster::show_routing(state, identity));
-    }
-    if upper.starts_with("SHOW SCHEMA VERSION") {
-        return Some(super::super::super::cluster::show_schema_version(
-            state, identity,
-        ));
-    }
+    // Cluster management & observability DDL has been migrated to the
+    // protocol-neutral router (`shared::ddl::neutral::cluster`), which is
+    // tried before this transitional pgwire delegation runs.
 
     // Introspection.
     if upper.starts_with("SHOW USERS") {
