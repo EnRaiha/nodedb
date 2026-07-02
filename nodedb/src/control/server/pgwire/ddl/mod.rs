@@ -15,8 +15,6 @@ pub mod emergency_ddl;
 pub mod explain_ddl;
 pub mod field_def;
 pub mod impersonation_ddl;
-pub mod inspect;
-pub mod inspect_audit;
 pub mod match_ops;
 pub mod metering_ddl;
 pub mod observability;

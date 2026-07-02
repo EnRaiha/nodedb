@@ -19,6 +19,8 @@ pub mod dsl;
 pub mod function;
 pub mod grant;
 pub mod graph_ops;
+pub mod inspect;
+pub mod inspect_audit;
 pub mod kv_atomic;
 pub mod kv_sorted_index;
 pub mod last_value;

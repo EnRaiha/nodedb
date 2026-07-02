@@ -45,20 +45,9 @@ pub(super) fn dispatch(
     // protocol-neutral router (`shared::ddl::neutral::cluster`), which is
     // tried before this transitional pgwire delegation runs.
 
-    // Introspection.
-    if upper.starts_with("SHOW USERS") {
-        return Some(super::super::super::inspect::show_users(state, identity));
-    }
-    // Exact-match only. Filtered forms (`SHOW TENANTS WITH NAME <name>`,
-    // `SHOW TENANT <ident>`) are parsed into typed variants and routed
-    // through the AST dispatcher; a prefix match here would silently
-    // drop the filter and list every tenant.
-    if upper == "SHOW TENANTS" {
-        return Some(super::super::super::inspect::show_tenants(state, identity));
-    }
-    if upper == "SHOW ROLES" || upper.starts_with("SHOW ROLES ") {
-        return Some(super::super::super::inspect::show_roles(state, identity));
-    }
+    // Introspection (SHOW USERS / SHOW TENANTS / SHOW ROLES) has been migrated
+    // to the protocol-neutral router (`shared::ddl::neutral::inspect`), which is
+    // tried before this transitional pgwire delegation runs.
 
     // Administrative observability — server-wide counters, per-engine
     // memory budgets. `SHOW STATS` and `SHOW SERVER STATS` share a
@@ -85,9 +74,9 @@ pub(super) fn dispatch(
             state, identity,
         ));
     }
-    if upper.starts_with("SHOW SESSION") {
-        return Some(super::super::super::inspect::show_session(identity));
-    }
+    // SHOW SESSION has been migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::inspect`), which is tried before this transitional
+    // pgwire delegation runs.
     if upper.starts_with("TRUNCATE AUDIT")
         || upper.starts_with("DELETE AUDIT")
         || upper.starts_with("CLEAR AUDIT")
@@ -97,46 +86,10 @@ pub(super) fn dispatch(
             "audit log cannot be manually truncated. Entries are pruned automatically by the retention policy (audit_retention_days in config).",
         )));
     }
-    if upper.starts_with("EXPORT AUDIT") {
-        return Some(super::super::super::inspect::export_audit_log(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW AUDIT IN DATABASE") {
-        // SHOW AUDIT IN DATABASE <name> [LIMIT <n>]
-        // parts: ["SHOW", "AUDIT", "IN", "DATABASE", "<name>", ...]
-        let db_name = if parts.len() >= 5 {
-            parts[4]
-        } else {
-            return Some(Err(super::super::super::super::types::sqlstate_error(
-                "42601",
-                "syntax: SHOW AUDIT IN DATABASE <name> [LIMIT <n>]",
-            )));
-        };
-        let limit = if parts.len() >= 7 && parts[5].eq_ignore_ascii_case("LIMIT") {
-            parts[6].parse::<usize>().unwrap_or(100)
-        } else {
-            100
-        };
-        return Some(super::super::super::inspect::show_audit_in_database(
-            state, identity, db_name, limit,
-        ));
-    }
-    if upper.starts_with("SHOW AUDIT WHERE") {
-        return Some(super::super::super::inspect::show_audit_where(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW AUDIT LOG") || upper.starts_with("SHOW AUDIT_LOG") {
-        return Some(super::super::super::inspect::show_audit_log(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW GRANTS") {
-        return Some(super::super::super::inspect::show_grants(
-            state, identity, parts,
-        ));
-    }
+    // EXPORT AUDIT, SHOW AUDIT IN DATABASE / WHERE / LOG, and SHOW GRANTS have
+    // been migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::inspect` / `inspect_audit`), which is tried before
+    // this transitional pgwire delegation runs.
 
     None
 }

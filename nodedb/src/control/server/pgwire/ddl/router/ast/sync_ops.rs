@@ -5,11 +5,10 @@
 use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
-use nodedb_sql::ddl_ast::statement::{AuthStmt, CollectionStmt, DatabaseStmt, NodedbStatement};
+use nodedb_sql::ddl_ast::statement::{CollectionStmt, DatabaseStmt, NodedbStatement};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::ddl::collection::drop_collection;
-use crate::control::server::pgwire::ddl::inspect::show_permissions;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -64,16 +63,9 @@ pub(super) fn try_dispatch_sync(
             )))
         }
 
-        NodedbStatement::Auth(AuthStmt::ShowPermissions {
-            on_collection,
-            for_grantee,
-        }) => Some(show_permissions(
-            state,
-            identity,
-            on_collection.as_deref(),
-            for_grantee.as_deref(),
-        )),
-
+        // ShowPermissions has been migrated to the protocol-neutral router
+        // (`shared::ddl::neutral::inspect`), which is tried before this
+        // transitional pgwire delegation runs.
         _ => None,
     }
 }

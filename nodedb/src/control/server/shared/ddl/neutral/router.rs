@@ -7,8 +7,8 @@
 //! parent [`super::super::dispatch`] handles it.
 
 use nodedb_sql::ddl_ast::statement::{
-    AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, NodedbStatement, PolicyStmt,
-    StreamViewStmt,
+    AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, DatabaseStmt, NodedbStatement,
+    PolicyStmt, StreamViewStmt,
 };
 
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -27,6 +27,8 @@ use super::dsl;
 use super::function;
 use super::grant;
 use super::graph_ops;
+use super::inspect;
+use super::inspect_audit;
 use super::kv_atomic;
 use super::kv_sorted_index;
 use super::last_value;
@@ -667,6 +669,76 @@ pub async fn try_dispatch(
     if upper.starts_with("CRDT MERGE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(dsl::crdt_merge(state, identity, database_id, &parts).await);
+    }
+
+    // Administrative introspection & audit: SHOW USERS, SHOW TENANTS, SHOW
+    // ROLES, SHOW SESSION, EXPORT AUDIT, SHOW AUDIT IN DATABASE / WHERE / LOG,
+    // SHOW GRANTS. `SHOW USERS`, `SHOW GRANTS`, and `SHOW AUDIT…` parse into
+    // typed AST variants (`AuthStmt::ShowUsers` / `ShowGrants`,
+    // `MiscStmt::ShowAuditLog`) and bare `SHOW TENANTS` into
+    // `DatabaseStmt::ShowTenants`, but the pgwire typed-AST path has no arm for
+    // any of them — they fell through to the admin/observability string router,
+    // which dispatched them by prefix from the raw token slice. `SHOW ROLES`,
+    // `SHOW SESSION`, and `EXPORT AUDIT` parse into no typed DDL variant.
+    // Replicate the string dispatch exactly here, before the parse gate, so the
+    // prefix recognition and the `parts`-based extraction stay byte-identical.
+    // `SHOW SESSIONS` is excluded because the admin router claimed it (via the
+    // not-yet-migrated `session_ddl::show_sessions`) before the observability
+    // `SHOW SESSION` prefix ran; the guard preserves that ordering. The
+    // `TRUNCATE / DELETE / CLEAR AUDIT` guard stays on the transitional pgwire
+    // path — it is not one of the migrated inspect handlers.
+    if upper.starts_with("SHOW USERS") {
+        return Some(inspect::show_users(state, identity));
+    }
+    // Exact-match only. Filtered forms (`SHOW TENANTS WITH NAME <name>`,
+    // `SHOW TENANT <ident>`) are parsed into typed variants and routed through
+    // the typed match below; a prefix match here would silently drop the filter
+    // and list every tenant.
+    if upper == "SHOW TENANTS" {
+        return Some(inspect::show_tenants(state, identity));
+    }
+    if upper == "SHOW ROLES" || upper.starts_with("SHOW ROLES ") {
+        return Some(inspect::show_roles(state, identity));
+    }
+    if upper.starts_with("SHOW SESSION") && !upper.starts_with("SHOW SESSIONS") {
+        return Some(inspect::show_session(identity));
+    }
+    if upper.starts_with("EXPORT AUDIT") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(inspect_audit::export_audit_log(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW AUDIT IN DATABASE") {
+        // SHOW AUDIT IN DATABASE <name> [LIMIT <n>]
+        // parts: ["SHOW", "AUDIT", "IN", "DATABASE", "<name>", ...]
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let db_name = if parts.len() >= 5 {
+            parts[4]
+        } else {
+            return Some(Err(DdlError {
+                sqlstate: "42601".to_string(),
+                message: "syntax: SHOW AUDIT IN DATABASE <name> [LIMIT <n>]".to_string(),
+            }));
+        };
+        let limit = if parts.len() >= 7 && parts[5].eq_ignore_ascii_case("LIMIT") {
+            parts[6].parse::<usize>().unwrap_or(100)
+        } else {
+            100
+        };
+        return Some(inspect_audit::show_audit_in_database(
+            state, identity, db_name, limit,
+        ));
+    }
+    if upper.starts_with("SHOW AUDIT WHERE") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(inspect_audit::show_audit_where(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW AUDIT LOG") || upper.starts_with("SHOW AUDIT_LOG") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(inspect_audit::show_audit_log(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW GRANTS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(inspect::show_grants(state, identity, &parts));
     }
 
     // Parse errors → let the pgwire path run, which re-parses and reproduces the
@@ -1365,6 +1437,32 @@ pub async fn try_dispatch(
             node_id,
         }) => Some(cluster::alter_raft_group(
             state, identity, group_id, action, node_id,
+        )),
+
+        // Tenant introspection by identifier / name filter. These parse into
+        // typed `DatabaseStmt` variants and were dispatched from the pgwire
+        // typed-AST database router (`database_ops`). The credential / usage
+        // reads are preserved verbatim in `inspect`.
+        NodedbStatement::Database(DatabaseStmt::ShowTenantByIdentifier { ident }) => {
+            Some(inspect::show_tenant_by_identifier(state, identity, ident))
+        }
+
+        NodedbStatement::Database(DatabaseStmt::ShowTenantsFilteredByName { name }) => Some(
+            inspect::show_tenants_filtered_by_name(state, identity, name),
+        ),
+
+        // SHOW PERMISSIONS [ON <collection>] [FOR <grantee>]. Parses into a
+        // typed `AuthStmt::ShowPermissions` and was dispatched from the pgwire
+        // typed-AST sync router (`sync_ops`). The permission-store reads are
+        // preserved verbatim in `inspect`.
+        NodedbStatement::Auth(AuthStmt::ShowPermissions {
+            on_collection,
+            for_grantee,
+        }) => Some(inspect::show_permissions(
+            state,
+            identity,
+            on_collection.as_deref(),
+            for_grantee.as_deref(),
         )),
 
         _ => None,

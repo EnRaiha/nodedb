@@ -5,7 +5,8 @@
 mod common;
 
 use common::pgwire_auth_helpers::{ddl_ok, make_state, superuser};
-use nodedb::control::server::pgwire::ddl;
+use nodedb::control::server::shared::ddl;
+use nodedb::control::server::shared::ddl::result::DdlResult;
 
 #[tokio::test]
 async fn show_session() {
@@ -22,8 +23,8 @@ async fn show_session() {
     .unwrap();
 
     match &result[0] {
-        pgwire::api::results::Response::Query(_) => {}
-        other => panic!("expected Query response, got: {other:?}"),
+        DdlResult::Rows(_) => {}
+        other => panic!("expected Rows response, got: {other:?}"),
     }
 }
 
@@ -49,7 +50,7 @@ async fn show_grants() {
     .unwrap()
     .unwrap();
     match &result[0] {
-        pgwire::api::results::Response::Query(_) => {}
-        other => panic!("expected Query response, got: {other:?}"),
+        DdlResult::Rows(_) => {}
+        other => panic!("expected Rows response, got: {other:?}"),
     }
 }
