@@ -7,7 +7,7 @@
 //! parent [`super::super::dispatch`] handles it.
 
 use nodedb_sql::ddl_ast::statement::{
-    AuthStmt, AutomationStmt, CollectionStmt, NodedbStatement, PolicyStmt,
+    AuthStmt, AutomationStmt, CollectionStmt, NodedbStatement, PolicyStmt, StreamViewStmt,
 };
 
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -15,6 +15,7 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::result::{DdlError, DdlResult};
+use super::change_stream;
 use super::constraint;
 use super::function;
 use super::grant;
@@ -188,6 +189,16 @@ pub async fn try_dispatch(
         return Some(schedule::show_schedules(state, identity));
     }
 
+    // Change streams: `SHOW CHANGE STREAM(S)`. This parses into a typed
+    // `StreamViewStmt::ShowChangeStreams`, but the pgwire router dispatched it
+    // from the raw SQL by string prefix (the `SHOW CHANGE STREAM` prefix, which
+    // captures both the plural `SHOW CHANGE STREAMS` and the bare-singular
+    // input). Replicate that exactly here, before the parse gate, so the prefix
+    // recognition stays byte-identical.
+    if upper.starts_with("SHOW CHANGE STREAM") {
+        return Some(change_stream::show_change_streams(state, identity));
+    }
+
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,
     // which re-parses and reproduces the exact error handling for those inputs.
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
@@ -196,6 +207,39 @@ pub async fn try_dispatch(
     };
 
     match &stmt {
+        NodedbStatement::StreamView(StreamViewStmt::CreateChangeStream {
+            name,
+            collection,
+            with_clause_raw,
+        }) => Some(change_stream::create_change_stream(
+            state,
+            identity,
+            name,
+            collection,
+            with_clause_raw,
+        )),
+
+        NodedbStatement::StreamView(StreamViewStmt::AlterChangeStream { name, action }) => Some(
+            change_stream::alter_change_stream(state, identity, name, action),
+        ),
+
+        NodedbStatement::StreamView(StreamViewStmt::DropChangeStream { name, if_exists }) => {
+            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // non-existing change stream returns the tag before the token
+            // handler runs. The `if_exists: false` case and the existing-stream
+            // case fall through to `drop_change_stream`, which re-derives the
+            // name / IF EXISTS from `parts` exactly as the pgwire streaming
+            // string dispatch did.
+            if *if_exists && !change_stream::change_stream_exists(state, identity, name) {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "DROP CHANGE STREAM".to_string(),
+                    rows_affected: None,
+                }]));
+            }
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(change_stream::drop_change_stream(state, identity, &parts))
+        }
+
         NodedbStatement::Collection(CollectionStmt::CreateSequence {
             name,
             if_not_exists,

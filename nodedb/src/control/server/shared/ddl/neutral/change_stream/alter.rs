@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `ALTER CHANGE STREAM` DDL handler.
+//! Protocol-neutral `ALTER CHANGE STREAM` DDL handler.
+//!
+//! Ported from the pgwire `ddl::change_stream::alter` handler. The tenant-admin
+//! gate and the action matching are preserved verbatim; only the error
+//! construction changed from pgwire `PgWireError` to the protocol-neutral
+//! [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
@@ -14,13 +19,11 @@
 //! `ChangeStreamDef` which is not yet present; those actions return
 //! SQLSTATE 0A000 until that field is added.
 
-use pgwire::api::results::Response;
-use pgwire::error::PgWireResult;
-
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::require_tenant_admin;
 
 /// Handle `ALTER CHANGE STREAM <name> <action>`.
 ///
@@ -30,24 +33,24 @@ pub fn alter_change_stream(
     identity: &AuthenticatedIdentity,
     name: &str,
     action: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "alter change streams")?;
 
     match action {
-        "ENABLE" | "DISABLE" | "SUSPEND" | "RESUME" | "PAUSE" => Err(sqlstate_error(
-            "0A000",
-            &format!(
+        "ENABLE" | "DISABLE" | "SUSPEND" | "RESUME" | "PAUSE" => Err(DdlError {
+            sqlstate: "0A000".to_string(),
+            message: format!(
                 "ALTER CHANGE STREAM {name} {action} is not yet supported; \
                      stream pause/resume requires a schema migration to add the \
                      'paused' field to ChangeStreamDef"
             ),
-        )),
-        _ => Err(sqlstate_error(
-            "42601",
-            &format!(
+        }),
+        _ => Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: format!(
                 "unknown ALTER CHANGE STREAM action '{action}'; \
                  expected ENABLE, DISABLE, SUSPEND, or RESUME"
             ),
-        )),
+        }),
     }
 }

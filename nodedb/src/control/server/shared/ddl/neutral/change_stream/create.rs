@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `CREATE CHANGE STREAM` DDL handler.
+//! Protocol-neutral `CREATE CHANGE STREAM` DDL handler.
+//!
+//! Ported from the pgwire `ddl::change_stream::create` handler. All non-return
+//! logic (WITH-clause parsing, `ChangeStreamDef` build, `propose_and_apply` +
+//! `log_index == 0` local registry refresh, webhook / kafka task startup, and
+//! the `audit_record` call) is preserved verbatim; only the result construction
+//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
 //! CREATE CHANGE STREAM <name> ON <collection|*>
 //!   [WITH (FORMAT = 'json'|'msgpack', INCLUDE = 'INSERT,UPDATE,DELETE')]
 //! ```
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -18,7 +22,9 @@ use crate::event::cdc::stream_def::{
 };
 use crate::event::webhook::WebhookConfig;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::catalog::propose_and_apply;
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
 
 /// Handle `CREATE CHANGE STREAM <name> ON <collection> [WITH (...)]`
 ///
@@ -29,15 +35,16 @@ pub fn create_change_stream(
     name: &str,
     collection: &str,
     with_clause_raw: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create change streams")?;
 
     if state.event_plane_budget.should_reject_new_streams() {
-        return Err(sqlstate_error(
-            "53000",
-            "Event Plane memory budget exceeded — cannot create new change streams. \
-             Existing streams continue with reduced retention.",
-        ));
+        return Err(DdlError {
+            sqlstate: "53000".to_string(),
+            message: "Event Plane memory budget exceeded — cannot create new change streams. \
+             Existing streams continue with reduced retention."
+                .to_string(),
+        });
     }
 
     let tenant_id = identity.tenant_id.as_u64();
@@ -46,13 +53,16 @@ pub fn create_change_stream(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        })?;
 
     if let Ok(Some(_)) = catalog.get_change_stream(tenant_id, name) {
-        return Err(sqlstate_error(
-            "42710",
-            &format!("change stream '{name}' already exists"),
-        ));
+        return Err(DdlError {
+            sqlstate: "42710".to_string(),
+            message: format!("change stream '{name}' already exists"),
+        });
     }
 
     // Parse WITH clause options.
@@ -125,7 +135,10 @@ pub fn create_change_stream(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock before UNIX epoch"))?
+        .map_err(|_| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system clock before UNIX epoch".to_string(),
+        })?
         .as_secs();
 
     let def = ChangeStreamDef {
@@ -148,7 +161,7 @@ pub fn create_change_stream(
     let kafka_config = def.kafka.clone();
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutChangeStream(Box::new(def.clone()));
-    let log_index = super::super::catalog_propose::propose_and_apply(state, &entry)?;
+    let log_index = propose_and_apply(state, &entry)?;
     if log_index == 0 {
         state.stream_registry.register(def.clone());
     }
@@ -169,7 +182,7 @@ pub fn create_change_stream(
         &format!("CREATE CHANGE STREAM {name} ON {collection}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE CHANGE STREAM"))])
+    Ok(status("CREATE CHANGE STREAM"))
 }
 
 /// Extract all `KEY = VALUE` pairs from a WITH clause inner string.

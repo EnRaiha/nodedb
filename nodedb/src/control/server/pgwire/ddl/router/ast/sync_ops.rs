@@ -13,7 +13,6 @@ use nodedb_sql::ddl_ast::statement::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::ddl::alert::alter_alert;
 use crate::control::server::pgwire::ddl::alert::{CreateAlertRequest, create_alert};
-use crate::control::server::pgwire::ddl::change_stream::alter_change_stream;
 use crate::control::server::pgwire::ddl::cluster::alter_raft_group;
 use crate::control::server::pgwire::ddl::collection::drop_collection;
 use crate::control::server::pgwire::ddl::consumer_group::create_consumer_group;
@@ -61,10 +60,6 @@ pub(super) fn try_dispatch_sync(
 
         NodedbStatement::Automation(AutomationStmt::AlterAlert { name, action }) => {
             Some(alter_alert(state, identity, database_id, name, action))
-        }
-
-        NodedbStatement::StreamView(StreamViewStmt::AlterChangeStream { name, action }) => {
-            Some(alter_change_stream(state, identity, name, action))
         }
 
         NodedbStatement::Database(DatabaseStmt::BackupTenant { .. }) => {

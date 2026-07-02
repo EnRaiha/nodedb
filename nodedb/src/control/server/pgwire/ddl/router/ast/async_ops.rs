@@ -10,7 +10,6 @@ use nodedb_sql::ddl_ast::statement::{
 };
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::change_stream::create_change_stream;
 use crate::control::server::pgwire::ddl::collection::copy_from::CopyFromOptions;
 use crate::control::server::pgwire::ddl::collection::{
     CreateCollectionRequest, CreateIndexRequest, copy_from_file, copy_to_file, create_collection,
@@ -43,18 +42,6 @@ pub(super) async fn try_dispatch_async(
     database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     match stmt {
-        NodedbStatement::StreamView(StreamViewStmt::CreateChangeStream {
-            name,
-            collection,
-            with_clause_raw,
-        }) => Some(create_change_stream(
-            state,
-            identity,
-            name,
-            collection,
-            with_clause_raw,
-        )),
-
         NodedbStatement::StreamView(StreamViewStmt::CreateMaterializedView {
             name,
             source,

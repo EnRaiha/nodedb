@@ -14,8 +14,8 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::exists::{
-    alert_exists, change_stream_exists, collection_exists, continuous_aggregate_exists,
-    materialized_view_exists, retention_policy_exists,
+    alert_exists, collection_exists, continuous_aggregate_exists, materialized_view_exists,
+    retention_policy_exists,
 };
 
 /// Handle IF [NOT] EXISTS guard arms. Returns `Some(result)` if the statement
@@ -76,18 +76,6 @@ pub(super) fn try_dispatch_guards(
             if !retention_policy_exists(state, identity, database_id, name) {
                 return Some(Ok(vec![Response::Execution(Tag::new(
                     "DROP RETENTION POLICY",
-                ))]));
-            }
-            None
-        }
-
-        NodedbStatement::StreamView(StreamViewStmt::DropChangeStream {
-            name,
-            if_exists: true,
-        }) => {
-            if !change_stream_exists(state, identity, name) {
-                return Some(Ok(vec![Response::Execution(Tag::new(
-                    "DROP CHANGE STREAM",
                 ))]));
             }
             None

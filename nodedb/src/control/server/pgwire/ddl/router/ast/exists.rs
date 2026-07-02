@@ -45,15 +45,6 @@ pub(super) fn retention_policy_exists(
         .is_some()
 }
 
-pub(super) fn change_stream_exists(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    name: &str,
-) -> bool {
-    let tid = identity.tenant_id.as_u64();
-    state.stream_registry.get(tid, name).is_some()
-}
-
 pub(super) fn materialized_view_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,

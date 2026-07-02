@@ -13,19 +13,6 @@ pub(super) async fn dispatch(
     upper: &str,
     parts: &[&str],
 ) -> Option<PgWireResult<Vec<Response>>> {
-    // Change Streams: CREATE/DROP/SHOW CHANGE STREAM ...
-    // CREATE CHANGE STREAM is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("DROP CHANGE STREAM ") {
-        return Some(super::super::change_stream::drop_change_stream(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW CHANGE STREAM") {
-        return Some(super::super::change_stream::show_change_streams(
-            state, identity,
-        ));
-    }
-
     // Consumer Groups: CREATE/DROP/SHOW CONSUMER GROUP + COMMIT OFFSET(S)
     // CREATE CONSUMER GROUP is fully dispatched via typed AST (ast.rs).
     if upper.starts_with("DROP CONSUMER GROUP ") {
