@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! DDL-time validation for CHECK constraint expressions.
+//!
+//! Ported verbatim from the pgwire `ddl::constraint::validate`; only the error
+//! type changed from pgwire `PgWireError` to the protocol-neutral [`DdlError`].
 
-use pgwire::error::PgWireResult;
+use crate::control::server::shared::ddl::result::DdlError;
 
-use super::err;
+use super::support::err;
 
 /// Validate that a subquery CHECK expression uses a supported pattern.
 ///
 /// Supported patterns:
 /// - `expr IN (SELECT col FROM tbl [WHERE ...])`
 /// - `expr NOT IN (SELECT col FROM tbl [WHERE ...])`
-pub(super) fn validate_subquery_pattern(check_sql: &str) -> PgWireResult<()> {
+pub(super) fn validate_subquery_pattern(check_sql: &str) -> Result<(), DdlError> {
     let upper = check_sql.to_uppercase();
 
     if upper.contains(" IN (SELECT ") || upper.contains(" IN(SELECT ") {

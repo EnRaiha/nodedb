@@ -1,23 +1,28 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! DDL handlers for adding and dropping constraints.
+//! Protocol-neutral DDL handlers for adding and dropping constraints.
+//!
+//! Ported from the pgwire `ddl::constraint::handlers`. All non-return logic
+//! (token parsing, catalog get/put, duplicate pre-checks, `schema_version.bump`)
+//! is preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
+//! [`DdlError`].
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::catalog::types::StateTransitionDef;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::err;
+use super::support::err;
 
 /// Handle `ALTER COLLECTION x ADD CONSTRAINT name ON COLUMN col TRANSITIONS (...)`.
 pub fn add_state_constraint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
     let parts: Vec<&str> = sql.split_whitespace().collect();
     let upper = sql.to_uppercase();
@@ -76,7 +81,10 @@ pub fn add_state_constraint(
 
     state.schema_version.bump();
 
-    Ok(vec![Response::Execution(Tag::new("ALTER COLLECTION"))])
+    Ok(vec![DdlResult::Status {
+        command: "ALTER COLLECTION".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Handle `ALTER COLLECTION x ADD TRANSITION CHECK name (predicate)`.
@@ -84,7 +92,7 @@ pub fn add_transition_check(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
@@ -135,7 +143,10 @@ pub fn add_transition_check(
 
     state.schema_version.bump();
 
-    Ok(vec![Response::Execution(Tag::new("ALTER COLLECTION"))])
+    Ok(vec![DdlResult::Status {
+        command: "ALTER COLLECTION".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Handle `ALTER COLLECTION x ADD CONSTRAINT name CHECK (expr)`.
@@ -143,7 +154,7 @@ pub fn add_check_constraint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
@@ -221,7 +232,10 @@ pub fn add_check_constraint(
 
     state.schema_version.bump();
 
-    Ok(vec![Response::Execution(Tag::new("ALTER COLLECTION"))])
+    Ok(vec![DdlResult::Status {
+        command: "ALTER COLLECTION".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Handle `DROP CONSTRAINT name ON collection`.
@@ -229,7 +243,7 @@ pub fn drop_constraint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
     let constraint_name = parts
@@ -277,5 +291,8 @@ pub fn drop_constraint(
 
     state.schema_version.bump();
 
-    Ok(vec![Response::Execution(Tag::new("DROP CONSTRAINT"))])
+    Ok(vec![DdlResult::Status {
+        command: "DROP CONSTRAINT".to_string(),
+        rows_affected: None,
+    }])
 }

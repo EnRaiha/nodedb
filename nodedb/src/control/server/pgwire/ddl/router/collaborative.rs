@@ -22,43 +22,6 @@ pub(super) async fn dispatch(
         ));
     }
 
-    // State transition constraints and transition checks.
-    if upper.starts_with("ALTER COLLECTION ")
-        && upper.contains("ADD CONSTRAINT")
-        && upper.contains("TRANSITIONS")
-    {
-        return Some(super::super::constraint::add_state_constraint(
-            state, identity, sql,
-        ));
-    }
-    if upper.starts_with("ALTER COLLECTION ") && upper.contains("ADD TRANSITION CHECK") {
-        return Some(super::super::constraint::add_transition_check(
-            state, identity, sql,
-        ));
-    }
-    // General CHECK constraint (not TRANSITIONS, not TRANSITION CHECK).
-    if upper.starts_with("ALTER COLLECTION ")
-        && upper.contains("ADD CONSTRAINT")
-        && upper.contains("CHECK")
-        && !upper.contains("TRANSITIONS")
-        && !upper.contains("TRANSITION CHECK")
-    {
-        return Some(super::super::constraint::add_check_constraint(
-            state, identity, sql,
-        ));
-    }
-    // SHOW CONSTRAINTS ON <collection>
-    if upper.starts_with("SHOW CONSTRAINTS ON ") {
-        return Some(super::super::constraint::show_constraints(
-            state, identity, sql,
-        ));
-    }
-    if upper.starts_with("DROP CONSTRAINT ") {
-        return Some(super::super::constraint::drop_constraint(
-            state, identity, parts,
-        ));
-    }
-
     // Period lock management.
     if upper.starts_with("ALTER COLLECTION ") && upper.contains("ADD PERIOD LOCK") {
         return Some(super::super::period_lock::add_period_lock(

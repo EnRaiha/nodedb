@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! `SHOW CONSTRAINTS ON <collection>` — unified view of all constraint kinds.
+//!
+//! Ported from the pgwire `ddl::constraint::show`. The per-row content is
+//! preserved verbatim; only the result construction changed from a pgwire
+//! `QueryResponse` (4 text columns via `DataRowEncoder`) to a protocol-neutral
+//! [`DdlResult::Rows`] carrying the same four text columns.
 
 use nodedb_types::DatabaseId;
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::text_field;
+use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::err;
+use super::support::err;
 
 /// Handle `SHOW CONSTRAINTS ON <collection>`.
 ///
@@ -26,7 +28,7 @@ pub fn show_constraints(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let coll_name = extract_collection_after_on(sql)?;
 
     let Some(catalog) = state.credentials.catalog() else {
@@ -39,14 +41,14 @@ pub fn show_constraints(
         .map_err(|e| err("XX000", &e.to_string()))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
-    let schema = Arc::new(vec![
-        text_field("name"),
-        text_field("kind"),
-        text_field("field"),
-        text_field("detail"),
-    ]);
+    let columns = vec![
+        "name".to_string(),
+        "kind".to_string(),
+        "field".to_string(),
+        "detail".to_string(),
+    ];
 
-    let mut rows = Vec::new();
+    let mut rows: Vec<Map<String, JsonValue>> = Vec::new();
 
     // State transition constraints.
     for sc in &coll.state_constraints {
@@ -62,22 +64,17 @@ pub fn show_constraints(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        let _ = encoder.encode_field(&sc.name);
-        let _ = encoder.encode_field(&"transition");
-        let _ = encoder.encode_field(&sc.column);
-        let _ = encoder.encode_field(&detail);
-        rows.push(Ok(encoder.take_row()));
+        rows.push(constraint_row(&sc.name, "transition", &sc.column, &detail));
     }
 
     // Transition check constraints.
     for tc in &coll.transition_checks {
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        let _ = encoder.encode_field(&tc.name);
-        let _ = encoder.encode_field(&"transition_check");
-        let _ = encoder.encode_field(&""); // no specific field
-        let _ = encoder.encode_field(&format!("{:?}", tc.predicate));
-        rows.push(Ok(encoder.take_row()));
+        rows.push(constraint_row(
+            &tc.name,
+            "transition_check",
+            "",
+            &format!("{:?}", tc.predicate),
+        ));
     }
 
     // Typeguard constraints.
@@ -94,12 +91,12 @@ pub fn show_constraints(
             parts.join(", ")
         };
         let auto_name = format!("_guard_{}", guard.field);
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        let _ = encoder.encode_field(&auto_name);
-        let _ = encoder.encode_field(&"typeguard");
-        let _ = encoder.encode_field(&guard.field);
-        let _ = encoder.encode_field(&detail);
-        rows.push(Ok(encoder.take_row()));
+        rows.push(constraint_row(
+            &auto_name,
+            "typeguard",
+            &guard.field,
+            &detail,
+        ));
     }
 
     // General CHECK constraints.
@@ -109,22 +106,30 @@ pub fn show_constraints(
         } else {
             "check"
         };
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        let _ = encoder.encode_field(&cc.name);
-        let _ = encoder.encode_field(&kind_str);
-        let _ = encoder.encode_field(&""); // general, not field-specific
-        let _ = encoder.encode_field(&cc.check_sql);
-        rows.push(Ok(encoder.take_row()));
+        rows.push(constraint_row(&cc.name, kind_str, "", &cc.check_sql));
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    let column_types = ShapedRows::text_types(columns.len());
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
+}
+
+/// Build a single `SHOW CONSTRAINTS` row keyed by the four text columns.
+fn constraint_row(name: &str, kind: &str, field: &str, detail: &str) -> Map<String, JsonValue> {
+    let mut row = Map::new();
+    row.insert("name".to_string(), JsonValue::String(name.to_string()));
+    row.insert("kind".to_string(), JsonValue::String(kind.to_string()));
+    row.insert("field".to_string(), JsonValue::String(field.to_string()));
+    row.insert("detail".to_string(), JsonValue::String(detail.to_string()));
+    row
 }
 
 /// Extract collection name from `SHOW CONSTRAINTS ON <collection>`.
-fn extract_collection_after_on(sql: &str) -> PgWireResult<String> {
+fn extract_collection_after_on(sql: &str) -> Result<String, DdlError> {
     let upper = sql.to_uppercase();
     let on_pos = upper
         .find(" ON ")

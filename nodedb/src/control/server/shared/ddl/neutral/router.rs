@@ -15,6 +15,7 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::result::{DdlError, DdlResult};
+use super::constraint;
 use super::function;
 use super::grant;
 use super::oidc;
@@ -109,6 +110,39 @@ pub async fn try_dispatch(
     }
     if upper == "SHOW FUNCTIONS" || upper.starts_with("SHOW FUNCTIONS") {
         return Some(function::show_functions(state, identity));
+    }
+
+    // Constraint DDL. `ALTER COLLECTION ... ADD CONSTRAINT` / `ADD TRANSITION
+    // CHECK` do not parse into any typed AST variant (the `parse_alter_operation`
+    // path returns `None` for them, so `ddl_ast::parse` yields `None`), and
+    // `DROP CONSTRAINT` / `SHOW CONSTRAINTS ON` were dispatched by string prefix
+    // from the pgwire collaborative router. Replicate that exactly here, before
+    // the parse gate, so the prefix recognition and syntax messages stay
+    // byte-identical. Guard ordering (TRANSITIONS before the general CHECK arm,
+    // which excludes both TRANSITIONS and TRANSITION CHECK) is preserved verbatim.
+    if upper.starts_with("ALTER COLLECTION ")
+        && upper.contains("ADD CONSTRAINT")
+        && upper.contains("TRANSITIONS")
+    {
+        return Some(constraint::add_state_constraint(state, identity, sql));
+    }
+    if upper.starts_with("ALTER COLLECTION ") && upper.contains("ADD TRANSITION CHECK") {
+        return Some(constraint::add_transition_check(state, identity, sql));
+    }
+    if upper.starts_with("ALTER COLLECTION ")
+        && upper.contains("ADD CONSTRAINT")
+        && upper.contains("CHECK")
+        && !upper.contains("TRANSITIONS")
+        && !upper.contains("TRANSITION CHECK")
+    {
+        return Some(constraint::add_check_constraint(state, identity, sql));
+    }
+    if upper.starts_with("SHOW CONSTRAINTS ON ") {
+        return Some(constraint::show_constraints(state, identity, sql));
+    }
+    if upper.starts_with("DROP CONSTRAINT ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(constraint::drop_constraint(state, identity, &parts));
     }
 
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,

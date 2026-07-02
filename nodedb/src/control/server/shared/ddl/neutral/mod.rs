@@ -8,6 +8,7 @@
 //! delegation in the parent [`super::dispatch`] handles it.
 
 mod auth_support;
+pub mod constraint;
 pub mod function;
 pub mod grant;
 pub mod oidc;

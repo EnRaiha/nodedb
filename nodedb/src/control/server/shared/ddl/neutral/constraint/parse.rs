@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Parsing helpers for constraint DDL: transition rules, predicates, expressions.
-
-use pgwire::error::PgWireResult;
+//!
+//! Ported verbatim from the pgwire `ddl::constraint::parse`; only the error type
+//! changed from pgwire `PgWireError` to the protocol-neutral [`DdlError`].
 
 use crate::control::security::catalog::types::TransitionRule;
+use crate::control::server::shared::ddl::result::DdlError;
 
-use super::err;
+use super::support::err;
 
 /// Parse transition rules from `TRANSITIONS ('a' -> 'b', 'b' -> 'c' BY ROLE 'role', ...)`.
-pub(super) fn parse_transitions(upper: &str) -> PgWireResult<Vec<TransitionRule>> {
+pub(super) fn parse_transitions(upper: &str) -> Result<Vec<TransitionRule>, DdlError> {
     let start = upper
         .find("TRANSITIONS")
         .ok_or_else(|| err("42601", "missing TRANSITIONS keyword"))?;
@@ -40,7 +42,7 @@ pub(super) fn parse_transitions(upper: &str) -> PgWireResult<Vec<TransitionRule>
 }
 
 /// Parse `'from' -> 'to'` or `'from' -> 'to' BY ROLE 'role'`.
-fn parse_single_transition(s: &str) -> PgWireResult<TransitionRule> {
+fn parse_single_transition(s: &str) -> Result<TransitionRule, DdlError> {
     let (from_part, rest) = if let Some(pos) = s.find("->") {
         (&s[..pos], &s[pos + 2..])
     } else if let Some(pos) = s.find("→") {
@@ -90,7 +92,7 @@ fn parse_single_transition(s: &str) -> PgWireResult<TransitionRule> {
 ///
 /// Used by both TRANSITION CHECK and general CHECK constraints.
 /// Finds `CHECK`, skips to `(`, extracts balanced content.
-pub(super) fn extract_parenthesized_predicate(sql: &str) -> PgWireResult<String> {
+pub(super) fn extract_parenthesized_predicate(sql: &str) -> Result<String, DdlError> {
     extract_check_body(sql, "CHECK")
 }
 
@@ -98,7 +100,7 @@ pub(super) fn extract_parenthesized_predicate(sql: &str) -> PgWireResult<String>
 ///
 /// Finds `keyword` in `sql`, then extracts the content between the next `(` and
 /// its matching `)`, respecting nesting.
-pub(super) fn extract_check_body(sql: &str, keyword: &str) -> PgWireResult<String> {
+pub(super) fn extract_check_body(sql: &str, keyword: &str) -> Result<String, DdlError> {
     let upper = sql.to_uppercase();
     let kw_pos = upper
         .find(keyword)
@@ -146,7 +148,7 @@ pub(super) fn extract_check_body(sql: &str, keyword: &str) -> PgWireResult<Strin
 /// Parse a transition check predicate string into a SqlExpr.
 pub(super) fn parse_transition_predicate(
     s: &str,
-) -> PgWireResult<crate::bridge::expr_eval::SqlExpr> {
+) -> Result<crate::bridge::expr_eval::SqlExpr, DdlError> {
     use crate::bridge::expr_eval::{BinaryOp, SqlExpr};
 
     let s = s.trim();
@@ -200,7 +202,7 @@ pub(super) fn parse_transition_predicate(
 }
 
 /// Parse a simple comparison like `OLD.sealed = FALSE` or `NEW.amount >= OLD.amount`.
-fn parse_simple_comparison(s: &str) -> PgWireResult<crate::bridge::expr_eval::SqlExpr> {
+fn parse_simple_comparison(s: &str) -> Result<crate::bridge::expr_eval::SqlExpr, DdlError> {
     use crate::bridge::expr_eval::{BinaryOp, SqlExpr};
 
     for (op_str, op) in &[
@@ -230,7 +232,7 @@ fn parse_simple_comparison(s: &str) -> PgWireResult<crate::bridge::expr_eval::Sq
 }
 
 /// Parse a value reference: `OLD.column`, `NEW.column`, `column`, literal.
-fn parse_value_ref(s: &str) -> PgWireResult<crate::bridge::expr_eval::SqlExpr> {
+fn parse_value_ref(s: &str) -> Result<crate::bridge::expr_eval::SqlExpr, DdlError> {
     use crate::bridge::expr_eval::SqlExpr;
 
     let upper = s.to_uppercase();
