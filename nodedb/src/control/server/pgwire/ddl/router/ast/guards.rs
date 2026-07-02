@@ -15,8 +15,7 @@ use crate::types::DatabaseId;
 
 use super::exists::{
     alert_exists, change_stream_exists, collection_exists, continuous_aggregate_exists,
-    materialized_view_exists, retention_policy_exists, schedule_exists, sequence_exists,
-    trigger_exists,
+    materialized_view_exists, retention_policy_exists, schedule_exists, trigger_exists,
 };
 
 /// Handle IF [NOT] EXISTS guard arms. Returns `Some(result)` if the statement
@@ -51,17 +50,6 @@ pub(super) fn try_dispatch_guards(
             None // fall through to schema dispatcher
         }
 
-        NodedbStatement::Collection(CollectionStmt::CreateSequence {
-            name,
-            if_not_exists: true,
-            ..
-        }) => {
-            if sequence_exists(state, identity, name) {
-                return Some(Ok(vec![Response::Execution(Tag::new("CREATE SEQUENCE"))]));
-            }
-            None
-        }
-
         // `DropCollection` is fully owned by the sync_ops typed
         // handler, which honours `if_exists` correctly via the
         // existence-check matrix. No guard short-circuit needed.
@@ -88,16 +76,6 @@ pub(super) fn try_dispatch_guards(
         }) => {
             if !schedule_exists(state, identity, name) {
                 return Some(Ok(vec![Response::Execution(Tag::new("DROP SCHEDULE"))]));
-            }
-            None
-        }
-
-        NodedbStatement::Collection(CollectionStmt::DropSequence {
-            name,
-            if_exists: true,
-        }) => {
-            if !sequence_exists(state, identity, name) {
-                return Some(Ok(vec![Response::Execution(Tag::new("DROP SEQUENCE"))]));
             }
             None
         }

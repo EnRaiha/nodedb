@@ -27,6 +27,14 @@ pub async fn dispatch(
     sql: &str,
     database_id: DatabaseId,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
+    // Neutral-first: migrated DDL families build `DdlResult` directly with no
+    // pgwire types. Returns `None` for non-migrated families (and for any
+    // sub-case that today falls through to the planner) so the transitional
+    // pgwire delegation below handles them unchanged.
+    if let Some(r) = super::neutral::try_dispatch(state, identity, sql, database_id).await {
+        return Some(r);
+    }
+
     // transitional: the neutral module delegates to the pgwire router until the
     // leaf DDL handlers are ported to produce `DdlResult` directly.
     let pg_result =

@@ -37,19 +37,8 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
         ));
     }
 
-    // Sequences: CREATE/DROP/ALTER/SHOW SEQUENCE
-    // CREATE SEQUENCE is fully dispatched via typed AST (ast.rs).
-    if upper.starts_with("DROP SEQUENCE ") {
-        return Some(super::super::super::sequence::drop_sequence(
-            state, identity, parts,
-        ));
-    }
-    // ALTER SEQUENCE is fully dispatched via typed AST (ast.rs).
-    if upper == "SHOW SEQUENCES" || upper.starts_with("SHOW SEQUENCES ") {
-        return Some(super::super::super::sequence::show_sequences(
-            state, identity,
-        ));
-    }
+    // Sequences (CREATE/DROP/ALTER/SHOW/DESCRIBE) are served by the
+    // protocol-neutral DDL router; the pgwire router no longer routes them.
 
     // Maintenance: ANALYZE, COMPACT, REINDEX, SHOW STORAGE, SHOW COMPACTION
     if upper.starts_with("ANALYZE ") {

@@ -40,15 +40,6 @@ pub(super) fn schedule_exists(
     state.schedule_registry.get(tid, name).is_some()
 }
 
-pub(super) fn sequence_exists(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    name: &str,
-) -> bool {
-    let tid = identity.tenant_id.as_u64();
-    state.sequence_registry.exists(tid, name)
-}
-
 pub(super) fn alert_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,

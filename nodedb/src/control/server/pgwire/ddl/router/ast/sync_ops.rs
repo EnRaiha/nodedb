@@ -27,7 +27,6 @@ use crate::control::server::pgwire::ddl::retention_policy::alter_retention_polic
 use crate::control::server::pgwire::ddl::rls::{CreateRlsPolicyRequest, create_rls_policy};
 use crate::control::server::pgwire::ddl::role::alter_role_typed;
 use crate::control::server::pgwire::ddl::schedule::alter_schedule;
-use crate::control::server::pgwire::ddl::sequence::{alter_sequence, create_sequence};
 use crate::control::server::pgwire::ddl::trigger::alter_trigger;
 use crate::control::server::pgwire::ddl::user::{alter_user, create_user};
 use crate::control::state::SharedState;
@@ -189,18 +188,6 @@ pub(super) fn try_dispatch_sync(
             set_value.as_deref(),
         )),
 
-        NodedbStatement::Collection(CollectionStmt::AlterSequence {
-            name,
-            action,
-            with_value,
-        }) => Some(alter_sequence(
-            state,
-            identity,
-            name,
-            action,
-            with_value.as_deref(),
-        )),
-
         NodedbStatement::StreamView(StreamViewStmt::CreateConsumerGroup {
             group_name,
             stream_name,
@@ -260,35 +247,6 @@ pub(super) fn try_dispatch_sync(
                 on_deny_raw: on_deny_raw.as_deref(),
                 tenant_id_override: *tenant_id_override,
             },
-        )),
-
-        NodedbStatement::Collection(CollectionStmt::CreateSequence {
-            name,
-            if_not_exists: false,
-            start,
-            increment,
-            min_value,
-            max_value,
-            cycle,
-            cache,
-            format_template_raw,
-            reset_period_raw,
-            gap_free,
-            scope,
-        }) => Some(create_sequence(
-            state,
-            identity,
-            name,
-            *start,
-            *increment,
-            *min_value,
-            *max_value,
-            *cycle,
-            *cache,
-            format_template_raw.as_deref(),
-            reset_period_raw.as_deref(),
-            *gap_free,
-            scope.as_deref(),
         )),
 
         NodedbStatement::Auth(AuthStmt::CreateUser {

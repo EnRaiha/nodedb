@@ -24,12 +24,7 @@ pub(super) async fn dispatch(
     }
 
     // Schema introspection.
-    if upper.starts_with("DESCRIBE SEQUENCE ") {
-        let name = parts.get(2).unwrap_or(&"");
-        return Some(super::super::sequence::describe_sequence(
-            state, identity, name,
-        ));
-    }
+    // DESCRIBE SEQUENCE is served by the protocol-neutral DDL router.
     if upper.starts_with("DESCRIBE ") || upper.starts_with("\\D ") {
         return Some(super::super::collection::describe_collection(
             state, identity, parts,
@@ -39,7 +34,7 @@ pub(super) async fn dispatch(
     // CREATE TABLE — fully dispatched via typed AST (ast.rs).
     // CREATE COLLECTION — fully dispatched via typed AST (ast.rs).
     // CREATE INDEX / CREATE UNIQUE INDEX — fully dispatched via typed AST (ast.rs).
-    // CREATE SEQUENCE — fully dispatched via typed AST (ast.rs).
+    // CREATE SEQUENCE — served by the protocol-neutral DDL router.
     // CREATE RLS POLICY — fully dispatched via typed AST (ast.rs).
     // ALTER COLLECTION (all sub-operations) — fully dispatched via typed AST (ast.rs).
 
