@@ -27,11 +27,15 @@ use super::dsl;
 use super::function;
 use super::grant;
 use super::graph_ops;
+use super::kv_atomic;
+use super::kv_sorted_index;
+use super::last_value;
 use super::maintenance;
 use super::materialized_view;
 use super::oidc;
 use super::procedure;
 use super::query_functions;
+use super::rate_gate;
 use super::retention_policy;
 use super::rls::{self, CreateRlsPolicyRequest};
 use super::role;
@@ -39,12 +43,15 @@ use super::schedule::{self, CreateScheduleRequest};
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
 use super::synonym_group;
+use super::timeseries;
 use super::topic;
+use super::transfer;
 use super::tree_ops;
 use super::trigger;
 use super::typeguard;
 use super::user;
 use super::version_history;
+use super::weighted_pick;
 
 /// Try to handle `sql` with a migrated protocol-neutral DDL family handler.
 ///
@@ -452,6 +459,128 @@ pub async fn try_dispatch(
     }
     if upper.starts_with("SELECT TREE_CHILDREN") || upper.starts_with("TREE_CHILDREN") {
         return Some(tree_ops::tree_children(state, identity, database_id, sql).await);
+    }
+
+    // Engine-ops SQL functions and DDL. None of these are dispatched from a
+    // typed AST arm — the pgwire engine_ops router recognized all of them by
+    // string prefix from the raw SQL (these keywords do not appear in the DDL
+    // AST grammar, so `ddl_ast::parse` returns `None` for them). Replicate that
+    // exactly here, before the parse gate, so the prefix recognition, guard
+    // ordering, and syntax messages stay byte-identical. The three vector
+    // model / metadata forms (`ALTER COLLECTION … SET VECTOR METADATA ON`,
+    // `SHOW VECTOR MODELS`, `SELECT VECTOR_METADATA(…)`) remain on the
+    // transitional pgwire path — they are handled by the not-yet-migrated
+    // collection family — so they are intentionally not routed here.
+    //
+    // `CREATE TIMESERIES` / `ALTER TIMESERIES` / `REWRITE PARTITIONS` are
+    // routed here, but `SHOW PARTITIONS ` is intentionally NOT — it is already
+    // claimed by the consumer-group handler above (which ran before engine_ops
+    // on the pgwire path too), so the timeseries `show_partitions` handler stays
+    // shadowed exactly as it was.
+
+    // Weighted random selection.
+    if upper.contains("WEIGHTED_PICK(") || upper.contains("WEIGHTED_PICK (") {
+        return Some(weighted_pick::weighted_pick(state, identity, sql).await);
+    }
+
+    // Rate gate / cooldown functions.
+    if upper.starts_with("SELECT RATE_CHECK(") || upper.starts_with("SELECT RATE_CHECK (") {
+        return Some(rate_gate::rate_check(state, identity, sql).await);
+    }
+    if upper.starts_with("SELECT RATE_REMAINING(") || upper.starts_with("SELECT RATE_REMAINING (") {
+        return Some(rate_gate::rate_remaining(state, identity, sql).await);
+    }
+    if upper.starts_with("SELECT RATE_RESET(") || upper.starts_with("SELECT RATE_RESET (") {
+        return Some(rate_gate::rate_reset(state, identity, sql).await);
+    }
+
+    // Atomic transfer functions.
+    if upper.starts_with("SELECT TRANSFER(") || upper.starts_with("SELECT TRANSFER (") {
+        return Some(transfer::transfer(state, identity, sql).await);
+    }
+    if upper.starts_with("SELECT TRANSFER_ITEM(") || upper.starts_with("SELECT TRANSFER_ITEM (") {
+        return Some(transfer::transfer_item(state, identity, sql).await);
+    }
+
+    // Sorted index DDL.
+    if upper.starts_with("CREATE SORTED INDEX ") {
+        return Some(kv_sorted_index::create_sorted_index(state, identity, sql).await);
+    }
+    if upper.starts_with("DROP SORTED INDEX ") {
+        return Some(kv_sorted_index::drop_sorted_index(state, identity, sql).await);
+    }
+
+    // Sorted index query functions.
+    if upper.starts_with("SELECT RANK(") || upper.starts_with("SELECT RANK (") {
+        return Some(kv_sorted_index::select_rank(state, identity, sql).await);
+    }
+    if upper.contains("TOPK(") || upper.contains("TOPK (") {
+        return Some(kv_sorted_index::select_topk(state, identity, sql).await);
+    }
+    if upper.starts_with("SELECT SORTED_COUNT(") || upper.starts_with("SELECT SORTED_COUNT (") {
+        return Some(kv_sorted_index::select_sorted_count(state, identity, sql).await);
+    }
+    // RANGE as a sorted index function (check it's not a standard SQL RANGE).
+    if (upper.starts_with("SELECT * FROM RANGE(") || upper.starts_with("SELECT * FROM RANGE ("))
+        && !upper.contains(" BETWEEN ")
+    {
+        return Some(kv_sorted_index::select_range(state, identity, sql).await);
+    }
+
+    // KV_INCR / KV_DECR / KV_INCR_FLOAT / KV_CAS / KV_GETSET — atomic KV operations.
+    if upper.starts_with("SELECT KV_INCR(") || upper.starts_with("SELECT KV_INCR (") {
+        return Some(kv_atomic::kv_incr(state, identity, sql, false).await);
+    }
+    if upper.starts_with("SELECT KV_DECR(") || upper.starts_with("SELECT KV_DECR (") {
+        return Some(kv_atomic::kv_incr(state, identity, sql, true).await);
+    }
+    if upper.starts_with("SELECT KV_INCR_FLOAT(") || upper.starts_with("SELECT KV_INCR_FLOAT (") {
+        return Some(kv_atomic::kv_incr_float(state, identity, sql).await);
+    }
+    if upper.starts_with("SELECT KV_CAS(") || upper.starts_with("SELECT KV_CAS (") {
+        return Some(kv_atomic::kv_cas(state, identity, sql).await);
+    }
+    if upper.starts_with("SELECT KV_GETSET(") || upper.starts_with("SELECT KV_GETSET (") {
+        return Some(kv_atomic::kv_getset(state, identity, sql).await);
+    }
+
+    // Timeseries: CREATE TIMESERIES, ALTER TIMESERIES, REWRITE PARTITIONS.
+    // (SHOW PARTITIONS is shadowed by consumer_group above, as noted.)
+    if upper.starts_with("CREATE TIMESERIES ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(timeseries::create_timeseries(
+            state,
+            identity,
+            &parts,
+            database_id,
+        ));
+    }
+    if upper.starts_with("ALTER TIMESERIES ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(timeseries::alter_timeseries(state, identity, &parts));
+    }
+    if upper.starts_with("REWRITE PARTITIONS ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(timeseries::rewrite_partitions(state, identity, &parts));
+    }
+
+    // Last-value cache queries.
+    if upper.starts_with("SELECT LAST_VALUES(") {
+        // SELECT LAST_VALUES('collection_name')
+        if let Some(collection) = extract_last_values_arg(sql) {
+            return Some(
+                last_value::query_last_values(state, identity, database_id, &collection).await,
+            );
+        }
+    }
+    if upper.starts_with("SELECT LAST_VALUE(") && !upper.starts_with("SELECT LAST_VALUES(") {
+        // SELECT LAST_VALUE('collection_name', series_id)
+        if let Some((collection, series_id)) = extract_last_value_args(sql) {
+            return Some(
+                last_value::query_last_value(state, identity, database_id, &collection, series_id)
+                    .await,
+            );
+        }
     }
 
     // Materialized views (HTAP). `REFRESH MATERIALIZED VIEW` parses into no typed
@@ -1240,4 +1369,36 @@ pub async fn try_dispatch(
 
         _ => None,
     }
+}
+
+/// Extract the single-quoted collection argument from `SELECT LAST_VALUES('coll')`.
+///
+/// Mirrors the pgwire router's `extract_quoted_arg(sql, "LAST_VALUES(")` exactly
+/// so the parse behaviour stays byte-identical.
+fn extract_last_values_arg(sql: &str) -> Option<String> {
+    let prefix = "LAST_VALUES(";
+    let upper = sql.to_uppercase();
+    let pos = upper.find(prefix)?;
+    let after = &sql[pos + prefix.len()..];
+    let start = after.find('\'')?;
+    let end = after[start + 1..].find('\'')?;
+    Some(after[start + 1..start + 1 + end].to_string())
+}
+
+/// Extract `('collection', series_id)` from a `SELECT LAST_VALUE(...)` call.
+///
+/// Mirrors the pgwire router's `extract_lv_args` exactly.
+fn extract_last_value_args(sql: &str) -> Option<(String, u64)> {
+    let upper = sql.to_uppercase();
+    let pos = upper.find("LAST_VALUE(")?;
+    let after = &sql[pos + 11..];
+    let close = after.find(')')?;
+    let inner = &after[..close];
+    let parts: Vec<&str> = inner.splitn(2, ',').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let collection = parts[0].trim().trim_matches('\'').to_string();
+    let series_id: u64 = parts[1].trim().parse().ok()?;
+    Some((collection, series_id))
 }

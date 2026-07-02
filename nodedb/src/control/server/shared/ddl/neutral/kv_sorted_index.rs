@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! DDL and SQL function handlers for sorted indexes (leaderboards).
+//! Protocol-neutral DDL and SQL function handlers for sorted indexes
+//! (leaderboards).
 //!
 //! DDL:
 //!   CREATE SORTED INDEX name ON collection (score DESC [, tiebreak ASC]) KEY key_col [WINDOW DAILY ON ts_col]
@@ -12,52 +13,52 @@
 //!   SELECT * FROM RANGE(index_name, score_min, score_max)
 //!   SELECT COUNT(index_name)  -- when index_name is a sorted index
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response};
-use pgwire::error::PgWireResult;
-use sonic_rs;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+
+use super::super::result::{DdlError, DdlResult};
 
 /// Handle `CREATE SORTED INDEX name ON collection (col DIR, ...) KEY key_col [WINDOW ...]`
 pub async fn create_sorted_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
 
     // Extract index name.
     let rest = upper
         .strip_prefix("CREATE SORTED INDEX ")
-        .ok_or_else(|| sqlstate_error("42601", "expected CREATE SORTED INDEX"))?;
+        .ok_or_else(|| ddl_err("42601", "expected CREATE SORTED INDEX"))?;
     let index_name = rest
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "missing index name"))?
+        .ok_or_else(|| ddl_err("42601", "missing index name"))?
         .to_lowercase();
 
     // Extract collection name after ON.
     let on_pos = upper
         .find(" ON ")
-        .ok_or_else(|| sqlstate_error("42601", "missing ON clause"))?;
+        .ok_or_else(|| ddl_err("42601", "missing ON clause"))?;
     let after_on = sql[on_pos + 4..].trim();
     let collection = after_on
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "missing collection name after ON"))?
+        .ok_or_else(|| ddl_err("42601", "missing collection name after ON"))?
         .to_lowercase();
 
     // Extract sort columns from parentheses.
     let paren_start = sql
         .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "missing '(' for sort columns"))?;
+        .ok_or_else(|| ddl_err("42601", "missing '(' for sort columns"))?;
     let paren_end = sql
         .find(')')
-        .ok_or_else(|| sqlstate_error("42601", "missing ')' for sort columns"))?;
+        .ok_or_else(|| ddl_err("42601", "missing ')' for sort columns"))?;
     let cols_str = &sql[paren_start + 1..paren_end];
     let sort_columns = parse_sort_columns(cols_str)?;
 
@@ -87,15 +88,15 @@ pub async fn drop_sorted_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
     let rest = upper
         .strip_prefix("DROP SORTED INDEX ")
-        .ok_or_else(|| sqlstate_error("42601", "expected DROP SORTED INDEX"))?;
+        .ok_or_else(|| ddl_err("42601", "expected DROP SORTED INDEX"))?;
     let index_name = rest
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "missing index name"))?
+        .ok_or_else(|| ddl_err("42601", "missing index name"))?
         .to_lowercase();
 
     let plan = PhysicalPlan::Kv(KvOp::DropSortedIndex {
@@ -112,10 +113,10 @@ pub async fn select_rank(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql)?;
     if args.len() < 2 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "RANK requires 2 arguments: (index_name, key_value)",
         ));
@@ -138,10 +139,10 @@ pub async fn select_topk(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql)?;
     if args.len() < 2 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "TOPK requires 2 arguments: (index_name, k)",
         ));
@@ -149,9 +150,9 @@ pub async fn select_topk(
 
     let index_name = unquote(&args[0]).to_lowercase();
     let k: u32 = args[1].trim().parse().map_err(|_| {
-        sqlstate_error(
+        ddl_err(
             "42601",
-            &format!("TOPK: k must be a positive integer, got '{}'", args[1]),
+            format!("TOPK: k must be a positive integer, got '{}'", args[1]),
         )
     })?;
 
@@ -169,10 +170,10 @@ pub async fn select_range(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql)?;
     if args.len() < 3 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "RANGE requires 3 arguments: (index_name, score_min, score_max)",
         ));
@@ -197,10 +198,10 @@ pub async fn select_sorted_count(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql)?;
     if args.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "SORTED_COUNT requires 1 argument: (index_name)",
         ));
@@ -218,7 +219,7 @@ pub async fn select_sorted_count(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-fn parse_sort_columns(cols_str: &str) -> PgWireResult<Vec<(String, String)>> {
+fn parse_sort_columns(cols_str: &str) -> Result<Vec<(String, String)>, DdlError> {
     let mut columns = Vec::new();
     for part in cols_str.split(',') {
         let tokens: Vec<&str> = part.split_whitespace().collect();
@@ -232,33 +233,33 @@ fn parse_sort_columns(cols_str: &str) -> PgWireResult<Vec<(String, String)>> {
             "ASC".into()
         };
         if dir != "ASC" && dir != "DESC" {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42601",
-                &format!("invalid sort direction '{dir}', expected ASC or DESC"),
+                format!("invalid sort direction '{dir}', expected ASC or DESC"),
             ));
         }
         columns.push((name, dir));
     }
     if columns.is_empty() {
-        return Err(sqlstate_error("42601", "at least one sort column required"));
+        return Err(ddl_err("42601", "at least one sort column required"));
     }
     Ok(columns)
 }
 
-fn parse_key_column(upper: &str, _sql: &str) -> PgWireResult<String> {
+fn parse_key_column(upper: &str, _sql: &str) -> Result<String, DdlError> {
     // Look for "KEY <column_name>" after the closing paren.
     let key_pos = upper
         .find(") KEY ")
         .or_else(|| upper.find(")KEY "))
-        .ok_or_else(|| sqlstate_error("42601", "missing KEY clause"))?;
+        .ok_or_else(|| ddl_err("42601", "missing KEY clause"))?;
     let after_key = upper[key_pos..].trim_start_matches(')').trim();
     let after_key = after_key
         .strip_prefix("KEY ")
-        .ok_or_else(|| sqlstate_error("42601", "missing KEY clause"))?;
+        .ok_or_else(|| ddl_err("42601", "missing KEY clause"))?;
     let key_col = after_key
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "missing key column name"))?
+        .ok_or_else(|| ddl_err("42601", "missing key column name"))?
         .trim_end_matches(';')
         .to_lowercase();
     Ok(key_col)
@@ -312,13 +313,13 @@ fn parse_window_clause(upper: &str, _sql: &str) -> (String, String, u64, u64) {
     }
 }
 
-fn parse_function_args(sql: &str) -> PgWireResult<Vec<String>> {
+fn parse_function_args(sql: &str) -> Result<Vec<String>, DdlError> {
     let start = sql
         .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected '(' in function call"))?;
+        .ok_or_else(|| ddl_err("42601", "expected '(' in function call"))?;
     let end = sql
         .rfind(')')
-        .ok_or_else(|| sqlstate_error("42601", "expected ')' in function call"))?;
+        .ok_or_else(|| ddl_err("42601", "expected ')' in function call"))?;
     if start >= end {
         return Ok(Vec::new());
     }
@@ -355,7 +356,7 @@ async fn dispatch_and_respond_tag(
     vshard: VShardId,
     plan: PhysicalPlan,
     tag: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         identity.tenant_id,
@@ -366,10 +367,11 @@ async fn dispatch_and_respond_tag(
     )
     .await
     {
-        Ok(_) => Ok(vec![Response::Execution(pgwire::api::results::Tag::new(
-            tag,
-        ))]),
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Ok(_) => Ok(vec![DdlResult::Status {
+            command: tag.to_string(),
+            rows_affected: None,
+        }]),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
@@ -380,7 +382,7 @@ async fn dispatch_and_respond_json(
     vshard: VShardId,
     plan: PhysicalPlan,
     col_name: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         identity.tenant_id,
@@ -394,16 +396,16 @@ async fn dispatch_and_respond_json(
         Ok(resp) => {
             let payload_text =
                 crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            let schema = std::sync::Arc::new(vec![text_field(col_name)]);
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            let _ = encoder.encode_field(&payload_text);
-            let row = encoder.take_row();
-            Ok(vec![Response::Query(QueryResponse::new(
-                schema,
-                stream::iter(vec![Ok(row)]),
-            ))])
+            let mut row = Map::new();
+            row.insert(col_name.to_string(), JsonValue::String(payload_text));
+            Ok(vec![DdlResult::Rows(ShapedRows {
+                columns: vec![col_name.to_string()],
+                column_types: ShapedRows::text_types(1),
+                rows: vec![row],
+                notice: None,
+            })])
         }
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
@@ -413,7 +415,7 @@ async fn dispatch_and_respond_rows(
     identity: &AuthenticatedIdentity,
     vshard: VShardId,
     plan: PhysicalPlan,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         identity.tenant_id,
@@ -425,42 +427,41 @@ async fn dispatch_and_respond_rows(
     .await
     {
         Ok(resp) => {
-            let schema = std::sync::Arc::new(vec![text_field("rank"), text_field("key")]);
-
             let rows_json: Vec<serde_json::Value> =
                 sonic_rs::from_slice(&resp.payload).unwrap_or_default();
 
             let mut rows = Vec::with_capacity(rows_json.len());
-            for row in &rows_json {
-                let mut encoder = DataRowEncoder::new(schema.clone());
-                let rank = row
+            for row_json in &rows_json {
+                let rank = row_json
                     .get("rank")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0)
                     .to_string();
-                let key = row
+                let key = row_json
                     .get("key")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let _ = encoder.encode_field(&rank);
-                let _ = encoder.encode_field(&key);
-                rows.push(Ok(encoder.take_row()));
+                let mut row = Map::new();
+                row.insert("rank".to_string(), JsonValue::String(rank));
+                row.insert("key".to_string(), JsonValue::String(key));
+                rows.push(row);
             }
 
-            Ok(vec![Response::Query(QueryResponse::new(
-                schema,
-                stream::iter(rows),
-            ))])
+            Ok(vec![DdlResult::Rows(ShapedRows {
+                columns: vec!["rank".to_string(), "key".to_string()],
+                column_types: ShapedRows::text_types(2),
+                rows,
+                notice: None,
+            })])
         }
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
-fn text_field(name: &str) -> FieldInfo {
-    super::super::types::text_field(name)
-}
-
-fn sqlstate_error(code: &str, message: &str) -> pgwire::error::PgWireError {
-    super::super::types::sqlstate_error(code, message)
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
 }

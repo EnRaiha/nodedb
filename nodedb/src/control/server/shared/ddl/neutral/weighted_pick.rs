@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! WEIGHTED_PICK SQL table-valued function for weighted random selection.
+//! Protocol-neutral WEIGHTED_PICK SQL table-valued function for weighted random
+//! selection.
 //!
 //! `SELECT * FROM WEIGHTED_PICK('collection', weight => 'weight_col', count => N
 //!     [, SEED => 'seed_string'] [, AUDIT => TRUE] [, WITH REPLACEMENT])`
@@ -13,28 +14,28 @@
 //! 5. Optionally log the pick to `_system.random_audit`.
 //! 6. Return selected rows with (pick_index, key, weight) columns.
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
-use sonic_rs;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::engine::random::alias::AliasTable;
 use crate::engine::random::csprng::SeedableRng;
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::KvOp;
 
+use super::super::result::{DdlError, DdlResult};
+
 /// Handle `SELECT * FROM WEIGHTED_PICK('collection', weight => 'col', count => N, ...)`
 pub async fn weighted_pick(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let args = super::kv_atomic::parse_function_args(sql, "WEIGHTED_PICK")?;
     if args.len() < 3 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "WEIGHTED_PICK requires at least 3 arguments: (collection, weight => 'col', count => N)",
         ));
@@ -57,9 +58,9 @@ pub async fn weighted_pick(
             weight_col = unquote(&val).to_lowercase();
         } else if let Some(val) = strip_named_param(&upper, trimmed, "COUNT") {
             count = val.trim().parse().map_err(|_| {
-                sqlstate_error(
+                ddl_err(
                     "42601",
-                    &format!("count must be a positive integer, got '{val}'"),
+                    format!("count must be a positive integer, got '{val}'"),
                 )
             })?;
         } else if let Some(val) = strip_named_param(&upper, trimmed, "SEED") {
@@ -74,13 +75,13 @@ pub async fn weighted_pick(
     }
 
     if weight_col.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "WEIGHTED_PICK: missing 'weight' parameter",
         ));
     }
     if count == 0 {
-        return Err(sqlstate_error("42601", "WEIGHTED_PICK: count must be >= 1"));
+        return Err(ddl_err("42601", "WEIGHTED_PICK: count must be >= 1"));
     }
 
     let tenant_id = identity.tenant_id;
@@ -89,7 +90,7 @@ pub async fn weighted_pick(
     // Step 1: Scan the collection to get all entries.
     let entries = scan_all_entries(state, tenant_id, vshard, &collection).await?;
     if entries.is_empty() {
-        return respond_empty();
+        return Ok(vec![empty_pick_rows()]);
     }
 
     // Step 2: Extract weights and build alias table.
@@ -100,9 +101,9 @@ pub async fn weighted_pick(
         let key_str = String::from_utf8_lossy(key_bytes).to_string();
         let weight = extract_weight(value_bytes, &weight_col).unwrap_or(0.0);
         if weight < 0.0 {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42601",
-                &format!("WEIGHTED_PICK: negative weight {weight} for key '{key_str}'"),
+                format!("WEIGHTED_PICK: negative weight {weight} for key '{key_str}'"),
             ));
         }
         keys.push(key_str);
@@ -110,7 +111,7 @@ pub async fn weighted_pick(
     }
 
     let table = AliasTable::new(&weights)
-        .ok_or_else(|| sqlstate_error("42601", "WEIGHTED_PICK: all weights are zero or empty"))?;
+        .ok_or_else(|| ddl_err("42601", "WEIGHTED_PICK: all weights are zero or empty"))?;
 
     // Step 3: Sample.
     let mut rng = match &seed {
@@ -188,25 +189,27 @@ pub async fn weighted_pick(
     }
 
     // Step 5: Build response rows.
-    let schema = std::sync::Arc::new(vec![
-        super::super::types::text_field("pick_index"),
-        super::super::types::text_field("key"),
-        super::super::types::text_field("weight"),
-    ]);
-
     let mut rows = Vec::with_capacity(selected_indices.len());
     for (pick_idx, &item_idx) in selected_indices.iter().enumerate() {
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        let _ = encoder.encode_field(&(pick_idx + 1).to_string());
-        let _ = encoder.encode_field(&keys[item_idx]);
-        let _ = encoder.encode_field(&weights[item_idx].to_string());
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert(
+            "pick_index".to_string(),
+            JsonValue::String((pick_idx + 1).to_string()),
+        );
+        row.insert("key".to_string(), JsonValue::String(keys[item_idx].clone()));
+        row.insert(
+            "weight".to_string(),
+            JsonValue::String(weights[item_idx].to_string()),
+        );
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: pick_columns(),
+        column_types: ShapedRows::text_types(3),
+        rows,
+        notice: None,
+    })])
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -217,7 +220,7 @@ async fn scan_all_entries(
     tenant_id: crate::types::TenantId,
     vshard: VShardId,
     collection: &str,
-) -> PgWireResult<Vec<(Vec<u8>, Vec<u8>)>> {
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DdlError> {
     let plan = PhysicalPlan::Kv(KvOp::Scan {
         collection: collection.to_string(),
         cursor: Vec::new(),
@@ -237,7 +240,7 @@ async fn scan_all_entries(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     if resp.status != Status::Ok {
         return Ok(Vec::new());
@@ -293,16 +296,23 @@ fn strip_named_param(upper: &str, original: &str, name: &str) -> Option<String> 
     }
 }
 
-fn respond_empty() -> PgWireResult<Vec<Response>> {
-    let schema = std::sync::Arc::new(vec![
-        super::super::types::text_field("pick_index"),
-        super::super::types::text_field("key"),
-        super::super::types::text_field("weight"),
-    ]);
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![]),
-    ))])
+/// Column names for the WEIGHTED_PICK result set.
+fn pick_columns() -> Vec<String> {
+    vec![
+        "pick_index".to_string(),
+        "key".to_string(),
+        "weight".to_string(),
+    ]
+}
+
+/// Empty (no-rows) result set with the WEIGHTED_PICK schema.
+fn empty_pick_rows() -> DdlResult {
+    DdlResult::Rows(ShapedRows {
+        columns: pick_columns(),
+        column_types: ShapedRows::text_types(3),
+        rows: Vec::new(),
+        notice: None,
+    })
 }
 
 fn unquote(s: &str) -> String {
@@ -322,6 +332,9 @@ fn unix_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn sqlstate_error(code: &str, message: &str) -> pgwire::error::PgWireError {
-    super::super::types::sqlstate_error(code, message)
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
 }

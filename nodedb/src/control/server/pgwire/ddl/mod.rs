@@ -17,9 +17,6 @@ pub mod field_def;
 pub mod impersonation_ddl;
 pub mod inspect;
 pub mod inspect_audit;
-pub mod kv_atomic;
-pub mod kv_sorted_index;
-pub mod last_value;
 pub mod match_ops;
 pub mod metering_ddl;
 pub mod observability;
@@ -29,7 +26,6 @@ pub(crate) mod parse_utils;
 pub mod period_lock;
 pub mod permission_tree;
 pub mod pubsub;
-pub mod rate_gate;
 #[path = "router/mod.rs"]
 pub mod router;
 pub mod schema_validation;
@@ -44,9 +40,5 @@ pub mod sync_dispatch;
 pub mod system_ddl;
 pub mod temp_table;
 pub mod tenant;
-pub mod timeseries;
-mod timeseries_helpers;
-pub mod transfer;
-pub mod weighted_pick;
 
 pub use router::dispatch;

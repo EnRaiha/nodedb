@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Rate gate / cooldown SQL functions.
+//! Protocol-neutral rate gate / cooldown SQL functions.
 //!
 //! `SELECT RATE_CHECK(gate_name, key, max_count, window_secs)`
 //!   — Atomically increments a counter for `(gate, key)`.
@@ -14,16 +14,14 @@
 //! `SELECT RATE_RESET(gate_name, key)`
 //!   — Deletes the counter key (admin cooldown clear).
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
-use sonic_rs;
-
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::KvOp;
+
+use super::super::result::{DdlError, DdlResult};
+use super::kv_atomic::single_text_col;
 
 /// Internal collection used for rate gate counters.
 const RATE_COLLECTION: &str = "_system_rate_gates";
@@ -33,10 +31,10 @@ pub async fn rate_check(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let args = super::kv_atomic::parse_function_args(sql, "RATE_CHECK")?;
     if args.len() < 4 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "RATE_CHECK requires 4 arguments: (gate_name, key, max_count, window_secs)",
         ));
@@ -48,16 +46,10 @@ pub async fn rate_check(
     let window_secs: u64 = parse_u64(&args[3], "RATE_CHECK", "window_secs")?;
 
     if max_count <= 0 {
-        return Err(sqlstate_error(
-            "42601",
-            "RATE_CHECK: max_count must be positive",
-        ));
+        return Err(ddl_err("42601", "RATE_CHECK: max_count must be positive"));
     }
     if window_secs == 0 {
-        return Err(sqlstate_error(
-            "42601",
-            "RATE_CHECK: window_secs must be positive",
-        ));
+        return Err(ddl_err("42601", "RATE_CHECK: window_secs must be positive"));
     }
 
     let rate_key = format!("_rate:{gate_name}:{key}");
@@ -124,9 +116,9 @@ pub async fn rate_check(
             if current > max_count {
                 // Read TTL to compute retry_after_ms.
                 let ttl_remaining = read_ttl_ms(state, tenant_id, vshard, &rate_key).await;
-                Err(sqlstate_error(
+                Err(ddl_err(
                     "54001",
-                    &format!(
+                    format!(
                         "rate limit exceeded for {gate_name}:{key}, retry after {ttl_remaining}ms (current={current}, max={max_count})"
                     ),
                 ))
@@ -137,15 +129,15 @@ pub async fn rate_check(
                     "max_count": max_count,
                     "remaining": max_count - current,
                 });
-                respond_json("rate_check", &result.to_string())
+                Ok(vec![single_text_col("rate_check", result.to_string())])
             }
         }
         Ok(resp) => {
             let payload_text =
                 crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            Err(sqlstate_error("XX000", &payload_text))
+            Err(ddl_err("XX000", payload_text))
         }
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
@@ -154,10 +146,10 @@ pub async fn rate_remaining(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let args = super::kv_atomic::parse_function_args(sql, "RATE_REMAINING")?;
     if args.len() < 4 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "RATE_REMAINING requires 4 arguments: (gate_name, key, max_count, window_secs)",
         ));
@@ -210,7 +202,7 @@ pub async fn rate_remaining(
         "max_count": max_count,
         "resets_in_ms": ttl_remaining,
     });
-    respond_json("rate_remaining", &result.to_string())
+    Ok(vec![single_text_col("rate_remaining", result.to_string())])
 }
 
 /// Handle `SELECT RATE_RESET(gate_name, key)`
@@ -218,10 +210,10 @@ pub async fn rate_reset(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let args = super::kv_atomic::parse_function_args(sql, "RATE_RESET")?;
     if args.len() < 2 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "RATE_RESET requires 2 arguments: (gate_name, key)",
         ));
@@ -255,9 +247,9 @@ pub async fn rate_reset(
                 "key": key,
                 "reset": true,
             });
-            respond_json("rate_reset", &result.to_string())
+            Ok(vec![single_text_col("rate_reset", result.to_string())])
         }
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
@@ -298,17 +290,6 @@ async fn read_ttl_ms(
     }
 }
 
-fn respond_json(col_name: &str, json_text: &str) -> PgWireResult<Vec<Response>> {
-    let schema = std::sync::Arc::new(vec![super::super::types::text_field(col_name)]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    let _ = encoder.encode_field(&json_text.to_string());
-    let row = encoder.take_row();
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(row)]),
-    ))])
-}
-
 fn unquote(s: &str) -> String {
     let t = s.trim();
     if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
@@ -318,20 +299,20 @@ fn unquote(s: &str) -> String {
     }
 }
 
-fn parse_i64(s: &str, func: &str, param: &str) -> PgWireResult<i64> {
+fn parse_i64(s: &str, func: &str, param: &str) -> Result<i64, DdlError> {
     s.trim().parse().map_err(|_| {
-        sqlstate_error(
+        ddl_err(
             "42601",
-            &format!("{func}: {param} must be an integer, got '{}'", s.trim()),
+            format!("{func}: {param} must be an integer, got '{}'", s.trim()),
         )
     })
 }
 
-fn parse_u64(s: &str, func: &str, param: &str) -> PgWireResult<u64> {
+fn parse_u64(s: &str, func: &str, param: &str) -> Result<u64, DdlError> {
     s.trim().parse().map_err(|_| {
-        sqlstate_error(
+        ddl_err(
             "42601",
-            &format!(
+            format!(
                 "{func}: {param} must be a positive integer, got '{}'",
                 s.trim()
             ),
@@ -339,6 +320,9 @@ fn parse_u64(s: &str, func: &str, param: &str) -> PgWireResult<u64> {
     })
 }
 
-fn sqlstate_error(code: &str, message: &str) -> pgwire::error::PgWireError {
-    super::super::types::sqlstate_error(code, message)
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
 }

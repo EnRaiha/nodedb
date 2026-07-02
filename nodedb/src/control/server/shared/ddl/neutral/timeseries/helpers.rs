@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Internal helpers for timeseries DDL handlers.
+//! Internal helpers for the protocol-neutral timeseries DDL handlers.
+
+use super::super::super::result::DdlError;
+
+/// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
+pub(super) fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// Parse a `WITH (key = 'value', ...)` clause from a split DDL statement.
 ///

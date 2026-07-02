@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Atomic transfer SQL functions: TRANSFER (fungible) and TRANSFER_ITEM (non-fungible).
+//! Protocol-neutral atomic transfer SQL functions: TRANSFER (fungible) and
+//! TRANSFER_ITEM (non-fungible).
 //!
 //! `SELECT TRANSFER(collection, source_key, dest_key, field, amount)`
 //!   — Atomically: source.field -= amount, dest.field += amount.
@@ -15,24 +16,23 @@
 //! Both dispatch to the Data Plane as dedicated KvOp variants. The entire
 //! read-validate-write executes in a single TPC core pass — no TOCTOU race.
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
-
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+
+use super::super::result::{DdlError, DdlResult};
+use super::kv_atomic::{parse_function_args, single_text_col};
 
 /// Handle `SELECT TRANSFER(collection, source_key, dest_key, field, amount)`
 pub async fn transfer(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
-    let args = super::kv_atomic::parse_function_args(sql, "TRANSFER")?;
+) -> Result<Vec<DdlResult>, DdlError> {
+    let args = parse_function_args(sql, "TRANSFER")?;
     if args.len() < 5 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "TRANSFER requires 5 arguments: (collection, source_key, dest_key, field, amount)",
         ));
@@ -44,14 +44,14 @@ pub async fn transfer(
     let field = unquote(&args[3]);
     let amount_str = args[4].trim().to_string();
     let amount: f64 = amount_str.parse().map_err(|_| {
-        sqlstate_error(
+        ddl_err(
             "42601",
-            &format!("TRANSFER: amount must be a number, got '{amount_str}'"),
+            format!("TRANSFER: amount must be a number, got '{amount_str}'"),
         )
     })?;
 
     if amount <= 0.0 {
-        return Err(sqlstate_error("42601", "TRANSFER: amount must be positive"));
+        return Err(ddl_err("42601", "TRANSFER: amount must be positive"));
     }
 
     let tenant_id = identity.tenant_id;
@@ -79,9 +79,9 @@ pub async fn transfer(
         Ok(resp) => {
             let payload_text =
                 crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            respond_json("transfer", &payload_text)
+            Ok(vec![single_text_col("transfer", payload_text)])
         }
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
@@ -90,10 +90,10 @@ pub async fn transfer_item(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
-    let args = super::kv_atomic::parse_function_args(sql, "TRANSFER_ITEM")?;
+) -> Result<Vec<DdlResult>, DdlError> {
+    let args = parse_function_args(sql, "TRANSFER_ITEM")?;
     if args.len() < 5 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "TRANSFER_ITEM requires 5 arguments: (source_collection, dest_collection, item_id, source_owner, dest_owner)",
         ));
@@ -110,9 +110,9 @@ pub async fn transfer_item(
     let vshard_src = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &source_collection);
     let vshard_dst = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &dest_collection);
     if source_collection != dest_collection && vshard_src != vshard_dst {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "0A000",
-            &format!(
+            format!(
                 "TRANSFER_ITEM: cross-shard transfer not supported \
                  (source '{}' and dest '{}' map to different vShards)",
                 source_collection, dest_collection
@@ -145,24 +145,13 @@ pub async fn transfer_item(
         Ok(resp) => {
             let payload_text =
                 crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            respond_json("transfer_item", &payload_text)
+            Ok(vec![single_text_col("transfer_item", payload_text)])
         }
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Err(e) => Err(ddl_err("XX000", e.to_string())),
     }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
-
-fn respond_json(col_name: &str, json_text: &str) -> PgWireResult<Vec<Response>> {
-    let schema = std::sync::Arc::new(vec![super::super::types::text_field(col_name)]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    let _ = encoder.encode_field(&json_text.to_string());
-    let row = encoder.take_row();
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(row)]),
-    ))])
-}
 
 fn unquote(s: &str) -> String {
     let t = s.trim();
@@ -173,6 +162,9 @@ fn unquote(s: &str) -> String {
     }
 }
 
-fn sqlstate_error(code: &str, message: &str) -> pgwire::error::PgWireError {
-    super::super::types::sqlstate_error(code, message)
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
 }

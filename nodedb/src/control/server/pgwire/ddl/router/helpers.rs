@@ -303,29 +303,3 @@ pub(super) fn explain_tiers(
         stream::iter(rows),
     ))])
 }
-
-/// Extract a single-quoted argument from `FUNC_NAME('value')`.
-pub(super) fn extract_quoted_arg(sql: &str, prefix: &str) -> Option<String> {
-    let upper = sql.to_uppercase();
-    let pos = upper.find(&prefix.to_uppercase())?;
-    let after = &sql[pos + prefix.len()..];
-    let start = after.find('\'')?;
-    let end = after[start + 1..].find('\'')?;
-    Some(after[start + 1..start + 1 + end].to_string())
-}
-
-/// Extract `('collection', series_id)` from LAST_VALUE call.
-pub(super) fn extract_lv_args(sql: &str) -> Option<(String, u64)> {
-    let upper = sql.to_uppercase();
-    let pos = upper.find("LAST_VALUE(")?;
-    let after = &sql[pos + 11..];
-    let close = after.find(')')?;
-    let inner = &after[..close];
-    let parts: Vec<&str> = inner.splitn(2, ',').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let collection = parts[0].trim().trim_matches('\'').to_string();
-    let series_id: u64 = parts[1].trim().parse().ok()?;
-    Some((collection, series_id))
-}
