@@ -102,6 +102,7 @@ impl CoreLoop {
                         document_id: &row_key,
                         surrogate: *surrogate,
                         value,
+                        index_text: true,
                     },
                 )
                 .map_err(|e| {

@@ -48,6 +48,7 @@ impl CoreLoop {
                 document_id: row_key,
                 surrogate,
                 value,
+                index_text: true,
             },
         ) {
             Ok(p) => p,

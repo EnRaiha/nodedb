@@ -8,21 +8,31 @@
 //! schemaless put does. These helpers are split out of `crdt.rs` to keep that
 //! file within the file-size limit; they extend `CoreLoop` with the encode +
 //! write steps invoked from `execute_crdt_apply`.
+//!
+//! Materialization reuses the same `apply_point_put` transaction helper the
+//! native put path uses, so a synced document gets identical side effects:
+//! column statistics, aggregate-cache invalidation, document cache, secondary
+//! indexes, spatial R-tree, and vector index maintenance — plus a Data → Event
+//! Plane `WriteEvent` (tagged with the task's `CrdtSync` source, so CDC/change
+//! streams observe it while AFTER triggers do not cascade). The one deliberate
+//! exclusion is inverted BM25 text indexing: the sync stream delivers that via
+//! a separate `FtsIndexDoc` frame, so `index_text` is `false` here to avoid
+//! double-indexing the same surrogate.
 
 use tracing::warn;
 
 use nodedb_types::Surrogate;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format::canonicalize_document_for_storage;
+use crate::data::executor::handlers::point::apply_put::PointPutParams;
+use crate::data::executor::task::ExecutionTask;
 use crate::engine::crdt::tenant_state::TenantCrdtEngine;
 use crate::engine::document::crdt_store::loro_value_to_json;
 use crate::engine::document::store::surrogate_to_doc_id;
-use crate::engine::sparse::btree_versioned::VersionedPut;
 
 impl CoreLoop {
-    /// Read the merged Loro row back and encode it into the canonical
-    /// schemaless storage bytes the native put path writes.
+    /// Read the merged Loro row back and encode it into the schemaless
+    /// MessagePack bytes the native put path accepts.
     ///
     /// Called while the CRDT engine `&mut` borrow is still live (the borrow
     /// checker forbids touching `self.sparse` here), so it is an associated
@@ -31,6 +41,11 @@ impl CoreLoop {
     /// the sparse write. A materialization miss must never fail the delta
     /// apply: the Loro merge has already succeeded and the sync stream must
     /// not wedge.
+    ///
+    /// The returned bytes are the pre-canonicalization MessagePack, matching
+    /// the raw `value` a native put receives; `apply_point_put` canonicalizes
+    /// (or Binary-Tuple-encodes) internally, so encoding here would diverge
+    /// from the native pipeline.
     pub(super) fn encode_crdt_row(
         engine: &TenantCrdtEngine,
         collection: &str,
@@ -38,55 +53,86 @@ impl CoreLoop {
     ) -> Option<Vec<u8>> {
         let loro_val = engine.read_row(collection, document_id)?;
         let json = loro_value_to_json(&loro_val);
-        let msgpack = nodedb_types::json_to_msgpack(&json).ok()?;
-        Some(canonicalize_document_for_storage(&msgpack))
+        nodedb_types::json_to_msgpack(&json).ok()
     }
 
-    /// Write the merged CRDT document into the sparse document store so
-    /// `DocumentScan` / `ShapeSnapshot` observe the synced write, matching the
-    /// key and bytes the native schemaless put path produces.
+    /// Write the merged CRDT document into the sparse document store — with the
+    /// same side effects a native schemaless put produces — so the synced write
+    /// is fully visible to scans, statistics, secondary/spatial/vector indexes,
+    /// and CDC.
     ///
-    /// The storage key is the hex-encoded surrogate (identical to the native
-    /// path), NOT the CRDT `document_id` (which is the user-facing Loro row
-    /// id). Bitemporal collections append a version per applied delta;
-    /// non-bitemporal collections overwrite by key (idempotent under replay).
-    /// FTS is intentionally NOT indexed here — the sync path delivers a
-    /// separate `FtsIndex` frame, and re-indexing would double-index. A write
-    /// failure is logged and swallowed so a materialization miss never wedges
-    /// the sync stream.
+    /// Routes through `apply_point_put` inside a single write transaction, then
+    /// commits and emits the `WriteEvent`, mirroring `execute_point_put`. The
+    /// storage key is the hex-encoded surrogate (identical to the native path),
+    /// NOT the CRDT `document_id` (the user-facing Loro row id); bitemporal
+    /// collections append a version per applied delta (handled inside
+    /// `apply_point_put`), non-bitemporal collections overwrite by key
+    /// (idempotent under replay). Inverted BM25 text indexing is skipped
+    /// (`index_text: false`) — the sync path delivers a separate `FtsIndex`
+    /// frame. Any failure is logged and swallowed (the transaction is dropped,
+    /// leaving no partial write) so a materialization miss never wedges the
+    /// sync stream.
     pub(super) fn materialize_synced_document(
-        &self,
-        database_id: u64,
+        &mut self,
+        task: &ExecutionTask,
         tid: u64,
         collection: &str,
         surrogate: Surrogate,
-        stored: &[u8],
+        value: &[u8],
     ) {
+        let database_id = task.request.database_id.as_u64();
         let storage_key = surrogate_to_doc_id(surrogate);
-        let result = if self.is_bitemporal(tid, collection) {
-            self.sparse.versioned_put(VersionedPut {
-                database_id,
-                tenant: tid,
-                coll: collection,
-                doc_id: storage_key.as_str(),
-                sys_from_ms: self.bitemporal_now_ms(),
-                valid_from_ms: i64::MIN,
-                valid_until_ms: i64::MAX,
-                body: stored,
-            })
-        } else {
-            self.sparse
-                .put(database_id, tid, collection, storage_key.as_str(), stored)
-                .map(|_| ())
+
+        let txn = match self.sparse.begin_write() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(core = self.core_id, %collection, error = %e, "crdt sync materialize: begin_write failed");
+                return;
+            }
         };
-        if let Err(e) = result {
-            warn!(
-                core = self.core_id,
-                %collection,
-                document_id = %storage_key,
-                error = %e,
-                "crdt sync materialize into sparse document store failed"
-            );
+
+        let prior = match self.apply_point_put(
+            &txn,
+            PointPutParams {
+                database_id,
+                tid,
+                collection,
+                document_id: storage_key.as_str(),
+                surrogate,
+                value,
+                index_text: false,
+            },
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    core = self.core_id,
+                    %collection,
+                    document_id = %storage_key,
+                    error = %e,
+                    "crdt sync materialize into sparse document store failed"
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = txn.commit() {
+            warn!(core = self.core_id, %collection, error = %e, "crdt sync materialize: commit failed");
+            return;
         }
+
+        self.checkpoint_coordinator.mark_dirty("sparse", 1);
+
+        // Data → Event Plane. The task carries `EventSource::CrdtSync`, so CDC /
+        // change streams observe the synced write while AFTER triggers skip it
+        // (non-User events do not cascade).
+        self.emit_put_event(
+            task,
+            tid,
+            collection,
+            storage_key.as_str(),
+            value,
+            prior.as_deref(),
+        );
     }
 }

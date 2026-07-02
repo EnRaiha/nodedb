@@ -271,7 +271,7 @@ impl CoreLoop {
             // store so DocumentScan / ShapeSnapshot see the synced document.
             if let Some(bytes) = materialized {
                 self.materialize_synced_document(
-                    task.request.database_id.as_u64(),
+                    task,
                     tenant_id.as_u64(),
                     collection,
                     surrogate,
@@ -389,7 +389,7 @@ impl CoreLoop {
                 // is Some only on a Clean apply with an assigned surrogate.
                 if let Some(bytes) = materialized {
                     self.materialize_synced_document(
-                        task.request.database_id.as_u64(),
+                        task,
                         tenant_id.as_u64(),
                         collection,
                         surrogate,

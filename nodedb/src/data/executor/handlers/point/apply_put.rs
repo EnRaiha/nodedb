@@ -19,6 +19,13 @@ pub(in crate::data::executor) struct PointPutParams<'a> {
     pub document_id: &'a str,
     pub surrogate: Surrogate,
     pub value: &'a [u8],
+    /// Whether to index the document's text into the inverted BM25 index.
+    ///
+    /// `true` for native writes (PointPut/Insert/Upsert/batch/insert-select),
+    /// which own the full write. `false` for CRDT-sync materialization: that
+    /// path receives text via a separate `FtsIndexDoc` sync frame, so indexing
+    /// here too would double-index the same surrogate.
+    pub index_text: bool,
 }
 
 impl CoreLoop {
@@ -47,6 +54,7 @@ impl CoreLoop {
             document_id,
             surrogate,
             value,
+            index_text,
         } = params;
         // Evaluate generated columns before encoding.
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
@@ -170,7 +178,8 @@ impl CoreLoop {
                     .filter_map(|v| v.as_str())
                     .collect::<Vec<_>>()
                     .join(" ");
-                if !text_content.is_empty()
+                if index_text
+                    && !text_content.is_empty()
                     && let Err(e) = self.inverted.index_document_in_txn(
                         txn,
                         crate::engine::sparse::inverted::IndexDocScope {

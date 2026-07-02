@@ -93,6 +93,7 @@ impl CoreLoop {
                     document_id: source_id,
                     surrogate: source_surrogate,
                     value,
+                    index_text: true,
                 },
             ) {
                 return self.response_error(
