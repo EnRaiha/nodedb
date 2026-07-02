@@ -2,7 +2,7 @@
 
 //! `CREATE [OR REPLACE] FUNCTION` — split by concern.
 //!
-//! - [`handler`] — the `create_function` pgwire entry point
+//! - [`handler`] — the `create_function` protocol-neutral entry point
 //! - [`parse`]   — `CREATE FUNCTION` grammar parser
 //! - [`deps`]    — dependency extraction from function bodies
 

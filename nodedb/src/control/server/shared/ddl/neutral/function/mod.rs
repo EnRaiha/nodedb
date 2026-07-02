@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+//! Protocol-neutral function DDL — CREATE / DROP / ALTER / SHOW, plus WASM
+//! scalar and aggregate function creation.
+
 pub mod alter;
 pub mod create;
 pub mod drop;

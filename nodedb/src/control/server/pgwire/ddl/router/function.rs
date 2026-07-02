@@ -13,38 +13,6 @@ pub(super) async fn dispatch(
     upper: &str,
     parts: &[&str],
 ) -> Option<PgWireResult<Vec<Response>>> {
-    // User-defined functions.
-    if upper.starts_with("CREATE OR REPLACE AGGREGATE FUNCTION ")
-        || upper.starts_with("CREATE AGGREGATE FUNCTION ")
-    {
-        return Some(super::super::function::create_wasm_aggregate(
-            state, identity, sql,
-        ));
-    }
-    if upper.starts_with("CREATE OR REPLACE FUNCTION ") || upper.starts_with("CREATE FUNCTION ") {
-        if upper.contains("LANGUAGE WASM") {
-            return Some(super::super::function::create_wasm_function(
-                state, identity, sql,
-            ));
-        }
-        return Some(super::super::function::create_function(
-            state, identity, sql,
-        ));
-    }
-    if upper.starts_with("DROP FUNCTION ") {
-        return Some(super::super::function::drop_function(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("ALTER FUNCTION ") {
-        return Some(super::super::function::alter_function(
-            state, identity, parts,
-        ));
-    }
-    if upper == "SHOW FUNCTIONS" || upper.starts_with("SHOW FUNCTIONS") {
-        return Some(super::super::function::show_functions(state, identity));
-    }
-
     // Stored procedures.
     if upper.starts_with("CREATE OR REPLACE PROCEDURE ") || upper.starts_with("CREATE PROCEDURE ") {
         return Some(super::super::procedure::create_procedure(

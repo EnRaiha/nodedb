@@ -6,13 +6,11 @@
 //! - The SQL expression is syntactically valid.
 //! - All referenced functions are known (system or user-defined).
 
-use pgwire::error::PgWireResult;
-
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::DdlError;
 use super::create::ParsedCreateFunction;
 
 /// Validate function body by attempting to parse it as a SQL expression.
-pub(super) fn validate_function_body(parsed: &ParsedCreateFunction) -> PgWireResult<()> {
+pub(super) fn validate_function_body(parsed: &ParsedCreateFunction) -> Result<(), DdlError> {
     let body = &parsed.body_sql;
 
     // Build the test SQL.
@@ -24,8 +22,11 @@ pub(super) fn validate_function_body(parsed: &ParsedCreateFunction) -> PgWireRes
 
     // Parse via sqlparser to check syntax.
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
-    let _statements = sqlparser::parser::Parser::parse_sql(&dialect, &test_sql)
-        .map_err(|e| sqlstate_error("42601", &format!("invalid function body: {e}")))?;
+    let _statements =
+        sqlparser::parser::Parser::parse_sql(&dialect, &test_sql).map_err(|e| DdlError {
+            sqlstate: "42601".to_string(),
+            message: format!("invalid function body: {e}"),
+        })?;
 
     Ok(())
 }

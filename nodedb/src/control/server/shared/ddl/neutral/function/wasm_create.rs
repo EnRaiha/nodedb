@@ -4,9 +4,13 @@
 //!
 //! Parses WASM function DDL, decodes the base64 binary, validates it,
 //! stores it in the WASM module store, and registers the function.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! Ported from the pgwire `ddl::function::wasm_create` handler. The catalog
+//! path is preserved verbatim — a WASM function is written with a direct
+//! `catalog.put_function` (NOT through the metadata-raft propose path), and the
+//! `audit_record` call is retained. Only the result construction changed from
+//! pgwire `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
+//! [`DdlError`].
 
 use crate::control::planner::wasm;
 use crate::control::security::catalog::{
@@ -15,7 +19,8 @@ use crate::control::security::catalog::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
 use super::parse::parse_function_header;
 
 /// Handle `CREATE [OR REPLACE] FUNCTION ... LANGUAGE WASM AS '<base64>'`
@@ -23,7 +28,7 @@ pub fn create_wasm_function(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create WASM functions")?;
 
     let parsed = parse_wasm_create(sql)?;
@@ -33,31 +38,43 @@ pub fn create_wasm_function(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        })?;
 
     if !parsed.or_replace
         && let Ok(Some(_)) = catalog.get_function(tenant_id, &parsed.name)
     {
-        return Err(sqlstate_error(
-            "42723",
-            &format!("function '{}' already exists", parsed.name),
-        ));
+        return Err(DdlError {
+            sqlstate: "42723".to_string(),
+            message: format!("function '{}' already exists", parsed.name),
+        });
     }
 
     // Decode base64 binary.
     use base64::Engine;
     let wasm_bytes = base64::engine::general_purpose::STANDARD
         .decode(&parsed.base64_body)
-        .map_err(|e| sqlstate_error("42601", &format!("invalid base64: {e}")))?;
+        .map_err(|e| DdlError {
+            sqlstate: "42601".to_string(),
+            message: format!("invalid base64: {e}"),
+        })?;
 
     // Store the WASM binary (validates magic header + size limit).
     let config = wasm::WasmConfig::default();
     let hash = wasm::store::store_wasm_binary(catalog, &wasm_bytes, config.max_binary_size)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: e.to_string(),
+        })?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock before UNIX epoch"))?
+        .map_err(|_| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system clock before UNIX epoch".to_string(),
+        })?
         .as_secs();
 
     let stored = StoredFunction {
@@ -79,9 +96,10 @@ pub fn create_wasm_function(
         modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
-    catalog
-        .put_function(&stored)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+    catalog.put_function(&stored).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("catalog write: {e}"),
+    })?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -90,7 +108,7 @@ pub fn create_wasm_function(
         &format!("CREATE FUNCTION {} LANGUAGE WASM", stored.name),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
+    Ok(status("CREATE FUNCTION"))
 }
 
 // ─── Parsing ────────────────────────────────────────────────────────────────
@@ -107,7 +125,7 @@ struct ParsedWasmCreate {
 
 /// Parse: CREATE [OR REPLACE] FUNCTION name(params) RETURNS type LANGUAGE WASM
 ///        [WITH (FUEL = N, MEMORY = N)] AS '<base64>'
-fn parse_wasm_create(sql: &str) -> PgWireResult<ParsedWasmCreate> {
+fn parse_wasm_create(sql: &str) -> Result<ParsedWasmCreate, DdlError> {
     let header = parse_function_header(sql, &[" LANGUAGE "])?;
 
     // rest starts with "LANGUAGE ..."
@@ -115,7 +133,10 @@ fn parse_wasm_create(sql: &str) -> PgWireResult<ParsedWasmCreate> {
     let after_lang = after_lang_kw.trim();
     let after_lang_upper = after_lang.to_uppercase();
     if !after_lang_upper.starts_with("WASM") {
-        return Err(sqlstate_error("42601", "expected LANGUAGE WASM"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected LANGUAGE WASM".to_string(),
+        });
     }
     let after_wasm = after_lang["WASM".len()..].trim();
 
@@ -125,7 +146,10 @@ fn parse_wasm_create(sql: &str) -> PgWireResult<ParsedWasmCreate> {
     // AS '<base64>'
     let after_with_upper = after_with.to_uppercase();
     if !after_with_upper.starts_with("AS") {
-        return Err(sqlstate_error("42601", "expected AS '<base64>'"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected AS '<base64>'".to_string(),
+        });
     }
     let body_part = after_with["AS".len()..].trim();
 
@@ -137,7 +161,10 @@ fn parse_wasm_create(sql: &str) -> PgWireResult<ParsedWasmCreate> {
     };
 
     if base64_body.is_empty() {
-        return Err(sqlstate_error("42601", "WASM binary body is empty"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "WASM binary body is empty".to_string(),
+        });
     }
 
     Ok(ParsedWasmCreate {
@@ -151,7 +178,7 @@ fn parse_wasm_create(sql: &str) -> PgWireResult<ParsedWasmCreate> {
     })
 }
 
-fn parse_wasm_with(s: &str) -> PgWireResult<(Option<u64>, Option<usize>, &str)> {
+fn parse_wasm_with(s: &str) -> Result<(Option<u64>, Option<usize>, &str), DdlError> {
     let upper = s.to_uppercase();
     if !upper.starts_with("WITH") {
         return Ok((None, None, s));
@@ -160,9 +187,10 @@ fn parse_wasm_with(s: &str) -> PgWireResult<(Option<u64>, Option<usize>, &str)> 
     if !after.starts_with('(') {
         return Ok((None, None, s));
     }
-    let close = after
-        .find(')')
-        .ok_or_else(|| sqlstate_error("42601", "unmatched '(' in WITH"))?;
+    let close = after.find(')').ok_or_else(|| DdlError {
+        sqlstate: "42601".to_string(),
+        message: "unmatched '(' in WITH".to_string(),
+    })?;
     let inner = &after[1..close];
     let rest = after[close + 1..].trim();
 

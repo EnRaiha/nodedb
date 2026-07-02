@@ -13,6 +13,7 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::result::{DdlError, DdlResult};
+use super::function;
 use super::grant;
 use super::oidc;
 use super::rls::{self, CreateRlsPolicyRequest};
@@ -76,6 +77,35 @@ pub async fn try_dispatch(
         return Some(service_account::alter_service_account_set_databases(
             state, identity, &parts,
         ));
+    }
+
+    // User-defined functions. None of `CREATE [OR REPLACE] [AGGREGATE] FUNCTION`,
+    // `DROP FUNCTION`, `ALTER FUNCTION`, or `SHOW FUNCTIONS` parse into any typed
+    // AST variant — the pgwire router dispatched all of them by string prefix
+    // from the raw SQL / token slice. Replicate that exactly here, before the
+    // parse gate, so the prefix recognition, `LANGUAGE WASM` branch, and syntax
+    // messages stay byte-identical.
+    if upper.starts_with("CREATE OR REPLACE AGGREGATE FUNCTION ")
+        || upper.starts_with("CREATE AGGREGATE FUNCTION ")
+    {
+        return Some(function::create_wasm_aggregate(state, identity, sql));
+    }
+    if upper.starts_with("CREATE OR REPLACE FUNCTION ") || upper.starts_with("CREATE FUNCTION ") {
+        if upper.contains("LANGUAGE WASM") {
+            return Some(function::create_wasm_function(state, identity, sql));
+        }
+        return Some(function::create_function(state, identity, sql));
+    }
+    if upper.starts_with("DROP FUNCTION ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(function::drop_function(state, identity, &parts));
+    }
+    if upper.starts_with("ALTER FUNCTION ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(function::alter_function(state, identity, &parts));
+    }
+    if upper == "SHOW FUNCTIONS" || upper.starts_with("SHOW FUNCTIONS") {
+        return Some(function::show_functions(state, identity));
     }
 
     // Parse errors / non-DDL / non-migrated families → let the pgwire path run,

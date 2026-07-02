@@ -3,11 +3,9 @@
 //! Parse a `CREATE [OR REPLACE] FUNCTION` statement into a
 //! typed `ParsedCreateFunction`.
 
-use pgwire::error::PgWireResult;
-
 use crate::control::security::catalog::{FunctionParam, FunctionVolatility};
+use crate::control::server::shared::ddl::result::DdlError;
 
-use super::super::super::super::types::sqlstate_error;
 use super::super::parse::parse_function_header;
 
 /// Parsed components of a `CREATE FUNCTION` statement.
@@ -29,7 +27,7 @@ pub struct ParsedCreateFunction {
 ///   [IMMUTABLE | STABLE | VOLATILE]
 ///   AS <sql_expression> ;
 /// ```
-pub fn parse_create_function(sql: &str) -> PgWireResult<ParsedCreateFunction> {
+pub fn parse_create_function(sql: &str) -> Result<ParsedCreateFunction, DdlError> {
     // Use shared header parser — SQL functions terminate return type at AS/volatility.
     let header = parse_function_header(sql, &[" AS ", " IMMUTABLE ", " STABLE ", " VOLATILE "])?;
 
@@ -37,7 +35,10 @@ pub fn parse_create_function(sql: &str) -> PgWireResult<ParsedCreateFunction> {
 
     let body_sql = body_part.trim().trim_end_matches(';').trim().to_string();
     if body_sql.is_empty() {
-        return Err(sqlstate_error("42601", "function body is empty"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "function body is empty".to_string(),
+        });
     }
 
     Ok(ParsedCreateFunction {
@@ -51,7 +52,7 @@ pub fn parse_create_function(sql: &str) -> PgWireResult<ParsedCreateFunction> {
 }
 
 /// Extract optional volatility keyword and the body after AS.
-fn extract_volatility_and_body(s: &str) -> PgWireResult<(FunctionVolatility, &str)> {
+fn extract_volatility_and_body(s: &str) -> Result<(FunctionVolatility, &str), DdlError> {
     let upper = s.to_uppercase();
     let mut rest = s;
     let mut volatility = FunctionVolatility::Immutable; // default
@@ -67,9 +68,15 @@ fn extract_volatility_and_body(s: &str) -> PgWireResult<(FunctionVolatility, &st
     let rest_upper = rest.to_uppercase();
     if !rest_upper.starts_with("AS ") && !rest_upper.starts_with("AS\n") {
         if rest_upper.starts_with("AS") {
-            return Err(sqlstate_error("42601", "expected function body after AS"));
+            return Err(DdlError {
+                sqlstate: "42601".to_string(),
+                message: "expected function body after AS".to_string(),
+            });
         }
-        return Err(sqlstate_error("42601", "expected AS <body>"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected AS <body>".to_string(),
+        });
     }
     let body = rest["AS".len()..].trim();
 

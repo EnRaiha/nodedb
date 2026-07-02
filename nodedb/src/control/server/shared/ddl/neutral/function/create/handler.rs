@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! The `create_function` pgwire handler.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! The protocol-neutral `create_function` handler.
+//!
+//! Ported from the pgwire `ddl::function::create` handler. All non-return logic
+//! (privilege gate, parsing, body compilation/validation, StoredFunction build,
+//! catalog propose-and-apply, dependency extraction, Lite definition-sync
+//! broadcast, and the `audit_record` call) is preserved verbatim; only the
+//! result construction changed from pgwire `Response` / `PgWireError` to the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::catalog::StoredFunction;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::catalog::propose_and_apply;
+use crate::control::server::shared::ddl::neutral::auth_support::{require_tenant_admin, status};
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::super::super::super::types::{require_tenant_admin, sqlstate_error};
 use super::super::validate::validate_function_body;
 use super::deps::extract_dependencies;
 use super::parse::{ParsedCreateFunction, parse_create_function};
@@ -24,7 +30,7 @@ pub fn create_function(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create functions")?;
 
     let parsed = parse_create_function(sql)?;
@@ -34,52 +40,69 @@ pub fn create_function(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        })?;
 
     if !parsed.or_replace
         && let Ok(Some(_)) = catalog.get_function(tenant_id, &parsed.name)
     {
-        return Err(sqlstate_error(
-            "42723",
-            &format!("function '{}' already exists", parsed.name),
-        ));
+        return Err(DdlError {
+            sqlstate: "42723".to_string(),
+            message: format!("function '{}' already exists", parsed.name),
+        });
     }
 
     // Detect body kind and compile/validate accordingly.
     use crate::control::planner::procedural::ast::BodyKind;
-    let compiled_body_sql = match BodyKind::detect(&parsed.body_sql) {
-        BodyKind::Expression => {
-            validate_function_body(&parsed)?;
-            None
-        }
-        BodyKind::Procedural => {
-            let block = crate::control::planner::procedural::parse_block(&parsed.body_sql)
-                .map_err(|e| sqlstate_error("42601", &format!("procedural parse error: {e}")))?;
+    let compiled_body_sql =
+        match BodyKind::detect(&parsed.body_sql) {
+            BodyKind::Expression => {
+                validate_function_body(&parsed)?;
+                None
+            }
+            BodyKind::Procedural => {
+                let block = crate::control::planner::procedural::parse_block(&parsed.body_sql)
+                    .map_err(|e| DdlError {
+                        sqlstate: "42601".to_string(),
+                        message: format!("procedural parse error: {e}"),
+                    })?;
 
-            crate::control::planner::procedural::validate_function_block(&block)
-                .map_err(|e| sqlstate_error("42601", &format!("procedural validation: {e}")))?;
+                crate::control::planner::procedural::validate_function_block(&block).map_err(
+                    |e| DdlError {
+                        sqlstate: "42601".to_string(),
+                        message: format!("procedural validation: {e}"),
+                    },
+                )?;
 
-            let compiled = crate::control::planner::procedural::compile_to_sql(&block)
-                .map_err(|e| sqlstate_error("42601", &format!("procedural compile: {e}")))?;
+                let compiled = crate::control::planner::procedural::compile_to_sql(&block)
+                    .map_err(|e| DdlError {
+                        sqlstate: "42601".to_string(),
+                        message: format!("procedural compile: {e}"),
+                    })?;
 
-            // Validate the compiled expression via DataFusion.
-            let compiled_parsed = ParsedCreateFunction {
-                or_replace: parsed.or_replace,
-                name: parsed.name.clone(),
-                parameters: parsed.parameters.clone(),
-                return_type: parsed.return_type.clone(),
-                volatility: parsed.volatility,
-                body_sql: compiled.clone(),
-            };
-            validate_function_body(&compiled_parsed)?;
+                // Validate the compiled expression via DataFusion.
+                let compiled_parsed = ParsedCreateFunction {
+                    or_replace: parsed.or_replace,
+                    name: parsed.name.clone(),
+                    parameters: parsed.parameters.clone(),
+                    return_type: parsed.return_type.clone(),
+                    volatility: parsed.volatility,
+                    body_sql: compiled.clone(),
+                };
+                validate_function_body(&compiled_parsed)?;
 
-            Some(compiled)
-        }
-    };
+                Some(compiled)
+            }
+        };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock before UNIX epoch"))?
+        .map_err(|_| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system clock before UNIX epoch".to_string(),
+        })?
         .as_secs();
 
     let stored = StoredFunction {
@@ -113,7 +136,7 @@ pub fn create_function(
     // `propose_and_apply` runs the same applier locally so the
     // OWNERS row lands too.
     let entry = crate::control::catalog_entry::CatalogEntry::PutFunction(Box::new(stored.clone()));
-    super::super::super::catalog_propose::propose_and_apply(state, &entry)?;
+    propose_and_apply(state, &entry)?;
 
     // Extract and store dependencies (referenced functions in the body).
     let deps = extract_dependencies(&stored);
@@ -131,7 +154,7 @@ pub fn create_function(
         &format!("CREATE FUNCTION {}", stored.name),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
+    Ok(status("CREATE FUNCTION"))
 }
 
 /// Encode the stored function into a `DefinitionSyncMsg` and broadcast to

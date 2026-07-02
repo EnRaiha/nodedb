@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! `DROP FUNCTION [IF EXISTS]` DDL handler.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! Ported from the pgwire `ddl::function::drop` handler. The catalog path
+//! (`propose_catalog_entry` + `log_index == 0` local-delete fallback,
+//! dependency-block check, WASM binary cleanup, dependency delete, Lite
+//! definition-sync broadcast, and the `audit_record` call) is preserved
+//! verbatim; only the result construction changed from pgwire `Response` /
+//! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
 use super::parse::validate_identifier;
 
 /// Handle `DROP FUNCTION [IF EXISTS] <name>`
@@ -18,7 +23,7 @@ pub fn drop_function(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop functions")?;
 
     let (name, if_exists) = parse_drop_function(parts)?;
@@ -28,42 +33,51 @@ pub fn drop_function(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        })?;
 
     // Check if function exists.
     let func_exists = catalog
         .get_function(tenant_id, &name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog read: {e}")))?
+        .map_err(|e| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: format!("catalog read: {e}"),
+        })?
         .is_some();
 
     if !func_exists && !if_exists {
-        return Err(sqlstate_error(
-            "42883",
-            &format!("function '{name}' does not exist"),
-        ));
+        return Err(DdlError {
+            sqlstate: "42883".to_string(),
+            message: format!("function '{name}' does not exist"),
+        });
     }
 
     if !func_exists {
         // IF EXISTS and function doesn't exist — no-op.
-        return Ok(vec![Response::Execution(Tag::new("DROP FUNCTION"))]);
+        return Ok(status("DROP FUNCTION"));
     }
 
     // Check dependencies: block DROP if other objects depend on this function.
     let dependents = catalog
         .find_dependents(tenant_id, "function", &name)
-        .map_err(|e| sqlstate_error("XX000", &format!("dependency check: {e}")))?;
+        .map_err(|e| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: format!("dependency check: {e}"),
+        })?;
     if !dependents.is_empty() {
         let dep_list: Vec<String> = dependents
             .iter()
             .map(|(t, n)| format!("{t} '{n}'"))
             .collect();
-        return Err(sqlstate_error(
-            "2BP01",
-            &format!(
+        return Err(DdlError {
+            sqlstate: "2BP01".to_string(),
+            message: format!(
                 "cannot drop function '{name}': depended on by {}",
                 dep_list.join(", ")
             ),
-        ));
+        });
     }
 
     // If the function is a WASM function, clean up the stored binary.
@@ -82,11 +96,17 @@ pub fn drop_function(
         name: name.clone(),
     };
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("metadata propose: {e}")))?;
+        .map_err(|e| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: format!("metadata propose: {e}"),
+        })?;
     if log_index == 0 {
         catalog
             .delete_function(tenant_id, &name)
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+            .map_err(|e| DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("catalog write: {e}"),
+            })?;
     }
     let _ = catalog.delete_dependencies("function", tenant_id, &name);
 
@@ -109,17 +129,17 @@ pub fn drop_function(
         &format!("DROP FUNCTION {name}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("DROP FUNCTION"))])
+    Ok(status("DROP FUNCTION"))
 }
 
 /// Parse `DROP FUNCTION [IF EXISTS] <name>`.
-fn parse_drop_function(parts: &[&str]) -> PgWireResult<(String, bool)> {
+fn parse_drop_function(parts: &[&str]) -> Result<(String, bool), DdlError> {
     // parts[0] = "DROP", parts[1] = "FUNCTION", ...
     if parts.len() < 3 {
-        return Err(sqlstate_error(
-            "42601",
-            "syntax: DROP FUNCTION [IF EXISTS] <name>",
-        ));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "syntax: DROP FUNCTION [IF EXISTS] <name>".to_string(),
+        });
     }
 
     let mut idx = 2;
@@ -134,7 +154,10 @@ fn parse_drop_function(parts: &[&str]) -> PgWireResult<(String, bool)> {
     };
 
     if idx >= parts.len() {
-        return Err(sqlstate_error("42601", "function name required"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "function name required".to_string(),
+        });
     }
 
     let name = parts[idx].to_lowercase().trim_end_matches(';').to_string();

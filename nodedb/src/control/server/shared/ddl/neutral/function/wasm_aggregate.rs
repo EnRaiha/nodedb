@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! `CREATE AGGREGATE FUNCTION ... LANGUAGE WASM AS <base64>` DDL handler.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! Ported from the pgwire `ddl::function::wasm_aggregate` handler. The catalog
+//! path is preserved verbatim — the aggregate is written with a direct
+//! `catalog.put_function` (NOT through the metadata-raft propose path), the WASM
+//! aggregate-export validation is retained, and so is the `audit_record` call.
+//! Only the result construction changed from pgwire `Response` / `PgWireError`
+//! to the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::planner::wasm;
 use crate::control::security::catalog::FunctionParam;
@@ -11,7 +15,8 @@ use crate::control::security::catalog::function_types::*;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::{require_tenant_admin, status};
 use super::parse::{find_matching_paren, parse_parameters, validate_identifier};
 
 /// Handle `CREATE [OR REPLACE] AGGREGATE FUNCTION <name>(<input_type>)
@@ -20,7 +25,7 @@ pub fn create_wasm_aggregate(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create WASM aggregate functions")?;
 
     let parsed = parse_aggregate_create(sql)?;
@@ -30,40 +35,57 @@ pub fn create_wasm_aggregate(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system catalog not available".to_string(),
+        })?;
 
     if !parsed.or_replace
         && let Ok(Some(_)) = catalog.get_function(tenant_id, &parsed.name)
     {
-        return Err(sqlstate_error(
-            "42723",
-            &format!("function '{}' already exists", parsed.name),
-        ));
+        return Err(DdlError {
+            sqlstate: "42723".to_string(),
+            message: format!("function '{}' already exists", parsed.name),
+        });
     }
 
     // Decode base64 binary.
     use base64::Engine;
     let wasm_bytes = base64::engine::general_purpose::STANDARD
         .decode(&parsed.base64_body)
-        .map_err(|e| sqlstate_error("42601", &format!("invalid base64: {e}")))?;
+        .map_err(|e| DdlError {
+            sqlstate: "42601".to_string(),
+            message: format!("invalid base64: {e}"),
+        })?;
 
     // Store the WASM binary.
     let config = wasm::WasmConfig::default();
     let hash = wasm::store::store_wasm_binary(catalog, &wasm_bytes, config.max_binary_size)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: e.to_string(),
+        })?;
 
     // Validate aggregate exports (init, accumulate, merge, finalize).
-    let runtime =
-        wasm::runtime::WasmRuntime::new().map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    let module = runtime
-        .get_or_compile(&wasm_bytes)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    wasm::wit::validate_aggregate_exports(&module)
-        .map_err(|e| sqlstate_error("42601", &e.to_string()))?;
+    let runtime = wasm::runtime::WasmRuntime::new().map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: e.to_string(),
+    })?;
+    let module = runtime.get_or_compile(&wasm_bytes).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: e.to_string(),
+    })?;
+    wasm::wit::validate_aggregate_exports(&module).map_err(|e| DdlError {
+        sqlstate: "42601".to_string(),
+        message: e.to_string(),
+    })?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| sqlstate_error("XX000", "system clock"))?
+        .map_err(|_| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "system clock".to_string(),
+        })?
         .as_secs();
 
     // Store as a function with language=WASM. The "aggregate" nature is
@@ -88,9 +110,10 @@ pub fn create_wasm_aggregate(
         modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
-    catalog
-        .put_function(&stored)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+    catalog.put_function(&stored).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("catalog write: {e}"),
+    })?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -99,9 +122,7 @@ pub fn create_wasm_aggregate(
         &format!("CREATE AGGREGATE FUNCTION {} LANGUAGE WASM", stored.name),
     );
 
-    Ok(vec![Response::Execution(Tag::new(
-        "CREATE AGGREGATE FUNCTION",
-    ))])
+    Ok(status("CREATE AGGREGATE FUNCTION"))
 }
 
 struct ParsedAggregateCreate {
@@ -112,7 +133,7 @@ struct ParsedAggregateCreate {
     base64_body: String,
 }
 
-fn parse_aggregate_create(sql: &str) -> PgWireResult<ParsedAggregateCreate> {
+fn parse_aggregate_create(sql: &str) -> Result<ParsedAggregateCreate, DdlError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_uppercase();
 
@@ -124,20 +145,23 @@ fn parse_aggregate_create(sql: &str) -> PgWireResult<ParsedAggregateCreate> {
     } else if upper.starts_with("CREATE AGGREGATE FUNCTION ") {
         (false, &trimmed["CREATE AGGREGATE FUNCTION ".len()..])
     } else {
-        return Err(sqlstate_error(
-            "42601",
-            "expected CREATE AGGREGATE FUNCTION",
-        ));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected CREATE AGGREGATE FUNCTION".to_string(),
+        });
     };
 
-    let paren_open = after
-        .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected '('"))?;
+    let paren_open = after.find('(').ok_or_else(|| DdlError {
+        sqlstate: "42601".to_string(),
+        message: "expected '('".to_string(),
+    })?;
     let name = after[..paren_open].trim().to_lowercase();
     validate_identifier(&name)?;
 
-    let paren_close = find_matching_paren(after, paren_open)
-        .ok_or_else(|| sqlstate_error("42601", "unmatched '('"))?;
+    let paren_close = find_matching_paren(after, paren_open).ok_or_else(|| DdlError {
+        sqlstate: "42601".to_string(),
+        message: "unmatched '('".to_string(),
+    })?;
     let params_str = &after[paren_open + 1..paren_close];
     let parameters = parse_parameters(params_str)?;
 
@@ -145,25 +169,37 @@ fn parse_aggregate_create(sql: &str) -> PgWireResult<ParsedAggregateCreate> {
     let rest_upper = rest.to_uppercase();
 
     if !rest_upper.starts_with("RETURNS ") {
-        return Err(sqlstate_error("42601", "expected RETURNS <type>"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected RETURNS <type>".to_string(),
+        });
     }
     let after_returns = rest["RETURNS ".len()..].trim();
 
     let lang_pos = after_returns
         .to_uppercase()
         .find("LANGUAGE")
-        .ok_or_else(|| sqlstate_error("42601", "expected LANGUAGE WASM"))?;
+        .ok_or_else(|| DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected LANGUAGE WASM".to_string(),
+        })?;
     let return_type = after_returns[..lang_pos].trim().to_uppercase();
 
     let after_lang = after_returns[lang_pos + "LANGUAGE".len()..].trim();
     if !after_lang.to_uppercase().starts_with("WASM") {
-        return Err(sqlstate_error("42601", "expected LANGUAGE WASM"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected LANGUAGE WASM".to_string(),
+        });
     }
     let after_wasm = after_lang["WASM".len()..].trim();
 
     let after_upper = after_wasm.to_uppercase();
     if !after_upper.starts_with("AS") {
-        return Err(sqlstate_error("42601", "expected AS '<base64>'"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected AS '<base64>'".to_string(),
+        });
     }
     let body = after_wasm["AS".len()..].trim();
     let base64_body = if body.starts_with('\'') && body.ends_with('\'') {
