@@ -2,33 +2,15 @@
 
 //! Handler for `ALTER DATABASE <name> PROMOTE`.
 //!
-//! Promotes a mirror database to a writable primary. The operation is:
-//! - One-way and irreversible (no DEMOTE SQL surface exists).
-//! - Idempotent: promoting an already-promoted database is a no-op.
-//! - Durable: `MirrorStatus::Promoted` is written via a Raft-proposed
-//!   `PutDatabase` catalog entry, so it survives restart.
-//!
-//! After promotion:
-//! - `DatabaseDescriptor.status` is set to `Active`.
-//! - `MirrorOrigin.status` is set to `MirrorStatus::Promoted`.
-//! - `mirror_origin` is retained for historical lineage.
-//! - The database accepts writes normally; the source observer link is torn down.
-//!
-//! Link teardown happens BEFORE the catalog mutation so there is no window
-//! where the database is Promoted but the link is still live. If teardown
-//! fails (e.g. the source is unreachable), we log and continue — the
-//! operator's intent to stop following the source must succeed regardless
-//! of the source's availability.
-//!
-//! Restart recovery: on server start, databases with `MirrorStatus::Promoted`
-//! in their catalog descriptor are treated as normal writable databases.
-//! The bootstrap loop skips them; they do NOT attempt to reconnect.
-//!
-//! Privilege gate: Superuser required (matches MIRROR DATABASE privilege level).
+//! Ported from the pgwire `ddl::database::mirror::promote` handler. The catalog
+//! lookup, superuser gate (after db-id resolution), idempotent already-promoted
+//! short-circuit, not-a-mirror rejection, observer-link teardown BEFORE the
+//! descriptor mutation, status flip, Raft propose / single-node fallback,
+//! mirror-only catalog cleanup, and `DatabasePromoted` audit are preserved
+//! verbatim; only the result construction changed from pgwire `Response` to the
+//! protocol-neutral [`DdlResult`].
 
 use nodedb_types::MirrorStatus;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
@@ -36,25 +18,27 @@ use crate::control::security::catalog::database_types::DatabaseStatus;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::super::types::{require_superuser, sqlstate_error};
+use super::super::super::super::result::{DdlError, DdlResult};
+use super::super::gate::require_superuser;
+use super::super::support::{ddl_err, status};
 
 /// Handle `ALTER DATABASE <name> PROMOTE`.
 ///
 /// Required role: `Superuser`.
-pub fn handle_promote_database(
+pub fn promote_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let catalog = state.credentials.catalog();
     let catalog = catalog
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog unavailable"))?;
+        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     let db_id = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup failed: {e}")))?
-        .ok_or_else(|| sqlstate_error("3D000", &format!("database '{name}' does not exist")))?;
+        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
     // Gate after db_id resolution so the audit record carries the database id.
     require_superuser(
@@ -66,8 +50,8 @@ pub fn handle_promote_database(
 
     let mut descriptor = catalog
         .get_database(db_id)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog read failed: {e}")))?
-        .ok_or_else(|| sqlstate_error("XX000", &format!("database '{name}' descriptor missing")))?;
+        .map_err(|e| ddl_err("XX000", format!("catalog read failed: {e}")))?
+        .ok_or_else(|| ddl_err("XX000", format!("database '{name}' descriptor missing")))?;
 
     // Idempotent: if already promoted (or Active without any mirror_origin),
     // return success immediately.
@@ -76,15 +60,15 @@ pub fn handle_promote_database(
         None => descriptor.status == DatabaseStatus::Active,
     };
     if already_promoted {
-        return Ok(vec![Response::Execution(Tag::new("ALTER DATABASE"))]);
+        return Ok(status("ALTER DATABASE"));
     }
 
     // Reject PROMOTE on a database that is not a mirror at all
     // (not Mirroring status and has no mirror_origin).
     if descriptor.mirror_origin.is_none() && descriptor.status != DatabaseStatus::Mirroring {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "0A000",
-            &format!("database '{name}' is not a mirror database"),
+            format!("database '{name}' is not a mirror database"),
         ));
     }
 
@@ -114,12 +98,12 @@ pub fn handle_promote_database(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
-    .map_err(|e| sqlstate_error("XX000", &format!("catalog propose failed: {e}")))?;
+    .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
 
     if proposed == 0 {
         catalog
             .put_database(&descriptor)
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog write failed: {e}")))?;
+            .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
     }
 
     // The database is now writable. Clear the mirror-only catalog state so
@@ -132,15 +116,15 @@ pub fn handle_promote_database(
     // lineage (origin cluster, mode, last applied LSN at promotion). DROP
     // DATABASE relies on this cleanup having happened — see drop.rs.
     if let Err(e) = catalog.delete_mirror_collection_map(db_id) {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "XX000",
-            &format!("PROMOTE: failed to clear mirror_collection_map: {e}"),
+            format!("PROMOTE: failed to clear mirror_collection_map: {e}"),
         ));
     }
     if let Err(e) = catalog.delete_mirror_lag(db_id) {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "XX000",
-            &format!("PROMOTE: failed to clear mirror_lag: {e}"),
+            format!("PROMOTE: failed to clear mirror_lag: {e}"),
         ));
     }
 
@@ -152,5 +136,5 @@ pub fn handle_promote_database(
         &format!("ALTER DATABASE {name} PROMOTE"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER DATABASE"))])
+    Ok(status("ALTER DATABASE"))
 }

@@ -80,8 +80,9 @@ pub fn handle_show_tenant_quota_in_database(
 /// gauges are not yet emitted by any subsystem (memory governor, compaction,
 /// query path), so `current` is reported as `0` — the value such a gauge
 /// would actually hold — and `percent_used` is computed accordingly via
-/// [`super::super::database::show_usage::format_percent`]. When per-tenant
-/// gauges land they wire in here without changing the column shape.
+/// [`crate::control::server::shared::ddl::neutral::database::show_usage::format_percent`].
+/// When per-tenant gauges land they wire in here without changing the column
+/// shape.
 pub fn handle_show_tenant_usage_in_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -119,7 +120,10 @@ pub fn handle_show_tenant_usage_in_database(
         } else {
             limit.to_string()
         };
-        let pct_str = super::super::database::show_usage::format_percent(limit, current);
+        let pct_str =
+            crate::control::server::shared::ddl::neutral::database::show_usage::format_percent(
+                limit, current,
+            );
         let mut enc = DataRowEncoder::new(schema.clone());
         enc.encode_field(&name.to_string())?;
         enc.encode_field(&database.to_string())?;

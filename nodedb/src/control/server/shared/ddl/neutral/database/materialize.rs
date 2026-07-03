@@ -2,13 +2,11 @@
 
 //! Handler for `ALTER DATABASE <name> MATERIALIZE`.
 //!
-//! Forces immediate full materialization of every cloned collection in the
-//! database.  Blocks until all collections flip to `CloneStatus::Materialized`.
-//! Calls into the materializer with the maintenance budget bypassed (estimated_secs
-//! = 0.0 always passes the `consumed + 0.0 <= cap` check).
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Ported from the pgwire `ddl::database::materialize` handler. The catalog
+//! lookup, `DatabaseOwner`-or-higher gate, blocking force-materialization (with
+//! `BadRequest` → `0A000` mapping), and `DatabaseMaterialized` audit record are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` to the protocol-neutral [`DdlResult`].
 
 use crate::control::maintenance::clone_materializer::{
     CloneMaterializerHandle, force_materialize_blocking,
@@ -16,7 +14,9 @@ use crate::control::maintenance::clone_materializer::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_database_owner_or_higher, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::gate::require_database_owner_or_higher;
+use super::support::{ddl_err, status};
 
 /// Handle `ALTER DATABASE <name> MATERIALIZE`.
 ///
@@ -24,21 +24,21 @@ use super::super::super::types::{require_database_owner_or_higher, sqlstate_erro
 ///
 /// Forces synchronous full materialization of all clone collections in the
 /// named database.  Returns once all collections are in `Materialized` state.
-pub fn handle_alter_database_materialize(
+pub fn alter_database_materialize(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let catalog = state
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog unavailable"))?;
+        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     let db_id = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup failed: {e}")))?
-        .ok_or_else(|| sqlstate_error("3D000", &format!("database '{name}' does not exist")))?;
+        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
     require_database_owner_or_higher(
         state,
@@ -58,10 +58,10 @@ pub fn handle_alter_database_materialize(
     // failures and retry strategy is unambiguous (don't retry — wait for the
     // per-engine bulk-copy implementation to land).
     force_materialize_blocking(db_id, state, catalog, Some(&handle)).map_err(|e| match e {
-        crate::Error::BadRequest { detail } => sqlstate_error("0A000", &detail),
-        other => sqlstate_error(
+        crate::Error::BadRequest { detail } => ddl_err("0A000", detail),
+        other => ddl_err(
             "XX000",
-            &format!("clone materialization of '{name}' failed: {other}"),
+            format!("clone materialization of '{name}' failed: {other}"),
         ),
     })?;
 
@@ -73,5 +73,5 @@ pub fn handle_alter_database_materialize(
         &format!("ALTER DATABASE {name} MATERIALIZE"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER DATABASE"))])
+    Ok(status("ALTER DATABASE"))
 }

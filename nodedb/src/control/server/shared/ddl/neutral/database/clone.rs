@@ -2,17 +2,14 @@
 
 //! Handler for `CLONE DATABASE <new> FROM <source> [AS OF SYSTEM TIME <ms> | LATEST]`.
 //!
-//! Creates a copy-on-write snapshot of `<source>` at the requested LSN point.
-//! The operation is catalog-only and returns in O(1) relative to source size.
-//! Writes to the clone go to fresh target storage; reads delegate to the source
-//! up to `as_of_lsn` until the background materializer completes.
-//!
-//! Enforces:
-//!   - `MAX_CLONE_DEPTH = 8` — a chain reaching 8 hops is rejected.
-//!   - Mirror detection — rejects cloning a mirror database.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Ported from the pgwire `ddl::database::clone` handler. Source resolution,
+//! the superuser gate (after source resolution so the audit carries the source
+//! db), mirror rejection, `MAX_CLONE_DEPTH` enforcement, duplicate-name check,
+//! as-of LSN resolution, descriptor build, Raft propose / single-node
+//! lineage-then-descriptor write with compensating rollback, shadow-collection
+//! stamping, allocator-hwm flush, and `DatabaseCloned` audit are preserved
+//! verbatim; only the result construction changed from pgwire `Response` to the
+//! protocol-neutral [`DdlResult`].
 
 use nodedb_sql::ddl_ast::CloneAsOf;
 use nodedb_types::{DatabaseId, MAX_CLONE_DEPTH};
@@ -26,9 +23,11 @@ use crate::control::security::catalog::database_types::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_superuser, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::gate::require_superuser;
+use super::support::{ddl_err, status};
 
-/// Parameters for `handle_clone_database`, extracted from the parsed AST.
+/// Parameters for `clone_database`, extracted from the parsed AST.
 pub struct CloneDatabaseParams<'a> {
     pub new_name: &'a str,
     pub source_name: &'a str,
@@ -38,24 +37,24 @@ pub struct CloneDatabaseParams<'a> {
 /// Handle `CLONE DATABASE <new_name> FROM <source_name> [AS OF …]`.
 ///
 /// Required role: `Superuser`.
-pub fn handle_clone_database(
+pub fn clone_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     params: CloneDatabaseParams<'_>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let catalog = state.credentials.catalog();
     let catalog = catalog
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog unavailable"))?;
+        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     // ── Resolve source database ───────────────────────────────────────────────
     let source_db_id = catalog
         .get_database_id_by_name(params.source_name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup failed: {e}")))?
+        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
         .ok_or_else(|| {
-            sqlstate_error(
+            ddl_err(
                 "42P01",
-                &format!("source database '{}' not found", params.source_name),
+                format!("source database '{}' not found", params.source_name),
             )
         })?;
 
@@ -64,11 +63,11 @@ pub fn handle_clone_database(
 
     let source_descriptor = catalog
         .get_database(source_db_id)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog read failed: {e}")))?
+        .map_err(|e| ddl_err("XX000", format!("catalog read failed: {e}")))?
         .ok_or_else(|| {
-            sqlstate_error(
+            ddl_err(
                 "42P01",
-                &format!(
+                format!(
                     "source database '{}' descriptor missing",
                     params.source_name
                 ),
@@ -82,9 +81,9 @@ pub fn handle_clone_database(
     // subsystem is wired; when mirrors land, this helper will inspect the
     // descriptor's status.
     if is_mirror_database(&source_descriptor) {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             nodedb_types::error::sqlstate::CANNOT_CLONE_MIRROR,
-            &format!(
+            format!(
                 "database '{}' is a mirror and cannot be cloned; \
                  promote it with ALTER DATABASE {} PROMOTE first",
                 params.source_name, params.source_name,
@@ -94,12 +93,12 @@ pub fn handle_clone_database(
 
     // ── Enforce MAX_CLONE_DEPTH ────────────────────────────────────────────────
     let depth = clone_chain_depth(state, source_db_id)
-        .map_err(|e| sqlstate_error("XX000", &format!("clone depth check failed: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("clone depth check failed: {e}")))?;
 
     if depth >= MAX_CLONE_DEPTH {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             nodedb_types::error::sqlstate::CLONE_DEPTH_EXCEEDED,
-            &format!(
+            format!(
                 "clone chain depth {} equals the maximum of {}; \
                  materialize a clone to flatten the chain before cloning again",
                 depth, MAX_CLONE_DEPTH,
@@ -110,17 +109,14 @@ pub fn handle_clone_database(
     // ── Reject duplicate name ─────────────────────────────────────────────────
     match catalog.get_database_id_by_name(params.new_name) {
         Ok(Some(_)) => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42P04",
-                &format!("database '{}' already exists", params.new_name),
+                format!("database '{}' already exists", params.new_name),
             ));
         }
         Ok(None) => {}
         Err(e) => {
-            return Err(sqlstate_error(
-                "XX000",
-                &format!("catalog lookup failed: {e}"),
-            ));
+            return Err(ddl_err("XX000", format!("catalog lookup failed: {e}")));
         }
     }
 
@@ -133,8 +129,8 @@ pub fn handle_clone_database(
     // replayed or emitted) this is a precise interpolation.  When the map is
     // empty the WAL frontier is used as the best available approximation,
     // which is correct for recent timestamps (within the same server session).
-    let now_ms = current_wall_ms()
-        .map_err(|e| sqlstate_error("XX000", &format!("clock read failed: {e}")))?;
+    let now_ms =
+        current_wall_ms().map_err(|e| ddl_err("XX000", format!("clock read failed: {e}")))?;
     let (as_of_lsn, as_of_ms) = match params.as_of {
         CloneAsOf::Latest => (state.wal.next_lsn(), now_ms),
         CloneAsOf::SystemTimeMs(ms) => {
@@ -180,7 +176,7 @@ pub fn handle_clone_database(
     };
 
     let proposed = propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog propose failed: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
 
     // Single-node fast path (returned 0 means "no Raft, apply directly").
     //
@@ -192,15 +188,15 @@ pub fn handle_clone_database(
     if proposed == 0 {
         catalog
             .add_clone_child(source_db_id, target_db_id)
-            .map_err(|e| sqlstate_error("XX000", &format!("lineage write failed: {e}")))?;
+            .map_err(|e| ddl_err("XX000", format!("lineage write failed: {e}")))?;
 
         if let Err(put_err) = catalog.put_database(&target_descriptor) {
             // Compensate: remove the lineage edge we just wrote. A failure here
             // is fatal — surface both errors so on-call can repair the catalog.
             if let Err(rb_err) = catalog.remove_clone_child(source_db_id, target_db_id) {
-                return Err(sqlstate_error(
+                return Err(ddl_err(
                     "XX000",
-                    &format!(
+                    format!(
                         "catalog write failed: {put_err}; \
                          lineage rollback ALSO failed: {rb_err} — \
                          catalog left with orphan lineage edge \
@@ -208,22 +204,16 @@ pub fn handle_clone_database(
                     ),
                 ));
             }
-            return Err(sqlstate_error(
-                "XX000",
-                &format!("catalog write failed: {put_err}"),
-            ));
+            return Err(ddl_err("XX000", format!("catalog write failed: {put_err}")));
         }
 
         // Stamp every active source collection into the target database with
         // `cloned_from` set.  This lets the SQL planner resolve collection
         // names against the clone without knowing about clone indirection;
         // CoW delegation happens at dispatch time.
-        let source_colls = catalog.load_all_collections(source_db_id).map_err(|e| {
-            sqlstate_error(
-                "XX000",
-                &format!("clone: enumerate source collections: {e}"),
-            )
-        })?;
+        let source_colls = catalog
+            .load_all_collections(source_db_id)
+            .map_err(|e| ddl_err("XX000", format!("clone: enumerate source collections: {e}")))?;
         let kv_surrogate_ceiling = Some(state.surrogate_assigner.current_hwm());
         for mut coll in source_colls.into_iter().filter(|c| c.is_active) {
             coll.database_id = target_db_id;
@@ -266,7 +256,7 @@ pub fn handle_clone_database(
         ),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CLONE DATABASE"))])
+    Ok(status("CLONE DATABASE"))
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

@@ -31,6 +31,7 @@ use super::consumer_group;
 use super::continuous_agg;
 use super::crdt_ops;
 use super::custom_type;
+use super::database;
 use super::dsl;
 use super::emergency_ddl;
 use super::explain_ddl;
@@ -1903,6 +1904,95 @@ pub async fn try_dispatch(
         }) => Some(cluster::alter_raft_group(
             state, identity, group_id, action, node_id,
         )),
+
+        // Database DDL family (CREATE / DROP / ALTER DATABASE, SHOW DATABASES /
+        // QUOTA / USAGE / LINEAGE, CLONE / MIRROR / PROMOTE, BACKUP / RESTORE,
+        // SHOW DATABASE MIRROR STATUS). Migrated from the pgwire typed-AST
+        // database router (`database_ops`); all catalog / audit / gate side
+        // effects are preserved verbatim in `database`.
+        //
+        // NOT here: `UseDatabase` (session-coupled, intercepted before the DDL
+        // router), `MoveTenant` (async, tenant family), and the tenant-quota /
+        // tenant-usage arms — those remain on the pgwire database router.
+        NodedbStatement::Database(DatabaseStmt::CreateDatabase {
+            name,
+            if_not_exists,
+            options,
+        }) => Some(database::create::create_database(
+            state,
+            identity,
+            name,
+            *if_not_exists,
+            options,
+        )),
+
+        NodedbStatement::Database(DatabaseStmt::DropDatabase {
+            name,
+            if_exists,
+            cascade,
+        }) => Some(database::drop::drop_database(
+            state, identity, name, *if_exists, *cascade,
+        )),
+
+        NodedbStatement::Database(DatabaseStmt::AlterDatabase { name, operation }) => Some(
+            database::alter::alter_database(state, identity, name, operation),
+        ),
+
+        NodedbStatement::Database(DatabaseStmt::ShowDatabases) => {
+            Some(database::show::show_databases(state, identity))
+        }
+
+        NodedbStatement::Database(DatabaseStmt::ShowDatabaseQuota { name }) => Some(
+            database::show_quota::show_database_quota(state, identity, name),
+        ),
+
+        NodedbStatement::Database(DatabaseStmt::ShowDatabaseUsage { name }) => Some(
+            database::show_usage::show_database_usage(state, identity, name),
+        ),
+
+        NodedbStatement::Database(DatabaseStmt::ShowDatabaseLineage { name }) => Some(
+            database::show_lineage::show_database_lineage(state, identity, name),
+        ),
+
+        NodedbStatement::Database(DatabaseStmt::CloneDatabase {
+            new_name,
+            source_name,
+            as_of,
+        }) => Some(database::clone::clone_database(
+            state,
+            identity,
+            database::clone::CloneDatabaseParams {
+                new_name,
+                source_name,
+                as_of,
+            },
+        )),
+
+        NodedbStatement::Database(DatabaseStmt::MirrorDatabase {
+            local_name,
+            source_cluster,
+            source_database,
+            mode,
+        }) => Some(database::mirror::create::mirror_database(
+            state,
+            identity,
+            local_name,
+            source_cluster,
+            source_database,
+            *mode,
+        )),
+
+        NodedbStatement::Database(DatabaseStmt::ShowDatabaseMirrorStatus { name }) => Some(
+            database::mirror::show::show_database_mirror_status(state, identity, name.as_deref()),
+        ),
+
+        NodedbStatement::Database(DatabaseStmt::BackupDatabase { name, .. }) => Some(
+            database::backup_restore::backup_database(state, identity, name),
+        ),
+
+        NodedbStatement::Database(DatabaseStmt::RestoreDatabase { name, .. }) => Some(
+            database::backup_restore::restore_database(state, identity, name),
+        ),
 
         // Tenant introspection by identifier / name filter. These parse into
         // typed `DatabaseStmt` variants and were dispatched from the pgwire

@@ -2,47 +2,45 @@
 
 //! Handler for `SHOW DATABASE USAGE FOR <name>`.
 //!
-//! Reports the configured quota dimensions for a database alongside live
-//! values pulled from `SystemMetrics`. The metrics gauges are wired by the
-//! memory governor (memory), compaction (storage), and the query path
-//! (queries). Dimensions that have no per-database accounting source yet
-//! (currently `max_connections`) report `0` — the value the gauge actually
-//! holds — rather than a fabricated placeholder. The `current` column is
-//! always the live gauge value; `percent_used` is computed from it.
+//! Ported from the pgwire `ddl::database::show_usage` handler. The tenant-admin
+//! gate, catalog lookup, live-gauge reads from `SystemMetrics`, and per-dimension
+//! row rendering (`unlimited` limit + `percent_used`) are preserved verbatim;
+//! only the result construction changed from pgwire `QueryResponse` to the
+//! protocol-neutral [`DdlResult`] over `ShapedRows`. Every column is a
+//! `text_field` in the original, so all columns stay `Text`.
 
-use std::sync::Arc;
+use serde_json::{Map, Value as JsonValue};
 
-use futures::stream;
 use nodedb_types::QuotaRecord;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error, text_field};
+use super::super::super::result::{DdlError, DdlResult};
+use super::gate::require_tenant_admin;
+use super::support::{ddl_err, text_rows};
 
 /// Handle `SHOW DATABASE USAGE FOR <name>`.
-pub fn handle_show_database_usage(
+pub fn show_database_usage(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "show database usage")?;
 
     let catalog = match state.credentials.catalog() {
         Some(c) => c,
-        None => return Err(sqlstate_error("XX000", "system catalog unavailable")),
+        None => return Err(ddl_err("XX000", "system catalog unavailable")),
     };
 
     let db_id = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup failed: {e}")))?
-        .ok_or_else(|| sqlstate_error("3D000", &format!("database '{name}' does not exist")))?;
+        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
     let record = catalog
         .get_database_quota(db_id)
-        .map_err(|e| sqlstate_error("XX000", &format!("quota read failed: {e}")))?
+        .map_err(|e| ddl_err("XX000", format!("quota read failed: {e}")))?
         .unwrap_or(QuotaRecord::DEFAULT);
 
     // Pull live gauges from the system metrics registry. Dimensions without a
@@ -62,13 +60,13 @@ pub fn handle_show_database_usage(
     // connection accounting lands.
     let cur_connections: u64 = 0;
 
-    let schema = Arc::new(vec![
-        text_field("database"),
-        text_field("quota_name"),
-        text_field("limit"),
-        text_field("current"),
-        text_field("percent_used"),
-    ]);
+    let columns = vec![
+        "database".to_string(),
+        "quota_name".to_string(),
+        "limit".to_string(),
+        "current".to_string(),
+        "percent_used".to_string(),
+    ];
 
     let dims: &[(&str, u64, u64)] = &[
         ("max_memory_bytes", record.max_memory_bytes, cur_memory),
@@ -81,7 +79,7 @@ pub fn handle_show_database_usage(
         ),
     ];
 
-    let mut rows = Vec::new();
+    let mut rows: Vec<Map<String, JsonValue>> = Vec::new();
     for &(quota_name, limit, current) in dims {
         let limit_str = if limit == 0 {
             "unlimited".to_string()
@@ -89,19 +87,22 @@ pub fn handle_show_database_usage(
             limit.to_string()
         };
         let pct_str = format_percent(limit, current);
-        let mut enc = DataRowEncoder::new(schema.clone());
-        enc.encode_field(&name.to_string())?;
-        enc.encode_field(&quota_name.to_string())?;
-        enc.encode_field(&limit_str)?;
-        enc.encode_field(&current.to_string())?;
-        enc.encode_field(&pct_str)?;
-        rows.push(Ok(enc.take_row()));
+        let mut row = Map::new();
+        row.insert("database".to_string(), JsonValue::String(name.to_string()));
+        row.insert(
+            "quota_name".to_string(),
+            JsonValue::String(quota_name.to_string()),
+        );
+        row.insert("limit".to_string(), JsonValue::String(limit_str));
+        row.insert(
+            "current".to_string(),
+            JsonValue::String(current.to_string()),
+        );
+        row.insert("percent_used".to_string(), JsonValue::String(pct_str));
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(text_rows(columns, rows))
 }
 
 /// Render `current / limit` as a `"<n>%"` string.

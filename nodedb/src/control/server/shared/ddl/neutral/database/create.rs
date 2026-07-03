@@ -2,13 +2,11 @@
 
 //! Handler for `CREATE [IF NOT EXISTS] DATABASE <name> [WITH (...)]`.
 //!
-//! Allocates a new `DatabaseId`, writes the descriptor to `_system.databases`
-//! and `_system.databases_by_name` atomically, then flushes the database
-//! allocator high-watermark. The allocation counter is the local cache; the
-//! authoritative allocation goes through Raft metadata group 0.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Ported from the pgwire `ddl::database::create` handler. The catalog
+//! allocation, Raft propose / single-node fallback, allocator-hwm flush,
+//! per-database metric registration, and the `DatabaseCreated` audit record are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` to the protocol-neutral [`DdlResult`].
 
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
@@ -16,7 +14,9 @@ use crate::control::security::catalog::database_types::{DatabaseDescriptor, Data
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_cluster_admin, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::gate::require_cluster_admin;
+use super::support::{ddl_err, status};
 
 /// Options accepted in `CREATE DATABASE ... WITH (...)`. Resolving them here
 /// up front makes the unknown-key error path explicit and keeps the descriptor
@@ -27,22 +27,22 @@ struct CreateDatabaseOptions {
     quota_id: u64,
 }
 
-fn parse_create_options(options: &[(String, String)]) -> PgWireResult<CreateDatabaseOptions> {
+fn parse_create_options(options: &[(String, String)]) -> Result<CreateDatabaseOptions, DdlError> {
     let mut out = CreateDatabaseOptions::default();
     for (k, v) in options {
         match k.to_ascii_lowercase().as_str() {
             "quota_id" | "quota" => {
                 out.quota_id = v.parse::<u64>().map_err(|_| {
-                    sqlstate_error(
+                    ddl_err(
                         "22023",
-                        &format!("CREATE DATABASE: invalid {k}='{v}' (expected unsigned integer)"),
+                        format!("CREATE DATABASE: invalid {k}='{v}' (expected unsigned integer)"),
                     )
                 })?;
             }
             other => {
-                return Err(sqlstate_error(
+                return Err(ddl_err(
                     "0A000",
-                    &format!("CREATE DATABASE: unsupported WITH option '{other}'"),
+                    format!("CREATE DATABASE: unsupported WITH option '{other}'"),
                 ));
             }
         }
@@ -53,13 +53,13 @@ fn parse_create_options(options: &[(String, String)]) -> PgWireResult<CreateData
 /// Handle `CREATE [IF NOT EXISTS] DATABASE <name> [WITH (...)]`.
 ///
 /// Required role: `ClusterAdmin` or `Superuser`.
-pub fn handle_create_database(
+pub fn create_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
     if_not_exists: bool,
     options: &[(String, String)],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_cluster_admin(state, identity, None, &format!("CREATE DATABASE {name}"))?;
 
     let opts = parse_create_options(options)?;
@@ -67,25 +67,22 @@ pub fn handle_create_database(
     let catalog = state.credentials.catalog();
     let catalog = catalog
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog unavailable"))?;
+        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     // Check for duplicate name.
     match catalog.get_database_id_by_name(name) {
         Ok(Some(_)) => {
             if if_not_exists {
-                return Ok(vec![Response::Execution(Tag::new("CREATE DATABASE"))]);
+                return Ok(status("CREATE DATABASE"));
             }
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42P04",
-                &format!("database '{name}' already exists"),
+                format!("database '{name}' already exists"),
             ));
         }
         Ok(None) => {}
         Err(e) => {
-            return Err(sqlstate_error(
-                "XX000",
-                &format!("catalog lookup failed: {e}"),
-            ));
+            return Err(ddl_err("XX000", format!("catalog lookup failed: {e}")));
         }
     }
 
@@ -118,14 +115,14 @@ pub fn handle_create_database(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
-    .map_err(|e| sqlstate_error("XX000", &format!("catalog propose failed: {e}")))?;
+    .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
 
     // Direct write for single-node mode (proposed == 0) or as a fallback
     // when the cluster is in mixed-version compat mode.
     if proposed == 0 {
         catalog
             .put_database(&descriptor)
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog write failed: {e}")))?;
+            .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
     }
 
     // Flush the allocator hwm on the periodic threshold so restarts
@@ -155,5 +152,5 @@ pub fn handle_create_database(
         &format!("CREATE DATABASE {name}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE DATABASE"))])
+    Ok(status("CREATE DATABASE"))
 }

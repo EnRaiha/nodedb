@@ -1,32 +1,20 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Mirror database operations.
+//! Mirror database runtime helpers (read-consistency enforcement + DDL apply).
 //!
-//! Lifecycle:
-//! 1. `MIRROR DATABASE <local> FROM <cluster>.<src>` ([`create`]) creates a
-//!    `Bootstrapping` replica descriptor and triggers the cross-cluster
-//!    observer link.
-//! 2. The observer stream delivers Raft DDL entries from the source; each is
-//!    applied via [`ddl_apply::apply_mirror_ddl_entry`], which atomically
-//!    updates the mirror collection map and the lag record in one catalog
-//!    transaction (LSN-idempotent).
-//! 3. Reads are gated by [`read::check_mirror_read_consistency`] using the
-//!    session's `ReadConsistency` (Strong rejects, BoundedStaleness compares
-//!    lag, Eventual passes); writes are rejected with `MIRROR_READ_ONLY`
-//!    until promotion.
-//! 4. `ALTER DATABASE <name> PROMOTE` ([`promote`]) flips the descriptor to
-//!    a writable primary (`MirrorStatus::Promoted` + `DatabaseStatus::Active`).
-//! 5. `SHOW DATABASE MIRROR STATUS` ([`show`]) exposes lifecycle state and
-//!    lag metrics for operators.
+//! The mirror DDL *router handlers* (`MIRROR DATABASE`, `ALTER DATABASE …
+//! PROMOTE`, `SHOW DATABASE MIRROR STATUS`) have been migrated to the
+//! protocol-neutral router (`shared::ddl::neutral::database::mirror`). What
+//! remains here are the runtime helpers that are NOT part of the DDL router:
+//!
+//! - [`read::check_mirror_read_consistency`] gates reads by the session's
+//!   `ReadConsistency` (used by the pgwire read path in `handler::dispatch`).
+//! - [`ddl_apply::apply_mirror_ddl_entry`] applies Raft DDL entries from the
+//!   source observer stream, atomically updating `_system.mirror_collection_map`
+//!   and `_system.mirror_lag`.
 
-pub mod create;
 pub mod ddl_apply;
-pub mod promote;
 pub mod read;
-pub mod show;
 
-pub use create::handle_mirror_database;
 pub use ddl_apply::{MirrorDdlKind, apply_mirror_ddl_entry};
-pub use promote::handle_promote_database;
 pub use read::{MirrorReadOutcome, check_mirror_read_consistency};
-pub use show::handle_show_database_mirror_status;

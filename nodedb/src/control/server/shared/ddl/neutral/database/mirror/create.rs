@@ -2,21 +2,14 @@
 
 //! Handler for `MIRROR DATABASE <local_name> FROM <source_cluster>.<source_database> [MODE = sync | async]`.
 //!
-//! Creates a read-only replica database that continuously applies Raft log entries
-//! from the source cluster via a cross-cluster QUIC observer link.
-//!
-//! Enforces:
-//! - Superuser privilege required.
-//! - Reject if a database with `local_name` already exists.
-//! - Reject if `source_cluster` matches this cluster's own id (no self-mirror).
-//!
-//! The handler creates the `DatabaseDescriptor` with `MirrorStatus::Bootstrapping`
-//! and `mirror_origin` populated, then triggers the bootstrap sequence via the
-//! cluster mirror subsystem.
+//! Ported from the pgwire `ddl::database::mirror::create` handler. The superuser
+//! gate, duplicate-name rejection, self-mirror pre-flight, descriptor build with
+//! `MirrorStatus::Bootstrapping`, Raft propose / single-node fallback,
+//! allocator-hwm flush, and `DatabaseMirrored` audit are preserved verbatim;
+//! only the result construction changed from pgwire `Response` to the
+//! protocol-neutral [`DdlResult`].
 
 use nodedb_types::{DatabaseId, Lsn, MirrorMode, MirrorOrigin, MirrorStatus};
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
@@ -24,41 +17,40 @@ use crate::control::security::catalog::database_types::{DatabaseDescriptor, Data
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::super::types::{require_superuser, sqlstate_error};
+use super::super::super::super::result::{DdlError, DdlResult};
+use super::super::gate::require_superuser;
+use super::super::support::{ddl_err, status};
 
 /// Handle `MIRROR DATABASE <local_name> FROM <source_cluster>.<source_database> [MODE = ...]`.
 ///
 /// Required role: `Superuser`.
-pub fn handle_mirror_database(
+pub fn mirror_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     local_name: &str,
     source_cluster: &str,
     source_database: &str,
     mode: MirrorMode,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // db_id=None — local mirror does not exist yet at gate time.
     require_superuser(state, identity, None, "MIRROR DATABASE")?;
 
     let catalog = state.credentials.catalog();
     let catalog = catalog
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog unavailable"))?;
+        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     // Reject if the local name already exists.
     match catalog.get_database_id_by_name(local_name) {
         Ok(Some(_)) => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42P04",
-                &format!("database '{local_name}' already exists"),
+                format!("database '{local_name}' already exists"),
             ));
         }
         Ok(None) => {}
         Err(e) => {
-            return Err(sqlstate_error(
-                "XX000",
-                &format!("catalog lookup failed: {e}"),
-            ));
+            return Err(ddl_err("XX000", format!("catalog lookup failed: {e}")));
         }
     }
 
@@ -73,9 +65,9 @@ pub fn handle_mirror_database(
     // we compare; otherwise we skip the check (single-node / test mode).
     let own_node_id = state.node_id;
     if source_cluster.parse::<u64>().ok() == Some(own_node_id) {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "0A000",
-            &format!(
+            format!(
                 "MIRROR DATABASE: source cluster '{source_cluster}' matches this node's id; \
                  self-mirroring is not supported"
             ),
@@ -121,12 +113,12 @@ pub fn handle_mirror_database(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
-    .map_err(|e| sqlstate_error("XX000", &format!("catalog propose failed: {e}")))?;
+    .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
 
     if proposed == 0 {
         catalog
             .put_database(&descriptor)
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog write failed: {e}")))?;
+            .map_err(|e| ddl_err("XX000", format!("catalog write failed: {e}")))?;
     }
 
     // Flush allocator hwm on threshold.
@@ -147,5 +139,5 @@ pub fn handle_mirror_database(
         ),
     );
 
-    Ok(vec![Response::Execution(Tag::new("MIRROR DATABASE"))])
+    Ok(status("MIRROR DATABASE"))
 }

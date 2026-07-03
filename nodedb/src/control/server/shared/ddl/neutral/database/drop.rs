@@ -2,23 +2,17 @@
 
 //! Handler for `DROP [IF EXISTS] DATABASE <name> [CASCADE | FORCE]`.
 //!
-//! Rejects non-CASCADE drops when the database has collections.
-//! The built-in `default` database (`DatabaseId(0)`) cannot be dropped.
-//! With `CASCADE`, all collections in the database are dropped before removing
-//! the descriptor; a single collection delete failure aborts the cascade with no
-//! descriptor mutation, so the catalog never observes a half-dropped database.
-//!
-//! Orphan protection: before any state change, the handler queries the clone
-//! lineage table.  If dependent clones exist:
-//!   - Without `cascade`/`force`: returns `CLONE_DEPENDENCY` with dependent ids.
-//!   - With `cascade` (`FORCE`): blocks on full materialization of every
-//!     dependent clone before proceeding with the drop.
+//! Ported from the pgwire `ddl::database::drop` handler. The default-database
+//! guard, superuser gate, mirror-unsubscribe teardown, clone orphan-protection
+//! (reject / force-materialize), cascade collection drop, `DatabaseDropped`
+//! audit (emitted before the catalog mutation), Raft propose / single-node
+//! fallback, and per-database metrics cleanup are preserved verbatim; only the
+//! result construction changed from pgwire `Response` to the protocol-neutral
+//! [`DdlResult`].
 
 use nodedb_types::DatabaseId;
 use nodedb_types::MirrorStatus;
 use nodedb_types::error::sqlstate;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::maintenance::clone_materializer::{
@@ -29,31 +23,23 @@ use crate::control::security::catalog::{StoredCollection, SystemCatalog};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_superuser, sqlstate_error};
+use super::super::super::result::{DdlError, DdlResult};
+use super::gate::require_superuser;
+use super::support::{ddl_err, status};
 
 /// Handle `DROP [IF EXISTS] DATABASE <name> [CASCADE | FORCE]`.
 ///
 /// Required role: `Superuser`.
-///
-/// `CASCADE` and `FORCE` are conflated into a single `cascade = true` flag at
-/// the parser level: both drop child collections AND attempt to materialize
-/// dependent clones before completing the drop (orphan protection). Distinct
-/// PG-style `FORCE` semantics (terminating active sessions on the database)
-/// are out of scope.
-///
-/// When dependent clones exist and the per-engine row-copy materializer is
-/// not yet implemented, `force_materialize_blocking` returns `BadRequest`
-/// which this handler surfaces as SQLSTATE `0A000` (`feature_not_supported`).
-pub fn handle_drop_database(
+pub fn drop_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
     if_exists: bool,
     cascade: bool,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // `default` is immutable — cannot be dropped.
     if name.eq_ignore_ascii_case("default") {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             sqlstate::CANNOT_DROP_DEFAULT_DATABASE,
             "cannot drop the built-in 'default' database",
         ));
@@ -62,21 +48,21 @@ pub fn handle_drop_database(
     let catalog = state.credentials.catalog();
     let catalog = catalog
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog unavailable"))?;
+        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     let db_id = match catalog
         .get_database_id_by_name(name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup failed: {e}")))?
+        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
     {
         Some(id) => id,
         None => {
             // If the database does not exist and if_exists=true, no actor to record.
             if if_exists {
-                return Ok(vec![Response::Execution(Tag::new("DROP DATABASE"))]);
+                return Ok(status("DROP DATABASE"));
             }
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "3D000",
-                &format!("database '{name}' does not exist"),
+                format!("database '{name}' does not exist"),
             ));
         }
     };
@@ -92,7 +78,7 @@ pub fn handle_drop_database(
 
     // Guard: `default` identity check by id (rename resilience).
     if db_id == DatabaseId::DEFAULT {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             sqlstate::CANNOT_DROP_DEFAULT_DATABASE,
             "cannot drop the built-in 'default' database",
         ));
@@ -112,7 +98,7 @@ pub fn handle_drop_database(
     {
         let descriptor_for_mirror = catalog
             .get_database(db_id)
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog read failed: {e}")))?;
+            .map_err(|e| ddl_err("XX000", format!("catalog read failed: {e}")))?;
         if let Some(descriptor) = descriptor_for_mirror
             && let Some(origin) = descriptor.mirror_origin.as_ref()
             // Promoted mirrors are now standalone writable databases — the
@@ -151,7 +137,7 @@ pub fn handle_drop_database(
     // before proceeding.
     let dependent_ids = catalog
         .get_clone_children(db_id)
-        .map_err(|e| sqlstate_error("XX000", &format!("lineage check failed: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("lineage check failed: {e}")))?;
 
     if !dependent_ids.is_empty() {
         if !cascade {
@@ -159,9 +145,9 @@ pub fn handle_drop_database(
                 .iter()
                 .map(|id| id.as_u64().to_string())
                 .collect();
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 sqlstate::CLONE_DEPENDENCY,
-                &format!(
+                format!(
                     "database '{}' cannot be dropped: {} clone(s) depend on it \
                      (database ids: {}); use FORCE or CASCADE to materialize them first",
                     name,
@@ -186,10 +172,10 @@ pub fn handle_drop_database(
                 |e| match e {
                     // Gated until per-engine row copy lands — surface `0A000`
                     // (`feature_not_supported`) so clients know not to retry.
-                    crate::Error::BadRequest { detail } => sqlstate_error("0A000", &detail),
-                    other => sqlstate_error(
+                    crate::Error::BadRequest { detail } => ddl_err("0A000", detail),
+                    other => ddl_err(
                         "XX000",
-                        &format!(
+                        format!(
                             "force materialization of dependent clone {} failed: {other}",
                             dep_id.as_u64()
                         ),
@@ -202,12 +188,12 @@ pub fn handle_drop_database(
     // ── Cascade: drop all collections ────────────────────────────────────────
     let collections = catalog
         .load_all_collections(db_id)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog scan failed: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("catalog scan failed: {e}")))?;
 
     if !cascade && !collections.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "2BP01",
-            &format!(
+            format!(
                 "database '{name}' has {} collection(s); \
                  use CASCADE to drop all collections automatically",
                 collections.len()
@@ -237,12 +223,12 @@ pub fn handle_drop_database(
             db_id: db_id.as_u64(),
         },
     )
-    .map_err(|e| sqlstate_error("XX000", &format!("catalog propose failed: {e}")))?;
+    .map_err(|e| ddl_err("XX000", format!("catalog propose failed: {e}")))?;
 
     if proposed == 0 {
         catalog
             .delete_database(db_id)
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog delete failed: {e}")))?;
+            .map_err(|e| ddl_err("XX000", format!("catalog delete failed: {e}")))?;
     }
 
     // Remove per-database metrics entries on drop.
@@ -258,7 +244,7 @@ pub fn handle_drop_database(
         }
     }
 
-    Ok(vec![Response::Execution(Tag::new("DROP DATABASE"))])
+    Ok(status("DROP DATABASE"))
 }
 
 /// Drop every collection in `collections` from the catalog under `db_id`.
@@ -271,14 +257,14 @@ fn drop_all_collections_in_database(
     catalog: &SystemCatalog,
     db_id: DatabaseId,
     collections: &[StoredCollection],
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     for coll in collections {
         catalog
             .delete_collection(db_id, coll.tenant_id, &coll.name)
             .map_err(|e| {
-                sqlstate_error(
+                ddl_err(
                     "XX000",
-                    &format!(
+                    format!(
                         "CASCADE DROP DATABASE {}: failed to delete collection '{}': {e}",
                         db_id.as_u64(),
                         coll.name

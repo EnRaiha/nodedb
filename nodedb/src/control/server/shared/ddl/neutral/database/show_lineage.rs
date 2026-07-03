@@ -2,26 +2,22 @@
 
 //! Handler for `SHOW DATABASE LINEAGE FOR <name>`.
 //!
-//! Walks the `parent_clone` chain from the named database up to the root,
-//! emitting one row per ancestor:
-//!
-//!   database_id | name | as_of_lsn | clone_created_at_lsn
-//!
-//! The named database itself is included as the first row; ancestor rows
-//! follow in order from most recent to oldest.  A non-cloned database
-//! returns exactly one row (itself, with `as_of_lsn = 0`).
+//! Ported from the pgwire `ddl::database::show_lineage` handler. The tenant-admin
+//! gate, bounded `parent_clone` chain walk, and per-ancestor row rendering are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `QueryResponse` to the protocol-neutral [`DdlResult`] over `ShapedRows`.
+//! Every column is a `text_field` in the original, so all columns stay `Text`.
 
-use std::sync::Arc;
+use serde_json::{Map, Value as JsonValue};
 
-use futures::stream;
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::{require_tenant_admin, sqlstate_error, text_field};
+use super::super::super::result::{DdlError, DdlResult};
+use super::gate::require_tenant_admin;
+use super::support::{ddl_err, text_rows};
 
 /// One row in the lineage result set.
 struct LineageRow {
@@ -35,23 +31,23 @@ struct LineageRow {
 }
 
 /// Handle `SHOW DATABASE LINEAGE FOR <name>`.
-pub fn handle_show_database_lineage(
+pub fn show_database_lineage(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "show database lineage")?;
 
     let catalog = state
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog unavailable"))?;
+        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     let start_id = catalog
         .get_database_id_by_name(name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup failed: {e}")))?
-        .ok_or_else(|| sqlstate_error("3D000", &format!("database '{name}' does not exist")))?;
+        .map_err(|e| ddl_err("XX000", format!("catalog lookup failed: {e}")))?
+        .ok_or_else(|| ddl_err("3D000", format!("database '{name}' does not exist")))?;
 
     // Walk the parent_clone chain, bounded by MAX_CLONE_DEPTH to prevent
     // infinite loops from corrupt catalog state.
@@ -62,11 +58,11 @@ pub fn handle_show_database_lineage(
     for _ in 0..max_hops {
         let desc = catalog
             .get_database(current_id)
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog read failed: {e}")))?
+            .map_err(|e| ddl_err("XX000", format!("catalog read failed: {e}")))?
             .ok_or_else(|| {
-                sqlstate_error(
+                ddl_err(
                     "XX000",
-                    &format!("database id {} descriptor missing", current_id.as_u64()),
+                    format!("database id {} descriptor missing", current_id.as_u64()),
                 )
             })?;
 
@@ -90,25 +86,31 @@ pub fn handle_show_database_lineage(
         }
     }
 
-    let schema = Arc::new(vec![
-        text_field("database_id"),
-        text_field("name"),
-        text_field("as_of_lsn"),
-        text_field("clone_created_at_lsn"),
-    ]);
+    let columns = vec![
+        "database_id".to_string(),
+        "name".to_string(),
+        "as_of_lsn".to_string(),
+        "clone_created_at_lsn".to_string(),
+    ];
 
-    let mut rows = Vec::new();
+    let mut rows: Vec<Map<String, JsonValue>> = Vec::new();
     for row in lineage {
-        let mut enc = DataRowEncoder::new(schema.clone());
-        enc.encode_field(&row.database_id.as_u64().to_string())?;
-        enc.encode_field(&row.name)?;
-        enc.encode_field(&row.as_of_lsn.to_string())?;
-        enc.encode_field(&row.clone_created_at_lsn.to_string())?;
-        rows.push(Ok(enc.take_row()));
+        let mut m = Map::new();
+        m.insert(
+            "database_id".to_string(),
+            JsonValue::String(row.database_id.as_u64().to_string()),
+        );
+        m.insert("name".to_string(), JsonValue::String(row.name));
+        m.insert(
+            "as_of_lsn".to_string(),
+            JsonValue::String(row.as_of_lsn.to_string()),
+        );
+        m.insert(
+            "clone_created_at_lsn".to_string(),
+            JsonValue::String(row.clone_created_at_lsn.to_string()),
+        );
+        rows.push(m);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(text_rows(columns, rows))
 }
