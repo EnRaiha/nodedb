@@ -11,10 +11,12 @@ use std::fmt::Debug;
 use bytes::Bytes;
 use futures::sink::Sink;
 use pgwire::api::portal::Portal;
-use pgwire::api::results::{FieldInfo, Response};
+use pgwire::api::results::Response;
 use pgwire::api::{ClientInfo, ClientPortalStore, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
+
+use crate::control::server::response_shape::project::ProjectionItem;
 
 use super::super::core::NodeDbPgHandler;
 use super::statement::ParsedStatement;
@@ -90,66 +92,44 @@ impl NodeDbPgHandler {
             return Ok(results.pop().unwrap_or(Response::EmptyQuery));
         }
 
+        // When the statement declared typed result columns via Describe, the
+        // client expects DataRow messages with one field per declared column
+        // (the RowDescription was already sent by Describe). Build a neutral
+        // projection from the declared result fields — lookup_key == display_name
+        // == field name, exactly matching the prior post-hoc reproject — so the
+        // SELECT-read producer shapes and projects the response in one pass.
+        // When no result columns were declared, no projection is applied.
+        //
+        // DML RETURNING rows are shaped as multi-column `RowsPayload` by the
+        // `ReturningRows` producer (which ignores projection), so they stay
+        // correct without any guard.
+        let projection: Option<Vec<ProjectionItem>> = if stmt.result_fields.is_empty() {
+            None
+        } else {
+            Some(
+                stmt.result_fields
+                    .iter()
+                    .map(|f| ProjectionItem::Named {
+                        lookup_key: f.name().into(),
+                        display_name: f.name().into(),
+                    })
+                    .collect(),
+            )
+        };
+
         // Execute through the planned SQL path with AST-level parameter binding.
         let mut results = self
-            .execute_planned_sql_with_params(&identity, &stmt.sql, tenant_id, &addr, &params)
+            .execute_planned_sql_with_params(
+                &identity,
+                &stmt.sql,
+                tenant_id,
+                &addr,
+                &params,
+                projection.as_deref(),
+            )
             .await?;
-        let result = results.pop().unwrap_or(Response::EmptyQuery);
-
-        // When the statement declared typed result columns via Describe, the
-        // client expects DataRow messages with one field per declared column.
-        //
-        // The generic `payload_to_response` path produces a single-column
-        // QueryResponse with the full JSON as one text field. In the extended-
-        // query protocol the RowDescription was already sent by Describe, so
-        // pgwire sends only the DataRow messages on Execute — the client maps
-        // them against the previously-described schema. A 1-field row against
-        // an N-column schema causes null values for columns 2..N.
-        //
-        // Fix: when result_fields is non-empty, consume the single-field stream,
-        // parse each JSON object, and re-encode with one pgwire field per
-        // declared column.
-        //
-        // Exception: DML RETURNING responses are already shaped as multi-column
-        // RowsPayload by `payload_to_response(PlanKind::ReturningRows)`. Applying
-        // `reproject_response` on top would re-read the first column of each row
-        // as JSON (which is a plain field value, not a JSON object) and produce
-        // empty rows. Detect this by checking whether the response is already a
-        // multi-column QueryResponse whose column count matches the declared schema.
-        if !stmt.result_fields.is_empty() && !is_already_shaped(&result) {
-            reproject_response(result, &stmt.result_fields)
-        } else {
-            Ok(result)
-        }
+        Ok(results.pop().unwrap_or(Response::EmptyQuery))
     }
-}
-
-/// Return true when `response` is already a multi-column QueryResponse.
-///
-/// Used to skip `reproject_response` for DML RETURNING payloads that
-/// `payload_to_response(PlanKind::ReturningRows)` already shaped as one
-/// field per RETURNING column. Re-projecting them would treat each row's
-/// first column value as a JSON object and produce empty rows.
-///
-/// Single-column envelope responses (produced by the regular scan/document
-/// path) always have exactly one column named "document" or "result"; any
-/// response with two or more columns is already correctly shaped.
-fn is_already_shaped(response: &Response) -> bool {
-    match response {
-        Response::Query(qr) => qr.row_schema.len() >= 2,
-        _ => false,
-    }
-}
-
-/// Re-encode a simple-query envelope response to match the column schema
-/// declared by Describe. Delegates to the shared projection module.
-///
-/// Prepared statements that reach this path are scalar / single-table SELECTs
-/// where the lookup key matches the display name; we pass the field names as
-/// the lookup keys.
-fn reproject_response(response: Response, result_fields: &[FieldInfo]) -> PgWireResult<Response> {
-    let lookup_keys: Vec<String> = result_fields.iter().map(|f| f.name().to_string()).collect();
-    super::super::projection::reproject_response(response, result_fields, &lookup_keys)
 }
 
 /// Convert pgwire portal parameters to typed `ParamValue` for AST-level binding.
@@ -508,31 +488,5 @@ mod tests {
         // (`coerce::as_usize_literal`, etc.) handles numeric contexts.
         let out = pgwire_text_to_param("42", &Type::UNKNOWN);
         assert!(matches!(&out, nodedb_sql::ParamValue::Text(s) if s == "42"));
-    }
-
-    #[test]
-    fn decode_first_field_text_normal() {
-        use crate::control::server::pgwire::handler::projection::decode_first_field_text;
-        // Wire format: 4-byte length (big-endian) + UTF-8 bytes.
-        let text = b"hello";
-        let mut data = bytes::BytesMut::new();
-        data.extend_from_slice(&(text.len() as i32).to_be_bytes());
-        data.extend_from_slice(text);
-        assert_eq!(decode_first_field_text(&data), Some("hello"));
-    }
-
-    #[test]
-    fn decode_first_field_text_null() {
-        use crate::control::server::pgwire::handler::projection::decode_first_field_text;
-        // -1 length means SQL NULL.
-        let mut data = bytes::BytesMut::new();
-        data.extend_from_slice(&(-1i32).to_be_bytes());
-        assert_eq!(decode_first_field_text(&data), None);
-    }
-
-    #[test]
-    fn decode_first_field_text_empty() {
-        use crate::control::server::pgwire::handler::projection::decode_first_field_text;
-        assert_eq!(decode_first_field_text(&bytes::BytesMut::new()), None);
     }
 }

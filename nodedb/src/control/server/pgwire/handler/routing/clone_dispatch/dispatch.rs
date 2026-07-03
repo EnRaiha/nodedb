@@ -17,7 +17,10 @@ use crate::control::clone::resolver::{
     CloneReadParams, ResolveOutcome, filter_tombstoned_rows, resolve_read,
 };
 use crate::control::server::pgwire::handler::plan::{PlanKind, payload_to_response};
+use crate::control::server::pgwire::handler::shape_encode;
+use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::kv::apply_kv_wrap;
+use crate::control::server::response_shape::project::ProjectionItem;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -39,6 +42,7 @@ impl NodeDbPgHandler {
         tasks: Vec<PhysicalTask>,
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
+        projection: Option<&[ProjectionItem]>,
     ) -> PgWireResult<Option<Vec<Response>>> {
         // Compute query LSN and wall-ms for the resolver.
         //
@@ -88,11 +92,22 @@ impl NodeDbPgHandler {
                 );
                 let empty: Vec<u8> =
                     nodedb_types::json_to_msgpack(&serde_json::json!([])).unwrap_or_default();
-                let shaped = payload_to_response(&empty, PlanKind::MultiRow);
-                if let Some(notice) = shaped.notice {
-                    self.sessions.push_notice(addr, notice);
+                match compose::shape_payload_no_plan(&empty, PlanKind::MultiRow, projection) {
+                    ShapeOutcome::Rows(shaped) => {
+                        let (response, notice) = shape_encode::shaped_query_response(shaped);
+                        if let Some(n) = notice {
+                            self.sessions.push_notice(addr, n);
+                        }
+                        Ok(Some(vec![response]))
+                    }
+                    ShapeOutcome::Passthrough => {
+                        let shaped = payload_to_response(&empty, PlanKind::MultiRow);
+                        if let Some(notice) = shaped.notice {
+                            self.sessions.push_notice(addr, notice);
+                        }
+                        Ok(Some(vec![shaped.response]))
+                    }
                 }
-                Ok(Some(vec![shaped.response]))
             }
 
             Some(ResolveOutcome::Augmented {
@@ -268,11 +283,27 @@ impl NodeDbPgHandler {
                 // Convert raw Response objects to pgwire Responses.
                 let mut pg_responses = Vec::with_capacity(responses.len());
                 for resp in responses {
-                    let shaped = payload_to_response(resp.payload.as_ref(), PlanKind::MultiRow);
-                    if let Some(notice) = shaped.notice {
-                        self.sessions.push_notice(addr, notice);
+                    match compose::shape_payload_no_plan(
+                        resp.payload.as_ref(),
+                        PlanKind::MultiRow,
+                        projection,
+                    ) {
+                        ShapeOutcome::Rows(shaped) => {
+                            let (response, notice) = shape_encode::shaped_query_response(shaped);
+                            if let Some(n) = notice {
+                                self.sessions.push_notice(addr, n);
+                            }
+                            pg_responses.push(response);
+                        }
+                        ShapeOutcome::Passthrough => {
+                            let shaped =
+                                payload_to_response(resp.payload.as_ref(), PlanKind::MultiRow);
+                            if let Some(notice) = shaped.notice {
+                                self.sessions.push_notice(addr, notice);
+                            }
+                            pg_responses.push(shaped.response);
+                        }
                     }
-                    pg_responses.push(shaped.response);
                 }
 
                 Ok(Some(pg_responses))

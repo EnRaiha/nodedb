@@ -15,11 +15,14 @@ use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::gateway::GatewayErrorMap;
+use crate::control::server::response_shape::compose::{self, ShapeOutcome};
+use crate::control::server::response_shape::project::ProjectionItem;
 use crate::types::{ReadConsistency, TenantId, TraceId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::core::NodeDbPgHandler;
 use super::super::plan::{PlanKind, payload_to_response};
+use super::super::shape_encode;
 
 impl NodeDbPgHandler {
     /// Returns `true` when every task targets a single remote leader and the
@@ -85,6 +88,7 @@ impl NodeDbPgHandler {
         tasks: Vec<PhysicalTask>,
         tenant_id: TenantId,
         database_id: nodedb_types::id::DatabaseId,
+        projection: Option<&[ProjectionItem]>,
     ) -> PgWireResult<Vec<Response>> {
         let gateway = self.state.gateway.as_ref().ok_or_else(|| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -115,9 +119,23 @@ impl NodeDbPgHandler {
                 responses.push(Response::Execution(Tag::new("OK")));
             } else {
                 for payload in &payloads {
-                    // MultiRow path never produces a NOTICE — discard it.
-                    let shaped = payload_to_response(payload, PlanKind::MultiRow);
-                    responses.push(shaped.response);
+                    match compose::shape_payload_no_plan(payload, PlanKind::MultiRow, projection) {
+                        ShapeOutcome::Rows(shaped) => {
+                            let (response, notice) = shape_encode::shaped_query_response(shaped);
+                            // The gateway has no `addr` to route a NOTICE to; the
+                            // MultiRow shape never carries one, so assert loudly
+                            // rather than silently swallowing.
+                            debug_assert!(
+                                notice.is_none(),
+                                "MultiRow gateway response must not carry a NOTICE"
+                            );
+                            responses.push(response);
+                        }
+                        ShapeOutcome::Passthrough => {
+                            responses
+                                .push(payload_to_response(payload, PlanKind::MultiRow).response);
+                        }
+                    }
                 }
             }
         }

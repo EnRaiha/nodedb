@@ -2,22 +2,21 @@
 
 //! Composed, protocol-neutral materialized response shaping.
 //!
-//! `shape_response_materialized` reproduces pgwire's per-payload shaping
-//! order (`apply_kv_wrap` -> `translate_if_vector` -> decode -> scan-envelope
-//! unwrap -> optional SELECT-list projection), exactly as traced in
-//! `pgwire::handler::routing::execute::dispatch_task_loop` and
-//! `pgwire::handler::projection`, as a single call. It exists for callers —
-//! today, only the native protocol dispatch loop — that need one materialized
-//! shot of shaping rather than pgwire's own two-seam pipeline.
+//! `shape_response_materialized` performs the full per-payload shaping order
+//! (`apply_kv_wrap` -> `translate_if_vector` -> decode -> scan-envelope
+//! unwrap -> optional SELECT-list projection) as a single call, producing an
+//! already-shaped, already-projected [`ShapeOutcome`]. Every SELECT-read
+//! producer — pgwire's non-streaming dispatch, native's dispatch loop — calls
+//! this directly and hands the resulting `ShapedRows` to its own protocol
+//! encoder, rather than emitting a single-column envelope for a later
+//! reprojection seam to re-decode.
 //!
-//! pgwire itself is NOT routed through this function: its lazy streaming
-//! projection path (`reproject_response`) and its `SELECT *` path
-//! (`reproject_star_response`) stay exactly as they are, both for byte-for-
-//! byte wire compatibility and because the lazy path must not be
-//! materialized. This module only shares the per-step LOGIC (via
-//! `apply_kv_wrap`, `translate_if_vector`, `push_flat_rows`,
-//! `parse_select_projection` and friends) with pgwire — it does not touch
-//! pgwire's call sites.
+//! Producers with no `PhysicalPlan` in scope (ClusterArray, set-op merges,
+//! gateway forwarding, clone merges) call [`shape_payload_no_plan`], which
+//! skips the plan-dependent `apply_kv_wrap` / `translate_if_vector` transforms
+//! those callers never ran. The pure kernel [`shape_decoded_rows`] is shared
+//! with per-batch lazy streaming callers, which have an already-decoded batch
+//! and only need the envelope-unwrap + projection logic.
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -94,6 +93,29 @@ pub fn shape_response_materialized(
         PlanKind::Execution | PlanKind::DmlResult(_) => return Ok(ShapeOutcome::Passthrough),
     };
     Ok(ShapeOutcome::Rows(shaped))
+}
+
+/// Shape a Data-Plane payload with no `PhysicalPlan` in scope.
+///
+/// Producers that never had a plan to KV-wrap or vector-translate
+/// (ClusterArray, set-op merges, gateway forwarding, clone merges) call this
+/// instead of [`shape_response_materialized`]: it applies only the decode +
+/// scan-envelope unwrap + optional SELECT-list projection steps, skipping the
+/// plan-dependent `apply_kv_wrap` / `translate_if_vector` transforms those
+/// callers never ran.
+pub fn shape_payload_no_plan(
+    payload: &[u8],
+    plan_kind: PlanKind,
+    projection: Option<&[ProjectionItem]>,
+) -> ShapeOutcome {
+    match plan_kind {
+        PlanKind::Execution | PlanKind::DmlResult(_) => ShapeOutcome::Passthrough,
+        PlanKind::ArraySlice => ShapeOutcome::Rows(shape_array_slice(payload)),
+        PlanKind::ReturningRows => ShapeOutcome::Rows(shape_returning_rows(payload)),
+        PlanKind::SingleDocument | PlanKind::MultiRow => {
+            ShapeOutcome::Rows(shape_generic_rows(payload, projection))
+        }
+    }
 }
 
 /// Shape an `ArrayOp::Slice` response: decode the `ArraySliceResponse`

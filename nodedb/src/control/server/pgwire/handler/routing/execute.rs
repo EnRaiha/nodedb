@@ -10,13 +10,15 @@ use crate::control::planner::calvin::{
     DispatchClass, classify_dispatch, plan_needs_implicit_edge_recon,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::response_shape::kv::apply_kv_wrap;
+use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::types::TenantId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use super::super::super::types::{error_to_sqlstate, response_status_to_sqlstate};
+use super::super::super::types::{error_to_sqlstate, response_status_to_sqlstate, sqlstate_error};
 use super::super::core::NodeDbPgHandler;
 use super::super::plan::{describe_plan, extract_collection, payload_to_response};
+use super::super::projection::{ProjectionItem, parse_select_projection};
+use super::super::shape_encode;
 use super::planning::consistency_for_tasks;
 use super::set_ops;
 
@@ -40,55 +42,12 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
     ) -> PgWireResult<Vec<Response>> {
-        let responses = self
-            .execute_planned_sql_inner(identity, sql, tenant_id, addr, &[])
-            .await?;
-
-        // Column projection: re-encode each query response with one pgwire
-        // field per named column from the SELECT list.
-        use super::super::projection::{
-            ProjectionItem, fields_for_projection, lookup_keys_for_projection, needs_projection,
-            parse_select_projection, reproject_star_response,
-        };
-        let items_opt = parse_select_projection(sql);
-
-        // SELECT * — expand each row's JSON object into individual columns.
-        if matches!(items_opt.as_deref(), Some([ProjectionItem::Star])) {
-            let mut projected = Vec::with_capacity(responses.len());
-            for resp in responses {
-                projected.push(reproject_star_response(resp).await.map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "XX000".to_owned(),
-                        format!("star projection failed: {e}"),
-                    )))
-                })?);
-            }
-            return Ok(projected);
-        }
-
-        // Named columns — re-encode with the declared column list.
-        if let Some(items) = items_opt.filter(|items| needs_projection(items)) {
-            let fields = fields_for_projection(&items);
-            let keys = lookup_keys_for_projection(&items);
-            let mut projected = Vec::with_capacity(responses.len());
-            for resp in responses {
-                projected.push(
-                    super::super::projection::reproject_response(resp, &fields, &keys).map_err(
-                        |e| {
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_owned(),
-                                "XX000".to_owned(),
-                                format!("column projection failed: {e}"),
-                            )))
-                        },
-                    )?,
-                );
-            }
-            return Ok(projected);
-        }
-
-        Ok(responses)
+        // Parse the SELECT projection list once. Each SELECT-read producer
+        // shapes and projects its own response via the neutral shaping core,
+        // so there is no post-hoc reproject seam here.
+        let items = parse_select_projection(sql);
+        self.execute_planned_sql_inner(identity, sql, tenant_id, addr, &[], items.as_deref())
+            .await
     }
 
     /// Execute planned SQL with bound parameters (prepared statement path).
@@ -99,8 +58,9 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
         params: &[nodedb_sql::ParamValue],
+        projection: Option<&[ProjectionItem]>,
     ) -> PgWireResult<Vec<Response>> {
-        self.execute_planned_sql_inner(identity, sql, tenant_id, addr, params)
+        self.execute_planned_sql_inner(identity, sql, tenant_id, addr, params, projection)
             .await
     }
 
@@ -111,6 +71,7 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
         params: &[nodedb_sql::ParamValue],
+        projection: Option<&[ProjectionItem]>,
     ) -> PgWireResult<Vec<Response>> {
         let (mut tasks, _plan_lease_scope) = self
             .plan_statement_to_tasks(identity, sql, tenant_id, addr, params)
@@ -150,7 +111,7 @@ impl NodeDbPgHandler {
         // Returns Some(responses) when clone dispatch is fully handled.
         // Returns None when this is not a cloned collection (fast path).
         if let Some(clone_responses) = self
-            .maybe_dispatch_clone_reads(tasks.clone(), tenant_id, addr)
+            .maybe_dispatch_clone_reads(tasks.clone(), tenant_id, addr, projection)
             .await?
         {
             return Ok(clone_responses);
@@ -207,7 +168,7 @@ impl NodeDbPgHandler {
                 .get_current_database(addr)
                 .unwrap_or(crate::types::DatabaseId::DEFAULT);
             return self
-                .dispatch_tasks_via_gateway(tasks, tenant_id, database_id)
+                .dispatch_tasks_via_gateway(tasks, tenant_id, database_id, projection)
                 .await;
         }
 
@@ -252,7 +213,7 @@ impl NodeDbPgHandler {
             }
         }
 
-        self.dispatch_task_loop(tasks, tenant_id, identity, addr)
+        self.dispatch_task_loop(tasks, tenant_id, identity, addr, projection)
             .await
     }
 
@@ -263,6 +224,7 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         identity: &AuthenticatedIdentity,
         addr: &std::net::SocketAddr,
+        projection: Option<&[ProjectionItem]>,
     ) -> PgWireResult<Vec<Response>> {
         let needs_set_op = tasks.iter().any(|t| t.post_set_op != PostSetOp::None);
         let mut dedup_payloads: Vec<Vec<u8>> = Vec::new();
@@ -329,11 +291,23 @@ impl NodeDbPgHandler {
                     }
                     _ => PlanKind::MultiRow,
                 };
-                let shaped = payload_to_response(&payload_bytes, cluster_plan_kind);
-                if let Some(notice) = shaped.notice {
-                    self.sessions.push_notice(addr, notice);
+                match compose::shape_payload_no_plan(&payload_bytes, cluster_plan_kind, projection)
+                {
+                    ShapeOutcome::Rows(shaped) => {
+                        let (response, notice) = shape_encode::shaped_query_response(shaped);
+                        if let Some(n) = notice {
+                            self.sessions.push_notice(addr, n);
+                        }
+                        responses.push(response);
+                    }
+                    ShapeOutcome::Passthrough => {
+                        let shaped = payload_to_response(&payload_bytes, cluster_plan_kind);
+                        if let Some(notice) = shaped.notice {
+                            self.sessions.push_notice(addr, notice);
+                        }
+                        responses.push(shaped.response);
+                    }
                 }
-                responses.push(shaped.response);
                 continue;
             }
 
@@ -366,7 +340,7 @@ impl NodeDbPgHandler {
             // client (see `maybe_stream_select`); everything else falls through
             // to the normal dispatch path below.
             if let Some(stream_response) = self
-                .maybe_stream_select(&task, plan_kind, resp_post_set_op, addr)
+                .maybe_stream_select(&task, plan_kind, resp_post_set_op, addr, projection)
                 .await?
             {
                 responses.push(stream_response);
@@ -468,25 +442,43 @@ impl NodeDbPgHandler {
                     dedup_set_op = resp_post_set_op;
                 }
             } else {
-                let payload = apply_kv_wrap(&plan_for_response, &resp.payload);
-                let payload = crate::control::server::response_translate::translate_if_vector(
-                    &payload,
+                match compose::shape_response_materialized(
+                    &resp.payload,
                     &plan_for_response,
+                    plan_kind,
+                    projection,
                     &self.state,
                     task_database_id,
                     tenant_id,
-                );
-                let shaped = payload_to_response(&payload, plan_kind);
-                if let Some(notice) = shaped.notice {
-                    self.sessions.push_notice(addr, notice);
+                )
+                .map_err(|e| sqlstate_error("XX000", e.message()))?
+                {
+                    ShapeOutcome::Rows(shaped) => {
+                        let (response, notice) = shape_encode::shaped_query_response(shaped);
+                        if let Some(n) = notice {
+                            self.sessions.push_notice(addr, n);
+                        }
+                        responses.push(response);
+                    }
+                    ShapeOutcome::Passthrough => {
+                        let shaped = payload_to_response(&resp.payload, plan_kind);
+                        if let Some(notice) = shaped.notice {
+                            self.sessions.push_notice(addr, notice);
+                        }
+                        responses.push(shaped.response);
+                    }
                 }
-                responses.push(shaped.response);
             }
         }
 
         // Set operations: merge sub-query payloads.
         if needs_set_op && !dedup_payloads.is_empty() {
-            responses.push(set_ops::apply_set_ops(&dedup_payloads, dedup_set_op));
+            let (response, notice) =
+                set_ops::apply_set_ops(&dedup_payloads, dedup_set_op, projection);
+            if let Some(n) = notice {
+                self.sessions.push_notice(addr, n);
+            }
+            responses.push(response);
         }
 
         Ok(responses)

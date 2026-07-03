@@ -8,6 +8,7 @@
 //! stays in `pgwire::handler::projection`.
 
 /// Projection item from a parsed SELECT list.
+#[derive(Clone)]
 pub enum ProjectionItem {
     /// SELECT *
     Star,

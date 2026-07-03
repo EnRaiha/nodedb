@@ -4,15 +4,23 @@
 //!
 //! Operates on raw msgpack payloads — no decode/re-encode round-trip.
 
+use pgwire::api::results::Response;
+
 use nodedb_physical::physical_task::PostSetOp;
 
-use super::super::plan::{PlanKind, payload_to_response};
+use crate::control::server::response_shape::compose::{self, ShapeOutcome};
+use crate::control::server::response_shape::project::ProjectionItem;
 
-/// Apply set operation merging to collected sub-query payloads.
+use super::super::plan::{PlanKind, payload_to_response};
+use super::super::shape_encode;
+
+/// Apply set operation merging to collected sub-query payloads, then shape and
+/// project the merged result into an already-encoded pgwire response.
 pub(super) fn apply_set_ops(
     dedup_payloads: &[Vec<u8>],
     dedup_set_op: PostSetOp,
-) -> pgwire::api::results::Response {
+    projection: Option<&[ProjectionItem]>,
+) -> (Response, Option<String>) {
     let merged = match dedup_set_op {
         PostSetOp::Intersect | PostSetOp::IntersectAll => {
             merge_set_op_payloads(dedup_payloads, SetMergeMode::Intersect)
@@ -22,7 +30,13 @@ pub(super) fn apply_set_ops(
         }
         _ => dedup_union_payloads(dedup_payloads),
     };
-    payload_to_response(&merged, PlanKind::MultiRow).response
+    match compose::shape_payload_no_plan(&merged, PlanKind::MultiRow, projection) {
+        ShapeOutcome::Rows(shaped) => shape_encode::shaped_query_response(shaped),
+        ShapeOutcome::Passthrough => {
+            let shaped = payload_to_response(&merged, PlanKind::MultiRow);
+            (shaped.response, shaped.notice)
+        }
+    }
 }
 
 /// Merge multiple Data Plane response payloads and deduplicate rows (UNION DISTINCT).

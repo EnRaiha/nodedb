@@ -14,9 +14,12 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+use crate::control::server::response_shape::project::{ProjectionItem, needs_projection};
+
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
 use super::super::plan::PlanKind;
+use super::super::stream_response;
 
 impl NodeDbPgHandler {
     /// Build a streaming `Response` for an eligible autocommit SELECT, or
@@ -39,6 +42,7 @@ impl NodeDbPgHandler {
         plan_kind: PlanKind,
         post_set_op: PostSetOp,
         addr: &std::net::SocketAddr,
+        projection: Option<&[ProjectionItem]>,
     ) -> PgWireResult<Option<Response>> {
         if post_set_op != PostSetOp::None
             || !matches!(plan_kind, PlanKind::MultiRow)
@@ -97,8 +101,21 @@ impl NodeDbPgHandler {
             )))
         })?;
 
-        Ok(Some(
-            super::super::stream_response::streaming_multirow_response(stream, limit),
-        ))
+        // Shape the streamed rows to match the SELECT projection, mirroring
+        // the (now-removed) post-hoc reproject seam:
+        //   - named columns  -> lazy per-batch shaping + projection
+        //   - `SELECT *`      -> materialize, then id-first column union
+        //   - anything else   -> raw single-column envelope passthrough
+        let response = match projection {
+            Some(items) if needs_projection(items) => {
+                stream_response::streaming_shaped_response(stream, limit, items)
+            }
+            Some([ProjectionItem::Star]) => {
+                stream_response::streaming_star_response(stream, limit).await
+            }
+            _ => stream_response::streaming_multirow_response(stream, limit),
+        };
+
+        Ok(Some(response))
     }
 }

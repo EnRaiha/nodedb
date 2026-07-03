@@ -9,13 +9,16 @@
 
 use std::sync::Arc;
 
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::{ErrorInfo, PgWireError};
+use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
+use crate::control::server::response_shape::compose::shape_decoded_rows;
+use crate::control::server::response_shape::project::ProjectionItem;
 use crate::control::server::result_stream::ResultStream;
 use crate::data::executor::response_codec::decode_payload_to_json;
 
 use super::super::types::{error_to_sqlstate, text_field};
+use super::shape_encode::{encode_shaped_row, shaped_query_response};
 
 /// Build a streaming multi-row pgwire `Response` whose `DataRow`s are pulled
 /// lazily from a [`ResultStream`].
@@ -78,4 +81,151 @@ pub(crate) fn streaming_multirow_response(stream: ResultStream, limit: usize) ->
     };
 
     Response::Query(QueryResponse::new(schema, row_stream))
+}
+
+/// Build a streaming, already-projected pgwire `Response` for a SELECT with a
+/// named projection list.
+///
+/// The `RowDescription` schema (one TEXT column per projected display name) is
+/// fixed up front, before the first row is pulled. Each batch is decoded and
+/// handed to the neutral [`shape_decoded_rows`] core with the projection, then
+/// each shaped row is encoded with one pgwire field per projected column. Rows
+/// stream lazily — batches are not collected. A global take-N is enforced when
+/// `limit < usize::MAX`, matching `streaming_multirow_response`.
+pub(crate) fn streaming_shaped_response(
+    stream: ResultStream,
+    limit: usize,
+    items: &[ProjectionItem],
+) -> Response {
+    use futures::StreamExt;
+
+    let display_columns: Vec<String> = items
+        .iter()
+        .filter_map(|i| match i {
+            ProjectionItem::Named { display_name, .. } => Some(display_name.clone()),
+            ProjectionItem::Star => None,
+        })
+        .collect();
+    let fields: Vec<FieldInfo> = display_columns.iter().map(|n| text_field(n)).collect();
+    let schema = Arc::new(fields);
+    let row_schema = schema.clone();
+    let items: Vec<ProjectionItem> = items.to_vec();
+
+    let row_stream = async_stream::try_stream! {
+        let mut emitted: usize = 0;
+        let mut batches = stream;
+        while let Some(batch) = batches.next().await {
+            let batch = batch.map_err(|e| {
+                let (severity, code, message) = error_to_sqlstate(&e);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            })?;
+
+            if emitted >= limit {
+                break;
+            }
+
+            let text = decode_payload_to_json(&batch.payload);
+            let value = sonic_rs::from_str::<serde_json::Value>(&text).map_err(|e| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "XX000".to_owned(),
+                    format!("failed to decode streamed batch: {e}"),
+                )))
+            })?;
+            let shaped = shape_decoded_rows(&value, Some(items.as_slice()));
+            for row in &shaped.rows {
+                if emitted >= limit {
+                    break;
+                }
+                let encoded = encode_shaped_row(&row_schema, &display_columns, row)?;
+                emitted += 1;
+                yield encoded;
+            }
+        }
+    };
+
+    Response::Query(QueryResponse::new(schema, row_stream))
+}
+
+/// Build a single-column, single-row `Response` that immediately yields the
+/// given error, used by non-lazy streaming callers that discover a fatal
+/// condition before any row schema is otherwise fixed.
+fn single_pgwire_error(err: PgWireError) -> Response {
+    let schema = Arc::new(vec![text_field("result")]);
+    let errored: Vec<PgWireResult<_>> = vec![Err(err)];
+    Response::Query(QueryResponse::new(schema, futures::stream::iter(errored)))
+}
+
+/// Build a `SELECT *` pgwire `Response` by materializing the stream and
+/// deriving the id-first column union across all rows.
+///
+/// Unlike the named-projection path this is NOT lazy: the id-first column set
+/// can only be known once every row is seen, so all batches are drained first
+/// (matching the prior `reproject_star_response` behavior exactly), then the
+/// neutral shaping core derives the column union. The empty-result quirk is
+/// preserved: zero rows yield a single-column `result` empty response.
+pub(crate) async fn streaming_star_response(stream: ResultStream, limit: usize) -> Response {
+    use futures::StreamExt;
+
+    let mut values: Vec<serde_json::Value> = Vec::new();
+    let mut batches = stream;
+    while let Some(batch) = batches.next().await {
+        let batch = match batch {
+            Ok(b) => b,
+            Err(e) => {
+                let (severity, code, message) = error_to_sqlstate(&e);
+                return single_pgwire_error(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                ))));
+            }
+        };
+
+        if values.len() >= limit {
+            break;
+        }
+
+        let text = decode_payload_to_json(&batch.payload);
+        match sonic_rs::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Array(items)) => {
+                for item in items {
+                    if values.len() >= limit {
+                        break;
+                    }
+                    values.push(item);
+                }
+            }
+            Ok(_) => {
+                return single_pgwire_error(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "XX000".to_owned(),
+                    "streamed batch payload was not a JSON array".to_owned(),
+                ))));
+            }
+            Err(e) => {
+                return single_pgwire_error(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "XX000".to_owned(),
+                    format!("failed to decode streamed batch: {e}"),
+                ))));
+            }
+        }
+    }
+
+    if values.is_empty() {
+        let schema = Arc::new(vec![text_field("result")]);
+        return Response::Query(QueryResponse::new(
+            schema,
+            futures::stream::iter(Vec::<PgWireResult<_>>::new()),
+        ));
+    }
+
+    let shaped = shape_decoded_rows(&serde_json::Value::Array(values), None);
+    let (response, _notice) = shaped_query_response(shaped);
+    response
 }
