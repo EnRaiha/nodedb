@@ -21,6 +21,7 @@ pub mod conflict_policy;
 pub mod constraint;
 pub mod consumer_group;
 pub mod continuous_agg;
+pub mod convert;
 pub mod crdt_ops;
 pub mod custom_type;
 pub mod database;

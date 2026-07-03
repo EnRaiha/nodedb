@@ -10,7 +10,7 @@ use crate::types::DatabaseId;
 pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    sql: &str,
+    _sql: &str,
     upper: &str,
     parts: &[&str],
     database_id: DatabaseId,
@@ -38,15 +38,9 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // Continuous aggregates (CREATE/DROP/SHOW CONTINUOUS AGGREGATE) are served by
     // the protocol-neutral DDL router; the pgwire router no longer routes them.
 
-    // CONVERT COLLECTION.
-    if upper.starts_with("CONVERT COLLECTION ")
-        || upper.starts_with("CONVERT ") && upper.contains(" TO ")
-    {
-        return Some(
-            super::super::super::convert::convert_collection(state, identity, database_id, sql)
-                .await,
-        );
-    }
+    // CONVERT COLLECTION (CONVERT ... TO ...) is served by the protocol-neutral
+    // DDL router (`shared::ddl::neutral::convert`), which is tried before this
+    // transitional pgwire delegation runs.
 
     // Materialized views (HTAP) — CREATE/DROP/REFRESH/SHOW MATERIALIZED VIEW are
     // served by the protocol-neutral DDL router; the pgwire router no longer

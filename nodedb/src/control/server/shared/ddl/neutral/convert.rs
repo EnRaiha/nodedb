@@ -1,25 +1,39 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! DDL handler for CONVERT COLLECTION.
+//! Protocol-neutral DDL handler for CONVERT COLLECTION.
 //!
 //! Syntax:
 //! - `CONVERT COLLECTION <name> TO document`
 //! - `CONVERT COLLECTION <name> TO strict (col1 TYPE, col2 TYPE, ...)`
 //! - `CONVERT COLLECTION <name> TO kv`
+//!
+//! Ported from the pgwire `ddl::convert` handler. The accepted-target
+//! validation (document_schemaless / document_strict / kv — columnar /
+//! timeseries / spatial rejected), the catalog read + write, the Data Plane
+//! conversion dispatch, and the typeguard → CHECK-constraint carry-over are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
+//! [`DdlError`].
 
 use nodedb_types::DatabaseId;
 use std::time::Duration;
 
-use pgwire::api::results::Response;
-use pgwire::error::PgWireResult;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::MetaOp;
 
-use super::super::types::sqlstate_error;
+use super::super::result::{DdlError, DdlResult};
+
+fn err(sqlstate: &str, message: &str) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.to_string(),
+    }
+}
 
 /// CONVERT COLLECTION <name> TO <target_type> [(<col_defs>)]
 pub async fn convert_collection(
@@ -27,20 +41,20 @@ pub async fn convert_collection(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, target_type, explicit_columns) = parse_convert_sql(sql)?;
     let tenant_id = identity.tenant_id;
 
     // Validate collection exists.
     let Some(catalog) = state.credentials.catalog() else {
-        return Err(sqlstate_error("XX000", "catalog unavailable"));
+        return Err(err("XX000", "catalog unavailable"));
     };
 
     let mut coll = catalog
         .get_collection(database_id, tenant_id.as_u64(), &collection)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
+        .map_err(|e| err("XX000", &e.to_string()))?
         .ok_or_else(|| {
-            sqlstate_error(
+            err(
                 "42P01",
                 &format!("collection '{collection}' does not exist"),
             )
@@ -54,7 +68,7 @@ pub async fn convert_collection(
             } else if !coll.type_guards.is_empty() {
                 typeguards_to_column_defs(&coll.type_guards)?
             } else {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42601",
                     "CONVERT TO strict requires column definitions or active typeguards",
                 ));
@@ -66,7 +80,7 @@ pub async fn convert_collection(
 
     let schema_json_for_dp = if let Some(ref cols) = columns {
         sonic_rs::to_string(cols)
-            .map_err(|e| sqlstate_error("XX000", &format!("schema serialization: {e}")))?
+            .map_err(|e| err("XX000", &format!("schema serialization: {e}")))?
     } else {
         String::new()
     };
@@ -78,7 +92,7 @@ pub async fn convert_collection(
         schema_json: schema_json_for_dp,
     });
 
-    super::sync_dispatch::dispatch_async(
+    dispatch_async(
         state,
         tenant_id,
         database_id,
@@ -87,7 +101,7 @@ pub async fn convert_collection(
         Duration::from_secs(60),
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &format!("conversion failed: {e}")))?;
+    .map_err(|e| err("XX000", &format!("conversion failed: {e}")))?;
 
     // Update catalog collection type.
     let new_type = match target_type.as_str() {
@@ -109,7 +123,7 @@ pub async fn convert_collection(
             }
         }
         _ => {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42601",
                 &format!("unsupported target type: {target_type}"),
             ));
@@ -141,7 +155,7 @@ pub async fn convert_collection(
 
     catalog
         .put_collection(database_id, &coll)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", &e.to_string()))?;
 
     tracing::info!(
         %collection,
@@ -150,9 +164,10 @@ pub async fn convert_collection(
         "collection converted"
     );
 
-    Ok(vec![Response::Execution(pgwire::api::results::Tag::new(
-        "CONVERT COLLECTION",
-    ))])
+    Ok(vec![DdlResult::Status {
+        command: "CONVERT COLLECTION".to_string(),
+        rows_affected: None,
+    }])
 }
 
 // ── SQL Parsing ──────────────────────────────────────────────────────────
@@ -163,33 +178,36 @@ pub async fn convert_collection(
 /// `explicit_columns` is `None` for `TO document` or `TO strict` without parens.
 fn parse_convert_sql(
     sql: &str,
-) -> PgWireResult<(
-    String,
-    String,
-    Option<Vec<nodedb_types::columnar::ColumnDef>>,
-)> {
+) -> Result<
+    (
+        String,
+        String,
+        Option<Vec<nodedb_types::columnar::ColumnDef>>,
+    ),
+    DdlError,
+> {
     let upper = sql.to_uppercase();
 
     // Extract collection name: CONVERT COLLECTION <name> TO ...
     let coll_pos = upper
         .find("COLLECTION ")
-        .ok_or_else(|| sqlstate_error("42601", "expected COLLECTION keyword"))?;
+        .ok_or_else(|| err("42601", "expected COLLECTION keyword"))?;
     let after_coll = sql[coll_pos + 11..].trim_start();
     let collection = after_coll
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "missing collection name"))?
+        .ok_or_else(|| err("42601", "missing collection name"))?
         .to_lowercase();
 
     // Extract target type: TO <type>
     let to_pos = upper[coll_pos + 11..]
         .find(" TO ")
-        .ok_or_else(|| sqlstate_error("42601", "expected TO <type> clause"))?;
+        .ok_or_else(|| err("42601", "expected TO <type> clause"))?;
     let after_to = sql[coll_pos + 11 + to_pos + 4..].trim_start();
     let target_type = after_to
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "missing target type after TO"))?
+        .ok_or_else(|| err("42601", "missing target type after TO"))?
         .to_lowercase()
         .trim_matches('(')
         .to_string();
@@ -204,18 +222,16 @@ fn parse_convert_sql(
                 Ok((collection, target_type, None))
             }
         }
-        "document" | "doc" => Err(sqlstate_error(
+        "document" | "doc" => Err(err(
             "42601",
             "deprecated target type 'document'; use 'document_schemaless'",
         )),
-        "strict" => Err(sqlstate_error(
+        "strict" => Err(err(
             "42601",
             "deprecated target type 'strict'; use 'document_strict'",
         )),
-        "key_value" | "keyvalue" => {
-            Err(sqlstate_error("42601", "deprecated target type; use 'kv'"))
-        }
-        other => Err(sqlstate_error(
+        "key_value" | "keyvalue" => Err(err("42601", "deprecated target type; use 'kv'")),
+        other => Err(err(
             "42601",
             &format!(
                 "unsupported target type: '{other}' \
@@ -226,17 +242,17 @@ fn parse_convert_sql(
 }
 
 /// Parse `(col1 TYPE, col2 TYPE, ...)` into `Vec<ColumnDef>`.
-fn parse_column_defs(s: &str) -> PgWireResult<Vec<nodedb_types::columnar::ColumnDef>> {
+fn parse_column_defs(s: &str) -> Result<Vec<nodedb_types::columnar::ColumnDef>, DdlError> {
     use nodedb_types::columnar::ColumnDef;
 
     let open = s
         .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected (column definitions) after type"))?;
+        .ok_or_else(|| err("42601", "expected (column definitions) after type"))?;
     let close = s
         .rfind(')')
-        .ok_or_else(|| sqlstate_error("42601", "missing closing parenthesis"))?;
+        .ok_or_else(|| err("42601", "missing closing parenthesis"))?;
     if close <= open {
-        return Err(sqlstate_error("42601", "empty column definitions"));
+        return Err(err("42601", "empty column definitions"));
     }
 
     let inner = &s[open + 1..close];
@@ -249,7 +265,7 @@ fn parse_column_defs(s: &str) -> PgWireResult<Vec<nodedb_types::columnar::Column
         }
         let tokens: Vec<&str> = part.split_whitespace().collect();
         if tokens.len() < 2 {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42601",
                 &format!("expected 'name TYPE' in column def: {part}"),
             ));
@@ -277,7 +293,7 @@ fn parse_column_defs(s: &str) -> PgWireResult<Vec<nodedb_types::columnar::Column
     }
 
     if columns.is_empty() {
-        return Err(sqlstate_error("42601", "at least one column required"));
+        return Err(err("42601", "at least one column required"));
     }
 
     Ok(columns)
@@ -310,7 +326,7 @@ fn sql_type_to_column_type(sql_type: &str) -> nodedb_types::columnar::ColumnType
 /// REQUIRED fields become NOT NULL. DEFAULT expressions carry over.
 fn typeguards_to_column_defs(
     guards: &[nodedb_types::TypeGuardFieldDef],
-) -> PgWireResult<Vec<nodedb_types::columnar::ColumnDef>> {
+) -> Result<Vec<nodedb_types::columnar::ColumnDef>, DdlError> {
     use nodedb_types::columnar::{ColumnDef, ColumnType};
 
     // Always include an `id` column as primary key.

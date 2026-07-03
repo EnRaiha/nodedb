@@ -29,6 +29,7 @@ use super::conflict_policy;
 use super::constraint;
 use super::consumer_group;
 use super::continuous_agg;
+use super::convert;
 use super::crdt_ops;
 use super::custom_type;
 use super::database;
@@ -904,6 +905,19 @@ pub async fn try_dispatch(
         return Some(
             continuous_agg::show_continuous_aggregates(state, identity, database_id, &parts).await,
         );
+    }
+
+    // CONVERT COLLECTION between storage modes. `CONVERT COLLECTION <name> TO
+    // <target>` parses into no typed AST variant — the pgwire admin router
+    // dispatched it by string prefix from the raw SQL. Replicate that exactly
+    // here, before the parse gate, so the prefix recognition (the
+    // `CONVERT COLLECTION ` form plus the broader `CONVERT ... TO ...` form, in
+    // that `||`/`&&` precedence) and the parse / syntax messages stay
+    // byte-identical.
+    if upper.starts_with("CONVERT COLLECTION ")
+        || upper.starts_with("CONVERT ") && upper.contains(" TO ")
+    {
+        return Some(convert::convert_collection(state, identity, database_id, sql).await);
     }
 
     // Retention policies (timeseries). `SHOW RETENTION POLICIES` parses into a
