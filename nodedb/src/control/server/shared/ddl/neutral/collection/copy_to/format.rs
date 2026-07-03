@@ -8,8 +8,15 @@
 use nodedb_sql::ddl_ast::statement::CopyFormat;
 use sonic_rs;
 
-use crate::control::server::pgwire::types::sqlstate_error;
-use pgwire::error::PgWireResult;
+use crate::control::server::shared::ddl::result::DdlError;
+
+/// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// Serialize a slice of JSON object values to bytes in the requested format.
 ///
@@ -20,7 +27,7 @@ pub(super) fn serialize_rows(
     format: &CopyFormat,
     delimiter: char,
     header: bool,
-) -> PgWireResult<Vec<u8>> {
+) -> Result<Vec<u8>, DdlError> {
     match format {
         CopyFormat::Ndjson => serialize_ndjson(rows),
         CopyFormat::JsonArray => serialize_json_array(rows),
@@ -28,25 +35,24 @@ pub(super) fn serialize_rows(
     }
 }
 
-fn serialize_ndjson(rows: &[serde_json::Value]) -> PgWireResult<Vec<u8>> {
+fn serialize_ndjson(rows: &[serde_json::Value]) -> Result<Vec<u8>, DdlError> {
     let mut out = Vec::with_capacity(rows.len() * 64);
     for row in rows {
-        let line = sonic_rs::to_vec(row).map_err(|e| {
-            sqlstate_error("XX000", &format!("COPY TO: JSON serialization error: {e}"))
-        })?;
+        let line = sonic_rs::to_vec(row)
+            .map_err(|e| ddl_err("XX000", format!("COPY TO: JSON serialization error: {e}")))?;
         out.extend_from_slice(&line);
         out.push(b'\n');
     }
     Ok(out)
 }
 
-fn serialize_json_array(rows: &[serde_json::Value]) -> PgWireResult<Vec<u8>> {
+fn serialize_json_array(rows: &[serde_json::Value]) -> Result<Vec<u8>, DdlError> {
     // Build a serde_json::Value::Array and serialize once.
     let arr = serde_json::Value::Array(rows.to_vec());
     let bytes = sonic_rs::to_vec(&arr).map_err(|e| {
-        sqlstate_error(
+        ddl_err(
             "XX000",
-            &format!("COPY TO: JSON array serialization error: {e}"),
+            format!("COPY TO: JSON array serialization error: {e}"),
         )
     })?;
     Ok(bytes)
@@ -56,7 +62,7 @@ fn serialize_csv(
     rows: &[serde_json::Value],
     delimiter: char,
     header: bool,
-) -> PgWireResult<Vec<u8>> {
+) -> Result<Vec<u8>, DdlError> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -69,7 +75,7 @@ fn serialize_csv(
             cols
         }
         _ => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "22P02",
                 "COPY TO CSV: expected JSON objects as rows",
             ));
@@ -91,9 +97,9 @@ fn serialize_csv(
         let obj = match row.as_object() {
             Some(m) => m,
             None => {
-                return Err(sqlstate_error(
+                return Err(ddl_err(
                     "22P02",
-                    &format!("COPY TO CSV: row {idx} is not a JSON object"),
+                    format!("COPY TO CSV: row {idx} is not a JSON object"),
                 ));
             }
         };

@@ -8,7 +8,6 @@
 //! [`DdlResult`] instead of pgwire `Response` / `PgWireResult`.
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sql_parse::{parse_sql_value, split_values};
 use crate::control::state::SharedState;
@@ -102,10 +101,10 @@ pub(super) fn parse_write_statement(
                 coll_type,
             );
         }
-        return Some(Err(err_from_pgwire(sqlstate_error(
+        return Some(Err(ddl_err(
             "42601",
             "failed to parse object literal in INSERT/UPSERT statement",
-        ))));
+        )));
     }
 
     parse_values_form(sql, &upper, keyword, &coll_name, coll_type)
@@ -122,28 +121,22 @@ fn parse_values_form(
     let first_open = match sql.find('(') {
         Some(p) => p,
         None => {
-            return Some(Err(err_from_pgwire(sqlstate_error(
+            return Some(Err(ddl_err(
                 "42601",
-                &format!("missing column list in {}", keyword.trim()),
-            ))));
+                format!("missing column list in {}", keyword.trim()),
+            )));
         }
     };
     let values_kw = match upper.find("VALUES") {
         Some(p) => p,
         None => {
-            return Some(Err(err_from_pgwire(sqlstate_error(
-                "42601",
-                "missing VALUES clause",
-            ))));
+            return Some(Err(ddl_err("42601", "missing VALUES clause")));
         }
     };
     let first_close = match sql[first_open..values_kw].rfind(')') {
         Some(p) => first_open + p,
         None => {
-            return Some(Err(err_from_pgwire(sqlstate_error(
-                "42601",
-                "missing closing ) for column list",
-            ))));
+            return Some(Err(ddl_err("42601", "missing closing ) for column list")));
         }
     };
     let cols_str = &sql[first_open + 1..first_close];
@@ -153,33 +146,27 @@ fn parse_values_form(
     let vals_open = match after_values.find('(') {
         Some(p) => p,
         None => {
-            return Some(Err(err_from_pgwire(sqlstate_error(
-                "42601",
-                "missing VALUES (...)",
-            ))));
+            return Some(Err(ddl_err("42601", "missing VALUES (...)")));
         }
     };
     let vals_close = match after_values.rfind(')') {
         Some(p) => p,
         None => {
-            return Some(Err(err_from_pgwire(sqlstate_error(
-                "42601",
-                "missing closing ) for VALUES",
-            ))));
+            return Some(Err(ddl_err("42601", "missing closing ) for VALUES")));
         }
     };
     let vals_str = &after_values[vals_open + 1..vals_close];
     let values: Vec<&str> = split_values(vals_str);
 
     if columns.len() != values.len() {
-        return Some(Err(err_from_pgwire(sqlstate_error(
+        return Some(Err(ddl_err(
             "42601",
-            &format!(
+            format!(
                 "column count ({}) doesn't match value count ({})",
                 columns.len(),
                 values.len()
             ),
-        ))));
+        )));
     }
 
     let mut doc_id = String::new();
@@ -253,7 +240,7 @@ pub(super) async fn dispatch_plan(
         crate::types::DatabaseId::DEFAULT,
         &plan,
     ) {
-        return Some(Err(ddl_err_raw("XX000", &e.to_string())));
+        return Some(Err(ddl_err("XX000", e.to_string())));
     }
     if let Err(e) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
@@ -265,7 +252,7 @@ pub(super) async fn dispatch_plan(
     )
     .await
     {
-        return Some(Err(ddl_err_raw("XX000", &e.to_string())));
+        return Some(Err(ddl_err("XX000", e.to_string())));
     }
     None
 }
@@ -355,7 +342,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     let mut tasks = query_ctx
         .plan_sql(sql, tenant_id, database_id)
         .await
-        .map_err(|e| ddl_err_raw("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     // Schemaless INSERT / UPSERT / object-literal documents carrying `_from`
     // / `_to` mirror an implicit graph edge. Extract it here — the same as the
@@ -370,7 +357,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| ddl_err_raw("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     // A cross-shard write (e.g. a doc + its dual-homed implicit edge, or a
     // multi-row insert spanning vShards) must commit atomically through the
@@ -391,7 +378,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             false,
         )
         .await
-        .map_err(|e| ddl_err_raw("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
         return Ok(());
     }
 
@@ -403,7 +390,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             task.database_id,
             &task.plan,
         )
-        .map_err(|e| ddl_err_raw("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
         let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
@@ -413,7 +400,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| ddl_err_raw("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
         // Data Plane returns `Ok(Response { status: Error, .. })` for
         // constraint violations (UNIQUE, CHECK-at-write, etc.). Surface
@@ -431,33 +418,17 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             } else {
                 "XX000"
             };
-            return Err(ddl_err_raw(sqlstate, &detail));
+            return Err(ddl_err(sqlstate, detail));
         }
     }
     Ok(())
 }
 
-/// Build a [`DdlError`] from a SQLSTATE + message.
-fn ddl_err_raw(code: &str, msg: &str) -> DdlError {
+/// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError {
-        sqlstate: code.to_string(),
-        message: msg.to_string(),
-    }
-}
-
-/// Convert a pgwire error (from a shared infra helper still imported from the
-/// pgwire crate boundary, e.g. `sqlstate_error`) into a [`DdlError`], mirroring
-/// `dispatch.rs::pgwire_error_to_ddl_error`.
-fn err_from_pgwire(err: pgwire::error::PgWireError) -> DdlError {
-    match err {
-        pgwire::error::PgWireError::UserError(info) => DdlError {
-            sqlstate: info.code.clone(),
-            message: info.message.clone(),
-        },
-        other => DdlError {
-            sqlstate: "XX000".to_string(),
-            message: other.to_string(),
-        },
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
     }
 }
 

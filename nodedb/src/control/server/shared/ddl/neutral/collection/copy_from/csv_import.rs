@@ -5,12 +5,10 @@
 //! Relocated verbatim from the pgwire `ddl::collection::copy_from::csv_import`
 //! module (now deleted). `plan_and_dispatch` returns the protocol-neutral
 //! [`DdlError`] directly (it is the neutral collection-DML helper), so this
-//! module's own file-read/parse errors — built from the still-imported
-//! `pgwire::types::sqlstate_error` — are converted to `DdlError` at their call
+//! module's own file-read/parse errors are built as `DdlError` at their call
 //! sites to keep one error type end to end.
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::server::shared::ddl::neutral::collection::dml::{
     fields_to_insert_sql, plan_and_dispatch,
 };
@@ -19,18 +17,11 @@ use crate::control::state::SharedState;
 
 use super::entry::wrap_row_error;
 
-/// Convert a pgwire error (from the still-imported `sqlstate_error` helper)
-/// into a protocol-neutral [`DdlError`].
-fn ddl_err(err: pgwire::error::PgWireError) -> DdlError {
-    match err {
-        pgwire::error::PgWireError::UserError(info) => DdlError {
-            sqlstate: info.code.clone(),
-            message: info.message.clone(),
-        },
-        other => DdlError {
-            sqlstate: "XX000".to_string(),
-            message: other.to_string(),
-        },
+/// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
     }
 }
 
@@ -55,18 +46,15 @@ pub(super) async fn import_csv(
         delimiter,
         has_header,
     } = opts;
-    let bytes = tokio::fs::read(path).await.map_err(|e| {
-        ddl_err(sqlstate_error(
-            "58030",
-            &format!("COPY: cannot read '{path}': {e}"),
-        ))
-    })?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| ddl_err("58030", format!("COPY: cannot read '{path}': {e}")))?;
 
     let content = std::str::from_utf8(&bytes).map_err(|e| {
-        ddl_err(sqlstate_error(
+        ddl_err(
             "22021",
-            &format!("COPY: file '{path}' is not valid UTF-8: {e}"),
-        ))
+            format!("COPY: file '{path}' is not valid UTF-8: {e}"),
+        )
     })?;
 
     let mut lines = content.lines();
@@ -97,14 +85,14 @@ pub(super) async fn import_csv(
         let values = parse_csv_row(line, delimiter);
         let mut fields: std::collections::HashMap<String, nodedb_types::Value> = if has_header {
             if values.len() != headers.len() {
-                return Err(ddl_err(sqlstate_error(
+                return Err(ddl_err(
                     "22P02",
-                    &format!(
+                    format!(
                         "COPY: row {line_no} has {} columns, header has {}",
                         values.len(),
                         headers.len()
                     ),
-                )));
+                ));
             }
             headers
                 .iter()

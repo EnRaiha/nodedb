@@ -4,10 +4,9 @@
 //!
 //! Relocated verbatim from the pgwire `ddl::collection::copy_from::entry`
 //! module (now deleted) except for the result type, which is [`DdlResult`] /
-//! [`DdlError`] throughout instead of pgwire `Response` / `PgWireResult`. The
-//! still-imported `pgwire::types::sqlstate_error` builds a `PgWireError` at
-//! each error site (shared infra, unchanged), converted immediately to
-//! `DdlError` via [`ddl_err`] so the whole call chain speaks one error type.
+//! [`DdlError`] throughout instead of pgwire `Response` / `PgWireResult`. Each
+//! error site builds a `DdlError` directly via [`ddl_err`] so the whole call
+//! chain speaks one error type.
 
 use nodedb_types::DatabaseId;
 use std::path::Path;
@@ -16,7 +15,6 @@ use nodedb_sql::ddl_ast::statement::CopyFormat;
 use nodedb_types::CollectionType;
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
@@ -51,32 +49,29 @@ pub async fn copy_from_file(
     validate_path(path)?;
 
     // Check file size before reading.
-    let metadata = tokio::fs::metadata(path).await.map_err(|e| {
-        ddl_err(sqlstate_error(
-            "58030",
-            &format!("COPY: cannot stat file '{path}': {e}"),
-        ))
-    })?;
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| ddl_err("58030", format!("COPY: cannot stat file '{path}': {e}")))?;
     if metadata.len() > MAX_FILE_BYTES {
-        return Err(ddl_err(sqlstate_error(
+        return Err(ddl_err(
             "54000",
-            &format!(
+            format!(
                 "COPY: file '{path}' is {} bytes, exceeds limit of {} bytes",
                 metadata.len(),
                 MAX_FILE_BYTES
             ),
-        )));
+        ));
     }
 
     // Determine format (caller has already auto-detected from extension; this is a safety net).
     let resolved_format = format.ok_or_else(|| {
-        ddl_err(sqlstate_error(
+        ddl_err(
             "42601",
-            &format!(
+            format!(
                 "COPY: cannot infer format for '{path}'; \
                  add WITH (FORMAT ndjson|json|csv)"
             ),
-        ))
+        )
     })?;
 
     // Validate engine: reject Timeseries and Spatial.
@@ -117,25 +112,25 @@ pub async fn copy_from_file(
 /// Reject paths with `..` segments and non-absolute paths.
 fn validate_path(path: &str) -> Result<(), DdlError> {
     if !path.starts_with('/') {
-        return Err(ddl_err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
-            &format!(
+            format!(
                 "COPY: path '{path}' is not absolute; \
                  only absolute server-side paths are accepted"
             ),
-        )));
+        ));
     }
     let p = Path::new(path);
     for component in p.components() {
         use std::path::Component;
         if matches!(component, Component::ParentDir) {
-            return Err(ddl_err(sqlstate_error(
+            return Err(ddl_err(
                 "42501",
-                &format!(
+                format!(
                     "COPY: path '{path}' contains '..'; \
                      directory traversal is not permitted"
                 ),
-            )));
+            ));
         }
     }
     Ok(())
@@ -156,10 +151,10 @@ fn check_engine_support(
         Ok(Some(c)) => c,
         Ok(None) => return Ok(()), // Collection doesn't exist yet — will fail at INSERT.
         Err(e) => {
-            return Err(ddl_err(sqlstate_error(
+            return Err(ddl_err(
                 "XX000",
-                &format!("COPY: catalog lookup failed: {e}"),
-            )));
+                format!("COPY: catalog lookup failed: {e}"),
+            ));
         }
     };
 
@@ -168,20 +163,20 @@ fn check_engine_support(
             use nodedb_types::ColumnarProfile;
             match profile {
                 ColumnarProfile::Plain => Ok(()),
-                ColumnarProfile::Timeseries { .. } => Err(ddl_err(sqlstate_error(
+                ColumnarProfile::Timeseries { .. } => Err(ddl_err(
                     "0A000",
-                    &format!(
+                    format!(
                         "COPY: collection '{collection}' uses the timeseries engine; \
                          use ILP or INSERT with explicit time column instead"
                     ),
-                ))),
-                ColumnarProfile::Spatial { .. } => Err(ddl_err(sqlstate_error(
+                )),
+                ColumnarProfile::Spatial { .. } => Err(ddl_err(
                     "0A000",
-                    &format!(
+                    format!(
                         "COPY: collection '{collection}' uses the spatial engine; \
                          use INSERT with a WKT/GeoJSON geometry column instead"
                     ),
-                ))),
+                )),
             }
         }
         CollectionType::Document(_) => Ok(()),
@@ -202,17 +197,10 @@ pub(super) fn wrap_row_error(e: DdlError, line_no: usize, fmt: &str) -> DdlError
     }
 }
 
-/// Convert a pgwire error (from the still-imported `sqlstate_error` helper)
-/// into a protocol-neutral [`DdlError`].
-fn ddl_err(err: pgwire::error::PgWireError) -> DdlError {
-    match err {
-        pgwire::error::PgWireError::UserError(info) => DdlError {
-            sqlstate: info.code.clone(),
-            message: info.message.clone(),
-        },
-        other => DdlError {
-            sqlstate: "XX000".to_string(),
-            message: other.to_string(),
-        },
+/// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
     }
 }

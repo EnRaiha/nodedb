@@ -3,25 +3,30 @@
 //! Entry point: `copy_to_file`, path validation, scan, and atomic file write.
 //!
 //! Relocated verbatim from the pgwire `ddl::collection::copy_to::entry`
-//! module (now deleted) except for the result type at the outer boundary,
-//! which is [`DdlResult`] / [`DdlError`] instead of pgwire `Response` /
-//! `PgWireResult`.
+//! module (now deleted) except for the result type, which is [`DdlResult`] /
+//! [`DdlError`] throughout instead of pgwire `Response` / `PgWireResult`.
 
 use nodedb_types::DatabaseId;
 use std::path::Path;
 
-use pgwire::error::PgWireResult;
 use sonic_rs;
 
 use nodedb_sql::ddl_ast::statement::{CopyFormat, CopyToSource};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 use crate::types::TraceId;
 
 use super::format::serialize_rows;
+
+/// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// Execute `COPY <source> TO '<path>' [WITH (...)]`.
 pub async fn copy_to_file(
@@ -33,27 +38,13 @@ pub async fn copy_to_file(
     delimiter: Option<char>,
     header: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    copy_to_file_inner(state, identity, source, path, format, delimiter, header)
-        .await
-        .map_err(pgwire_err_to_ddl_err)
-}
-
-async fn copy_to_file_inner(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    source: &CopyToSource,
-    path: &str,
-    format: Option<&CopyFormat>,
-    delimiter: Option<char>,
-    header: bool,
-) -> PgWireResult<Vec<DdlResult>> {
     validate_path(path)?;
 
     // Resolve format (caller has already auto-detected from extension).
     let resolved_format = format.ok_or_else(|| {
-        sqlstate_error(
+        ddl_err(
             "42601",
-            &format!(
+            format!(
                 "COPY TO: cannot infer format for '{path}'; \
                  add WITH (FORMAT ndjson|json|csv)"
             ),
@@ -77,17 +68,17 @@ async fn copy_to_file_inner(
     // Atomic write: temp file → rename.
     let tmp_path = format!("{path}.tmp");
     tokio::fs::write(&tmp_path, &bytes).await.map_err(|e| {
-        sqlstate_error(
+        ddl_err(
             "58030",
-            &format!("COPY TO: cannot write to '{tmp_path}': {e}"),
+            format!("COPY TO: cannot write to '{tmp_path}': {e}"),
         )
     })?;
     tokio::fs::rename(&tmp_path, path).await.map_err(|e| {
         // Clean up the temp file on rename failure.
         let _ = std::fs::remove_file(&tmp_path);
-        sqlstate_error(
+        ddl_err(
             "58030",
-            &format!("COPY TO: cannot rename '{tmp_path}' to '{path}': {e}"),
+            format!("COPY TO: cannot rename '{tmp_path}' to '{path}': {e}"),
         )
     })?;
 
@@ -99,7 +90,7 @@ async fn copy_to_file_inner(
 }
 
 /// Build a SELECT SQL string from the source.
-fn build_select_sql(source: &CopyToSource) -> PgWireResult<String> {
+fn build_select_sql(source: &CopyToSource) -> Result<String, DdlError> {
     match source {
         CopyToSource::Collection(coll) => Ok(format!("SELECT * FROM {coll}")),
         CopyToSource::Query(q) => Ok(q.clone()),
@@ -111,20 +102,20 @@ fn check_collection_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     collection: &str,
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     let catalog = match state.credentials.catalog() {
         Some(c) => c,
         None => return Ok(()), // No catalog: schemaless fallback; proceed.
     };
     match catalog.get_collection(DatabaseId::DEFAULT, identity.tenant_id.as_u64(), collection) {
         Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(sqlstate_error(
+        Ok(None) => Err(ddl_err(
             "42P01",
-            &format!("COPY TO: collection \"{collection}\" does not exist"),
+            format!("COPY TO: collection \"{collection}\" does not exist"),
         )),
-        Err(e) => Err(sqlstate_error(
+        Err(e) => Err(ddl_err(
             "XX000",
-            &format!("COPY TO: catalog lookup failed: {e}"),
+            format!("COPY TO: catalog lookup failed: {e}"),
         )),
     }
 }
@@ -134,7 +125,7 @@ async fn execute_and_collect(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     select_sql: &str,
-) -> PgWireResult<Vec<serde_json::Value>> {
+) -> Result<Vec<serde_json::Value>, DdlError> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
     let tasks = query_ctx
         .plan_sql(
@@ -143,7 +134,7 @@ async fn execute_and_collect(
             crate::types::DatabaseId::DEFAULT,
         )
         .await
-        .map_err(|e| sqlstate_error("42601", &format!("COPY TO: query planning failed: {e}")))?;
+        .map_err(|e| ddl_err("42601", format!("COPY TO: query planning failed: {e}")))?;
 
     let mut all_rows: Vec<serde_json::Value> = Vec::new();
 
@@ -157,7 +148,7 @@ async fn execute_and_collect(
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| sqlstate_error("XX000", &format!("COPY TO: dispatch failed: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("COPY TO: dispatch failed: {e}")))?;
 
         if resp.payload.is_empty() {
             continue;
@@ -171,14 +162,14 @@ async fn execute_and_collect(
 }
 
 /// Parse a JSON string (array or single object) and append rows to `out`.
-fn extract_json_rows(json: &str, out: &mut Vec<serde_json::Value>) -> PgWireResult<()> {
+fn extract_json_rows(json: &str, out: &mut Vec<serde_json::Value>) -> Result<(), DdlError> {
     if json.is_empty() {
         return Ok(());
     }
     let parsed: serde_json::Value = sonic_rs::from_str(json).map_err(|e| {
-        sqlstate_error(
+        ddl_err(
             "XX000",
-            &format!("COPY TO: failed to decode result rows: {e}"),
+            format!("COPY TO: failed to decode result rows: {e}"),
         )
     })?;
     match parsed {
@@ -194,11 +185,11 @@ fn extract_json_rows(json: &str, out: &mut Vec<serde_json::Value>) -> PgWireResu
 }
 
 /// Reject paths with `..` segments and non-absolute paths.
-fn validate_path(path: &str) -> PgWireResult<()> {
+fn validate_path(path: &str) -> Result<(), DdlError> {
     if !path.starts_with('/') {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
-            &format!(
+            format!(
                 "COPY TO: path '{path}' is not absolute; \
                  only absolute server-side paths are accepted"
             ),
@@ -208,9 +199,9 @@ fn validate_path(path: &str) -> PgWireResult<()> {
     for component in p.components() {
         use std::path::Component;
         if matches!(component, Component::ParentDir) {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42501",
-                &format!(
+                format!(
                     "COPY TO: path '{path}' contains '..'; \
                      directory traversal is not permitted"
                 ),
@@ -218,18 +209,4 @@ fn validate_path(path: &str) -> PgWireResult<()> {
         }
     }
     Ok(())
-}
-
-/// Convert the accumulated `PgWireError` into a protocol-neutral [`DdlError`].
-fn pgwire_err_to_ddl_err(err: pgwire::error::PgWireError) -> DdlError {
-    match err {
-        pgwire::error::PgWireError::UserError(info) => DdlError {
-            sqlstate: info.code.clone(),
-            message: info.message.clone(),
-        },
-        other => DdlError {
-            sqlstate: "XX000".to_string(),
-            message: other.to_string(),
-        },
-    }
 }

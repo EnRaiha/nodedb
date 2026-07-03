@@ -9,7 +9,6 @@
 use nodedb_types::DatabaseId;
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::state::SharedState;
@@ -117,7 +116,7 @@ pub async fn upsert_document(
                     type_name,
                     label,
                 ) {
-                    return Some(Err(ddl_err_from_pgwire(sqlstate_error("22P02", &msg))));
+                    return Some(Err(ddl_err("22P02", msg)));
                 }
             }
         }
@@ -188,17 +187,10 @@ pub async fn upsert_document(
     }]))
 }
 
-/// Convert a pgwire error (from a shared infra helper still imported from the
-/// pgwire crate boundary) into a [`DdlError`].
-fn ddl_err_from_pgwire(err: pgwire::error::PgWireError) -> DdlError {
-    match err {
-        pgwire::error::PgWireError::UserError(info) => DdlError {
-            sqlstate: info.code.clone(),
-            message: info.message.clone(),
-        },
-        other => DdlError {
-            sqlstate: "XX000".to_string(),
-            message: other.to_string(),
-        },
+/// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
     }
 }
