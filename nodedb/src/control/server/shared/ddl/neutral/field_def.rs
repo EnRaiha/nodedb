@@ -1,37 +1,46 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! DEFINE FIELD handler.
+//! Protocol-neutral DEFINE FIELD / DEFINE EVENT handlers.
 //!
-//! Parses: DEFINE FIELD <name> ON <collection> [TYPE <type>] [DEFAULT <expr>]
-//!         [VALUE <expr>] [ASSERT <expr>] [READONLY]
+//! - `DEFINE FIELD <name> ON <collection> [TYPE <type>] [DEFAULT <expr>]
+//!   [VALUE <expr>] [ASSERT <expr>] [READONLY]` — stores a field definition in
+//!   the catalog. Applied during writes (DEFAULT, ASSERT, TYPE validation) and
+//!   reads (VALUE computed fields).
+//! - `DEFINE EVENT <name> ON <collection> WHEN <condition> THEN <action>` —
+//!   stores an event definition in the catalog.
 //!
-//! Stores the field definition in the catalog. Applied during writes (DEFAULT,
-//! ASSERT, TYPE validation) and reads (VALUE computed fields).
+//! Handlers build [`DdlResult`] directly and carry no pgwire wire types.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::catalog::types::FieldDefinition;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::ddl::sql_parse::extract_clause;
 use crate::control::state::SharedState;
 
-use super::super::types::sqlstate_error;
-use super::sql_parse::extract_clause;
+use super::super::result::{DdlError, DdlResult};
 
 /// Keywords that delimit DEFINE FIELD clauses.
 const FIELD_KEYWORDS: &[&str] = &["TYPE", "DEFAULT", "VALUE", "ASSERT", "READONLY"];
+
+/// Build a [`DdlError`] from a SQLSTATE + message.
+fn err(sqlstate: &str, message: &str) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.to_string(),
+    }
+}
 
 /// Parse and store a DEFINE FIELD statement.
 pub fn define_field(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // Parse: DEFINE FIELD <name> ON <collection> ...
     let parts: Vec<&str> = sql.split_whitespace().collect();
     if parts.len() < 5 || !parts[3].eq_ignore_ascii_case("ON") {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: DEFINE FIELD <name> ON <collection> [TYPE <type>] [DEFAULT <expr>] [VALUE <expr>] [ASSERT <expr>] [READONLY]",
         ));
@@ -94,11 +103,11 @@ pub fn define_field(
                 }
 
                 if let Err(e) = catalog.put_collection(DatabaseId::DEFAULT, &coll) {
-                    return Err(sqlstate_error("XX000", &format!("save collection: {e}")));
+                    return Err(err("XX000", &format!("save collection: {e}")));
                 }
             }
             _ => {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42P01",
                     &format!("collection '{collection}' does not exist"),
                 ));
@@ -113,7 +122,10 @@ pub fn define_field(
         &format!("defined field '{field_name}' on '{collection}'"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("DEFINE FIELD"))])
+    Ok(vec![DdlResult::Status {
+        command: "DEFINE FIELD".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Parse and store a DEFINE EVENT statement.
@@ -123,12 +135,12 @@ pub fn define_event(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     use crate::control::security::catalog::types::EventDefinition;
 
     let parts: Vec<&str> = sql.split_whitespace().collect();
     if parts.len() < 5 || !parts[3].eq_ignore_ascii_case("ON") {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: DEFINE EVENT <name> ON <collection> WHEN <condition> THEN <action>",
         ));
@@ -153,7 +165,7 @@ pub fn define_event(
         extract_clause(&upper_rem, remainder, "THEN", EVENT_KEYWORDS).unwrap_or_default();
 
     if when_condition.is_empty() || then_action.is_empty() {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "DEFINE EVENT requires both WHEN and THEN clauses",
         ));
@@ -172,11 +184,11 @@ pub fn define_event(
                 coll.event_defs.retain(|e| e.name != event_name);
                 coll.event_defs.push(def);
                 if let Err(e) = catalog.put_collection(DatabaseId::DEFAULT, &coll) {
-                    return Err(sqlstate_error("XX000", &format!("save collection: {e}")));
+                    return Err(err("XX000", &format!("save collection: {e}")));
                 }
             }
             _ => {
-                return Err(sqlstate_error(
+                return Err(err(
                     "42P01",
                     &format!("collection '{collection}' does not exist"),
                 ));
@@ -191,5 +203,8 @@ pub fn define_event(
         &format!("defined event '{event_name}' on '{collection}'"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("DEFINE EVENT"))])
+    Ok(vec![DdlResult::Status {
+        command: "DEFINE EVENT".to_string(),
+        rows_affected: None,
+    }])
 }

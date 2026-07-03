@@ -7,10 +7,10 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
 pub(super) async fn dispatch(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    sql: &str,
-    upper: &str,
+    _state: &SharedState,
+    _identity: &AuthenticatedIdentity,
+    _sql: &str,
+    _upper: &str,
     _parts: &[&str],
 ) -> Option<PgWireResult<Vec<Response>>> {
     // Triggers (CREATE / DROP / ALTER / SHOW) are served by the protocol-neutral DDL router.
@@ -41,15 +41,9 @@ pub(super) async fn dispatch(
 
     // DROP RLS POLICY / SHOW RLS POLICIES — served by the protocol-neutral DDL router.
 
-    // DEFINE FIELD <name> ON <collection> [TYPE <type>] [DEFAULT <expr>] [VALUE <expr>] [ASSERT <expr>] [READONLY]
-    if upper.starts_with("DEFINE FIELD ") {
-        return Some(super::super::field_def::define_field(state, identity, sql));
-    }
-
-    // DEFINE EVENT <name> ON <collection> WHEN <condition> THEN <action>
-    if upper.starts_with("DEFINE EVENT ") {
-        return Some(super::super::field_def::define_event(state, identity, sql));
-    }
+    // DEFINE FIELD / DEFINE EVENT have been migrated to the protocol-neutral
+    // router (`shared::ddl::neutral::field_def`), which is tried before this
+    // transitional pgwire delegation runs.
 
     // CREATE SPATIAL INDEX has been migrated to the protocol-neutral router
     // (`shared::ddl::neutral::spatial`), which is tried before this transitional

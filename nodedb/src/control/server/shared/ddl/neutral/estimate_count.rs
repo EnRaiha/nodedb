@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Protocol-neutral `SELECT ESTIMATE_COUNT('collection', 'field')` function.
+//!
+//! Dispatches [`DocumentOp::EstimateCount`] to the Data Plane for a fast
+//! approximate count derived from HLL statistics and returns a single text row.
+//! The handler builds [`DdlResult`] directly and carries no pgwire types.
+
+use serde_json::{Map, Value as JsonValue};
+
+use crate::bridge::envelope::PhysicalPlan;
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::state::SharedState;
+use crate::types::{DatabaseId, TraceId};
+use nodedb_physical::physical_plan::DocumentOp;
+
+use super::super::result::{DdlError, DdlResult};
+
+/// Execute `SELECT ESTIMATE_COUNT('collection', 'field')`.
+pub async fn estimate_count(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    sql: &str,
+) -> Result<Vec<DdlResult>, DdlError> {
+    // Parse: SELECT ESTIMATE_COUNT('collection', 'field')
+    let inner = sql
+        .find('(')
+        .and_then(|start| sql.rfind(')').map(|end| &sql[start + 1..end]));
+    if let Some(args_str) = inner {
+        let args: Vec<&str> = args_str
+            .split(',')
+            .map(|s| s.trim().trim_matches('\''))
+            .collect();
+        if args.len() >= 2 {
+            let coll = args[0].to_lowercase();
+            let field = args[1].to_string();
+            let tenant_id = identity.tenant_id;
+            let vshard = crate::types::VShardId::from_collection_in_database(database_id, &coll);
+            let plan = PhysicalPlan::Document(DocumentOp::EstimateCount {
+                collection: coll,
+                field,
+            });
+            match crate::control::server::dispatch_utils::dispatch_to_data_plane(
+                state,
+                tenant_id,
+                database_id,
+                vshard,
+                plan,
+                TraceId::ZERO,
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let payload_text =
+                        crate::data::executor::response_codec::decode_payload_to_json(
+                            &resp.payload,
+                        );
+                    let columns = vec!["estimate_count".to_string()];
+                    let column_types = vec![DdlColType::Text];
+                    let mut row = Map::new();
+                    row.insert(
+                        "estimate_count".to_string(),
+                        JsonValue::String(payload_text),
+                    );
+                    return Ok(vec![DdlResult::Rows(ShapedRows {
+                        columns,
+                        column_types,
+                        rows: vec![row],
+                        notice: None,
+                    })]);
+                }
+                Err(e) => {
+                    return Err(DdlError {
+                        sqlstate: "XX000".to_string(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Err(DdlError {
+        sqlstate: "42601".to_string(),
+        message: "usage: SELECT ESTIMATE_COUNT('collection', 'field')".to_string(),
+    })
+}

@@ -23,6 +23,7 @@ use super::auth_user;
 use super::blacklist;
 use super::bulk;
 use super::change_stream;
+use super::chunk_text;
 use super::cluster;
 use super::collection;
 use super::conflict_policy;
@@ -35,7 +36,10 @@ use super::custom_type;
 use super::database;
 use super::dsl;
 use super::emergency_ddl;
+use super::estimate_count;
 use super::explain_ddl;
+use super::explain_tiers;
+use super::field_def;
 use super::function;
 use super::grant;
 use super::graph_ops;
@@ -66,6 +70,7 @@ use super::scope_query_ddl;
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
 use super::session_admin;
+use super::show_changes;
 use super::spatial;
 use super::stream_select;
 use super::synonym_group;
@@ -985,6 +990,49 @@ pub async fn try_dispatch(
     }
     if upper.starts_with("SELECT CRDT_APPLY(") || upper.starts_with("SELECT CRDT_APPLY (") {
         return Some(crdt_ops::crdt_apply(state, identity, database_id, sql).await);
+    }
+
+    // `NDB_CHUNK_TEXT(...)` table-valued function, `SHOW CHANGES FOR …`
+    // change-stream query, and `SELECT ESTIMATE_COUNT(…)` — string-recognized
+    // (none parse into a typed DDL variant). The pgwire dsl string router
+    // recognized all three by prefix from the raw SQL; replicate that exactly
+    // here, before the parse gate, so the prefix recognition and syntax messages
+    // stay byte-identical. The `NDB_CHUNK_TEXT(` and `ESTIMATE_COUNT(`
+    // function-name checks are specific enough not to collide with the other
+    // migrated `SELECT …` arms above.
+    if (upper.starts_with("SELECT ") && upper.contains("NDB_CHUNK_TEXT("))
+        || upper.starts_with("SELECT NDB_CHUNK_TEXT(")
+    {
+        return Some(chunk_text::execute_chunk_text(sql));
+    }
+    if upper.starts_with("SHOW CHANGES ") {
+        return Some(show_changes::show_changes(state, sql));
+    }
+    if upper.starts_with("SELECT ESTIMATE_COUNT(") || upper.starts_with("SELECT ESTIMATE_COUNT (") {
+        return Some(estimate_count::estimate_count(state, identity, database_id, sql).await);
+    }
+
+    // `DEFINE FIELD …` / `DEFINE EVENT …` — string-recognized (no typed DDL
+    // variant); the pgwire schema string router dispatched both from the raw
+    // SQL. Replicate that exactly here, before the parse gate.
+    if upper.starts_with("DEFINE FIELD ") {
+        return Some(field_def::define_field(state, identity, sql));
+    }
+    if upper.starts_with("DEFINE EVENT ") {
+        return Some(field_def::define_event(state, identity, sql));
+    }
+
+    // `EXPLAIN TIERS ON <collection> [RANGE …]` — string-recognized (no typed
+    // DDL variant); the pgwire admin string router dispatched it from the raw
+    // token slice. Replicate that exactly here, before the parse gate.
+    if upper.starts_with("EXPLAIN TIERS ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(explain_tiers::explain_tiers(
+            state,
+            identity,
+            database_id,
+            &parts,
+        ));
     }
 
     // Administrative introspection & audit: SHOW USERS, SHOW TENANTS, SHOW

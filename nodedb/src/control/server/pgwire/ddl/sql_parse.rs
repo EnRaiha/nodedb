@@ -155,7 +155,7 @@ fn sql_value_to_ndb_value(v: nodedb_sql::types::SqlValue) -> nodedb_types::Value
 /// The value spans from after the keyword to the next keyword or end of string.
 ///
 /// `all_keywords` lists every keyword that can terminate the value.
-pub(super) fn extract_clause(
+pub(crate) fn extract_clause(
     upper: &str,
     original: &str,
     keyword: &str,
@@ -198,7 +198,7 @@ pub(crate) fn extract_collection_after(sql: &str, marker: &str) -> Option<String
 ///
 /// Accepts ISO 8601 datetime strings or raw milliseconds.
 /// Returns an error with a descriptive message for invalid formats.
-pub(super) fn parse_since_timestamp(input: &str) -> crate::Result<u64> {
+pub(crate) fn parse_since_timestamp(input: &str) -> crate::Result<u64> {
     // Try ISO 8601 first.
     if let Some(dt) = nodedb_types::NdbDateTime::parse(input) {
         return Ok(dt.unix_millis() as u64);

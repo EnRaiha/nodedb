@@ -6,23 +6,18 @@ use pgwire::error::PgWireResult;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
-use crate::types::TraceId;
-use nodedb_physical::physical_plan::DocumentOp;
 
 pub(super) async fn dispatch(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
+    _state: &SharedState,
+    _identity: &AuthenticatedIdentity,
     sql: &str,
     upper: &str,
     _parts: &[&str],
-    database_id: DatabaseId,
+    _database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
-    // NDB_CHUNK_TEXT table-valued function: SELECT * FROM NDB_CHUNK_TEXT(...).
-    if (upper.starts_with("SELECT ") && upper.contains("NDB_CHUNK_TEXT("))
-        || upper.starts_with("SELECT NDB_CHUNK_TEXT(")
-    {
-        return Some(super::helpers::execute_chunk_text(sql));
-    }
+    // NDB_CHUNK_TEXT table-valued function has been migrated to the
+    // protocol-neutral router (`shared::ddl::neutral::chunk_text`), which is
+    // tried before this transitional pgwire delegation runs.
 
     // CRDT DSL functions (`SELECT crdt_state(...)` / `SELECT crdt_apply(...)`)
     // and `MATCH` pattern queries have been migrated to the protocol-neutral
@@ -57,140 +52,13 @@ pub(super) async fn dispatch(
     // (`shared::ddl::neutral::collection::dml`), which is tried before this
     // transitional pgwire delegation runs.
 
-    // SHOW CHANGES FOR <collection> [SINCE <timestamp>] [LIMIT <n>]
-    if upper.starts_with("SHOW CHANGES ") {
-        if let Some(coll_name) = super::super::sql_parse::extract_collection_after(sql, " FOR ") {
-            let since_ms: u64 = if let Some(since_pos) = upper.find(" SINCE ") {
-                let since_str = sql[since_pos + 7..]
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("0");
-                match super::super::sql_parse::parse_since_timestamp(since_str) {
-                    Ok(ms) => ms,
-                    Err(msg) => {
-                        return Some(Err(super::super::super::types::sqlstate_error(
-                            "22007",
-                            &msg.to_string(),
-                        )));
-                    }
-                }
-            } else {
-                // Default: last 24 hours of changes.
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                now_ms.saturating_sub(86_400 * 1000)
-            };
+    // SHOW CHANGES FOR <collection> has been migrated to the protocol-neutral
+    // router (`shared::ddl::neutral::show_changes`), which is tried before this
+    // transitional pgwire delegation runs.
 
-            let limit = upper
-                .find(" LIMIT ")
-                .and_then(|pos| sql[pos + 7..].split_whitespace().next())
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(1000);
-
-            let changes = state
-                .change_stream
-                .query_changes(Some(&coll_name), since_ms, limit);
-
-            use futures::stream;
-            use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-
-            let schema = std::sync::Arc::new(vec![
-                super::super::super::types::text_field("collection"),
-                super::super::super::types::text_field("operation"),
-                super::super::super::types::text_field("document_id"),
-                super::super::super::types::text_field("timestamp_ms"),
-                super::super::super::types::text_field("lsn"),
-            ]);
-
-            let mut rows = Vec::with_capacity(changes.len());
-            for change in &changes {
-                let mut encoder = DataRowEncoder::new(schema.clone());
-                let _ = encoder.encode_field(&change.collection);
-                let _ = encoder.encode_field(&change.operation.as_str().to_string());
-                let _ = encoder.encode_field(&change.document_id);
-                let _ = encoder.encode_field(&change.timestamp_ms.to_string());
-                let _ = encoder.encode_field(&change.lsn.as_u64().to_string());
-                rows.push(Ok(encoder.take_row()));
-            }
-
-            return Some(Ok(vec![Response::Query(QueryResponse::new(
-                schema,
-                stream::iter(rows),
-            ))]));
-        }
-        return Some(Err(super::super::super::types::sqlstate_error(
-            "42601",
-            "syntax: SHOW CHANGES FOR <collection> [SINCE <timestamp>]",
-        )));
-    }
-
-    // ESTIMATE_COUNT('collection', 'field') — fast approximate count from HLL stats.
-    if upper.starts_with("SELECT ESTIMATE_COUNT(") || upper.starts_with("SELECT ESTIMATE_COUNT (") {
-        // Parse: SELECT ESTIMATE_COUNT('collection', 'field')
-        let inner = sql
-            .find('(')
-            .and_then(|start| sql.rfind(')').map(|end| &sql[start + 1..end]));
-        if let Some(args_str) = inner {
-            let args: Vec<&str> = args_str
-                .split(',')
-                .map(|s| s.trim().trim_matches('\''))
-                .collect();
-            if args.len() >= 2 {
-                let coll = args[0].to_lowercase();
-                let field = args[1].to_string();
-                let tenant_id = identity.tenant_id;
-                let vshard =
-                    crate::types::VShardId::from_collection_in_database(database_id, &coll);
-                let plan =
-                    crate::bridge::envelope::PhysicalPlan::Document(DocumentOp::EstimateCount {
-                        collection: coll,
-                        field,
-                    });
-                match crate::control::server::dispatch_utils::dispatch_to_data_plane(
-                    state,
-                    tenant_id,
-                    database_id,
-                    vshard,
-                    plan,
-                    TraceId::ZERO,
-                )
-                .await
-                {
-                    Ok(resp) => {
-                        let payload_text =
-                            crate::data::executor::response_codec::decode_payload_to_json(
-                                &resp.payload,
-                            );
-                        use futures::stream;
-                        use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-                        let schema =
-                            std::sync::Arc::new(vec![super::super::super::types::text_field(
-                                "estimate_count",
-                            )]);
-                        let mut encoder = DataRowEncoder::new(schema.clone());
-                        let _ = encoder.encode_field(&payload_text);
-                        let row = encoder.take_row();
-                        return Some(Ok(vec![Response::Query(QueryResponse::new(
-                            schema,
-                            stream::iter(vec![Ok(row)]),
-                        ))]));
-                    }
-                    Err(e) => {
-                        return Some(Err(super::super::super::types::sqlstate_error(
-                            "XX000",
-                            &e.to_string(),
-                        )));
-                    }
-                }
-            }
-        }
-        return Some(Err(super::super::super::types::sqlstate_error(
-            "42601",
-            "usage: SELECT ESTIMATE_COUNT('collection', 'field')",
-        )));
-    }
+    // ESTIMATE_COUNT('collection', 'field') has been migrated to the
+    // protocol-neutral router (`shared::ddl::neutral::estimate_count`), which is
+    // tried before this transitional pgwire delegation runs.
 
     // TRUNCATE — handled by SQL planner (plan_truncate_stmt → DocumentOp::Truncate).
 

@@ -3,7 +3,6 @@
 mod admin;
 mod ast;
 mod dsl;
-mod helpers;
 mod schema;
 
 use pgwire::api::results::Response;

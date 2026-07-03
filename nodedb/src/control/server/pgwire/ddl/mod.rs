@@ -2,7 +2,6 @@
 
 pub mod catalog_propose;
 pub mod database;
-pub mod field_def;
 #[path = "router/mod.rs"]
 pub mod router;
 pub mod schema_validation;

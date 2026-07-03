@@ -13,7 +13,7 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     _sql: &str,
     upper: &str,
     parts: &[&str],
-    database_id: DatabaseId,
+    _database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     // BACKUP/RESTORE TENANT are fully dispatched via typed AST (ast.rs).
 
@@ -63,15 +63,9 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // `shared::ddl::neutral::scope_query_ddl`), which is tried before this
     // transitional pgwire delegation runs.
 
-    // EXPLAIN TIERS ON <collection> [RANGE <start> <end>]
-    if upper.starts_with("EXPLAIN TIERS ") {
-        return Some(super::super::helpers::explain_tiers(
-            state,
-            identity,
-            database_id,
-            parts,
-        ));
-    }
+    // EXPLAIN TIERS ON <collection> has been migrated to the protocol-neutral
+    // router (`shared::ddl::neutral::explain_tiers`), which is tried before this
+    // transitional pgwire delegation runs.
 
     // EXPLAIN PERMISSION / EXPLAIN SCOPE have been migrated to the
     // protocol-neutral router (`shared::ddl::neutral::explain_ddl`), which is
