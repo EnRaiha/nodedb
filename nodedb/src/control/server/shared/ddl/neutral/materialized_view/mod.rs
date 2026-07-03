@@ -6,6 +6,7 @@ pub mod create;
 pub mod drop;
 pub mod refresh;
 pub mod show;
+pub mod streaming_parse;
 
 pub use create::create_materialized_view;
 pub use drop::{drop_materialized_view, materialized_view_exists};

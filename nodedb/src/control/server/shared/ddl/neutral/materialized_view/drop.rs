@@ -59,6 +59,28 @@ pub fn drop_materialized_view(
         (parts[3].to_lowercase(), false)
     };
 
+    // Streaming MVs live in the Event-Plane registry (`mv_registry`), not the
+    // periodic MV catalog. Handle them first: delete the catalog record and
+    // unregister from the live registry. Falls through to the periodic path
+    // below when no streaming MV of this name exists, preserving IF EXISTS.
+    if state
+        .mv_registry
+        .get_def(tenant_id.as_u64(), &name)
+        .is_some()
+    {
+        if let Some(catalog) = state.credentials.catalog() {
+            catalog
+                .delete_streaming_mv(tenant_id.as_u64(), &name)
+                .map_err(|e| err("XX000", e.to_string()))?;
+        }
+        state.mv_registry.unregister(tenant_id.as_u64(), &name);
+        tracing::info!(view = name, "streaming materialized view dropped");
+        return Ok(vec![DdlResult::Status {
+            command: "DROP MATERIALIZED VIEW".to_string(),
+            rows_affected: None,
+        }]);
+    }
+
     // Pre-check existence so `IF EXISTS` + missing is a no-op
     // that never touches raft.
     let exists_before = if let Some(catalog) = state.credentials.catalog() {

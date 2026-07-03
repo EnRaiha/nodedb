@@ -42,6 +42,15 @@ pub async fn create_materialized_view(
 
     let tenant_id = identity.tenant_id;
 
+    // Streaming MVs are Event-Plane objects: they source from a change stream
+    // (named in the query's FROM clause) and maintain per-group partial
+    // aggregates in `mv_registry`. They deliberately skip the periodic path
+    // below — no `PutMaterializedView` proposal, no target collection, and no
+    // `ON` source-collection existence check (those are periodic-only).
+    if refresh_mode.eq_ignore_ascii_case("STREAMING") {
+        return create_streaming_mv(state, identity, &name, &query_sql).await;
+    }
+
     // Validate source collection exists.
     if let Some(catalog) = state.credentials.catalog() {
         match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &source) {
@@ -154,6 +163,104 @@ pub async fn create_materialized_view(
         source,
         tenant = tenant_id.as_u64(),
         "materialized view created"
+    );
+
+    Ok(vec![DdlResult::Status {
+        command: "CREATE MATERIALIZED VIEW".to_string(),
+        rows_affected: None,
+    }])
+}
+
+/// `CREATE MATERIALIZED VIEW <name> [ON <coll>] STREAMING AS SELECT ... FROM <stream> ...`
+///
+/// Ported from the deleted pgwire `ddl::streaming_mv::create` handler: the
+/// tenant-admin gate, source-stream existence check, duplicate guard, catalog
+/// persist, in-memory registration, and buffer backfill are preserved; only the
+/// result / error types changed to the protocol-neutral [`DdlResult`] /
+/// [`DdlError`]. The source is the change stream named in the query's FROM
+/// clause, not the `ON` lineage collection.
+async fn create_streaming_mv(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    name: &str,
+    query_sql: &str,
+) -> Result<Vec<DdlResult>, DdlError> {
+    super::super::auth_support::require_tenant_admin(
+        identity,
+        "create streaming materialized views",
+    )?;
+
+    let parsed = super::streaming_parse::parse_streaming_mv(query_sql)?;
+    let tenant_id = identity.tenant_id.as_u64();
+
+    // Verify the source change stream exists.
+    if state
+        .stream_registry
+        .get(tenant_id, &parsed.source_stream)
+        .is_none()
+    {
+        return Err(err(
+            "42704",
+            format!("change stream '{}' does not exist", parsed.source_stream),
+        ));
+    }
+
+    // Reject a duplicate streaming MV.
+    if state.mv_registry.get_def(tenant_id, name).is_some() {
+        return Err(err(
+            "42710",
+            format!("streaming MV '{name}' already exists"),
+        ));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let source_stream = parsed.source_stream.clone();
+    let def = crate::event::streaming_mv::types::StreamingMvDef {
+        tenant_id,
+        name: name.to_string(),
+        source_stream: parsed.source_stream,
+        group_by_columns: parsed.group_by_columns,
+        aggregates: parsed.aggregates,
+        filter_expr: parsed.filter_expr,
+        owner: identity.username.clone(),
+        created_at: now,
+    };
+
+    let catalog = state
+        .credentials
+        .catalog()
+        .as_ref()
+        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
+    catalog
+        .put_streaming_mv(&def)
+        .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
+
+    state.mv_registry.register(def);
+
+    // Backfill: replay events already in the source stream's buffer so the MV
+    // bootstraps with historical data instead of only future events.
+    if let Some(mv_state) = state.mv_registry.get_state(tenant_id, name)
+        && let Some(buffer) = state.cdc_router.get_buffer(tenant_id, &source_stream)
+    {
+        crate::event::streaming_mv::processor::backfill_from_buffer(&mv_state, &buffer);
+    }
+
+    state.audit_record(
+        crate::control::security::audit::AuditEvent::AdminAction,
+        Some(identity.tenant_id),
+        &identity.username,
+        &format!("CREATE MATERIALIZED VIEW {name} STREAMING"),
+    );
+
+    tracing::info!(
+        view = name,
+        stream = source_stream,
+        tenant = tenant_id,
+        "streaming materialized view created"
     );
 
     Ok(vec![DdlResult::Status {
