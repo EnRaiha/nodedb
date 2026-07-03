@@ -5,7 +5,7 @@
 /// Split VALUES content respecting quoted strings and brackets.
 ///
 /// `'hello', 42, 'it''s'` → `["'hello'", "42", "'it''s'"]`
-pub(super) fn split_values(s: &str) -> Vec<&str> {
+pub(crate) fn split_values(s: &str) -> Vec<&str> {
     let mut results = Vec::new();
     let mut start = 0;
     let mut in_quote = false;
@@ -31,7 +31,7 @@ pub(super) fn split_values(s: &str) -> Vec<&str> {
 }
 
 /// Parse a SQL literal value to a `serde_json::Value`.
-pub(super) fn parse_sql_value(val: &str) -> nodedb_types::Value {
+pub(crate) fn parse_sql_value(val: &str) -> nodedb_types::Value {
     let trimmed = val.trim();
     let upper = trimmed.to_uppercase();
     if upper.starts_with("ARRAY[") && trimmed.ends_with(']') {

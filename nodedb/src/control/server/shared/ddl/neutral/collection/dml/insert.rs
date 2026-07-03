@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! INSERT INTO dispatch for schemaless, KV, and columnar collections.
+//!
+//! Relocated verbatim from the pgwire `ddl::collection::insert` handler (now
+//! deleted) except for the result type, which is [`DdlError`] / [`DdlResult`]
+//! instead of pgwire `Response` / `PgWireResult`.
 
+use nodedb_physical::physical_plan::VectorOp;
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::types::{error_code_to_sqlstate, sqlstate_error};
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
-use nodedb_physical::physical_plan::VectorOp;
 
-use super::insert_parse::{
-    dispatch_plan, extract_vector_fields, fields_to_insert_sql, fire_before_triggers,
-    fire_instead_triggers, fire_sync_after_triggers, parse_write_statement, plan_and_dispatch,
-    returning_response,
+use super::parse::{
+    dispatch_plan, extract_vector_fields, fields_to_insert_sql, parse_write_statement,
+    plan_and_dispatch, returning_response,
 };
-use crate::control::server::pgwire::types::sqlstate_error;
+use super::triggers::{fire_before_triggers, fire_instead_triggers, fire_sync_after_triggers};
 
 /// INSERT INTO <collection> (col1, col2, ...) VALUES (val1, val2, ...)
 pub async fn insert_document(
@@ -23,7 +26,7 @@ pub async fn insert_document(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-) -> Option<PgWireResult<Vec<Response>>> {
+) -> Option<Result<Vec<DdlResult>, DdlError>> {
     let parsed = match parse_write_statement(state, identity, sql, "INSERT INTO ")? {
         Ok(p) => p,
         Err(e) => return Some(Err(e)),
@@ -88,10 +91,10 @@ pub async fn insert_document(
                         fields.insert(field_def.name.clone(), typed_val);
                     }
                     Err(e) => {
-                        return Some(Err(sqlstate_error(
+                        return Some(Err(ddl_err_from_pgwire(sqlstate_error(
                             "XX000",
                             &format!("sequence '{seq_name}' error: {e}"),
-                        )));
+                        ))));
                     }
                 }
             }
@@ -112,22 +115,23 @@ pub async fn insert_document(
                     &mut fields,
                 )
         {
-            use crate::control::server::pgwire::types::error_code_to_sqlstate;
-            let (severity, code, message) = error_code_to_sqlstate(&violation);
-            return Some(Err(pgwire::error::PgWireError::UserError(Box::new(
-                pgwire::error::ErrorInfo::new(severity.to_owned(), code.to_owned(), message),
-            ))));
+            let (_severity, code, message) = error_code_to_sqlstate(&violation);
+            return Some(Err(DdlError {
+                sqlstate: code.to_owned(),
+                message,
+            }));
         }
 
         // General CHECK constraints (Control Plane enforcement, may have subqueries).
         if !coll_def.check_constraints.is_empty()
-            && let Err(e) = super::check_constraint::enforce_check_constraints(
-                state,
-                tenant_id,
-                &coll_def.check_constraints,
-                &fields,
-            )
-            .await
+            && let Err(e) =
+                crate::control::server::shared::check_constraint::enforce_check_constraints(
+                    state,
+                    tenant_id,
+                    &coll_def.check_constraints,
+                    &fields,
+                )
+                .await
         {
             return Some(Err(e));
         }
@@ -152,7 +156,7 @@ pub async fn insert_document(
                     type_name,
                     label,
                 ) {
-                    return Some(Err(sqlstate_error("22P02", &msg)));
+                    return Some(Err(ddl_err_from_pgwire(sqlstate_error("22P02", &msg))));
                 }
             }
         }
@@ -219,13 +223,13 @@ pub async fn insert_document(
                 && entry.metadata.strict_dimensions
                 && entry.metadata.dimensions != dim
             {
-                return Some(Err(sqlstate_error(
+                return Some(Err(ddl_err_from_pgwire(sqlstate_error(
                     "23514",
                     &format!(
                         "strict_dimensions: vector has {} dimensions, model '{}' requires {}",
                         dim, entry.metadata.model, entry.metadata.dimensions
                     ),
-                )));
+                ))));
             }
         }
         let surrogate = match state.surrogate_assigner.assign(
@@ -236,10 +240,10 @@ pub async fn insert_document(
         ) {
             Ok(s) => s,
             Err(e) => {
-                return Some(Err(sqlstate_error(
+                return Some(Err(ddl_err_from_pgwire(sqlstate_error(
                     "XX000",
                     &format!("surrogate assign: {e}"),
-                )));
+                ))));
             }
         };
         let vec_plan = crate::bridge::envelope::PhysicalPlan::Vector(VectorOp::Insert {
@@ -261,12 +265,30 @@ pub async fn insert_document(
         return Some(returning_response(&parsed.doc_id, &fields));
     }
 
-    Some(Ok(vec![Response::Execution(Tag::new("INSERT"))]))
+    Some(Ok(vec![DdlResult::Status {
+        command: "INSERT".to_string(),
+        rows_affected: None,
+    }]))
+}
+
+/// Convert a pgwire error (from a shared infra helper still imported from the
+/// pgwire crate boundary) into a [`DdlError`].
+fn ddl_err_from_pgwire(err: pgwire::error::PgWireError) -> DdlError {
+    match err {
+        pgwire::error::PgWireError::UserError(info) => DdlError {
+            sqlstate: info.code.clone(),
+            message: info.message.clone(),
+        },
+        other => DdlError {
+            sqlstate: "XX000".to_string(),
+            message: other.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::insert_parse::extract_vector_fields;
+    use super::super::parse::extract_vector_fields;
 
     #[test]
     fn extract_vector_fields_keeps_named_numeric_arrays() {

@@ -52,35 +52,10 @@ pub(super) async fn dispatch(
     // to the protocol-neutral router (`shared::ddl::neutral::bulk`), which is
     // tried before this transitional pgwire delegation runs.
 
-    // INSERT INTO x { } — object literal syntax; intercept for trigger/sequence handling.
-    if upper.starts_with("INSERT INTO ") {
-        let after_into = &sql["INSERT INTO ".len()..].trim_start();
-        let coll_end = after_into
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(after_into.len());
-        if after_into[coll_end..].trim_start().starts_with('{')
-            && let Some(result) =
-                super::super::collection::insert_document(state, identity, database_id, sql).await
-        {
-            return Some(result);
-        }
-    }
-
-    // UPSERT INTO — same as INSERT but merges into existing document if it exists.
-    // Handles both (cols) VALUES (vals) and { } object literal forms.
-    if upper.starts_with("UPSERT INTO ")
-        && (upper.contains("VALUES") || {
-            let after_into = &sql["UPSERT INTO ".len()..].trim_start();
-            let coll_end = after_into
-                .find(|c: char| c.is_whitespace())
-                .unwrap_or(after_into.len());
-            after_into[coll_end..].trim_start().starts_with('{')
-        })
-        && let Some(result) =
-            super::super::collection::upsert_document(state, identity, database_id, sql).await
-    {
-        return Some(result);
-    }
+    // INSERT INTO x { } (object literal) and UPSERT INTO (both VALUES and { }
+    // object literal forms) have been migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::collection::dml`), which is tried before this
+    // transitional pgwire delegation runs.
 
     // SHOW CHANGES FOR <collection> [SINCE <timestamp>] [LIMIT <n>]
     if upper.starts_with("SHOW CHANGES ") {

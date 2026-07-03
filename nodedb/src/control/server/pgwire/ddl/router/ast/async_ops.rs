@@ -5,86 +5,46 @@
 use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
-use nodedb_sql::ddl_ast::statement::{MiscStmt, NodedbStatement};
+use nodedb_sql::ddl_ast::statement::NodedbStatement;
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::collection::copy_from::CopyFromOptions;
-use crate::control::server::pgwire::ddl::collection::{copy_from_file, copy_to_file};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 /// Try to dispatch asynchronous DDL statement variants.
 /// Returns `Some(result)` if handled, `None` to fall through to legacy dispatch.
+///
+/// Every variant this file used to own has been migrated to the
+/// protocol-neutral DDL router, which is tried before this transitional
+/// pgwire delegation runs — see the comments below for where each landed.
 pub(super) async fn try_dispatch_async(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    stmt: &NodedbStatement,
-    database_id: DatabaseId,
+    _state: &SharedState,
+    _identity: &AuthenticatedIdentity,
+    _stmt: &NodedbStatement,
+    _database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
-    match stmt {
-        // CREATE [UNIQUE] INDEX (CreateIndex) is served by the protocol-neutral
-        // DDL router (`shared::ddl::neutral::collection::index`), which is tried
-        // before this transitional pgwire delegation runs.
+    // CREATE [UNIQUE] INDEX (CreateIndex) is served by the protocol-neutral
+    // DDL router (`shared::ddl::neutral::collection::index`).
 
-        // CreateCollection / CreateTable are served by the protocol-neutral
-        // DDL router (`shared::ddl::neutral::collection::create`), which is
-        // tried before this transitional pgwire delegation runs. The
-        // `if_not_exists: true` short-circuit lives in the neutral router's
-        // typed-arm guard, replicated from this file's former `guards.rs`
-        // sibling arms.
-        // AlterCollection (every `AlterCollectionOp` variant) is served by the
-        // protocol-neutral DDL router (`shared::ddl::neutral::collection::alter`),
-        // which is tried before this transitional pgwire delegation runs.
+    // CreateCollection / CreateTable are served by the protocol-neutral DDL
+    // router (`shared::ddl::neutral::collection::create`). The
+    // `if_not_exists: true` short-circuit lives in the neutral router's
+    // typed-arm guard, replicated from this file's former `guards.rs`
+    // sibling arms.
+    // AlterCollection (every `AlterCollectionOp` variant) is served by the
+    // protocol-neutral DDL router (`shared::ddl::neutral::collection::alter`).
 
-        // SHOW CONFLICT POLICY (PolicyStmt::ShowConflictPolicy) is served by the
-        // protocol-neutral DDL router; the pgwire router no longer routes it.
+    // SHOW CONFLICT POLICY (PolicyStmt::ShowConflictPolicy) is served by the
+    // protocol-neutral DDL router.
 
-        // REINDEX (CollectionStmt::Reindex) is served by the protocol-neutral
-        // DDL router; the pgwire router no longer routes it.
-        NodedbStatement::Misc(MiscStmt::CopyFromFile {
-            collection,
-            path,
-            format,
-            delimiter,
-            header,
-        }) => Some(
-            copy_from_file(
-                state,
-                identity,
-                collection,
-                path,
-                CopyFromOptions {
-                    format: format.as_ref(),
-                    delimiter: *delimiter,
-                    header: *header,
-                },
-                database_id,
-            )
-            .await,
-        ),
+    // REINDEX (CollectionStmt::Reindex) is served by the protocol-neutral DDL
+    // router.
 
-        NodedbStatement::Misc(MiscStmt::CopyToFile {
-            source,
-            path,
-            format,
-            delimiter,
-            header,
-        }) => Some(
-            copy_to_file(
-                state,
-                identity,
-                source,
-                path,
-                format.as_ref(),
-                *delimiter,
-                *header,
-            )
-            .await,
-        ),
+    // CopyFromFile / CopyToFile (`COPY ... FROM/TO '<path>'`) are served by
+    // the protocol-neutral DDL router (`shared::ddl::neutral::collection::{
+    // copy_from, copy_to}`).
 
-        // MOVE TENANT is served by the protocol-neutral DDL router
-        // (`shared::ddl::neutral::tenant::move_tenant`), which is tried before
-        // this transitional pgwire delegation runs.
-        _ => None,
-    }
+    // MOVE TENANT is served by the protocol-neutral DDL router
+    // (`shared::ddl::neutral::tenant::move_tenant`).
+    None
 }

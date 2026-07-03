@@ -1,17 +1,38 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! NDJSON and JSON array import for `COPY FROM`.
-
-use pgwire::error::PgWireResult;
+//!
+//! Relocated verbatim from the pgwire `ddl::collection::copy_from::json_import`
+//! module (now deleted). `plan_and_dispatch` returns the protocol-neutral
+//! [`DdlError`] directly (it is the neutral collection-DML helper), so this
+//! module's own file-read/parse errors — built from the still-imported
+//! `pgwire::types::sqlstate_error` — are converted to `DdlError` at their call
+//! sites to keep one error type end to end.
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::collection::insert_parse::{
+use crate::control::server::pgwire::types::sqlstate_error;
+use crate::control::server::shared::ddl::neutral::collection::dml::{
     fields_to_insert_sql, plan_and_dispatch,
 };
-use crate::control::server::pgwire::types::sqlstate_error;
+use crate::control::server::shared::ddl::result::DdlError;
 use crate::control::state::SharedState;
 
 use super::entry::wrap_row_error;
+
+/// Convert a pgwire error (from the still-imported `sqlstate_error` helper)
+/// into a protocol-neutral [`DdlError`].
+fn ddl_err(err: pgwire::error::PgWireError) -> DdlError {
+    match err {
+        pgwire::error::PgWireError::UserError(info) => DdlError {
+            sqlstate: info.code.clone(),
+            message: info.message.clone(),
+        },
+        other => DdlError {
+            sqlstate: "XX000".to_string(),
+            message: other.to_string(),
+        },
+    }
+}
 
 /// Import from an NDJSON file (one JSON object per non-empty line).
 ///
@@ -24,16 +45,19 @@ pub(super) async fn import_ndjson(
     collection: &str,
     path: &str,
     database_id: nodedb_types::DatabaseId,
-) -> PgWireResult<usize> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| sqlstate_error("58030", &format!("COPY: cannot read '{path}': {e}")))?;
+) -> Result<usize, DdlError> {
+    let bytes = tokio::fs::read(path).await.map_err(|e| {
+        ddl_err(sqlstate_error(
+            "58030",
+            &format!("COPY: cannot read '{path}': {e}"),
+        ))
+    })?;
 
     let content = std::str::from_utf8(&bytes).map_err(|e| {
-        sqlstate_error(
+        ddl_err(sqlstate_error(
             "22021",
             &format!("COPY: file '{path}' is not valid UTF-8: {e}"),
-        )
+        ))
     })?;
 
     // Parse phase: collect all rows first.
@@ -73,16 +97,19 @@ pub(super) async fn import_json_array(
     collection: &str,
     path: &str,
     database_id: nodedb_types::DatabaseId,
-) -> PgWireResult<usize> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| sqlstate_error("58030", &format!("COPY: cannot read '{path}': {e}")))?;
+) -> Result<usize, DdlError> {
+    let bytes = tokio::fs::read(path).await.map_err(|e| {
+        ddl_err(sqlstate_error(
+            "58030",
+            &format!("COPY: cannot read '{path}': {e}"),
+        ))
+    })?;
 
     let array: Vec<serde_json::Value> = sonic_rs::from_slice(&bytes).map_err(|e| {
-        sqlstate_error(
+        ddl_err(sqlstate_error(
             "22P02",
             &format!("COPY: file '{path}' is not a valid JSON array: {e}"),
-        )
+        ))
     })?;
 
     // Parse phase: validate all elements are objects.
@@ -91,10 +118,10 @@ pub(super) async fn import_json_array(
     for (idx, elem) in array.iter().enumerate() {
         let line_no = idx + 1;
         let obj = elem.as_object().ok_or_else(|| {
-            sqlstate_error(
+            ddl_err(sqlstate_error(
                 "22P02",
                 &format!("COPY: row {line_no} in '{path}' is not a JSON object"),
-            )
+            ))
         })?;
         let mut fields = std::collections::HashMap::new();
         for (key, val) in obj.iter() {
@@ -119,16 +146,19 @@ pub(super) async fn import_json_array(
 fn json_object_to_fields(
     json: &str,
     line_no: usize,
-) -> PgWireResult<std::collections::HashMap<String, nodedb_types::Value>> {
+) -> Result<std::collections::HashMap<String, nodedb_types::Value>, DdlError> {
     let val: serde_json::Value = sonic_rs::from_str(json).map_err(|e| {
-        sqlstate_error("22P02", &format!("COPY: line {line_no}: invalid JSON: {e}"))
+        ddl_err(sqlstate_error(
+            "22P02",
+            &format!("COPY: line {line_no}: invalid JSON: {e}"),
+        ))
     })?;
 
     let obj = val.as_object().ok_or_else(|| {
-        sqlstate_error(
+        ddl_err(sqlstate_error(
             "22P02",
             &format!("COPY: line {line_no}: expected JSON object, got other type"),
-        )
+        ))
     })?;
 
     let mut fields = std::collections::HashMap::new();

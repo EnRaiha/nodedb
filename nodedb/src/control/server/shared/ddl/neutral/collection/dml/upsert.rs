@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! UPSERT INTO dispatch for schemaless and KV collections.
+//!
+//! Relocated verbatim from the pgwire `ddl::collection::upsert` handler (now
+//! deleted) except for the result type, which is [`DdlError`] / [`DdlResult`]
+//! instead of pgwire `Response` / `PgWireResult`.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::types::{error_code_to_sqlstate, sqlstate_error};
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::insert_parse::{
+use super::parse::{fields_to_upsert_sql, parse_write_statement, plan_and_dispatch};
+use super::triggers::{
     fire_before_triggers, fire_instead_triggers, fire_sync_after_triggers,
-    fire_sync_after_update_triggers, parse_write_statement,
+    fire_sync_after_update_triggers,
 };
 
 /// UPSERT INTO <collection> (col1, col2, ...) VALUES (val1, val2, ...)
@@ -23,7 +28,7 @@ pub async fn upsert_document(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-) -> Option<PgWireResult<Vec<Response>>> {
+) -> Option<Result<Vec<DdlResult>, DdlError>> {
     let parsed = match parse_write_statement(state, identity, sql, "UPSERT INTO ")? {
         Ok(p) => p,
         Err(e) => return Some(Err(e)),
@@ -73,22 +78,23 @@ pub async fn upsert_document(
                     &mut fields,
                 )
         {
-            use crate::control::server::pgwire::types::error_code_to_sqlstate;
-            let (severity, code, message) = error_code_to_sqlstate(&violation);
-            return Some(Err(pgwire::error::PgWireError::UserError(Box::new(
-                pgwire::error::ErrorInfo::new(severity.to_owned(), code.to_owned(), message),
-            ))));
+            let (_severity, code, message) = error_code_to_sqlstate(&violation);
+            return Some(Err(DdlError {
+                sqlstate: code.to_owned(),
+                message,
+            }));
         }
 
         // General CHECK constraints (Control Plane enforcement, may have subqueries).
         if !coll_def.check_constraints.is_empty()
-            && let Err(e) = super::check_constraint::enforce_check_constraints(
-                state,
-                tenant_id,
-                &coll_def.check_constraints,
-                &fields,
-            )
-            .await
+            && let Err(e) =
+                crate::control::server::shared::check_constraint::enforce_check_constraints(
+                    state,
+                    tenant_id,
+                    &coll_def.check_constraints,
+                    &fields,
+                )
+                .await
         {
             return Some(Err(e));
         }
@@ -110,8 +116,7 @@ pub async fn upsert_document(
                     type_name,
                     label,
                 ) {
-                    use crate::control::server::pgwire::types::sqlstate_error;
-                    return Some(Err(sqlstate_error("22P02", &msg)));
+                    return Some(Err(ddl_err_from_pgwire(sqlstate_error("22P02", &msg))));
                 }
             }
         }
@@ -147,11 +152,8 @@ pub async fn upsert_document(
     };
 
     // Build SQL and route through nodedb-sql → EngineRules → sql_plan_convert.
-    let upsert_sql = super::insert_parse::fields_to_upsert_sql(&parsed.coll_name, &fields);
-    if let Err(e) =
-        super::insert_parse::plan_and_dispatch(state, identity, tenant_id, database_id, &upsert_sql)
-            .await
-    {
+    let upsert_sql = fields_to_upsert_sql(&parsed.coll_name, &fields);
+    if let Err(e) = plan_and_dispatch(state, identity, tenant_id, database_id, &upsert_sql).await {
         return Some(Err(e));
     }
 
@@ -179,5 +181,23 @@ pub async fn upsert_document(
         return Some(err);
     }
 
-    Some(Ok(vec![Response::Execution(Tag::new("UPSERT"))]))
+    Some(Ok(vec![DdlResult::Status {
+        command: "UPSERT".to_string(),
+        rows_affected: None,
+    }]))
+}
+
+/// Convert a pgwire error (from a shared infra helper still imported from the
+/// pgwire crate boundary) into a [`DdlError`].
+fn ddl_err_from_pgwire(err: pgwire::error::PgWireError) -> DdlError {
+    match err {
+        pgwire::error::PgWireError::UserError(info) => DdlError {
+            sqlstate: info.code.clone(),
+            message: info.message.clone(),
+        },
+        other => DdlError {
+            sqlstate: "XX000".to_string(),
+            message: other.to_string(),
+        },
+    }
 }

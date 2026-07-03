@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Entry point: `copy_from_file`, path validation, and engine-support check.
+//!
+//! Relocated verbatim from the pgwire `ddl::collection::copy_from::entry`
+//! module (now deleted) except for the result type, which is [`DdlResult`] /
+//! [`DdlError`] throughout instead of pgwire `Response` / `PgWireResult`. The
+//! still-imported `pgwire::types::sqlstate_error` builds a `PgWireError` at
+//! each error site (shared infra, unchanged), converted immediately to
+//! `DdlError` via [`ddl_err`] so the whole call chain speaks one error type.
 
 use nodedb_types::DatabaseId;
 use std::path::Path;
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use nodedb_sql::ddl_ast::statement::CopyFormat;
 use nodedb_types::CollectionType;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::types::sqlstate_error;
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
 use super::csv_import::{CsvOptions, import_csv};
@@ -37,7 +42,7 @@ pub async fn copy_from_file(
     path: &str,
     options: CopyFromOptions<'_>,
     database_id: DatabaseId,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let CopyFromOptions {
         format,
         delimiter,
@@ -46,29 +51,32 @@ pub async fn copy_from_file(
     validate_path(path)?;
 
     // Check file size before reading.
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|e| sqlstate_error("58030", &format!("COPY: cannot stat file '{path}': {e}")))?;
+    let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+        ddl_err(sqlstate_error(
+            "58030",
+            &format!("COPY: cannot stat file '{path}': {e}"),
+        ))
+    })?;
     if metadata.len() > MAX_FILE_BYTES {
-        return Err(sqlstate_error(
+        return Err(ddl_err(sqlstate_error(
             "54000",
             &format!(
                 "COPY: file '{path}' is {} bytes, exceeds limit of {} bytes",
                 metadata.len(),
                 MAX_FILE_BYTES
             ),
-        ));
+        )));
     }
 
     // Determine format (caller has already auto-detected from extension; this is a safety net).
     let resolved_format = format.ok_or_else(|| {
-        sqlstate_error(
+        ddl_err(sqlstate_error(
             "42601",
             &format!(
                 "COPY: cannot infer format for '{path}'; \
                  add WITH (FORMAT ndjson|json|csv)"
             ),
-        )
+        ))
     })?;
 
     // Validate engine: reject Timeseries and Spatial.
@@ -100,33 +108,34 @@ pub async fn copy_from_file(
         }
     };
 
-    Ok(vec![Response::Execution(Tag::new(&format!(
-        "COPY {row_count}"
-    )))])
+    Ok(vec![DdlResult::Status {
+        command: format!("COPY {row_count}"),
+        rows_affected: None,
+    }])
 }
 
 /// Reject paths with `..` segments and non-absolute paths.
-fn validate_path(path: &str) -> PgWireResult<()> {
+fn validate_path(path: &str) -> Result<(), DdlError> {
     if !path.starts_with('/') {
-        return Err(sqlstate_error(
+        return Err(ddl_err(sqlstate_error(
             "42601",
             &format!(
                 "COPY: path '{path}' is not absolute; \
                  only absolute server-side paths are accepted"
             ),
-        ));
+        )));
     }
     let p = Path::new(path);
     for component in p.components() {
         use std::path::Component;
         if matches!(component, Component::ParentDir) {
-            return Err(sqlstate_error(
+            return Err(ddl_err(sqlstate_error(
                 "42501",
                 &format!(
                     "COPY: path '{path}' contains '..'; \
                      directory traversal is not permitted"
                 ),
-            ));
+            )));
         }
     }
     Ok(())
@@ -137,7 +146,7 @@ fn check_engine_support(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     collection: &str,
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     let tenant_id = identity.tenant_id;
     let catalog = match state.credentials.catalog() {
         Some(c) => c,
@@ -147,10 +156,10 @@ fn check_engine_support(
         Ok(Some(c)) => c,
         Ok(None) => return Ok(()), // Collection doesn't exist yet — will fail at INSERT.
         Err(e) => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(sqlstate_error(
                 "XX000",
                 &format!("COPY: catalog lookup failed: {e}"),
-            ));
+            )));
         }
     };
 
@@ -159,20 +168,20 @@ fn check_engine_support(
             use nodedb_types::ColumnarProfile;
             match profile {
                 ColumnarProfile::Plain => Ok(()),
-                ColumnarProfile::Timeseries { .. } => Err(sqlstate_error(
+                ColumnarProfile::Timeseries { .. } => Err(ddl_err(sqlstate_error(
                     "0A000",
                     &format!(
                         "COPY: collection '{collection}' uses the timeseries engine; \
                          use ILP or INSERT with explicit time column instead"
                     ),
-                )),
-                ColumnarProfile::Spatial { .. } => Err(sqlstate_error(
+                ))),
+                ColumnarProfile::Spatial { .. } => Err(ddl_err(sqlstate_error(
                     "0A000",
                     &format!(
                         "COPY: collection '{collection}' uses the spatial engine; \
                          use INSERT with a WKT/GeoJSON geometry column instead"
                     ),
-                )),
+                ))),
             }
         }
         CollectionType::Document(_) => Ok(()),
@@ -181,18 +190,29 @@ fn check_engine_support(
 }
 
 /// Wrap a row-level error to include the row number in the message.
-pub(super) fn wrap_row_error(
-    e: pgwire::error::PgWireError,
-    line_no: usize,
-    fmt: &str,
-) -> pgwire::error::PgWireError {
-    use pgwire::error::{ErrorInfo, PgWireError};
-    match e {
-        PgWireError::UserError(info) => PgWireError::UserError(Box::new(ErrorInfo::new(
-            info.severity.clone(),
-            info.code.clone(),
-            format!("COPY: {fmt} row {line_no}: {}", info.message),
-        ))),
-        other => other,
+///
+/// Row-level import helpers (`import_csv`, `import_ndjson`, `import_json_array`)
+/// call `plan_and_dispatch`, which returns a protocol-neutral [`DdlError`] (not
+/// a pgwire `PgWireError`), so this wraps the same type — only the message is
+/// decorated with the row number, matching the original pgwire behavior.
+pub(super) fn wrap_row_error(e: DdlError, line_no: usize, fmt: &str) -> DdlError {
+    DdlError {
+        sqlstate: e.sqlstate,
+        message: format!("COPY: {fmt} row {line_no}: {}", e.message),
+    }
+}
+
+/// Convert a pgwire error (from the still-imported `sqlstate_error` helper)
+/// into a protocol-neutral [`DdlError`].
+fn ddl_err(err: pgwire::error::PgWireError) -> DdlError {
+    match err {
+        pgwire::error::PgWireError::UserError(info) => DdlError {
+            sqlstate: info.code.clone(),
+            message: info.message.clone(),
+        },
+        other => DdlError {
+            sqlstate: "XX000".to_string(),
+            message: other.to_string(),
+        },
     }
 }

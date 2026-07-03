@@ -7,7 +7,7 @@
 //! parent [`super::super::dispatch`] handles it.
 
 use nodedb_sql::ddl_ast::statement::{
-    AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, DatabaseStmt, GraphStmt,
+    AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, DatabaseStmt, GraphStmt, MiscStmt,
     NodedbStatement, PolicyStmt, StreamViewStmt,
 };
 
@@ -1312,8 +1312,8 @@ pub async fn try_dispatch(
         None => {
             // Bulk import: `COPY <collection> FROM STDIN [WITH (...)]`. The
             // file-path form (`COPY … FROM '<path>'`) parses into a typed
-            // `MiscStmt::CopyFromFile` and stays on the transitional pgwire path;
-            // the STDIN form parses into no typed variant (`ddl_ast::parse`
+            // `MiscStmt::CopyFromFile`, handled by the typed arm above; the
+            // STDIN form parses into no typed variant (`ddl_ast::parse`
             // returns `None`) and reached the pgwire `dsl` string router, which
             // ran after the typed-AST parse gate. Recognizing it here in the
             // `None` branch preserves that ordering exactly — the file form never
@@ -1322,6 +1322,42 @@ pub async fn try_dispatch(
                 let parts: Vec<&str> = sql.split_whitespace().collect();
                 return Some(bulk::copy_from(state, identity, &parts).await);
             }
+
+            // INSERT INTO x { } — object literal syntax; intercept for
+            // trigger/sequence handling. Ported from the pgwire `dsl`
+            // string router, which ran after the typed-AST parse gate —
+            // recognizing it here in the `None` branch preserves that
+            // ordering exactly.
+            if upper.starts_with("INSERT INTO ") {
+                let after_into = sql["INSERT INTO ".len()..].trim_start();
+                let coll_end = after_into
+                    .find(|c: char| c.is_whitespace())
+                    .unwrap_or(after_into.len());
+                if after_into[coll_end..].trim_start().starts_with('{')
+                    && let Some(result) =
+                        collection::insert_document(state, identity, database_id, sql).await
+                {
+                    return Some(result);
+                }
+            }
+
+            // UPSERT INTO — same as INSERT but merges into existing document
+            // if it exists. Handles both (cols) VALUES (vals) and { } object
+            // literal forms.
+            if upper.starts_with("UPSERT INTO ")
+                && (upper.contains("VALUES") || {
+                    let after_into = sql["UPSERT INTO ".len()..].trim_start();
+                    let coll_end = after_into
+                        .find(|c: char| c.is_whitespace())
+                        .unwrap_or(after_into.len());
+                    after_into[coll_end..].trim_start().starts_with('{')
+                })
+                && let Some(result) =
+                    collection::upsert_document(state, identity, database_id, sql).await
+            {
+                return Some(result);
+            }
+
             return query_functions::try_dispatch(state, identity, sql).await;
         }
     };
@@ -1346,6 +1382,51 @@ pub async fn try_dispatch(
     }
 
     match &stmt {
+        // `COPY <collection> FROM '<path>' [WITH (...)]` bulk import. Ported
+        // from the pgwire `ast::async_ops::try_dispatch_async` typed arm.
+        NodedbStatement::Misc(MiscStmt::CopyFromFile {
+            collection,
+            path,
+            format,
+            delimiter,
+            header,
+        }) => Some(
+            collection::copy_from_file(
+                state,
+                identity,
+                collection,
+                path,
+                collection::CopyFromOptions {
+                    format: format.as_ref(),
+                    delimiter: *delimiter,
+                    header: *header,
+                },
+                database_id,
+            )
+            .await,
+        ),
+
+        // `COPY <source> TO '<path>' [WITH (...)]` bulk export. Ported from
+        // the pgwire `ast::async_ops::try_dispatch_async` typed arm.
+        NodedbStatement::Misc(MiscStmt::CopyToFile {
+            source,
+            path,
+            format,
+            delimiter,
+            header,
+        }) => Some(
+            collection::copy_to_file(
+                state,
+                identity,
+                source,
+                path,
+                format.as_ref(),
+                *delimiter,
+                *header,
+            )
+            .await,
+        ),
+
         NodedbStatement::StreamView(StreamViewStmt::CreateChangeStream {
             name,
             collection,

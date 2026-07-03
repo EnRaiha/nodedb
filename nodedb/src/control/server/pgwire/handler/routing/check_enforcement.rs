@@ -91,13 +91,14 @@ impl NodeDbPgHandler {
             fields = merged;
         }
 
-        super::super::super::ddl::collection::check_constraint::enforce_check_constraints(
+        crate::control::server::shared::check_constraint::enforce_check_constraints(
             &self.state,
             tenant_id,
             &coll.check_constraints,
             &fields,
         )
         .await
+        .map_err(|e| pgwire_err(&e.sqlstate, &e.message))
     }
 
     /// Validate enum-typed column values against the custom type registry.

@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Entry point: `copy_to_file`, path validation, scan, and atomic file write.
+//!
+//! Relocated verbatim from the pgwire `ddl::collection::copy_to::entry`
+//! module (now deleted) except for the result type at the outer boundary,
+//! which is [`DdlResult`] / [`DdlError`] instead of pgwire `Response` /
+//! `PgWireResult`.
 
 use nodedb_types::DatabaseId;
 use std::path::Path;
 
-use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 use sonic_rs;
 
@@ -13,6 +17,7 @@ use nodedb_sql::ddl_ast::statement::{CopyFormat, CopyToSource};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::types::sqlstate_error;
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 use crate::types::TraceId;
 
@@ -27,7 +32,21 @@ pub async fn copy_to_file(
     format: Option<&CopyFormat>,
     delimiter: Option<char>,
     header: bool,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
+    copy_to_file_inner(state, identity, source, path, format, delimiter, header)
+        .await
+        .map_err(pgwire_err_to_ddl_err)
+}
+
+async fn copy_to_file_inner(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    source: &CopyToSource,
+    path: &str,
+    format: Option<&CopyFormat>,
+    delimiter: Option<char>,
+    header: bool,
+) -> PgWireResult<Vec<DdlResult>> {
     validate_path(path)?;
 
     // Resolve format (caller has already auto-detected from extension).
@@ -73,9 +92,10 @@ pub async fn copy_to_file(
     })?;
 
     let row_count = rows.len();
-    Ok(vec![Response::Execution(Tag::new(&format!(
-        "COPY {row_count}"
-    )))])
+    Ok(vec![DdlResult::Status {
+        command: format!("COPY {row_count}"),
+        rows_affected: None,
+    }])
 }
 
 /// Build a SELECT SQL string from the source.
@@ -198,4 +218,18 @@ fn validate_path(path: &str) -> PgWireResult<()> {
         }
     }
     Ok(())
+}
+
+/// Convert the accumulated `PgWireError` into a protocol-neutral [`DdlError`].
+fn pgwire_err_to_ddl_err(err: pgwire::error::PgWireError) -> DdlError {
+    match err {
+        pgwire::error::PgWireError::UserError(info) => DdlError {
+            sqlstate: info.code.clone(),
+            message: info.message.clone(),
+        },
+        other => DdlError {
+            sqlstate: "XX000".to_string(),
+            message: other.to_string(),
+        },
+    }
 }

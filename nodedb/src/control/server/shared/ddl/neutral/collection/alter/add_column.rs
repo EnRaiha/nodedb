@@ -14,7 +14,7 @@ use nodedb_types::DatabaseId;
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::collection::helpers::parse_origin_column_def;
+use crate::control::server::shared::ddl::neutral::collection::helpers::parse_origin_column_def;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 

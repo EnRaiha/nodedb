@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Shared parsing helpers used across collection DDL sub-modules.
+//!
+//! Relocated verbatim from the pgwire `ddl::collection::helpers` module (now
+//! deleted): its sole external caller was already `neutral::collection::alter::add_column`.
 
 use sonic_rs;
 

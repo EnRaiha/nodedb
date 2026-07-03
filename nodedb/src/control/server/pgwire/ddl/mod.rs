@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 pub mod catalog_propose;
-pub mod collection;
 pub mod database;
 pub mod field_def;
 #[path = "router/mod.rs"]

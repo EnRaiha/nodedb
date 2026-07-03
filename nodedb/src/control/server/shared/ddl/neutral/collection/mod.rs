@@ -6,10 +6,14 @@
 //! collection purge helpers.
 
 pub mod alter;
+pub mod copy_from;
+pub mod copy_to;
 pub mod create;
 pub mod describe;
+pub mod dml;
 pub mod drop;
 pub mod enforcement;
+pub(crate) mod helpers;
 pub mod index;
 pub(super) mod index_fanout;
 pub mod purge;
@@ -19,8 +23,11 @@ pub mod undrop;
 pub mod vector_metadata;
 
 pub use alter::dispatch_alter_collection;
+pub use copy_from::{CopyFromOptions, copy_from_file};
+pub use copy_to::copy_to_file;
 pub use create::{CreateCollectionRequest, create_collection, create_table};
 pub use describe::{describe_collection, show_collections};
+pub use dml::{insert_document, upsert_document};
 pub use drop::drop_collection;
 pub use index::{CreateIndexRequest, create_index, drop_index};
 pub use register::{dispatch_register_by_name, dispatch_register_from_stored};

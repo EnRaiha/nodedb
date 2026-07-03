@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Shared parsing and helpers for INSERT/UPSERT dispatch.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Shared parsing, SQL-building, and plan-dispatch helpers for the
+//! protocol-neutral INSERT/UPSERT DML handlers.
+//!
+//! Relocated verbatim from the pgwire `ddl::collection::insert_parse` module
+//! (now deleted) except for the result type, which is [`DdlError`] /
+//! [`DdlResult`] instead of pgwire `Response` / `PgWireResult`.
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::ddl::sql_parse::{parse_sql_value, split_values};
+use crate::control::server::pgwire::types::sqlstate_error;
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use crate::types::TraceId;
-
-use super::super::sql_parse::{parse_sql_value, split_values};
-use crate::control::server::pgwire::types::sqlstate_error;
 
 /// Parsed INSERT/UPSERT statement fields.
 pub(super) struct ParsedInsert {
@@ -54,7 +56,7 @@ pub(super) fn parse_write_statement(
     identity: &AuthenticatedIdentity,
     sql: &str,
     keyword: &str,
-) -> Option<PgWireResult<ParsedInsert>> {
+) -> Option<Result<ParsedInsert, DdlError>> {
     let upper = sql.to_uppercase();
     let kw_pos = upper.find(keyword)?;
     let after_into = sql[kw_pos + keyword.len()..].trim_start();
@@ -100,10 +102,10 @@ pub(super) fn parse_write_statement(
                 coll_type,
             );
         }
-        return Some(Err(sqlstate_error(
+        return Some(Err(err_from_pgwire(sqlstate_error(
             "42601",
             "failed to parse object literal in INSERT/UPSERT statement",
-        )));
+        ))));
     }
 
     parse_values_form(sql, &upper, keyword, &coll_name, coll_type)
@@ -116,27 +118,32 @@ fn parse_values_form(
     keyword: &str,
     coll_name: &str,
     coll_type: Option<nodedb_types::CollectionType>,
-) -> Option<PgWireResult<ParsedInsert>> {
+) -> Option<Result<ParsedInsert, DdlError>> {
     let first_open = match sql.find('(') {
         Some(p) => p,
         None => {
-            return Some(Err(sqlstate_error(
+            return Some(Err(err_from_pgwire(sqlstate_error(
                 "42601",
                 &format!("missing column list in {}", keyword.trim()),
-            )));
+            ))));
         }
     };
     let values_kw = match upper.find("VALUES") {
         Some(p) => p,
-        None => return Some(Err(sqlstate_error("42601", "missing VALUES clause"))),
+        None => {
+            return Some(Err(err_from_pgwire(sqlstate_error(
+                "42601",
+                "missing VALUES clause",
+            ))));
+        }
     };
     let first_close = match sql[first_open..values_kw].rfind(')') {
         Some(p) => first_open + p,
         None => {
-            return Some(Err(sqlstate_error(
+            return Some(Err(err_from_pgwire(sqlstate_error(
                 "42601",
                 "missing closing ) for column list",
-            )));
+            ))));
         }
     };
     let cols_str = &sql[first_open + 1..first_close];
@@ -145,24 +152,34 @@ fn parse_values_form(
     let after_values = sql[values_kw + 6..].trim_start();
     let vals_open = match after_values.find('(') {
         Some(p) => p,
-        None => return Some(Err(sqlstate_error("42601", "missing VALUES (...)"))),
+        None => {
+            return Some(Err(err_from_pgwire(sqlstate_error(
+                "42601",
+                "missing VALUES (...)",
+            ))));
+        }
     };
     let vals_close = match after_values.rfind(')') {
         Some(p) => p,
-        None => return Some(Err(sqlstate_error("42601", "missing closing ) for VALUES"))),
+        None => {
+            return Some(Err(err_from_pgwire(sqlstate_error(
+                "42601",
+                "missing closing ) for VALUES",
+            ))));
+        }
     };
     let vals_str = &after_values[vals_open + 1..vals_close];
     let values: Vec<&str> = split_values(vals_str);
 
     if columns.len() != values.len() {
-        return Some(Err(sqlstate_error(
+        return Some(Err(err_from_pgwire(sqlstate_error(
             "42601",
             &format!(
                 "column count ({}) doesn't match value count ({})",
                 columns.len(),
                 values.len()
             ),
-        )));
+        ))));
     }
 
     let mut doc_id = String::new();
@@ -199,9 +216,9 @@ fn parse_values_form(
 pub(super) fn returning_response(
     doc_id: &str,
     fields: &std::collections::HashMap<String, nodedb_types::Value>,
-) -> PgWireResult<Vec<Response>> {
-    use futures::stream;
-    use pgwire::api::results::{DataRowEncoder, QueryResponse};
+) -> Result<Vec<DdlResult>, DdlError> {
+    use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+    use serde_json::{Map, Value as JsonValue};
 
     let mut result_doc = fields.clone();
     result_doc.insert(
@@ -210,16 +227,16 @@ pub(super) fn returning_response(
     );
     let json_str =
         sonic_rs::to_string(&nodedb_types::Value::Object(result_doc)).unwrap_or_default();
-    let schema = std::sync::Arc::new(vec![crate::control::server::pgwire::types::text_field(
-        "result",
-    )]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    let _ = encoder.encode_field(&json_str);
-    let row = encoder.take_row();
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(row)]),
-    ))])
+
+    let mut row = Map::new();
+    row.insert("result".to_string(), JsonValue::String(json_str));
+
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["result".to_string()],
+        column_types: vec![DdlColType::Text],
+        rows: vec![row],
+        notice: None,
+    })])
 }
 
 /// Dispatch a plan to WAL + Data Plane, returning an error response on failure.
@@ -228,7 +245,7 @@ pub(super) async fn dispatch_plan(
     tenant_id: nodedb_types::TenantId,
     vshard_id: crate::types::VShardId,
     plan: crate::bridge::envelope::PhysicalPlan,
-) -> Option<PgWireResult<Vec<Response>>> {
+) -> Option<Result<Vec<DdlResult>, DdlError>> {
     if let Err(e) = crate::control::server::wal_dispatch::wal_append_if_write(
         &state.wal,
         tenant_id,
@@ -236,7 +253,7 @@ pub(super) async fn dispatch_plan(
         crate::types::DatabaseId::DEFAULT,
         &plan,
     ) {
-        return Some(Err(sqlstate_error("XX000", &e.to_string())));
+        return Some(Err(ddl_err_raw("XX000", &e.to_string())));
     }
     if let Err(e) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
@@ -248,7 +265,7 @@ pub(super) async fn dispatch_plan(
     )
     .await
     {
-        return Some(Err(sqlstate_error("XX000", &e.to_string())));
+        return Some(Err(ddl_err_raw("XX000", &e.to_string())));
     }
     None
 }
@@ -270,7 +287,7 @@ fn quote_column_identifier(key: &str) -> String {
 /// punctuation, whitespace, or SQL syntax are treated as a single
 /// identifier by the downstream parser instead of fragmenting the
 /// statement.
-pub(super) fn fields_to_insert_sql(
+pub(in crate::control::server::shared::ddl::neutral::collection) fn fields_to_insert_sql(
     collection: &str,
     fields: &std::collections::HashMap<String, nodedb_types::Value>,
 ) -> String {
@@ -326,19 +343,19 @@ fn value_to_sql_literal(value: &nodedb_types::Value) -> String {
 /// Plan SQL through nodedb-sql and dispatch the resulting physical plans.
 ///
 /// This is the shared path: SQL → nodedb-sql → EngineRules → SqlPlan → PhysicalPlan → dispatch.
-/// Returns `Ok(())` on success, or a pgwire error on failure.
-pub(super) async fn plan_and_dispatch(
+/// Returns `Ok(())` on success, or a protocol-neutral error on failure.
+pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_and_dispatch(
     state: &SharedState,
-    _identity: &crate::control::security::identity::AuthenticatedIdentity,
+    _identity: &AuthenticatedIdentity,
     tenant_id: nodedb_types::TenantId,
     database_id: crate::types::DatabaseId,
     sql: &str,
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
     let mut tasks = query_ctx
         .plan_sql(sql, tenant_id, database_id)
         .await
-        .map_err(|e| sqlstate_error_raw("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err_raw("XX000", &e.to_string()))?;
 
     // Schemaless INSERT / UPSERT / object-literal documents carrying `_from`
     // / `_to` mirror an implicit graph edge. Extract it here — the same as the
@@ -353,7 +370,7 @@ pub(super) async fn plan_and_dispatch(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error_raw("XX000", &e.to_string()))?;
+    .map_err(|e| ddl_err_raw("XX000", &e.to_string()))?;
 
     // A cross-shard write (e.g. a doc + its dual-homed implicit edge, or a
     // multi-row insert spanning vShards) must commit atomically through the
@@ -374,7 +391,7 @@ pub(super) async fn plan_and_dispatch(
             false,
         )
         .await
-        .map_err(|e| sqlstate_error_raw("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err_raw("XX000", &e.to_string()))?;
         return Ok(());
     }
 
@@ -386,7 +403,7 @@ pub(super) async fn plan_and_dispatch(
             task.database_id,
             &task.plan,
         )
-        .map_err(|e| sqlstate_error_raw("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err_raw("XX000", &e.to_string()))?;
         let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
@@ -396,11 +413,11 @@ pub(super) async fn plan_and_dispatch(
             TraceId::ZERO,
         )
         .await
-        .map_err(|e| sqlstate_error_raw("XX000", &e.to_string()))?;
+        .map_err(|e| ddl_err_raw("XX000", &e.to_string()))?;
 
         // Data Plane returns `Ok(Response { status: Error, .. })` for
         // constraint violations (UNIQUE, CHECK-at-write, etc.). Surface
-        // them as pgwire errors — without this mapping the Data Plane's
+        // them as errors — without this mapping the Data Plane's
         // rejection would be silently swallowed and the write appears
         // to succeed at the SQL layer.
         if response.status == crate::bridge::envelope::Status::Error {
@@ -414,117 +431,33 @@ pub(super) async fn plan_and_dispatch(
             } else {
                 "XX000"
             };
-            return Err(sqlstate_error_raw(sqlstate, &detail));
+            return Err(ddl_err_raw(sqlstate, &detail));
         }
     }
     Ok(())
 }
 
-/// Create a raw PgWireError (not wrapped in Option/Result).
-fn sqlstate_error_raw(code: &str, msg: &str) -> pgwire::error::PgWireError {
-    pgwire::error::PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-        "ERROR".to_owned(),
-        code.to_owned(),
-        msg.to_owned(),
-    )))
-}
-
-/// Fire SYNC AFTER INSERT triggers, returning an error response on failure.
-pub(super) async fn fire_sync_after_triggers(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: nodedb_types::TenantId,
-    coll_name: &str,
-    fields: &std::collections::HashMap<String, nodedb_types::Value>,
-) -> Option<PgWireResult<Vec<Response>>> {
-    use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
-    if let Err(e) = crate::control::trigger::fire::fire_after_insert(
-        state,
-        identity,
-        tenant_id,
-        coll_name,
-        fields,
-        0,
-        Some(TriggerExecutionMode::Sync),
-    )
-    .await
-    {
-        return Some(Err(sqlstate_error("XX000", &format!("trigger error: {e}"))));
-    }
-    None
-}
-
-/// Fire SYNC AFTER UPDATE triggers, returning an error response on failure.
-///
-/// Used by the UPSERT DSL when the probe finds a pre-existing row —
-/// without this, AFTER UPDATE subscribers would silently miss overwrite
-/// events because the UPSERT handler historically fired only AFTER INSERT.
-pub(super) async fn fire_sync_after_update_triggers(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: nodedb_types::TenantId,
-    coll_name: &str,
-    old_fields: &std::collections::HashMap<String, nodedb_types::Value>,
-    new_fields: &std::collections::HashMap<String, nodedb_types::Value>,
-) -> Option<PgWireResult<Vec<Response>>> {
-    use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
-    if let Err(e) = crate::control::trigger::fire_after::fire_after_update(
-        state,
-        identity,
-        tenant_id,
-        coll_name,
-        old_fields,
-        new_fields,
-        0,
-        Some(TriggerExecutionMode::Sync),
-    )
-    .await
-    {
-        return Some(Err(sqlstate_error("XX000", &format!("trigger error: {e}"))));
-    }
-    None
-}
-
-/// Fire INSTEAD OF INSERT triggers, returning the result.
-pub(super) async fn fire_instead_triggers(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: nodedb_types::TenantId,
-    coll_name: &str,
-    fields: &std::collections::HashMap<String, nodedb_types::Value>,
-    tag: &str,
-) -> Option<PgWireResult<Vec<Response>>> {
-    match crate::control::trigger::fire_instead::fire_instead_of_insert(
-        state, identity, tenant_id, coll_name, fields, 0,
-    )
-    .await
-    {
-        Ok(crate::control::trigger::fire_instead::InsteadOfResult::Handled) => {
-            Some(Ok(vec![Response::Execution(Tag::new(tag))]))
-        }
-        Ok(crate::control::trigger::fire_instead::InsteadOfResult::NoTrigger) => None,
-        Err(e) => Some(Err(sqlstate_error("XX000", &format!("trigger error: {e}")))),
+/// Build a [`DdlError`] from a SQLSTATE + message.
+fn ddl_err_raw(code: &str, msg: &str) -> DdlError {
+    DdlError {
+        sqlstate: code.to_string(),
+        message: msg.to_string(),
     }
 }
 
-/// Fire BEFORE INSERT triggers, returning mutated fields or an error.
-pub(super) async fn fire_before_triggers(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: nodedb_types::TenantId,
-    coll_name: &str,
-    fields: &std::collections::HashMap<String, nodedb_types::Value>,
-) -> Result<std::collections::HashMap<String, nodedb_types::Value>, PgWireResult<Vec<Response>>> {
-    match crate::control::trigger::fire_before::fire_before_insert(
-        state, identity, tenant_id, coll_name, fields, 0,
-    )
-    .await
-    {
-        Ok(f) => Ok(f),
-        Err(e) => Err(Err(sqlstate_error(
-            "XX000",
-            &format!("BEFORE trigger error: {e}"),
-        ))),
+/// Convert a pgwire error (from a shared infra helper still imported from the
+/// pgwire crate boundary, e.g. `sqlstate_error`) into a [`DdlError`], mirroring
+/// `dispatch.rs::pgwire_error_to_ddl_error`.
+fn err_from_pgwire(err: pgwire::error::PgWireError) -> DdlError {
+    match err {
+        pgwire::error::PgWireError::UserError(info) => DdlError {
+            sqlstate: info.code.clone(),
+            message: info.message.clone(),
+        },
+        other => DdlError {
+            sqlstate: "XX000".to_string(),
+            message: other.to_string(),
+        },
     }
 }
 
