@@ -8,6 +8,13 @@
 //! `payload_to_response`. Clients expect one pgwire field per projected
 //! column, not a JSON blob in one field.
 //!
+//! Shaping itself (scan-envelope unwrap, SELECT-list column selection,
+//! id-first column-union derivation) lives in the canonical, protocol-neutral
+//! `response_shape::compose::shape_decoded_rows`. This module holds only the
+//! pgwire-side adapter: decode the envelope text, hand the parsed JSON to the
+//! neutral shaping core, and encode the resulting `ShapedRows` back into
+//! pgwire `DataRow`s.
+//!
 //! The entry point is `reproject_if_select`: parse the SQL's SELECT list,
 //! determine the projected column names, and re-encode the response rows
 //! with one pgwire field per column.
@@ -16,16 +23,15 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use pgwire::api::Type;
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
+use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::data::DataRow;
 
 use super::super::types::text_field;
-use crate::control::server::response_shape::project::json_value_to_text;
+use super::shape_encode::{self, encode_shaped_row};
+use crate::control::server::response_shape::compose::shape_decoded_rows;
 
 pub(super) use crate::control::server::response_shape::project::{
     ProjectionItem, lookup_keys_for_projection, needs_projection, parse_select_projection,
-    push_flat_rows,
 };
 
 /// Build `FieldInfo`s from a projection list, all as TEXT.
@@ -85,12 +91,20 @@ pub(super) fn reproject_response(
 
     let schema = Arc::new(result_fields.to_vec());
 
-    // Clone the small, bounded per-query metadata so we can move it into the
-    // stream closure without borrowing across the async boundary.
+    // Build the neutral `ProjectionItem` list from the already-resolved
+    // lookup keys / display names, and clone the small, bounded per-query
+    // metadata so we can move it into the stream closure without borrowing
+    // across the async boundary.
+    let items: Vec<ProjectionItem> = lookup_keys
+        .iter()
+        .zip(result_fields.iter())
+        .map(|(lookup_key, field)| ProjectionItem::Named {
+            lookup_key: lookup_key.clone(),
+            display_name: field.name().to_owned(),
+        })
+        .collect();
+    let display_columns: Vec<String> = result_fields.iter().map(|f| f.name().to_owned()).collect();
     let stream_schema = schema.clone();
-    let stream_lookup_keys: Vec<String> = lookup_keys.to_vec();
-    let stream_display_names: Vec<String> =
-        result_fields.iter().map(|f| f.name().to_owned()).collect();
 
     // Move the upstream row stream into the closure. `data_rows` is
     // `Pin<Box<dyn Stream + Send>>` which is `Unpin` (Box makes it so),
@@ -104,25 +118,11 @@ pub(super) fn reproject_response(
             let Some(text) = decode_first_field_text(&row.data) else {
                 continue;
             };
-            let value = sonic_rs::from_str::<serde_json::Value>(text).map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "XX000".to_owned(),
-                    format!("malformed Data-Plane response envelope: {e}"),
-                )))
-            })?;
+            let value = decode_envelope_value(text)?;
 
-            let mut flat = Vec::new();
-            push_flat_rows(value, &mut flat);
-
-            for obj in flat {
-                let data_row = encode_projected_row(
-                    &obj,
-                    &stream_schema,
-                    &stream_lookup_keys,
-                    &stream_display_names,
-                )?;
-                yield data_row;
+            let shaped = shape_decoded_rows(&value, Some(&items));
+            for row in shaped.rows {
+                yield encode_shaped_row(&stream_schema, &display_columns, &row)?;
             }
         }
     };
@@ -130,94 +130,35 @@ pub(super) fn reproject_response(
     Ok(Response::Query(QueryResponse::new(schema, row_stream)))
 }
 
-/// Encode a single flat row object into a pgwire `DataRow` using the projected
-/// column schema.
+/// Parse a single envelope row's text payload into a `serde_json::Value`,
+/// wrapping malformed JSON in a client-facing `PgWireError`.
 ///
-/// For each column position `i`:
-/// - `lookup_keys[i]` is tried first (handles qualified `table.col` references
-///   against join-prefixed row objects).
-/// - Falls back to the bare column name (last dot-segment) for plain
-///   single-table queries.
-/// - Falls back to `display_names[i]` (the SELECT alias) for aliased
-///   function calls like `rrf_score(...) AS score`.
-///
-/// Missing or `null` values are encoded as SQL `NULL`.
-fn encode_projected_row(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    schema: &Arc<Vec<FieldInfo>>,
-    lookup_keys: &[String],
-    display_names: &[String],
-) -> PgWireResult<DataRow> {
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    for (i, lookup_key) in lookup_keys.iter().enumerate() {
-        let bare = lookup_key
-            .rfind('.')
-            .map(|dot_pos| &lookup_key[dot_pos + 1..])
-            .unwrap_or(lookup_key.as_str());
-        let display_name: Option<&str> = display_names.get(i).map(String::as_str);
-        let value = obj
-            .get(lookup_key.as_str())
-            .or_else(|| {
-                if bare != lookup_key {
-                    obj.get(bare)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                display_name.and_then(|n| {
-                    if n != lookup_key.as_str() && Some(n) != Some(bare) {
-                        obj.get(n)
-                    } else {
-                        None
-                    }
-                })
-            });
-        match value {
-            None | Some(serde_json::Value::Null) => {
-                encoder.encode_field(&Option::<String>::None).map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "XX000".to_owned(),
-                        format!("failed to encode NULL field: {e}"),
-                    )))
-                })?;
-            }
-            Some(v) => {
-                let text = json_value_to_text(v);
-                encoder.encode_field(&text).map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "XX000".to_owned(),
-                        format!("failed to encode field: {e}"),
-                    )))
-                })?;
-            }
-        }
-    }
-    Ok(encoder.take_row())
+/// Shared by `reproject_response`'s streaming decode and
+/// `collect_decoded_values`'s eager decode — same envelope format, same
+/// error shape either way.
+fn decode_envelope_value(text: &str) -> PgWireResult<serde_json::Value> {
+    sonic_rs::from_str::<serde_json::Value>(text).map_err(|e| {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "XX000".to_owned(),
+            format!("malformed Data-Plane response envelope: {e}"),
+        )))
+    })
 }
 
-/// Consume an envelope `QueryResponse` and return flat row objects.
-pub(super) async fn collect_flat_rows(
-    mut qr: QueryResponse,
-) -> PgWireResult<Vec<serde_json::Map<String, serde_json::Value>>> {
-    let mut rows = Vec::new();
+/// Consume an envelope `QueryResponse` and return each row's decoded JSON
+/// value (before scan-envelope unwrap or projection — that is applied
+/// uniformly afterward by `shape_decoded_rows`).
+async fn collect_decoded_values(mut qr: QueryResponse) -> PgWireResult<Vec<serde_json::Value>> {
+    let mut values = Vec::new();
     while let Some(row_result) = qr.data_rows.next().await {
         let row = row_result?;
         let Some(text) = decode_first_field_text(&row.data) else {
             continue;
         };
-        let value = sonic_rs::from_str::<serde_json::Value>(text).map_err(|e| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "XX000".to_owned(),
-                format!("malformed Data-Plane response envelope: {e}"),
-            )))
-        })?;
-        push_flat_rows(value, &mut rows);
+        values.push(decode_envelope_value(text)?);
     }
-    Ok(rows)
+    Ok(values)
 }
 
 /// Re-encode a `SELECT *` envelope response as one pgwire field per key found
@@ -231,8 +172,8 @@ pub(super) async fn reproject_star_response(response: Response) -> PgWireResult<
         other => return Ok(other),
     };
 
-    let flat_rows = collect_flat_rows(qr).await?;
-    if flat_rows.is_empty() {
+    let values = collect_decoded_values(qr).await?;
+    if values.is_empty() {
         let schema = Arc::new(vec![text_field("result")]);
         return Ok(Response::Query(QueryResponse::new(
             schema,
@@ -240,53 +181,9 @@ pub(super) async fn reproject_star_response(response: Response) -> PgWireResult<
         )));
     }
 
-    // Derive column order: id first (if present), then remaining keys
-    // in stable insertion order from the first row.
-    let mut cols: Vec<String> = Vec::new();
-    let first = &flat_rows[0];
-    if first.contains_key("id") {
-        cols.push("id".to_string());
-    }
-    for key in first.keys() {
-        if key != "id" {
-            cols.push(key.clone());
-        }
-    }
-    // Ensure any keys from later rows that were absent in the first row
-    // are also included (union over all rows).
-    for row in flat_rows.iter().skip(1) {
-        for key in row.keys() {
-            if !cols.contains(key) {
-                cols.push(key.clone());
-            }
-        }
-    }
-
-    let schema: Arc<Vec<_>> = Arc::new(cols.iter().map(|c| text_field(c)).collect());
-    let row_schema = schema.clone();
-    let pgwire_rows: Vec<PgWireResult<_>> = flat_rows
-        .iter()
-        .map(|obj| {
-            let mut encoder = DataRowEncoder::new(row_schema.clone());
-            for col in &cols {
-                match obj.get(col.as_str()) {
-                    None | Some(serde_json::Value::Null) => {
-                        let _ = encoder.encode_field(&Option::<String>::None);
-                    }
-                    Some(v) => {
-                        let text = json_value_to_text(v);
-                        let _ = encoder.encode_field(&text);
-                    }
-                }
-            }
-            Ok(encoder.take_row())
-        })
-        .collect();
-
-    Ok(Response::Query(QueryResponse::new(
-        schema,
-        futures::stream::iter(pgwire_rows),
-    )))
+    let shaped = shape_decoded_rows(&serde_json::Value::Array(values), None);
+    let (response, _notice) = shape_encode::shaped_query_response(shaped);
+    Ok(response)
 }
 
 /// Decode the text bytes of the first field from a pgwire `DataRow` wire buffer.

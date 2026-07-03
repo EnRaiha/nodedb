@@ -136,7 +136,13 @@ fn rows_to_response(shaped: ShapedRows) -> PgWireResult<Response> {
 /// that produces the matching type OID (all with `FieldFormat::Text`). This
 /// is the inverse of the OID→`DdlColType` mapping the neutral dispatch used
 /// when capturing the schema, so the RowDescription round-trips losslessly.
-fn col_type_to_field(name: &str, ct: DdlColType) -> FieldInfo {
+///
+/// Visible across the pgwire module so `handler::shape_encode` can reuse the
+/// same OID mapping when encoding the canonical `ShapedRows` response shape.
+pub(in crate::control::server::pgwire) fn col_type_to_field(
+    name: &str,
+    ct: DdlColType,
+) -> FieldInfo {
     match ct {
         DdlColType::Text => text_field(name),
         DdlColType::Int8 => int8_field(name),
