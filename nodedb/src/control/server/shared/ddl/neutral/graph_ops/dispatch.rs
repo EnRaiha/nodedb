@@ -14,8 +14,9 @@ use super::{algo, edge, rag_fusion, stats, traverse};
 /// Dispatch a parsed graph-overlay variant to its handler.
 ///
 /// Returns `None` when the statement is not a graph-overlay variant this family
-/// owns (e.g. `GraphStmt::MatchQuery`, which stays on the pgwire `match_ops`
-/// path), so the caller falls through to the transitional pgwire delegation.
+/// owns (e.g. `GraphStmt::MatchQuery`, which the router dispatches to the neutral
+/// `match_ops` handler from its own typed arm before calling this), so the caller
+/// falls through to the transitional pgwire delegation.
 pub async fn dispatch_graph(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -139,8 +140,9 @@ pub async fn dispatch_graph(
         }) => Some(
             stats::show_graph_stats(state, identity, database_id, collection, verbose, as_of).await,
         ),
-        // `MatchQuery` (pgwire `match_ops`) and every non-graph-overlay variant
-        // return None so the caller can route them elsewhere.
+        // `MatchQuery` (handled by the router's typed arm → neutral `match_ops`)
+        // and every non-graph-overlay variant return None so the caller can route
+        // them elsewhere.
         _ => None,
     }
 }

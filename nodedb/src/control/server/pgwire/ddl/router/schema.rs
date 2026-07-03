@@ -67,12 +67,9 @@ pub(super) async fn dispatch(
         return Some(super::super::field_def::define_event(state, identity, sql));
     }
 
-    // CREATE SPATIAL INDEX
-    if upper.starts_with("CREATE SPATIAL INDEX ") {
-        return Some(super::super::spatial::create_spatial_index(
-            state, identity, parts,
-        ));
-    }
+    // CREATE SPATIAL INDEX has been migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::spatial`), which is tried before this transitional
+    // pgwire delegation runs.
 
     None
 }

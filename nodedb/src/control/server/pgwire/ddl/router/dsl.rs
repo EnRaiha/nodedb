@@ -24,20 +24,13 @@ pub(super) async fn dispatch(
         return Some(super::helpers::execute_chunk_text(sql));
     }
 
-    // CRDT operations via SQL-like syntax (async).
-    if upper.starts_with("SELECT CRDT_STATE(") || upper.starts_with("SELECT CRDT_STATE (") {
-        return Some(super::super::crdt_ops::crdt_state(state, identity, database_id, sql).await);
-    }
-    if upper.starts_with("SELECT CRDT_APPLY(") || upper.starts_with("SELECT CRDT_APPLY (") {
-        return Some(super::super::crdt_ops::crdt_apply(state, identity, database_id, sql).await);
-    }
-
-    // `MATCH` graph pattern queries flow through the typed AST to `match_ops`.
-    // Parsing is done by `nodedb_sql::ddl_ast::graph_parse`, which is quote- and
-    // brace-aware — handlers never see raw SQL. The other graph-overlay
-    // statements (GRAPH INSERT/DELETE EDGE, LABEL/UNLABEL, TRAVERSE/NEIGHBORS/
-    // PATH, ALGO, RAG FUSION, SHOW GRAPH STATS) are handled on the typed path by
-    // the protocol-neutral router before this pgwire delegation runs.
+    // CRDT DSL functions (`SELECT crdt_state(...)` / `SELECT crdt_apply(...)`)
+    // and `MATCH` pattern queries have been migrated to the protocol-neutral
+    // router (`shared::ddl::neutral::crdt_ops` / `match_ops`), which is tried
+    // before this transitional pgwire delegation runs. Graph parse errors for
+    // `GRAPH ` / `MATCH ` / `SHOW GRAPH STATS` prefixed inputs are reproduced
+    // here so those inputs still surface a 42601 rather than falling through to
+    // the SQL planner.
     if upper.starts_with("GRAPH ")
         || upper.starts_with("MATCH ")
         || upper.starts_with("OPTIONAL MATCH ")
@@ -50,19 +43,7 @@ pub(super) async fn dispatch(
                     &e.to_string(),
                 )));
             }
-            Some(Ok(stmt)) => {
-                if matches!(
-                    stmt,
-                    nodedb_sql::ddl_ast::NodedbStatement::Graph(
-                        nodedb_sql::ddl_ast::statement::GraphStmt::MatchQuery { .. }
-                    )
-                ) {
-                    return Some(
-                        super::super::match_ops::match_query(state, identity, database_id, sql)
-                            .await,
-                    );
-                }
-            }
+            Some(Ok(_)) => {}
             None => {}
         }
     }

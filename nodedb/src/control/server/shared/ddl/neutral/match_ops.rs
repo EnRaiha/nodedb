@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! MATCH pattern query handler — parses Cypher-style MATCH syntax,
-//! compiles to PhysicalPlan::GraphMatch, and dispatches to Data Plane.
+//! Protocol-neutral MATCH pattern query handler — parses Cypher-style MATCH
+//! syntax, compiles to PhysicalPlan::GraphMatch, and dispatches to Data Plane.
+//!
+//! The handler builds [`DdlResult`](super::super::result::DdlResult) directly
+//! and carries no pgwire types. It is dispatched from the neutral router's typed
+//! `GraphStmt::MatchQuery` arm, but re-parses the raw `sql` with the graph
+//! pattern compiler (as the pgwire handler did) to build the physical plan.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
-use sonic_rs;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::graph_dispatch;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
-use crate::types::TraceId;
+use crate::types::{DatabaseId, TraceId};
 use nodedb_physical::physical_plan::GraphOp;
-use nodedb_types::DatabaseId;
 
-use super::super::types::{sqlstate_error, text_field};
+use super::super::result::{DdlError, DdlResult};
 
 /// Returned when a MATCH could not be fully resolved within its expansion
 /// budget — either the cross-shard hop rounds or the variable-length paging
@@ -39,10 +39,12 @@ pub async fn match_query(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // Parse the MATCH query.
-    let query = crate::engine::graph::pattern::compiler::parse(sql)
-        .map_err(|e| sqlstate_error("42601", &format!("MATCH parse error: {e}")))?;
+    let query = crate::engine::graph::pattern::compiler::parse(sql).map_err(|e| DdlError {
+        sqlstate: "42601".to_string(),
+        message: format!("MATCH parse error: {e}"),
+    })?;
 
     // Enforce the tenant's max_graph_depth quota.  Reject if any edge in the
     // pattern exceeds the cap.  Unbounded [*] (max_hops == usize::MAX) is
@@ -59,13 +61,13 @@ pub async fn match_query(
                     for triple in &chain.triples {
                         let hops = triple.edge.max_hops;
                         if hops > limit as usize {
-                            return Err(sqlstate_error(
-                                "42P17",
-                                &format!(
+                            return Err(DdlError {
+                                sqlstate: "42P17".to_string(),
+                                message: format!(
                                     "MATCH traversal depth {hops} exceeds tenant quota \
                                      max_graph_depth={limit}"
                                 ),
-                            ));
+                            });
                         }
                     }
                 }
@@ -86,8 +88,10 @@ pub async fn match_query(
     };
 
     // Serialize the MatchQuery for SPSC transport.
-    let query_bytes = zerompk::to_msgpack_vec(&query)
-        .map_err(|e| sqlstate_error("XX000", &format!("serialize match query: {e}")))?;
+    let query_bytes = zerompk::to_msgpack_vec(&query).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("serialize match query: {e}"),
+    })?;
 
     let tenant_id = identity.tenant_id;
 
@@ -118,12 +122,18 @@ pub async fn match_query(
                 // result is surfaced fail-closed rather than silently truncated.
                 let _frontier = outcome.frontier;
                 if outcome.partial {
-                    Err(sqlstate_error("54001", MATCH_INCOMPLETE_MESSAGE))
+                    Err(DdlError {
+                        sqlstate: "54001".to_string(),
+                        message: MATCH_INCOMPLETE_MESSAGE.to_string(),
+                    })
                 } else {
-                    match_payload_to_response(&outcome.rows_payload, &column_names)
+                    match_payload_to_rows(&outcome.rows_payload, &column_names)
                 }
             }
-            Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+            Err(e) => Err(DdlError {
+                sqlstate: "XX000".to_string(),
+                message: e.to_string(),
+            }),
         };
     }
 
@@ -141,54 +151,60 @@ pub async fn match_query(
             // still pending: the result set is INCOMPLETE. Surface it
             // fail-closed so a client never mistakes it for a complete result.
             if outcome.partial {
-                Err(sqlstate_error("54001", MATCH_INCOMPLETE_MESSAGE))
+                Err(DdlError {
+                    sqlstate: "54001".to_string(),
+                    message: MATCH_INCOMPLETE_MESSAGE.to_string(),
+                })
             } else {
-                match_payload_to_response(&outcome.rows_payload, &column_names)
+                match_payload_to_rows(&outcome.rows_payload, &column_names)
             }
         }
-        Err(e) => Err(sqlstate_error("XX000", &e.to_string())),
+        Err(e) => Err(DdlError {
+            sqlstate: "XX000".to_string(),
+            message: e.to_string(),
+        }),
     }
 }
 
-/// Convert MATCH result payload to pgwire multi-row response.
-fn match_payload_to_response(
+/// Convert MATCH result payload to a protocol-neutral multi-row result.
+fn match_payload_to_rows(
     payload: &crate::bridge::envelope::Payload,
     column_names: &[String],
-) -> PgWireResult<Vec<Response>> {
-    let schema = Arc::new(
-        column_names
-            .iter()
-            .map(|name| text_field(name))
-            .collect::<Vec<_>>(),
-    );
+) -> Result<Vec<DdlResult>, DdlError> {
+    let columns = column_names.to_vec();
+    let column_types = ShapedRows::text_types(column_names.len());
 
     if payload.is_empty() {
-        return Ok(vec![Response::Query(QueryResponse::new(
-            schema,
-            stream::empty(),
-        ))]);
+        return Ok(vec![DdlResult::Rows(ShapedRows {
+            columns,
+            column_types,
+            rows: Vec::new(),
+            notice: None,
+        })]);
     }
 
     let json_text = response_codec::decode_payload_to_json(payload);
-    let rows: Vec<serde_json::Value> = sonic_rs::from_str(&json_text)
-        .map_err(|e| sqlstate_error("XX000", &format!("invalid match result JSON: {e}")))?;
+    let rows: Vec<serde_json::Value> = sonic_rs::from_str(&json_text).map_err(|e| DdlError {
+        sqlstate: "XX000".to_string(),
+        message: format!("invalid match result JSON: {e}"),
+    })?;
 
-    let mut pgwire_rows = Vec::with_capacity(rows.len());
+    let mut out_rows = Vec::with_capacity(rows.len());
     for row in &rows {
-        let mut encoder = DataRowEncoder::new(schema.clone());
+        let mut map = Map::new();
         for col_name in column_names {
             let val = row.get(col_name).and_then(|v| v.as_str()).unwrap_or("NULL");
-            encoder
-                .encode_field(&val.to_string())
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+            map.insert(col_name.clone(), JsonValue::String(val.to_string()));
         }
-        pgwire_rows.push(Ok(encoder.take_row()));
+        out_rows.push(map);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(pgwire_rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows: out_rows,
+        notice: None,
+    })])
 }
 
 // Tenant-prefix stripping lives in the Data Plane, in

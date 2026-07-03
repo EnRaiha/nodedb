@@ -1,38 +1,42 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! CREATE SPATIAL INDEX / DROP SPATIAL INDEX DDL handling.
+//! Protocol-neutral CREATE SPATIAL INDEX DDL handling.
 //!
 //! Syntax:
 //! ```sql
 //! CREATE SPATIAL INDEX <name> ON <collection>(<field>) [USING RTREE|GEOHASH] [PRECISION <n>]
 //! DROP INDEX <name>   -- handled by existing DROP INDEX path
 //! ```
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! The handler builds [`DdlResult`](super::super::result::DdlResult) directly
+//! and carries no pgwire types.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::types::sqlstate_error;
+use super::super::owner;
+use super::super::result::{DdlError, DdlResult};
 
 /// CREATE SPATIAL INDEX <name> ON <collection>(<field>) [USING RTREE|GEOHASH] [PRECISION <n>]
 pub fn create_spatial_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // Minimum: CREATE SPATIAL INDEX name ON collection(field)
     if parts.len() < 6 {
-        return Err(sqlstate_error(
-            "42601",
-            "syntax: CREATE SPATIAL INDEX <name> ON <collection>(<field>) [USING RTREE|GEOHASH] [PRECISION <n>]",
-        ));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "syntax: CREATE SPATIAL INDEX <name> ON <collection>(<field>) [USING RTREE|GEOHASH] [PRECISION <n>]".to_string(),
+        });
     }
 
     let index_name = parts[3];
     if !parts[4].eq_ignore_ascii_case("ON") {
-        return Err(sqlstate_error("42601", "expected ON after index name"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "expected ON after index name".to_string(),
+        });
     }
 
     // Parse collection(field) — field may be in the same token or next token.
@@ -52,14 +56,13 @@ pub fn create_spatial_index(
         let _precision = 6;
     }
 
-    crate::control::server::shared::ddl::owner::propose_owner(
+    owner::propose_owner(
         state,
         "spatial_index",
         tenant_id,
         index_name,
         &identity.username,
-    )
-    .map_err(|e| sqlstate_error(&e.sqlstate, &e.message))?;
+    )?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -75,17 +78,23 @@ pub fn create_spatial_index(
         ),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE SPATIAL INDEX"))])
+    Ok(vec![DdlResult::Status {
+        command: "CREATE SPATIAL INDEX".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Parse "collection(field)" or "collection" + "(field)".
-fn parse_collection_field(first: &str, second: Option<&str>) -> PgWireResult<(String, String)> {
+fn parse_collection_field(first: &str, second: Option<&str>) -> Result<(String, String), DdlError> {
     // Try "collection(field)" format.
     if let Some(paren_pos) = first.find('(') {
         let collection = &first[..paren_pos];
         let field = first[paren_pos + 1..].trim_end_matches(')').trim();
         if collection.is_empty() || field.is_empty() {
-            return Err(sqlstate_error("42601", "expected collection(field) format"));
+            return Err(DdlError {
+                sqlstate: "42601".to_string(),
+                message: "expected collection(field) format".to_string(),
+            });
         }
         return Ok((collection.to_string(), field.to_string()));
     }
@@ -98,10 +107,10 @@ fn parse_collection_field(first: &str, second: Option<&str>) -> PgWireResult<(St
         }
     }
 
-    Err(sqlstate_error(
-        "42601",
-        "expected collection(field) after ON",
-    ))
+    Err(DdlError {
+        sqlstate: "42601".to_string(),
+        message: "expected collection(field) after ON".to_string(),
+    })
 }
 
 /// Parse USING clause: RTREE (default) or GEOHASH.

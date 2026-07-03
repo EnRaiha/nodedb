@@ -8,8 +8,8 @@
 
 use nodedb_sql::ddl_ast::AlterCollectionOp;
 use nodedb_sql::ddl_ast::statement::{
-    AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, DatabaseStmt, NodedbStatement,
-    PolicyStmt, StreamViewStmt,
+    AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, DatabaseStmt, GraphStmt,
+    NodedbStatement, PolicyStmt, StreamViewStmt,
 };
 
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -29,6 +29,7 @@ use super::conflict_policy;
 use super::constraint;
 use super::consumer_group;
 use super::continuous_agg;
+use super::crdt_ops;
 use super::custom_type;
 use super::dsl;
 use super::emergency_ddl;
@@ -42,6 +43,7 @@ use super::kv_atomic;
 use super::kv_sorted_index;
 use super::last_value;
 use super::maintenance;
+use super::match_ops;
 use super::materialized_view;
 use super::metering_ddl;
 use super::observability;
@@ -60,6 +62,7 @@ use super::scope_ddl;
 use super::scope_query_ddl;
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
+use super::spatial;
 use super::synonym_group;
 use super::system_ddl;
 use super::timeseries;
@@ -800,9 +803,26 @@ pub async fn try_dispatch(
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(dsl::create_sparse_index(state, identity, &parts));
     }
+    // CREATE SPATIAL INDEX — string-recognized (no typed AST variant); the pgwire
+    // schema string router dispatched it from the raw token slice. Replicate that
+    // exactly here, before the parse gate.
+    if upper.starts_with("CREATE SPATIAL INDEX ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(spatial::create_spatial_index(state, identity, &parts));
+    }
     if upper.starts_with("CRDT MERGE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(dsl::crdt_merge(state, identity, database_id, &parts).await);
+    }
+    // `SELECT crdt_state(...)` / `SELECT crdt_apply(...)` CRDT DSL functions —
+    // string-recognized (they parse into no typed DDL variant). The pgwire dsl
+    // string router recognized both by prefix from the raw SQL; replicate that
+    // exactly here, before the parse gate.
+    if upper.starts_with("SELECT CRDT_STATE(") || upper.starts_with("SELECT CRDT_STATE (") {
+        return Some(crdt_ops::crdt_state(state, identity, database_id, sql).await);
+    }
+    if upper.starts_with("SELECT CRDT_APPLY(") || upper.starts_with("SELECT CRDT_APPLY (") {
+        return Some(crdt_ops::crdt_apply(state, identity, database_id, sql).await);
     }
 
     // Administrative introspection & audit: SHOW USERS, SHOW TENANTS, SHOW
@@ -1048,14 +1068,21 @@ pub async fn try_dispatch(
         }
     };
 
+    // `MATCH` pattern queries parse into `GraphStmt::MatchQuery`. The `match_ops`
+    // handler re-parses the raw `sql` with the graph pattern compiler, so it is
+    // dispatched here from the typed arm with the original SQL (matching the
+    // pgwire `dsl` router's MatchQuery branch). It must precede the general graph
+    // dispatch below, which does not own `MatchQuery`.
+    if let NodedbStatement::Graph(GraphStmt::MatchQuery { .. }) = &stmt {
+        return Some(match_ops::match_query(state, identity, database_id, sql).await);
+    }
+
     // Graph-overlay statements (GRAPH INSERT/DELETE EDGE, GRAPH LABEL/UNLABEL,
     // GRAPH TRAVERSE/NEIGHBORS/PATH, GRAPH ALGO, GRAPH RAG FUSION, SHOW GRAPH
     // STATS) parse into typed `GraphStmt` variants. In the pgwire router these
-    // were dispatched from the typed AST by the `dsl` string router (last),
-    // after the `MATCH` pattern query was split off to `match_ops`. Recognizing
-    // them here on the typed path preserves that: `dispatch_graph` returns
-    // `Some` for the graph-overlay variants and `None` for `GraphStmt::MatchQuery`
-    // (which stays on the pgwire `match_ops` path) so it falls through unchanged.
+    // were dispatched from the typed AST by the `dsl` string router (last).
+    // Recognizing them here on the typed path preserves that: `dispatch_graph`
+    // returns `Some` for the graph-overlay variants and `None` otherwise.
     if let NodedbStatement::Graph(_) = &stmt {
         return graph_ops::dispatch_graph(state, identity, database_id, stmt).await;
     }
