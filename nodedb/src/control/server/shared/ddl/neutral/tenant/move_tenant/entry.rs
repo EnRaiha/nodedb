@@ -4,18 +4,24 @@
 //! durable journal and the compensation paths.
 //!
 //! See the module-level docs on [`super`] for the phase table.
+//!
+//! Ported verbatim from the pgwire `ddl::tenant::move_tenant::entry` handler.
+//! `require_superuser` is byte-identical to the pgwire
+//! `types::privilege::require_superuser` gate used here originally (same
+//! audit-on-denial behaviour, same SQLSTATE, same message), so it is reused
+//! directly from `neutral::database::gate` rather than duplicated.
 
 use std::time::Duration;
 
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
-
-use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::{require_superuser, sqlstate_error};
-use crate::control::state::SharedState;
-use crate::types::TenantId;
 use nodedb_types::error::sqlstate;
 
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::state::SharedState;
+use crate::types::TenantId;
+
+use super::super::super::super::result::{DdlError, DdlResult};
+use super::super::super::database::gate::require_superuser;
+use super::super::support::{ddl_err, status};
 use super::journal::{self, MovePhase, MoveTenantJournalEntry};
 use super::{cutover, drain, preflight, recovery, snapshot};
 
@@ -35,22 +41,20 @@ pub async fn handle_move_tenant(
     tenant_name: &str,
     from_db: &str,
     to_db: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let catalog = state
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog unavailable"))?;
+        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     // Resolve source database id first so the privilege gate can carry it
     // in the audit record. The gate runs BEFORE tenant / target lookup so an
     // unauthorized caller never learns whether the tenant or target db exists.
     let source_db_id = catalog
         .get_database_id_by_name(from_db)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup: {e}")))?
-        .ok_or_else(|| {
-            sqlstate_error("42P01", &format!("source database '{from_db}' not found"))
-        })?;
+        .map_err(|e| ddl_err("XX000", format!("catalog lookup: {e}")))?
+        .ok_or_else(|| ddl_err("42P01", format!("source database '{from_db}' not found")))?;
 
     require_superuser(
         state,
@@ -63,22 +67,22 @@ pub async fn handle_move_tenant(
     // for administrative DDL operations).
     let tenant_record = catalog
         .load_all_tenants()
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup: {e}")))?
+        .map_err(|e| ddl_err("XX000", format!("catalog lookup: {e}")))?
         .into_iter()
         .find(|t| t.name == tenant_name)
-        .ok_or_else(|| sqlstate_error("42P01", &format!("tenant '{tenant_name}' not found")))?;
+        .ok_or_else(|| ddl_err("42P01", format!("tenant '{tenant_name}' not found")))?;
     let tenant_id = TenantId::new(tenant_record.tenant_id);
 
     let target_db_id = catalog
         .get_database_id_by_name(to_db)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog lookup: {e}")))?
-        .ok_or_else(|| sqlstate_error("42P01", &format!("target database '{to_db}' not found")))?;
+        .map_err(|e| ddl_err("XX000", format!("catalog lookup: {e}")))?
+        .ok_or_else(|| ddl_err("42P01", format!("target database '{to_db}' not found")))?;
 
     // Idempotency: tenant already in target?
     if recovery::tenant_already_in_target(catalog, tenant_id, source_db_id, target_db_id)
-        .map_err(|e| sqlstate_error("XX000", &format!("idempotency check: {e}")))?
+        .map_err(|e| ddl_err("XX000", format!("idempotency check: {e}")))?
     {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             sqlstate::MOVE_TENANT_ALREADY_AT_TARGET,
             nodedb_types::NodeDbError::move_tenant_already_at_target(tenant_name, to_db).message(),
         ));
@@ -86,14 +90,14 @@ pub async fn handle_move_tenant(
 
     // Check for an in-progress journal entry — resume or compensate.
     if let Some(entry) = journal::load_journal_entry(catalog, tenant_id)
-        .map_err(|e| sqlstate_error("XX000", &format!("journal read: {e}")))?
+        .map_err(|e| ddl_err("XX000", format!("journal read: {e}")))?
     {
         return recovery::resume_or_compensate(state, catalog, entry, identity).await;
     }
 
     // ── Phase 1: Pre-flight ───────────────────────────────────────────────────
     preflight::run(catalog, source_db_id, target_db_id, tenant_name, to_db)
-        .map_err(|e| sqlstate_error(sqlstate::MOVE_TENANT_PREFLIGHT_FAILED, e.message()))?;
+        .map_err(|e| ddl_err(sqlstate::MOVE_TENANT_PREFLIGHT_FAILED, e.message()))?;
 
     // ── Write journal entry at Preflight phase ────────────────────────────────
     let journal_entry = MoveTenantJournalEntry {
@@ -108,23 +112,20 @@ pub async fn handle_move_tenant(
         temp_snapshot_key: None,
     };
     journal::save_journal_entry(catalog, &journal_entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("journal write: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("journal write: {e}")))?;
 
     // ── Phase 2: Drain ────────────────────────────────────────────────────────
     let drain_result = drain::run(state, tenant_id, source_db_id, DRAIN_TIMEOUT).await;
     if let Err(ref e) = drain_result {
         // Compensate: remove journal entry so state is clean.
         journal::delete_journal_entry_logged(catalog, tenant_id);
-        return Err(sqlstate_error(
-            sqlstate::MOVE_TENANT_DRAIN_TIMEOUT,
-            e.message(),
-        ));
+        return Err(ddl_err(sqlstate::MOVE_TENANT_DRAIN_TIMEOUT, e.message()));
     }
 
     // Update journal to Snapshot phase.
     let journal_entry = journal_entry.with_phase(MovePhase::Snapshot);
     journal::save_journal_entry(catalog, &journal_entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("journal update: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("journal update: {e}")))?;
 
     // ── Phase 3: Snapshot ─────────────────────────────────────────────────────
     let snapshot_result = snapshot::run(state, tenant_id, source_db_id, SNAPSHOT_TIMEOUT).await;
@@ -134,10 +135,7 @@ pub async fn handle_move_tenant(
             // Compensate: release drain, remove journal.
             drain::release(state, tenant_id, source_db_id);
             journal::delete_journal_entry_logged(catalog, tenant_id);
-            return Err(sqlstate_error(
-                sqlstate::MOVE_TENANT_SNAPSHOT_FAILED,
-                e.message(),
-            ));
+            return Err(ddl_err(sqlstate::MOVE_TENANT_SNAPSHOT_FAILED, e.message()));
         }
     };
 
@@ -147,7 +145,7 @@ pub async fn handle_move_tenant(
         .with_phase(MovePhase::Cutover)
         .with_temp_snapshot_key(temp_key.clone());
     journal::save_journal_entry(catalog, &journal_entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("journal update: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("journal update: {e}")))?;
 
     // ── Phase 4: Cutover ──────────────────────────────────────────────────────
     let cutover_result = cutover::run(
@@ -166,10 +164,7 @@ pub async fn handle_move_tenant(
         drain::release(state, tenant_id, source_db_id);
         let _ = snapshot::delete_temp(state, &temp_key).await;
         journal::delete_journal_entry_logged(catalog, tenant_id);
-        return Err(sqlstate_error(
-            sqlstate::MOVE_TENANT_CUTOVER_FAILED,
-            e.message(),
-        ));
+        return Err(ddl_err(sqlstate::MOVE_TENANT_CUTOVER_FAILED, e.message()));
     }
 
     // ── Phase 5: Resume ───────────────────────────────────────────────────────
@@ -185,5 +180,5 @@ pub async fn handle_move_tenant(
         &format!("MOVE TENANT {tenant_name} FROM {from_db} TO {to_db} completed"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("MOVE TENANT"))])
+    Ok(status("MOVE TENANT"))
 }

@@ -61,6 +61,7 @@ pub mod spatial;
 pub mod stream_select;
 pub mod synonym_group;
 pub mod system_ddl;
+pub mod tenant;
 pub mod timeseries;
 pub mod topic;
 pub mod topic_subscribe;

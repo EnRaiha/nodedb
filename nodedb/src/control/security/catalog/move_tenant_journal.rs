@@ -4,11 +4,11 @@
 //!
 //! These methods live inside the `catalog` module so they have direct access
 //! to `SystemCatalog::db`.  They are called exclusively by the
-//! `control::server::pgwire::ddl::tenant::move_tenant::journal` module.
+//! `control::server::shared::ddl::neutral::tenant::move_tenant::journal` module.
 
 use super::system_catalog::SystemCatalog;
 use super::types::catalog_err;
-use crate::control::server::pgwire::ddl::tenant::move_tenant::journal::{
+use crate::control::server::shared::ddl::neutral::tenant::move_tenant::journal::{
     MOVE_TENANT_JOURNAL, MoveTenantJournalEntry,
 };
 

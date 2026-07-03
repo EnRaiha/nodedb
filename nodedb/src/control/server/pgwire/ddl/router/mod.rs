@@ -2,7 +2,6 @@
 
 mod admin;
 mod ast;
-mod auth;
 mod dsl;
 mod engine_ops;
 mod helpers;
@@ -58,9 +57,10 @@ pub async fn dispatch(
     let upper = sql.to_uppercase();
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
-    if let Some(r) = auth::dispatch(state, identity, sql, &upper, &parts, database_id).await {
-        return Some(r);
-    }
+    // Tenant management (CREATE / ALTER / DROP / PURGE TENANT), user/role,
+    // service-account, and system-settings string dispatch have all been
+    // migrated to the protocol-neutral router (`shared::ddl::neutral`),
+    // which is tried before this transitional pgwire delegation runs.
 
     // Stream/topic consumption (`SELECT * FROM STREAM|TOPIC ... CONSUMER
     // GROUP ...`) and legacy pub/sub (`SUBSCRIBE TO ...`) are served by the

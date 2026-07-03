@@ -21,7 +21,12 @@ use super::support::ddl_err;
 /// Require that the identity is a superuser.
 ///
 /// Emits `AuditEvent::PermissionDenied` and returns SQLSTATE 42501 on failure.
-pub(super) fn require_superuser(
+///
+/// Visibility is widened to the whole `neutral` tree (not just `database`) so
+/// the tenant family's `MOVE TENANT` handler — which uses this exact gate
+/// verbatim from the pgwire `types::privilege::require_superuser` — can reuse
+/// it instead of duplicating the audit-on-denial logic.
+pub(in crate::control::server::shared::ddl::neutral) fn require_superuser(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     db_id: Option<DatabaseId>,
@@ -106,8 +111,12 @@ pub(super) fn require_database_owner_or_higher(
 /// Require that the identity is superuser or tenant_admin.
 ///
 /// Mirrors pgwire `require_tenant_admin`: this gate does NOT emit an audit
-/// record on denial. Used by the read-only database SHOW handlers.
-pub(super) fn require_tenant_admin(
+/// record on denial. Used by the read-only database SHOW handlers, and reused
+/// (visibility widened to the `neutral` tree) by the tenant family's
+/// `SHOW TENANT QUOTA|USAGE FOR ... IN DATABASE ...` and
+/// `ALTER TENANT ... IN DATABASE ... SET QUOTA` handlers, which used the
+/// identical pgwire gate.
+pub(in crate::control::server::shared::ddl::neutral) fn require_tenant_admin(
     identity: &AuthenticatedIdentity,
     action: &str,
 ) -> Result<(), DdlError> {

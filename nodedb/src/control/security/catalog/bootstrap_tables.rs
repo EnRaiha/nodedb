@@ -124,5 +124,5 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "mirror_lag" => MIRROR_LAG,
     // ── Tenant relocation ──
     "move_tenant_journal" =>
-        crate::control::server::pgwire::ddl::tenant::move_tenant::journal::MOVE_TENANT_JOURNAL,
+        crate::control::server::shared::ddl::neutral::tenant::move_tenant::journal::MOVE_TENANT_JOURNAL,
 ];

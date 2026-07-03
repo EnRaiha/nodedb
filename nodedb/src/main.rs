@@ -305,7 +305,10 @@ async fn main() -> anyhow::Result<()> {
     // This runs synchronously before accepting connections so that
     // in-flight tenant moves are resolved before any client can issue
     // new ones against the same tenant.
-    nodedb::control::server::pgwire::ddl::tenant::move_tenant::recovery::recover_all(&shared).await;
+    nodedb::control::server::shared::ddl::neutral::tenant::move_tenant::recovery::recover_all(
+        &shared,
+    )
+    .await;
 
     // Bootstrap superuser credential (or warn about trust mode).
     bootstrap::credentials::bootstrap_superuser(&shared, &config)?;

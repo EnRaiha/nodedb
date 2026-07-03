@@ -23,7 +23,7 @@ pub(super) fn try_dispatch_sync(
     _database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     // Database DDL (all synchronous — catalog reads/writes only).
-    if let Some(result) = try_dispatch_database(state, identity, stmt) {
+    if let Some(result) = try_dispatch_database(stmt) {
         return Some(result);
     }
 

@@ -69,6 +69,7 @@ use super::spatial;
 use super::stream_select;
 use super::synonym_group;
 use super::system_ddl;
+use super::tenant;
 use super::timeseries;
 use super::topic;
 use super::topic_subscribe;
@@ -192,6 +193,51 @@ pub async fn try_dispatch(
     if upper.starts_with("SHOW BLACKLIST") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(blacklist::show_blacklist(state, identity, &parts));
+    }
+
+    // Tenant management. `CREATE TENANT`, `DROP TENANT`, and `PURGE TENANT`
+    // parse into no typed AST variant — the pgwire auth router dispatched all
+    // three by string prefix from the raw token slice. Replicate that exactly
+    // here, before the parse gate, so the `IF [NOT] EXISTS` stripping and
+    // syntax messages stay byte-identical. `PURGE TENANT` dispatches an async
+    // Data Plane meta op.
+    //
+    // `ALTER TENANT ` is ambiguous: `ALTER TENANT <id|name> SET QUOTA ...`
+    // (this string form) and `ALTER TENANT <name> IN DATABASE <db> SET QUOTA
+    // (...)` (a typed `DatabaseStmt::AlterTenant`, handled in the typed match
+    // below) share the same prefix. The typed `ddl_ast` tenant parser only
+    // recognizes the `IN DATABASE` form when `parts.len() >= 8` and tokens 3/4
+    // are `IN`/`DATABASE`; replicate that exact partition here so the
+    // `IN DATABASE` form always falls through to the typed arm instead of
+    // being shadowed by this string handler.
+    //
+    // `SHOW TENANT USAGE` / `SHOW TENANT QUOTA` (bare, no `IN DATABASE`) are
+    // NOT recognized here: the typed `ddl_ast` tenant parser never returns
+    // `None` for `SHOW TENANT USAGE|QUOTA...` — every such input resolves to
+    // either the typed `IN DATABASE` variant or a `42601` parse error. Their
+    // pgwire string handlers were therefore confirmed dead code and deleted,
+    // not migrated; adding a neutral string prefix for them would make that
+    // dead code reachable and break parity.
+    if upper.starts_with("CREATE TENANT ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(tenant::create_tenant(state, identity, &parts));
+    }
+    if upper.starts_with("ALTER TENANT ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let is_in_database_form = parts.len() >= 8
+            && parts[3].eq_ignore_ascii_case("IN")
+            && parts[4].eq_ignore_ascii_case("DATABASE");
+        if !is_in_database_form {
+            return Some(tenant::alter_tenant(state, identity, &parts));
+        }
+    }
+    if upper.starts_with("DROP TENANT ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(tenant::drop_tenant(state, identity, &parts));
+    }
+    if upper.starts_with("PURGE TENANT ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(tenant::purge_tenant(state, identity, database_id, &parts).await);
     }
 
     // Emergency & incident response DDL. `EMERGENCY LOCKDOWN` / `EMERGENCY
@@ -1912,8 +1958,9 @@ pub async fn try_dispatch(
         // effects are preserved verbatim in `database`.
         //
         // NOT here: `UseDatabase` (session-coupled, intercepted before the DDL
-        // router), `MoveTenant` (async, tenant family), and the tenant-quota /
-        // tenant-usage arms — those remain on the pgwire database router.
+        // router). `AlterTenant` / `ShowTenantQuotaInDatabase` /
+        // `ShowTenantUsageInDatabase` / `MoveTenant` are typed `DatabaseStmt`
+        // variants too, but dispatch to the `tenant` family below, not `database`.
         NodedbStatement::Database(DatabaseStmt::CreateDatabase {
             name,
             if_not_exists,
@@ -1993,6 +2040,43 @@ pub async fn try_dispatch(
         NodedbStatement::Database(DatabaseStmt::RestoreDatabase { name, .. }) => Some(
             database::backup_restore::restore_database(state, identity, name),
         ),
+
+        // Tenant DDL family (`ALTER TENANT ... IN DATABASE ... SET QUOTA`,
+        // `SHOW TENANT QUOTA|USAGE FOR ... IN DATABASE ...`). These parse into
+        // typed `DatabaseStmt` variants and were dispatched from the pgwire
+        // typed-AST database router (`database_ops`); all catalog / audit /
+        // gate side effects are preserved verbatim in `tenant`.
+        NodedbStatement::Database(DatabaseStmt::AlterTenant {
+            name,
+            database,
+            operation,
+        }) => Some(tenant::handle_alter_tenant_quota(
+            state, identity, name, database, operation,
+        )),
+
+        NodedbStatement::Database(DatabaseStmt::ShowTenantQuotaInDatabase { name, database }) => {
+            Some(tenant::handle_show_tenant_quota_in_database(
+                state, identity, name, database,
+            ))
+        }
+
+        NodedbStatement::Database(DatabaseStmt::ShowTenantUsageInDatabase { name, database }) => {
+            Some(tenant::handle_show_tenant_usage_in_database(
+                state, identity, name, database,
+            ))
+        }
+
+        // `MOVE TENANT <name> FROM <source_db> TO <target_db>` — async,
+        // 5-phase re-parenting sequence. Parses into a typed `DatabaseStmt`
+        // variant and was dispatched from the pgwire typed-AST async router
+        // (`async_ops`); every phase (pre-flight, drain, snapshot, cutover,
+        // resume), the journal, and the compensation paths are preserved
+        // verbatim in `tenant::move_tenant`.
+        NodedbStatement::Database(DatabaseStmt::MoveTenant {
+            tenant_name,
+            from_db,
+            to_db,
+        }) => Some(tenant::handle_move_tenant(state, identity, tenant_name, from_db, to_db).await),
 
         // Tenant introspection by identifier / name filter. These parse into
         // typed `DatabaseStmt` variants and were dispatched from the pgwire

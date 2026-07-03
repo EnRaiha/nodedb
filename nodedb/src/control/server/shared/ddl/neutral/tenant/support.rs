@@ -1,43 +1,47 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Tenant DDL handlers.
+//! Shared error/result constructors and tenant-reference resolution helpers
+//! for the protocol-neutral tenant DDL handlers.
 //!
-//! - [`create`] — `CREATE TENANT` (proposes `CatalogEntry::PutTenant`).
-//! - [`alter`] — `ALTER TENANT SET QUOTA` (in-memory; quota is not
-//!   part of `StoredTenant` — quota replication is a separate concern).
-//! - [`alter_quota`] — `ALTER TENANT <name> IN DATABASE <db> SET QUOTA (...)` —
-//!   persists quota to `_system.tenant_quotas`.
-//! - [`drop`] — `DROP TENANT` (proposes `DeleteTenant`).
-//! - [`purge`] — `PURGE TENANT <id> CONFIRM` (Data Plane meta op).
-//! - [`show`] — `SHOW TENANT USAGE` / `SHOW TENANT QUOTA` reads.
-//! - [`show_in_database`] — `SHOW TENANT QUOTA/USAGE FOR <name> IN DATABASE <db>`.
+//! Ported verbatim from the pgwire `ddl::tenant` module: `resolve_tenant_ref`
+//! and `tenant_exists` are byte-identical except for the error type
+//! (`DdlError` instead of `PgWireError`).
 
-pub mod alter;
-pub mod alter_quota;
-pub mod create;
-pub mod drop;
-pub mod move_tenant;
-pub mod purge;
-pub mod show;
-pub mod show_in_database;
-
-pub use alter::alter_tenant;
-pub use alter_quota::handle_alter_tenant_quota;
-pub use create::create_tenant;
-pub use drop::drop_tenant;
-pub use move_tenant::handle_move_tenant;
-pub use purge::purge_tenant;
-pub use show::{show_tenant_quota, show_tenant_usage};
-pub use show_in_database::{
-    handle_show_tenant_quota_in_database, handle_show_tenant_usage_in_database,
-};
-
-use pgwire::error::PgWireResult;
-
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+
+/// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
+pub(super) fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
+
+/// Build a single-element command-tag result (`rows_affected: None`).
+pub(super) fn status(command: &str) -> Vec<DdlResult> {
+    vec![DdlResult::Status {
+        command: command.to_string(),
+        rows_affected: None,
+    }]
+}
+
+/// Build an all-text [`ShapedRows`] result.
+pub(super) fn text_rows(
+    columns: Vec<String>,
+    rows: Vec<serde_json::Map<String, serde_json::Value>>,
+) -> Vec<DdlResult> {
+    let column_types = vec![DdlColType::Text; columns.len()];
+    vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })]
+}
 
 /// Resolve a tenant reference token to a [`TenantId`], accepting either a
 /// numeric id or a tenant name.
@@ -51,7 +55,7 @@ use super::super::types::sqlstate_error;
 /// id/name asymmetry where a bogus numeric id silently "succeeds".
 ///
 /// A non-numeric token is treated as a tenant name and resolved via
-/// [`find_tenant_by_name`]. Single-quoted names are unwrapped, mirroring the
+/// `find_tenant_by_name`. Single-quoted names are unwrapped, mirroring the
 /// AST `TenantSelector` behavior introduced for the CREATE/SHOW paths.
 /// `Ok(None)` is returned if the name does not match any tenant, so the
 /// caller can decide between `IF EXISTS` no-op success and an explicit
@@ -65,13 +69,10 @@ use super::super::types::sqlstate_error;
 /// Used by `DROP TENANT`, `ALTER TENANT SET QUOTA`, and `PURGE TENANT` to
 /// accept names in addition to numeric ids, parallel to the existing
 /// `CREATE TENANT <name>` and `SHOW TENANT <name>` support.
-///
-/// [`find_tenant_by_name`]:
-/// crate::control::security::credential::store::CredentialStore::catalog
 pub(super) fn resolve_tenant_ref(
     state: &SharedState,
     token: &str,
-) -> PgWireResult<Option<TenantId>> {
+) -> Result<Option<TenantId>, DdlError> {
     // Numeric id fast path — legacy compatible.
     if let Ok(id) = token.parse::<u64>() {
         return Ok(Some(TenantId::new(id)));
@@ -79,20 +80,20 @@ pub(super) fn resolve_tenant_ref(
     // Name resolution via catalog.
     let name = token.trim_matches('\'');
     if name.is_empty() {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "TENANT reference must be a numeric id or a tenant name",
         ));
     }
     let catalog = state.credentials.catalog().as_ref().ok_or_else(|| {
-        sqlstate_error(
+        ddl_err(
             "42601",
             "cannot resolve tenant by name: catalog unavailable; use numeric id",
         )
     })?;
     Ok(catalog
         .find_tenant_by_name(name)
-        .map_err(|e| sqlstate_error("XX000", &format!("catalog read: {e}")))?
+        .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
         .map(|stored| TenantId::new(stored.tenant_id)))
 }
 
@@ -101,11 +102,11 @@ pub(super) fn resolve_tenant_ref(
 ///
 /// Shared by `DROP`, `ALTER`, and `PURGE TENANT` so existence is enforced the
 /// same way for numeric ids and resolved names — see [`resolve_tenant_ref`].
-pub(super) fn tenant_exists(state: &SharedState, tenant_id: TenantId) -> PgWireResult<bool> {
+pub(super) fn tenant_exists(state: &SharedState, tenant_id: TenantId) -> Result<bool, DdlError> {
     if let Some(catalog) = state.credentials.catalog() {
         let present = catalog
             .load_all_tenants()
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog read: {e}")))?
+            .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
             .iter()
             .any(|t| t.tenant_id == tenant_id.as_u64());
         return Ok(present);

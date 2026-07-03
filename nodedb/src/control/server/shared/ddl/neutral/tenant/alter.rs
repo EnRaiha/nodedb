@@ -9,51 +9,57 @@
 //! The tenant reference accepts either a numeric id or a tenant name
 //! (single-quoted optional), parallel to `CREATE TENANT <name>` and
 //! `SHOW TENANT <name|id>`.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! Ported verbatim from the pgwire `ddl::tenant::alter` handler. The neutral
+//! string-prefix dispatch that reaches this handler must guard against the
+//! `ALTER TENANT <name> IN DATABASE <db> SET QUOTA (...)` typed form (handled
+//! by [`super::alter_quota::handle_alter_tenant_quota`]) — that guard lives
+//! at the call site in `neutral::router`, not here, mirroring how the pgwire
+//! parser's typed-vs-string split worked (the typed AST claimed the
+//! `IN DATABASE` form first).
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::{ddl_err, resolve_tenant_ref, status, tenant_exists};
 
 pub fn alter_tenant(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can alter tenants",
         ));
     }
 
     if parts.len() < 7 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "syntax: ALTER TENANT <id|name> SET QUOTA <field> = <value>",
         ));
     }
 
     // Accept either a numeric id or a tenant name (mirrors CREATE/SHOW/DROP).
-    let tenant_id = super::resolve_tenant_ref(state, parts[2])?
-        .ok_or_else(|| sqlstate_error("42704", &format!("tenant '{}' does not exist", parts[2])))?;
+    let tenant_id = resolve_tenant_ref(state, parts[2])?
+        .ok_or_else(|| ddl_err("42704", format!("tenant '{}' does not exist", parts[2])))?;
 
     // Existence gate, uniform across numeric ids and resolved names: altering an
     // unknown tenant must error rather than silently seed a default quota for a
     // phantom id.
-    if !super::tenant_exists(state, tenant_id)? {
-        return Err(sqlstate_error(
+    if !tenant_exists(state, tenant_id)? {
+        return Err(ddl_err(
             "42704",
-            &format!("tenant '{}' does not exist", parts[2]),
+            format!("tenant '{}' does not exist", parts[2]),
         ));
     }
 
     if !parts[3].eq_ignore_ascii_case("SET") || !parts[4].eq_ignore_ascii_case("QUOTA") {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "expected SET QUOTA after tenant id or name",
         ));
@@ -66,12 +72,12 @@ pub fn alter_tenant(
         6
     };
     if value_idx >= parts.len() {
-        return Err(sqlstate_error("42601", "expected value after field name"));
+        return Err(ddl_err("42601", "expected value after field name"));
     }
 
     let value: u64 = parts[value_idx]
         .parse()
-        .map_err(|_| sqlstate_error("42601", "quota value must be a positive integer"))?;
+        .map_err(|_| ddl_err("42601", "quota value must be a positive integer"))?;
 
     let mut tenants = match state.tenants.lock() {
         Ok(t) => t,
@@ -90,9 +96,9 @@ pub fn alter_tenant(
             quota.deactivated_collection_retention_days = Some(value as u32);
         }
         other => {
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42601",
-                &format!(
+                format!(
                     "unknown quota field: {other}. Valid: max_memory_bytes, max_storage_bytes, max_concurrent_requests, max_qps, max_vector_dim, max_graph_depth, deactivated_collection_retention_days"
                 ),
             ));
@@ -107,5 +113,5 @@ pub fn alter_tenant(
         &format!("altered tenant {tenant_id}: set {field} = {value}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER TENANT"))])
+    Ok(status("ALTER TENANT"))
 }

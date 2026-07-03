@@ -5,7 +5,7 @@
 use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
-use nodedb_sql::ddl_ast::statement::{CollectionStmt, DatabaseStmt, MiscStmt, NodedbStatement};
+use nodedb_sql::ddl_ast::statement::{CollectionStmt, MiscStmt, NodedbStatement};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::ddl::collection::copy_from::CopyFromOptions;
@@ -13,7 +13,6 @@ use crate::control::server::pgwire::ddl::collection::{
     CreateCollectionRequest, CreateIndexRequest, copy_from_file, copy_to_file, create_collection,
     create_index, create_table, dispatch_register_by_name,
 };
-use crate::control::server::pgwire::ddl::tenant::handle_move_tenant;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -174,12 +173,9 @@ pub(super) async fn try_dispatch_async(
             .await,
         ),
 
-        NodedbStatement::Database(DatabaseStmt::MoveTenant {
-            tenant_name,
-            from_db,
-            to_db,
-        }) => Some(handle_move_tenant(state, identity, tenant_name, from_db, to_db).await),
-
+        // MOVE TENANT is served by the protocol-neutral DDL router
+        // (`shared::ddl::neutral::tenant::move_tenant`), which is tried before
+        // this transitional pgwire delegation runs.
         _ => None,
     }
 }

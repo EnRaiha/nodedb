@@ -7,57 +7,57 @@
 //! The tenant reference accepts either a numeric id or a tenant name
 //! (single-quoted optional), parallel to `CREATE TENANT <name>` and
 //! `SHOW TENANT <name|id>`.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! Ported verbatim from the pgwire `ddl::tenant::purge` handler, including
+//! the `PhysicalPlan::Meta(MetaOp::PurgeTenant)` Data Plane dispatch (300s
+//! timeout via `sync_dispatch::dispatch_async`).
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+use super::support::{ddl_err, resolve_tenant_ref, status, tenant_exists};
 
 pub async fn purge_tenant(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can purge tenants",
         ));
     }
 
     if parts.len() < 4 {
-        return Err(sqlstate_error(
-            "42601",
-            "syntax: PURGE TENANT <id|name> CONFIRM",
-        ));
+        return Err(ddl_err("42601", "syntax: PURGE TENANT <id|name> CONFIRM"));
     }
 
     // Accept either a numeric id or a tenant name (mirrors CREATE/SHOW/DROP).
-    let tenant_id = super::resolve_tenant_ref(state, parts[2])?
-        .ok_or_else(|| sqlstate_error("42704", &format!("tenant '{}' does not exist", parts[2])))?;
+    let tenant_id = resolve_tenant_ref(state, parts[2])?
+        .ok_or_else(|| ddl_err("42704", format!("tenant '{}' does not exist", parts[2])))?;
     let tid = tenant_id.as_u64();
 
     if tid == 0 {
-        return Err(sqlstate_error("42501", "cannot purge system tenant (0)"));
+        return Err(ddl_err("42501", "cannot purge system tenant (0)"));
     }
 
     // Existence gate, uniform across numeric ids and resolved names: refuse to
     // dispatch the destructive meta op for a tenant that does not exist.
-    if !super::tenant_exists(state, tenant_id)? {
-        return Err(sqlstate_error(
+    if !tenant_exists(state, tenant_id)? {
+        return Err(ddl_err(
             "42704",
-            &format!("tenant '{}' does not exist", parts[2]),
+            format!("tenant '{}' does not exist", parts[2]),
         ));
     }
 
     if !parts[3].eq_ignore_ascii_case("CONFIRM") {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "PURGE TENANT requires CONFIRM keyword to prevent accidental data destruction",
         ));
@@ -74,7 +74,7 @@ pub async fn purge_tenant(
         nodedb_physical::physical_plan::MetaOp::PurgeTenant { tenant_id: tid },
     );
 
-    match super::super::sync_dispatch::dispatch_async(
+    match sync_dispatch::dispatch_async(
         state,
         tenant_id,
         database_id,
@@ -91,8 +91,8 @@ pub async fn purge_tenant(
                 &identity.username,
                 &format!("PURGE TENANT {tid} completed successfully"),
             );
-            Ok(vec![Response::Execution(Tag::new("PURGE TENANT"))])
+            Ok(status("PURGE TENANT"))
         }
-        Err(e) => Err(sqlstate_error("XX000", &format!("purge failed: {e}"))),
+        Err(e) => Err(ddl_err("XX000", format!("purge failed: {e}"))),
     }
 }

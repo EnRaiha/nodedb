@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `DROP TENANT [IF EXISTS] <id|name>` handler. Migrated to
-//! `CatalogEntry::DeleteTenant` in phase 1k.6.
+//! `DROP TENANT [IF EXISTS] <id|name>` handler.
 //!
 //! Accepts either a numeric tenant id or a tenant name (single-quoted
 //! optional), parallel to the `CREATE TENANT <name>` and
 //! `SHOW TENANT <name|id>` paths.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! Ported verbatim from the pgwire `ddl::tenant::drop` handler. The
+//! `reconcile_tenant_users` cleanup now calls `neutral::user::drop_user`
+//! directly (it was already protocol-neutral) instead of round-tripping
+//! through `ddl_encode::ddl_results_to_pgwire`.
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
@@ -17,17 +18,18 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::super::super::types::sqlstate_error;
-use super::super::parse_utils::strip_if_exists;
-use super::tenant_exists;
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::strip_if_exists;
+use super::create::default_admin_username;
+use super::support::{ddl_err, resolve_tenant_ref, status, tenant_exists};
 
 pub fn drop_tenant(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can drop tenants",
         ));
@@ -36,7 +38,7 @@ pub fn drop_tenant(
     let (if_exists, parts) = strip_if_exists(parts, 2);
 
     if parts.len() < 3 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "syntax: DROP TENANT [IF EXISTS] <id|name>",
         ));
@@ -46,23 +48,23 @@ pub fn drop_tenant(
     // CREATE TENANT name-resolution path. A name that matches no tenant yields
     // `None` here; an unknown numeric id resolves to a candidate that the
     // existence gate below rejects, so both forms behave identically.
-    let tenant_id = match super::resolve_tenant_ref(state, parts[2])? {
+    let tenant_id = match resolve_tenant_ref(state, parts[2])? {
         Some(tid) => tid,
         None => {
             // Name token did not resolve to any tenant.
             if if_exists {
-                return Ok(vec![Response::Execution(Tag::new("DROP TENANT"))]);
+                return Ok(status("DROP TENANT"));
             }
-            return Err(sqlstate_error(
+            return Err(ddl_err(
                 "42704",
-                &format!("tenant '{}' does not exist", parts[2]),
+                format!("tenant '{}' does not exist", parts[2]),
             ));
         }
     };
     let tid = tenant_id.as_u64();
 
     if tid == 0 {
-        return Err(sqlstate_error("42501", "cannot drop system tenant (0)"));
+        return Err(ddl_err("42501", "cannot drop system tenant (0)"));
     }
 
     // Existence gate, uniform across numeric ids and resolved names: an unknown
@@ -70,11 +72,11 @@ pub fn drop_tenant(
     // delete proposal for a tenant that does not exist.
     if !tenant_exists(state, tenant_id)? {
         if if_exists {
-            return Ok(vec![Response::Execution(Tag::new("DROP TENANT"))]);
+            return Ok(status("DROP TENANT"));
         }
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42704",
-            &format!("tenant '{}' does not exist", parts[2]),
+            format!("tenant '{}' does not exist", parts[2]),
         ));
     }
 
@@ -95,12 +97,12 @@ pub fn drop_tenant(
 
     let entry = CatalogEntry::DeleteTenant { tenant_id: tid };
     let log_index = propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("metadata propose: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("metadata propose: {e}")))?;
     if log_index == 0 {
         if let Some(catalog) = state.credentials.catalog() {
             catalog
                 .delete_tenant(tid)
-                .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+                .map_err(|e| ddl_err("XX000", format!("catalog write: {e}")))?;
         }
         let mut tenants = match state.tenants.lock() {
             Ok(t) => t,
@@ -116,7 +118,7 @@ pub fn drop_tenant(
         &format!("dropped tenant {tenant_id}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("DROP TENANT"))])
+    Ok(status("DROP TENANT"))
 }
 
 /// Reconcile the users that belong to `tenant_id` before its catalog
@@ -133,7 +135,7 @@ fn reconcile_tenant_users(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     // Tenant identity — its name, hence the `<name>_admin` of the
     // lifecycle-owned admin — lives only in the catalog. Without a
     // catalog there is no persisted `StoredTenant` to surface as a
@@ -152,7 +154,7 @@ fn reconcile_tenant_users(
     else {
         return Ok(());
     };
-    let admin_username = super::create::default_admin_username(&tenant_name);
+    let admin_username = default_admin_username(&tenant_name);
 
     // The same active-user set `SHOW TENANTS` unions over — reconciling
     // exactly this set is what clears the ghost.
@@ -176,9 +178,9 @@ fn reconcile_tenant_users(
 
     if !others.is_empty() {
         others.sort();
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
-            &format!(
+            format!(
                 "cannot drop tenant: {} user(s) still belong to it; drop or \
                  reassign them first: {}",
                 others.len(),
@@ -193,9 +195,7 @@ fn reconcile_tenant_users(
     // all run — the same guarantees `DROP USER` gives directly.
     if let Some(admin) = lifecycle_admin {
         let parts = ["DROP", "USER", admin.as_str()];
-        crate::control::server::pgwire::ddl_encode::ddl_results_to_pgwire(
-            crate::control::server::shared::ddl::neutral::user::drop_user(state, identity, &parts),
-        )?;
+        super::super::user::drop_user(state, identity, &parts)?;
     }
 
     Ok(())

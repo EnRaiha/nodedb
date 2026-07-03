@@ -8,19 +8,21 @@
 //! At handler entry time, [`tenant_already_in_target`] provides the idempotent
 //! short-circuit: if a previously completed move is re-issued, the response
 //! is `MOVE_TENANT_ALREADY_AT_TARGET`.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! Ported verbatim from the pgwire `ddl::tenant::move_tenant::recovery`
+//! handler; only the result construction changed from pgwire `Response` /
+//! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
+use super::super::super::super::result::{DdlError, DdlResult};
+use super::super::support::{ddl_err, status};
 use super::entry::SNAPSHOT_TIMEOUT;
 use super::journal::{self, MovePhase, MoveTenantJournalEntry};
 use super::{cutover, drain, snapshot};
-use crate::control::server::pgwire::types::sqlstate_error;
 use nodedb_types::error::sqlstate;
 
 /// Check whether the source database has already been emptied by a prior move.
@@ -54,7 +56,7 @@ pub async fn resume_or_compensate(
     catalog: &SystemCatalog,
     entry: MoveTenantJournalEntry,
     identity: &AuthenticatedIdentity,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = TenantId::new(entry.tenant_id);
     let source_db_id = DatabaseId::new(entry.source_db_id);
     let target_db_id = DatabaseId::new(entry.target_db_id);
@@ -64,9 +66,9 @@ pub async fn resume_or_compensate(
             // Journal recorded but drain never completed.
             // Compensate: remove journal, return error asking operator to retry.
             journal::delete_journal_entry_logged(catalog, tenant_id);
-            Err(sqlstate_error(
+            Err(ddl_err(
                 sqlstate::MOVE_TENANT_DRAIN_TIMEOUT,
-                &format!(
+                format!(
                     "MOVE TENANT '{}' was interrupted during drain and has been rolled back; \
                      please retry the operation",
                     entry.tenant_name
@@ -78,9 +80,9 @@ pub async fn resume_or_compensate(
             // Compensate: release drain, remove journal.
             drain::release(state, tenant_id, source_db_id);
             journal::delete_journal_entry_logged(catalog, tenant_id);
-            Err(sqlstate_error(
+            Err(ddl_err(
                 sqlstate::MOVE_TENANT_SNAPSHOT_FAILED,
-                &format!(
+                format!(
                     "MOVE TENANT '{}' was interrupted during snapshot and has been rolled back; \
                      please retry the operation",
                     entry.tenant_name
@@ -92,7 +94,7 @@ pub async fn resume_or_compensate(
             // actually completed (idempotency: tenant may already be in target).
             let already_moved =
                 tenant_already_in_target(catalog, tenant_id, source_db_id, target_db_id)
-                    .map_err(|e| sqlstate_error("XX000", &format!("idempotency check: {e}")))?;
+                    .map_err(|e| ddl_err("XX000", format!("idempotency check: {e}")))?;
 
             if already_moved {
                 // Cutover succeeded but client crashed before reading the response.
@@ -110,7 +112,7 @@ pub async fn resume_or_compensate(
                         entry.tenant_name, entry.source_db_name, entry.target_db_name
                     ),
                 );
-                return Ok(vec![Response::Execution(Tag::new("MOVE TENANT"))]);
+                return Ok(status("MOVE TENANT"));
             }
 
             // Cutover proposal did not apply. Re-run the snapshot and cutover.
@@ -121,10 +123,7 @@ pub async fn resume_or_compensate(
                 Err(ref e) => {
                     drain::release(state, tenant_id, source_db_id);
                     journal::delete_journal_entry_logged(catalog, tenant_id);
-                    return Err(sqlstate_error(
-                        sqlstate::MOVE_TENANT_SNAPSHOT_FAILED,
-                        e.message(),
-                    ));
+                    return Err(ddl_err(sqlstate::MOVE_TENANT_SNAPSHOT_FAILED, e.message()));
                 }
             };
 
@@ -144,10 +143,7 @@ pub async fn resume_or_compensate(
                     let _ = snapshot::delete_temp(state, key).await;
                 }
                 journal::delete_journal_entry_logged(catalog, tenant_id);
-                return Err(sqlstate_error(
-                    sqlstate::MOVE_TENANT_CUTOVER_FAILED,
-                    e.message(),
-                ));
+                return Err(ddl_err(sqlstate::MOVE_TENANT_CUTOVER_FAILED, e.message()));
             }
 
             if let Some(ref key) = entry.temp_snapshot_key {
@@ -163,13 +159,13 @@ pub async fn resume_or_compensate(
                     entry.tenant_name, entry.source_db_name, entry.target_db_name
                 ),
             );
-            Ok(vec![Response::Execution(Tag::new("MOVE TENANT"))])
+            Ok(status("MOVE TENANT"))
         }
         MovePhase::Resumed => {
             // Move completed normally; journal entry should have been removed.
             // Clean it up now as a belt-and-suspenders measure.
             journal::delete_journal_entry_logged(catalog, tenant_id);
-            Ok(vec![Response::Execution(Tag::new("MOVE TENANT"))])
+            Ok(status("MOVE TENANT"))
         }
     }
 }

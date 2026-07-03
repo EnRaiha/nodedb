@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! `CREATE TENANT [IF NOT EXISTS] <name> [ID <id>] [WITH ADMIN <user>]`
-//! handler. Migrated to `CatalogEntry::PutTenant` in phase 1k.6.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! handler.
+//!
+//! Ported from the pgwire `ddl::tenant::create` handler verbatim: the
+//! superuser gate (inline, no audit on denial — distinct from
+//! `neutral::database::gate::require_superuser`, which does audit), the
+//! `CatalogEntry::PutTenant` propose / single-node fallback, the auto-created
+//! `tenant_admin` user, and the `TenantCreated` audit record are all
+//! preserved. Only the result construction changed from pgwire `Response` to
+//! the protocol-neutral [`DdlResult`].
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
@@ -15,8 +20,9 @@ use crate::control::security::tenant::TenantQuota;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::super::super::types::sqlstate_error;
-use super::super::parse_utils::strip_if_not_exists;
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::auth_support::strip_if_not_exists;
+use super::support::{ddl_err, status};
 
 /// Optional `ID <id>` and `WITH ADMIN <user>` clauses parsed from the
 /// tokens that follow the tenant name.
@@ -27,7 +33,7 @@ struct TenantOptions<'a> {
 
 /// Scan the tokens after the tenant name for `ID <id>` and `WITH ADMIN
 /// <user>`. Both clauses are optional and order-independent.
-fn parse_tenant_options<'a>(rest: &[&'a str]) -> PgWireResult<TenantOptions<'a>> {
+fn parse_tenant_options<'a>(rest: &[&'a str]) -> Result<TenantOptions<'a>, DdlError> {
     let mut explicit_id = None;
     let mut admin_override = None;
     let mut i = 0;
@@ -35,7 +41,7 @@ fn parse_tenant_options<'a>(rest: &[&'a str]) -> PgWireResult<TenantOptions<'a>>
         if rest[i].eq_ignore_ascii_case("ID") && i + 1 < rest.len() {
             let id: u64 = rest[i + 1]
                 .parse()
-                .map_err(|_| sqlstate_error("42601", "TENANT ID must be a numeric value"))?;
+                .map_err(|_| ddl_err("42601", "TENANT ID must be a numeric value"))?;
             explicit_id = Some(id);
             i += 2;
         } else if rest[i].eq_ignore_ascii_case("WITH")
@@ -72,9 +78,9 @@ pub fn create_tenant(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42501",
             "permission denied: only superuser can create tenants",
         ));
@@ -83,7 +89,7 @@ pub fn create_tenant(
     let (if_not_exists, parts) = strip_if_not_exists(parts, 2);
 
     if parts.len() < 3 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "syntax: CREATE TENANT [IF NOT EXISTS] <name> [ID <id>] [WITH ADMIN <user>]",
         ));
@@ -98,10 +104,10 @@ pub fn create_tenant(
         && let Some(catalog) = state.credentials.catalog()
         && catalog
             .find_tenant_by_name(name)
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog read: {e}")))?
+            .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
             .is_some()
     {
-        return Ok(vec![Response::Execution(Tag::new("CREATE TENANT"))]);
+        return Ok(status("CREATE TENANT"));
     }
 
     // Pick the tenant id. An explicit `ID <n>` is honored verbatim;
@@ -115,7 +121,7 @@ pub fn create_tenant(
             Some(catalog) => TenantId::new(
                 catalog
                     .allocate_tenant_id()
-                    .map_err(|e| sqlstate_error("XX000", &format!("tenant id alloc: {e}")))?,
+                    .map_err(|e| ddl_err("XX000", format!("tenant id alloc: {e}")))?,
             ),
             None => {
                 let mut tenants = match state.tenants.lock() {
@@ -140,14 +146,14 @@ pub fn create_tenant(
 
     let entry = CatalogEntry::PutTenant(Box::new(stored.clone()));
     let log_index = propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("metadata propose: {e}")))?;
+        .map_err(|e| ddl_err("XX000", format!("metadata propose: {e}")))?;
     if log_index == 0 {
         // Single-node fallback: write redb + seed in-memory quota
         // ourselves since post_apply only runs on the raft path.
         if let Some(catalog) = state.credentials.catalog() {
             catalog
                 .put_tenant(&stored)
-                .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+                .map_err(|e| ddl_err("XX000", format!("catalog write: {e}")))?;
         }
         let mut tenants = match state.tenants.lock() {
             Ok(t) => t,
@@ -201,5 +207,5 @@ pub fn create_tenant(
         &format!("created tenant '{name}' (id {tenant_id}) with admin '{admin_name}'"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE TENANT"))])
+    Ok(status("CREATE TENANT"))
 }
