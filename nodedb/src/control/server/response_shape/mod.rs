@@ -5,4 +5,5 @@
 pub mod compose;
 pub mod kv;
 pub mod project;
+pub mod schema;
 pub mod types;
