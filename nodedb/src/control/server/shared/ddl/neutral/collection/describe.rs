@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Protocol-neutral DESCRIBE COLLECTION and SHOW COLLECTIONS DDL.
+//!
+//! Ported from the pgwire `ddl::collection::describe` handlers. The catalog
+//! reads, row ordering, and error paths are preserved verbatim; only the result
+//! construction changed from pgwire `Response` / `QueryResponse` to the
+//! protocol-neutral `DdlResult` over `ShapedRows`.
+
+use nodedb_types::DatabaseId;
+use serde_json::{Map, Value as JsonValue};
+
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::state::SharedState;
+
+use super::super::super::result::{DdlError, DdlResult};
+
+/// Push a `(field, type, nullable)` row into `rows`.
+fn push_describe_row(
+    rows: &mut Vec<Map<String, JsonValue>>,
+    field: &str,
+    ty: &str,
+    nullable: &str,
+) {
+    let mut row = Map::new();
+    row.insert("field".to_string(), JsonValue::String(field.to_string()));
+    row.insert("type".to_string(), JsonValue::String(ty.to_string()));
+    row.insert(
+        "nullable".to_string(),
+        JsonValue::String(nullable.to_string()),
+    );
+    rows.push(row);
+}
+
+/// DESCRIBE <collection> — show fields, types, and schema info.
+pub fn describe_collection(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    parts: &[&str],
+) -> Result<Vec<DdlResult>, DdlError> {
+    if parts.len() < 2 {
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "syntax: DESCRIBE <collection>".to_string(),
+        });
+    }
+
+    let name_lower = parts[1].to_lowercase();
+    let name = name_lower.as_str();
+    let tenant_id = identity.tenant_id;
+
+    let catalog = match state.credentials.catalog() {
+        Some(c) => c,
+        None => {
+            return Err(DdlError {
+                sqlstate: "XX000".to_string(),
+                message: "catalog not available".to_string(),
+            });
+        }
+    };
+
+    let coll = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), name) {
+        Ok(Some(c)) if c.is_active => c,
+        _ => {
+            return Err(DdlError {
+                sqlstate: "42P01".to_string(),
+                message: format!("collection '{name}' not found"),
+            });
+        }
+    };
+
+    let columns = vec![
+        "field".to_string(),
+        "type".to_string(),
+        "nullable".to_string(),
+    ];
+    let column_types = vec![DdlColType::Text, DdlColType::Text, DdlColType::Text];
+
+    let mut rows = Vec::new();
+
+    // Always has an 'id' field.
+    push_describe_row(&mut rows, "id", "TEXT", "false");
+
+    if coll.fields.is_empty() {
+        push_describe_row(&mut rows, "document", "JSON", "true");
+    } else {
+        for (field_name, field_type) in &coll.fields {
+            push_describe_row(&mut rows, field_name, field_type, "true");
+        }
+    }
+
+    // Show storage mode info.
+    if coll.collection_type.is_strict()
+        || coll.collection_type.is_columnar_family()
+        || coll.collection_type.is_kv()
+    {
+        push_describe_row(
+            &mut rows,
+            "__storage",
+            coll.collection_type.as_str(),
+            "false",
+        );
+    }
+
+    // Timeseries-specific info: show collection_type and config.
+    if coll.collection_type.is_timeseries() {
+        push_describe_row(&mut rows, "__collection_type", "timeseries", "false");
+
+        if let Some(config) = coll.get_timeseries_config() {
+            for (key, value) in config.as_object().into_iter().flatten() {
+                let val_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                push_describe_row(&mut rows, &format!("__ts_{key}"), &val_str, "config");
+            }
+        }
+    }
+
+    // KV-specific info: show TTL policy and key type.
+    if let Some(kv_config) = coll.collection_type.kv_config() {
+        if let Some(pk) = kv_config.primary_key_column() {
+            push_describe_row(
+                &mut rows,
+                "__kv_key",
+                &format!("{} ({})", pk.name, pk.column_type),
+                "false",
+            );
+        }
+        if let Some(ttl) = &kv_config.ttl {
+            let ttl_str = match ttl {
+                nodedb_types::KvTtlPolicy::FixedDuration { duration_ms } => {
+                    format!("INTERVAL '{duration_ms}ms'")
+                }
+                nodedb_types::KvTtlPolicy::FieldBased { field, offset_ms } => {
+                    format!("{field} + INTERVAL '{offset_ms}ms'")
+                }
+                _ => "UNKNOWN TTL POLICY".to_string(),
+            };
+            push_describe_row(&mut rows, "__kv_ttl", &ttl_str, "false");
+        }
+    }
+
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
+}
+
+/// SHOW COLLECTIONS
+///
+/// Lists all active collections for the current tenant.
+pub fn show_collections(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+) -> Result<Vec<DdlResult>, DdlError> {
+    let tenant_id = identity.tenant_id;
+
+    let columns = vec![
+        "name".to_string(),
+        "owner".to_string(),
+        "created_at".to_string(),
+        "partition_strategy".to_string(),
+    ];
+    let column_types = vec![
+        DdlColType::Text,
+        DdlColType::Text,
+        DdlColType::Int8,
+        DdlColType::Text,
+    ];
+
+    let collections = if let Some(catalog) = state.credentials.catalog() {
+        if identity.is_superuser {
+            catalog
+                .load_all_collections(DatabaseId::DEFAULT)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| c.is_active)
+                .collect::<Vec<_>>()
+        } else {
+            catalog
+                .load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id.as_u64())
+                .unwrap_or_default()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut rows = Vec::with_capacity(collections.len());
+
+    for coll in &collections {
+        let mut row = Map::new();
+        row.insert("name".to_string(), JsonValue::String(coll.name.clone()));
+        row.insert("owner".to_string(), JsonValue::String(coll.owner.clone()));
+        row.insert(
+            "created_at".to_string(),
+            JsonValue::String((coll.created_at as i64).to_string()),
+        );
+        row.insert(
+            "partition_strategy".to_string(),
+            JsonValue::String(coll.partition_strategy.as_str().to_string()),
+        );
+        rows.push(row);
+    }
+
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
+}

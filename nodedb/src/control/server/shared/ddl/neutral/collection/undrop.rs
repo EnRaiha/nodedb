@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `UNDROP COLLECTION <name>` — restore a soft-deleted collection.
+//! Protocol-neutral `UNDROP COLLECTION <name>` — restore a soft-deleted
+//! collection.
 //!
 //! Valid only while the collection's retention window has not elapsed
 //! (the redb row still exists with `is_active = false`). Flips
@@ -12,24 +13,30 @@
 //! superuser, or tenant_admin. If the preserved-owner user no longer
 //! exists, only superuser / tenant_admin may undrop; the restore is
 //! audit-logged with an `owner_user_missing` marker.
+//!
+//! Ported from the pgwire `ddl::collection::undrop` handler. The catalog /
+//! permission / audit reads and the metadata proposal are preserved verbatim;
+//! only the result construction changed from pgwire `Response` / `Tag` to the
+//! protocol-neutral `DdlResult` / `DdlError`.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::audit::{AuditEvent, UndropAuditDetail, UndropStage};
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
 
 pub fn undrop_collection(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 3 {
-        return Err(sqlstate_error("42601", "syntax: UNDROP COLLECTION <name>"));
+        return Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "syntax: UNDROP COLLECTION <name>".to_string(),
+        });
     }
 
     let name_lower = parts[2].to_lowercase();
@@ -37,10 +44,10 @@ pub fn undrop_collection(
     let tenant_id = identity.tenant_id;
 
     let Some(catalog) = state.credentials.catalog() else {
-        return Err(sqlstate_error(
-            "XX000",
-            "UNDROP COLLECTION requires a persistent system catalog",
-        ));
+        return Err(DdlError {
+            sqlstate: "XX000".to_string(),
+            message: "UNDROP COLLECTION requires a persistent system catalog".to_string(),
+        });
     };
 
     // Look up the soft-deleted record. Three distinct failures:
@@ -50,20 +57,25 @@ pub fn undrop_collection(
     let mut stored = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), name) {
         Ok(Some(c)) => c,
         Ok(None) => {
-            return Err(sqlstate_error(
-                "42P01",
-                &format!(
+            return Err(DdlError {
+                sqlstate: "42P01".to_string(),
+                message: format!(
                     "collection '{name}' not found (retention window elapsed or never existed)"
                 ),
-            ));
+            });
         }
-        Err(e) => return Err(sqlstate_error("XX000", &e.to_string())),
+        Err(e) => {
+            return Err(DdlError {
+                sqlstate: "XX000".to_string(),
+                message: e.to_string(),
+            });
+        }
     };
     if stored.is_active {
-        return Err(sqlstate_error(
-            "42P07",
-            &format!("collection '{name}' is already active"),
-        ));
+        return Err(DdlError {
+            sqlstate: "42P07".to_string(),
+            message: format!("collection '{name}' is already active"),
+        });
     }
 
     // Authorization: preserved owner OR admin.
@@ -72,10 +84,12 @@ pub fn undrop_collection(
     let is_admin = identity.is_superuser || identity.has_role(&Role::TenantAdmin);
 
     if !is_preserved_owner && !is_admin {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: only the preserved owner, superuser, or tenant_admin may UNDROP",
-        ));
+        return Err(DdlError {
+            sqlstate: "42501".to_string(),
+            message:
+                "permission denied: only the preserved owner, superuser, or tenant_admin may UNDROP"
+                    .to_string(),
+        });
     }
 
     // If the preserved-owner user no longer exists, only admin may restore.
@@ -83,10 +97,12 @@ pub fn undrop_collection(
         .as_deref()
         .is_some_and(|u| state.credentials.get_user(u).is_none());
     if owner_user_missing && !is_admin {
-        return Err(sqlstate_error(
-            "42501",
-            "preserved-owner user no longer exists — only superuser or tenant_admin may UNDROP",
-        ));
+        return Err(DdlError {
+            sqlstate: "42501".to_string(),
+            message:
+                "preserved-owner user no longer exists — only superuser or tenant_admin may UNDROP"
+                    .to_string(),
+        });
     }
 
     // Audit intent BEFORE the catalog mutation (symmetric with drop;
@@ -110,12 +126,18 @@ pub fn undrop_collection(
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(stored.clone()));
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: e.to_string(),
+        })?;
     if log_index == 0 {
         // Single-node fallback: write directly.
         catalog
             .put_collection(DatabaseId::DEFAULT, &stored)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+            .map_err(|e| DdlError {
+                sqlstate: "XX000".to_string(),
+                message: e.to_string(),
+            })?;
     }
 
     let completion = UndropAuditDetail::new(name, UndropStage::Completed, owner_user_missing)
@@ -128,5 +150,8 @@ pub fn undrop_collection(
         &completion,
     );
 
-    Ok(vec![Response::Execution(Tag::new("UNDROP COLLECTION"))])
+    Ok(vec![DdlResult::Status {
+        command: "UNDROP COLLECTION".to_string(),
+        rows_affected: None,
+    }])
 }

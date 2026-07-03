@@ -17,11 +17,7 @@ pub(super) async fn dispatch(
 
     // Schema introspection.
     // DESCRIBE SEQUENCE is served by the protocol-neutral DDL router.
-    if upper.starts_with("DESCRIBE ") || upper.starts_with("\\D ") {
-        return Some(super::super::collection::describe_collection(
-            state, identity, parts,
-        ));
-    }
+    // DESCRIBE <collection> / `\D <collection>` is served by the protocol-neutral DDL router.
 
     // CREATE TABLE — fully dispatched via typed AST (ast.rs).
     // CREATE COLLECTION — fully dispatched via typed AST (ast.rs).
@@ -34,23 +30,13 @@ pub(super) async fn dispatch(
     // DropCollection); the text-based dispatch used to read `parts[2]` for
     // the name, which broke `DROP COLLECTION IF EXISTS <name>` (read "IF"
     // as the name) and never recognised the `DROP TABLE` spelling at all.
-    if upper.starts_with("UNDROP COLLECTION ") || upper.starts_with("UNDROP TABLE ") {
-        return Some(super::super::collection::undrop_collection(
-            state, identity, parts,
-        ));
-    }
-    if upper == "SHOW COLLECTIONS" || upper.starts_with("SHOW COLLECTIONS") {
-        return Some(super::super::collection::show_collections(state, identity));
-    }
+    // UNDROP COLLECTION|TABLE — served by the protocol-neutral DDL router.
+    // SHOW COLLECTIONS — served by the protocol-neutral DDL router.
 
     if upper.starts_with("DROP INDEX ") {
         return Some(super::super::collection::drop_index(state, identity, parts).await);
     }
-    if upper.starts_with("SHOW INDEXES") || upper.starts_with("SHOW INDEX") {
-        return Some(super::super::collection::show_indexes(
-            state, identity, parts,
-        ));
-    }
+    // SHOW INDEXES / SHOW INDEX — served by the protocol-neutral DDL router.
 
     // ALTER TABLE ADD COLUMN — handled via typed AST (ast.rs AlterCollection).
     // The only remaining ALTER TABLE path is undirected fallthrough.

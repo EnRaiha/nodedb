@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Index DDL: CREATE INDEX, DROP INDEX, SHOW INDEXES.
+//! Index DDL: CREATE INDEX, DROP INDEX.
 //!
 //! CREATE/DROP INDEX mutate the owning [`StoredCollection`]'s `indexes`
 //! vector and commit a `CatalogEntry::PutCollection`. The replicated
@@ -8,12 +8,9 @@
 //! every node's Data Plane (including this leader), so `doc_configs`
 //! reflects the new index before the next write arrives. The `indexes`
 //! ownership keys (`permissions.propose_owner("index", ...)`) continue
-//! to back SHOW INDEXES.
+//! to back SHOW INDEXES (served by the protocol-neutral DDL router).
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
+use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 
 use crate::control::security::audit::AuditEvent;
@@ -23,7 +20,7 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use crate::types::TraceId;
 
-use super::super::super::types::{sqlstate_error, text_field};
+use super::super::super::types::sqlstate_error;
 
 /// Normalize a user-supplied field reference into the canonical JSON path
 /// used by the sparse-index extraction (`$.field` / `$.nested.field`).
@@ -400,69 +397,4 @@ pub async fn drop_index(
     );
 
     Ok(vec![Response::Execution(Tag::new("DROP INDEX"))])
-}
-
-/// SHOW INDEXES [ON <collection>]
-///
-/// Lists indexes for the current tenant (optionally filtered by collection).
-pub fn show_indexes(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
-    let tenant_id = identity.tenant_id;
-
-    // Parse optional ON <collection> filter.
-    let filter_collection = if parts.len() >= 4
-        && parts[1].eq_ignore_ascii_case("INDEXES")
-        && parts[2].eq_ignore_ascii_case("ON")
-    {
-        Some(parts[3])
-    } else {
-        None
-    };
-
-    let schema = Arc::new(vec![
-        text_field("index_name"),
-        text_field("type"),
-        text_field("owner"),
-    ]);
-
-    // List all index types for this tenant.
-    let index_types = [
-        ("index", "btree"),
-        ("vector_index", "vector"),
-        ("fulltext_index", "fulltext"),
-        ("spatial_index", "spatial"),
-    ];
-
-    let mut rows = Vec::new();
-    let mut encoder = DataRowEncoder::new(schema.clone());
-
-    for (owner_type, display_type) in &index_types {
-        let indexes = state.permissions.list_owners(owner_type, tenant_id);
-        for (index_name, owner) in &indexes {
-            if let Some(coll) = filter_collection
-                && !index_name.starts_with(coll)
-            {
-                continue;
-            }
-
-            encoder
-                .encode_field(index_name)
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-            encoder
-                .encode_field(display_type)
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-            encoder
-                .encode_field(owner)
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-            rows.push(Ok(encoder.take_row()));
-        }
-    }
-
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
 }

@@ -25,6 +25,7 @@ use super::blacklist;
 use super::bulk;
 use super::change_stream;
 use super::cluster;
+use super::collection;
 use super::conflict_policy;
 use super::constraint;
 use super::consumer_group;
@@ -1196,6 +1197,37 @@ pub async fn try_dispatch(
     if upper.starts_with("SHOW SCOPE") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(scope_ddl::show_scopes(state, identity, &parts));
+    }
+
+    // Collection introspection: DESCRIBE <collection> / `\D <collection>`,
+    // UNDROP COLLECTION|TABLE, SHOW COLLECTIONS, SHOW INDEXES|INDEX. All four
+    // parse into typed `CollectionStmt` variants, but the pgwire schema string
+    // router dispatched them by string prefix from the raw token slice, using
+    // `parts`-based name / filter extraction and the `\D` alias that the typed
+    // parser does not reproduce (`\D <coll>` never parses into
+    // `DescribeCollection`; bare `\D` parses into `ShowCollections`; the
+    // `SHOW INDEXES` typed `collection` field is `parts[2]`, not the handler's
+    // `parts[3]` filter). Replicate the string dispatch exactly here, before the
+    // parse gate, so the prefix recognition, `parts` extraction, and syntax
+    // messages stay byte-identical. `DESCRIBE SEQUENCE` is excluded so it falls
+    // through to the typed `DescribeSequence` arm (claimed by the sequence
+    // family), exactly as it was before this block existed.
+    if (upper.starts_with("DESCRIBE ") && !upper.starts_with("DESCRIBE SEQUENCE"))
+        || upper.starts_with("\\D ")
+    {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(collection::describe_collection(state, identity, &parts));
+    }
+    if upper.starts_with("UNDROP COLLECTION ") || upper.starts_with("UNDROP TABLE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(collection::undrop_collection(state, identity, &parts));
+    }
+    if upper == "SHOW COLLECTIONS" || upper.starts_with("SHOW COLLECTIONS") {
+        return Some(collection::show_collections(state, identity));
+    }
+    if upper.starts_with("SHOW INDEXES") || upper.starts_with("SHOW INDEX") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(collection::show_indexes(state, identity, &parts));
     }
 
     // Parse errors → let the pgwire path run, which re-parses and reproduces the

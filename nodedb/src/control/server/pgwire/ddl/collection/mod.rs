@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Collection DDL: CREATE COLLECTION, DROP COLLECTION, SHOW COLLECTIONS,
-//! DESCRIBE, indexes, and ALTER commands.
+//! Collection DDL: CREATE COLLECTION, DROP COLLECTION, indexes, and ALTER
+//! commands. (DESCRIBE / SHOW COLLECTIONS / SHOW INDEXES / UNDROP COLLECTION are
+//! served by the protocol-neutral DDL router.)
 
 pub mod alter;
 pub mod check_constraint;
 pub mod copy_from;
 pub mod copy_to;
 pub mod create;
-pub mod describe;
 pub mod drop;
 pub mod helpers;
 pub mod index;
@@ -16,7 +16,6 @@ pub(super) mod index_fanout;
 pub mod insert;
 pub(super) mod insert_parse;
 pub mod purge;
-pub mod undrop;
 pub mod upsert;
 pub mod vector_metadata;
 
@@ -33,11 +32,9 @@ pub use create::{
     CreateCollectionRequest, create_collection, create_table, dispatch_register_by_name,
     dispatch_register_from_stored, dispatch_register_if_needed,
 };
-pub use describe::{describe_collection, show_collections};
 pub use drop::drop_collection;
-pub use index::{CreateIndexRequest, create_index, drop_index, show_indexes};
+pub use index::{CreateIndexRequest, create_index, drop_index};
 pub use insert::insert_document;
-pub use undrop::undrop_collection;
 pub use upsert::upsert_document;
 pub use vector_metadata::{
     handle_set_vector_metadata, handle_show_vector_models, handle_vector_metadata_query,
