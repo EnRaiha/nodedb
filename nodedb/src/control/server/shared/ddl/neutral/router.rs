@@ -1708,16 +1708,19 @@ pub async fn try_dispatch(
 
         NodedbStatement::Collection(CollectionStmt::CreateTable {
             name,
-            // Both false (normal create) and true (IF NOT EXISTS — guard
-            // already returned early if the collection existed) fall
-            // through to the same create_table handler.
-            if_not_exists: _,
+            if_not_exists,
             engine,
             columns,
             options,
             flags,
             balanced_raw,
         }) => {
+            if *if_not_exists && collection_exists(state, identity, name, database_id) {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "CREATE TABLE".to_string(),
+                    rows_affected: None,
+                }]));
+            }
             let result = collection::create_table(
                 state,
                 identity,

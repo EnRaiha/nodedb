@@ -187,7 +187,7 @@ fn timeseries_merge_directory_swap_is_durable() {
 
 #[test]
 fn timeseries_ddl_partition_swap_is_durable() {
-    let src = read("nodedb/src/control/server/pgwire/ddl/timeseries.rs");
+    let src = read("nodedb/src/control/server/shared/ddl/neutral/timeseries/rewrite.rs");
     assert!(
         src.contains("atomic_swap_dirs_fsync") || src.contains("fsync_directory"),
         "timeseries DDL partition rewrite directory swap must fsync the \
