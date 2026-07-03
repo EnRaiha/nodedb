@@ -127,6 +127,12 @@ impl QueryContext {
             database_id,
             tenant_id,
         };
+        let _output_schema =
+            crate::control::planner::sql_plan_convert::output_schema::build_output_schema(
+                &plans,
+                &catalog,
+                database_id,
+            );
         let tasks = crate::control::planner::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
         Ok((tasks, version_set))
     }
