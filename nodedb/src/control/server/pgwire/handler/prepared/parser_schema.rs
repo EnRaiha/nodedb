@@ -13,9 +13,9 @@ use pgwire::api::results::FieldInfo;
 /// Return true if `sql` starts with a DSL or DDL keyword that `plan_sql`
 /// cannot parse and must be routed through `execute_sql` at Execute time.
 ///
-/// Mirrors the prefix checks in `ddl/router/dsl.rs` so the extended-query
-/// Parse handler can mark such statements as DSL passthroughs and route them
-/// through the DSL dispatcher at Execute time.
+/// Mirrors the prefix checks in the protocol-neutral DDL router so the
+/// extended-query Parse handler can mark such statements as DSL passthroughs
+/// and route them through the DSL dispatcher at Execute time.
 ///
 /// NodeDB-specific DDL (`CREATE COLLECTION`, `DROP COLLECTION`, etc.) is also
 /// included here because `execute_planned_sql_with_params` uses the standard

@@ -1047,9 +1047,20 @@ pub async fn try_dispatch(
     // Replicate the string dispatch exactly here, before the parse gate, so the
     // prefix recognition and the `parts`-based extraction stay byte-identical.
     // `SHOW SESSIONS` is excluded here (see the `session_admin::show_sessions`
-    // arm above, which is now checked first) so the two never race. The
-    // `TRUNCATE / DELETE / CLEAR AUDIT` guard stays on the transitional pgwire
-    // path — it is not one of the migrated inspect handlers.
+    // arm above, which is now checked first) so the two never race.
+    //
+    // Audit-log truncation is rejected: entries are pruned only by the retention
+    // policy. Recognized by string prefix before the parse gate so the message
+    // stays byte-identical regardless of how the tail parses.
+    if upper.starts_with("TRUNCATE AUDIT")
+        || upper.starts_with("DELETE AUDIT")
+        || upper.starts_with("CLEAR AUDIT")
+    {
+        return Some(Err(DdlError {
+            sqlstate: "42501".to_string(),
+            message: "audit log cannot be manually truncated. Entries are pruned automatically by the retention policy (audit_retention_days in config).".to_string(),
+        }));
+    }
     if upper.starts_with("SHOW USERS") {
         return Some(inspect::show_users(state, identity));
     }
@@ -1344,8 +1355,12 @@ pub async fn try_dispatch(
         return Some(collection::drop_index(state, identity, &parts).await);
     }
 
-    // Parse errors → let the pgwire path run, which re-parses and reproduces the
-    // exact error handling for those inputs.
+    // Parse errors surface as a typed `DdlError` here: `UnsupportedConstraint`
+    // maps to `0A000` (feature_not_supported), every other parse error to
+    // `42601` (syntax error), with the parser's own `Display` text as the
+    // message. This is the sole parse-error gate for the DDL router; the
+    // GRAPH / MATCH / SHOW GRAPH STATS prefixed inputs that previously carried
+    // their own parse-error reproduction are subsumed by this arm.
     //
     // Non-DDL statements (`None`) include the temporal / audit query functions —
     // `SELECT <FUNC>(...)` calls that never parse into a typed DDL AST. In the
@@ -1353,10 +1368,21 @@ pub async fn try_dispatch(
     // gate and the auth family; recognizing them here, in the `None` branch,
     // preserves that ordering exactly (any typed DDL whose body contains one of
     // the substrings is handled by the typed match above first). A non-match
-    // returns `None` so the transitional pgwire delegation handles it unchanged.
+    // returns `None` so the caller falls through to the SQL planner.
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
         Some(Ok(stmt)) => stmt,
-        Some(Err(_)) => return None,
+        Some(Err(e)) => {
+            // UnsupportedConstraint → 0A000 (feature_not_supported).
+            // All other parse errors → 42601 (syntax error).
+            let sqlstate = match &e {
+                nodedb_sql::SqlError::UnsupportedConstraint { .. } => "0A000",
+                _ => "42601",
+            };
+            return Some(Err(DdlError {
+                sqlstate: sqlstate.to_string(),
+                message: e.to_string(),
+            }));
+        }
         None => {
             // Bulk import: `COPY <collection> FROM STDIN [WITH (...)]`. The
             // file-path form (`COPY … FROM '<path>'`) parses into a typed
@@ -2462,6 +2488,29 @@ pub async fn try_dispatch(
             on_collection.as_deref(),
             for_grantee.as_deref(),
         )),
+
+        // Tenant backup/restore stream bytes over the COPY protocol; the bare
+        // statement forms are rejected so callers use the streaming COPY forms.
+        NodedbStatement::Database(DatabaseStmt::BackupTenant { .. }) => Some(Err(DdlError {
+            sqlstate: "0A000".to_string(),
+            message:
+                "use `COPY (BACKUP TENANT <id>) TO STDOUT` to stream backup bytes to the client"
+                    .to_string(),
+        })),
+
+        NodedbStatement::Database(DatabaseStmt::RestoreTenant { .. }) => Some(Err(DdlError {
+            sqlstate: "0A000".to_string(),
+            message:
+                "use `COPY tenant_restore(<id>) FROM STDIN` to stream backup bytes from the client"
+                    .to_string(),
+        })),
+
+        // USE DATABASE is intercepted in `execute_single_sql` before the DDL
+        // router runs; reaching this arm means the intercept did not fire.
+        NodedbStatement::Database(DatabaseStmt::UseDatabase { name }) => Some(Err(DdlError {
+            sqlstate: "XX000".to_string(),
+            message: format!("USE DATABASE {name}: reached router after expected intercept"),
+        })),
 
         _ => None,
     }
