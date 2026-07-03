@@ -8,9 +8,9 @@
 //! [`DdlResult`] instead of pgwire `Response` / `PgWireResult`.
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::sql_parse::{parse_sql_value, split_values};
 use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
+use crate::control::server::shared::ddl::sql_parse::{parse_sql_value, split_values};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use crate::types::TraceId;

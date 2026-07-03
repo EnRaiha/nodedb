@@ -10,8 +10,9 @@ use nodedb_physical::physical_plan::VectorOp;
 use nodedb_types::DatabaseId;
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::{error_code_to_sqlstate, sqlstate_error};
+use crate::control::server::pgwire::types::sqlstate_error;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
+use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::state::SharedState;
 
 use super::parse::{

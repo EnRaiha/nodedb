@@ -149,7 +149,7 @@ pub async fn build_and_persist(
     .map_err(|e| err("42601", e.to_string()))?;
 
     let (mut fields, serial_fields) =
-        crate::control::server::pgwire::ddl::schema_validation::parse_fields_clause_from_pairs(
+        crate::control::server::shared::ddl::schema_validation::parse_fields_clause_from_pairs(
             columns,
         );
     if fields.is_empty() && !columnar_schema_columns.is_empty() {
@@ -336,7 +336,7 @@ fn resolve_primary_engine(
 /// the engine auto-configured during a CREATE.
 fn log_vector_fields(collection_name: &str, fields: &[(String, String)]) {
     let vector_fields =
-        crate::control::server::pgwire::ddl::schema_validation::extract_vector_fields(fields);
+        crate::control::server::shared::ddl::schema_validation::extract_vector_fields(fields);
     for (field_name, _dim, metric) in &vector_fields {
         tracing::info!(
             name = %collection_name,

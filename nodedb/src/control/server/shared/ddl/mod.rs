@@ -6,6 +6,9 @@ pub mod dispatch;
 pub mod neutral;
 pub mod owner;
 pub mod result;
+pub mod schema_validation;
+pub mod sql_parse;
+pub mod sqlstate;
 pub mod sync_dispatch;
 
 pub use self::dispatch::dispatch;

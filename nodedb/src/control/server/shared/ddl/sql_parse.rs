@@ -211,6 +211,22 @@ pub(crate) fn parse_since_timestamp(input: &str) -> crate::Result<u64> {
     })
 }
 
+/// Decode a hex string into bytes.
+///
+/// Returns `None` if the input has an odd number of characters or contains
+/// characters that are not valid hexadecimal digits.
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    for i in (0..s.len()).step_by(2) {
+        let byte = u8::from_str_radix(&s[i..i + 2], 16).ok()?;
+        bytes.push(byte);
+    }
+    Some(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_sql_value;

@@ -56,7 +56,7 @@ pub async fn dispatch_register_if_needed(
         return Ok(());
     };
     let (fields, _serial_fields) =
-        crate::control::server::pgwire::ddl::schema_validation::parse_fields_clause(parts);
+        crate::control::server::shared::ddl::schema_validation::parse_fields_clause(parts);
     let mut indexes = derive_auto_indexes(fields.iter().map(|(n, _)| n.as_str()));
     extend_with_catalog_indexes(&mut indexes, &coll);
     let _ = sql; // Reserved for future CRDT detection from SQL.

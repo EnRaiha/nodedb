@@ -21,14 +21,14 @@ pub fn show_changes(state: &SharedState, sql: &str) -> Result<Vec<DdlResult>, Dd
     let upper = sql.to_uppercase();
 
     if let Some(coll_name) =
-        crate::control::server::pgwire::ddl::sql_parse::extract_collection_after(sql, " FOR ")
+        crate::control::server::shared::ddl::sql_parse::extract_collection_after(sql, " FOR ")
     {
         let since_ms: u64 = if let Some(since_pos) = upper.find(" SINCE ") {
             let since_str = sql[since_pos + 7..]
                 .split_whitespace()
                 .next()
                 .unwrap_or("0");
-            match crate::control::server::pgwire::ddl::sql_parse::parse_since_timestamp(since_str) {
+            match crate::control::server::shared::ddl::sql_parse::parse_since_timestamp(since_str) {
                 Ok(ms) => ms,
                 Err(msg) => {
                     return Err(DdlError {

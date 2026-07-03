@@ -15,7 +15,7 @@ use nodedb_types::DatabaseId;
 
 use crate::control::security::catalog::types::FieldDefinition;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::sql_parse::extract_clause;
+use crate::control::server::shared::ddl::sql_parse::extract_clause;
 use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};

@@ -4,8 +4,6 @@ pub mod catalog_propose;
 pub mod database;
 #[path = "router/mod.rs"]
 pub mod router;
-pub mod schema_validation;
-pub(crate) mod sql_parse;
 pub mod temp_table;
 
 pub use router::dispatch;

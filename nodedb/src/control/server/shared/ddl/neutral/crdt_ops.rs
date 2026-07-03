@@ -14,8 +14,8 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::hex_decode;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::ddl::sql_parse::hex_decode;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
