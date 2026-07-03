@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! DDL handlers for ADD/DROP PERIOD LOCK.
+//! Protocol-neutral DDL handlers for ADD/DROP PERIOD LOCK.
 //!
 //! Syntax:
 //! ```sql
@@ -12,21 +12,36 @@
 //!
 //! ALTER COLLECTION journal_entries DROP PERIOD LOCK;
 //! ```
+//!
+//! Ported from the pgwire `ddl::period_lock` handlers; the token parsing,
+//! catalog get/put, schema-version bump, and audit side effects are preserved
+//! verbatim. Only the result construction changed from pgwire `Response` /
+//! `Tag` to the protocol-neutral [`DdlResult`]; the SQLSTATE codes, messages,
+//! and command tags are unchanged.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::catalog::PeriodLockDef;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+
+use super::super::result::{DdlError, DdlResult};
+
+/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
+/// the pgwire handlers produced.
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// Handle `ALTER COLLECTION x ADD PERIOD LOCK ON col REFERENCES table(pk) ...`
 pub fn add_period_lock(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
     let parts: Vec<&str> = sql.split_whitespace().collect();
     let upper = sql.to_uppercase();
@@ -34,29 +49,27 @@ pub fn add_period_lock(
     // ALTER COLLECTION <name> ADD PERIOD LOCK ON <col> REFERENCES <table>(<pk>) ...
     let name = parts
         .get(2)
-        .ok_or_else(|| sqlstate_error("42601", "missing collection name"))?
+        .ok_or_else(|| err("42601", "missing collection name"))?
         .to_lowercase();
 
     // Find the period column: "ON <col>"
     let on_idx = parts
         .iter()
         .position(|p| p.eq_ignore_ascii_case("ON"))
-        .ok_or_else(|| sqlstate_error("42601", "ADD PERIOD LOCK requires ON <column>"))?;
+        .ok_or_else(|| err("42601", "ADD PERIOD LOCK requires ON <column>"))?;
     let period_column = parts
         .get(on_idx + 1)
-        .ok_or_else(|| sqlstate_error("42601", "missing column name after ON"))?
+        .ok_or_else(|| err("42601", "missing column name after ON"))?
         .to_lowercase();
 
     // Find REFERENCES <table>(<pk>)
     let ref_idx = parts
         .iter()
         .position(|p| p.eq_ignore_ascii_case("REFERENCES"))
-        .ok_or_else(|| {
-            sqlstate_error("42601", "ADD PERIOD LOCK requires REFERENCES <table>(<pk>)")
-        })?;
+        .ok_or_else(|| err("42601", "ADD PERIOD LOCK requires REFERENCES <table>(<pk>)"))?;
     let ref_spec = parts
         .get(ref_idx + 1)
-        .ok_or_else(|| sqlstate_error("42601", "missing table(pk) after REFERENCES"))?;
+        .ok_or_else(|| err("42601", "missing table(pk) after REFERENCES"))?;
     let (ref_table, ref_pk) = parse_table_pk(ref_spec)?;
 
     // Find STATUS <col> (optional, defaults to "status").
@@ -83,19 +96,19 @@ pub fn add_period_lock(
 
     // Load the collection, update, and re-persist.
     let Some(catalog) = state.credentials.catalog() else {
-        return Err(sqlstate_error("XX000", "no catalog available"));
+        return Err(err("XX000", "no catalog available"));
     };
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &name)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
-        .ok_or_else(|| sqlstate_error("42P01", &format!("collection '{name}' not found")))?;
+        .map_err(|e| err("XX000", e.to_string()))?
+        .ok_or_else(|| err("42P01", format!("collection '{name}' not found")))?;
 
     coll.period_lock = Some(def);
 
     catalog
         .put_collection(DatabaseId::DEFAULT, &coll)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     state.schema_version.bump();
 
@@ -107,7 +120,10 @@ pub fn add_period_lock(
         &format!("ADD PERIOD LOCK on {name}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER COLLECTION"))])
+    Ok(vec![DdlResult::Status {
+        command: "ALTER COLLECTION".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Handle `ALTER COLLECTION x DROP PERIOD LOCK`.
@@ -115,27 +131,27 @@ pub fn drop_period_lock(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
     let name = parts
         .get(2)
-        .ok_or_else(|| sqlstate_error("42601", "missing collection name"))?
+        .ok_or_else(|| err("42601", "missing collection name"))?
         .to_lowercase();
 
     let Some(catalog) = state.credentials.catalog() else {
-        return Err(sqlstate_error("XX000", "no catalog available"));
+        return Err(err("XX000", "no catalog available"));
     };
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &name)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
-        .ok_or_else(|| sqlstate_error("42P01", &format!("collection '{name}' not found")))?;
+        .map_err(|e| err("XX000", e.to_string()))?
+        .ok_or_else(|| err("42P01", format!("collection '{name}' not found")))?;
 
     coll.period_lock = None;
 
     catalog
         .put_collection(DatabaseId::DEFAULT, &coll)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     state.schema_version.bump();
 
@@ -147,11 +163,14 @@ pub fn drop_period_lock(
         &format!("DROP PERIOD LOCK on {name}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER COLLECTION"))])
+    Ok(vec![DdlResult::Status {
+        command: "ALTER COLLECTION".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Parse `table(pk)` into `(table, pk)`.
-fn parse_table_pk(spec: &str) -> PgWireResult<(String, String)> {
+fn parse_table_pk(spec: &str) -> Result<(String, String), DdlError> {
     let spec = spec.trim();
     if let Some(paren_start) = spec.find('(') {
         let table = spec[..paren_start].trim().to_lowercase();
@@ -160,14 +179,11 @@ fn parse_table_pk(spec: &str) -> PgWireResult<(String, String)> {
             .trim()
             .to_lowercase();
         if table.is_empty() || pk.is_empty() {
-            return Err(sqlstate_error(
-                "42601",
-                "REFERENCES requires table(pk) format",
-            ));
+            return Err(err("42601", "REFERENCES requires table(pk) format"));
         }
         Ok((table, pk))
     } else {
-        Err(sqlstate_error(
+        Err(err(
             "42601",
             "REFERENCES requires table(pk) format, e.g. fiscal_periods(period_key)",
         ))
@@ -175,10 +191,10 @@ fn parse_table_pk(spec: &str) -> PgWireResult<(String, String)> {
 }
 
 /// Parse `ALLOW WRITE WHEN status IN ('OPEN', 'ADJUSTING')`.
-fn parse_allowed_statuses(upper: &str) -> PgWireResult<Vec<String>> {
+fn parse_allowed_statuses(upper: &str) -> Result<Vec<String>, DdlError> {
     // Find "IN" keyword followed by "(" with optional whitespace.
     let in_kw = upper.find("IN").ok_or_else(|| {
-        sqlstate_error(
+        err(
             "42601",
             "ADD PERIOD LOCK requires ALLOW WRITE WHEN ... IN ('status1', ...)",
         )
@@ -186,9 +202,9 @@ fn parse_allowed_statuses(upper: &str) -> PgWireResult<Vec<String>> {
     let after_in = upper[in_kw + 2..].trim_start();
     let after = after_in
         .strip_prefix('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected '(' after IN keyword"))?;
+        .ok_or_else(|| err("42601", "expected '(' after IN keyword"))?;
     let Some(close) = after.find(')') else {
-        return Err(sqlstate_error("42601", "missing closing ')' in IN clause"));
+        return Err(err("42601", "missing closing ')' in IN clause"));
     };
     let inner = &after[..close];
     let statuses: Vec<String> = inner
@@ -198,19 +214,11 @@ fn parse_allowed_statuses(upper: &str) -> PgWireResult<Vec<String>> {
         .collect();
 
     if statuses.is_empty() {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "IN clause must list at least one status value",
         ));
     }
 
     Ok(statuses)
-}
-
-fn sqlstate_error(code: &str, msg: &str) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_owned(),
-        code.to_owned(),
-        msg.to_owned(),
-    )))
 }

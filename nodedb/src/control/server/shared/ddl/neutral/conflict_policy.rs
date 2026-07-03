@@ -1,28 +1,41 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! pgwire handlers for CRDT conflict-policy DDL.
+//! Protocol-neutral handlers for CRDT conflict-policy DDL.
 //!
 //! - `ALTER COLLECTION <name> SET ON CONFLICT <policy> FOR <kind>`
 //! - `SHOW CONFLICT POLICY ON <name>`
+//!
+//! Ported from the pgwire `ddl::conflict_policy` handlers; the Data Plane
+//! read-modify-write cycle (`CrdtOp::GetPolicy` / `SetPolicy`), the policy
+//! serialization, and the fallback-to-empty behavior are preserved verbatim.
+//! Only the result construction changed from pgwire `Response` /
+//! `QueryResponse` to the protocol-neutral [`DdlResult`] over [`ShapedRows`];
+//! the SQLSTATE codes and messages are unchanged.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use nodedb_crdt::policy::{CollectionPolicy, ConflictPolicy};
+use nodedb_physical::physical_plan::CrdtOp;
 use nodedb_sql::ddl_ast::alter_ops::{ConflictPolicyKind, ConstraintKindKeyword};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
-use nodedb_physical::physical_plan::CrdtOp;
 
-use super::super::types::{sqlstate_error, text_field};
-use super::sync_dispatch::dispatch_async;
+use super::super::result::{DdlError, DdlResult};
+
+/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
+/// the pgwire handlers produced.
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// Handle `ALTER COLLECTION <name> SET ON CONFLICT <policy> FOR <kind>`.
 ///
@@ -37,7 +50,7 @@ pub async fn alter_set_on_conflict(
     collection: &str,
     policy_kind: &ConflictPolicyKind,
     constraint_kind: &ConstraintKindKeyword,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
 
@@ -45,38 +58,49 @@ pub async fn alter_set_on_conflict(
     let get_plan = PhysicalPlan::Crdt(CrdtOp::GetPolicy {
         collection: collection.to_string(),
     });
-    let policy_bytes = dispatch_async(state, tenant_id, database_id, collection, get_plan, timeout)
-        .await
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    let policy_bytes = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+        state,
+        tenant_id,
+        database_id,
+        collection,
+        get_plan,
+        timeout,
+    )
+    .await
+    .map_err(|e| err("XX000", e.to_string()))?;
 
     let mut policy: CollectionPolicy =
-        sonic_rs::from_slice(&policy_bytes).map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        sonic_rs::from_slice(&policy_bytes).map_err(|e| err("XX000", e.to_string()))?;
 
     // Step 2: apply the partial update.
     let new_conflict_policy = resolve_policy_kind(policy_kind);
     apply_conflict_policy(&mut policy, constraint_kind, new_conflict_policy);
 
     // Step 3: write back.
-    let policy_json =
-        sonic_rs::to_string(&policy).map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    let policy_json = sonic_rs::to_string(&policy).map_err(|e| err("XX000", e.to_string()))?;
     let set_plan = PhysicalPlan::Crdt(CrdtOp::SetPolicy {
         collection: collection.to_string(),
         policy_json,
     });
-    dispatch_async(state, tenant_id, database_id, collection, set_plan, timeout)
-        .await
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+        state,
+        tenant_id,
+        database_id,
+        collection,
+        set_plan,
+        timeout,
+    )
+    .await
+    .map_err(|e| err("XX000", e.to_string()))?;
 
-    let schema = Arc::new(vec![text_field("result")]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    encoder
-        .encode_field(&"OK")
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    let row = encoder.take_row();
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(row)]),
-    ))])
+    let mut row = Map::new();
+    row.insert("result".to_string(), JsonValue::String("OK".to_string()));
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["result".to_string()],
+        column_types: ShapedRows::text_types(1),
+        rows: vec![row],
+        notice: None,
+    })])
 }
 
 /// Handle `SHOW CONFLICT POLICY ON <collection>`.
@@ -88,36 +112,45 @@ pub async fn show_conflict_policy(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     collection: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
 
     let plan = PhysicalPlan::Crdt(CrdtOp::GetPolicy {
         collection: collection.to_string(),
     });
-    let policy_bytes = dispatch_async(state, tenant_id, database_id, collection, plan, timeout)
-        .await
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    let policy_bytes = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+        state,
+        tenant_id,
+        database_id,
+        collection,
+        plan,
+        timeout,
+    )
+    .await
+    .map_err(|e| err("XX000", e.to_string()))?;
 
-    let schema = Arc::new(vec![text_field("policy")]);
+    let columns = vec!["policy".to_string()];
+    let column_types = ShapedRows::text_types(1);
 
     if policy_bytes.is_empty() {
-        return Ok(vec![Response::Query(QueryResponse::new(
-            schema,
-            stream::empty(),
-        ))]);
+        return Ok(vec![DdlResult::Rows(ShapedRows {
+            columns,
+            column_types,
+            rows: Vec::new(),
+            notice: None,
+        })]);
     }
 
     let text = String::from_utf8_lossy(&policy_bytes).into_owned();
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    encoder
-        .encode_field(&text)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
-    let row = encoder.take_row();
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(row)]),
-    ))])
+    let mut row = Map::new();
+    row.insert("policy".to_string(), JsonValue::String(text));
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows: vec![row],
+        notice: None,
+    })])
 }
 
 fn resolve_policy_kind(kind: &ConflictPolicyKind) -> ConflictPolicy {

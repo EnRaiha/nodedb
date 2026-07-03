@@ -83,22 +83,10 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // protocol-neutral router (`shared::ddl::neutral::explain_ddl`), which is
     // tried before this transitional pgwire delegation runs.
 
-    // Emergency response.
-    if upper.starts_with("EMERGENCY LOCKDOWN") {
-        return Some(super::super::super::emergency_ddl::emergency_lockdown(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("EMERGENCY UNLOCK") {
-        return Some(super::super::super::emergency_ddl::emergency_unlock(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("BLACKLIST AUTH USERS WHERE") {
-        return Some(super::super::super::emergency_ddl::bulk_blacklist(
-            state, identity, parts,
-        ));
-    }
+    // Emergency response (EMERGENCY LOCKDOWN / EMERGENCY UNLOCK / BLACKLIST AUTH
+    // USERS WHERE) has been migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::emergency_ddl`), which is tried before this
+    // transitional pgwire delegation runs.
 
     // Auth-scoped API keys (CREATE / ROTATE / LIST AUTH KEY[S]) have been
     // migrated to the protocol-neutral router

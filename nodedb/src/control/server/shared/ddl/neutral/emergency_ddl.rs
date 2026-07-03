@@ -1,32 +1,49 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Emergency & incident response DDL commands.
+//! Protocol-neutral emergency & incident response DDL commands.
 //!
 //! ```sql
 //! EMERGENCY LOCKDOWN REASON 'security incident'
 //! EMERGENCY UNLOCK
 //! BLACKLIST AUTH USERS WHERE email LIKE '%@compromised.com' WITH KILL SESSIONS
 //! ```
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! Ported from the pgwire `ddl::emergency_ddl` handlers; the superuser gates,
+//! two-party approval check, emergency-state mutation, blacklist / session
+//! side effects, and audit records are preserved verbatim. Only the result
+//! construction changed from pgwire `Response` / `Tag` to the protocol-neutral
+//! [`DdlResult`]; the SQLSTATE codes, messages, and command tags are unchanged.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::types::sqlstate_error;
+use super::super::result::{DdlError, DdlResult};
+
+/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
+/// the pgwire handlers produced.
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
+
+/// Build a single-tag status result.
+fn status(command: impl Into<String>) -> Vec<DdlResult> {
+    vec![DdlResult::Status {
+        command: command.into(),
+        rows_affected: None,
+    }]
+}
 
 /// EMERGENCY LOCKDOWN REASON '...'
 pub fn emergency_lockdown(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
 
     // Check two-party authorization if configured.
@@ -35,7 +52,7 @@ pub fn emergency_lockdown(
             .emergency
             .submit_two_party_approval("EMERGENCY LOCKDOWN", &identity.username)
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "42000",
             "two-party authorization required: waiting for second admin approval",
         ));
@@ -56,7 +73,7 @@ pub fn emergency_lockdown(
         &format!("EMERGENCY LOCKDOWN: {reason}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("EMERGENCY LOCKDOWN"))])
+    Ok(status("EMERGENCY LOCKDOWN"))
 }
 
 /// EMERGENCY UNLOCK
@@ -64,12 +81,9 @@ pub fn emergency_unlock(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     _parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
 
     state.emergency.unlock();
@@ -81,7 +95,7 @@ pub fn emergency_unlock(
         "EMERGENCY UNLOCK",
     );
 
-    Ok(vec![Response::Execution(Tag::new("EMERGENCY UNLOCK"))])
+    Ok(status("EMERGENCY UNLOCK"))
 }
 
 /// BLACKLIST AUTH USERS WHERE email LIKE '%@compromised.com' [WITH KILL SESSIONS]
@@ -89,19 +103,16 @@ pub fn bulk_blacklist(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
 
     // Parse: BLACKLIST AUTH USERS WHERE email LIKE '<pattern>' [WITH KILL SESSIONS]
     let like_idx = parts
         .iter()
         .position(|p| p.to_uppercase() == "LIKE")
-        .ok_or_else(|| sqlstate_error("42601", "missing LIKE clause"))?;
+        .ok_or_else(|| err("42601", "missing LIKE clause"))?;
     let pattern = parts
         .get(like_idx + 1)
         .map(|s| s.trim_matches('\''))
@@ -144,7 +155,5 @@ pub fn bulk_blacklist(
         ),
     );
 
-    Ok(vec![Response::Execution(Tag::new(&format!(
-        "BLACKLIST {blacklisted_count}"
-    )))])
+    Ok(status(format!("BLACKLIST {blacklisted_count}")))
 }

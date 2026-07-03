@@ -6,6 +6,7 @@
 //! other statement returns `None` so the transitional pgwire delegation in the
 //! parent [`super::super::dispatch`] handles it.
 
+use nodedb_sql::ddl_ast::AlterCollectionOp;
 use nodedb_sql::ddl_ast::statement::{
     AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, DatabaseStmt, NodedbStatement,
     PolicyStmt, StreamViewStmt,
@@ -21,13 +22,16 @@ use super::apikey;
 use super::auth_key;
 use super::auth_user;
 use super::blacklist;
+use super::bulk;
 use super::change_stream;
 use super::cluster;
+use super::conflict_policy;
 use super::constraint;
 use super::consumer_group;
 use super::continuous_agg;
 use super::custom_type;
 use super::dsl;
+use super::emergency_ddl;
 use super::explain_ddl;
 use super::function;
 use super::grant;
@@ -43,6 +47,7 @@ use super::metering_ddl;
 use super::observability;
 use super::oidc;
 use super::org_ddl;
+use super::period_lock;
 use super::permission_tree;
 use super::procedure;
 use super::query_functions;
@@ -56,6 +61,7 @@ use super::scope_query_ddl;
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
 use super::synonym_group;
+use super::system_ddl;
 use super::timeseries;
 use super::topic;
 use super::transfer;
@@ -180,6 +186,39 @@ pub async fn try_dispatch(
         return Some(blacklist::show_blacklist(state, identity, &parts));
     }
 
+    // Emergency & incident response DDL. `EMERGENCY LOCKDOWN` / `EMERGENCY
+    // UNLOCK` parse into no typed AST variant — the pgwire admin router
+    // dispatched both by string prefix from the raw token slice. Replicate that
+    // exactly here, before the parse gate, so the prefix recognition and syntax
+    // messages stay byte-identical. `BLACKLIST AUTH USERS WHERE …` is likewise
+    // string-recognized, but the `BLACKLIST ` prefix above already claims it
+    // (exactly as it shadowed the pgwire emergency handler, which ran only after
+    // this neutral router). This guard is therefore intentionally kept after the
+    // `BLACKLIST ` guard so `bulk_blacklist` remains unreachable — preserving the
+    // dead-but-present state verbatim.
+    if upper.starts_with("EMERGENCY LOCKDOWN") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(emergency_ddl::emergency_lockdown(state, identity, &parts));
+    }
+    if upper.starts_with("EMERGENCY UNLOCK") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(emergency_ddl::emergency_unlock(state, identity, &parts));
+    }
+    if upper.starts_with("BLACKLIST AUTH USERS WHERE") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(emergency_ddl::bulk_blacklist(state, identity, &parts));
+    }
+
+    // System-level settings: `ALTER SYSTEM SET <field> = <value>`. Parses into
+    // no typed AST variant — the pgwire auth router dispatched it by string
+    // prefix from the raw token slice. Replicate that exactly here, before the
+    // parse gate, so the prefix recognition and the `parts`-based field / value
+    // extraction stay byte-identical.
+    if upper.starts_with("ALTER SYSTEM ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(system_ddl::alter_system(state, identity, &parts));
+    }
+
     // Stored procedures. None of `CREATE [OR REPLACE] PROCEDURE`, `DROP
     // PROCEDURE`, `SHOW PROCEDURES`, or `CALL <procedure>(...)` parse into any
     // typed AST variant — the pgwire router dispatched all of them by string
@@ -273,6 +312,20 @@ pub async fn try_dispatch(
     }
     if upper.starts_with("ALTER COLLECTION ") && upper.contains("DROP PERMISSION_TREE") {
         return Some(permission_tree::drop_permission_tree(state, identity, sql).await);
+    }
+
+    // Period lock management. `ALTER COLLECTION … ADD PERIOD LOCK` and `… DROP
+    // PERIOD LOCK` do not parse into any typed AST variant (the
+    // `parse_alter_operation` path returns `None` for both, so `ddl_ast::parse`
+    // yields `None`) — the pgwire collaborative router dispatched both from the
+    // raw SQL by string prefix + `contains`. Replicate that exactly here, before
+    // the parse gate, so the recognition and syntax messages stay byte-identical.
+    if upper.starts_with("ALTER COLLECTION ") && upper.contains("ADD PERIOD LOCK") {
+        return Some(period_lock::add_period_lock(state, identity, sql));
+    }
+    if upper.starts_with("ALTER COLLECTION ") && upper.contains("DROP PERIOD LOCK") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(period_lock::drop_period_lock(state, identity, &parts));
     }
 
     // TYPEGUARD DDL. None of these statements are dispatched from a typed AST
@@ -978,7 +1031,21 @@ pub async fn try_dispatch(
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
         Some(Ok(stmt)) => stmt,
         Some(Err(_)) => return None,
-        None => return query_functions::try_dispatch(state, identity, sql).await,
+        None => {
+            // Bulk import: `COPY <collection> FROM STDIN [WITH (...)]`. The
+            // file-path form (`COPY … FROM '<path>'`) parses into a typed
+            // `MiscStmt::CopyFromFile` and stays on the transitional pgwire path;
+            // the STDIN form parses into no typed variant (`ddl_ast::parse`
+            // returns `None`) and reached the pgwire `dsl` string router, which
+            // ran after the typed-AST parse gate. Recognizing it here in the
+            // `None` branch preserves that ordering exactly — the file form never
+            // reaches this arm, so it is not diverted from the typed handler.
+            if upper.starts_with("COPY ") && upper.contains(" FROM ") {
+                let parts: Vec<&str> = sql.split_whitespace().collect();
+                return Some(bulk::copy_from(state, identity, &parts).await);
+            }
+            return query_functions::try_dispatch(state, identity, sql).await;
+        }
     };
 
     // Graph-overlay statements (GRAPH INSERT/DELETE EDGE, GRAPH LABEL/UNLABEL,
@@ -1211,6 +1278,40 @@ pub async fn try_dispatch(
         NodedbStatement::Collection(CollectionStmt::DescribeSequence { name }) => {
             Some(sequence::describe_sequence(state, identity, name))
         }
+
+        // CRDT conflict-policy update: `ALTER COLLECTION <name> SET ON CONFLICT
+        // <policy> FOR <kind>`. This parses into `CollectionStmt::AlterCollection`
+        // with an `AlterCollectionOp::SetOnConflict` operation, dispatched from
+        // the pgwire typed-AST ALTER-COLLECTION router (`dispatch_alter_collection`).
+        // Only `SetOnConflict` is migrated; every other `AlterCollectionOp`
+        // returns `None` so it falls through to the transitional pgwire path
+        // unchanged.
+        NodedbStatement::Collection(CollectionStmt::AlterCollection {
+            name,
+            operation:
+                AlterCollectionOp::SetOnConflict {
+                    policy,
+                    constraint_kind,
+                },
+        }) => Some(
+            conflict_policy::alter_set_on_conflict(
+                state,
+                identity,
+                database_id,
+                name,
+                policy,
+                constraint_kind,
+            )
+            .await,
+        ),
+
+        // `SHOW CONFLICT POLICY ON <collection>`. Parses into a typed
+        // `PolicyStmt::ShowConflictPolicy` and was dispatched from the pgwire
+        // typed-AST async router. The Data Plane `GetPolicy` read is preserved
+        // verbatim in `conflict_policy`.
+        NodedbStatement::Policy(PolicyStmt::ShowConflictPolicy { collection }) => Some(
+            conflict_policy::show_conflict_policy(state, identity, database_id, collection).await,
+        ),
 
         NodedbStatement::Collection(CollectionStmt::Reindex {
             collection,

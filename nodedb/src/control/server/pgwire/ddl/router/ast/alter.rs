@@ -15,7 +15,6 @@ use crate::control::server::pgwire::ddl::collection::{
     alter_collection_set_last_value_cache, alter_collection_set_legal_hold,
     alter_collection_set_retention, alter_table_add_column,
 };
-use crate::control::server::pgwire::ddl::conflict_policy::alter_set_on_conflict;
 use crate::control::server::pgwire::ddl::ownership::alter_collection_owner;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
@@ -23,7 +22,7 @@ use crate::types::DatabaseId;
 pub(super) async fn dispatch_alter_collection(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    database_id: DatabaseId,
+    _database_id: DatabaseId,
     name: &str,
     operation: &AlterCollectionOp,
 ) -> PgWireResult<Vec<Response>> {
@@ -91,11 +90,14 @@ pub(super) async fn dispatch_alter_collection(
             value_expr,
         ),
 
-        AlterCollectionOp::SetOnConflict {
-            policy,
-            constraint_kind,
-        } => {
-            alter_set_on_conflict(state, identity, database_id, name, policy, constraint_kind).await
+        // SET ON CONFLICT is served by the protocol-neutral DDL router, which is
+        // tried before this transitional pgwire delegation runs; this arm is
+        // unreachable but kept so the `AlterCollectionOp` match stays exhaustive.
+        AlterCollectionOp::SetOnConflict { .. } => {
+            Err(crate::control::server::pgwire::types::sqlstate_error(
+                "XX000",
+                "ALTER COLLECTION ... SET ON CONFLICT is routed by the protocol-neutral DDL router",
+            ))
         }
     }
 }

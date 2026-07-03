@@ -23,12 +23,9 @@ pub(super) async fn dispatch(
     // handled by the protocol-neutral DDL router, which runs before this pgwire
     // delegation.
 
-    // System-level settings (ALTER SYSTEM SET ...).
-    if upper.starts_with("ALTER SYSTEM ") {
-        return Some(super::super::system_ddl::alter_system(
-            state, identity, parts,
-        ));
-    }
+    // System-level settings (ALTER SYSTEM SET ...) have been migrated to the
+    // protocol-neutral router (`shared::ddl::neutral::system_ddl`), which is
+    // tried before this transitional pgwire delegation runs.
 
     // Tenant management.
     if upper.starts_with("CREATE TENANT ") {

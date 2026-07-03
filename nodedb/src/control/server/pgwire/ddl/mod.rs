@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-pub mod bulk;
 pub mod catalog_propose;
 pub mod collection;
-pub mod conflict_policy;
 pub mod convert;
 pub mod crdt_ops;
 pub mod database;
-pub mod emergency_ddl;
 pub mod field_def;
 pub mod impersonation_ddl;
 pub mod match_ops;
 pub mod ownership;
 pub(crate) mod parse_utils;
-pub mod period_lock;
 pub mod pubsub;
 #[path = "router/mod.rs"]
 pub mod router;
@@ -24,7 +20,6 @@ pub(crate) mod sql_parse;
 pub mod stream_select;
 pub mod streaming_mv;
 pub mod sync_dispatch;
-pub mod system_ddl;
 pub mod temp_table;
 pub mod tenant;
 

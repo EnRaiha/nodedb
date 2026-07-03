@@ -5,9 +5,7 @@
 use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
-use nodedb_sql::ddl_ast::statement::{
-    CollectionStmt, DatabaseStmt, MiscStmt, NodedbStatement, PolicyStmt,
-};
+use nodedb_sql::ddl_ast::statement::{CollectionStmt, DatabaseStmt, MiscStmt, NodedbStatement};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::ddl::collection::copy_from::CopyFromOptions;
@@ -15,7 +13,6 @@ use crate::control::server::pgwire::ddl::collection::{
     CreateCollectionRequest, CreateIndexRequest, copy_from_file, copy_to_file, create_collection,
     create_index, create_table, dispatch_register_by_name,
 };
-use crate::control::server::pgwire::ddl::conflict_policy::show_conflict_policy;
 use crate::control::server::pgwire::ddl::tenant::handle_move_tenant;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
@@ -131,9 +128,8 @@ pub(super) async fn try_dispatch_async(
             Some(dispatch_alter_collection(state, identity, database_id, name, operation).await)
         }
 
-        NodedbStatement::Policy(PolicyStmt::ShowConflictPolicy { collection }) => {
-            Some(show_conflict_policy(state, identity, database_id, collection).await)
-        }
+        // SHOW CONFLICT POLICY (PolicyStmt::ShowConflictPolicy) is served by the
+        // protocol-neutral DDL router; the pgwire router no longer routes it.
 
         // REINDEX (CollectionStmt::Reindex) is served by the protocol-neutral
         // DDL router; the pgwire router no longer routes it.

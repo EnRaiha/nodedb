@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `ALTER SYSTEM SET <field> = <value>` handler.
+//! Protocol-neutral `ALTER SYSTEM SET <field> = <value>` handler.
 //!
 //! System-level settings that change at runtime without a node
 //! restart. The live cell lives on `SharedState::retention_settings`;
@@ -8,23 +8,35 @@
 //!
 //! Currently supported fields:
 //! - `deactivated_collection_retention_days` (u32)
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! Ported from the pgwire `ddl::system_ddl` handler; the superuser gate,
+//! token parsing, retention-settings write, and audit side effect are
+//! preserved verbatim. Only the result construction changed from pgwire
+//! `Response` / `Tag` to the protocol-neutral [`DdlResult`]; the SQLSTATE codes
+//! and messages are unchanged.
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::types::sqlstate_error;
+use super::super::result::{DdlError, DdlResult};
+
+/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
+/// the pgwire handler produced.
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 pub fn alter_system(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
+        return Err(err(
             "42501",
             "permission denied: only superuser can ALTER SYSTEM",
         ));
@@ -35,10 +47,7 @@ pub fn alter_system(
     // or without the `=` token:
     //   [0]=ALTER  [1]=SYSTEM  [2]=SET  [3]=<field>  [4]=<value>
     if parts.len() < 5 || !parts[2].eq_ignore_ascii_case("SET") {
-        return Err(sqlstate_error(
-            "42601",
-            "syntax: ALTER SYSTEM SET <field> = <value>",
-        ));
+        return Err(err("42601", "syntax: ALTER SYSTEM SET <field> = <value>"));
     }
 
     let field = parts[3].trim_end_matches(';').to_lowercase();
@@ -48,14 +57,14 @@ pub fn alter_system(
         4
     };
     if value_idx >= parts.len() {
-        return Err(sqlstate_error("42601", "expected value after field name"));
+        return Err(err("42601", "expected value after field name"));
     }
     let raw_value = parts[value_idx].trim_end_matches(';');
 
     match field.as_str() {
         "deactivated_collection_retention_days" => {
             let days: u32 = raw_value.parse().map_err(|_| {
-                sqlstate_error(
+                err(
                     "42601",
                     "deactivated_collection_retention_days must be a non-negative integer",
                 )
@@ -63,7 +72,7 @@ pub fn alter_system(
             let mut w = state
                 .retention_settings
                 .write()
-                .map_err(|_| sqlstate_error("58000", "retention settings lock poisoned"))?;
+                .map_err(|_| err("58000", "retention settings lock poisoned"))?;
             w.deactivated_collection_retention_days = days;
             drop(w);
             state.audit_record(
@@ -72,11 +81,14 @@ pub fn alter_system(
                 &identity.username,
                 &format!("altered system: set {field} = {days}"),
             );
-            Ok(vec![Response::Execution(Tag::new("ALTER SYSTEM"))])
+            Ok(vec![DdlResult::Status {
+                command: "ALTER SYSTEM".to_string(),
+                rows_affected: None,
+            }])
         }
-        other => Err(sqlstate_error(
+        other => Err(err(
             "42601",
-            &format!(
+            format!(
                 "unknown ALTER SYSTEM field: {other}. Valid: deactivated_collection_retention_days"
             ),
         )),

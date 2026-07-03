@@ -14,7 +14,7 @@ pub(super) async fn dispatch(
     identity: &AuthenticatedIdentity,
     sql: &str,
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
     database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     // NDB_CHUNK_TEXT table-valued function: SELECT * FROM NDB_CHUNK_TEXT(...).
@@ -67,10 +67,9 @@ pub(super) async fn dispatch(
         }
     }
 
-    // COPY FROM file.
-    if upper.starts_with("COPY ") && upper.contains(" FROM ") {
-        return Some(super::super::bulk::copy_from(state, identity, parts).await);
-    }
+    // Bulk import (`COPY <collection> FROM STDIN [WITH (...)]`) has been migrated
+    // to the protocol-neutral router (`shared::ddl::neutral::bulk`), which is
+    // tried before this transitional pgwire delegation runs.
 
     // INSERT INTO x { } — object literal syntax; intercept for trigger/sequence handling.
     if upper.starts_with("INSERT INTO ") {
