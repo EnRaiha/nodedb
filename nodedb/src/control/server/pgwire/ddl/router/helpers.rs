@@ -192,48 +192,6 @@ fn split_args_respecting_quotes(s: &str) -> Vec<String> {
     args
 }
 
-/// Handle `SELECT * FROM TOPIC <topic> CONSUMER GROUP <group> [LIMIT <n>]`.
-///
-/// Topics use the same buffer pool as change streams, prefixed with "topic:".
-/// We rewrite the parts to use the prefixed name and delegate to stream_select.
-/// Handle `SELECT * FROM TOPIC <topic> CONSUMER GROUP <group> [LIMIT <n>]`.
-///
-/// Topics use "topic:<name>" as buffer keys. We parse the parts directly
-/// and call stream_select's underlying consume logic with the prefixed name.
-pub(super) async fn select_from_topic(
-    state: &crate::control::state::SharedState,
-    identity: &crate::control::security::identity::AuthenticatedIdentity,
-    parts: &[&str],
-) -> pgwire::error::PgWireResult<Vec<pgwire::api::results::Response>> {
-    // parts: [SELECT, *, FROM, TOPIC, <topic>, CONSUMER, GROUP, <group>, ...]
-    if parts.len() < 8
-        || !parts[3].eq_ignore_ascii_case("TOPIC")
-        || !parts[5].eq_ignore_ascii_case("CONSUMER")
-        || !parts[6].eq_ignore_ascii_case("GROUP")
-    {
-        return Err(super::super::super::types::sqlstate_error(
-            "42601",
-            "expected SELECT * FROM TOPIC <topic> CONSUMER GROUP <group>",
-        ));
-    }
-
-    // Build a rewritten parts slice with STREAM and prefixed name.
-    // Only two owned strings needed — the rest are borrowed from the original.
-    let prefixed_name = format!("topic:{}", parts[4].to_lowercase());
-    let stream_keyword = "STREAM";
-
-    let mut rewritten = Vec::with_capacity(parts.len());
-    for (i, &p) in parts.iter().enumerate() {
-        match i {
-            3 => rewritten.push(stream_keyword),
-            4 => rewritten.push(&prefixed_name),
-            _ => rewritten.push(p),
-        }
-    }
-
-    super::super::stream_select::select_from_stream(state, identity, &rewritten).await
-}
-
 /// EXPLAIN TIERS ON <collection> — show AUTO_TIER routing plan.
 pub(super) fn explain_tiers(
     state: &SharedState,

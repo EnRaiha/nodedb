@@ -37,6 +37,7 @@ use super::explain_ddl;
 use super::function;
 use super::grant;
 use super::graph_ops;
+use super::impersonation;
 use super::inspect;
 use super::inspect_audit;
 use super::kv_atomic;
@@ -62,11 +63,14 @@ use super::scope_ddl;
 use super::scope_query_ddl;
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
+use super::session_admin;
 use super::spatial;
+use super::stream_select;
 use super::synonym_group;
 use super::system_ddl;
 use super::timeseries;
 use super::topic;
+use super::topic_subscribe;
 use super::transfer;
 use super::tree_ops;
 use super::trigger;
@@ -444,6 +448,62 @@ pub async fn try_dispatch(
     }
     if upper.starts_with("PUBLISH TO ") {
         return Some(topic::handle_publish(state, identity, sql).await);
+    }
+
+    // Stream consumption: `SELECT * FROM STREAM <name> CONSUMER GROUP <group>
+    // [PARTITION <p>] [LIMIT <n>]`. Parses into no typed AST variant — the
+    // pgwire streaming router recognized it by string prefix from the raw
+    // token slice. Replicate that exactly here, before the parse gate, so the
+    // prefix recognition and the `parts`-based extraction stay byte-identical.
+    if upper.starts_with("SELECT ")
+        && upper.contains("FROM STREAM ")
+        && upper.contains("CONSUMER GROUP")
+    {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(stream_select::select_from_stream(state, identity, &parts).await);
+    }
+
+    // Stream/Topic consumption: `SELECT * FROM TOPIC <name> CONSUMER GROUP
+    // <group> [LIMIT <n>]`. Topics use "topic:<name>" buffer keys; the pgwire
+    // streaming router rewrote the token slice (TOPIC → STREAM, name →
+    // "topic:<name>") and delegated to the stream-consume handler. Replicate
+    // that rewrite exactly here, before the parse gate.
+    if upper.starts_with("SELECT ")
+        && upper.contains("FROM TOPIC ")
+        && upper.contains("CONSUMER GROUP")
+    {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        if parts.len() < 8
+            || !parts[3].eq_ignore_ascii_case("TOPIC")
+            || !parts[5].eq_ignore_ascii_case("CONSUMER")
+            || !parts[6].eq_ignore_ascii_case("GROUP")
+        {
+            return Some(Err(DdlError {
+                sqlstate: "42601".to_string(),
+                message: "expected SELECT * FROM TOPIC <topic> CONSUMER GROUP <group>".to_string(),
+            }));
+        }
+        let prefixed_name = format!("topic:{}", parts[4].to_lowercase());
+        let stream_keyword = "STREAM";
+        let mut rewritten = Vec::with_capacity(parts.len());
+        for (i, &p) in parts.iter().enumerate() {
+            match i {
+                3 => rewritten.push(stream_keyword),
+                4 => rewritten.push(prefixed_name.as_str()),
+                _ => rewritten.push(p),
+            }
+        }
+        return Some(stream_select::select_from_stream(state, identity, &rewritten).await);
+    }
+
+    // Pub/Sub: `SUBSCRIBE TO <topic> [GROUP <group>] [SINCE <seq>]` (legacy).
+    // Parses into no typed AST variant — the pgwire collaborative router
+    // recognized it by string prefix from the raw token slice. Replicate that
+    // exactly here, before the parse gate, so the prefix recognition stays
+    // byte-identical.
+    if upper.starts_with("SUBSCRIBE TO ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(topic_subscribe::subscribe_to(state, identity, sql, &parts));
     }
 
     // Version history. None of `CREATE CHECKPOINT`, `DROP CHECKPOINT`, `SHOW
@@ -836,9 +896,8 @@ pub async fn try_dispatch(
     // `SHOW SESSION`, and `EXPORT AUDIT` parse into no typed DDL variant.
     // Replicate the string dispatch exactly here, before the parse gate, so the
     // prefix recognition and the `parts`-based extraction stay byte-identical.
-    // `SHOW SESSIONS` is excluded because the admin router claimed it (via the
-    // not-yet-migrated `session_ddl::show_sessions`) before the observability
-    // `SHOW SESSION` prefix ran; the guard preserves that ordering. The
+    // `SHOW SESSIONS` is excluded here (see the `session_admin::show_sessions`
+    // arm above, which is now checked first) so the two never race. The
     // `TRUNCATE / DELETE / CLEAR AUDIT` guard stays on the transitional pgwire
     // path — it is not one of the migrated inspect handlers.
     if upper.starts_with("SHOW USERS") {
@@ -893,6 +952,60 @@ pub async fn try_dispatch(
     if upper.starts_with("SHOW GRANTS") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(inspect::show_grants(state, identity, &parts));
+    }
+
+    // Impersonation & delegation: IMPERSONATE AUTH USER, STOP IMPERSONATION,
+    // DELEGATE AUTH USER, REVOKE DELEGATION, SHOW DELEGATIONS. None of these
+    // parse into any typed AST variant — the pgwire admin router dispatched
+    // all five by string prefix from the raw token slice. Replicate that
+    // exactly here, before the parse gate, so the prefix recognition and the
+    // `parts`-based extraction / syntax messages stay byte-identical.
+    if upper.starts_with("IMPERSONATE AUTH USER ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(impersonation::impersonate(state, identity, &parts));
+    }
+    if upper.starts_with("STOP IMPERSONATION") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(impersonation::stop_impersonation(state, identity, &parts));
+    }
+    if upper.starts_with("DELEGATE AUTH USER ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(impersonation::delegate(state, identity, &parts));
+    }
+    if upper.starts_with("REVOKE DELEGATION ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(impersonation::revoke_delegation(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW DELEGATIONS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(impersonation::show_delegations(state, identity, &parts));
+    }
+
+    // Session management: SHOW SESSIONS, KILL SESSION, KILL USER SESSIONS,
+    // VERIFY AUDIT CHAIN. None of these parse into any typed AST variant —
+    // the pgwire admin router dispatched all four by string prefix from the
+    // raw token slice. Replicate that exactly here, before the parse gate, so
+    // the prefix recognition and the `parts`-based extraction / syntax
+    // messages stay byte-identical. `SHOW SESSIONS` is matched here (before
+    // the observability `SHOW SESSION` prefix below), mirroring the pgwire
+    // admin router's precedence over the pgwire observability router; the
+    // `SHOW SESSION` guard below already excludes `SHOW SESSIONS` explicitly,
+    // so the two never race regardless of which is checked first.
+    if upper.starts_with("SHOW SESSIONS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(session_admin::show_sessions(state, identity, &parts));
+    }
+    if upper.starts_with("KILL SESSION ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(session_admin::kill_session(state, identity, &parts));
+    }
+    if upper.starts_with("KILL USER SESSIONS ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(session_admin::kill_user_sessions(state, identity, &parts));
+    }
+    if upper.starts_with("VERIFY AUDIT CHAIN") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(session_admin::verify_audit_chain(state, identity, &parts));
     }
 
     // Administrative observability: SHOW SERVER STATS / SHOW STATS / SHOW

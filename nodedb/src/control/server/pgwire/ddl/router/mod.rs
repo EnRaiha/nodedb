@@ -3,12 +3,10 @@
 mod admin;
 mod ast;
 mod auth;
-mod collaborative;
 mod dsl;
 mod engine_ops;
 mod helpers;
 mod schema;
-mod streaming;
 
 use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
@@ -64,21 +62,17 @@ pub async fn dispatch(
         return Some(r);
     }
 
-    if let Some(r) = streaming::dispatch(state, identity, sql, &upper, &parts).await {
-        return Some(r);
-    }
+    // Stream/topic consumption (`SELECT * FROM STREAM|TOPIC ... CONSUMER
+    // GROUP ...`) and legacy pub/sub (`SUBSCRIBE TO ...`) are served by the
+    // protocol-neutral DDL router (`shared::ddl::neutral::stream_select` /
+    // `shared::ddl::neutral::topic_subscribe`), which is tried before this
+    // transitional pgwire delegation runs.
 
     if let Some(r) = engine_ops::dispatch(state, identity, sql, &upper, &parts, database_id).await {
         return Some(r);
     }
 
     if let Some(r) = schema::dispatch(state, identity, sql, &upper, &parts).await {
-        return Some(r);
-    }
-
-    if let Some(r) =
-        collaborative::dispatch(state, identity, sql, &upper, &parts, database_id).await
-    {
         return Some(r);
     }
 

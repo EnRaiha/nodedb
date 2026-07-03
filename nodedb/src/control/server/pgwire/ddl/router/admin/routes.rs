@@ -93,54 +93,16 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // (`shared::ddl::neutral::auth_key`), which is tried before this
     // transitional pgwire delegation runs.
 
-    // Impersonation & delegation.
-    if upper.starts_with("IMPERSONATE AUTH USER ") {
-        return Some(super::super::super::impersonation_ddl::impersonate(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("STOP IMPERSONATION") {
-        return Some(super::super::super::impersonation_ddl::stop_impersonation(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("DELEGATE AUTH USER ") {
-        return Some(super::super::super::impersonation_ddl::delegate(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("REVOKE DELEGATION ") {
-        return Some(super::super::super::impersonation_ddl::revoke_delegation(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW DELEGATIONS") {
-        return Some(super::super::super::impersonation_ddl::show_delegations(
-            state, identity, parts,
-        ));
-    }
+    // Impersonation & delegation (IMPERSONATE AUTH USER, STOP IMPERSONATION,
+    // DELEGATE AUTH USER, REVOKE DELEGATION, SHOW DELEGATIONS) has been
+    // migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::impersonation`), which is tried before this
+    // transitional pgwire delegation runs.
 
-    // Session management.
-    if upper.starts_with("SHOW SESSIONS") {
-        return Some(super::super::super::session_ddl::show_sessions(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("KILL SESSION ") {
-        return Some(super::super::super::session_ddl::kill_session(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("KILL USER SESSIONS ") {
-        return Some(super::super::super::session_ddl::kill_user_sessions(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("VERIFY AUDIT CHAIN") {
-        return Some(super::super::super::session_ddl::verify_audit_chain(
-            state, identity, parts,
-        ));
-    }
+    // Session management (SHOW SESSIONS, KILL SESSION, KILL USER SESSIONS,
+    // VERIFY AUDIT CHAIN) has been migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::session_admin`), which is tried before this
+    // transitional pgwire delegation runs.
 
     // Usage metering (DEFINE METERING DIMENSION, SHOW USAGE [FOR TENANT],
     // EXPORT USAGE, SHOW QUOTA) has been migrated to the protocol-neutral

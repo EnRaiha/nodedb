@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Impersonation & delegation DDL commands.
+//! Protocol-neutral impersonation & delegation DDL commands.
 //!
 //! ```sql
 //! IMPERSONATE AUTH USER 'user_42'
@@ -9,35 +9,49 @@
 //! REVOKE DELEGATION FROM 'bob' AS 'alice'
 //! SHOW DELEGATIONS
 //! ```
+//!
+//! Ported from the pgwire `ddl::impersonation_ddl` handlers. All five mutate
+//! or read the GLOBAL `state.impersonation` registry (keyed by user_id, not
+//! by connection) plus the audit log — not the current connection's identity
+//! — so they carry no per-connection state. The superuser / delegator gates,
+//! the token parsing (`AS` / `SCOPES` / `EXPIRES` / `REASON` extraction), the
+//! registry calls, and the audit records are preserved verbatim; only the
+//! result construction changed from pgwire `Response` / `PgWireError` to the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
-use super::super::types::{sqlstate_error, text_field};
+use super::super::result::{DdlError, DdlResult};
+
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
+
+fn status(command: &str) -> Vec<DdlResult> {
+    vec![DdlResult::Status {
+        command: command.to_string(),
+        rows_affected: None,
+    }]
+}
 
 /// IMPERSONATE AUTH USER '<target_user_id>'
 pub fn impersonate(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
     if parts.len() < 4 {
-        return Err(sqlstate_error(
-            "42601",
-            "syntax: IMPERSONATE AUTH USER '<user_id>'",
-        ));
+        return Err(err("42601", "syntax: IMPERSONATE AUTH USER '<user_id>'"));
     }
     let target_id = parts[3].trim_matches('\'');
 
@@ -49,7 +63,7 @@ pub fn impersonate(
             target_id,
             target_id,
         )
-        .map_err(|e| sqlstate_error("42000", &e.to_string()))?;
+        .map_err(|e| err("42000", e.to_string()))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -58,7 +72,7 @@ pub fn impersonate(
         &format!("{} impersonating {target_id}", identity.username),
     );
 
-    Ok(vec![Response::Execution(Tag::new("IMPERSONATE"))])
+    Ok(status("IMPERSONATE"))
 }
 
 /// STOP IMPERSONATION
@@ -66,15 +80,12 @@ pub fn stop_impersonation(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     _parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let stopped = state
         .impersonation
         .stop_impersonation(&identity.user_id.to_string());
     if !stopped {
-        return Err(sqlstate_error(
-            "42000",
-            "not currently impersonating anyone",
-        ));
+        return Err(err("42000", "not currently impersonating anyone"));
     }
 
     state.audit_record(
@@ -84,7 +95,7 @@ pub fn stop_impersonation(
         "impersonation stopped",
     );
 
-    Ok(vec![Response::Execution(Tag::new("STOP IMPERSONATION"))])
+    Ok(status("STOP IMPERSONATION"))
 }
 
 /// DELEGATE AUTH USER '<delegate>' AS AUTH USER '<delegator>' SCOPES '...' EXPIRES <dur> REASON '...'
@@ -92,10 +103,10 @@ pub fn delegate(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // DELEGATE AUTH USER '<b>' AS AUTH USER '<a>' SCOPES '...' EXPIRES <d> REASON '...'
     if parts.len() < 8 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: DELEGATE AUTH USER '<delegate>' AS AUTH USER '<delegator>' SCOPES '...' [EXPIRES <dur>] [REASON '...']",
         ));
@@ -105,7 +116,7 @@ pub fn delegate(
     let as_idx = parts
         .iter()
         .position(|p| p.to_uppercase() == "AS")
-        .ok_or_else(|| sqlstate_error("42601", "missing AS keyword"))?;
+        .ok_or_else(|| err("42601", "missing AS keyword"))?;
     let delegator_id = parts
         .get(as_idx + 3)
         .map(|s| s.trim_matches('\''))
@@ -113,7 +124,7 @@ pub fn delegate(
 
     // Only the delegator or a superuser can create delegations.
     if identity.user_id.to_string() != delegator_id && !identity.is_superuser {
-        return Err(sqlstate_error("42501", "can only delegate your own scopes"));
+        return Err(err("42501", "can only delegate your own scopes"));
     }
 
     let scopes: Vec<String> = parts
@@ -149,7 +160,7 @@ pub fn delegate(
     state
         .impersonation
         .delegate(delegator_id, delegate_id, scopes, expires_secs, &reason)
-        .map_err(|e| sqlstate_error("42000", &e.to_string()))?;
+        .map_err(|e| err("42000", e.to_string()))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::PrivilegeChange,
@@ -158,7 +169,7 @@ pub fn delegate(
         &format!("delegated scopes from '{delegator_id}' to '{delegate_id}': {reason}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("DELEGATE"))])
+    Ok(status("DELEGATE"))
 }
 
 /// REVOKE DELEGATION FROM '<delegate>' AS '<delegator>'
@@ -166,9 +177,9 @@ pub fn revoke_delegation(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 5 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: REVOKE DELEGATION FROM '<delegate>' AS '<delegator>'",
         ));
@@ -187,7 +198,7 @@ pub fn revoke_delegation(
         &format!("revoked delegation from '{delegator_id}' to '{delegate_id}'"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("REVOKE DELEGATION"))])
+    Ok(status("REVOKE DELEGATION"))
 }
 
 /// SHOW DELEGATIONS
@@ -195,32 +206,44 @@ pub fn show_delegations(
     state: &SharedState,
     _identity: &AuthenticatedIdentity,
     _parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let delegations = state.impersonation.list_delegations();
 
-    let schema = Arc::new(vec![
-        text_field("delegator"),
-        text_field("delegate"),
-        text_field("scopes"),
-        text_field("expires_at"),
-        text_field("reason"),
-    ]);
+    let columns = vec![
+        "delegator".to_string(),
+        "delegate".to_string(),
+        "scopes".to_string(),
+        "expires_at".to_string(),
+        "reason".to_string(),
+    ];
 
-    let rows: Vec<_> = delegations
+    let rows: Vec<Map<String, JsonValue>> = delegations
         .iter()
         .map(|d| {
-            let mut enc = DataRowEncoder::new(schema.clone());
-            let _ = enc.encode_field(&d.delegator_user_id);
-            let _ = enc.encode_field(&d.delegate_user_id);
-            let _ = enc.encode_field(&d.scopes.join(", "));
-            let _ = enc.encode_field(&d.expires_at.to_string());
-            let _ = enc.encode_field(&d.reason);
-            Ok(enc.take_row())
+            let mut row = Map::new();
+            row.insert(
+                "delegator".to_string(),
+                JsonValue::String(d.delegator_user_id.clone()),
+            );
+            row.insert(
+                "delegate".to_string(),
+                JsonValue::String(d.delegate_user_id.clone()),
+            );
+            row.insert("scopes".to_string(), JsonValue::String(d.scopes.join(", ")));
+            row.insert(
+                "expires_at".to_string(),
+                JsonValue::String(d.expires_at.to_string()),
+            );
+            row.insert("reason".to_string(), JsonValue::String(d.reason.clone()));
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    let column_types = ShapedRows::text_types(columns.len());
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
