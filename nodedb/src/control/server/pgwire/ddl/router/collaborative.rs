@@ -34,17 +34,10 @@ pub(super) async fn dispatch(
         ));
     }
 
-    // Permission tree management.
-    if upper.starts_with("ALTER COLLECTION ") && upper.contains("SET PERMISSION_TREE") {
-        return Some(
-            super::super::permission_tree::set_permission_tree(state, identity, sql).await,
-        );
-    }
-    if upper.starts_with("ALTER COLLECTION ") && upper.contains("DROP PERMISSION_TREE") {
-        return Some(
-            super::super::permission_tree::drop_permission_tree(state, identity, sql).await,
-        );
-    }
+    // Permission tree management (ALTER COLLECTION … SET/DROP PERMISSION_TREE)
+    // has been migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::permission_tree`), which is tried before this
+    // transitional pgwire delegation runs.
 
     None
 }

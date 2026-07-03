@@ -11,11 +11,9 @@ pub mod emergency_ddl;
 pub mod field_def;
 pub mod impersonation_ddl;
 pub mod match_ops;
-pub mod org_ddl;
 pub mod ownership;
 pub(crate) mod parse_utils;
 pub mod period_lock;
-pub mod permission_tree;
 pub mod pubsub;
 #[path = "router/mod.rs"]
 pub mod router;

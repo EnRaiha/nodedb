@@ -42,6 +42,8 @@ use super::materialized_view;
 use super::metering_ddl;
 use super::observability;
 use super::oidc;
+use super::org_ddl;
+use super::permission_tree;
 use super::procedure;
 use super::query_functions;
 use super::rate_gate;
@@ -256,6 +258,19 @@ pub async fn try_dispatch(
     if upper.starts_with("DROP CONSTRAINT ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(constraint::drop_constraint(state, identity, &parts));
+    }
+
+    // Permission tree management. `ALTER COLLECTION … SET PERMISSION_TREE` and
+    // `… DROP PERMISSION_TREE` do not parse into any typed AST variant (the
+    // `parse_alter_operation` path returns `None` for both, so `ddl_ast::parse`
+    // yields `None`) — the pgwire collaborative router dispatched both from the
+    // raw SQL by string prefix + `contains`. Replicate that exactly here, before
+    // the parse gate, so the recognition and syntax messages stay byte-identical.
+    if upper.starts_with("ALTER COLLECTION ") && upper.contains("SET PERMISSION_TREE") {
+        return Some(permission_tree::set_permission_tree(state, identity, sql).await);
+    }
+    if upper.starts_with("ALTER COLLECTION ") && upper.contains("DROP PERMISSION_TREE") {
+        return Some(permission_tree::drop_permission_tree(state, identity, sql).await);
     }
 
     // TYPEGUARD DDL. None of these statements are dispatched from a typed AST
@@ -870,6 +885,28 @@ pub async fn try_dispatch(
     if upper.starts_with("SHOW QUOTA ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(metering_ddl::show_quota(state, identity, &parts));
+    }
+
+    // Organization management. None of `CREATE ORG`, `ALTER ORG`, `DROP ORG`,
+    // `SHOW ORGS`, or `SHOW MEMBERS OF ORG` parse into any typed AST variant —
+    // the pgwire admin router dispatched all of them by string prefix from the
+    // raw token slice. Replicate that exactly here, before the parse gate, so
+    // the prefix recognition and the `parts`-based extraction / syntax messages
+    // stay byte-identical.
+    if upper.starts_with("CREATE ORG ")
+        || upper.starts_with("ALTER ORG ")
+        || upper.starts_with("DROP ORG ")
+    {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(org_ddl::handle_org(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW ORGS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(org_ddl::show_orgs(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW MEMBERS OF ORG") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(org_ddl::show_members(state, identity, &parts));
     }
 
     // Parse errors → let the pgwire path run, which re-parses and reproduces the

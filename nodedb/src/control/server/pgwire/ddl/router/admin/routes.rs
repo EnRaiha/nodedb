@@ -58,25 +58,10 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // (`shared::ddl::neutral::blacklist` / `shared::ddl::neutral::auth_user`),
     // which is tried before this transitional pgwire delegation runs.
 
-    // Organization management.
-    if upper.starts_with("CREATE ORG ")
-        || upper.starts_with("ALTER ORG ")
-        || upper.starts_with("DROP ORG ")
-    {
-        return Some(super::super::super::org_ddl::handle_org(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW ORGS") {
-        return Some(super::super::super::org_ddl::show_orgs(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW MEMBERS OF ORG") {
-        return Some(super::super::super::org_ddl::show_members(
-            state, identity, parts,
-        ));
-    }
+    // Organization management (CREATE/ALTER/DROP ORG, SHOW ORGS, SHOW MEMBERS OF
+    // ORG) has been migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::org_ddl`), which is tried before this transitional
+    // pgwire delegation runs.
 
     // Scope management.
     if upper.starts_with("DEFINE SCOPE ") {

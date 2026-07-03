@@ -34,6 +34,8 @@ pub mod materialized_view;
 pub mod metering_ddl;
 pub mod observability;
 pub mod oidc;
+pub mod org_ddl;
+pub mod permission_tree;
 pub mod procedure;
 pub mod query_functions;
 pub mod rate_gate;
