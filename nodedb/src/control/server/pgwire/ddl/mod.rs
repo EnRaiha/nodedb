@@ -5,7 +5,6 @@ pub mod collection;
 pub mod convert;
 pub mod database;
 pub mod field_def;
-pub mod ownership;
 #[path = "router/mod.rs"]
 pub mod router;
 pub mod schema_validation;

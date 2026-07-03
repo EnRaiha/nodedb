@@ -5,7 +5,7 @@
 use sonic_rs;
 
 /// Parse a single column definition: `name TYPE [NOT NULL] [PRIMARY KEY] [DEFAULT expr]`
-pub(super) fn parse_origin_column_def(s: &str) -> crate::Result<nodedb_types::columnar::ColumnDef> {
+pub(crate) fn parse_origin_column_def(s: &str) -> crate::Result<nodedb_types::columnar::ColumnDef> {
     use nodedb_types::columnar::{ColumnDef, ColumnType};
 
     let upper = s.to_uppercase();

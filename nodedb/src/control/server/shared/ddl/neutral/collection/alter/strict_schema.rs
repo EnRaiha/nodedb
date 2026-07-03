@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Shared helpers for strict-schema-altering DDL.
+//!
+//! `ALTER COLUMN TYPE`, `DROP COLUMN`, and `RENAME COLUMN` all open
+//! with the same prelude — look up the catalog, fetch the active
+//! strict collection, deserialize its `StrictSchema` blob — and close
+//! with the same coda — package the mutated `StoredCollection` into a
+//! `PutCollection` entry, replicate it through the metadata raft group,
+//! refresh the Data Plane register, and bump the schema version.
+//!
+//! Ported verbatim from the pgwire
+//! `ddl::collection::alter::strict_schema` module; only the result type
+//! changed from pgwire `PgWireResult` / `sqlstate_error` to the
+//! protocol-neutral [`DdlError`]. The catalog lookup, engine gate, schema
+//! (de)serialization, propose + register + version-bump ordering, and the
+//! SQLSTATE codes / messages are unchanged.
+
+use nodedb_types::DatabaseId;
+
+use crate::control::security::catalog::StoredCollection;
+use crate::control::server::shared::ddl::result::DdlError;
+use crate::control::state::SharedState;
+
+use super::support::err;
+
+/// Look up the active strict collection `name` for `tenant_id` and
+/// return it together with its deserialized `StrictSchema`. Returns
+/// the appropriate error if the catalog is missing, the collection is
+/// absent / inactive, the engine is not strict, or the embedded
+/// `timeseries_config` JSON fails to parse.
+pub(super) fn load_strict_collection(
+    state: &SharedState,
+    tenant_id: u64,
+    name: &str,
+    operation: &str,
+) -> Result<(StoredCollection, nodedb_types::columnar::StrictSchema), DdlError> {
+    let Some(catalog) = state.credentials.catalog() else {
+        return Err(err("XX000", "no catalog available"));
+    };
+
+    let coll = catalog
+        .get_collection(DatabaseId::DEFAULT, tenant_id, name)
+        .map_err(|e| err("XX000", e.to_string()))?
+        .filter(|c| c.is_active)
+        .ok_or_else(|| err("42P01", format!("collection '{name}' does not exist")))?;
+
+    if !coll.collection_type.is_strict() {
+        return Err(err(
+            "0A000",
+            format!("{operation} is only supported on strict document collections"),
+        ));
+    }
+
+    let schema: nodedb_types::columnar::StrictSchema = coll
+        .timeseries_config
+        .as_deref()
+        .and_then(|s| sonic_rs::from_str(s).ok())
+        .ok_or_else(|| err("XX000", "strict schema missing or malformed"))?;
+
+    Ok((coll, schema))
+}
+
+/// Re-serialize `schema` into `coll.timeseries_config` and set
+/// `coll.collection_type` to the matching `Strict(...)` variant.
+pub(super) fn write_schema_back(
+    coll: &mut StoredCollection,
+    schema: nodedb_types::columnar::StrictSchema,
+) {
+    coll.collection_type = nodedb_types::CollectionType::strict(schema.clone());
+    coll.timeseries_config = sonic_rs::to_string(&schema).ok();
+}
+
+/// Replicate the mutated collection through the metadata raft group,
+/// refresh this node's Data Plane register so the in-memory shape
+/// catches up with the new schema, then bump `schema_version`.
+pub(super) async fn persist_schema_change(
+    state: &SharedState,
+    updated: &StoredCollection,
+) -> Result<(), DdlError> {
+    let entry =
+        crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(updated.clone()));
+    super::support::propose_and_apply(state, &entry)?;
+
+    super::super::register::dispatch_register_from_stored(state, updated)
+        .await
+        .map_err(|e| err("XX000", e.to_string()))?;
+    state.schema_version.bump();
+    Ok(())
+}

@@ -3,7 +3,6 @@
 mod admin;
 mod ast;
 mod dsl;
-mod engine_ops;
 mod helpers;
 mod schema;
 
@@ -68,9 +67,11 @@ pub async fn dispatch(
     // `shared::ddl::neutral::topic_subscribe`), which is tried before this
     // transitional pgwire delegation runs.
 
-    if let Some(r) = engine_ops::dispatch(state, identity, sql, &upper, &parts, database_id).await {
-        return Some(r);
-    }
+    // Engine-ops string dispatch (weighted pick, rate gate, atomic transfer,
+    // sorted index, atomic KV, timeseries, last-value cache, vector index
+    // lifecycle, graph/tree ops, and the vector-model metadata forms) has been
+    // fully migrated to the protocol-neutral router (`shared::ddl::neutral`),
+    // which is tried before this transitional pgwire delegation runs.
 
     if let Some(r) = schema::dispatch(state, identity, sql, &upper, &parts).await {
         return Some(r);

@@ -3,33 +3,28 @@
 //! `ALTER COLLECTION <name> RENAME COLUMN <old> TO <new>` — rename a
 //! column in a strict-document collection's schema.
 //!
-//! Binary-tuple layout is positional, so a rename is pure metadata: no row
-//! re-encoding is required. The schema version is bumped so the Data Plane
-//! picks up the new name on the next register dispatch.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Ported verbatim from the pgwire `ddl::collection::alter::rename_column`
+//! handler; only the result type changed to the protocol-neutral
+//! [`DdlResult`] / [`DdlError`]. The duplicate-name guard, positional
+//! rename + version bump, persist, and audit are unchanged, as is the
+//! `ALTER COLLECTION` command tag.
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::super::super::super::types::sqlstate_error;
 use super::strict_schema::{load_strict_collection, persist_schema_change, write_schema_back};
+use super::support::{err, status};
 
 /// ALTER COLLECTION <name> RENAME COLUMN <old_name> TO <new_name>
-///
-/// All fields arrive pre-parsed:
-/// - `name`: collection name.
-/// - `old_name`: current column name.
-/// - `new_name`: new column name.
-pub async fn alter_collection_rename_column(
+pub(super) async fn alter_collection_rename_column(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
     old_name: &str,
     new_name: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
 
     let (coll, mut schema) =
@@ -40,9 +35,9 @@ pub async fn alter_collection_rename_column(
         .iter()
         .any(|c| c.name.eq_ignore_ascii_case(new_name))
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "42P07",
-            &format!("column '{new_name}' already exists on '{name}'"),
+            format!("column '{new_name}' already exists on '{name}'"),
         ));
     }
 
@@ -51,9 +46,9 @@ pub async fn alter_collection_rename_column(
         .iter_mut()
         .find(|c| c.name.eq_ignore_ascii_case(old_name))
         .ok_or_else(|| {
-            sqlstate_error(
+            err(
                 "42703",
-                &format!("column '{old_name}' does not exist on '{name}'"),
+                format!("column '{old_name}' does not exist on '{name}'"),
             )
         })?;
     col.name = new_name.to_string();
@@ -70,5 +65,5 @@ pub async fn alter_collection_rename_column(
         &format!("ALTER COLLECTION '{name}' RENAME COLUMN '{old_name}' TO '{new_name}'"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER COLLECTION"))])
+    Ok(status("ALTER COLLECTION"))
 }

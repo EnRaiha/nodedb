@@ -1,36 +1,49 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! DDL handler for vector model metadata.
+//! Protocol-neutral DDL handlers for vector model metadata.
 //!
 //! - `ALTER COLLECTION x SET VECTOR METADATA ON column (model = '...', dimensions = N, ...)`
 //! - `SHOW VECTOR MODELS` — catalog view of all vector columns with model metadata
+//! - `SELECT VECTOR_METADATA('collection', 'column')` — inline JSON query
+//!
+//! Ported verbatim from the pgwire `ddl::collection::vector_metadata`
+//! handlers; only the result construction changed from pgwire `Response` /
+//! `QueryResponse` (text fields) to the protocol-neutral [`DdlResult`] over
+//! [`ShapedRows`] (all-text columns — every field the pgwire handlers encoded
+//! via `text_field`, including `dimensions` / `strict_dimensions`, was a text
+//! column). The parsing, catalog reads/writes, `chrono_format_utc` default,
+//! SQLSTATE codes / messages, and the `ALTER COLLECTION` command tag are
+//! unchanged.
 
 use nodedb_types::DatabaseId;
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use nodedb_types::{VectorModelEntry, VectorModelMetadata};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::super::super::types::{sqlstate_error, text_field};
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// Handle `ALTER COLLECTION x SET VECTOR METADATA ON column (model = '...', dimensions = N, ...)`.
 pub fn handle_set_vector_metadata(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
     // Parse: ALTER COLLECTION <name> SET VECTOR METADATA ON <column> (...)
     let parts: Vec<&str> = sql.split_whitespace().collect();
     if parts.len() < 8 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: ALTER COLLECTION <name> SET VECTOR METADATA ON <column> (model = '...', dimensions = N)",
         ));
@@ -42,12 +55,12 @@ pub fn handle_set_vector_metadata(
     // Find column name after " ON " (the second ON after "METADATA ON").
     let metadata_on_pos = upper
         .find("METADATA ON ")
-        .ok_or_else(|| sqlstate_error("42601", "expected METADATA ON <column>"))?;
+        .ok_or_else(|| err("42601", "expected METADATA ON <column>"))?;
     let after_on = sql[metadata_on_pos + "METADATA ON ".len()..].trim();
     let column = after_on
         .split_whitespace()
         .next()
-        .ok_or_else(|| sqlstate_error("42601", "expected column name after ON"))?
+        .ok_or_else(|| err("42601", "expected column name after ON"))?
         .to_lowercase();
 
     // Verify collection exists.
@@ -58,19 +71,19 @@ pub fn handle_set_vector_metadata(
             .flatten()
             .is_none()
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "42P01",
-            &format!("collection \"{collection}\" does not exist"),
+            format!("collection \"{collection}\" does not exist"),
         ));
     }
 
     // Parse parenthesized key-value pairs.
     let paren_start = sql
         .find('(')
-        .ok_or_else(|| sqlstate_error("42601", "expected (...) with model metadata"))?;
+        .ok_or_else(|| err("42601", "expected (...) with model metadata"))?;
     let paren_end = sql
         .rfind(')')
-        .ok_or_else(|| sqlstate_error("42601", "expected closing ) for metadata"))?;
+        .ok_or_else(|| err("42601", "expected closing ) for metadata"))?;
 
     let inner = &sql[paren_start + 1..paren_end];
     let mut model = String::new();
@@ -86,9 +99,9 @@ pub fn handle_set_vector_metadata(
             match key.as_str() {
                 "model" => model = val.to_string(),
                 "dimensions" => {
-                    dimensions = val.parse().map_err(|_| {
-                        sqlstate_error("22023", &format!("invalid dimensions: {val}"))
-                    })?;
+                    dimensions = val
+                        .parse()
+                        .map_err(|_| err("22023", format!("invalid dimensions: {val}")))?;
                 }
                 "created_at" => created_at = val.to_string(),
                 "strict_dimensions" => {
@@ -96,9 +109,9 @@ pub fn handle_set_vector_metadata(
                         matches!(val.to_uppercase().as_str(), "TRUE" | "1" | "ON" | "YES");
                 }
                 other => {
-                    return Err(sqlstate_error(
+                    return Err(err(
                         "42601",
-                        &format!(
+                        format!(
                             "unknown metadata key '{other}'; supported: model, dimensions, created_at, strict_dimensions"
                         ),
                     ));
@@ -108,13 +121,10 @@ pub fn handle_set_vector_metadata(
     }
 
     if model.is_empty() {
-        return Err(sqlstate_error("42601", "model is required"));
+        return Err(err("42601", "model is required"));
     }
     if dimensions == 0 {
-        return Err(sqlstate_error(
-            "42601",
-            "dimensions is required and must be > 0",
-        ));
+        return Err(err("42601", "dimensions is required and must be > 0"));
     }
 
     // Default created_at to now.
@@ -142,11 +152,11 @@ pub fn handle_set_vector_metadata(
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| err("XX000", "system catalog not available"))?;
 
     catalog
         .put_vector_model(&entry)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     tracing::info!(
         %collection,
@@ -157,53 +167,73 @@ pub fn handle_set_vector_metadata(
         "vector model metadata set"
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER COLLECTION"))])
+    Ok(vec![DdlResult::Status {
+        command: "ALTER COLLECTION".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Handle `SHOW VECTOR MODELS` — list all vector columns with model metadata.
 pub fn handle_show_vector_models(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
     let catalog = state
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| err("XX000", "system catalog not available"))?;
 
     let entries = catalog
         .list_vector_models(tenant_id)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
 
-    let schema = Arc::new(vec![
-        text_field("collection"),
-        text_field("column"),
-        text_field("model"),
-        text_field("dimensions"),
-        text_field("created_at"),
-        text_field("strict_dimensions"),
-    ]);
+    let columns = vec![
+        "collection".to_string(),
+        "column".to_string(),
+        "model".to_string(),
+        "dimensions".to_string(),
+        "created_at".to_string(),
+        "strict_dimensions".to_string(),
+    ];
 
-    let rows: Vec<_> = entries
+    let rows: Vec<Map<String, JsonValue>> = entries
         .iter()
         .map(|e| {
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            let _ = encoder.encode_field(&e.collection);
-            let _ = encoder.encode_field(&e.column);
-            let _ = encoder.encode_field(&e.metadata.model);
-            let _ = encoder.encode_field(&e.metadata.dimensions.to_string());
-            let _ = encoder.encode_field(&e.metadata.created_at);
-            let _ = encoder.encode_field(&e.metadata.strict_dimensions.to_string());
-            Ok(encoder.take_row())
+            let mut row = Map::new();
+            row.insert(
+                "collection".to_string(),
+                JsonValue::String(e.collection.clone()),
+            );
+            row.insert("column".to_string(), JsonValue::String(e.column.clone()));
+            row.insert(
+                "model".to_string(),
+                JsonValue::String(e.metadata.model.clone()),
+            );
+            row.insert(
+                "dimensions".to_string(),
+                JsonValue::String(e.metadata.dimensions.to_string()),
+            );
+            row.insert(
+                "created_at".to_string(),
+                JsonValue::String(e.metadata.created_at.clone()),
+            );
+            row.insert(
+                "strict_dimensions".to_string(),
+                JsonValue::String(e.metadata.strict_dimensions.to_string()),
+            );
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types: ShapedRows::text_types(6),
+        rows,
+        notice: None,
+    })])
 }
 
 /// Handle `SELECT VECTOR_METADATA('collection', 'column')` — return JSON.
@@ -212,18 +242,18 @@ pub fn handle_vector_metadata_query(
     identity: &AuthenticatedIdentity,
     collection: &str,
     column: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
     let catalog = state
         .credentials
         .catalog()
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "system catalog not available"))?;
+        .ok_or_else(|| err("XX000", "system catalog not available"))?;
 
     let entry = catalog
         .get_vector_model(tenant_id, collection, column)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     let json = match entry {
         Some(e) => {
@@ -238,15 +268,15 @@ pub fn handle_vector_metadata_query(
         None => "null".to_string(),
     };
 
-    let schema = Arc::new(vec![text_field("vector_metadata")]);
-    let mut encoder = DataRowEncoder::new(schema.clone());
-    let _ = encoder.encode_field(&json);
-    let row = encoder.take_row();
+    let mut row = Map::new();
+    row.insert("vector_metadata".to_string(), JsonValue::String(json));
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(row)]),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["vector_metadata".to_string()],
+        column_types: ShapedRows::text_types(1),
+        rows: vec![row],
+        notice: None,
+    })])
 }
 
 /// Format a Unix timestamp (seconds) as an ISO-8601 UTC date string (YYYY-MM-DD).

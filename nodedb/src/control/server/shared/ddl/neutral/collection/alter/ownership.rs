@@ -1,32 +1,37 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+//! `ALTER COLLECTION <name> OWNER TO <user>` — transfer collection ownership.
+//!
+//! Ported verbatim from the pgwire `ddl::ownership` handler; only the result
+//! type changed to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//!
+//! The ownership change is applied by mutating the parent `StoredCollection`
+//! and re-proposing it (NOT via a standalone `PutOwner`): the `OWNERS` redb
+//! table is rewritten from `stored.owner` by the `PutCollection` `post_apply`
+//! on every node, so a separate `PutOwner` would be silently overwritten the
+//! next time anyone re-proposed the collection. The authorization gate, new-
+//! owner existence check, the propose + single-node fallback
+//! (`put_collection` + `install_replicated_owner`), and the audit are
+//! unchanged, as is the `ALTER COLLECTION` command tag.
+
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::super::types::sqlstate_error;
+use super::support::{err, status};
 
 /// ALTER COLLECTION <name> OWNER TO <user>
-///
-/// Transfer ownership of a collection. Requires:
-/// - Current owner, OR
-/// - Superuser / tenant_admin
-///
-/// All fields arrive pre-parsed:
-/// - `collection`: collection name.
-/// - `new_owner`: new owner username.
-pub fn alter_collection_owner(
+pub(super) fn alter_collection_owner(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     collection: &str,
     new_owner: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // Check authorization: current owner or admin.
     let current_owner = state
         .permissions
@@ -40,7 +45,7 @@ pub fn alter_collection_owner(
         && !identity.is_superuser
         && !identity.has_role(&crate::control::security::identity::Role::TenantAdmin)
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "42501",
             "permission denied: only the current owner, superuser, or tenant_admin can transfer ownership",
         ));
@@ -48,10 +53,7 @@ pub fn alter_collection_owner(
 
     // Verify new owner exists.
     if state.credentials.get_user(new_owner).is_none() {
-        return Err(sqlstate_error(
-            "42704",
-            &format!("user '{new_owner}' not found"),
-        ));
+        return Err(err("42704", format!("user '{new_owner}' not found")));
     }
 
     // Mutate the parent `StoredCollection` and re-propose it: the
@@ -65,7 +67,7 @@ pub fn alter_collection_owner(
     let catalog_ref = state.credentials.catalog();
     let catalog = catalog_ref
         .as_ref()
-        .ok_or_else(|| sqlstate_error("XX000", "catalog unavailable for ALTER COLLECTION OWNER"))?;
+        .ok_or_else(|| err("XX000", "catalog unavailable for ALTER COLLECTION OWNER"))?;
     let mut stored = match catalog.get_collection(
         DatabaseId::DEFAULT,
         identity.tenant_id.as_u64(),
@@ -73,21 +75,21 @@ pub fn alter_collection_owner(
     ) {
         Ok(Some(c)) => c,
         Ok(None) => {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42P01",
-                &format!("collection '{collection}' does not exist"),
+                format!("collection '{collection}' does not exist"),
             ));
         }
-        Err(e) => return Err(sqlstate_error("XX000", &format!("catalog read: {e}"))),
+        Err(e) => return Err(err("XX000", format!("catalog read: {e}"))),
     };
     stored.owner = new_owner.to_string();
     let entry = CatalogEntry::PutCollection(Box::new(stored.clone()));
     let log_index = propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &format!("metadata propose: {e}")))?;
+        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
     if log_index == 0 {
         catalog
             .put_collection(DatabaseId::DEFAULT, &stored)
-            .map_err(|e| sqlstate_error("XX000", &format!("catalog write: {e}")))?;
+            .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
         state.permissions.install_replicated_owner(
             &crate::control::security::catalog::StoredOwner {
                 object_type: "collection".into(),
@@ -108,5 +110,5 @@ pub fn alter_collection_owner(
         ),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER COLLECTION"))])
+    Ok(status("ALTER COLLECTION"))
 }

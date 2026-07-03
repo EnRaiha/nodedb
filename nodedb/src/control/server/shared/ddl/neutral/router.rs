@@ -6,7 +6,6 @@
 //! other statement returns `None` so the transitional pgwire delegation in the
 //! parent [`super::super::dispatch`] handles it.
 
-use nodedb_sql::ddl_ast::AlterCollectionOp;
 use nodedb_sql::ddl_ast::statement::{
     AuthStmt, AutomationStmt, ClusterStmt, CollectionStmt, DatabaseStmt, GraphStmt,
     NodedbStatement, PolicyStmt, StreamViewStmt,
@@ -691,6 +690,48 @@ pub async fn try_dispatch(
         return Some(maintenance::handle_alter_vector_index_set(state, identity, sql).await);
     }
 
+    // Vector model metadata. None of these are dispatched from a typed AST arm —
+    // `ALTER COLLECTION ... SET VECTOR METADATA ON` parses into no
+    // `AlterCollectionOp` variant, and `SHOW VECTOR MODELS` / `SELECT
+    // VECTOR_METADATA(...)` parse into no typed DDL AST at all. The pgwire
+    // engine_ops router recognized all three by string prefix from the raw SQL.
+    // Replicate that exactly here, before the parse gate, so the prefix
+    // recognition (and the `ALTER COLLECTION ... SET VECTOR METADATA ON` guard
+    // running before the typed `AlterCollection` parse handling) stays
+    // byte-identical. The `SET VECTOR METADATA ON` guard precedes the typed
+    // parse gate below, so it is never shadowed by the migrated typed
+    // `AlterCollection` dispatch.
+    if upper.starts_with("ALTER COLLECTION ") && upper.contains("SET VECTOR METADATA ON") {
+        return Some(collection::handle_set_vector_metadata(state, identity, sql));
+    }
+    if upper.starts_with("SHOW VECTOR MODELS") {
+        return Some(collection::handle_show_vector_models(state, identity));
+    }
+    if upper.starts_with("SELECT VECTOR_METADATA(") || upper.starts_with("SELECT VECTOR_METADATA (")
+    {
+        let inner = sql
+            .find('(')
+            .and_then(|start| sql.rfind(')').map(|end| &sql[start + 1..end]));
+        if let Some(args_str) = inner {
+            let args: Vec<&str> = args_str
+                .split(',')
+                .map(|s| s.trim().trim_matches('\'').trim_matches('"'))
+                .collect();
+            if args.len() >= 2 && !args[0].is_empty() && !args[1].is_empty() {
+                return Some(collection::handle_vector_metadata_query(
+                    state,
+                    identity,
+                    &args[0].to_lowercase(),
+                    &args[1].to_lowercase(),
+                ));
+            }
+        }
+        return Some(Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: "usage: SELECT VECTOR_METADATA('collection', 'column')".to_string(),
+        }));
+    }
+
     // Graph index and tree operations: CREATE GRAPH INDEX / TREE_SUM /
     // TREE_CHILDREN. None of these are dispatched from a typed AST arm — the
     // pgwire engine_ops router recognized all three by string prefix from the
@@ -715,9 +756,8 @@ pub async fn try_dispatch(
     // exactly here, before the parse gate, so the prefix recognition, guard
     // ordering, and syntax messages stay byte-identical. The three vector
     // model / metadata forms (`ALTER COLLECTION … SET VECTOR METADATA ON`,
-    // `SHOW VECTOR MODELS`, `SELECT VECTOR_METADATA(…)`) remain on the
-    // transitional pgwire path — they are handled by the not-yet-migrated
-    // collection family — so they are intentionally not routed here.
+    // `SHOW VECTOR MODELS`, `SELECT VECTOR_METADATA(…)`) are routed by the
+    // string-prefix arms above (alongside the vector-index lifecycle forms).
     //
     // `CREATE TIMESERIES` / `ALTER TIMESERIES` / `REWRITE PARTITIONS` are
     // routed here, but `SHOW PARTITIONS ` is intentionally NOT — it is already
@@ -1654,30 +1694,18 @@ pub async fn try_dispatch(
             Some(sequence::describe_sequence(state, identity, name))
         }
 
-        // CRDT conflict-policy update: `ALTER COLLECTION <name> SET ON CONFLICT
-        // <policy> FOR <kind>`. This parses into `CollectionStmt::AlterCollection`
-        // with an `AlterCollectionOp::SetOnConflict` operation, dispatched from
-        // the pgwire typed-AST ALTER-COLLECTION router (`dispatch_alter_collection`).
-        // Only `SetOnConflict` is migrated; every other `AlterCollectionOp`
-        // returns `None` so it falls through to the transitional pgwire path
-        // unchanged.
-        NodedbStatement::Collection(CollectionStmt::AlterCollection {
-            name,
-            operation:
-                AlterCollectionOp::SetOnConflict {
-                    policy,
-                    constraint_kind,
-                },
-        }) => Some(
-            conflict_policy::alter_set_on_conflict(
-                state,
-                identity,
-                database_id,
-                name,
-                policy,
-                constraint_kind,
-            )
-            .await,
+        // `ALTER COLLECTION <name> <operation>` for every typed
+        // `AlterCollectionOp` variant (ADD/DROP/RENAME/ALTER COLUMN, OWNER TO,
+        // SET RETENTION / APPEND_ONLY / LAST_VALUE_CACHE / LEGAL_HOLD, ADD
+        // MATERIALIZED_SUM, SET ON CONFLICT). `dispatch_alter_collection` is a
+        // total match over `AlterCollectionOp` — no variant falls through — so
+        // the pgwire path never sees an `AlterCollection` statement. Each
+        // sub-handler's catalog / register / audit side effects and command tag
+        // (`ALTER TABLE` for ADD COLUMN, `ALTER COLLECTION` otherwise) are
+        // preserved verbatim in `collection::alter`.
+        NodedbStatement::Collection(CollectionStmt::AlterCollection { name, operation }) => Some(
+            collection::dispatch_alter_collection(state, identity, database_id, name, operation)
+                .await,
         ),
 
         // `SHOW CONFLICT POLICY ON <collection>`. Parses into a typed

@@ -3,34 +3,27 @@
 //! `ALTER COLLECTION <name> DROP COLUMN <col>` — remove a column from a
 //! strict-document collection's schema.
 //!
-//! Current scope: strict collections only. The column is removed from the
-//! schema metadata and the schema version is bumped; existing rows are not
-//! re-encoded, so any row written before the drop retains the column's
-//! physical bytes. Reads of those rows will see trailing bytes as extra
-//! tuple elements — acceptable for the "fix after drop, new writes work"
-//! workflow. A full online rewrite is tracked as a separate enhancement.
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//! Ported verbatim from the pgwire `ddl::collection::alter::drop_column`
+//! handler; only the result type changed to the protocol-neutral
+//! [`DdlResult`] / [`DdlError`]. The dropped-column bookkeeping
+//! (`dropped_columns` push + version bump), primary-key guard, persist,
+//! and audit are unchanged, as is the `ALTER COLLECTION` command tag.
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::super::super::super::types::sqlstate_error;
 use super::strict_schema::{load_strict_collection, persist_schema_change, write_schema_back};
+use super::support::{err, status};
 
 /// ALTER COLLECTION <name> DROP COLUMN <column_name>
-///
-/// All fields arrive pre-parsed:
-/// - `name`: collection name.
-/// - `column_name`: column to drop.
-pub async fn alter_collection_drop_column(
+pub(super) async fn alter_collection_drop_column(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
     column_name: &str,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
 
     let (coll, mut schema) =
@@ -41,16 +34,16 @@ pub async fn alter_collection_drop_column(
         .iter()
         .position(|c| c.name.eq_ignore_ascii_case(column_name))
         .ok_or_else(|| {
-            sqlstate_error(
+            err(
                 "42703",
-                &format!("column '{column_name}' does not exist on '{name}'"),
+                format!("column '{column_name}' does not exist on '{name}'"),
             )
         })?;
 
     if schema.columns[idx].primary_key {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
-            &format!("cannot drop primary key column '{column_name}'"),
+            format!("cannot drop primary key column '{column_name}'"),
         ));
     }
 
@@ -76,5 +69,5 @@ pub async fn alter_collection_drop_column(
         &format!("ALTER COLLECTION '{name}' DROP COLUMN '{column_name}'"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER COLLECTION"))])
+    Ok(status("ALTER COLLECTION"))
 }
