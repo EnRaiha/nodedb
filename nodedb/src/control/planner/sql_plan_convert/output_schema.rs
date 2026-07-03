@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use nodedb_sql::catalog::SqlCatalog;
 use nodedb_sql::types::SqlPlan;
 use nodedb_sql::types::query::Projection;
+use nodedb_sql::types_expr::SqlExpr;
 
 use crate::control::server::response_shape::schema::{
     OutputColumn, OutputSchema, sql_data_type_to_ddl_col_type,
@@ -75,6 +76,37 @@ fn column_types_for<C: SqlCatalog>(
             .map(|c| (c.name.clone(), sql_data_type_to_ddl_col_type(&c.data_type)))
             .collect(),
         _ => HashMap::new(),
+    }
+}
+
+/// Derives an `OutputColumn` for one GROUP BY key expression.
+///
+/// Mirrors the `Projection::Column` naming rule: a bare/qualified column
+/// name's `display_name` is its last dot segment while `lookup_key` keeps
+/// the full qualified form; any other expression shape falls back to
+/// `DdlColType::Text` with no resolvable name, using the group index as a
+/// stable placeholder lookup key.
+fn group_by_key_column(expr: &SqlExpr, index: usize) -> OutputColumn {
+    match expr {
+        SqlExpr::Column { table, name } => {
+            let lookup_key = match table {
+                Some(t) => format!("{t}.{name}"),
+                None => name.clone(),
+            };
+            OutputColumn {
+                display_name: name.clone(),
+                lookup_key,
+                ty: DdlColType::Text,
+            }
+        }
+        _ => {
+            let placeholder = format!("group_{index}");
+            OutputColumn {
+                display_name: placeholder.clone(),
+                lookup_key: placeholder,
+                ty: DdlColType::Text,
+            }
+        }
     }
 }
 
@@ -153,8 +185,95 @@ pub fn build_output_schema<C: SqlCatalog>(
                 .collect(),
             is_star: false,
         },
-        // Other plan variants (Aggregate, Union, VectorSearch, HybridSearch,
-        // Match, etc.) are handled by later units in this effort.
+        SqlPlan::Aggregate {
+            group_by,
+            aggregates,
+            ..
+        } => {
+            let mut columns = Vec::with_capacity(group_by.len() + aggregates.len());
+            for (index, key) in group_by.iter().enumerate() {
+                columns.push(group_by_key_column(key, index));
+            }
+            for agg in aggregates {
+                // `AggregateExpr::alias` is always populated by the planner:
+                // either the user's explicit alias, or (for unnamed
+                // projections) the lowercased unparsed expression text —
+                // e.g. `count(*)` — matching
+                // `response_shape::project::expr_column_names`'s own
+                // lowercasing of non-column expressions. So the alias is
+                // already the canonical name; no separate derivation needed.
+                let ty = if agg.function.eq_ignore_ascii_case("count") {
+                    DdlColType::Int8
+                } else {
+                    DdlColType::Text
+                };
+                columns.push(OutputColumn {
+                    display_name: agg.alias.clone(),
+                    lookup_key: agg.alias.clone(),
+                    ty,
+                });
+            }
+            OutputSchema {
+                columns,
+                is_star: false,
+            }
+        }
+        // Set operations take their column names/types from the first
+        // (left) branch, matching standard SQL set-op semantics.
+        SqlPlan::Union { inputs, .. } => match inputs.first() {
+            Some(first) => build_output_schema(std::slice::from_ref(first), catalog, database_id),
+            None => OutputSchema::default(),
+        },
+        SqlPlan::Intersect { left, .. } | SqlPlan::Except { left, .. } => {
+            build_output_schema(std::slice::from_ref(left.as_ref()), catalog, database_id)
+        }
+        SqlPlan::RecursiveValue { columns, .. } => OutputSchema {
+            columns: columns
+                .iter()
+                .map(|name| OutputColumn {
+                    display_name: name.clone(),
+                    lookup_key: name.clone(),
+                    ty: DdlColType::Text,
+                })
+                .collect(),
+            is_star: false,
+        },
+        // The outer query determines the final projected shape; the CTE
+        // definitions themselves are only inputs to it.
+        SqlPlan::Cte { outer, .. } => {
+            build_output_schema(std::slice::from_ref(outer.as_ref()), catalog, database_id)
+        }
+        SqlPlan::LateralTopK { projection, .. } | SqlPlan::LateralLoop { projection, .. } => {
+            // No single source collection spans both outer and inner rows;
+            // default every projected field to `Text` rather than picking
+            // one side's catalog arbitrarily.
+            let types = HashMap::new();
+            schema_from_projection(projection, &types)
+        }
+        SqlPlan::ArraySlice {
+            attr_projection, ..
+        }
+        | SqlPlan::ArrayProject {
+            attr_projection, ..
+        } => OutputSchema {
+            columns: attr_projection
+                .iter()
+                .map(|name| OutputColumn {
+                    display_name: name.clone(),
+                    lookup_key: name.clone(),
+                    ty: DdlColType::Text,
+                })
+                .collect(),
+            is_star: false,
+        },
+        // `Merge` carries no output projection (it reports affected-row
+        // counts, optionally with `RETURNING`, which isn't a static column
+        // list on the plan) and `ArrayAgg` / `ArrayElementwise` compute a
+        // single synthesized value column with no name carried on the plan
+        // either; both are left to a later unit rather than guessed here.
+        //
+        // Other plan variants (VectorSearch, HybridSearch, Match, etc.) are
+        // handled by later units in this effort.
         _ => OutputSchema {
             columns: Vec::new(),
             is_star: false,
@@ -236,6 +355,106 @@ mod tests {
         assert_eq!(schema.columns[0].display_name, "a");
         assert_eq!(schema.columns[0].lookup_key, "a");
         assert_eq!(schema.columns[1].display_name, "b");
+        assert!(!schema.is_star);
+    }
+
+    /// Minimal `Scan` plan against `collection`, used only to exercise
+    /// recursion (Union/Intersect/Except/Cte); the catalog is `NoCatalog`
+    /// so every column falls back to `DdlColType::Text`.
+    fn scan_plan(collection: &str, projection: Vec<Projection>) -> SqlPlan {
+        SqlPlan::Scan {
+            collection: collection.to_string(),
+            alias: None,
+            engine: nodedb_sql::types::query::EngineType::DocumentSchemaless,
+            filters: Vec::new(),
+            projection,
+            sort_keys: Vec::new(),
+            limit: None,
+            offset: 0,
+            distinct: false,
+            window_functions: Vec::new(),
+            temporal: nodedb_sql::temporal::TemporalScope::default(),
+        }
+    }
+
+    #[test]
+    fn aggregate_outputs_group_keys_then_aggregates_in_order() {
+        use nodedb_sql::types::query::AggregateExpr;
+
+        let plans = vec![SqlPlan::Aggregate {
+            input: Box::new(scan_plan("orders", vec![])),
+            group_by: vec![SqlExpr::Column {
+                table: None,
+                name: "status".to_string(),
+            }],
+            aggregates: vec![
+                AggregateExpr {
+                    function: "sum".to_string(),
+                    args: vec![SqlExpr::Column {
+                        table: None,
+                        name: "x".to_string(),
+                    }],
+                    alias: "total".to_string(),
+                    distinct: false,
+                    grouping_col_index: None,
+                },
+                AggregateExpr {
+                    function: "count".to_string(),
+                    args: vec![SqlExpr::Wildcard],
+                    alias: "count(*)".to_string(),
+                    distinct: false,
+                    grouping_col_index: None,
+                },
+            ],
+            having: Vec::new(),
+            limit: 0,
+            grouping_sets: None,
+            sort_keys: Vec::new(),
+        }];
+
+        let schema = build_output_schema(&plans, &NoCatalog, nodedb_types::DatabaseId::DEFAULT);
+        assert_eq!(schema.columns.len(), 3);
+        assert_eq!(schema.columns[0].display_name, "status");
+        assert_eq!(schema.columns[0].lookup_key, "status");
+        assert_eq!(schema.columns[1].display_name, "total");
+        assert_eq!(schema.columns[1].lookup_key, "total");
+        assert_eq!(schema.columns[1].ty, DdlColType::Text);
+        assert_eq!(schema.columns[2].display_name, "count(*)");
+        assert_eq!(schema.columns[2].lookup_key, "count(*)");
+        assert_eq!(schema.columns[2].ty, DdlColType::Int8);
+        assert!(!schema.is_star);
+    }
+
+    #[test]
+    fn union_takes_schema_from_first_input() {
+        let plans = vec![SqlPlan::Union {
+            inputs: vec![
+                scan_plan("a", vec![Projection::Column("id".to_string())]),
+                scan_plan("b", vec![Projection::Column("other".to_string())]),
+            ],
+            distinct: false,
+        }];
+        let schema = build_output_schema(&plans, &NoCatalog, nodedb_types::DatabaseId::DEFAULT);
+        assert_eq!(schema.columns.len(), 1);
+        assert_eq!(schema.columns[0].display_name, "id");
+    }
+
+    #[test]
+    fn recursive_value_columns_map_to_text_output_columns() {
+        let plans = vec![SqlPlan::RecursiveValue {
+            cte_name: "c".to_string(),
+            columns: vec!["n".to_string()],
+            init_exprs: vec!["1".to_string()],
+            step_exprs: vec!["n + 1".to_string()],
+            condition: None,
+            max_depth: 100,
+            distinct: false,
+        }];
+        let schema = build_output_schema(&plans, &NoCatalog, nodedb_types::DatabaseId::DEFAULT);
+        assert_eq!(schema.columns.len(), 1);
+        assert_eq!(schema.columns[0].display_name, "n");
+        assert_eq!(schema.columns[0].lookup_key, "n");
+        assert_eq!(schema.columns[0].ty, DdlColType::Text);
         assert!(!schema.is_star);
     }
 }
