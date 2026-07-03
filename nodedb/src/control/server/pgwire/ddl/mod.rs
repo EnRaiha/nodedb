@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-pub mod apikey;
-pub mod auth_key_ddl;
-pub mod auth_user_ddl;
-pub mod blacklist_ddl;
 pub mod bulk;
 pub mod catalog_propose;
 pub mod collection;

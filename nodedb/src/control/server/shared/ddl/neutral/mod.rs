@@ -8,7 +8,11 @@
 //! delegation in the parent [`super::dispatch`] handles it.
 
 pub mod alert;
+pub mod apikey;
+pub mod auth_key;
 mod auth_support;
+pub mod auth_user;
+pub mod blacklist;
 pub mod change_stream;
 pub mod cluster;
 pub mod constraint;

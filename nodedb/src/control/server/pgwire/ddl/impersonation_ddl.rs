@@ -135,7 +135,9 @@ pub fn delegate(
         .iter()
         .position(|p| p.to_uppercase() == "EXPIRES")
         .and_then(|i| parts.get(i + 1))
-        .and_then(|s| crate::control::server::pgwire::ddl::auth_user_ddl::parse_duration_public(s))
+        .and_then(|s| {
+            crate::control::server::shared::ddl::neutral::auth_user::parse_duration_public(s)
+        })
         .unwrap_or(86_400); // Default 1 day.
 
     let reason = parts

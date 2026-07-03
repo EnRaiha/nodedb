@@ -1,39 +1,48 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Auth-scoped API key DDL commands.
+//! Protocol-neutral auth-scoped API key DDL commands.
 //!
 //! ```sql
 //! CREATE AUTH KEY FOR AUTH USER 'x' WITH SCOPES 'profile:read' [RATE_LIMIT 100] [EXPIRES 30d]
 //! ROTATE AUTH KEY '<key_id>' [OVERLAP 24h]
 //! LIST AUTH KEYS [FOR AUTH USER 'x']
 //! ```
+//!
+//! Ported from the pgwire `ddl::auth_key_ddl` handlers. The superuser gate,
+//! token creation / rotation, listing, and `audit_record` side effects are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `QueryResponse` to the protocol-neutral [`DdlResult`] over
+//! [`ShapedRows`].
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
-use super::super::types::{sqlstate_error, text_field};
+use super::super::result::{DdlError, DdlResult};
+
+/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
+/// the pgwire handlers produced.
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// CREATE AUTH KEY FOR AUTH USER '<id>' WITH SCOPES '...' [RATE_LIMIT N] [EXPIRES Nd]
 pub fn create_auth_key(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
     // CREATE AUTH KEY FOR AUTH USER '<id>' ...
     if parts.len() < 6 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: CREATE AUTH KEY FOR AUTH USER '<id>' [WITH SCOPES '...'] [RATE_LIMIT N] [EXPIRES Nd]",
         ));
@@ -91,13 +100,14 @@ pub fn create_auth_key(
         &format!("created auth API key for user '{auth_user_id}'"),
     );
 
-    let schema = Arc::new(vec![text_field("auth_api_key")]);
-    let mut enc = DataRowEncoder::new(schema.clone());
-    let _ = enc.encode_field(&token);
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(enc.take_row())]),
-    ))])
+    let mut row = Map::new();
+    row.insert("auth_api_key".to_string(), JsonValue::String(token));
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["auth_api_key".to_string()],
+        column_types: vec![DdlColType::Text],
+        rows: vec![row],
+        notice: None,
+    })])
 }
 
 /// ROTATE AUTH KEY '<key_id>' [OVERLAP 24h]
@@ -105,15 +115,12 @@ pub fn rotate_auth_key(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
     if parts.len() < 4 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: ROTATE AUTH KEY '<key_id>' [OVERLAP 24h]",
         ));
@@ -129,7 +136,7 @@ pub fn rotate_auth_key(
     let new_token = state
         .auth_api_keys
         .rotate(key_id, overlap_hours)
-        .ok_or_else(|| sqlstate_error("42704", &format!("auth key '{key_id}' not found")))?;
+        .ok_or_else(|| err("42704", format!("auth key '{key_id}' not found")))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::PrivilegeChange,
@@ -138,13 +145,14 @@ pub fn rotate_auth_key(
         &format!("rotated auth key '{key_id}' (overlap {overlap_hours}h)"),
     );
 
-    let schema = Arc::new(vec![text_field("new_auth_api_key")]);
-    let mut enc = DataRowEncoder::new(schema.clone());
-    let _ = enc.encode_field(&new_token);
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(enc.take_row())]),
-    ))])
+    let mut row = Map::new();
+    row.insert("new_auth_api_key".to_string(), JsonValue::String(new_token));
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["new_auth_api_key".to_string()],
+        column_types: vec![DdlColType::Text],
+        rows: vec![row],
+        notice: None,
+    })])
 }
 
 /// LIST AUTH KEYS [FOR AUTH USER '<id>']
@@ -152,7 +160,7 @@ pub fn list_auth_keys(
     state: &SharedState,
     _identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let user_filter = parts
         .iter()
         .position(|p| p.to_uppercase() == "USER")
@@ -165,41 +173,59 @@ pub fn list_auth_keys(
         state.auth_api_keys.list_all()
     };
 
-    let schema = Arc::new(vec![
-        text_field("key_id"),
-        text_field("auth_user_id"),
-        text_field("scopes"),
-        text_field("rate_limit"),
-        text_field("expires_at"),
-        text_field("last_used_at"),
-        text_field("last_used_ip"),
-    ]);
+    let columns = vec![
+        "key_id".to_string(),
+        "auth_user_id".to_string(),
+        "scopes".to_string(),
+        "rate_limit".to_string(),
+        "expires_at".to_string(),
+        "last_used_at".to_string(),
+        "last_used_ip".to_string(),
+    ];
+    let column_types = ShapedRows::text_types(columns.len());
 
     let rows: Vec<_> = keys
         .iter()
         .map(|k| {
-            let mut enc = DataRowEncoder::new(schema.clone());
-            let _ = enc.encode_field(&k.key_id);
-            let _ = enc.encode_field(&k.auth_user_id);
-            let _ = enc.encode_field(&k.scopes.join(", "));
-            let _ = enc.encode_field(&k.rate_limit_qps.to_string());
-            let _ = enc.encode_field(&if k.expires_at == 0 {
-                "never".into()
-            } else {
-                k.expires_at.to_string()
-            });
-            let _ = enc.encode_field(&if k.last_used_at == 0 {
-                "never".into()
-            } else {
-                k.last_used_at.to_string()
-            });
-            let _ = enc.encode_field(&k.last_used_ip);
-            Ok(enc.take_row())
+            let mut row = Map::new();
+            row.insert("key_id".to_string(), JsonValue::String(k.key_id.clone()));
+            row.insert(
+                "auth_user_id".to_string(),
+                JsonValue::String(k.auth_user_id.clone()),
+            );
+            row.insert("scopes".to_string(), JsonValue::String(k.scopes.join(", ")));
+            row.insert(
+                "rate_limit".to_string(),
+                JsonValue::String(k.rate_limit_qps.to_string()),
+            );
+            row.insert(
+                "expires_at".to_string(),
+                JsonValue::String(if k.expires_at == 0 {
+                    "never".into()
+                } else {
+                    k.expires_at.to_string()
+                }),
+            );
+            row.insert(
+                "last_used_at".to_string(),
+                JsonValue::String(if k.last_used_at == 0 {
+                    "never".into()
+                } else {
+                    k.last_used_at.to_string()
+                }),
+            );
+            row.insert(
+                "last_used_ip".to_string(),
+                JsonValue::String(k.last_used_ip.clone()),
+            );
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }

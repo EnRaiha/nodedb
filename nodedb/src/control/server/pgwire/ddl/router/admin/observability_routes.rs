@@ -14,32 +14,14 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
 pub(super) fn dispatch(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
+    _state: &SharedState,
+    _identity: &AuthenticatedIdentity,
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
 ) -> Option<PgWireResult<Vec<Response>>> {
-    // API keys.
-    if upper.starts_with("CREATE API KEY ") {
-        return Some(super::super::super::apikey::create_api_key(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("REVOKE API KEY ") {
-        return Some(super::super::super::apikey::revoke_api_key(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("LIST API KEYS") {
-        return Some(super::super::super::apikey::list_api_keys(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW API KEYS") {
-        return Some(super::super::super::apikey::list_api_keys(
-            state, identity, parts,
-        ));
-    }
+    // API keys (CREATE / REVOKE / LIST / SHOW API KEY[S]) have been migrated to
+    // the protocol-neutral router (`shared::ddl::neutral::apikey`), which is
+    // tried before this transitional pgwire delegation runs.
 
     // Cluster management & observability DDL has been migrated to the
     // protocol-neutral router (`shared::ddl::neutral::cluster`), which is

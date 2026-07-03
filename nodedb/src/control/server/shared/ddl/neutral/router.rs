@@ -17,6 +17,10 @@ use crate::types::DatabaseId;
 
 use super::super::result::{DdlError, DdlResult};
 use super::alert::{self, CreateAlertRequest};
+use super::apikey;
+use super::auth_key;
+use super::auth_user;
+use super::blacklist;
 use super::change_stream;
 use super::cluster;
 use super::constraint;
@@ -113,6 +117,63 @@ pub async fn try_dispatch(
         return Some(service_account::alter_service_account_set_databases(
             state, identity, &parts,
         ));
+    }
+
+    // Auth-admin DDL families (API keys, auth-scoped API keys, auth user
+    // management, blacklist). None of these parse into any typed AST variant —
+    // the pgwire admin router dispatched all of them by string prefix from the
+    // raw token slice. Replicate that exactly here, before the parse gate, so
+    // the prefix recognition and syntax messages stay byte-identical. The
+    // `BLACKLIST ` prefix intentionally precedes the (non-migrated) emergency
+    // `BLACKLIST AUTH USERS WHERE` handler exactly as it did in the pgwire admin
+    // router, so the shadowing behavior is unchanged.
+    if upper.starts_with("CREATE API KEY ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(apikey::create_api_key(state, identity, &parts));
+    }
+    if upper.starts_with("REVOKE API KEY ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(apikey::revoke_api_key(state, identity, &parts));
+    }
+    if upper.starts_with("LIST API KEYS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(apikey::list_api_keys(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW API KEYS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(apikey::list_api_keys(state, identity, &parts));
+    }
+    if upper.starts_with("CREATE AUTH KEY ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(auth_key::create_auth_key(state, identity, &parts));
+    }
+    if upper.starts_with("ROTATE AUTH KEY ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(auth_key::rotate_auth_key(state, identity, &parts));
+    }
+    if upper.starts_with("LIST AUTH KEYS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(auth_key::list_auth_keys(state, identity, &parts));
+    }
+    if upper.starts_with("DEACTIVATE AUTH USER ") || upper.starts_with("ALTER AUTH USER ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(auth_user::handle_auth_user(state, identity, &parts));
+    }
+    if upper.starts_with("PURGE AUTH USERS ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(auth_user::purge_auth_users(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW AUTH USERS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(auth_user::show_auth_users(state, identity, &parts));
+    }
+    if upper.starts_with("BLACKLIST ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(blacklist::handle_blacklist(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW BLACKLIST") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(blacklist::show_blacklist(state, identity, &parts));
     }
 
     // Stored procedures. None of `CREATE [OR REPLACE] PROCEDURE`, `DROP

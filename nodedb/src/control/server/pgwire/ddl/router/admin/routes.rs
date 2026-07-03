@@ -52,34 +52,11 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // served by the protocol-neutral DDL router; the pgwire router no longer
     // routes them.
 
-    // Blacklist management.
-    if upper.starts_with("BLACKLIST ") {
-        return Some(super::super::super::blacklist_ddl::handle_blacklist(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW BLACKLIST") {
-        return Some(super::super::super::blacklist_ddl::show_blacklist(
-            state, identity, parts,
-        ));
-    }
-
-    // Auth user management (JIT-provisioned users).
-    if upper.starts_with("DEACTIVATE AUTH USER ") || upper.starts_with("ALTER AUTH USER ") {
-        return Some(super::super::super::auth_user_ddl::handle_auth_user(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("PURGE AUTH USERS ") {
-        return Some(super::super::super::auth_user_ddl::purge_auth_users(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW AUTH USERS") {
-        return Some(super::super::super::auth_user_ddl::show_auth_users(
-            state, identity, parts,
-        ));
-    }
+    // Blacklist management (BLACKLIST ..., SHOW BLACKLIST) and auth user
+    // management (DEACTIVATE / ALTER AUTH USER, PURGE AUTH USERS, SHOW AUTH
+    // USERS) have been migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::blacklist` / `shared::ddl::neutral::auth_user`),
+    // which is tried before this transitional pgwire delegation runs.
 
     // Organization management.
     if upper.starts_with("CREATE ORG ")
@@ -174,22 +151,10 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
         ));
     }
 
-    // Auth-scoped API keys.
-    if upper.starts_with("CREATE AUTH KEY ") {
-        return Some(super::super::super::auth_key_ddl::create_auth_key(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("ROTATE AUTH KEY ") {
-        return Some(super::super::super::auth_key_ddl::rotate_auth_key(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("LIST AUTH KEYS") {
-        return Some(super::super::super::auth_key_ddl::list_auth_keys(
-            state, identity, parts,
-        ));
-    }
+    // Auth-scoped API keys (CREATE / ROTATE / LIST AUTH KEY[S]) have been
+    // migrated to the protocol-neutral router
+    // (`shared::ddl::neutral::auth_key`), which is tried before this
+    // transitional pgwire delegation runs.
 
     // Impersonation & delegation.
     if upper.starts_with("IMPERSONATE AUTH USER ") {

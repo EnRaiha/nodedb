@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Blacklist DDL commands.
+//! Protocol-neutral blacklist DDL commands.
 //!
 //! ```sql
 //! BLACKLIST AUTH USER 'user_42' [UNTIL '2026-12-31T00:00:00Z'] REASON 'spam'
@@ -8,33 +8,50 @@
 //! BLACKLIST IP '10.0.0.0/8' REASON 'blocked network'
 //! SHOW BLACKLIST [IP | USER | ALL]
 //! ```
+//!
+//! Ported from the pgwire `ddl::blacklist_ddl` handlers. The superuser gate,
+//! blacklist-registry mutations, `WITH KILL SESSIONS` session termination, and
+//! `audit_record` side effects are preserved verbatim; only the result
+//! construction changed from pgwire `Response` / `QueryResponse` / `Tag` to the
+//! protocol-neutral [`DdlResult`] over [`ShapedRows`].
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
-use super::super::types::{sqlstate_error, text_field};
+use super::super::result::{DdlError, DdlResult};
+
+/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
+/// the pgwire handlers produced.
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
+
+/// Build a single-tag status result.
+fn status(command: &str) -> Vec<DdlResult> {
+    vec![DdlResult::Status {
+        command: command.to_string(),
+        rows_affected: None,
+    }]
+}
 
 /// Handle BLACKLIST commands (AUTH USER or IP).
 pub fn handle_blacklist(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
 
     if parts.len() < 3 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: BLACKLIST AUTH USER '<id>' [UNTIL '<timestamp>'] REASON '<reason>' | BLACKLIST IP '<addr>' REASON '<reason>'",
         ));
@@ -44,7 +61,7 @@ pub fn handle_blacklist(
     match upper1.as_str() {
         "AUTH" => handle_blacklist_user(state, identity, parts),
         "IP" => handle_blacklist_ip(state, identity, parts),
-        _ => Err(sqlstate_error(
+        _ => Err(err(
             "42601",
             "expected: BLACKLIST AUTH USER ... or BLACKLIST IP ...",
         )),
@@ -56,10 +73,10 @@ fn handle_blacklist_user(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // BLACKLIST AUTH USER '<id>' ...
     if parts.len() < 4 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: BLACKLIST AUTH USER '<id>' REASON '<reason>'",
         ));
@@ -73,7 +90,7 @@ fn handle_blacklist_user(
     state
         .blacklist
         .blacklist_user(user_id, &reason, &identity.username, expires_at)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     // WITH KILL SESSIONS — terminate active sessions immediately.
     let kill_sessions = parts.iter().any(|p| p.to_uppercase() == "KILL");
@@ -97,7 +114,7 @@ fn handle_blacklist_user(
         &format!("blacklisted user '{user_id}': {reason}{kill_msg}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("BLACKLIST"))])
+    Ok(status("BLACKLIST"))
 }
 
 /// BLACKLIST IP '<addr_or_cidr>' REASON '<reason>'
@@ -105,9 +122,9 @@ fn handle_blacklist_ip(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 3 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: BLACKLIST IP '<addr>' REASON '<reason>'",
         ));
@@ -120,7 +137,7 @@ fn handle_blacklist_ip(
     state
         .blacklist
         .blacklist_ip(addr, &reason, &identity.username, expires_at)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -129,7 +146,7 @@ fn handle_blacklist_ip(
         &format!("blacklisted IP '{addr}': {reason}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("BLACKLIST"))])
+    Ok(status("BLACKLIST"))
 }
 
 /// SHOW BLACKLIST [IP | USER | ALL]
@@ -137,12 +154,9 @@ pub fn show_blacklist(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
 
     let kind_filter = parts
@@ -156,37 +170,49 @@ pub fn show_blacklist(
 
     let entries = state.blacklist.list(kind_filter);
 
-    let schema = Arc::new(vec![
-        text_field("key"),
-        text_field("kind"),
-        text_field("reason"),
-        text_field("created_by"),
-        text_field("created_at"),
-        text_field("expires_at"),
-    ]);
+    let columns = vec![
+        "key".to_string(),
+        "kind".to_string(),
+        "reason".to_string(),
+        "created_by".to_string(),
+        "created_at".to_string(),
+        "expires_at".to_string(),
+    ];
+    let column_types = ShapedRows::text_types(columns.len());
 
     let rows: Vec<_> = entries
         .iter()
         .map(|e| {
-            let mut enc = DataRowEncoder::new(schema.clone());
-            let _ = enc.encode_field(&e.key);
-            let _ = enc.encode_field(&e.kind);
-            let _ = enc.encode_field(&e.reason);
-            let _ = enc.encode_field(&e.created_by);
-            let _ = enc.encode_field(&e.created_at.to_string());
-            let _ = enc.encode_field(&if e.expires_at == 0 {
-                "permanent".to_string()
-            } else {
-                e.expires_at.to_string()
-            });
-            Ok(enc.take_row())
+            let mut row = Map::new();
+            row.insert("key".to_string(), JsonValue::String(e.key.clone()));
+            row.insert("kind".to_string(), JsonValue::String(e.kind.clone()));
+            row.insert("reason".to_string(), JsonValue::String(e.reason.clone()));
+            row.insert(
+                "created_by".to_string(),
+                JsonValue::String(e.created_by.clone()),
+            );
+            row.insert(
+                "created_at".to_string(),
+                JsonValue::String(e.created_at.to_string()),
+            );
+            row.insert(
+                "expires_at".to_string(),
+                JsonValue::String(if e.expires_at == 0 {
+                    "permanent".to_string()
+                } else {
+                    e.expires_at.to_string()
+                }),
+            );
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
 
 /// Extract UNTIL timestamp from parts. Returns 0 (permanent) if not present.

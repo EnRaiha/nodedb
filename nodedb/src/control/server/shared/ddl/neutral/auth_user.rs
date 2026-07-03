@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Auth user management DDL commands (JIT-provisioned users).
+//! Protocol-neutral auth user management DDL commands (JIT-provisioned users).
 //!
 //! ```sql
 //! ALTER AUTH USER 'user_42' SET STATUS active|suspended|banned|restricted|read_only
@@ -8,37 +8,54 @@
 //! PURGE AUTH USERS INACTIVE FOR 90d
 //! SHOW AUTH USERS
 //! ```
+//!
+//! Ported from the pgwire `ddl::auth_user_ddl` handlers. The superuser gate,
+//! status parsing, auth-user store mutations, and `audit_record` side effects
+//! are preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `QueryResponse` / `Tag` to the protocol-neutral [`DdlResult`]
+//! over [`ShapedRows`].
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::auth_context::AuthStatus;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
-use super::super::types::{sqlstate_error, text_field};
+use super::super::result::{DdlError, DdlResult};
+
+/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
+/// the pgwire handlers produced.
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
+
+/// Build a single-tag status result.
+fn status(command: impl Into<String>) -> Vec<DdlResult> {
+    vec![DdlResult::Status {
+        command: command.into(),
+        rows_affected: None,
+    }]
+}
 
 /// Handle ALTER AUTH USER or DEACTIVATE AUTH USER commands.
 pub fn handle_auth_user(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
 
     let upper0 = parts.first().map(|s| s.to_uppercase()).unwrap_or_default();
     match upper0.as_str() {
         "DEACTIVATE" => deactivate_auth_user(state, identity, parts),
         "ALTER" => alter_auth_user_status(state, identity, parts),
-        _ => Err(sqlstate_error(
+        _ => Err(err(
             "42601",
             "expected ALTER AUTH USER or DEACTIVATE AUTH USER",
         )),
@@ -50,13 +67,10 @@ fn deactivate_auth_user(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // DEACTIVATE AUTH USER '<id>'
     if parts.len() < 4 {
-        return Err(sqlstate_error(
-            "42601",
-            "syntax: DEACTIVATE AUTH USER '<user_id>'",
-        ));
+        return Err(err("42601", "syntax: DEACTIVATE AUTH USER '<user_id>'"));
     }
 
     let user_id = parts[3].trim_matches('\'');
@@ -64,13 +78,10 @@ fn deactivate_auth_user(
     let found = state
         .auth_users
         .deactivate(user_id)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     if !found {
-        return Err(sqlstate_error(
-            "42704",
-            &format!("auth user '{user_id}' not found"),
-        ));
+        return Err(err("42704", format!("auth user '{user_id}' not found")));
     }
 
     state.audit_record(
@@ -80,7 +91,7 @@ fn deactivate_auth_user(
         &format!("deactivated auth user '{user_id}'"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("DEACTIVATE"))])
+    Ok(status("DEACTIVATE"))
 }
 
 /// ALTER AUTH USER '<user_id>' SET STATUS <status>
@@ -88,10 +99,10 @@ fn alter_auth_user_status(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // ALTER AUTH USER '<id>' SET STATUS <status>
     if parts.len() < 7 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: ALTER AUTH USER '<user_id>' SET STATUS <active|suspended|banned|restricted|read_only>",
         ));
@@ -99,30 +110,25 @@ fn alter_auth_user_status(
 
     let user_id = parts[3].trim_matches('\'');
     let status_str = parts[6].to_lowercase();
-    let status: AuthStatus = status_str
-        .parse()
-        .map_err(|e: String| sqlstate_error("42601", &e))?;
+    let status_val: AuthStatus = status_str.parse().map_err(|e: String| err("42601", e))?;
 
     let found = state
         .auth_users
-        .set_status(user_id, status)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .set_status(user_id, status_val)
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     if !found {
-        return Err(sqlstate_error(
-            "42704",
-            &format!("auth user '{user_id}' not found"),
-        ));
+        return Err(err("42704", format!("auth user '{user_id}' not found")));
     }
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
         Some(identity.tenant_id),
         &identity.username,
-        &format!("auth user '{user_id}' status set to {status}"),
+        &format!("auth user '{user_id}' status set to {status_val}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER AUTH USER"))])
+    Ok(status("ALTER AUTH USER"))
 }
 
 /// PURGE AUTH USERS INACTIVE FOR <duration>
@@ -132,17 +138,14 @@ pub fn purge_auth_users(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
 
     // PURGE AUTH USERS INACTIVE FOR <duration>
     if parts.len() < 6 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: PURGE AUTH USERS INACTIVE FOR <duration> (e.g., 90d, 24h)",
         ));
@@ -150,9 +153,9 @@ pub fn purge_auth_users(
 
     let duration_str = parts[5];
     let threshold_secs = parse_duration_secs(duration_str).ok_or_else(|| {
-        sqlstate_error(
+        err(
             "42601",
-            &format!("invalid duration: '{duration_str}'. Use 90d or 24h"),
+            format!("invalid duration: '{duration_str}'. Use 90d or 24h"),
         )
     })?;
 
@@ -165,7 +168,7 @@ pub fn purge_auth_users(
     let purged = state
         .auth_users
         .purge_inactive(cutoff)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -174,9 +177,7 @@ pub fn purge_auth_users(
         &format!("purged {purged} inactive auth users (older than {duration_str})"),
     );
 
-    Ok(vec![Response::Execution(Tag::new(&format!(
-        "PURGE {purged}"
-    )))])
+    Ok(status(format!("PURGE {purged}")))
 }
 
 /// SHOW AUTH USERS
@@ -184,47 +185,65 @@ pub fn show_auth_users(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     _parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
 
     let users = state.auth_users.list(false);
 
-    let schema = Arc::new(vec![
-        text_field("id"),
-        text_field("username"),
-        text_field("email"),
-        text_field("tenant_id"),
-        text_field("provider"),
-        text_field("status"),
-        text_field("is_active"),
-        text_field("last_seen"),
-    ]);
+    let columns = vec![
+        "id".to_string(),
+        "username".to_string(),
+        "email".to_string(),
+        "tenant_id".to_string(),
+        "provider".to_string(),
+        "status".to_string(),
+        "is_active".to_string(),
+        "last_seen".to_string(),
+    ];
+    let column_types = ShapedRows::text_types(columns.len());
 
     let rows: Vec<_> = users
         .iter()
         .map(|u| {
-            let mut enc = DataRowEncoder::new(schema.clone());
-            let _ = enc.encode_field(&u.id);
-            let _ = enc.encode_field(&u.username);
-            let _ = enc.encode_field(&u.email);
-            let _ = enc.encode_field(&u.tenant_id.to_string());
-            let _ = enc.encode_field(&u.provider);
-            let _ = enc.encode_field(&u.status.to_string());
-            let _ = enc.encode_field(&u.is_active.to_string());
-            let _ = enc.encode_field(&u.last_seen.to_string());
-            Ok(enc.take_row())
+            let mut row = Map::new();
+            row.insert("id".to_string(), JsonValue::String(u.id.clone()));
+            row.insert(
+                "username".to_string(),
+                JsonValue::String(u.username.clone()),
+            );
+            row.insert("email".to_string(), JsonValue::String(u.email.clone()));
+            row.insert(
+                "tenant_id".to_string(),
+                JsonValue::String(u.tenant_id.to_string()),
+            );
+            row.insert(
+                "provider".to_string(),
+                JsonValue::String(u.provider.clone()),
+            );
+            row.insert(
+                "status".to_string(),
+                JsonValue::String(u.status.to_string()),
+            );
+            row.insert(
+                "is_active".to_string(),
+                JsonValue::String(u.is_active.to_string()),
+            );
+            row.insert(
+                "last_seen".to_string(),
+                JsonValue::String(u.last_seen.to_string()),
+            );
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
 
 /// Public re-export of duration parser for use by other DDL modules.

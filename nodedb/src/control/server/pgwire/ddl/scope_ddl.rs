@@ -320,10 +320,10 @@ pub fn renew_scope(
     let grantee_id = parts[5].trim_matches('\'');
     let duration_str = parts[7];
     let extend_secs =
-        crate::control::server::pgwire::ddl::auth_user_ddl::parse_duration_public(duration_str)
-            .ok_or_else(|| {
-                sqlstate_error("42601", &format!("invalid duration: '{duration_str}'"))
-            })?;
+        crate::control::server::shared::ddl::neutral::auth_user::parse_duration_public(
+            duration_str,
+        )
+        .ok_or_else(|| sqlstate_error("42601", &format!("invalid duration: '{duration_str}'")))?;
 
     let found = state
         .scope_grants
@@ -354,7 +354,7 @@ pub fn show_scope_grants(
     let grants = if let Some(within_idx) = parts.iter().position(|p| p.to_uppercase() == "WITHIN") {
         let dur_str = parts.get(within_idx + 1).unwrap_or(&"7d");
         let secs =
-            crate::control::server::pgwire::ddl::auth_user_ddl::parse_duration_public(dur_str)
+            crate::control::server::shared::ddl::neutral::auth_user::parse_duration_public(dur_str)
                 .unwrap_or(7 * 86_400);
         state.scope_grants.expiring_within(secs)
     } else {
@@ -419,7 +419,9 @@ fn parse_grace_period(parts: &[&str]) -> u64 {
                 None
             }
         })
-        .and_then(|s| crate::control::server::pgwire::ddl::auth_user_ddl::parse_duration_public(s))
+        .and_then(|s| {
+            crate::control::server::shared::ddl::neutral::auth_user::parse_duration_public(s)
+        })
         .unwrap_or(0)
 }
 
