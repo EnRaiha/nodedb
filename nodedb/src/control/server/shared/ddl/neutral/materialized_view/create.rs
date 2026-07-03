@@ -144,11 +144,9 @@ pub async fn create_materialized_view(
         propose_and_apply(state, &coll_entry)?;
         // Register the target with this node's Data Plane so writes
         // encode correctly and scans can find the collection.
-        crate::control::server::pgwire::ddl::collection::dispatch_register_from_stored(
-            state, &target,
-        )
-        .await
-        .map_err(|e| err("XX000", e.to_string()))?;
+        super::super::collection::dispatch_register_from_stored(state, &target)
+            .await
+            .map_err(|e| err("XX000", e.to_string()))?;
     }
 
     tracing::info!(

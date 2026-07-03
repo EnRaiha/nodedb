@@ -2,38 +2,40 @@
 
 //! Shared implementation behind `CREATE COLLECTION` and `CREATE TABLE`.
 //!
-//! The two surface DDLs differ in only five places: the error label
-//! ("collection" vs "table"), whether an empty column list is allowed,
-//! the default `CollectionType` when no engine is named (schemaless
-//! vs strict), the audit-log verb, and the pgwire response tag.
-//! Everything in between — name validation, duplicate check, engine
-//! validation, schema construction, vector-primary parsing, flag
-//! validation, `StoredCollection` assembly, propose+apply, SERIAL
-//! sequence auto-creation, vector-field auto-config — is identical.
+//! Relocated verbatim from the pgwire `pgwire::ddl::collection::create::build`
+//! module (now deleted). The two surface DDLs differ in only five places: the
+//! error label ("collection" vs "table"), whether an empty column list is
+//! allowed, the default `CollectionType` when no engine is named (schemaless
+//! vs strict), the audit-log verb, and the response tag. Everything in
+//! between — name validation, duplicate check, engine validation, schema
+//! construction, vector-primary parsing, flag validation, `StoredCollection`
+//! assembly, propose+apply, SERIAL sequence auto-creation, vector-field
+//! auto-config — is identical, and is preserved verbatim here; only the
+//! result construction changed from pgwire `Response` / `PgWireError` to the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
-//! Inlining all of it in two sibling files gave us a 270-line file in
-//! `handler.rs` and a 269-line near-copy in `table.rs` whose only real
-//! difference was the five points above; any cross-cutting fix had to
-//! be made twice and stayed in sync only by reviewer vigilance.
-//! [`build_and_persist`] is the single body; [`Variant`] supplies the
-//! five differences declaratively.
+//! [`build_and_persist`] is the single body; [`Variant`] supplies the five
+//! differences declaratively.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::StoredCollection;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::super::types::sqlstate_error;
-use super::super::super::schema_validation::{
-    extract_vector_fields, parse_fields_clause_from_pairs,
-};
-use super::enforcement::{parse_balanced_clause_from_raw, resolve_custom_type_columns};
+use super::super::super::super::catalog::propose_and_apply;
+use super::super::super::super::result::{DdlError, DdlResult};
+use super::super::enforcement::{parse_balanced_clause_from_raw, resolve_custom_type_columns};
 use super::engine_option::validate_engine_name;
 use super::request::CreateCollectionRequest;
+
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
+    }
+}
 
 /// Per-surface configuration. The fields are the entire surface-level
 /// difference between `CREATE COLLECTION` and `CREATE TABLE`.
@@ -42,7 +44,7 @@ pub struct Variant {
     /// error messages and in the audit log entry.
     /// `"collection"` for CREATE COLLECTION, `"table"` for CREATE TABLE.
     pub label: &'static str,
-    /// pgwire response tag returned on success.
+    /// Response tag returned on success.
     /// `"CREATE COLLECTION"` / `"CREATE TABLE"`.
     pub response_tag: &'static str,
     /// CREATE TABLE requires a column list by convention; CREATE
@@ -64,7 +66,7 @@ pub async fn build_and_persist(
     req: &CreateCollectionRequest<'_>,
     database_id: DatabaseId,
     variant: &Variant,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let CreateCollectionRequest {
         name,
         engine,
@@ -76,9 +78,10 @@ pub async fn build_and_persist(
 
     validate_name(name, variant.label)?;
     if variant.require_columns && columns.is_empty() {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
-            "CREATE TABLE requires a column list; for schemaless collections use CREATE COLLECTION",
+            "CREATE TABLE requires a column list; for schemaless collections use CREATE COLLECTION"
+                .to_string(),
         ));
     }
 
@@ -89,9 +92,9 @@ pub async fn build_and_persist(
         && let Ok(Some(existing)) = catalog.get_collection(database_id, tenant_id.as_u64(), name)
     {
         if existing.is_active {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42P07",
-                &format!("{} '{name}' already exists", variant.label),
+                format!("{} '{name}' already exists", variant.label),
             ));
         }
 
@@ -113,9 +116,14 @@ pub async fn build_and_persist(
         // catalog row, ABORT the CREATE rather than build a new
         // collection over un-purged data (which would resurrect the
         // stale rows). Surface as an internal error to the client.
-        super::super::purge::hard_purge_collection(state, tenant_id.as_u64(), name, purge_lsn)
-            .await
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        crate::control::server::pgwire::ddl::collection::purge::hard_purge_collection(
+            state,
+            tenant_id.as_u64(),
+            name,
+            purge_lsn,
+        )
+        .await
+        .map_err(|e| err("XX000", e.to_string()))?;
     }
 
     let now = std::time::SystemTime::now()
@@ -138,9 +146,12 @@ pub async fn build_and_persist(
         bitemporal_flag,
         variant.default_strict,
     )
-    .map_err(|e| sqlstate_error("42601", &e.to_string()))?;
+    .map_err(|e| err("42601", e.to_string()))?;
 
-    let (mut fields, serial_fields) = parse_fields_clause_from_pairs(columns);
+    let (mut fields, serial_fields) =
+        crate::control::server::pgwire::ddl::schema_validation::parse_fields_clause_from_pairs(
+            columns,
+        );
     if fields.is_empty() && !columnar_schema_columns.is_empty() {
         fields = columnar_schema_columns;
     }
@@ -160,10 +171,10 @@ pub async fn build_and_persist(
     let hash_chain = flags.iter().any(|f| f == "HASH_CHAIN");
     let bitemporal = bitemporal_flag;
     if hash_chain && !append_only {
-        return Err(sqlstate_error("42601", "HASH_CHAIN requires APPEND_ONLY"));
+        return Err(err("42601", "HASH_CHAIN requires APPEND_ONLY".to_string()));
     }
-    let balanced = parse_balanced_clause_from_raw(balanced_raw.unwrap_or(""))
-        .map_err(|e| sqlstate_error("42601", &e))?;
+    let balanced =
+        parse_balanced_clause_from_raw(balanced_raw.unwrap_or("")).map_err(|e| err("42601", e))?;
 
     let partition_strategy =
         nodedb_types::PartitionStrategy::default_for_collection_type(&collection_type);
@@ -220,7 +231,7 @@ pub async fn build_and_persist(
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
-    super::super::super::catalog_propose::propose_and_apply(state, &entry)?;
+    propose_and_apply(state, &entry)?;
 
     log_vector_fields(name, &coll.fields);
     create_serial_sequences(state, identity, name, &serial_fields, now)?;
@@ -232,20 +243,23 @@ pub async fn build_and_persist(
         &format!("created {} '{name}'", variant.label),
     );
 
-    Ok(vec![Response::Execution(Tag::new(variant.response_tag))])
+    Ok(vec![DdlResult::Status {
+        command: variant.response_tag.to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// Reject names that aren't `[A-Za-z0-9_-]+`. Both `collection` and
 /// `table` share the rule; only the error label differs.
-fn validate_name(name: &str, label: &str) -> PgWireResult<()> {
+fn validate_name(name: &str, label: &str) -> Result<(), DdlError> {
     if name.is_empty()
         || !name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
-            &format!(
+            format!(
                 "invalid {label} name '{name}': only letters, digits, '-', and '_' are allowed"
             ),
         ));
@@ -262,10 +276,13 @@ fn resolve_primary_engine(
     columns: &[(String, String)],
     fields: &[(String, String)],
     collection_type: &nodedb_types::CollectionType,
-) -> PgWireResult<(
-    nodedb_types::PrimaryEngine,
-    Option<nodedb_types::VectorPrimaryConfig>,
-)> {
+) -> Result<
+    (
+        nodedb_types::PrimaryEngine,
+        Option<nodedb_types::VectorPrimaryConfig>,
+    ),
+    DdlError,
+> {
     match nodedb_sql::ddl_ast::parse::vector_primary::parse_vector_primary_options_from_kvs(options)
     {
         Ok(Some(mut vp_cfg)) => {
@@ -275,12 +292,12 @@ fn resolve_primary_engine(
                 fields.to_vec()
             };
             nodedb_sql::ddl_ast::parse::vector_primary::validate_vector_field(&vp_cfg, &col_list)
-                .map_err(|e| sqlstate_error("42601", &e.to_string()))?;
+                .map_err(|e| err("42601", e.to_string()))?;
             nodedb_sql::ddl_ast::parse::vector_primary::validate_payload_indexes(
                 &mut vp_cfg,
                 &col_list,
             )
-            .map_err(|e| sqlstate_error("42601", &e.to_string()))?;
+            .map_err(|e| err("42601", e.to_string()))?;
             // Infer dim from VECTOR(n) column type when not in WITH clause.
             if let Some((_, type_str)) = col_list
                 .iter()
@@ -295,9 +312,9 @@ fn resolve_primary_engine(
                     if vp_cfg.dim == 0 {
                         vp_cfg.dim = d;
                     } else if vp_cfg.dim != d {
-                        return Err(sqlstate_error(
+                        return Err(err(
                             "42601",
-                            &format!(
+                            format!(
                                 "vector dim mismatch: WITH clause specifies {}, column type VECTOR({}) specifies {}",
                                 vp_cfg.dim, d, d
                             ),
@@ -311,14 +328,15 @@ fn resolve_primary_engine(
             nodedb_types::PrimaryEngine::infer_from_collection_type(collection_type),
             None,
         )),
-        Err(e) => Err(sqlstate_error("42601", &e.to_string())),
+        Err(e) => Err(err("42601", e.to_string())),
     }
 }
 
 /// INFO-log every detected vector field so operators can see what
 /// the engine auto-configured during a CREATE.
 fn log_vector_fields(collection_name: &str, fields: &[(String, String)]) {
-    let vector_fields = extract_vector_fields(fields);
+    let vector_fields =
+        crate::control::server::pgwire::ddl::schema_validation::extract_vector_fields(fields);
     for (field_name, _dim, metric) in &vector_fields {
         tracing::info!(
             name = %collection_name,
@@ -339,7 +357,7 @@ fn create_serial_sequences(
     collection_name: &str,
     serial_fields: &[String],
     now: u64,
-) -> PgWireResult<()> {
+) -> Result<(), DdlError> {
     for field_name in serial_fields {
         let seq_name = format!("{collection_name}_{field_name}_seq");
         let mut seq_def = crate::control::security::catalog::sequence_types::StoredSequence::new(
@@ -354,7 +372,7 @@ fn create_serial_sequences(
         // SEQUENCE has, applied to SERIAL columns.
         let seq_entry =
             crate::control::catalog_entry::CatalogEntry::PutSequence(Box::new(seq_def.clone()));
-        super::super::super::catalog_propose::propose_and_apply(state, &seq_entry)?;
+        propose_and_apply(state, &seq_entry)?;
         let _ = state.sequence_registry.create(seq_def);
         tracing::info!(
             collection = %collection_name,
@@ -364,4 +382,41 @@ fn create_serial_sequences(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Collection name validation tests. Relocated verbatim from the pgwire
+    //! `pgwire::ddl::collection::create::tests` module (now deleted).
+
+    /// Collection name validation: allowed chars are `[a-zA-Z0-9_-]`.
+    fn validate_name(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    #[test]
+    fn valid_collection_names() {
+        assert!(validate_name("docs"));
+        assert!(validate_name("my_collection"));
+        assert!(validate_name("my-collection"));
+        assert!(validate_name("Collection123"));
+        assert!(validate_name("a"));
+    }
+
+    #[test]
+    fn invalid_collection_names_rejected() {
+        // Semicolons are sent by psql in multi-statement queries —
+        // must be rejected with a clear error, not stored silently.
+        assert!(!validate_name("docs;"));
+        assert!(!validate_name("bad;name"));
+        assert!(!validate_name("bad name"));
+        assert!(!validate_name("bad.name"));
+        assert!(!validate_name("bad/name"));
+        assert!(!validate_name(""));
+        assert!(!validate_name("events;"));
+        assert!(!validate_name("orders;"));
+    }
 }

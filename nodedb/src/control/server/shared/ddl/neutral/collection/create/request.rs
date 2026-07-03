@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Parsed request struct shared by `CREATE COLLECTION` and `CREATE TABLE`.
+//!
+//! Relocated verbatim from the pgwire
+//! `pgwire::ddl::collection::create::request` module (now deleted); also used
+//! by the pgwire typed-AST router (`router/ast/async_ops.rs`) before this
+//! migration — that caller is gone now that `CreateCollection` / `CreateTable`
+//! are handled by the neutral router directly.
 
 /// Pre-parsed fields from the `nodedb-sql` AST for a `CREATE COLLECTION` /
 /// `CREATE TABLE` statement.

@@ -2,19 +2,19 @@
 
 //! `CREATE TABLE` DDL handler — strict-default Postgres-style syntax.
 //!
-//! Thin wrapper over [`super::build::build_and_persist`] — the entire
-//! validation + storage + replication body is shared with the
-//! [`super::handler::create_collection`] path; the only TABLE-specific
-//! knobs are the labels, the mandatory column list, and the
-//! strict-by-default engine mapping.
+//! Relocated verbatim from the pgwire `pgwire::ddl::collection::create::table`
+//! module (now deleted). Thin wrapper over [`super::build::build_and_persist`] —
+//! the entire validation + storage + replication body is shared with the
+//! [`super::handler::create_collection`] path; the only TABLE-specific knobs
+//! are the labels, the mandatory column list, and the strict-by-default engine
+//! mapping.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::Response;
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
+use super::super::super::super::result::{DdlError, DdlResult};
 use super::build::{Variant, build_and_persist};
 use super::request::CreateCollectionRequest;
 
@@ -32,7 +32,7 @@ pub async fn create_table(
     identity: &AuthenticatedIdentity,
     req: &CreateCollectionRequest<'_>,
     database_id: DatabaseId,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     build_and_persist(
         state,
         identity,

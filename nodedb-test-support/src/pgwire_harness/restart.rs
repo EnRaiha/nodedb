@@ -245,7 +245,7 @@ impl TestServer {
         });
 
         for coll in persisted_collections.into_iter().filter(|c| c.is_active) {
-            nodedb::control::server::pgwire::ddl::collection::create::register::dispatch_register_from_stored(
+            nodedb::control::server::shared::ddl::neutral::collection::dispatch_register_from_stored(
                 &shared,
                 &coll,
             )

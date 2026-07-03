@@ -18,13 +18,14 @@ use nodedb_types::DatabaseId;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::{StoredCollection, StoredContinuousAggregate};
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::{collection, sync_dispatch};
+use crate::control::server::pgwire::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::ContinuousAggregateDef;
 use nodedb_physical::physical_plan::MetaOp;
 
 use super::super::super::catalog::propose_and_apply;
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::collection;
 use super::parse::{extract_with_options, parse_create_sql};
 
 fn err(sqlstate: &str, message: String) -> DdlError {

@@ -34,7 +34,7 @@ pub fn put_owner_sync(stored: &StoredCollection, shared: Arc<SharedState>) {
 /// for `PutCollection` — it completes synchronously before the applied-index
 /// watcher bumps, making it part of the applied-index contract.
 pub async fn put_async(stored: StoredCollection, shared: Arc<SharedState>) {
-    match crate::control::server::pgwire::ddl::collection::create::dispatch_register_from_stored(
+    match crate::control::server::shared::ddl::neutral::collection::dispatch_register_from_stored(
         &shared, &stored,
     )
     .await

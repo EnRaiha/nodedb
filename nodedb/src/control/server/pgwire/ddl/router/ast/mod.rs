@@ -3,7 +3,6 @@
 mod alter;
 mod async_ops;
 mod database_ops;
-mod exists;
 mod guards;
 mod sync_ops;
 

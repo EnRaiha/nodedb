@@ -2,7 +2,7 @@
 
 //! IF [NOT] EXISTS guard arms: return early on duplicate-creation or not-found-drop.
 
-use pgwire::api::results::{Response, Tag};
+use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use nodedb_sql::ddl_ast::statement::{CollectionStmt, NodedbStatement};
@@ -11,40 +11,20 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
-use super::exists::collection_exists;
-
 /// Handle IF [NOT] EXISTS guard arms. Returns `Some(result)` if the statement
 /// was handled (short-circuit), `None` if it should proceed to typed dispatch.
+///
+/// `CreateCollection` / `CreateTable`'s `if_not_exists: true` short-circuit
+/// (and the `collection_exists` helper it used) moved to the protocol-neutral
+/// DDL router (tried before this transitional pgwire delegation runs), which
+/// replicates the same existence-check short-circuit in its typed arm.
 pub(super) fn try_dispatch_guards(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
+    _state: &SharedState,
+    _identity: &AuthenticatedIdentity,
     stmt: &NodedbStatement,
-    database_id: DatabaseId,
+    _database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     match stmt {
-        // ── IF NOT EXISTS: swallow duplicate-creation errors ──────
-        NodedbStatement::Collection(CollectionStmt::CreateCollection {
-            name,
-            if_not_exists: true,
-            ..
-        }) => {
-            if collection_exists(state, identity, name, database_id) {
-                return Some(Ok(vec![Response::Execution(Tag::new("CREATE COLLECTION"))]));
-            }
-            None // fall through to legacy CREATE handler
-        }
-
-        NodedbStatement::Collection(CollectionStmt::CreateTable {
-            name,
-            if_not_exists: true,
-            ..
-        }) => {
-            if collection_exists(state, identity, name, database_id) {
-                return Some(Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))]));
-            }
-            None // fall through to schema dispatcher
-        }
-
         // `DropCollection` is fully owned by the sync_ops typed
         // handler, which honours `if_exists` correctly via the
         // existence-check matrix. No guard short-circuit needed.

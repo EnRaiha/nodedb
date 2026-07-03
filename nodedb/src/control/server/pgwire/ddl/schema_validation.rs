@@ -13,7 +13,7 @@
 ///
 /// The second return value lists field names that had SERIAL/BIGSERIAL types,
 /// so the caller can create the implicit sequences.
-pub(super) fn parse_fields_clause(parts: &[&str]) -> (Vec<(String, String)>, Vec<String>) {
+pub(crate) fn parse_fields_clause(parts: &[&str]) -> (Vec<(String, String)>, Vec<String>) {
     let fields_idx = parts.iter().position(|p| p.eq_ignore_ascii_case("FIELDS"));
     let fields_idx = match fields_idx {
         Some(i) => i,
@@ -67,7 +67,7 @@ pub(super) fn parse_fields_clause(parts: &[&str]) -> (Vec<(String, String)>, Vec
 /// Returns `(fields, serial_fields)` where `serial_fields` holds the names
 /// of columns whose type was expanded from SERIAL / BIGSERIAL so the caller
 /// can create implicit sequences.
-pub(super) fn parse_fields_clause_from_pairs(
+pub(crate) fn parse_fields_clause_from_pairs(
     columns: &[(String, String)],
 ) -> (Vec<(String, String)>, Vec<String>) {
     let mut fields: Vec<(String, String)> = Vec::new();

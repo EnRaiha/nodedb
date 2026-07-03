@@ -1,161 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Canonical engine-option parsing for `CREATE COLLECTION` and `CREATE TABLE`.
+//! Parse and validate the `WITH (engine='...')` option from raw SQL, plus
+//! engine-name suggestions for the deprecated `TYPE <keyword>` axis.
 //!
-//! The single accepted syntax is `WITH (engine='<name>')`. All legacy axes —
-//! `TYPE <keyword>`, `WITH (profile='...')`, or bare `WITH (vector_field='...')`
-//! without an explicit engine — are rejected hard with a helpful SQLSTATE error.
+//! `parse_engine_option` has no production caller today (the typed-AST path
+//! uses `validate_engine_name` instead) — it is kept, with its test suite,
+//! exactly as it was on the pgwire side; only the error envelope changed from
+//! `PgWireResult` to `Result<_, DdlError>`.
 
-use pgwire::error::PgWireResult;
+use super::super::super::super::super::result::DdlError;
+use super::validate::canonical_list;
 
-use super::super::super::super::types::sqlstate_error;
-
-/// The seven canonical engine names. Anything else is `42601`.
-pub const CANONICAL_ENGINES: &[&str] = &[
-    "document_schemaless",
-    "document_strict",
-    "kv",
-    "columnar",
-    "timeseries",
-    "spatial",
-    "vector",
-];
-
-/// Validate a pre-parsed `engine: Option<&str>` from the typed AST.
-///
-/// Also checks for deprecated axes (profile=, vector_field= without engine=)
-/// from the parsed `options` slice.
-///
-/// Returns the canonical engine static str (`Some`) or `None` (caller applies default).
-pub fn validate_engine_name(
-    engine: Option<&str>,
-    options: &[(String, String)],
-) -> PgWireResult<Option<&'static str>> {
-    // ── Axis B: profile= present ──────────────────────────────────
-    if let Some((_, profile_val)) = options
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("profile"))
-    {
-        let profile_up = profile_val.to_uppercase();
-        let suggestion = match profile_up.as_str() {
-            "TIMESERIES" => "engine='timeseries'",
-            "SPATIAL" => "engine='spatial'",
-            other => {
-                return Err(sqlstate_error(
-                    "0A000",
-                    &format!(
-                        "NodeDB has canonicalized engine selection; 'WITH (profile='{other}')' \
-                         is no longer accepted. Use WITH (engine='timeseries') or \
-                         WITH (engine='spatial')"
-                    ),
-                ));
-            }
-        };
-        return Err(sqlstate_error(
-            "0A000",
-            &format!(
-                "NodeDB has canonicalized engine selection; 'WITH (profile=...)' is no longer \
-                 accepted. Use: CREATE COLLECTION foo (...) WITH ({suggestion})"
-            ),
-        ));
+fn err(sqlstate: &str, message: String) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message,
     }
-
-    // ── Axis C: vector_field= without engine= ─────────────────────
-    if engine.is_none()
-        && options
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("vector_field"))
-    {
-        return Err(sqlstate_error(
-            "0A000",
-            "NodeDB has canonicalized engine selection; 'WITH (vector_field=...)' without \
-             'engine=...' is no longer accepted. Use: CREATE COLLECTION foo (...) WITH \
-             (engine='vector', vector_field='embedding')",
-        ));
-    }
-
-    let engine_lower = match engine {
-        None => return Ok(None),
-        Some(e) => e.to_lowercase(),
-    };
-
-    let canonical = match engine_lower.as_str() {
-        "document_schemaless" => "document_schemaless",
-        "document_strict" => "document_strict",
-        "kv" => "kv",
-        "columnar" => "columnar",
-        "timeseries" => "timeseries",
-        "spatial" => "spatial",
-        "vector" => "vector",
-        "strict" => {
-            return Err(sqlstate_error(
-                "42601",
-                &format!(
-                    "unknown engine 'strict'; did you mean 'document_strict'? Supported engines: {}",
-                    canonical_list()
-                ),
-            ));
-        }
-        "document" => {
-            return Err(sqlstate_error(
-                "42601",
-                &format!(
-                    "unknown engine 'document'; did you mean 'document_schemaless' or \
-                     'document_strict'? Supported engines: {}",
-                    canonical_list()
-                ),
-            ));
-        }
-        "key_value" => {
-            return Err(sqlstate_error(
-                "42601",
-                &format!(
-                    "unknown engine 'key_value'; did you mean 'kv'? Supported engines: {}",
-                    canonical_list()
-                ),
-            ));
-        }
-        "fts" => {
-            return Err(sqlstate_error(
-                "42601",
-                &format!(
-                    "unknown engine 'fts'; FTS uses CREATE FULLTEXT INDEX (separate DDL); \
-                     graph operations work against existing collections via MATCH. \
-                     Supported engines: {}",
-                    canonical_list()
-                ),
-            ));
-        }
-        "graph" => {
-            return Err(sqlstate_error(
-                "42601",
-                &format!(
-                    "unknown engine 'graph'; graph operations work against existing collections \
-                     via MATCH / GRAPH INSERT/DELETE — there is no engine='graph'. \
-                     Supported engines: {}",
-                    canonical_list()
-                ),
-            ));
-        }
-        other => {
-            return Err(sqlstate_error(
-                "42601",
-                &format!(
-                    "unknown engine '{other}'; supported: {}. \
-                     (FTS uses CREATE FULLTEXT INDEX; graph operations work against existing \
-                     collections via MATCH.)",
-                    canonical_list()
-                ),
-            ));
-        }
-    };
-
-    Ok(Some(canonical))
-}
-
-/// Build the canonical-list suffix used in unknown-engine errors.
-fn canonical_list() -> String {
-    CANONICAL_ENGINES.join(", ")
 }
 
 /// Parse and validate the `WITH (engine='...')` option from `sql`.
@@ -168,15 +28,15 @@ fn canonical_list() -> String {
 /// All rejection codes follow the spec:
 /// - `0A000` — deprecated axis or unsupported feature syntax.
 /// - `42601` — unknown engine name.
-pub fn parse_engine_option(sql: &str, upper: &str) -> PgWireResult<Option<&'static str>> {
+pub fn parse_engine_option(sql: &str, upper: &str) -> Result<Option<&'static str>, DdlError> {
     // ── Axis A: TYPE <keyword> ──────────────────────────────────────────────
     // Detect any `TYPE <keyword>` token sequence in the uppercased SQL.
     if upper.contains("TYPE")
         && let Some(suggestion) = axis_a_suggestion(upper)
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "0A000",
-            &format!(
+            format!(
                 "NodeDB has canonicalized engine selection; the 'TYPE ...' syntax is no \
                      longer accepted. Use: CREATE COLLECTION foo (...) WITH ({suggestion})"
             ),
@@ -191,9 +51,9 @@ pub fn parse_engine_option(sql: &str, upper: &str) -> PgWireResult<Option<&'stat
             "TIMESERIES" => "engine='timeseries'",
             "SPATIAL" => "engine='spatial'",
             other => {
-                return Err(sqlstate_error(
+                return Err(err(
                     "0A000",
-                    &format!(
+                    format!(
                         "NodeDB has canonicalized engine selection; 'WITH (profile='{other}')' \
                          is no longer accepted. Use WITH (engine='timeseries') or \
                          WITH (engine='spatial')"
@@ -201,9 +61,9 @@ pub fn parse_engine_option(sql: &str, upper: &str) -> PgWireResult<Option<&'stat
                 ));
             }
         };
-        return Err(sqlstate_error(
+        return Err(err(
             "0A000",
-            &format!(
+            format!(
                 "NodeDB has canonicalized engine selection; 'WITH (profile=...)' is no longer \
                  accepted. Use: CREATE COLLECTION foo (...) WITH ({suggestion})"
             ),
@@ -216,11 +76,12 @@ pub fn parse_engine_option(sql: &str, upper: &str) -> PgWireResult<Option<&'stat
         None => {
             // ── Axis C: vector_field= without engine= ──────────────────────
             if extract_with_value(sql, "vector_field").is_some() {
-                return Err(sqlstate_error(
+                return Err(err(
                     "0A000",
                     "NodeDB has canonicalized engine selection; 'WITH (vector_field=...)' without \
                      'engine=...' is no longer accepted. Use: CREATE COLLECTION foo (...) WITH \
-                     (engine='vector', vector_field='embedding')",
+                     (engine='vector', vector_field='embedding')"
+                        .to_string(),
                 ));
             }
             return Ok(None);
@@ -241,18 +102,18 @@ pub fn parse_engine_option(sql: &str, upper: &str) -> PgWireResult<Option<&'stat
 
         // Helpful alias rejections.
         "strict" => {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42601",
-                &format!(
+                format!(
                     "unknown engine 'strict'; did you mean 'document_strict'? Supported engines: {}",
                     canonical_list()
                 ),
             ));
         }
         "document" => {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42601",
-                &format!(
+                format!(
                     "unknown engine 'document'; did you mean 'document_schemaless' or \
                      'document_strict'? Supported engines: {}",
                     canonical_list()
@@ -260,18 +121,18 @@ pub fn parse_engine_option(sql: &str, upper: &str) -> PgWireResult<Option<&'stat
             ));
         }
         "key_value" => {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42601",
-                &format!(
+                format!(
                     "unknown engine 'key_value'; did you mean 'kv'? Supported engines: {}",
                     canonical_list()
                 ),
             ));
         }
         "fts" => {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42601",
-                &format!(
+                format!(
                     "unknown engine 'fts'; FTS uses CREATE FULLTEXT INDEX (separate DDL); \
                      graph operations work against existing collections via MATCH. \
                      Supported engines: {}",
@@ -280,9 +141,9 @@ pub fn parse_engine_option(sql: &str, upper: &str) -> PgWireResult<Option<&'stat
             ));
         }
         "graph" => {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42601",
-                &format!(
+                format!(
                     "unknown engine 'graph'; graph operations work against existing collections \
                      via MATCH / GRAPH INSERT/DELETE — there is no engine='graph'. \
                      Supported engines: {}",
@@ -291,9 +152,9 @@ pub fn parse_engine_option(sql: &str, upper: &str) -> PgWireResult<Option<&'stat
             ));
         }
         other => {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42601",
-                &format!(
+                format!(
                     "unknown engine '{other}'; supported: {}. \
                      (FTS uses CREATE FULLTEXT INDEX; graph operations work against existing \
                      collections via MATCH.)",
@@ -364,7 +225,7 @@ mod tests {
     fn err_code(sql: &str, upper: &str) -> String {
         match parse_engine_option(sql, upper) {
             Ok(_) => panic!("expected error"),
-            Err(e) => e.to_string(),
+            Err(e) => format!("{}: {}", e.sqlstate, e.message),
         }
     }
 

@@ -10,8 +10,7 @@ use nodedb_sql::ddl_ast::statement::{CollectionStmt, MiscStmt, NodedbStatement};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::ddl::collection::copy_from::CopyFromOptions;
 use crate::control::server::pgwire::ddl::collection::{
-    CreateCollectionRequest, CreateIndexRequest, copy_from_file, copy_to_file, create_collection,
-    create_index, create_table, dispatch_register_by_name,
+    CreateIndexRequest, copy_from_file, copy_to_file, create_index,
 };
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
@@ -50,79 +49,12 @@ pub(super) async fn try_dispatch_async(
             .await,
         ),
 
-        NodedbStatement::Collection(CollectionStmt::CreateCollection {
-            name,
-            if_not_exists: _,
-            engine,
-            columns,
-            options,
-            flags,
-            balanced_raw,
-        }) => {
-            let result = create_collection(
-                state,
-                identity,
-                &CreateCollectionRequest {
-                    name,
-                    engine: engine.as_deref(),
-                    columns,
-                    options,
-                    flags,
-                    balanced_raw: balanced_raw.as_deref(),
-                },
-                database_id,
-            )
-            .await;
-            let result = match result {
-                Ok(resp) => dispatch_register_by_name(state, identity, name, database_id)
-                    .await
-                    .map(|()| resp)
-                    .map_err(|e| {
-                        super::super::super::super::types::sqlstate_error("XX000", &e.to_string())
-                    }),
-                Err(e) => Err(e),
-            };
-            Some(result)
-        }
-
-        NodedbStatement::Collection(CollectionStmt::CreateTable {
-            name,
-            // Both false (normal create) and true (IF NOT EXISTS — guard
-            // already returned early if the collection existed) fall through
-            // to the same create_table handler.
-            if_not_exists: _,
-            engine,
-            columns,
-            options,
-            flags,
-            balanced_raw,
-        }) => {
-            let result = create_table(
-                state,
-                identity,
-                &CreateCollectionRequest {
-                    name,
-                    engine: engine.as_deref(),
-                    columns,
-                    options,
-                    flags,
-                    balanced_raw: balanced_raw.as_deref(),
-                },
-                database_id,
-            )
-            .await;
-            let result = match result {
-                Ok(resp) => dispatch_register_by_name(state, identity, name, database_id)
-                    .await
-                    .map(|()| resp)
-                    .map_err(|e| {
-                        super::super::super::super::types::sqlstate_error("XX000", &e.to_string())
-                    }),
-                Err(e) => Err(e),
-            };
-            Some(result)
-        }
-
+        // CreateCollection / CreateTable are served by the protocol-neutral
+        // DDL router (`shared::ddl::neutral::collection::create`), which is
+        // tried before this transitional pgwire delegation runs. The
+        // `if_not_exists: true` short-circuit lives in the neutral router's
+        // typed-arm guard, replicated from this file's former `guards.rs`
+        // sibling arms.
         NodedbStatement::Collection(CollectionStmt::AlterCollection { name, operation }) => {
             Some(dispatch_alter_collection(state, identity, database_id, name, operation).await)
         }

@@ -7,6 +7,11 @@
 //!   materialized_sum lookup
 //! - [`build_generated_column_specs`] — extract generated-column
 //!   specs from a `StoredCollection`'s schema JSON
+//!
+//! Relocated verbatim from the pgwire `pgwire::ddl::collection::create::enforcement`
+//! module (now deleted) alongside `register.rs` — only `create::build_and_persist`
+//! and `register::dispatch_register_from_stored_inner` (both also relocated) used
+//! this module, so it moved with them in full.
 
 use nodedb_types::DatabaseId;
 use sonic_rs;

@@ -86,9 +86,11 @@ pub async fn alter_table_add_column(
     };
 
     if let Some(ref coll) = updated {
-        super::super::create::dispatch_register_from_stored(state, coll)
-            .await
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        crate::control::server::shared::ddl::neutral::collection::dispatch_register_from_stored(
+            state, coll,
+        )
+        .await
+        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
     }
 
     state.audit_record(

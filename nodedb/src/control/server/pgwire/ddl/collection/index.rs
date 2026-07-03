@@ -54,9 +54,11 @@ async fn commit_collection_mutation(
         // Single-node path bypasses the applier post-apply hook, so the
         // Register refresh has to be fired here. In cluster mode the
         // applier's `put_async` does it on every node.
-        super::create::dispatch_register_from_stored(state, coll)
-            .await
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        crate::control::server::shared::ddl::neutral::collection::dispatch_register_from_stored(
+            state, coll,
+        )
+        .await
+        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
     }
     Ok(())
 }

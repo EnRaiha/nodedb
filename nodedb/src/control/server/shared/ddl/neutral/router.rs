@@ -1433,6 +1433,99 @@ pub async fn try_dispatch(
             )
         }
 
+        // CREATE COLLECTION / CREATE TABLE. Migrated from the pgwire typed-AST
+        // async router (`async_ops`) plus the `if_not_exists: true` guard
+        // short-circuit that used to live in the pgwire `guards` module
+        // (checked here, inline, before the create handler runs — same
+        // ordering). `build_and_persist` (name/duplicate/engine validation,
+        // schema construction, `StoredCollection` assembly, propose+apply,
+        // SERIAL sequence auto-creation) and the `dispatch_register_by_name`
+        // follow-up dispatch are preserved verbatim in `collection::create`.
+        NodedbStatement::Collection(CollectionStmt::CreateCollection {
+            name,
+            if_not_exists,
+            engine,
+            columns,
+            options,
+            flags,
+            balanced_raw,
+        }) => {
+            if *if_not_exists && collection_exists(state, identity, name, database_id) {
+                return Some(Ok(vec![DdlResult::Status {
+                    command: "CREATE COLLECTION".to_string(),
+                    rows_affected: None,
+                }]));
+            }
+            let result = collection::create_collection(
+                state,
+                identity,
+                &collection::CreateCollectionRequest {
+                    name,
+                    engine: engine.as_deref(),
+                    columns,
+                    options,
+                    flags,
+                    balanced_raw: balanced_raw.as_deref(),
+                },
+                database_id,
+            )
+            .await;
+            let result = match result {
+                Ok(resp) => {
+                    collection::dispatch_register_by_name(state, identity, name, database_id)
+                        .await
+                        .map(|()| resp)
+                        .map_err(|e| DdlError {
+                            sqlstate: "XX000".to_string(),
+                            message: e.to_string(),
+                        })
+                }
+                Err(e) => Err(e),
+            };
+            Some(result)
+        }
+
+        NodedbStatement::Collection(CollectionStmt::CreateTable {
+            name,
+            // Both false (normal create) and true (IF NOT EXISTS — guard
+            // already returned early if the collection existed) fall
+            // through to the same create_table handler.
+            if_not_exists: _,
+            engine,
+            columns,
+            options,
+            flags,
+            balanced_raw,
+        }) => {
+            let result = collection::create_table(
+                state,
+                identity,
+                &collection::CreateCollectionRequest {
+                    name,
+                    engine: engine.as_deref(),
+                    columns,
+                    options,
+                    flags,
+                    balanced_raw: balanced_raw.as_deref(),
+                },
+                database_id,
+            )
+            .await;
+            let result = match result {
+                Ok(resp) => {
+                    collection::dispatch_register_by_name(state, identity, name, database_id)
+                        .await
+                        .map(|()| resp)
+                        .map_err(|e| DdlError {
+                            sqlstate: "XX000".to_string(),
+                            message: e.to_string(),
+                        })
+                }
+                Err(e) => Err(e),
+            };
+            Some(result)
+        }
+
         NodedbStatement::Collection(CollectionStmt::CreateSequence {
             name,
             if_not_exists,
@@ -2138,6 +2231,25 @@ pub async fn try_dispatch(
 
         _ => None,
     }
+}
+
+/// Existence check backing the `CreateCollection` `if_not_exists: true`
+/// short-circuit above.
+///
+/// Relocated verbatim from the pgwire `router::ast::exists::collection_exists`
+/// helper (now deleted, along with the pgwire guard arms that were its only
+/// callers).
+fn collection_exists(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    name: &str,
+    database_id: DatabaseId,
+) -> bool {
+    let Some(catalog) = state.credentials.catalog() else {
+        return false;
+    };
+    let tid = identity.tenant_id.as_u64();
+    matches!(catalog.get_collection(database_id, tid, name), Ok(Some(_)))
 }
 
 /// Extract the single-quoted collection argument from `SELECT LAST_VALUES('coll')`.

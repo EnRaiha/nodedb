@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! The `create_collection` pgwire handler.
+//! The `create_collection` handler.
 //!
-//! Thin wrapper over [`super::build::build_and_persist`] — the entire
-//! validation + storage + replication body is shared with the
-//! [`super::table::create_table`] path; the only collection-specific
-//! knobs are the labels and the schemaless-by-default engine mapping.
+//! Relocated verbatim from the pgwire `pgwire::ddl::collection::create::handler`
+//! module (now deleted). Thin wrapper over [`super::build::build_and_persist`] —
+//! the entire validation + storage + replication body is shared with the
+//! [`super::table::create_table`] path; the only collection-specific knobs are
+//! the labels and the schemaless-by-default engine mapping.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::Response;
-use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
+use super::super::super::super::result::{DdlError, DdlResult};
 use super::build::{Variant, build_and_persist};
 use super::request::CreateCollectionRequest;
 
@@ -30,7 +30,7 @@ pub async fn create_collection(
     identity: &AuthenticatedIdentity,
     req: &CreateCollectionRequest<'_>,
     database_id: DatabaseId,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     build_and_persist(
         state,
         identity,

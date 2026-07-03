@@ -88,9 +88,11 @@ pub async fn persist_schema_change(
         crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(updated.clone()));
     super::super::super::catalog_propose::propose_and_apply(state, &entry)?;
 
-    super::super::create::dispatch_register_from_stored(state, updated)
-        .await
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    crate::control::server::shared::ddl::neutral::collection::dispatch_register_from_stored(
+        state, updated,
+    )
+    .await
+    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
     state.schema_version.bump();
     Ok(())
 }

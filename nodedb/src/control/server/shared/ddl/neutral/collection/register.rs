@@ -15,6 +15,13 @@
 //! Both funnel into [`dispatch_register_from_stored_inner`]
 //! which builds the storage-mode + enforcement-options
 //! `EnforcementOptions` value and dispatches to the Data Plane.
+//!
+//! Relocated verbatim from the pgwire
+//! `pgwire::ddl::collection::create::register` module (now deleted) so the
+//! neutral `continuous_agg` / `materialized_view` families, the
+//! `catalog_entry::post_apply` hook, and the (still pgwire) `alter`
+//! handlers can all depend on a protocol-neutral home instead of reaching
+//! across the pgwire boundary.
 
 use crate::control::security::catalog::StoredCollection;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -49,7 +56,7 @@ pub async fn dispatch_register_if_needed(
         return Ok(());
     };
     let (fields, _serial_fields) =
-        super::super::super::schema_validation::parse_fields_clause(parts);
+        crate::control::server::pgwire::ddl::schema_validation::parse_fields_clause(parts);
     let mut indexes = derive_auto_indexes(fields.iter().map(|(n, _)| n.as_str()));
     extend_with_catalog_indexes(&mut indexes, &coll);
     let _ = sql; // Reserved for future CRDT detection from SQL.
