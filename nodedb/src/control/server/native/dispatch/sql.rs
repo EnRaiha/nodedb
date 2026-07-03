@@ -205,7 +205,7 @@ async fn execute_planned(
         roles: &ctx.state.roles,
         permission_cache: Some(&*perm_cache),
     };
-    let mut tasks = match ctx
+    let (mut tasks, _output_schema) = match ctx
         .query_ctx
         .plan_sql_with_rls(&clean_sql, ctx.tenant_id(), database_id, &sec)
         .await

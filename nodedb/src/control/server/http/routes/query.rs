@@ -138,7 +138,7 @@ pub async fn query(
         roles: &state.shared.roles,
         permission_cache: Some(&*perm_cache),
     };
-    let tasks = state
+    let (tasks, _output_schema) = state
         .query_ctx
         .plan_sql_with_rls(&clean_sql, tenant_id, database_id, &sec)
         .await
@@ -350,7 +350,7 @@ pub async fn query_ndjson(
         roles: &state.shared.roles,
         permission_cache: Some(&*perm_cache),
     };
-    let tasks = match query_ctx
+    let (tasks, _output_schema) = match query_ctx
         .plan_sql_with_rls(sql, tenant_id, database_id, &sec)
         .await
     {

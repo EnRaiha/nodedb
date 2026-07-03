@@ -77,7 +77,7 @@ impl NodeDbPgHandler {
             roles: &self.state.roles,
             permission_cache: Some(&*perm_cache),
         };
-        let tasks = self
+        let (tasks, _output_schema) = self
             .query_ctx
             .plan_sql_with_rls(inner_sql, tenant_id, database_id, &sec)
             .await

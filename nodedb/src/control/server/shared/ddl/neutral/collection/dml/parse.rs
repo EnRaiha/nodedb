@@ -339,7 +339,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     sql: &str,
 ) -> Result<(), DdlError> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-    let mut tasks = query_ctx
+    let (mut tasks, _output_schema) = query_ctx
         .plan_sql(sql, tenant_id, database_id)
         .await
         .map_err(|e| ddl_err("XX000", e.to_string()))?;

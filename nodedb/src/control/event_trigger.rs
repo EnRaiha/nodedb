@@ -138,7 +138,7 @@ async fn execute_then_action(
         .plan_sql(&sql, event.tenant_id, crate::types::DatabaseId::DEFAULT)
         .await
     {
-        Ok(tasks) => {
+        Ok((tasks, _output_schema)) => {
             for task in tasks {
                 match crate::control::server::dispatch_utils::dispatch_to_data_plane(
                     shared,

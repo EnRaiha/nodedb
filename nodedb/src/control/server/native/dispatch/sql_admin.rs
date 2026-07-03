@@ -143,7 +143,7 @@ pub(super) async fn handle_explain(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -
         .plan_sql_with_rls(inner_sql, ctx.tenant_id(), database_id, &sec)
         .await
     {
-        Ok(tasks) => {
+        Ok((tasks, _output_schema)) => {
             let plan_text = tasks
                 .iter()
                 .map(|t| format!("{:?}", t.plan))

@@ -68,7 +68,7 @@ pub async fn handle_analyze(
         )
         .await
     {
-        Ok(tasks) => {
+        Ok((tasks, _output_schema)) => {
             let mut json_rows = Vec::new();
             for task in tasks {
                 let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(

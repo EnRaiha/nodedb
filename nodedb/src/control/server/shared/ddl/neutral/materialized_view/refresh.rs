@@ -117,7 +117,7 @@ async fn execute_select(
     sql: &str,
 ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, DdlError> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-    let tasks = query_ctx
+    let (tasks, _output_schema) = query_ctx
         .plan_sql(sql, tenant_id, crate::types::DatabaseId::DEFAULT)
         .await
         .map_err(|e| err("XX000", format!("plan '{sql}': {e}")))?;
@@ -231,7 +231,7 @@ async fn dispatch_sql(
     sql: &str,
 ) -> Result<(), DdlError> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-    let tasks = query_ctx
+    let (tasks, _output_schema) = query_ctx
         .plan_sql(sql, tenant_id, crate::types::DatabaseId::DEFAULT)
         .await
         .map_err(|e| err("42P20", format!("plan '{sql}': {e}")))?;

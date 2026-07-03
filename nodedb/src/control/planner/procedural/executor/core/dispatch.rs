@@ -64,7 +64,7 @@ impl<'a> StatementExecutor<'a> {
 
         // Not a NodeDB extension: route through plan_sql with transaction buffering.
         let ctx = crate::control::planner::context::QueryContext::for_state(self.state);
-        let tasks = ctx
+        let (tasks, _output_schema) = ctx
             .plan_sql(
                 &bound_sql,
                 self.tenant_id,

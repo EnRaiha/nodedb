@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::QueryContext;
 use crate::control::planner::context::security::PlanSecurityContext;
+use crate::control::server::response_shape::schema::OutputSchema;
 
 impl QueryContext {
     /// Parse SQL and convert to NodeDB physical plan(s).
@@ -24,9 +25,12 @@ impl QueryContext {
         sql: &str,
         tenant_id: crate::types::TenantId,
         database_id: crate::types::DatabaseId,
-    ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+    ) -> crate::Result<(
+        Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
+    )> {
         self.plan_with_nodedb_sql(sql, tenant_id, database_id)
-            .map(|(t, _)| t)
+            .map(|(t, schema, _)| (t, schema))
     }
 
     /// Core planning via nodedb-sql: parse → plan → optimize → convert.
@@ -44,6 +48,7 @@ impl QueryContext {
         database_id: crate::types::DatabaseId,
     ) -> crate::Result<(
         Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
         crate::control::planner::descriptor_set::DescriptorVersionSet,
     )> {
         let inputs = match &self.catalog_inputs {
@@ -127,14 +132,14 @@ impl QueryContext {
             database_id,
             tenant_id,
         };
-        let _output_schema =
+        let output_schema =
             crate::control::planner::sql_plan_convert::output_schema::build_output_schema(
                 &plans,
                 &catalog,
                 database_id,
             );
         let tasks = crate::control::planner::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
-        Ok((tasks, version_set))
+        Ok((tasks, output_schema, version_set))
     }
 
     /// Parse SQL, inject RLS predicates, convert to physical plan.
@@ -147,7 +152,10 @@ impl QueryContext {
         tenant_id: crate::types::TenantId,
         database_id: crate::types::DatabaseId,
         sec: &PlanSecurityContext<'_>,
-    ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+    ) -> crate::Result<(
+        Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
+    )> {
         self.plan_sql_with_rls_returning(sql, tenant_id, database_id, sec, false)
             .await
     }
@@ -160,10 +168,13 @@ impl QueryContext {
         database_id: crate::types::DatabaseId,
         sec: &PlanSecurityContext<'_>,
         returning: bool,
-    ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+    ) -> crate::Result<(
+        Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
+    )> {
         self.plan_sql_with_rls_and_versions(sql, tenant_id, database_id, sec, returning)
             .await
-            .map(|(tasks, _)| tasks)
+            .map(|(tasks, schema, _)| (tasks, schema))
     }
 
     /// Variant of [`plan_sql_with_rls_returning`] that also
@@ -181,9 +192,11 @@ impl QueryContext {
         _returning: bool,
     ) -> crate::Result<(
         Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
         crate::control::planner::descriptor_set::DescriptorVersionSet,
     )> {
-        let (mut tasks, version_set) = self.plan_with_nodedb_sql(sql, tenant_id, database_id)?;
+        let (mut tasks, output_schema, version_set) =
+            self.plan_with_nodedb_sql(sql, tenant_id, database_id)?;
 
         // Inject RLS predicates.
         crate::control::planner::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
@@ -195,7 +208,7 @@ impl QueryContext {
             )?;
         }
 
-        Ok((tasks, version_set))
+        Ok((tasks, output_schema, version_set))
     }
 
     /// Plan SQL with bound parameters and RLS injection.
@@ -209,7 +222,10 @@ impl QueryContext {
         tenant_id: crate::types::TenantId,
         database_id: crate::types::DatabaseId,
         sec: &PlanSecurityContext<'_>,
-    ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+    ) -> crate::Result<(
+        Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
+    )> {
         let inputs = match &self.catalog_inputs {
             Some(i) => i,
             None => {
@@ -278,6 +294,12 @@ impl QueryContext {
             database_id,
             tenant_id,
         };
+        let output_schema =
+            crate::control::planner::sql_plan_convert::output_schema::build_output_schema(
+                &plans,
+                &catalog,
+                database_id,
+            );
         let mut tasks =
             crate::control::planner::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
 
@@ -290,6 +312,6 @@ impl QueryContext {
             )?;
         }
 
-        Ok(tasks)
+        Ok((tasks, output_schema))
     }
 }

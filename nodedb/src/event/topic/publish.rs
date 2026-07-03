@@ -168,7 +168,7 @@ pub async fn publish_remote(
 
     gateway
         .execute_sql(&gw_ctx, &sql, &[], || {
-            let tasks = tokio::task::block_in_place(|| {
+            let (tasks, _output_schema) = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(query_ctx.plan_sql(
                     &sql,
                     crate::types::TenantId::new(tenant_id),

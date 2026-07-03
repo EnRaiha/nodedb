@@ -127,7 +127,7 @@ async fn execute_and_collect(
     select_sql: &str,
 ) -> Result<Vec<serde_json::Value>, DdlError> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-    let tasks = query_ctx
+    let (tasks, _output_schema) = query_ctx
         .plan_sql(
             select_sql,
             identity.tenant_id,

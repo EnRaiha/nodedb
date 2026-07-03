@@ -73,7 +73,7 @@ impl NodeDbPgHandler {
         params: &[nodedb_sql::ParamValue],
         projection: Option<&[ProjectionItem]>,
     ) -> PgWireResult<Vec<Response>> {
-        let (mut tasks, _plan_lease_scope) = self
+        let (mut tasks, _output_schema, _plan_lease_scope) = self
             .plan_statement_to_tasks(identity, sql, tenant_id, addr, params)
             .await?;
 

@@ -29,7 +29,7 @@ pub(super) async fn enforce_subquery_check(
 
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
 
-    let tasks = match query_ctx
+    let (tasks, _output_schema) = match query_ctx
         .plan_sql(
             &restructured.sql,
             tenant_id,

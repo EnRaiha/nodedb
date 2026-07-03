@@ -31,7 +31,11 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
         params: &[nodedb_sql::ParamValue],
-    ) -> PgWireResult<(Vec<PhysicalTask>, crate::control::lease::QueryLeaseScope)> {
+    ) -> PgWireResult<(
+        Vec<PhysicalTask>,
+        crate::control::server::response_shape::schema::OutputSchema,
+        crate::control::lease::QueryLeaseScope,
+    )> {
         // Resolve opaque session handle if SET LOCAL nodedb.auth_session is set.
         let caller_fp = crate::control::security::session_handle::ClientFingerprint::from_peer(
             identity.tenant_id,
@@ -223,7 +227,7 @@ impl NodeDbPgHandler {
             })
         };
 
-        let (tasks, lease_scope) = if !params.is_empty() {
+        let (tasks, output_schema, lease_scope) = if !params.is_empty() {
             let perm_cache = self.state.permission_cache.read().await;
             let sec = crate::control::planner::context::PlanSecurityContext {
                 identity,
@@ -233,7 +237,7 @@ impl NodeDbPgHandler {
                 roles: &self.state.roles,
                 permission_cache: Some(&*perm_cache),
             };
-            let tasks = self
+            let (tasks, output_schema) = self
                 .query_ctx
                 .plan_sql_with_params_and_rls(&clean_sql, params, tenant_id, database_id, &sec)
                 .await
@@ -245,40 +249,49 @@ impl NodeDbPgHandler {
                         message,
                     )))
                 })?;
-            (tasks, crate::control::lease::QueryLeaseScope::empty())
+            (
+                tasks,
+                output_schema,
+                crate::control::lease::QueryLeaseScope::empty(),
+            )
         } else if let Some((tasks, versions)) = cached_tasks {
             let scope = self.state.acquire_plan_lease_scope(&versions);
-            (tasks, scope)
+            (
+                tasks,
+                crate::control::server::response_shape::schema::OutputSchema::default(),
+                scope,
+            )
         } else {
-            let (planned, versions) = super::super::retry::retry_on_schema_change(|| async {
-                let perm_cache = self.state.permission_cache.read().await;
-                let sec = crate::control::planner::context::PlanSecurityContext {
-                    identity,
-                    auth: &auth_ctx,
-                    rls_store: &self.state.rls,
-                    permissions: &self.state.permissions,
-                    roles: &self.state.roles,
-                    permission_cache: Some(&*perm_cache),
-                };
-                self.query_ctx
-                    .plan_sql_with_rls_and_versions(
-                        &clean_sql,
-                        tenant_id,
-                        database_id,
-                        &sec,
-                        has_returning,
-                    )
-                    .await
-            })
-            .await
-            .map_err(|e| {
-                let (severity, code, message) = error_to_sqlstate(&e);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?;
+            let (planned, output_schema, versions) =
+                super::super::retry::retry_on_schema_change(|| async {
+                    let perm_cache = self.state.permission_cache.read().await;
+                    let sec = crate::control::planner::context::PlanSecurityContext {
+                        identity,
+                        auth: &auth_ctx,
+                        rls_store: &self.state.rls,
+                        permissions: &self.state.permissions,
+                        roles: &self.state.roles,
+                        permission_cache: Some(&*perm_cache),
+                    };
+                    self.query_ctx
+                        .plan_sql_with_rls_and_versions(
+                            &clean_sql,
+                            tenant_id,
+                            database_id,
+                            &sec,
+                            has_returning,
+                        )
+                        .await
+                })
+                .await
+                .map_err(|e| {
+                    let (severity, code, message) = error_to_sqlstate(&e);
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        severity.to_owned(),
+                        code.to_owned(),
+                        message,
+                    )))
+                })?;
 
             let scope = self.state.acquire_plan_lease_scope(&versions);
             // Do not cache a plan built under a strategy-knob override (force
@@ -289,7 +302,7 @@ impl NodeDbPgHandler {
                 self.sessions
                     .put_cached_plan(addr, &clean_sql, planned.clone(), versions);
             }
-            (planned, scope)
+            (planned, output_schema, scope)
         };
 
         // Inject RETURNING spec into DML plans.
@@ -305,7 +318,7 @@ impl NodeDbPgHandler {
             tasks
         };
 
-        Ok((tasks, lease_scope))
+        Ok((tasks, output_schema, lease_scope))
     }
 }
 

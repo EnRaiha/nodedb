@@ -70,7 +70,7 @@ pub async fn validate_typeguard(
     // Scan all documents.
     let scan_sql = format!("SELECT * FROM {coll_name}");
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-    let tasks = query_ctx
+    let (tasks, _output_schema) = query_ctx
         .plan_sql(&scan_sql, tenant_id, crate::types::DatabaseId::DEFAULT)
         .await
         .map_err(|e| super::parse::err("XX000", &format!("scan planning failed: {e}")))?;

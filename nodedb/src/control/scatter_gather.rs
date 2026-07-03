@@ -366,7 +366,8 @@ pub async fn coordinate_cross_shard_hop(
                 });
 
                 let physical_plan = match plan_result {
-                    Ok(tasks) => match tasks.into_iter().next().map(|t| t.plan) {
+                    Ok((tasks, _output_schema)) => match tasks.into_iter().next().map(|t| t.plan)
+                    {
                         Some(p) => p,
                         None => continue,
                     },
