@@ -51,6 +51,8 @@ use super::retention_policy;
 use super::rls::{self, CreateRlsPolicyRequest};
 use super::role;
 use super::schedule::{self, CreateScheduleRequest};
+use super::scope_ddl;
+use super::scope_query_ddl;
 use super::sequence::{self, CreateSequenceRequest};
 use super::service_account;
 use super::synonym_group;
@@ -907,6 +909,60 @@ pub async fn try_dispatch(
     if upper.starts_with("SHOW MEMBERS OF ORG") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(org_ddl::show_members(state, identity, &parts));
+    }
+
+    // Scope management: DEFINE / DROP / GRANT / REVOKE / ALTER / RENEW SCOPE,
+    // SHOW MY SCOPES, SHOW SCOPES FOR, SHOW SCOPE GRANTS, SHOW SCOPE(S). None of
+    // these parse into any typed AST variant — `GRANT SCOPE` / `REVOKE SCOPE`
+    // are explicitly excluded from the typed grant parser (returning `None`),
+    // and the rest have no grammar at all — so the pgwire admin router
+    // dispatched all of them by string prefix from the raw token slice.
+    // Replicate that exactly here, before the parse gate, so the prefix
+    // recognition and the `parts`-based extraction / syntax messages stay
+    // byte-identical. Guard ordering mirrors the pgwire admin router: `SHOW MY
+    // SCOPES` and `SHOW SCOPES FOR ` are matched before the broader `SHOW SCOPE
+    // GRANTS` / `SHOW SCOPE` pair (nothing between them in the pgwire router
+    // claimed a scope input, so grouping them here is behavior-preserving), and
+    // `SHOW SCOPE GRANTS` is checked before the `SHOW SCOPE` catch-all.
+    if upper.starts_with("DEFINE SCOPE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(scope_ddl::define_scope(state, identity, &parts));
+    }
+    if upper.starts_with("DROP SCOPE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(scope_ddl::drop_scope(state, identity, &parts));
+    }
+    if upper.starts_with("GRANT SCOPE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(scope_ddl::grant_scope(state, identity, &parts));
+    }
+    if upper.starts_with("REVOKE SCOPE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(scope_ddl::revoke_scope(state, identity, &parts));
+    }
+    if upper.starts_with("ALTER SCOPE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(scope_query_ddl::alter_scope(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW MY SCOPES") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(scope_query_ddl::show_my_scopes(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW SCOPES FOR ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(scope_query_ddl::show_scopes_for(state, identity, &parts));
+    }
+    if upper.starts_with("RENEW SCOPE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(scope_ddl::renew_scope(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW SCOPE GRANTS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(scope_ddl::show_scope_grants(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW SCOPE") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(scope_ddl::show_scopes(state, identity, &parts));
     }
 
     // Parse errors → let the pgwire path run, which re-parses and reproduces the

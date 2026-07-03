@@ -63,47 +63,11 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // (`shared::ddl::neutral::org_ddl`), which is tried before this transitional
     // pgwire delegation runs.
 
-    // Scope management.
-    if upper.starts_with("DEFINE SCOPE ") {
-        return Some(super::super::super::scope_ddl::define_scope(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("DROP SCOPE ") {
-        return Some(super::super::super::scope_ddl::drop_scope(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("GRANT SCOPE ") {
-        return Some(super::super::super::scope_ddl::grant_scope(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("REVOKE SCOPE ") {
-        return Some(super::super::super::scope_ddl::revoke_scope(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("ALTER SCOPE ") {
-        return Some(super::super::super::scope_query_ddl::alter_scope(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW MY SCOPES") {
-        return Some(super::super::super::scope_query_ddl::show_my_scopes(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW SCOPES FOR ") {
-        return Some(super::super::super::scope_query_ddl::show_scopes_for(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("RENEW SCOPE ") {
-        return Some(super::super::super::scope_ddl::renew_scope(
-            state, identity, parts,
-        ));
-    }
+    // Scope management (DEFINE/DROP/GRANT/REVOKE/ALTER/RENEW SCOPE, SHOW MY
+    // SCOPES, SHOW SCOPES FOR, SHOW SCOPE GRANTS, SHOW SCOPE[S]) has been migrated
+    // to the protocol-neutral router (`shared::ddl::neutral::scope_ddl` /
+    // `shared::ddl::neutral::scope_query_ddl`), which is tried before this
+    // transitional pgwire delegation runs.
 
     // EXPLAIN TIERS ON <collection> [RANGE <start> <end>]
     if upper.starts_with("EXPLAIN TIERS ") {
@@ -195,16 +159,9 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
     // router (`shared::ddl::neutral::metering_ddl`), which is tried before this
     // transitional pgwire delegation runs.
 
-    if upper.starts_with("SHOW SCOPE GRANTS") {
-        return Some(super::super::super::scope_ddl::show_scope_grants(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW SCOPE") {
-        return Some(super::super::super::scope_ddl::show_scopes(
-            state, identity, parts,
-        ));
-    }
+    // SHOW SCOPE GRANTS / SHOW SCOPE[S] have been migrated to the
+    // protocol-neutral router (`shared::ddl::neutral::scope_ddl`), which is tried
+    // before this transitional pgwire delegation runs.
 
     // Read-only administrative routes (API keys, cluster, introspection,
     // observability, audit) live in observability_routes to keep this file

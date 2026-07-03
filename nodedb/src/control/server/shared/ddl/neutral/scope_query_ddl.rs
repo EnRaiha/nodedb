@@ -1,32 +1,42 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Scope query DDL commands: ALTER SCOPE, SHOW MY SCOPES, SHOW SCOPES FOR.
+//! Protocol-neutral scope query DDL commands: ALTER SCOPE, SHOW MY SCOPES,
+//! SHOW SCOPES FOR.
+//!
+//! Ported from the pgwire `ddl::scope_query_ddl` handlers. The superuser gate,
+//! `scope_defs` / `scope_grants` / `orgs` catalog reads and mutations, and
+//! `audit_record` side effects are preserved verbatim; only the result
+//! construction changed from pgwire `Response` / `QueryResponse` / `Tag` to the
+//! protocol-neutral [`DdlResult`] over [`ShapedRows`].
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
-use super::super::types::{sqlstate_error, text_field};
+use super::super::result::{DdlError, DdlResult};
+
+/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
+/// the pgwire handlers produced (via `sqlstate_error`).
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// ALTER SCOPE '<name>' SET GRANTS <perm> ON <coll> [, ...] [INCLUDE '<scope>']
 pub fn alter_scope(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(err("42501", "permission denied: requires superuser"));
     }
     if parts.len() < 5 {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "syntax: ALTER SCOPE '<name>' SET GRANTS <perm> ON <coll> [, ...] [INCLUDE '<scope>']",
         ));
@@ -36,7 +46,7 @@ pub fn alter_scope(
     let set_idx = parts
         .iter()
         .position(|p| p.to_uppercase() == "SET")
-        .ok_or_else(|| sqlstate_error("42601", "missing SET keyword"))?;
+        .ok_or_else(|| err("42601", "missing SET keyword"))?;
 
     let def_parts = &parts[set_idx + 1..];
     let mut grants = Vec::new();
@@ -92,13 +102,10 @@ pub fn alter_scope(
     let found = state
         .scope_defs
         .alter(scope_name, grants_opt, includes_opt)
-        .map_err(|e| sqlstate_error("42601", &e.to_string()))?;
+        .map_err(|e| err("42601", e.to_string()))?;
 
     if !found {
-        return Err(sqlstate_error(
-            "42704",
-            &format!("scope '{scope_name}' not found"),
-        ));
+        return Err(err("42704", format!("scope '{scope_name}' not found")));
     }
 
     state.audit_record(
@@ -108,7 +115,10 @@ pub fn alter_scope(
         &format!("altered scope '{scope_name}'"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("ALTER SCOPE"))])
+    Ok(vec![DdlResult::Status {
+        command: "ALTER SCOPE".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// SHOW MY SCOPES — show effective scopes for the current user.
@@ -116,12 +126,13 @@ pub fn show_my_scopes(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     _parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let user_id = identity.user_id.to_string();
     let org_ids = state.orgs.orgs_for_user(&user_id);
     let effective = state.scope_grants.effective_scopes(&user_id, &org_ids);
 
-    let schema = Arc::new(vec![text_field("scope"), text_field("source")]);
+    let columns = vec!["scope".to_string(), "source".to_string()];
+    let column_types = ShapedRows::text_types(columns.len());
 
     let mut rows = Vec::new();
     for scope_name in &effective {
@@ -134,16 +145,18 @@ pub fn show_my_scopes(
         } else {
             "org"
         };
-        let mut enc = DataRowEncoder::new(schema.clone());
-        let _ = enc.encode_field(scope_name);
-        let _ = enc.encode_field(&source);
-        rows.push(Ok(enc.take_row()));
+        let mut row = Map::new();
+        row.insert("scope".to_string(), JsonValue::String(scope_name.clone()));
+        row.insert("source".to_string(), JsonValue::String(source.to_string()));
+        rows.push(row);
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }
 
 /// SHOW SCOPES FOR USER '<id>' / SHOW SCOPES FOR ORG '<id>'
@@ -151,13 +164,10 @@ pub fn show_scopes_for(
     state: &SharedState,
     _identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // SHOW SCOPES FOR <USER|ORG> '<id>'
     if parts.len() < 5 {
-        return Err(sqlstate_error(
-            "42601",
-            "syntax: SHOW SCOPES FOR <USER|ORG> '<id>'",
-        ));
+        return Err(err("42601", "syntax: SHOW SCOPES FOR <USER|ORG> '<id>'"));
     }
 
     let grantee_type = parts[3].to_lowercase();
@@ -173,21 +183,24 @@ pub fn show_scopes_for(
             .scopes_for("org", grantee_id)
             .into_iter()
             .collect(),
-        _ => return Err(sqlstate_error("42601", "expected USER or ORG")),
+        _ => return Err(err("42601", "expected USER or ORG")),
     };
 
-    let schema = Arc::new(vec![text_field("scope")]);
+    let columns = vec!["scope".to_string()];
+    let column_types = ShapedRows::text_types(columns.len());
     let rows: Vec<_> = scopes
         .iter()
         .map(|s| {
-            let mut enc = DataRowEncoder::new(schema.clone());
-            let _ = enc.encode_field(s);
-            Ok(enc.take_row())
+            let mut row = Map::new();
+            row.insert("scope".to_string(), JsonValue::String(s.clone()));
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }

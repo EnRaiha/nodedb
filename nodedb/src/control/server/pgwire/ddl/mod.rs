@@ -18,8 +18,6 @@ pub mod pubsub;
 #[path = "router/mod.rs"]
 pub mod router;
 pub mod schema_validation;
-pub mod scope_ddl;
-pub mod scope_query_ddl;
 pub mod session_ddl;
 pub mod spatial;
 pub(crate) mod sql_parse;

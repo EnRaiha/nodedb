@@ -44,6 +44,8 @@ pub mod rls;
 pub mod role;
 pub mod router;
 pub mod schedule;
+pub mod scope_ddl;
+pub mod scope_query_ddl;
 pub mod sequence;
 pub mod service_account;
 pub mod synonym_group;
