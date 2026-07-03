@@ -17,10 +17,10 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use super::super::super::types::{error_to_sqlstate, response_status_to_sqlstate, sqlstate_error};
 use super::super::core::NodeDbPgHandler;
 use super::super::plan::{describe_plan, extract_collection, payload_to_response};
-use super::super::projection::{ProjectionItem, parse_select_projection};
 use super::super::shape_encode;
 use super::planning::consistency_for_tasks;
 use super::set_ops;
+use crate::control::server::response_shape::project::{ProjectionItem, parse_select_projection};
 
 impl NodeDbPgHandler {
     /// Plan and dispatch SQL after quota and DDL checks have passed.

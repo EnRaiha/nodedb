@@ -4,8 +4,8 @@
 //!
 //! These operate purely on parsed SQL and `serde_json::Value` — no pgwire
 //! wire types — so they are shared across any protocol-specific response
-//! shaper. The pgwire-only encode glue that turns these into `DataRow`s
-//! stays in `pgwire::handler::projection`.
+//! shaper. Protocol-specific encode glue that turns these into wire rows
+//! (e.g. pgwire's `DataRow`) lives in each protocol's own handler code.
 
 /// Projection item from a parsed SELECT list.
 #[derive(Clone)]
@@ -122,11 +122,10 @@ pub fn needs_projection(items: &[ProjectionItem]) -> bool {
         .any(|i| matches!(i, ProjectionItem::Named { .. }))
 }
 
-/// Build the ordered list of lookup keys that correspond to `fields_for_projection`.
+/// Build the ordered list of lookup keys for the named projection columns.
 ///
-/// Callers pass this alongside `result_fields` to `reproject_response` so
-/// that qualified column references (`table.column`) are resolved against the
-/// join-prefixed keys the Data Plane emits.
+/// The shaping core uses these to resolve qualified column references
+/// (`table.column`) against the join-prefixed keys the Data Plane emits.
 pub fn lookup_keys_for_projection(items: &[ProjectionItem]) -> Vec<String> {
     items
         .iter()

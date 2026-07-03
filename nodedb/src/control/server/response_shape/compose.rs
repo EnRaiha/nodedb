@@ -2,14 +2,16 @@
 
 //! Composed, protocol-neutral materialized response shaping.
 //!
-//! `shape_response_materialized` performs the full per-payload shaping order
-//! (`apply_kv_wrap` -> `translate_if_vector` -> decode -> scan-envelope
-//! unwrap -> optional SELECT-list projection) as a single call, producing an
-//! already-shaped, already-projected [`ShapeOutcome`]. Every SELECT-read
-//! producer — pgwire's non-streaming dispatch, native's dispatch loop — calls
-//! this directly and hands the resulting `ShapedRows` to its own protocol
-//! encoder, rather than emitting a single-column envelope for a later
-//! reprojection seam to re-decode.
+//! `shape_response_materialized` and `shape_decoded_rows` are the canonical
+//! SELECT-read shaping used by every protocol entrypoint. `shape_response_materialized`
+//! performs the full per-payload shaping order (`apply_kv_wrap` ->
+//! `translate_if_vector` -> decode -> scan-envelope unwrap -> optional
+//! SELECT-list projection) as a single call, producing an already-shaped,
+//! already-projected [`ShapeOutcome`]. Every SELECT-read producer — pgwire's
+//! non-streaming dispatch, native's dispatch loop — calls this directly and
+//! hands the resulting `ShapedRows` to its own protocol encoder; each
+//! protocol then encodes those rows in its own wire format (pgwire's
+//! RowDescription/DataRow, native's MessagePack, http's JSON).
 //!
 //! Producers with no `PhysicalPlan` in scope (ClusterArray, set-op merges,
 //! gateway forwarding, clone merges) call [`shape_payload_no_plan`], which
@@ -35,10 +37,8 @@ use super::project::{
 use super::types::{PlanKind, ShapedRows};
 
 /// NOTICE text for an `AS OF SYSTEM TIME` cutoff older than the oldest
-/// retained tile version. Must stay byte-identical to pgwire's private
-/// `TRUNCATED_BEFORE_HORIZON_NOTICE` in
-/// `pgwire::handler::plan` — duplicated here rather than shared because
-/// pgwire's copy is intentionally left untouched.
+/// retained tile version. This is the canonical definition, surfaced to
+/// every protocol via [`ShapedRows::notice`].
 const TRUNCATED_BEFORE_HORIZON_NOTICE: &str = "AS OF SYSTEM TIME cutoff is older than the oldest retained tile version; \
      results may be incomplete";
 
@@ -55,10 +55,9 @@ pub enum ShapeOutcome {
 }
 
 /// Shape a single Data-Plane payload into protocol-neutral rows, applying
-/// exactly the transforms pgwire's materialized path applies, in the same
-/// order: KV point-get wrap, vector surrogate->PK translation, payload
-/// decode, scan-envelope unwrap, and (when `projection` names columns)
-/// SELECT-list column selection.
+/// the canonical shaping order: KV point-get wrap, vector surrogate->PK
+/// translation, payload decode, scan-envelope unwrap, and (when
+/// `projection` names columns) SELECT-list column selection.
 pub fn shape_response_materialized(
     payload: &[u8],
     plan: &PhysicalPlan,
@@ -119,9 +118,9 @@ pub fn shape_payload_no_plan(
 }
 
 /// Shape an `ArrayOp::Slice` response: decode the `ArraySliceResponse`
-/// envelope (falling back to a plain payload decode for legacy shapes,
-/// mirroring `payload_to_response`'s `ArraySlice` arm), unwrap the row
-/// envelope, and surface `truncated_before_horizon` as a notice.
+/// envelope (falling back to a plain payload decode for legacy shapes),
+/// unwrap the row envelope, and surface `truncated_before_horizon` as a
+/// notice.
 ///
 /// Array slices never carry a SELECT-list projection today (matching the
 /// pre-extraction behavior), so `shape_decoded_rows` is always called with
@@ -150,8 +149,8 @@ fn shape_array_slice(payload: &[u8]) -> ShapedRows {
 }
 
 /// Shape a DML-with-`RETURNING` response: decode the `RowsPayload` envelope
-/// (already TEXT-formatted cells), mirroring `payload_to_response`'s
-/// `ReturningRows` arm including its malformed-payload fallback.
+/// (already TEXT-formatted cells), falling back to a single "result" column
+/// on a malformed payload.
 fn shape_returning_rows(payload: &[u8]) -> ShapedRows {
     if payload.is_empty() {
         return single_result_column_empty();
@@ -225,10 +224,9 @@ fn shape_generic_rows(payload: &[u8], projection: Option<&[ProjectionItem]>) -> 
 
 /// Pure shaping core: given an already-decoded Data-Plane JSON payload,
 /// unwrap the `{id, data}` scan envelope via `push_flat_rows`, then either
-/// select the named SELECT-list columns (mirroring
-/// `pgwire::handler::projection::reproject_response`'s column-selection
-/// logic) or derive the id-first column union (mirroring
-/// `reproject_star_response`) when no named projection applies.
+/// select the named SELECT-list columns when a projection is given, or
+/// derive the id-first column union across all rows when no named
+/// projection applies.
 ///
 /// Callers needing the composed materialized-shaping order (KV wrap, vector
 /// translation, payload decode) should use [`shape_response_materialized`];
@@ -279,10 +277,9 @@ pub fn shape_decoded_rows(
     }
 }
 
-/// Select and rename one flat row's fields per the projection lists, using
-/// the same fallback order as
-/// `pgwire::handler::projection::encode_projected_row`: full lookup key,
-/// then the bare (post-dot) column name, then the SELECT alias.
+/// Select and rename one flat row's fields per the projection lists, trying
+/// each candidate key in order: the full lookup key, then the bare
+/// (post-dot) column name, then the SELECT alias.
 fn project_row(
     row: &Map<String, JsonValue>,
     lookup_keys: &[String],
@@ -321,8 +318,8 @@ fn project_row(
     out
 }
 
-/// Derive the id-first column union across all rows, matching
-/// `reproject_star_response`'s column-ordering rule exactly.
+/// Derive the id-first column union across all rows: `id` first (if
+/// present), then each row's remaining keys in first-seen order.
 fn derive_columns(rows: &[Map<String, JsonValue>]) -> Vec<String> {
     let mut cols: Vec<String> = Vec::new();
     if let Some(first) = rows.first() {

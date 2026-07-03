@@ -164,10 +164,9 @@ fn single_pgwire_error(err: PgWireError) -> Response {
 /// deriving the id-first column union across all rows.
 ///
 /// Unlike the named-projection path this is NOT lazy: the id-first column set
-/// can only be known once every row is seen, so all batches are drained first
-/// (matching the prior `reproject_star_response` behavior exactly), then the
-/// neutral shaping core derives the column union. The empty-result quirk is
-/// preserved: zero rows yield a single-column `result` empty response.
+/// can only be known once every row is seen, so all batches are drained first,
+/// then the neutral shaping core derives the column union. Zero rows yield a
+/// single-column `result` empty response.
 pub(crate) async fn streaming_star_response(stream: ResultStream, limit: usize) -> Response {
     use futures::StreamExt;
 
