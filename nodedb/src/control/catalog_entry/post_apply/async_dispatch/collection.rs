@@ -46,7 +46,7 @@ pub async fn purge_async(tenant_id: u64, name: String, purge_lsn: u64, shared: A
 /// dispatch to the local Data Plane, and Lite `CollectionPurged` broadcast.
 ///
 /// Split out from `purge_async` so the synchronous re-CREATE hard-purge
-/// (`ddl::collection::purge::hard_purge_collection`) can reuse the exact
+/// (`shared::ddl::neutral::collection::purge::hard_purge_collection`) can reuse the exact
 /// same reclaim body against a `&SharedState` without an owned `Arc`, and
 /// so the raft post-apply path and the re-CREATE path share one
 /// implementation rather than a copy.
@@ -129,7 +129,7 @@ pub(crate) async fn reclaim_collection_storage(
     shared.quiesce.wait_until_drained(tenant_id, name).await;
 
     // 4. Reclaim on local Data Plane.
-    crate::control::server::pgwire::ddl::collection::purge::dispatch_unregister_collection(
+    crate::control::server::shared::ddl::neutral::collection::purge::dispatch_unregister_collection(
         shared, tenant_id, name, purge_lsn,
     )
     .await;

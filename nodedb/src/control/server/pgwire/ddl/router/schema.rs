@@ -11,7 +11,7 @@ pub(super) async fn dispatch(
     identity: &AuthenticatedIdentity,
     sql: &str,
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
 ) -> Option<PgWireResult<Vec<Response>>> {
     // Triggers (CREATE / DROP / ALTER / SHOW) are served by the protocol-neutral DDL router.
 
@@ -33,9 +33,7 @@ pub(super) async fn dispatch(
     // UNDROP COLLECTION|TABLE — served by the protocol-neutral DDL router.
     // SHOW COLLECTIONS — served by the protocol-neutral DDL router.
 
-    if upper.starts_with("DROP INDEX ") {
-        return Some(super::super::collection::drop_index(state, identity, parts).await);
-    }
+    // DROP INDEX — served by the protocol-neutral DDL router.
     // SHOW INDEXES / SHOW INDEX — served by the protocol-neutral DDL router.
 
     // ALTER TABLE ADD COLUMN — handled via typed AST (ast.rs AlterCollection).

@@ -9,9 +9,7 @@ use nodedb_sql::ddl_ast::statement::{CollectionStmt, MiscStmt, NodedbStatement};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::ddl::collection::copy_from::CopyFromOptions;
-use crate::control::server::pgwire::ddl::collection::{
-    CreateIndexRequest, copy_from_file, copy_to_file, create_index,
-};
+use crate::control::server::pgwire::ddl::collection::{copy_from_file, copy_to_file};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -26,28 +24,9 @@ pub(super) async fn try_dispatch_async(
     database_id: DatabaseId,
 ) -> Option<PgWireResult<Vec<Response>>> {
     match stmt {
-        NodedbStatement::Collection(CollectionStmt::CreateIndex {
-            unique,
-            index_name,
-            collection,
-            field,
-            case_insensitive,
-            where_condition,
-        }) => Some(
-            create_index(
-                state,
-                identity,
-                &CreateIndexRequest {
-                    is_unique: *unique,
-                    index_name_opt: index_name.as_deref(),
-                    collection,
-                    field,
-                    case_insensitive: *case_insensitive,
-                    where_condition: where_condition.as_deref(),
-                },
-            )
-            .await,
-        ),
+        // CREATE [UNIQUE] INDEX (CreateIndex) is served by the protocol-neutral
+        // DDL router (`shared::ddl::neutral::collection::index`), which is tried
+        // before this transitional pgwire delegation runs.
 
         // CreateCollection / CreateTable are served by the protocol-neutral
         // DDL router (`shared::ddl::neutral::collection::create`), which is

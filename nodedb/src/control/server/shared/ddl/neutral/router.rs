@@ -1230,6 +1230,18 @@ pub async fn try_dispatch(
         return Some(collection::show_indexes(state, identity, &parts));
     }
 
+    // DROP INDEX <name>. Parses into a typed `CollectionStmt::DropIndex`, but
+    // the pgwire schema string router dispatched it by string prefix from the
+    // raw token slice (the pgwire typed guards / sync / async arms all returned
+    // `None` for it), reading `parts[2]` for the name and handling IF EXISTS
+    // inside `drop_index`. Replicate that exactly here, before the parse gate,
+    // so the prefix recognition and `parts`-based name extraction stay
+    // byte-identical.
+    if upper.starts_with("DROP INDEX ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(collection::drop_index(state, identity, &parts).await);
+    }
+
     // Parse errors → let the pgwire path run, which re-parses and reproduces the
     // exact error handling for those inputs.
     //
@@ -1525,6 +1537,57 @@ pub async fn try_dispatch(
             };
             Some(result)
         }
+
+        // DROP { COLLECTION | TABLE } [IF EXISTS] <name> [PURGE] [CASCADE
+        // [FORCE]] — parser folds both spellings into `DropCollection`.
+        // Migrated from the pgwire typed-AST sync router (`sync_ops`). The
+        // handler honours `if_exists` internally via its existence-check
+        // matrix (no guard short-circuit); the catalog propose + single-node
+        // fallback, cascade dependent enumeration, soft vs hard delete, the
+        // implicit-sequence sweep, and the audit pair are preserved verbatim
+        // in `collection::drop`.
+        NodedbStatement::Collection(CollectionStmt::DropCollection {
+            name,
+            if_exists,
+            purge,
+            cascade,
+            cascade_force,
+        }) => Some(collection::drop_collection(
+            state,
+            identity,
+            name,
+            *if_exists,
+            *purge,
+            *cascade,
+            *cascade_force,
+        )),
+
+        // CREATE [UNIQUE] INDEX [name] ON <collection> (<field>) [WHERE ...].
+        // Migrated from the pgwire typed-AST async router (`async_ops`). The
+        // two-phase Building→Ready backfill, peer fan-out, Register refresh,
+        // and owner-ledger propose are preserved verbatim in `collection::index`.
+        NodedbStatement::Collection(CollectionStmt::CreateIndex {
+            unique,
+            index_name,
+            collection: coll,
+            field,
+            case_insensitive,
+            where_condition,
+        }) => Some(
+            collection::create_index(
+                state,
+                identity,
+                &collection::CreateIndexRequest {
+                    is_unique: *unique,
+                    index_name_opt: index_name.as_deref(),
+                    collection: coll,
+                    field,
+                    case_insensitive: *case_insensitive,
+                    where_condition: where_condition.as_deref(),
+                },
+            )
+            .await,
+        ),
 
         NodedbStatement::Collection(CollectionStmt::CreateSequence {
             name,

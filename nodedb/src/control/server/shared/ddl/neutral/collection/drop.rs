@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! DROP COLLECTION DDL.
+//! Protocol-neutral DROP COLLECTION DDL.
 //!
 //! Supported forms (tokens are case-insensitive; `COLLECTION` and
 //! `TABLE` are accepted as synonyms — both route through the parser
@@ -21,16 +21,27 @@
 //! The handler takes typed parsed arguments rather than the raw `parts`
 //! slice so the `IF EXISTS` and spelling-synonym contracts cannot be
 //! lost by an off-by-one index into the tokens.
+//!
+//! Ported from the pgwire `ddl::collection::drop` handler. The catalog
+//! (propose + single-node fallback), cascade dependent enumeration, soft
+//! vs hard delete, implicit-sequence sweep, and audit pair are preserved
+//! verbatim; only the result construction changed from pgwire `Response`
+//! / `Tag` to the protocol-neutral `DdlResult` / `DdlError`.
 
 use nodedb_types::DatabaseId;
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// DROP { COLLECTION | TABLE } [IF EXISTS] <name> [PURGE] [CASCADE [FORCE]]
 ///
@@ -53,7 +64,7 @@ pub fn drop_collection(
     purge: bool,
     cascade: bool,
     cascade_force: bool,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let name_lower = name.to_lowercase();
     let name = name_lower.as_str();
     let tenant_id = identity.tenant_id;
@@ -69,7 +80,7 @@ pub fn drop_collection(
     {
         let mut visited = std::collections::HashSet::new();
         crate::control::cascade::collect_dependents(catalog, tenant_id.as_u64(), name, &mut visited)
-            .map_err(|e| sqlstate_error("XX000", &e.to_string()))?
+            .map_err(|e| err("XX000", e.to_string()))?
     } else {
         Vec::new()
     };
@@ -90,9 +101,9 @@ pub fn drop_collection(
             .iter()
             .map(|d| format!("{}:{}", d.kind.as_str(), d.name))
             .collect();
-        return Err(sqlstate_error(
+        return Err(err(
             "2BP01",
-            &format!(
+            format!(
                 "cannot drop collection '{name}': {} dependent object(s) exist ({}); \
                  drop them individually or retry with CASCADE (batched-cascade propose \
                  not yet implemented — CASCADE currently rejected to avoid orphaned rows)",
@@ -103,7 +114,7 @@ pub fn drop_collection(
     }
 
     if cascade {
-        return Err(sqlstate_error(
+        return Err(err(
             "0A000",
             "DROP COLLECTION ... CASCADE requires atomic batched Delete* + PurgeCollection \
              in one metadata-raft commit — that proposer surface has not landed yet. \
@@ -126,7 +137,7 @@ pub fn drop_collection(
         // See the security invariant in the docstring: returned
         // unconditionally, before the existence check, so the response
         // does not depend on whether the target exists.
-        return Err(sqlstate_error(
+        return Err(err(
             "42501",
             "permission denied: only owner, superuser, or tenant_admin can drop collections",
         ));
@@ -135,7 +146,7 @@ pub fn drop_collection(
     // PURGE requires admin — it bypasses the retention safety net,
     // which an owner alone should not be able to invoke.
     if purge && !is_admin {
-        return Err(sqlstate_error(
+        return Err(err(
             "42501",
             "permission denied: only superuser or tenant_admin may DROP COLLECTION ... PURGE",
         ));
@@ -161,16 +172,19 @@ pub fn drop_collection(
             Ok(Some(coll)) if coll.is_active => {}
             Ok(Some(_)) if purge => {}
             Ok(Some(_)) => {
-                return Ok(vec![Response::Execution(Tag::new("DROP COLLECTION"))]);
+                return Ok(vec![DdlResult::Status {
+                    command: "DROP COLLECTION".to_string(),
+                    rows_affected: None,
+                }]);
             }
             Ok(None) if purge || if_exists => {
-                return Ok(vec![Response::Execution(Tag::new("DROP COLLECTION"))]);
+                return Ok(vec![DdlResult::Status {
+                    command: "DROP COLLECTION".to_string(),
+                    rows_affected: None,
+                }]);
             }
             _ => {
-                return Err(sqlstate_error(
-                    "42P01",
-                    &format!("collection '{name}' does not exist"),
-                ));
+                return Err(err("42P01", format!("collection '{name}' does not exist")));
             }
         }
     }
@@ -210,7 +224,7 @@ pub fn drop_collection(
         }
     };
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
     if log_index == 0
         && let Some(catalog) = state.credentials.catalog().as_ref()
     {
@@ -220,14 +234,14 @@ pub fn drop_collection(
         if purge {
             catalog
                 .delete_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), name)
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+                .map_err(|e| err("XX000", e.to_string()))?;
         } else if let Ok(Some(mut coll)) =
             catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), name)
         {
             coll.is_active = false;
             catalog
                 .put_collection(DatabaseId::DEFAULT, &coll)
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+                .map_err(|e| err("XX000", e.to_string()))?;
         }
     }
 
@@ -242,9 +256,9 @@ pub fn drop_collection(
                 catalog
                     .delete_sequence(tenant_id.as_u64(), &seq.name)
                     .map_err(|e| {
-                        sqlstate_error(
+                        err(
                             "XX000",
-                            &format!("failed to drop sequence '{}': {e}", seq.name),
+                            format!("failed to drop sequence '{}': {e}", seq.name),
                         )
                     })?;
                 // Best-effort: registry removal is non-critical since catalog
@@ -272,5 +286,8 @@ pub fn drop_collection(
         &completion,
     );
 
-    Ok(vec![Response::Execution(Tag::new("DROP COLLECTION"))])
+    Ok(vec![DdlResult::Status {
+        command: "DROP COLLECTION".to_string(),
+        rows_affected: None,
+    }])
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Index DDL: CREATE INDEX, DROP INDEX.
+//! Protocol-neutral index DDL: CREATE INDEX, DROP INDEX.
 //!
 //! CREATE/DROP INDEX mutate the owning [`StoredCollection`]'s `indexes`
 //! vector and commit a `CatalogEntry::PutCollection`. The replicated
@@ -9,9 +9,12 @@
 //! reflects the new index before the next write arrives. The `indexes`
 //! ownership keys (`permissions.propose_owner("index", ...)`) continue
 //! to back SHOW INDEXES (served by the protocol-neutral DDL router).
-
-use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+//!
+//! Ported from the pgwire `ddl::collection::index` handler. The async
+//! data-plane pipeline (two-phase Building→Ready backfill, peer fan-out,
+//! `dispatch_register_from_stored`, owner propose/delete) is preserved
+//! verbatim; only the result construction changed from pgwire `Response`
+//! / `Tag` to the protocol-neutral `DdlResult` / `DdlError`.
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::{IndexBuildState, StoredIndex};
@@ -20,7 +23,14 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use crate::types::TraceId;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::{DdlError, DdlResult};
+
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// Normalize a user-supplied field reference into the canonical JSON path
 /// used by the sparse-index extraction (`$.field` / `$.nested.field`).
@@ -41,24 +51,22 @@ fn normalize_index_field(field: &str) -> String {
 async fn commit_collection_mutation(
     state: &SharedState,
     coll: &crate::control::security::catalog::StoredCollection,
-) -> Result<(), pgwire::error::PgWireError> {
+) -> Result<(), DdlError> {
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
     if log_index == 0 {
         if let Some(catalog) = state.credentials.catalog() {
             catalog
                 .put_collection(DatabaseId::DEFAULT, coll)
-                .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+                .map_err(|e| err("XX000", e.to_string()))?;
         }
         // Single-node path bypasses the applier post-apply hook, so the
         // Register refresh has to be fired here. In cluster mode the
         // applier's `put_async` does it on every node.
-        crate::control::server::shared::ddl::neutral::collection::dispatch_register_from_stored(
-            state, coll,
-        )
-        .await
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        super::dispatch_register_from_stored(state, coll)
+            .await
+            .map_err(|e| err("XX000", e.to_string()))?;
     }
     Ok(())
 }
@@ -86,7 +94,7 @@ pub async fn create_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     req: &CreateIndexRequest<'_>,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let CreateIndexRequest {
         is_unique,
         index_name_opt,
@@ -96,7 +104,7 @@ pub async fn create_index(
         where_condition,
     } = *req;
     if collection.is_empty() {
-        return Err(sqlstate_error(
+        return Err(err(
             "42601",
             "CREATE INDEX requires at least: ON <collection> (<field>)",
         ));
@@ -113,7 +121,7 @@ pub async fn create_index(
 
     // Verify collection exists, capture it, and check CREATE permission.
     let Some(catalog) = state.credentials.catalog() else {
-        return Err(sqlstate_error(
+        return Err(err(
             "XX000",
             "catalog unavailable: CREATE INDEX requires persisted collections",
         ));
@@ -122,9 +130,9 @@ pub async fn create_index(
     {
         Ok(Some(c)) if c.is_active => c,
         _ => {
-            return Err(sqlstate_error(
+            return Err(err(
                 "42P01",
-                &format!("collection '{collection}' does not exist"),
+                format!("collection '{collection}' does not exist"),
             ));
         }
     };
@@ -134,7 +142,7 @@ pub async fn create_index(
         && !identity.is_superuser
         && !identity.has_role(&crate::control::security::identity::Role::TenantAdmin)
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "42501",
             "permission denied: must be collection owner or admin to create indexes",
         ));
@@ -142,9 +150,9 @@ pub async fn create_index(
 
     // Reject duplicates within this collection.
     if coll.indexes.iter().any(|i| i.name == index_name) {
-        return Err(sqlstate_error(
+        return Err(err(
             "42710",
-            &format!("index '{index_name}' already exists on '{collection}'"),
+            format!("index '{index_name}' already exists on '{collection}'"),
         ));
     }
 
@@ -203,7 +211,7 @@ pub async fn create_index(
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+    .map_err(|e| err("XX000", e.to_string()))?;
 
     if backfill_resp.status == crate::bridge::envelope::Status::Error {
         let detail = match &backfill_resp.error_code {
@@ -216,7 +224,7 @@ pub async fn create_index(
         } else {
             "XX000"
         };
-        return Err(sqlstate_error(code, &detail));
+        return Err(err(code, detail));
     }
 
     // Phase 2b: fan the same backfill op to every other cluster node.
@@ -264,7 +272,7 @@ pub async fn create_index(
         &index_name,
         &index_owner,
     )
-    .map_err(|e| sqlstate_error(&e.sqlstate, &e.message))?;
+    .map_err(|e| err(&e.sqlstate, e.message))?;
 
     let kind = if is_unique { "unique index" } else { "index" };
     let ci = if case_insensitive {
@@ -283,7 +291,10 @@ pub async fn create_index(
         &format!("created {kind} '{index_name}' on '{collection}' ({canonical_field}){ci}{cond}"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("CREATE INDEX"))])
+    Ok(vec![DdlResult::Status {
+        command: "CREATE INDEX".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// DROP INDEX <name>
@@ -291,9 +302,9 @@ pub async fn drop_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 3 {
-        return Err(sqlstate_error("42601", "syntax: DROP INDEX <name>"));
+        return Err(err("42601", "syntax: DROP INDEX <name>"));
     }
 
     let index_name = parts[2].to_string();
@@ -310,7 +321,7 @@ pub async fn drop_index(
         && !identity.is_superuser
         && !identity.has_role(&crate::control::security::identity::Role::TenantAdmin)
     {
-        return Err(sqlstate_error(
+        return Err(err(
             "42501",
             "permission denied: must be index owner or admin",
         ));
@@ -319,14 +330,14 @@ pub async fn drop_index(
     // Locate the owning collection via catalog scan. Every index lives on
     // exactly one collection; scanning is cheap relative to Raft commit.
     let Some(catalog) = state.credentials.catalog() else {
-        return Err(sqlstate_error(
+        return Err(err(
             "XX000",
             "catalog unavailable: DROP INDEX requires persisted collections",
         ));
     };
     let collections = catalog
         .load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id.as_u64())
-        .map_err(|e| sqlstate_error("XX000", &e.to_string()))?;
+        .map_err(|e| err("XX000", e.to_string()))?;
     let mut owning = collections
         .into_iter()
         .find(|c| c.indexes.iter().any(|i| i.name == index_name));
@@ -389,7 +400,7 @@ pub async fn drop_index(
         tenant_id,
         &index_name,
     )
-    .map_err(|e| sqlstate_error(&e.sqlstate, &e.message))?;
+    .map_err(|e| err(&e.sqlstate, e.message))?;
 
     state.audit_record(
         AuditEvent::AdminAction,
@@ -398,5 +409,8 @@ pub async fn drop_index(
         &format!("dropped index '{index_name}'"),
     );
 
-    Ok(vec![Response::Execution(Tag::new("DROP INDEX"))])
+    Ok(vec![DdlResult::Status {
+        command: "DROP INDEX".to_string(),
+        rows_affected: None,
+    }])
 }

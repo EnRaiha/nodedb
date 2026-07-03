@@ -28,7 +28,14 @@ use nodedb_cluster::rpc_codec::{ExecuteRequest, RaftRpc};
 use nodedb_cluster::topology::NodeState;
 use nodedb_physical::physical_plan::wire as plan_wire;
 
-use super::super::super::types::sqlstate_error;
+use super::super::super::result::DdlError;
+
+fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// Remaining budget for per-peer RPCs. Chosen to cover backfill on
 /// collections with up to ~1M rows at the Data Plane's current
@@ -38,7 +45,7 @@ const PEER_BACKFILL_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Run `DocumentOp::BackfillIndex` on every cluster node other than
 /// this coordinator. Returns `Ok(())` only when every peer reports
-/// success; any peer failure is returned as a pgwire error with
+/// success; any peer failure is returned as a DDL error with
 /// SQLSTATE 23505 for duplicates and XX000 otherwise, matching the
 /// single-node path.
 ///
@@ -62,7 +69,7 @@ pub(super) struct PeerBackfill<'a> {
 pub(super) async fn backfill_on_peers(
     state: &SharedState,
     args: PeerBackfill<'_>,
-) -> Result<(), pgwire::error::PgWireError> {
+) -> Result<(), DdlError> {
     let Some(transport) = state.cluster_transport.as_ref() else {
         // Non-cluster build / single-node without cluster transport:
         // the local dispatch is the only required step.
@@ -101,8 +108,8 @@ pub(super) async fn backfill_on_peers(
         case_insensitive: args.case_insensitive,
         predicate: args.predicate.map(str::to_string),
     });
-    let plan_bytes = plan_wire::encode(&plan)
-        .map_err(|e| sqlstate_error("XX000", &format!("backfill plan encode: {e}")))?;
+    let plan_bytes =
+        plan_wire::encode(&plan).map_err(|e| err("XX000", format!("backfill plan encode: {e}")))?;
 
     // Fan out in parallel; collect per-peer outcomes. Any failure
     // aborts the commit — we do NOT compensate by dropping the index
@@ -132,27 +139,27 @@ pub(super) async fn backfill_on_peers(
     for join in joins {
         let (node_id, outcome) = join
             .await
-            .map_err(|e| sqlstate_error("XX000", &format!("peer backfill join: {e}")))?;
+            .map_err(|e| err("XX000", format!("peer backfill join: {e}")))?;
         let resp = outcome.map_err(|e| {
-            sqlstate_error(
+            err(
                 "XX000",
-                &format!("peer backfill transport to node {node_id}: {e}"),
+                format!("peer backfill transport to node {node_id}: {e}"),
             )
         })?;
         let RaftRpc::ExecuteResponse(resp) = resp else {
-            return Err(sqlstate_error(
+            return Err(err(
                 "XX000",
-                &format!("peer backfill on node {node_id}: unexpected RPC variant {resp:?}"),
+                format!("peer backfill on node {node_id}: unexpected RPC variant {resp:?}"),
             ));
         };
-        if let Some(err) = resp.error {
-            let detail = format!("peer backfill on node {node_id}: {err:?}");
+        if let Some(e) = resp.error {
+            let detail = format!("peer backfill on node {node_id}: {e:?}");
             let code = if detail.to_lowercase().contains("unique") {
                 "23505"
             } else {
                 "XX000"
             };
-            return Err(sqlstate_error(code, &detail));
+            return Err(err(code, detail));
         }
     }
 

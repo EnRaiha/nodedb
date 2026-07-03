@@ -116,7 +116,7 @@ pub async fn build_and_persist(
         // catalog row, ABORT the CREATE rather than build a new
         // collection over un-purged data (which would resurrect the
         // stale rows). Surface as an internal error to the client.
-        crate::control::server::pgwire::ddl::collection::purge::hard_purge_collection(
+        crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
             state,
             tenant_id.as_u64(),
             name,

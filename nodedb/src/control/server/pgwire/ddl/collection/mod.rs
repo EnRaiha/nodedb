@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Collection DDL: DROP COLLECTION, indexes, and ALTER commands. (CREATE
-//! COLLECTION / CREATE TABLE, DESCRIBE / SHOW COLLECTIONS / SHOW INDEXES /
-//! UNDROP COLLECTION are served by the protocol-neutral DDL router.)
+//! Collection DDL: ALTER commands, COPY, and DML (insert/upsert). (CREATE
+//! COLLECTION / CREATE TABLE, DROP COLLECTION, CREATE / DROP INDEX, DESCRIBE /
+//! SHOW COLLECTIONS / SHOW INDEXES / UNDROP COLLECTION, and collection purge
+//! are served by the protocol-neutral DDL router.)
 
 pub mod alter;
 pub mod check_constraint;
 pub mod copy_from;
 pub mod copy_to;
-pub mod drop;
 pub mod helpers;
-pub mod index;
-pub(super) mod index_fanout;
 pub mod insert;
 pub(super) mod insert_parse;
-pub mod purge;
 pub mod upsert;
 pub mod vector_metadata;
 
@@ -27,8 +24,6 @@ pub use alter::{
 };
 pub use copy_from::copy_from_file;
 pub use copy_to::copy_to_file;
-pub use drop::drop_collection;
-pub use index::{CreateIndexRequest, create_index, drop_index};
 pub use insert::insert_document;
 pub use upsert::upsert_document;
 pub use vector_metadata::{
