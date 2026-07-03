@@ -105,7 +105,7 @@ impl DataPlaneSnapshotBuilder {
         merged: &mut TenantDataSnapshot,
     ) -> Result<(), Error> {
         let plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot { tenant_id });
-        let bytes = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+        let bytes = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
             &self.shared,
             TenantId::new(tenant_id),
             DatabaseId::DEFAULT,

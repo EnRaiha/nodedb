@@ -21,7 +21,7 @@ use nodedb_types::backup_envelope::{EnvelopeMeta, EnvelopeWriter};
 
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::pgwire::ddl::sync_dispatch;
+use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_physical::physical_plan::{MetaOp, wire as plan_wire};

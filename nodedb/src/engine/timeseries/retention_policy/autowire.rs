@@ -67,7 +67,7 @@ pub async fn register_tiers(
             def: agg_def.clone(),
         });
 
-        crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+        crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
             state,
             tenant_id,
             DatabaseId::new(def.database_id),
@@ -110,7 +110,7 @@ pub async fn unregister_tiers(
         // All aggregates routed via the base collection for vShard affinity.
         let route_collection = &def.collection;
 
-        crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+        crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
             state,
             tenant_id,
             DatabaseId::new(def.database_id),

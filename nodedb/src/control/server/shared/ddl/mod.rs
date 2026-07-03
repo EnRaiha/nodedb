@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod neutral;
 pub mod owner;
 pub mod result;
+pub mod sync_dispatch;
 
 pub use self::dispatch::dispatch;
 pub use self::result::{DdlError, DdlResult};

@@ -129,7 +129,7 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
             collections_to_clear,
         });
 
-        crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+        crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
             &self.shared,
             TenantId::new(0),
             DatabaseId::DEFAULT,

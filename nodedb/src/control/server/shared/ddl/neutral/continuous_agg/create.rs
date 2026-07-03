@@ -18,7 +18,7 @@ use nodedb_types::DatabaseId;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::{StoredCollection, StoredContinuousAggregate};
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::sync_dispatch;
+use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::ContinuousAggregateDef;
 use nodedb_physical::physical_plan::MetaOp;

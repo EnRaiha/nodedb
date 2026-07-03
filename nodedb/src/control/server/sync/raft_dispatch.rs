@@ -187,7 +187,7 @@ pub fn noop_dispatch_error(op: &str) -> crate::Error {
 /// Cluster path: proposes through Raft and returns the apply payload bytes.
 ///
 /// Single-node path: falls through to
-/// [`crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async_with_source`].
+/// [`crate::control::server::shared::ddl::sync_dispatch::dispatch_async_with_source`].
 pub async fn dispatch_sync_bytes(
     state: &SharedState,
     tenant_id: TenantId,
@@ -245,7 +245,7 @@ pub async fn dispatch_write_replicated(
     }
 
     let resp =
-        crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async_response_with_source(
+        crate::control::server::shared::ddl::sync_dispatch::dispatch_async_response_with_source(
             state,
             tenant_id,
             database_id,

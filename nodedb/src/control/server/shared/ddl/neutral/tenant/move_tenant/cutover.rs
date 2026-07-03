@@ -26,7 +26,7 @@ use crate::control::catalog_entry::apply::apply_to;
 use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::catalog::{StoredCollection, SystemCatalog};
-use crate::control::server::pgwire::ddl::sync_dispatch;
+use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::MetaOp;

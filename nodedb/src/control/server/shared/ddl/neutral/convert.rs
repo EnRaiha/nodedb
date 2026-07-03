@@ -22,7 +22,7 @@ use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async;
+use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::MetaOp;
 

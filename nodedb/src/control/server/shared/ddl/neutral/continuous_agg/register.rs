@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::pgwire::ddl::sync_dispatch;
+use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::ContinuousAggregateDef;
 use nodedb_physical::physical_plan::MetaOp;

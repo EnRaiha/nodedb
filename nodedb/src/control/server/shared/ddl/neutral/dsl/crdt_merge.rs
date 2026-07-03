@@ -53,7 +53,7 @@ pub async fn crdt_merge(
         document_id: source_id.to_string(),
     });
 
-    let source_bytes = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+    let source_bytes = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
         database_id,

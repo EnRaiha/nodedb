@@ -24,7 +24,7 @@ use nodedb_types::value::Value;
 
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::pgwire::ddl::sync_dispatch;
+use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::server::wal_dispatch::wal_append_if_write;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, VShardId};

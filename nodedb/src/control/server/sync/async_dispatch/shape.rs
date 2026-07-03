@@ -66,7 +66,7 @@ async fn take_shape_snapshot_async(
     tid: crate::types::TenantId,
 ) -> super::super::shape::handler::ShapeSnapshotData {
     use crate::bridge::envelope::PhysicalPlan;
-    use crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async;
+    use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
     use nodedb_physical::physical_plan::DocumentOp;
 
     shared.tenant_request_start(tid);

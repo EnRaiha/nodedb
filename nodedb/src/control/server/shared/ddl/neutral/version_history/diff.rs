@@ -8,8 +8,8 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;

@@ -36,7 +36,7 @@ pub async fn query_last_values(
         collection: collection.to_string(),
     });
 
-    let payload = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+    let payload = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
         database_id,
@@ -93,7 +93,7 @@ pub async fn query_last_value(
         series_id,
     });
 
-    let payload = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+    let payload = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
         database_id,

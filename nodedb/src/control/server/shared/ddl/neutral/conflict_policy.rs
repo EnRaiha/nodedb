@@ -58,7 +58,7 @@ pub async fn alter_set_on_conflict(
     let get_plan = PhysicalPlan::Crdt(CrdtOp::GetPolicy {
         collection: collection.to_string(),
     });
-    let policy_bytes = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+    let policy_bytes = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
         database_id,
@@ -82,7 +82,7 @@ pub async fn alter_set_on_conflict(
         collection: collection.to_string(),
         policy_json,
     });
-    crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+    crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
         database_id,
@@ -119,7 +119,7 @@ pub async fn show_conflict_policy(
     let plan = PhysicalPlan::Crdt(CrdtOp::GetPolicy {
         collection: collection.to_string(),
     });
-    let policy_bytes = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+    let policy_bytes = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
         database_id,

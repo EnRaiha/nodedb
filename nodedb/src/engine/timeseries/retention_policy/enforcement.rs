@@ -87,7 +87,7 @@ async fn enforcement_loop(
                     });
 
                     if let Err(e) =
-                        crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+                        crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
                             &state,
                             tenant_id,
                             DatabaseId::new(policy.database_id),
@@ -115,7 +115,7 @@ async fn enforcement_loop(
 
             // Apply retention to continuous aggregate buckets.
             let plan = PhysicalPlan::Meta(MetaOp::ApplyContinuousAggRetention);
-            if let Err(e) = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+            if let Err(e) = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
                 &state,
                 tenant_id,
                 DatabaseId::new(policy.database_id),
@@ -172,7 +172,7 @@ async fn check_watermark_coverage(
         aggregate_name: tier1_name.clone(),
     });
 
-    match crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+    match crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
         DatabaseId::new(policy.database_id),

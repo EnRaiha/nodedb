@@ -16,8 +16,8 @@ use nodedb_sql::ddl_ast::GraphDirection;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::ddl::sync_dispatch;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
 use crate::engine::graph::edge_store::Direction;

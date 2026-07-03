@@ -71,7 +71,7 @@ pub async fn crdt_state(
     });
 
     // Synchronous dispatch via the blocking bridge.
-    let result = crate::control::server::pgwire::ddl::sync_dispatch::dispatch_async(
+    let result = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
         state,
         tenant_id,
         database_id,

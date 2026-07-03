@@ -18,7 +18,7 @@ use nodedb_types::Surrogate;
 
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::pgwire::ddl::sync_dispatch;
+use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::types::{SurrogateBindEntry, TenantDataSnapshot, TenantId};
 use nodedb_physical::physical_plan::MetaOp;
