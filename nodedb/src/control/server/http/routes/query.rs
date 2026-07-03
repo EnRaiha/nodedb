@@ -12,17 +12,22 @@ use axum::extract::{Query as QueryParams, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
-use sonic_rs;
 
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::identity::{required_permission, role_grants_permission};
+use crate::control::server::response_shape::project::parse_select_projection;
+use crate::control::server::response_shape::types::describe_plan;
 use crate::types::{TraceId, VShardId};
 
 use super::super::auth::{ApiError, AppState, resolve_identity};
 use super::super::types::HttpQueryRequest;
 use super::super::types::HttpQueryResponse;
+use super::result_shape::{
+    HttpShaped, ddl_results_to_json, passthrough_json_row, passthrough_to_ndjson,
+    shape_http_payload,
+};
 
 /// Query string parameters for `/v1/query` and `/v1/query/stream`.
 ///
@@ -146,6 +151,10 @@ pub async fn query(
     // Track active request for quota accounting.
     state.shared.tenant_request_start(tenant_id);
 
+    // Parsed once, matching pgwire: drives the protocol-neutral shaping
+    // core's SELECT-list column selection below.
+    let projection = parse_select_projection(sql);
+
     // Execute each task via the SPSC bridge.
     let mut result_rows = Vec::new();
 
@@ -171,6 +180,11 @@ pub async fn query(
 
             // WAL append for write operations.
             wal_append_if_write(&state, &task)?;
+
+            // Captured before dispatch moves `task.plan` — needed by the
+            // protocol-neutral shaping core below.
+            let plan_kind = describe_plan(&task.plan);
+            let plan_for_shape = task.plan.clone();
 
             // Dispatch: prefer gateway when available (cluster-aware routing),
             // fall back to direct local SPSC dispatch on single-node boot.
@@ -214,16 +228,23 @@ pub async fn query(
             };
 
             for payload in &payloads {
-                if !payload.is_empty() {
-                    match decode_payload_to_json(payload) {
-                        Ok(value) => result_rows.push(value),
-                        Err(_) => {
-                            // Binary payload — base64 encode.
-                            use base64::Engine;
-                            let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
-                            result_rows.push(serde_json::json!({ "data": encoded }));
-                        }
+                if payload.is_empty() {
+                    continue;
+                }
+                match shape_http_payload(
+                    payload,
+                    &plan_for_shape,
+                    plan_kind,
+                    projection.as_deref(),
+                    &state.shared,
+                    database_id,
+                    tenant_id,
+                ) {
+                    Ok(HttpShaped::Rows(rows)) => result_rows.extend(rows),
+                    Ok(HttpShaped::Passthrough) => {
+                        result_rows.push(passthrough_json_row(payload));
                     }
+                    Err(e) => return Err(ApiError::Internal(e.message().to_string())),
                 }
             }
         }
@@ -271,56 +292,6 @@ async fn dispatch_to_data_plane(
         trace_id,
     )
     .await
-}
-
-/// Decode a Data Plane response payload to JSON.
-///
-/// Tries MessagePack first (primary format), then JSON passthrough.
-fn decode_payload_to_json(payload: &[u8]) -> Result<serde_json::Value, ()> {
-    // Try MessagePack.
-    if let Ok(val) = nodedb_types::json_from_msgpack(payload) {
-        return Ok(val);
-    }
-
-    // Try JSON passthrough.
-    if let Ok(val) = sonic_rs::from_slice::<serde_json::Value>(payload) {
-        return Ok(val);
-    }
-
-    Err(())
-}
-
-/// Render protocol-neutral DDL results to JSON rows.
-///
-/// Status and empty results keep their prior JSON shapes (`{type, tag}` /
-/// `{type: "empty"}`). Row-returning results (SHOW / EXPLAIN / introspection)
-/// now emit one JSON object per row instead of a stub note — HTTP can return
-/// DDL/SHOW rows directly.
-fn ddl_results_to_json(
-    results: Vec<crate::control::server::shared::ddl::DdlResult>,
-) -> Vec<serde_json::Value> {
-    use crate::control::server::shared::ddl::DdlResult;
-
-    let mut rows = Vec::new();
-    for result in results {
-        match result {
-            DdlResult::Status { command, .. } => {
-                rows.push(serde_json::json!({
-                    "type": "execution",
-                    "tag": command,
-                }));
-            }
-            DdlResult::Rows(shaped) => {
-                for row in shaped.rows {
-                    rows.push(serde_json::Value::Object(row));
-                }
-            }
-            DdlResult::Empty => {
-                rows.push(serde_json::json!({ "type": "empty" }));
-            }
-        }
-    }
-    rows
 }
 
 /// POST /v1/query/stream — execute SQL and return results as NDJSON (newline-delimited JSON).
@@ -389,6 +360,11 @@ pub async fn query_ndjson(
 
     let trace_id = crate::control::trace_context::generate_trace_id();
 
+    // Parsed once, matching pgwire: drives the protocol-neutral shaping
+    // core's SELECT-list column selection in both the lazy stream below and
+    // the materialized fallback.
+    let projection = parse_select_projection(sql);
+
     // Lazy fast path: an eligible single-task, unordered, multi-row SELECT
     // streams its rows straight off a `ResultStream` as NDJSON lines instead
     // of materializing the whole result first. HTTP is stateless, so there is
@@ -400,7 +376,9 @@ pub async fn query_ndjson(
     match super::query_stream::try_open_stream(&state, &tasks, database_id, trace_id).await {
         Ok(Some((stream, limit))) => {
             let body = axum::body::Body::from_stream(super::query_stream::ndjson_body_stream(
-                stream, limit,
+                stream,
+                limit,
+                projection.clone(),
             ));
             return Response::builder()
                 .header("Content-Type", "application/x-ndjson")
@@ -422,6 +400,11 @@ pub async fn query_ndjson(
 
     let mut ndjson = String::new();
     for task in tasks {
+        // Captured before dispatch moves `task.plan` — needed by the
+        // protocol-neutral shaping core below.
+        let plan_kind = describe_plan(&task.plan);
+        let plan_for_shape = task.plan.clone();
+
         let dispatch_result: crate::Result<Vec<Vec<u8>>> = match state.shared.gateway.as_ref() {
             Some(gw) => {
                 let gw_ctx = QueryContext {
@@ -449,22 +432,29 @@ pub async fn query_ndjson(
         match dispatch_result {
             Ok(payloads) => {
                 for payload in &payloads {
-                    if !payload.is_empty() {
-                        let json_str =
-                            crate::data::executor::response_codec::decode_payload_to_json(payload);
-                        // Emit each array element as its own NDJSON line.
-                        // `to_array_iter` yields raw JSON slices without
-                        // deserializing into a Value tree — no per-item heap
-                        // alloc and no re-serialization. Non-array payloads
-                        // (DDL acks, error text, etc.) fall back to emitting
-                        // the whole payload as one line.
-                        if json_str.trim_start().starts_with('[') {
-                            for lv in sonic_rs::to_array_iter(json_str.as_str()).flatten() {
-                                ndjson.push_str(lv.as_raw_str());
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    match shape_http_payload(
+                        payload,
+                        &plan_for_shape,
+                        plan_kind,
+                        projection.as_deref(),
+                        &state.shared,
+                        database_id,
+                        tenant_id,
+                    ) {
+                        Ok(HttpShaped::Rows(rows)) => {
+                            for row in rows {
+                                ndjson.push_str(&row.to_string());
                                 ndjson.push('\n');
                             }
-                        } else {
-                            ndjson.push_str(&json_str);
+                        }
+                        Ok(HttpShaped::Passthrough) => {
+                            passthrough_to_ndjson(payload, &mut ndjson);
+                        }
+                        Err(e) => {
+                            ndjson.push_str(&serde_json::json!({"error": e.message()}).to_string());
                             ndjson.push('\n');
                         }
                     }

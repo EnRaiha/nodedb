@@ -22,6 +22,8 @@ use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::server::exchange::gather::gather_all_cores_stream;
 use crate::control::server::exchange::streamable::streamable_gather_child;
+use crate::control::server::response_shape::compose::shape_decoded_rows;
+use crate::control::server::response_shape::project::ProjectionItem;
 use crate::control::server::result_stream::ResultStream;
 use crate::data::executor::response_codec::decode_payload_to_json;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -86,6 +88,7 @@ pub(super) async fn try_open_stream(
 pub(super) fn ndjson_body_stream(
     stream: ResultStream,
     limit: usize,
+    projection: Option<Vec<ProjectionItem>>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
         let mut emitted: usize = 0;
@@ -103,11 +106,26 @@ pub(super) fn ndjson_body_stream(
             };
 
             let json_str = decode_payload_to_json(&batch.payload);
-            for lv in sonic_rs::to_array_iter(json_str.as_str()).flatten() {
+            let value = match sonic_rs::from_str::<serde_json::Value>(&json_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    // A malformed batch payload is surfaced as an in-band error
+                    // line (matching the mid-stream dispatch-error path above)
+                    // rather than silently dropping the batch.
+                    let line = format!(
+                        "{}\n",
+                        serde_json::json!({ "error": format!("malformed response batch: {e}") })
+                    );
+                    yield Ok(Bytes::from(line));
+                    return;
+                }
+            };
+            let shaped = shape_decoded_rows(&value, projection.as_deref());
+            for row in shaped.rows {
                 if emitted >= limit {
                     break;
                 }
-                let line = format!("{}\n", lv.as_raw_str());
+                let line = format!("{}\n", serde_json::Value::Object(row));
                 emitted += 1;
                 yield Ok(Bytes::from(line));
             }
@@ -159,7 +177,7 @@ mod tests {
         let batches: Vec<crate::Result<RowBatch>> =
             vec![batch(0, 1000), batch(1000, 1000), batch(2000, 500)];
         let stream: ResultStream = Box::pin(futures::stream::iter(batches));
-        let lines = collect_lines(ndjson_body_stream(stream, usize::MAX)).await;
+        let lines = collect_lines(ndjson_body_stream(stream, usize::MAX, None)).await;
         assert_eq!(lines.len(), 2500, "all rows must stream as NDJSON lines");
     }
 
@@ -167,7 +185,7 @@ mod tests {
     async fn global_limit_caps_emitted_rows() {
         let batches: Vec<crate::Result<RowBatch>> = vec![batch(0, 1000), batch(1000, 1000)];
         let stream: ResultStream = Box::pin(futures::stream::iter(batches));
-        let lines = collect_lines(ndjson_body_stream(stream, 1500)).await;
+        let lines = collect_lines(ndjson_body_stream(stream, 1500, None)).await;
         assert_eq!(lines.len(), 1500, "global take-N must cap the line count");
     }
 
@@ -180,7 +198,7 @@ mod tests {
             }),
         ];
         let stream: ResultStream = Box::pin(futures::stream::iter(batches));
-        let lines = collect_lines(ndjson_body_stream(stream, usize::MAX)).await;
+        let lines = collect_lines(ndjson_body_stream(stream, usize::MAX, None)).await;
         assert_eq!(lines.len(), 11, "10 rows + 1 in-band error line");
         let last: serde_json::Value =
             sonic_rs::from_str(lines.last().expect("error line")).expect("json error line");
