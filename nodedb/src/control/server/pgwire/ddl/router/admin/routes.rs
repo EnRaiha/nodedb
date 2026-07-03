@@ -153,17 +153,9 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
         ));
     }
 
-    // EXPLAIN PERMISSION / EXPLAIN SCOPE.
-    if upper.starts_with("EXPLAIN PERMISSION ") {
-        return Some(super::super::super::explain_ddl::explain_permission(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("EXPLAIN SCOPE ") {
-        return Some(super::super::super::explain_ddl::explain_scope(
-            state, identity, parts,
-        ));
-    }
+    // EXPLAIN PERMISSION / EXPLAIN SCOPE have been migrated to the
+    // protocol-neutral router (`shared::ddl::neutral::explain_ddl`), which is
+    // tried before this transitional pgwire delegation runs.
 
     // Emergency response.
     if upper.starts_with("EMERGENCY LOCKDOWN") {
@@ -248,32 +240,10 @@ pub(in crate::control::server::pgwire::ddl::router) async fn dispatch(
         ));
     }
 
-    // Usage metering.
-    if upper.starts_with("DEFINE METERING DIMENSION ") {
-        return Some(super::super::super::metering_ddl::define_dimension(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW USAGE FOR TENANT ") {
-        return Some(super::super::super::metering_ddl::show_usage_for_tenant(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("EXPORT USAGE ") {
-        return Some(super::super::super::metering_ddl::export_usage(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW USAGE ") {
-        return Some(super::super::super::metering_ddl::show_usage(
-            state, identity, parts,
-        ));
-    }
-    if upper.starts_with("SHOW QUOTA ") {
-        return Some(super::super::super::metering_ddl::show_quota(
-            state, identity, parts,
-        ));
-    }
+    // Usage metering (DEFINE METERING DIMENSION, SHOW USAGE [FOR TENANT],
+    // EXPORT USAGE, SHOW QUOTA) has been migrated to the protocol-neutral
+    // router (`shared::ddl::neutral::metering_ddl`), which is tried before this
+    // transitional pgwire delegation runs.
 
     if upper.starts_with("SHOW SCOPE GRANTS") {
         return Some(super::super::super::scope_ddl::show_scope_grants(

@@ -1,32 +1,47 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! EXPLAIN PERMISSION and policy introspection DDL commands.
+//! Protocol-neutral EXPLAIN PERMISSION and policy introspection DDL commands.
 //!
 //! ```sql
 //! EXPLAIN PERMISSION READ ON orders FOR AUTH USER 'user_123'
 //! EXPLAIN SCOPE FOR AUTH USER 'user_123'
 //! ```
+//!
+//! Ported from the pgwire `ddl::explain_ddl` handlers. The permission /
+//! scope evaluation reads and the synthetic-identity construction are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `QueryResponse` to the protocol-neutral `DdlResult` over
+//! `ShapedRows`.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
-use super::super::types::{sqlstate_error, text_field};
+use super::super::result::{DdlError, DdlResult};
+
+/// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
+///
+/// Preserves the exact SQLSTATE / message the pgwire explain handlers
+/// produced (via `sqlstate_error`), so error parity stays byte-identical
+/// after the migration off the pgwire router.
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// EXPLAIN PERMISSION <perm> ON <collection> FOR AUTH USER '<id>'
 pub fn explain_permission(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // EXPLAIN PERMISSION READ ON orders FOR AUTH USER 'user_123'
     if parts.len() < 8 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "syntax: EXPLAIN PERMISSION <perm> ON <collection> FOR AUTH USER '<id>'",
         ));
@@ -67,35 +82,43 @@ pub fn explain_permission(
         state,
     );
 
-    let schema = Arc::new(vec![
-        text_field("check"),
-        text_field("result"),
-        text_field("source"),
-    ]);
+    let columns = vec![
+        "check".to_string(),
+        "result".to_string(),
+        "source".to_string(),
+    ];
 
-    let mut rows: Vec<_> = explanation
+    let mut rows: Vec<Map<String, JsonValue>> = explanation
         .steps
         .iter()
         .map(|s| {
-            let mut enc = DataRowEncoder::new(schema.clone());
-            let _ = enc.encode_field(&s.check);
-            let _ = enc.encode_field(&s.result);
-            let _ = enc.encode_field(&s.source);
-            Ok(enc.take_row())
+            let mut row = Map::new();
+            row.insert("check".to_string(), JsonValue::String(s.check.clone()));
+            row.insert("result".to_string(), JsonValue::String(s.result.clone()));
+            row.insert("source".to_string(), JsonValue::String(s.source.clone()));
+            row
         })
         .collect();
 
     // Final result row.
-    let mut enc = DataRowEncoder::new(schema.clone());
-    let _ = enc.encode_field(&"FINAL");
-    let _ = enc.encode_field(&if explanation.allowed { "ALLOW" } else { "DENY" });
-    let _ = enc.encode_field(&format!("{} on {}", perm, collection));
-    rows.push(Ok(enc.take_row()));
+    let mut row = Map::new();
+    row.insert("check".to_string(), JsonValue::String("FINAL".to_string()));
+    row.insert(
+        "result".to_string(),
+        JsonValue::String((if explanation.allowed { "ALLOW" } else { "DENY" }).to_string()),
+    );
+    row.insert(
+        "source".to_string(),
+        JsonValue::String(format!("{} on {}", perm, collection)),
+    );
+    rows.push(row);
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types: ShapedRows::text_types(3),
+        rows,
+        notice: None,
+    })])
 }
 
 /// EXPLAIN SCOPE FOR AUTH USER '<id>'
@@ -103,9 +126,9 @@ pub fn explain_scope(
     state: &SharedState,
     _identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 6 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "syntax: EXPLAIN SCOPE FOR AUTH USER '<id>'",
         ));
@@ -114,13 +137,13 @@ pub fn explain_scope(
     let org_ids = state.orgs.orgs_for_user(user_id);
     let effective = state.scope_grants.effective_scopes(user_id, &org_ids);
 
-    let schema = Arc::new(vec![
-        text_field("scope"),
-        text_field("source"),
-        text_field("resolved_grants"),
-    ]);
+    let columns = vec![
+        "scope".to_string(),
+        "source".to_string(),
+        "resolved_grants".to_string(),
+    ];
 
-    let rows: Vec<_> = effective
+    let rows: Vec<Map<String, JsonValue>> = effective
         .iter()
         .map(|scope_name| {
             let source = if state
@@ -138,18 +161,23 @@ pub fn explain_scope(
                 .map(|(p, c)| format!("{p} ON {c}"))
                 .collect();
 
-            let mut enc = DataRowEncoder::new(schema.clone());
-            let _ = enc.encode_field(scope_name);
-            let _ = enc.encode_field(&source);
-            let _ = enc.encode_field(&grants_str.join(", "));
-            Ok(enc.take_row())
+            let mut row = Map::new();
+            row.insert("scope".to_string(), JsonValue::String(scope_name.clone()));
+            row.insert("source".to_string(), JsonValue::String(source.to_string()));
+            row.insert(
+                "resolved_grants".to_string(),
+                JsonValue::String(grants_str.join(", ")),
+            );
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types: ShapedRows::text_types(3),
+        rows,
+        notice: None,
+    })])
 }
 
 /// `SELECT nodedb_assert_visible('<collection>', '<row_id>', '<user_id>')`
@@ -159,10 +187,10 @@ pub fn assert_visible(
     state: &SharedState,
     _identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     // Parse: nodedb_assert_visible('collection', 'row_id', 'user_id')
     if parts.len() < 4 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "syntax: SELECT nodedb_assert_visible('<collection>', '<row_id>', '<user_id>')",
         ));
@@ -196,12 +224,16 @@ pub fn assert_visible(
 
     let visible = rls_bytes.is_some_and(|b| b.is_empty()); // No filters = visible.
 
-    let schema = Arc::new(vec![text_field("visible")]);
-    let mut enc = DataRowEncoder::new(schema.clone());
-    let _ = enc.encode_field(&visible.to_string());
+    let mut row = Map::new();
+    row.insert(
+        "visible".to_string(),
+        JsonValue::String(visible.to_string()),
+    );
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(enc.take_row())]),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["visible".to_string()],
+        column_types: ShapedRows::text_types(1),
+        rows: vec![row],
+        notice: None,
+    })])
 }

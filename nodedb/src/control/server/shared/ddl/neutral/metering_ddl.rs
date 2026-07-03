@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Usage metering DDL commands.
+//! Protocol-neutral usage metering DDL commands.
 //!
 //! ```sql
 //! DEFINE METERING DIMENSION 'api_calls' UNIT 'calls'
@@ -8,32 +8,44 @@
 //! SHOW USAGE FOR ORG 'acme'
 //! SHOW QUOTA FOR AUTH USER 'user_42'
 //! ```
+//!
+//! Ported from the pgwire `ddl::metering_ddl` handlers. The usage-store /
+//! quota-manager / tenant-usage reads, ordering, and the superuser gates are
+//! preserved verbatim; only the result construction changed from pgwire
+//! `Response` / `QueryResponse` to the protocol-neutral `DdlResult` over
+//! `ShapedRows`.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
-use super::super::types::{sqlstate_error, text_field};
+use super::super::result::{DdlError, DdlResult};
+
+/// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
+///
+/// Preserves the exact SQLSTATE / message the pgwire metering handlers
+/// produced (via `sqlstate_error`), so error parity stays byte-identical
+/// after the migration off the pgwire router.
+fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+    DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: message.into(),
+    }
+}
 
 /// DEFINE METERING DIMENSION '<name>' UNIT '<unit>'
 pub fn define_dimension(
     _state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(ddl_err("42501", "permission denied: requires superuser"));
     }
     if parts.len() < 5 {
-        return Err(sqlstate_error(
+        return Err(ddl_err(
             "42601",
             "syntax: DEFINE METERING DIMENSION '<name>' UNIT '<unit>'",
         ));
@@ -48,9 +60,10 @@ pub fn define_dimension(
 
     // Custom dimensions are stored in config, not in a catalog table.
     // For now, acknowledge the command.
-    Ok(vec![Response::Execution(Tag::new(
-        "DEFINE METERING DIMENSION",
-    ))])
+    Ok(vec![DdlResult::Status {
+        command: "DEFINE METERING DIMENSION".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// SHOW USAGE FOR AUTH USER '<id>' / SHOW USAGE FOR ORG '<id>'
@@ -58,7 +71,7 @@ pub fn show_usage(
     state: &SharedState,
     _identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (user_filter, org_filter) = parse_for_clause(parts);
 
     let events = state.usage_store.query(
@@ -67,33 +80,50 @@ pub fn show_usage(
         0, // All time.
     );
 
-    let schema = Arc::new(vec![
-        text_field("auth_user_id"),
-        text_field("org_id"),
-        text_field("collection"),
-        text_field("operation"),
-        text_field("tokens"),
-        text_field("timestamp"),
-    ]);
+    let columns = vec![
+        "auth_user_id".to_string(),
+        "org_id".to_string(),
+        "collection".to_string(),
+        "operation".to_string(),
+        "tokens".to_string(),
+        "timestamp".to_string(),
+    ];
 
-    let rows: Vec<_> = events
+    let rows: Vec<Map<String, JsonValue>> = events
         .iter()
         .map(|e| {
-            let mut enc = DataRowEncoder::new(schema.clone());
-            let _ = enc.encode_field(&e.auth_user_id);
-            let _ = enc.encode_field(&e.org_id);
-            let _ = enc.encode_field(&e.collection);
-            let _ = enc.encode_field(&e.operation);
-            let _ = enc.encode_field(&e.tokens.to_string());
-            let _ = enc.encode_field(&e.timestamp_secs.to_string());
-            Ok(enc.take_row())
+            let mut row = Map::new();
+            row.insert(
+                "auth_user_id".to_string(),
+                JsonValue::String(e.auth_user_id.clone()),
+            );
+            row.insert("org_id".to_string(), JsonValue::String(e.org_id.clone()));
+            row.insert(
+                "collection".to_string(),
+                JsonValue::String(e.collection.clone()),
+            );
+            row.insert(
+                "operation".to_string(),
+                JsonValue::String(e.operation.clone()),
+            );
+            row.insert(
+                "tokens".to_string(),
+                JsonValue::String(e.tokens.to_string()),
+            );
+            row.insert(
+                "timestamp".to_string(),
+                JsonValue::String(e.timestamp_secs.to_string()),
+            );
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types: ShapedRows::text_types(6),
+        rows,
+        notice: None,
+    })])
 }
 
 /// SHOW QUOTA FOR AUTH USER '<id>' / SHOW QUOTA FOR ORG '<id>'
@@ -101,42 +131,62 @@ pub fn show_quota(
     state: &SharedState,
     _identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     let (user_filter, _org_filter) = parse_for_clause(parts);
     let grantee_id = user_filter.as_deref().unwrap_or("");
 
     let quotas = state.quota_manager.list_quotas();
 
-    let schema = Arc::new(vec![
-        text_field("scope"),
-        text_field("max_tokens"),
-        text_field("used_tokens"),
-        text_field("remaining"),
-        text_field("pct_used"),
-        text_field("enforcement"),
-        text_field("exceeded"),
-    ]);
+    let columns = vec![
+        "scope".to_string(),
+        "max_tokens".to_string(),
+        "used_tokens".to_string(),
+        "remaining".to_string(),
+        "pct_used".to_string(),
+        "enforcement".to_string(),
+        "exceeded".to_string(),
+    ];
 
-    let rows: Vec<_> = quotas
+    let rows: Vec<Map<String, JsonValue>> = quotas
         .iter()
         .filter_map(|q| state.quota_manager.get_status(&q.scope_name, grantee_id))
         .map(|s| {
-            let mut enc = DataRowEncoder::new(schema.clone());
-            let _ = enc.encode_field(&s.scope_name);
-            let _ = enc.encode_field(&s.max_tokens.to_string());
-            let _ = enc.encode_field(&s.used_tokens.to_string());
-            let _ = enc.encode_field(&s.remaining.to_string());
-            let _ = enc.encode_field(&format!("{:.1}%", s.pct_used * 100.0));
-            let _ = enc.encode_field(&format!("{:?}", s.enforcement));
-            let _ = enc.encode_field(&s.exceeded.to_string());
-            Ok(enc.take_row())
+            let mut row = Map::new();
+            row.insert("scope".to_string(), JsonValue::String(s.scope_name.clone()));
+            row.insert(
+                "max_tokens".to_string(),
+                JsonValue::String(s.max_tokens.to_string()),
+            );
+            row.insert(
+                "used_tokens".to_string(),
+                JsonValue::String(s.used_tokens.to_string()),
+            );
+            row.insert(
+                "remaining".to_string(),
+                JsonValue::String(s.remaining.to_string()),
+            );
+            row.insert(
+                "pct_used".to_string(),
+                JsonValue::String(format!("{:.1}%", s.pct_used * 100.0)),
+            );
+            row.insert(
+                "enforcement".to_string(),
+                JsonValue::String(format!("{:?}", s.enforcement)),
+            );
+            row.insert(
+                "exceeded".to_string(),
+                JsonValue::String(s.exceeded.to_string()),
+            );
+            row
         })
         .collect();
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types: ShapedRows::text_types(7),
+        rows,
+        notice: None,
+    })])
 }
 
 /// SHOW USAGE FOR TENANT <id>
@@ -146,12 +196,9 @@ pub fn show_usage_for_tenant(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(ddl_err("42501", "permission denied: requires superuser"));
     }
 
     // SHOW USAGE FOR TENANT <id>
@@ -160,9 +207,9 @@ pub fn show_usage_for_tenant(
         .position(|p| p.eq_ignore_ascii_case("TENANT"))
         .and_then(|i| parts.get(i + 1))
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| sqlstate_error("42601", "syntax: SHOW USAGE FOR TENANT <id>"))?;
+        .ok_or_else(|| ddl_err("42601", "syntax: SHOW USAGE FOR TENANT <id>"))?;
 
-    let schema = Arc::new(vec![text_field("metric"), text_field("value")]);
+    let columns = vec!["metric".to_string(), "value".to_string()];
 
     let tenants = match state.tenants.lock() {
         Ok(t) => t,
@@ -181,17 +228,19 @@ pub fn show_usage_for_tenant(
             ("active_connections", usage.active_connections as u64),
         ];
         for &(name, val) in metrics {
-            let mut enc = DataRowEncoder::new(schema.clone());
-            let _ = enc.encode_field(&name);
-            let _ = enc.encode_field(&val.to_string());
-            rows.push(Ok(enc.take_row()));
+            let mut row = Map::new();
+            row.insert("metric".to_string(), JsonValue::String(name.to_string()));
+            row.insert("value".to_string(), JsonValue::String(val.to_string()));
+            rows.push(row);
         }
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types: ShapedRows::text_types(2),
+        rows,
+        notice: None,
+    })])
 }
 
 /// EXPORT USAGE FOR TENANT <id> [PERIOD '<month>'] FORMAT 'json'
@@ -201,12 +250,9 @@ pub fn export_usage(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
-        return Err(sqlstate_error(
-            "42501",
-            "permission denied: requires superuser",
-        ));
+        return Err(ddl_err("42501", "permission denied: requires superuser"));
     }
 
     // Parse tenant_id.
@@ -216,7 +262,7 @@ pub fn export_usage(
         .and_then(|i| parts.get(i + 1))
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| {
-            sqlstate_error(
+            ddl_err(
                 "42601",
                 "syntax: EXPORT USAGE FOR TENANT <id> [PERIOD '<month>'] FORMAT 'json'",
             )
@@ -242,14 +288,15 @@ pub fn export_usage(
 
     let json = state.usage_store.export_tenant_json(tid, since_secs);
 
-    let schema = Arc::new(vec![text_field("usage_json")]);
-    let mut enc = DataRowEncoder::new(schema.clone());
-    let _ = enc.encode_field(&json);
+    let mut row = Map::new();
+    row.insert("usage_json".to_string(), JsonValue::String(json));
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(vec![Ok(enc.take_row())]),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["usage_json".to_string()],
+        column_types: ShapedRows::text_types(1),
+        rows: vec![row],
+        notice: None,
+    })])
 }
 
 /// Parse FOR AUTH USER '<id>' or FOR ORG '<id>' from parts.

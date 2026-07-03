@@ -1,45 +1,49 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Administrative observability `SHOW` commands: server-wide counters,
-//! per-engine query stats, and per-engine memory budgets.
+//! Protocol-neutral administrative observability `SHOW` commands: server-wide
+//! counters, per-engine query stats, and per-engine memory budgets.
 //!
 //! `SHOW STATS` and `SHOW SERVER STATS` expose the same underlying
 //! `SystemMetrics` counters used by the Prometheus `/metrics` endpoint
 //! and the OTLP exporter — without forcing administrators to leave the
-//! pgwire session for a side-channel HTTP probe.
+//! session for a side-channel HTTP probe.
 //!
 //! `SHOW METRICS` is a `(key, value)` projection of the same source,
-//! suitable for grep-and-pipe inspection from `psql`.
+//! suitable for grep-and-pipe inspection.
 //!
 //! `SHOW MEMORY` reports per-engine memory budgets and current
 //! utilisation from `nodedb_mem::MemoryGovernor`.
+//!
+//! Ported from the pgwire `ddl::observability` handlers. The metric source
+//! reads, ordering, and the tenant-admin gate are preserved verbatim; only the
+//! result construction changed from pgwire `Response` / `QueryResponse` to the
+//! protocol-neutral `DdlResult` over `ShapedRows`.
 
-use std::sync::Arc;
-
-use futures::stream;
-use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
-use pgwire::error::PgWireResult;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
-use super::super::types::{int8_field, require_tenant_admin, text_field};
+use super::super::result::{DdlError, DdlResult};
+use super::auth_support::require_tenant_admin;
 
-/// Render an `(key, value)` schema and emit one row per `(name, value)`
+/// Render an `(name, value)` schema and emit one row per `(name, value)`
 /// pair. Both columns are TEXT — the consumer interprets numbers.
-fn key_value_response(rows_in: Vec<(String, String)>) -> PgWireResult<Vec<Response>> {
-    let schema = Arc::new(vec![text_field("name"), text_field("value")]);
+fn key_value_result(rows_in: Vec<(String, String)>) -> Result<Vec<DdlResult>, DdlError> {
     let mut rows = Vec::with_capacity(rows_in.len());
     for (k, v) in rows_in {
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        encoder.encode_field(&k)?;
-        encoder.encode_field(&v)?;
-        rows.push(Ok(encoder.take_row()));
+        let mut row = Map::new();
+        row.insert("name".to_string(), JsonValue::String(k));
+        row.insert("value".to_string(), JsonValue::String(v));
+        rows.push(row);
     }
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns: vec!["name".to_string(), "value".to_string()],
+        column_types: ShapedRows::text_types(2),
+        rows,
+        notice: None,
+    })])
 }
 
 /// Build the canonical `(name, value)` rows for `SHOW STATS` and
@@ -151,9 +155,9 @@ fn server_stats_rows(state: &SharedState) -> Vec<(String, String)> {
 pub fn show_server_stats(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "show stats")?;
-    key_value_response(server_stats_rows(state))
+    key_value_result(server_stats_rows(state))
 }
 
 /// SHOW METRICS — `(name, value)` projection of the same source as
@@ -162,7 +166,7 @@ pub fn show_server_stats(
 pub fn show_metrics(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "show metrics")?;
     let mut rows = server_stats_rows(state);
 
@@ -185,7 +189,7 @@ pub fn show_metrics(
         ));
     }
 
-    key_value_response(rows)
+    key_value_result(rows)
 }
 
 /// SHOW MEMORY — per-engine memory budget and utilisation.
@@ -196,34 +200,62 @@ pub fn show_metrics(
 pub fn show_memory(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-) -> PgWireResult<Vec<Response>> {
+) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "show memory")?;
 
-    let schema = Arc::new(vec![
-        text_field("engine"),
-        int8_field("allocated_bytes"),
-        int8_field("limit_bytes"),
-        int8_field("peak_bytes"),
-        int8_field("rejections"),
-        int8_field("utilization_percent"),
-    ]);
+    let columns = vec![
+        "engine".to_string(),
+        "allocated_bytes".to_string(),
+        "limit_bytes".to_string(),
+        "peak_bytes".to_string(),
+        "rejections".to_string(),
+        "utilization_percent".to_string(),
+    ];
+    let column_types = vec![
+        DdlColType::Text,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Int8,
+        DdlColType::Int8,
+    ];
 
     let mut rows = Vec::new();
     if let Some(gov) = state.governor.as_ref() {
         for snap in gov.snapshot() {
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            encoder.encode_field(&format!("{:?}", snap.engine))?;
-            encoder.encode_field(&(snap.allocated as i64))?;
-            encoder.encode_field(&(snap.limit as i64))?;
-            encoder.encode_field(&(snap.peak as i64))?;
-            encoder.encode_field(&(snap.rejections as i64))?;
-            encoder.encode_field(&(snap.utilization_percent as i64))?;
-            rows.push(Ok(encoder.take_row()));
+            let mut row = Map::new();
+            row.insert(
+                "engine".to_string(),
+                JsonValue::String(format!("{:?}", snap.engine)),
+            );
+            row.insert(
+                "allocated_bytes".to_string(),
+                JsonValue::String((snap.allocated as i64).to_string()),
+            );
+            row.insert(
+                "limit_bytes".to_string(),
+                JsonValue::String((snap.limit as i64).to_string()),
+            );
+            row.insert(
+                "peak_bytes".to_string(),
+                JsonValue::String((snap.peak as i64).to_string()),
+            );
+            row.insert(
+                "rejections".to_string(),
+                JsonValue::String((snap.rejections as i64).to_string()),
+            );
+            row.insert(
+                "utilization_percent".to_string(),
+                JsonValue::String((snap.utilization_percent as i64).to_string()),
+            );
+            rows.push(row);
         }
     }
 
-    Ok(vec![Response::Query(QueryResponse::new(
-        schema,
-        stream::iter(rows),
-    ))])
+    Ok(vec![DdlResult::Rows(ShapedRows {
+        columns,
+        column_types,
+        rows,
+        notice: None,
+    })])
 }

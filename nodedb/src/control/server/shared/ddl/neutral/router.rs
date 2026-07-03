@@ -24,6 +24,7 @@ use super::consumer_group;
 use super::continuous_agg;
 use super::custom_type;
 use super::dsl;
+use super::explain_ddl;
 use super::function;
 use super::grant;
 use super::graph_ops;
@@ -34,6 +35,8 @@ use super::kv_sorted_index;
 use super::last_value;
 use super::maintenance;
 use super::materialized_view;
+use super::metering_ddl;
+use super::observability;
 use super::oidc;
 use super::procedure;
 use super::query_functions;
@@ -739,6 +742,73 @@ pub async fn try_dispatch(
     if upper.starts_with("SHOW GRANTS") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(inspect::show_grants(state, identity, &parts));
+    }
+
+    // Administrative observability: SHOW SERVER STATS / SHOW STATS / SHOW
+    // METRICS / SHOW MEMORY. None of these parse into a typed DDL AST variant —
+    // the pgwire admin observability router recognized all four by the
+    // exact-or-trailing-space prefix from the raw SQL. Replicate that exactly
+    // here, before the parse gate, so the recognition (and the `SHOW SERVER
+    // STATS` / `SHOW STATS` shared handler) stays byte-identical. `SHOW SERVER
+    // STATS` is checked before `SHOW STATS` exactly as the pgwire router did.
+    if upper == "SHOW SERVER STATS" || upper.starts_with("SHOW SERVER STATS ") {
+        return Some(observability::show_server_stats(state, identity));
+    }
+    if upper == "SHOW STATS" || upper.starts_with("SHOW STATS ") {
+        return Some(observability::show_server_stats(state, identity));
+    }
+    if upper == "SHOW METRICS" || upper.starts_with("SHOW METRICS ") {
+        return Some(observability::show_metrics(state, identity));
+    }
+    if upper == "SHOW MEMORY" || upper.starts_with("SHOW MEMORY ") {
+        return Some(observability::show_memory(state, identity));
+    }
+
+    // Permission / scope introspection: EXPLAIN PERMISSION / EXPLAIN SCOPE.
+    // Neither parses into a typed DDL AST variant — the pgwire admin router
+    // recognized both by string prefix from the raw token slice. Replicate that
+    // exactly here, before the parse gate, so the prefix recognition and the
+    // `parts`-based extraction / syntax messages stay byte-identical. The
+    // pgwire wire path reaches these full-`EXPLAIN …` statements through the
+    // DDL dispatch (native / http always; pgwire only for the non-`EXPLAIN `
+    // full-SQL dispatch), so recognizing them here preserves behavior; the
+    // `EXPLAIN <query>` handler strips the leading `EXPLAIN ` and never yields a
+    // `PERMISSION …` / `SCOPE …` prefix, so it is unaffected.
+    if upper.starts_with("EXPLAIN PERMISSION ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(explain_ddl::explain_permission(state, identity, &parts));
+    }
+    if upper.starts_with("EXPLAIN SCOPE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(explain_ddl::explain_scope(state, identity, &parts));
+    }
+
+    // Usage metering: DEFINE METERING DIMENSION, SHOW USAGE FOR TENANT, EXPORT
+    // USAGE, SHOW USAGE, SHOW QUOTA. None of these parse into a typed DDL AST
+    // variant — the pgwire admin router recognized all five by string prefix
+    // from the raw token slice. Replicate that exactly here, before the parse
+    // gate, so the prefix recognition and the `parts`-based extraction / syntax
+    // messages stay byte-identical. Guard ordering (SHOW USAGE FOR TENANT and
+    // EXPORT USAGE before the broader SHOW USAGE) mirrors the pgwire router.
+    if upper.starts_with("DEFINE METERING DIMENSION ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(metering_ddl::define_dimension(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW USAGE FOR TENANT ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(metering_ddl::show_usage_for_tenant(state, identity, &parts));
+    }
+    if upper.starts_with("EXPORT USAGE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(metering_ddl::export_usage(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW USAGE ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(metering_ddl::show_usage(state, identity, &parts));
+    }
+    if upper.starts_with("SHOW QUOTA ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        return Some(metering_ddl::show_quota(state, identity, &parts));
     }
 
     // Parse errors → let the pgwire path run, which re-parses and reproduces the
