@@ -148,14 +148,32 @@ impl NodeDbPgHandler {
             use super::clone_write_dispatch::CloneWriteOutcome;
             match self.maybe_intercept_clone_write(&task, tenant_id).await? {
                 CloneWriteOutcome::Handled(resp) => {
-                    let shaped = crate::control::server::pgwire::handler::plan::payload_to_response(
-                        resp.payload.as_ref(),
-                        plan_kind,
-                    );
-                    if let Some(notice) = shaped.notice {
-                        self.sessions.push_notice(addr, notice);
+                    use crate::control::server::response_shape::compose::{
+                        ShapeOutcome, shape_payload_no_plan,
+                    };
+                    match shape_payload_no_plan(resp.payload.as_ref(), plan_kind, None) {
+                        ShapeOutcome::Rows(shaped) => {
+                            let (response, notice) =
+                                crate::control::server::pgwire::handler::shape_encode::shaped_query_response(
+                                    shaped,
+                                );
+                            if let Some(n) = notice {
+                                self.sessions.push_notice(addr, n);
+                            }
+                            return Ok(PreDispatchOutcome::Handled(response));
+                        }
+                        ShapeOutcome::Passthrough => {
+                            let shaped =
+                                crate::control::server::pgwire::handler::plan::payload_to_response(
+                                    resp.payload.as_ref(),
+                                    plan_kind,
+                                );
+                            if let Some(notice) = shaped.notice {
+                                self.sessions.push_notice(addr, notice);
+                            }
+                            return Ok(PreDispatchOutcome::Handled(shaped.response));
+                        }
                     }
-                    return Ok(PreDispatchOutcome::Handled(shaped.response));
                 }
                 CloneWriteOutcome::Passthrough => {}
             }

@@ -154,10 +154,24 @@ fn shape_array_slice(payload: &[u8]) -> ShapedRows {
 /// `ReturningRows` arm including its malformed-payload fallback.
 fn shape_returning_rows(payload: &[u8]) -> ShapedRows {
     if payload.is_empty() {
-        return empty_shaped();
+        return single_result_column_empty();
     }
     match zerompk::from_msgpack::<RowsPayload>(payload) {
         Ok(rp) => {
+            if rp.rows.is_empty() {
+                let columns = if rp.columns.is_empty() {
+                    vec!["result".to_string()]
+                } else {
+                    rp.columns
+                };
+                let column_types = ShapedRows::text_types(columns.len());
+                return ShapedRows {
+                    columns,
+                    column_types,
+                    rows: Vec::new(),
+                    notice: None,
+                };
+            }
             let rows = rp
                 .rows
                 .iter()
@@ -335,6 +349,17 @@ fn empty_shaped() -> ShapedRows {
     ShapedRows {
         columns: Vec::new(),
         column_types: Vec::new(),
+        rows: Vec::new(),
+        notice: None,
+    }
+}
+
+/// Single "result" column with zero rows, matching `payload_to_response`'s
+/// `ReturningRows` arm when the payload itself is empty.
+fn single_result_column_empty() -> ShapedRows {
+    ShapedRows {
+        columns: vec!["result".to_string()],
+        column_types: ShapedRows::text_types(1),
         rows: Vec::new(),
         notice: None,
     }

@@ -9,14 +9,11 @@ use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::data::executor::response_codec::{
-    ArraySliceResponse, RowsPayload, decode_payload_to_json,
-};
+use crate::data::executor::response_codec::decode_payload_to_json;
 use nodedb_physical::physical_plan::{
     ColumnarOp, CrdtOp, DocumentOp, GraphOp, MetaOp, QueryOp, SpatialOp, TextOp, TimeseriesOp,
     VectorOp,
 };
-use zerompk;
 
 use super::super::types::text_field;
 
@@ -255,11 +252,6 @@ impl From<Response> for ShapedResponse {
     }
 }
 
-/// NOTICE message emitted when a slice request's `system_as_of` cutoff fell
-/// below the oldest tile version on at least one shard.
-const TRUNCATED_BEFORE_HORIZON_NOTICE: &str = "AS OF SYSTEM TIME cutoff is older than the oldest retained tile version; \
-     results may be incomplete";
-
 pub(super) fn payload_to_response(payload: &[u8], kind: PlanKind) -> ShapedResponse {
     match kind {
         PlanKind::Execution => Response::Execution(Tag::new("OK")).into(),
@@ -272,105 +264,14 @@ pub(super) fn payload_to_response(payload: &[u8], kind: PlanKind) -> ShapedRespo
             };
             Response::Execution(Tag::new(tag).with_rows(count)).into()
         }
-        PlanKind::ArraySlice => {
-            // Decode `ArraySliceResponse` envelope: extract rows and flag.
-            // Fall back to treating the payload as a plain array when the
-            // decode fails (e.g., empty payload or legacy shape).
+        PlanKind::ArraySlice | PlanKind::ReturningRows | PlanKind::SingleDocument => {
+            unreachable!(
+                "shaped via response_shape::compose; payload_to_response is only reached \
+                 for Execution/DmlResult tags and MultiRow (facet)"
+            )
+        }
+        PlanKind::MultiRow => {
             let schema = Arc::new(vec![text_field("result")]);
-            if payload.is_empty() {
-                return Response::Query(QueryResponse::new(schema, stream::empty())).into();
-            }
-            let (rows_json, truncated) =
-                if let Ok(resp) = zerompk::from_msgpack::<ArraySliceResponse>(payload) {
-                    let text = decode_payload_to_json(&resp.rows_msgpack);
-                    (text, resp.truncated_before_horizon)
-                } else {
-                    // Fallback for any legacy or plain-array payloads.
-                    (decode_payload_to_json(payload), false)
-                };
-            let notice = if truncated {
-                Some(TRUNCATED_BEFORE_HORIZON_NOTICE.to_string())
-            } else {
-                None
-            };
-            let response = if let Ok(serde_json::Value::Array(items)) =
-                sonic_rs::from_str::<serde_json::Value>(&rows_json)
-            {
-                let row_schema = schema.clone();
-                let rows: Vec<_> = items
-                    .iter()
-                    .map(|item| {
-                        let mut encoder = DataRowEncoder::new(row_schema.clone());
-                        let _ = encoder.encode_field(&item.to_string());
-                        Ok(encoder.take_row())
-                    })
-                    .collect();
-                Response::Query(QueryResponse::new(schema, stream::iter(rows)))
-            } else {
-                let mut encoder = DataRowEncoder::new(schema.clone());
-                if let Err(e) = encoder.encode_field(&rows_json) {
-                    tracing::error!(error = %e, "failed to encode array slice field");
-                    return Response::Execution(Tag::new("ERROR")).into();
-                }
-                let row = encoder.take_row();
-                Response::Query(QueryResponse::new(schema, stream::iter(vec![Ok(row)])))
-            };
-            ShapedResponse { response, notice }
-        }
-        PlanKind::ReturningRows => {
-            if payload.is_empty() {
-                let schema = Arc::new(vec![text_field("result")]);
-                return Response::Query(QueryResponse::new(schema, stream::empty())).into();
-            }
-            match zerompk::from_msgpack::<RowsPayload>(payload) {
-                Ok(rp) => {
-                    if rp.rows.is_empty() {
-                        let schema = if rp.columns.is_empty() {
-                            Arc::new(vec![text_field("result")])
-                        } else {
-                            Arc::new(rp.columns.iter().map(|c| text_field(c)).collect::<Vec<_>>())
-                        };
-                        return Response::Query(QueryResponse::new(schema, stream::empty())).into();
-                    }
-                    let schema: Arc<Vec<_>> =
-                        Arc::new(rp.columns.iter().map(|c| text_field(c)).collect());
-                    let row_schema = schema.clone();
-                    let rows: Vec<_> = rp
-                        .rows
-                        .iter()
-                        .map(|row_vals| {
-                            let mut encoder = DataRowEncoder::new(row_schema.clone());
-                            for cell in row_vals {
-                                let _ = encoder.encode_field(cell);
-                            }
-                            Ok(encoder.take_row())
-                        })
-                        .collect();
-                    Response::Query(QueryResponse::new(schema, stream::iter(rows))).into()
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        payload_len = payload.len(),
-                        "ReturningRows msgpack decode failed; falling back to single-column JSON"
-                    );
-                    // Fall back to single-column JSON representation.
-                    let schema = Arc::new(vec![text_field("result")]);
-                    let text = decode_payload_to_json(payload);
-                    let mut encoder = DataRowEncoder::new(schema.clone());
-                    let _ = encoder.encode_field(&text);
-                    let row = encoder.take_row();
-                    Response::Query(QueryResponse::new(schema, stream::iter(vec![Ok(row)]))).into()
-                }
-            }
-        }
-        PlanKind::SingleDocument | PlanKind::MultiRow => {
-            let col_name = if matches!(kind, PlanKind::SingleDocument) {
-                "document"
-            } else {
-                "result"
-            };
-            let schema = Arc::new(vec![text_field(col_name)]);
             if payload.is_empty() {
                 return Response::Query(QueryResponse::new(schema, stream::empty())).into();
             }
@@ -379,9 +280,8 @@ pub(super) fn payload_to_response(payload: &[u8], kind: PlanKind) -> ShapedRespo
             // For multi-row results, parse the JSON array and stream each
             // element as a separate pgwire row. This avoids materializing
             // a single giant row for large result sets.
-            if matches!(kind, PlanKind::MultiRow)
-                && let Ok(serde_json::Value::Array(items)) =
-                    sonic_rs::from_str::<serde_json::Value>(&text)
+            if let Ok(serde_json::Value::Array(items)) =
+                sonic_rs::from_str::<serde_json::Value>(&text)
             {
                 let row_schema = schema.clone();
                 let rows: Vec<_> = items
