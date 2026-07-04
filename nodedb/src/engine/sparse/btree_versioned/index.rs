@@ -86,6 +86,36 @@ impl SparseEngine {
         Ok(())
     }
 
+    /// Physically remove one versioned index entry's redb entry inside a
+    /// caller-owned write transaction. Unlike
+    /// [`Self::versioned_index_tombstone_in_txn`] (which appends a
+    /// tombstone marker), this deletes the entry at `sys_from_ms` outright.
+    /// Used by the transaction-rollback path to undo a
+    /// `versioned_index_put_in_txn` that must not survive an aborted
+    /// transaction. Removing a non-existent key is a no-op.
+    #[allow(clippy::too_many_arguments)]
+    pub fn versioned_index_remove_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        database_id: u64,
+        tenant: u64,
+        coll: &str,
+        field: &str,
+        value: &str,
+        doc_id: &str,
+        sys_from_ms: i64,
+    ) -> crate::Result<()> {
+        let key = format!(
+            "{database_id}:{tenant}:{coll}:{field}:{value}:{doc_id}\x00{}",
+            format_sys_from(sys_from_ms)
+        );
+        let mut t = txn
+            .open_table(INDEXES_VERSIONED)
+            .map_err(|e| redb_err("open table", e))?;
+        t.remove(key.as_str()).map_err(|e| redb_err("remove", e))?;
+        Ok(())
+    }
+
     /// Append a versioned secondary index entry in its own transaction.
     #[allow(clippy::too_many_arguments)]
     pub fn versioned_index_put(

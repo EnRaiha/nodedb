@@ -301,6 +301,67 @@ fn index_lookup_honors_cutoff_and_tombstone() {
 }
 
 #[test]
+fn versioned_remove_in_txn_deletes_the_version() {
+    let (e, _d) = open_temp();
+    put(&e, "c", "k", 100, b"v1");
+    assert_eq!(
+        e.versioned_get_current(1, 1, "c", "k").unwrap().as_deref(),
+        Some(b"v1" as &[u8])
+    );
+
+    let txn = e.db.begin_write().unwrap();
+    e.versioned_remove_in_txn(&txn, 1, 1, "c", "k", 100)
+        .unwrap();
+    txn.commit().unwrap();
+
+    assert!(e.versioned_get_current(1, 1, "c", "k").unwrap().is_none());
+    assert!(
+        e.versioned_get_as_of(1, 1, "c", "k", Some(100), None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn versioned_remove_in_txn_on_missing_key_is_ok() {
+    let (e, _d) = open_temp();
+    let txn = e.db.begin_write().unwrap();
+    let r = e.versioned_remove_in_txn(&txn, 1, 1, "c", "does-not-exist", 999);
+    assert!(r.is_ok());
+    txn.commit().unwrap();
+}
+
+#[test]
+fn versioned_index_remove_in_txn_removes_entry() {
+    let (e, _d) = open_temp();
+    e.versioned_index_put(1, 1, "c", "email", "a@x", "u1", 100)
+        .unwrap();
+    let before = e
+        .versioned_index_lookup_as_of(1, 1, "c", "email", "a@x", Some(150))
+        .unwrap();
+    assert_eq!(before, vec!["u1"]);
+
+    let txn = e.db.begin_write().unwrap();
+    e.versioned_index_remove_in_txn(&txn, 1, 1, "c", "email", "a@x", "u1", 100)
+        .unwrap();
+    txn.commit().unwrap();
+
+    let after = e
+        .versioned_index_lookup_as_of(1, 1, "c", "email", "a@x", Some(150))
+        .unwrap();
+    assert!(after.is_empty());
+}
+
+#[test]
+fn versioned_index_remove_in_txn_on_missing_key_is_ok() {
+    let (e, _d) = open_temp();
+    let txn = e.db.begin_write().unwrap();
+    let r = e.versioned_index_remove_in_txn(&txn, 1, 1, "c", "email", "nobody@x", "u9", 999);
+    assert!(r.is_ok());
+    txn.commit().unwrap();
+}
+
+#[test]
 fn nul_in_doc_id_is_rejected() {
     let (e, _d) = open_temp();
     let r = e.versioned_put(VersionedPut {

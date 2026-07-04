@@ -121,6 +121,29 @@ impl SparseEngine {
         Ok(())
     }
 
+    /// Physically remove one version's redb entry inside a caller-owned
+    /// write transaction. Unlike [`Self::versioned_tombstone_in_txn`] (which
+    /// appends a tombstone marker version), this deletes the entry at
+    /// `sys_from_ms` outright. Used by the transaction-rollback path to
+    /// undo a `versioned_put_in_txn` that must not survive an aborted
+    /// transaction. Removing a non-existent key is a no-op.
+    pub fn versioned_remove_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        database_id: u64,
+        tenant: u64,
+        coll: &str,
+        doc_id: &str,
+        sys_from_ms: i64,
+    ) -> crate::Result<()> {
+        let key = versioned_doc_key(database_id, tenant, coll, doc_id, sys_from_ms)?;
+        let mut t = txn
+            .open_table(DOCUMENTS_VERSIONED)
+            .map_err(|e| redb_err("open table", e))?;
+        t.remove(key.as_str()).map_err(|e| redb_err("remove", e))?;
+        Ok(())
+    }
+
     /// Check whether the current-state version of `doc_id` is live
     /// (not tombstoned, not GDPR-erased, and at least one version
     /// exists) inside a caller-owned write transaction. Used by
