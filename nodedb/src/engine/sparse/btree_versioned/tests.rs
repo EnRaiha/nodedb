@@ -2,7 +2,7 @@
 
 //! Unit tests for the versioned document + index tables.
 
-use super::value::VersionedPut;
+use super::value::{VersionedIndexEntry, VersionedPut, VersionedScanParams};
 use crate::engine::sparse::btree::SparseEngine;
 
 fn open_temp() -> (SparseEngine, tempfile::TempDir) {
@@ -23,6 +23,24 @@ fn put(e: &SparseEngine, coll: &str, id: &str, sys_from: i64, body: &[u8]) {
         body,
     })
     .unwrap();
+}
+
+fn idx_entry<'a>(
+    coll: &'a str,
+    field: &'a str,
+    value: &'a str,
+    doc_id: &'a str,
+    sys_from_ms: i64,
+) -> VersionedIndexEntry<'a> {
+    VersionedIndexEntry {
+        database_id: 1,
+        tenant: 1,
+        coll,
+        field,
+        value,
+        doc_id,
+        sys_from_ms,
+    }
 }
 
 fn put_valid(
@@ -156,7 +174,17 @@ fn scan_returns_latest_per_doc_id() {
     put(&e, "c", "a", 200, b"a2");
     put(&e, "c", "b", 150, b"b1");
     let all = e
-        .versioned_scan_as_of(1, 1, "c", None, None, 100, &|_: &[u8]| true)
+        .versioned_scan_as_of(
+            VersionedScanParams {
+                database_id: 1,
+                tenant: 1,
+                coll: "c",
+                sys_cutoff_ms: None,
+                valid_at_ms: None,
+                limit: 100,
+            },
+            &|_: &[u8]| true,
+        )
         .unwrap();
     let map: std::collections::HashMap<_, _> = all.into_iter().collect();
     assert_eq!(map.get("a").map(|v| v.as_slice()), Some(b"a2" as &[u8]));
@@ -243,7 +271,17 @@ fn scan_as_of_pushes_predicate_down_so_limit_counts_matches() {
     };
 
     let rows = e
-        .versioned_scan_as_of(1, 1, "c", None, None, 2, &even)
+        .versioned_scan_as_of(
+            VersionedScanParams {
+                database_id: 1,
+                tenant: 1,
+                coll: "c",
+                sys_cutoff_ms: None,
+                valid_at_ms: None,
+                limit: 2,
+            },
+            &even,
+        )
         .unwrap();
     assert_eq!(
         rows.len(),
@@ -265,11 +303,31 @@ fn scan_as_of_hides_tombstoned_rows() {
     put(&e, "c", "a", 100, b"a1");
     e.versioned_tombstone(1, 1, "c", "a", 200).unwrap();
     let at_150 = e
-        .versioned_scan_as_of(1, 1, "c", Some(150), None, 100, &|_: &[u8]| true)
+        .versioned_scan_as_of(
+            VersionedScanParams {
+                database_id: 1,
+                tenant: 1,
+                coll: "c",
+                sys_cutoff_ms: Some(150),
+                valid_at_ms: None,
+                limit: 100,
+            },
+            &|_: &[u8]| true,
+        )
         .unwrap();
     assert_eq!(at_150.len(), 1);
     let at_250 = e
-        .versioned_scan_as_of(1, 1, "c", Some(250), None, 100, &|_: &[u8]| true)
+        .versioned_scan_as_of(
+            VersionedScanParams {
+                database_id: 1,
+                tenant: 1,
+                coll: "c",
+                sys_cutoff_ms: Some(250),
+                valid_at_ms: None,
+                limit: 100,
+            },
+            &|_: &[u8]| true,
+        )
         .unwrap();
     assert!(at_250.is_empty());
 }
@@ -277,11 +335,11 @@ fn scan_as_of_hides_tombstoned_rows() {
 #[test]
 fn index_lookup_honors_cutoff_and_tombstone() {
     let (e, _d) = open_temp();
-    e.versioned_index_put(1, 1, "c", "email", "a@x", "u1", 100)
+    e.versioned_index_put(idx_entry("c", "email", "a@x", "u1", 100))
         .unwrap();
-    e.versioned_index_put(1, 1, "c", "email", "a@x", "u2", 150)
+    e.versioned_index_put(idx_entry("c", "email", "a@x", "u2", 150))
         .unwrap();
-    e.versioned_index_tombstone(1, 1, "c", "email", "a@x", "u1", 200)
+    e.versioned_index_tombstone(idx_entry("c", "email", "a@x", "u1", 200))
         .unwrap();
 
     let at_120 = e
@@ -334,7 +392,7 @@ fn versioned_remove_in_txn_on_missing_key_is_ok() {
 #[test]
 fn versioned_index_remove_in_txn_removes_entry() {
     let (e, _d) = open_temp();
-    e.versioned_index_put(1, 1, "c", "email", "a@x", "u1", 100)
+    e.versioned_index_put(idx_entry("c", "email", "a@x", "u1", 100))
         .unwrap();
     let before = e
         .versioned_index_lookup_as_of(1, 1, "c", "email", "a@x", Some(150))
@@ -342,7 +400,7 @@ fn versioned_index_remove_in_txn_removes_entry() {
     assert_eq!(before, vec!["u1"]);
 
     let txn = e.db.begin_write().unwrap();
-    e.versioned_index_remove_in_txn(&txn, 1, 1, "c", "email", "a@x", "u1", 100)
+    e.versioned_index_remove_in_txn(&txn, idx_entry("c", "email", "a@x", "u1", 100))
         .unwrap();
     txn.commit().unwrap();
 
@@ -356,7 +414,7 @@ fn versioned_index_remove_in_txn_removes_entry() {
 fn versioned_index_remove_in_txn_on_missing_key_is_ok() {
     let (e, _d) = open_temp();
     let txn = e.db.begin_write().unwrap();
-    let r = e.versioned_index_remove_in_txn(&txn, 1, 1, "c", "email", "nobody@x", "u9", 999);
+    let r = e.versioned_index_remove_in_txn(&txn, idx_entry("c", "email", "nobody@x", "u9", 999));
     assert!(r.is_ok());
     txn.commit().unwrap();
 }

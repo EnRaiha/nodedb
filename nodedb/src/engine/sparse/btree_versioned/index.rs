@@ -8,7 +8,7 @@
 use redb::TableDefinition;
 
 use super::key::format_sys_from;
-use super::value::{TAG_LIVE, TAG_TOMBSTONE};
+use super::value::{TAG_LIVE, TAG_TOMBSTONE, VersionedIndexEntry};
 use crate::engine::sparse::btree::{SparseEngine, redb_err};
 
 /// Keys carry the leading `{database_id}:` component.
@@ -32,27 +32,17 @@ impl SparseEngine {
     }
 
     /// `versioned_index_put` inside a caller-owned write transaction.
-    #[allow(clippy::too_many_arguments)]
     pub fn versioned_index_put_in_txn(
         &self,
         txn: &redb::WriteTransaction,
-        database_id: u64,
-        tenant: u64,
-        coll: &str,
-        field: &str,
-        value: &str,
-        doc_id: &str,
-        sys_from_ms: i64,
+        e: VersionedIndexEntry<'_>,
     ) -> crate::Result<()> {
-        if doc_id.as_bytes().contains(&0) {
+        if e.doc_id.as_bytes().contains(&0) {
             return Err(crate::Error::BadRequest {
                 detail: "document id may not contain NUL byte".into(),
             });
         }
-        let key = format!(
-            "{database_id}:{tenant}:{coll}:{field}:{value}:{doc_id}\x00{}",
-            format_sys_from(sys_from_ms)
-        );
+        let key = e.redb_key();
         let mut t = txn
             .open_table(INDEXES_VERSIONED)
             .map_err(|e| redb_err("open table", e))?;
@@ -62,22 +52,12 @@ impl SparseEngine {
     }
 
     /// `versioned_index_tombstone` inside a caller-owned write transaction.
-    #[allow(clippy::too_many_arguments)]
     pub fn versioned_index_tombstone_in_txn(
         &self,
         txn: &redb::WriteTransaction,
-        database_id: u64,
-        tenant: u64,
-        coll: &str,
-        field: &str,
-        value: &str,
-        doc_id: &str,
-        sys_from_ms: i64,
+        e: VersionedIndexEntry<'_>,
     ) -> crate::Result<()> {
-        let key = format!(
-            "{database_id}:{tenant}:{coll}:{field}:{value}:{doc_id}\x00{}",
-            format_sys_from(sys_from_ms)
-        );
+        let key = e.redb_key();
         let mut t = txn
             .open_table(INDEXES_VERSIONED)
             .map_err(|e| redb_err("open table", e))?;
@@ -93,22 +73,12 @@ impl SparseEngine {
     /// Used by the transaction-rollback path to undo a
     /// `versioned_index_put_in_txn` that must not survive an aborted
     /// transaction. Removing a non-existent key is a no-op.
-    #[allow(clippy::too_many_arguments)]
     pub fn versioned_index_remove_in_txn(
         &self,
         txn: &redb::WriteTransaction,
-        database_id: u64,
-        tenant: u64,
-        coll: &str,
-        field: &str,
-        value: &str,
-        doc_id: &str,
-        sys_from_ms: i64,
+        e: VersionedIndexEntry<'_>,
     ) -> crate::Result<()> {
-        let key = format!(
-            "{database_id}:{tenant}:{coll}:{field}:{value}:{doc_id}\x00{}",
-            format_sys_from(sys_from_ms)
-        );
+        let key = e.redb_key();
         let mut t = txn
             .open_table(INDEXES_VERSIONED)
             .map_err(|e| redb_err("open table", e))?;
@@ -117,62 +87,24 @@ impl SparseEngine {
     }
 
     /// Append a versioned secondary index entry in its own transaction.
-    #[allow(clippy::too_many_arguments)]
-    pub fn versioned_index_put(
-        &self,
-        database_id: u64,
-        tenant: u64,
-        coll: &str,
-        field: &str,
-        value: &str,
-        doc_id: &str,
-        sys_from_ms: i64,
-    ) -> crate::Result<()> {
+    pub fn versioned_index_put(&self, e: VersionedIndexEntry<'_>) -> crate::Result<()> {
         let txn = self
             .db
             .begin_write()
             .map_err(|e| redb_err("write txn", e))?;
-        self.versioned_index_put_in_txn(
-            &txn,
-            database_id,
-            tenant,
-            coll,
-            field,
-            value,
-            doc_id,
-            sys_from_ms,
-        )?;
+        self.versioned_index_put_in_txn(&txn, e)?;
         txn.commit().map_err(|e| redb_err("commit", e))?;
         Ok(())
     }
 
     /// Append a tombstone entry for an index value that's been removed,
     /// in its own transaction.
-    #[allow(clippy::too_many_arguments)]
-    pub fn versioned_index_tombstone(
-        &self,
-        database_id: u64,
-        tenant: u64,
-        coll: &str,
-        field: &str,
-        value: &str,
-        doc_id: &str,
-        sys_from_ms: i64,
-    ) -> crate::Result<()> {
+    pub fn versioned_index_tombstone(&self, e: VersionedIndexEntry<'_>) -> crate::Result<()> {
         let txn = self
             .db
             .begin_write()
             .map_err(|e| redb_err("write txn", e))?;
-        self.versioned_index_tombstone_in_txn(
-            &txn,
-            database_id,
-            tenant,
-            coll,
-            field,
-            value,
-            doc_id,
-            sys_from_ms,
-        )?;
+        self.versioned_index_tombstone_in_txn(&txn, e)?;
         txn.commit().map_err(|e| redb_err("commit", e))?;
         Ok(())
     }

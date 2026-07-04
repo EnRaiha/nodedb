@@ -37,13 +37,15 @@ impl<'a> DocumentEngine<'a> {
                         extract_index_values_rmpv(&rmpv_val, &index_path.path, index_path.is_array)
                     {
                         self.sparse.versioned_index_tombstone(
-                            self.database_id,
-                            self.tenant_id,
-                            collection,
-                            &index_path.path,
-                            &v,
-                            doc_id,
-                            sys_from,
+                            crate::engine::sparse::btree_versioned::VersionedIndexEntry {
+                                database_id: self.database_id,
+                                tenant: self.tenant_id,
+                                coll: collection,
+                                field: &index_path.path,
+                                value: &v,
+                                doc_id,
+                                sys_from_ms: sys_from,
+                            },
                         )?;
                     }
                 }

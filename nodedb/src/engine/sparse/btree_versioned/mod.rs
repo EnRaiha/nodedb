@@ -23,6 +23,6 @@ pub use key::{
     parse_sys_from, versioned_doc_key,
 };
 pub use value::{
-    DecodedValue, TAG_GDPR_ERASED, TAG_LIVE, TAG_TOMBSTONE, VersionedPut, decode_value,
-    encode_value,
+    DecodedValue, TAG_GDPR_ERASED, TAG_LIVE, TAG_TOMBSTONE, VersionedIndexEntry, VersionedPut,
+    VersionedScanParams, decode_value, encode_value,
 };

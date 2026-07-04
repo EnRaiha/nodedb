@@ -68,12 +68,14 @@ impl CoreLoop {
         let predicate = |body: &[u8]| filter_predicates.iter().all(|f| f.matches_binary(body));
         let scan_limit = offset.saturating_add(limit);
         let rows = match self.sparse.versioned_scan_as_of(
-            task.request.database_id.as_u64(),
-            tid,
-            collection,
-            system_as_of_ms,
-            valid_at_ms,
-            scan_limit,
+            crate::engine::sparse::btree_versioned::VersionedScanParams {
+                database_id: task.request.database_id.as_u64(),
+                tenant: tid,
+                coll: collection,
+                sys_cutoff_ms: system_as_of_ms,
+                valid_at_ms,
+                limit: scan_limit,
+            },
             &predicate,
         ) {
             Ok(r) => r,

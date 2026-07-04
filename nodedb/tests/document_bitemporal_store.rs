@@ -12,6 +12,7 @@
 
 use nodedb::engine::document::store::{CollectionConfig, DocumentEngine};
 use nodedb::engine::sparse::btree::SparseEngine;
+use nodedb::engine::sparse::btree_versioned::VersionedScanParams;
 
 fn open() -> (SparseEngine, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -89,7 +90,17 @@ fn non_bitemporal_collection_uses_legacy_storage() {
     // The versioned table must be empty for this collection because
     // writes went to the legacy path.
     let bitemporal_rows = sparse
-        .versioned_scan_as_of(0, 1, "c", None, None, 100, &|_: &[u8]| true)
+        .versioned_scan_as_of(
+            VersionedScanParams {
+                database_id: 0,
+                tenant: 1,
+                coll: "c",
+                sys_cutoff_ms: None,
+                valid_at_ms: None,
+                limit: 100,
+            },
+            &|_: &[u8]| true,
+        )
         .unwrap();
     assert!(
         bitemporal_rows.is_empty(),

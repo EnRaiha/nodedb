@@ -119,12 +119,14 @@ impl CoreLoop {
         let scan_result = if filter_predicates.is_empty() {
             if bitemporal {
                 self.sparse.versioned_scan_as_of(
-                    task.request.database_id.as_u64(),
-                    tid,
-                    collection,
-                    None,
-                    None,
-                    fetch_limit,
+                    crate::engine::sparse::btree_versioned::VersionedScanParams {
+                        database_id: task.request.database_id.as_u64(),
+                        tenant: tid,
+                        coll: collection,
+                        sys_cutoff_ms: None,
+                        valid_at_ms: None,
+                        limit: fetch_limit,
+                    },
                     &|_| true,
                 )
             } else {
@@ -165,12 +167,14 @@ impl CoreLoop {
                 };
             if bitemporal {
                 self.sparse.versioned_scan_as_of(
-                    task.request.database_id.as_u64(),
-                    tid,
-                    collection,
-                    None,
-                    None,
-                    fetch_limit,
+                    crate::engine::sparse::btree_versioned::VersionedScanParams {
+                        database_id: task.request.database_id.as_u64(),
+                        tenant: tid,
+                        coll: collection,
+                        sys_cutoff_ms: None,
+                        valid_at_ms: None,
+                        limit: fetch_limit,
+                    },
                     &predicate,
                 )
             } else {
@@ -187,12 +191,14 @@ impl CoreLoop {
                 |value: &[u8]| filter_predicates.iter().all(|f| f.matches_binary(value));
             if bitemporal {
                 self.sparse.versioned_scan_as_of(
-                    task.request.database_id.as_u64(),
-                    tid,
-                    collection,
-                    None,
-                    None,
-                    fetch_limit,
+                    crate::engine::sparse::btree_versioned::VersionedScanParams {
+                        database_id: task.request.database_id.as_u64(),
+                        tenant: tid,
+                        coll: collection,
+                        sys_cutoff_ms: None,
+                        valid_at_ms: None,
+                        limit: fetch_limit,
+                    },
                     &predicate,
                 )
             } else {

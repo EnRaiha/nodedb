@@ -73,13 +73,15 @@ impl CoreLoop {
                                     };
                                     self.sparse.versioned_index_tombstone_in_txn(
                                         &txn,
-                                        database_id,
-                                        tid,
-                                        collection,
-                                        &path.path,
-                                        &value,
-                                        row_key,
-                                        sys_from,
+                                        crate::engine::sparse::btree_versioned::VersionedIndexEntry {
+                                            database_id,
+                                            tenant: tid,
+                                            coll: collection,
+                                            field: &path.path,
+                                            value: &value,
+                                            doc_id: row_key,
+                                            sys_from_ms: sys_from,
+                                        },
                                     )?;
                                 }
                             }

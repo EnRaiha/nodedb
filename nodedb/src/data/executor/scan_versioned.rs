@@ -25,9 +25,17 @@ impl CoreLoop {
         collection: &str,
         limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        let docs =
-            self.sparse
-                .versioned_scan_as_of(did, tid, collection, None, None, limit, &|_| true)?;
+        let docs = self.sparse.versioned_scan_as_of(
+            crate::engine::sparse::btree_versioned::VersionedScanParams {
+                database_id: did,
+                tenant: tid,
+                coll: collection,
+                sys_cutoff_ms: None,
+                valid_at_ms: None,
+                limit,
+            },
+            &|_| true,
+        )?;
         let strict_schema = self.strict_schema_for(crate::types::TenantId::new(tid), collection);
 
         let mut normalized = Vec::with_capacity(docs.len());

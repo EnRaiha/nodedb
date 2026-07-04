@@ -8,7 +8,8 @@ use super::key::{
     coll_prefix, coll_prefix_end, doc_prefix, doc_prefix_end, format_sys_from, versioned_doc_key,
 };
 use super::value::{
-    TAG_GDPR_ERASED, TAG_LIVE, TAG_TOMBSTONE, VersionedPut, decode_value, encode_value,
+    TAG_GDPR_ERASED, TAG_LIVE, TAG_TOMBSTONE, VersionedPut, VersionedScanParams, decode_value,
+    encode_value,
 };
 use crate::engine::sparse::btree::{SparseEngine, redb_err};
 
@@ -286,17 +287,19 @@ impl SparseEngine {
     /// before it counts toward `limit`, so a selective filter never causes the
     /// scan to early-stop with fewer matching rows than exist. Pass `&|_| true`
     /// for an unfiltered scan.
-    #[allow(clippy::too_many_arguments)]
     pub fn versioned_scan_as_of(
         &self,
-        database_id: u64,
-        tenant: u64,
-        coll: &str,
-        sys_cutoff_ms: Option<i64>,
-        valid_at_ms: Option<i64>,
-        limit: usize,
+        params: VersionedScanParams<'_>,
         predicate: &dyn Fn(&[u8]) -> bool,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        let VersionedScanParams {
+            database_id,
+            tenant,
+            coll,
+            sys_cutoff_ms,
+            valid_at_ms,
+            limit,
+        } = params;
         let lo = coll_prefix(database_id, tenant, coll);
         let hi = coll_prefix_end(database_id, tenant, coll);
         let cutoff_key = sys_cutoff_ms.map(format_sys_from);

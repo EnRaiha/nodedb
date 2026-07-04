@@ -2,6 +2,8 @@
 
 //! Versioned payload format: `[tag:u8][valid_from_ms:i64 LE][valid_until_ms:i64 LE][body...]`.
 
+use super::key::format_sys_from;
+
 pub const TAG_LIVE: u8 = 0x00;
 pub const TAG_TOMBSTONE: u8 = 0xFF;
 pub const TAG_GDPR_ERASED: u8 = 0xFE;
@@ -69,4 +71,46 @@ pub struct VersionedPut<'a> {
     pub valid_from_ms: i64,
     pub valid_until_ms: i64,
     pub body: &'a [u8],
+}
+
+/// Arguments for the versioned secondary-index operations
+/// (`versioned_index_put[_in_txn]`, `versioned_index_tombstone[_in_txn]`,
+/// `versioned_index_remove_in_txn`). Packed to keep the signatures under
+/// clippy's 7-arg limit without an `#[allow]`.
+pub struct VersionedIndexEntry<'a> {
+    pub database_id: u64,
+    pub tenant: u64,
+    pub coll: &'a str,
+    pub field: &'a str,
+    pub value: &'a str,
+    pub doc_id: &'a str,
+    pub sys_from_ms: i64,
+}
+
+impl VersionedIndexEntry<'_> {
+    /// The redb key for this index entry:
+    /// `"{database_id}:{tenant}:{coll}:{field}:{value}:{doc_id}\x00{sys_from:020}"`.
+    pub fn redb_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}\x00{}",
+            self.database_id,
+            self.tenant,
+            self.coll,
+            self.field,
+            self.value,
+            self.doc_id,
+            format_sys_from(self.sys_from_ms)
+        )
+    }
+}
+
+/// Arguments for `SparseEngine::versioned_scan_as_of`. Packed to keep the
+/// signature under clippy's 7-arg limit without an `#[allow]`.
+pub struct VersionedScanParams<'a> {
+    pub database_id: u64,
+    pub tenant: u64,
+    pub coll: &'a str,
+    pub sys_cutoff_ms: Option<i64>,
+    pub valid_at_ms: Option<i64>,
+    pub limit: usize,
 }

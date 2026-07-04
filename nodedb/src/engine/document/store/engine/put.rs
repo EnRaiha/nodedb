@@ -72,13 +72,15 @@ impl<'a> DocumentEngine<'a> {
                     if bitemporal {
                         let sys_from = wall_now_ms();
                         self.sparse.versioned_index_put(
-                            self.database_id,
-                            self.tenant_id,
-                            collection,
-                            &index_path.path,
-                            &v,
-                            doc_id,
-                            sys_from,
+                            crate::engine::sparse::btree_versioned::VersionedIndexEntry {
+                                database_id: self.database_id,
+                                tenant: self.tenant_id,
+                                coll: collection,
+                                field: &index_path.path,
+                                value: &v,
+                                doc_id,
+                                sys_from_ms: sys_from,
+                            },
                         )?;
                     } else {
                         self.sparse.index_put(
