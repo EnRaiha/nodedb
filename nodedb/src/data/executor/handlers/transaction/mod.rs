@@ -2,6 +2,7 @@
 
 mod batch;
 pub mod overlay;
+mod stage_write;
 mod sub_plan;
 mod sub_plan_doc;
 mod sub_plan_kv;

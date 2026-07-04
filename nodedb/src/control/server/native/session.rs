@@ -416,7 +416,7 @@ impl NativeSession {
             // Transaction control.
             OpCode::Begin => dispatch::handle_begin(&ctx, seq),
             OpCode::Commit => dispatch::handle_commit(&ctx, seq).await,
-            OpCode::Rollback => dispatch::handle_rollback(&ctx, seq),
+            OpCode::Rollback => dispatch::handle_rollback(&ctx, seq).await,
 
             // Explain.
             OpCode::Explain => {

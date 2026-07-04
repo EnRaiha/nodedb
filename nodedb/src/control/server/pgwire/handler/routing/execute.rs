@@ -326,6 +326,15 @@ impl NodeDbPgHandler {
                 )
                 .is_some();
                 if is_write {
+                    // Point writes execute at STATEMENT time via the staging
+                    // overlay (real tag + statement-time constraint errors);
+                    // the plan is still buffered so COMMIT stays the sole
+                    // durable apply. Other writes keep buffer + "OK".
+                    if super::super::plan::is_point_write(&task.plan) {
+                        let staged = self.stage_in_tx_point_write(task, addr, identity).await?;
+                        responses.push(staged);
+                        continue;
+                    }
                     self.sessions.buffer_write(addr, task);
                     responses.push(Response::Execution(Tag::new("OK")));
                     continue;

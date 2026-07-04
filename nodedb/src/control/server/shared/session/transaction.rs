@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::types::{Lsn, TxnId};
+use crate::types::{Lsn, TxnId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::state::TransactionState;
@@ -35,6 +35,7 @@ impl SessionStore {
                 session.tx_snapshot_lsn = Some(current_lsn);
                 session.tx_read_set.clear();
                 session.tx_id = Some(TxnId::new(NEXT_TXN_ID.fetch_add(1, Ordering::Relaxed)));
+                session.tx_vshard = None;
                 Ok(())
             }
             TransactionState::InBlock => {
@@ -70,6 +71,20 @@ impl SessionStore {
         self.read_session(addr, |s| s.tx_snapshot_lsn)?
     }
 
+    /// Current transaction's overlay id, for stamping a `StageWrite` task
+    /// before it is dispatched. `None` outside a transaction block.
+    pub fn tx_id(&self, addr: &SocketAddr) -> Option<TxnId> {
+        self.read_session(addr, |s| s.tx_id).flatten()
+    }
+
+    /// Snapshot the current transaction's overlay identity (id + homing vShard)
+    /// WITHOUT clearing it. Called before `rollback()` releases session state so
+    /// the caller can dispatch `MetaOp::DropTxnOverlay` to the right vShard.
+    pub fn txn_identity(&self, addr: &SocketAddr) -> (Option<TxnId>, Option<VShardId>) {
+        self.read_session(addr, |s| (s.tx_id, s.tx_vshard))
+            .unwrap_or((None, None))
+    }
+
     /// Drain the read-set for conflict checking at COMMIT time.
     pub fn take_read_set(&self, addr: &SocketAddr) -> Vec<(String, String, Lsn)> {
         self.write_session(addr, |session| std::mem::take(&mut session.tx_read_set))
@@ -85,6 +100,7 @@ impl SessionStore {
             session.tx_state = TransactionState::Idle;
             session.tx_snapshot_lsn = None;
             session.tx_id = None;
+            session.tx_vshard = None;
             session.savepoints.clear();
             // Note: pending_sequence_reservations are taken separately via
             // take_pending_reservations() so the caller can finalize them
@@ -150,6 +166,9 @@ impl SessionStore {
         self.write_session(addr, |session| {
             if session.tx_state == TransactionState::InBlock {
                 task.txn_id = session.tx_id;
+                if session.tx_vshard.is_none() {
+                    session.tx_vshard = Some(task.vshard_id);
+                }
                 session.tx_buffer.push(task);
                 true
             } else {
@@ -171,6 +190,7 @@ impl SessionStore {
                 session.tx_state = TransactionState::Idle;
                 session.tx_snapshot_lsn = None;
                 session.tx_id = None;
+                session.tx_vshard = None;
                 session.tx_read_set.clear();
                 session.savepoints.clear();
                 session.pending_offset_commits.clear();

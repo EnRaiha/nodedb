@@ -484,10 +484,9 @@ pub struct CoreLoop {
     /// Per-transaction staging overlay: not-yet-durable writes for each
     /// in-flight transaction on this core, keyed by `TxnId`.
     ///
-    /// Scaffolding: nothing populates or reads this yet. Entries are
-    /// released via `MetaOp::DropTxnOverlay` once a transaction resolves
-    /// (commit or rollback); that dispatch wiring has not landed yet, so
-    /// today this map is always empty.
+    /// Populated by `MetaOp::StageWrite` when an in-transaction point write is
+    /// executed at statement time, and released by `MetaOp::DropTxnOverlay`
+    /// once the transaction resolves (commit or rollback).
     pub(in crate::data::executor) txn_overlays: HashMap<
         crate::types::TxnId,
         crate::data::executor::handlers::transaction::overlay::TxnOverlay,

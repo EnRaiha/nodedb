@@ -2,9 +2,10 @@
 
 //! Per-transaction staging overlay data types.
 //!
-//! This is pure scaffolding for an in-progress transaction-execution
-//! redesign: the types and data-only accessors below are not yet populated
-//! or read by any handler. Nothing in this file changes existing behavior.
+//! Holds the not-yet-durable writes an in-flight transaction has executed at
+//! statement time (`MetaOp::StageWrite`), so an in-transaction point write
+//! returns its real command tag and raises constraint violations immediately,
+//! while COMMIT's `TransactionBatch` replay remains the sole durable apply.
 //!
 //! Keying rationale: the real storage key for a document is the SURROGATE
 //! (`u32`) — `apply_point_put` keys `sparse.versioned_put_in_txn` by
@@ -15,6 +16,12 @@
 use std::collections::HashMap;
 
 use crate::types::{DatabaseId, TenantId};
+
+/// Per-core upper bound on the total staged-body bytes a single transaction's
+/// overlay may hold. Staging a point write that would push the overlay past
+/// this budget is rejected with `program_limit_exceeded` (SQLSTATE 54000)
+/// rather than growing a core's resident memory without bound.
+pub const MAX_TXN_OVERLAY_BYTES: usize = 256 * 1024 * 1024;
 
 /// A single staged mutation for one surrogate row.
 #[derive(Debug, Clone, PartialEq, Eq)]

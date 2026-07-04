@@ -70,6 +70,34 @@ fn batch_dispatch_to_commit_error(
 }
 
 impl NodeDbPgHandler {
+    /// Release the per-transaction staging overlay on the vShard that hosted
+    /// the transaction's staged point writes.
+    ///
+    /// Best-effort cleanup dispatched AFTER the durable resolution (COMMIT
+    /// batch flush / ROLLBACK). A failure here leaks in-memory overlay state
+    /// on that core but does not affect the already-resolved transaction, so it
+    /// is logged rather than surfaced to the client.
+    async fn dispatch_drop_txn_overlay(
+        &self,
+        tenant_id: crate::types::TenantId,
+        vshard_id: crate::types::VShardId,
+        txn_id: crate::types::TxnId,
+    ) {
+        let task = nodedb_physical::physical_task::PhysicalTask {
+            tenant_id,
+            vshard_id,
+            database_id: crate::types::DatabaseId::DEFAULT,
+            plan: crate::bridge::envelope::PhysicalPlan::Meta(
+                nodedb_physical::physical_plan::MetaOp::DropTxnOverlay { txn_id },
+            ),
+            post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+            txn_id: None,
+        };
+        if let Err(e) = self.dispatch_task_no_wal(task, None).await {
+            tracing::warn!(error = %e, "failed to drop per-transaction staging overlay");
+        }
+    }
+
     /// Handle BEGIN / START TRANSACTION.
     pub(super) fn handle_begin(&self, addr: &std::net::SocketAddr) -> PgWireResult<Vec<Response>> {
         let snapshot_lsn = {
@@ -311,6 +339,19 @@ impl NodeDbPgHandler {
                     }
                 }
             }
+
+            // Release the per-transaction staging overlay on every vShard that
+            // hosted a staged write, now that the durable batch(es) have
+            // flushed. Guarded on a staged (txn_id-carrying) buffer.
+            if let Some(txn_id) = buffered[0].txn_id {
+                let mut dropped = std::collections::HashSet::new();
+                for task in &buffered {
+                    if dropped.insert(task.vshard_id) {
+                        self.dispatch_drop_txn_overlay(tenant_id, task.vshard_id, txn_id)
+                            .await;
+                    }
+                }
+            }
         }
 
         // Flush pending offset commits (deferred from COMMIT OFFSET inside transaction).
@@ -402,12 +443,15 @@ impl NodeDbPgHandler {
     }
 
     /// Handle ROLLBACK / ABORT.
-    pub(super) fn handle_rollback(
+    pub(super) async fn handle_rollback(
         &self,
         identity: &AuthenticatedIdentity,
         addr: &std::net::SocketAddr,
     ) -> PgWireResult<Vec<Response>> {
         crate::control::server::shared::session::ddl_buffer::discard();
+        // Snapshot the overlay identity BEFORE `rollback()` clears session
+        // state, so the staging overlay can be released on its home vShard.
+        let (overlay_txn_id, overlay_vshard) = self.sessions.txn_identity(addr);
         let reservations = self.sessions.rollback(addr).unwrap_or_default();
         for handle in &reservations {
             let key = &handle.sequence_key;
@@ -433,6 +477,12 @@ impl NodeDbPgHandler {
         self.sessions.close_non_hold_cursors(addr);
         // Discard NOTIFY messages buffered during this transaction.
         self.sessions.discard_pending_notifies(addr);
+
+        // Release any staging overlay populated by statement-time point writes.
+        if let (Some(txn_id), Some(vshard_id)) = (overlay_txn_id, overlay_vshard) {
+            self.dispatch_drop_txn_overlay(identity.tenant_id, vshard_id, txn_id)
+                .await;
+        }
         Ok(vec![Response::Execution(Tag::new("ROLLBACK"))])
     }
 }

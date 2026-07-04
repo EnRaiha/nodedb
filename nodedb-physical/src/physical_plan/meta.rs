@@ -430,6 +430,20 @@ pub enum MetaOp {
         new_collection: String,
     },
 
+    /// Execute a point write at STATEMENT time by STAGING it into the
+    /// per-transaction overlay, instead of buffering it for COMMIT.
+    ///
+    /// `plan` is a single point-write `DocumentOp` (`PointPut` / `PointInsert`
+    /// / `PointDelete` / `PointUpdate`). The Data Plane handler evaluates the
+    /// write against BASE ∪ OVERLAY: it raises constraint violations
+    /// (unique / primary-key) immediately, computes the real affected-row
+    /// count, and records the resulting body (or tombstone) in the overlay so
+    /// a subsequent same-transaction read-modify-write observes it. It does
+    /// NOT make the write durable — the buffered plan is still replayed
+    /// through the real apply path inside the COMMIT `TransactionBatch`, which
+    /// remains the sole durable apply. Keyed by the request's `txn_id`.
+    StageWrite { plan: Box<super::PhysicalPlan> },
+
     /// Drop the per-transaction staging overlay for a completed (committed
     /// or rolled-back) transaction on this core.
     ///

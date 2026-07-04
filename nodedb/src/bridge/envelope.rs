@@ -276,6 +276,11 @@ pub enum ErrorCode {
     /// Numeric value: `OLLP_RETRY_REQUIRED_CODE` (0xCAAD) — single source of
     /// truth defined in `control/cluster/calvin/executor/ollp/orchestrator.rs`.
     OllpRetryRequired,
+    /// The per-transaction staging overlay exceeded its per-core byte budget.
+    /// Surfaces as `program_limit_exceeded` (54000) so clients know the
+    /// transaction is too large to stage rather than that it hit an internal
+    /// fault.
+    TxnOverlayMemoryExceeded { limit: usize },
 }
 
 impl From<crate::Error> for ErrorCode {
@@ -333,6 +338,9 @@ impl From<crate::Error> for ErrorCode {
                 gate,
                 retry_after_ms,
             },
+            crate::Error::TxnOverlayMemoryExceeded { limit } => {
+                Self::TxnOverlayMemoryExceeded { limit }
+            }
             other => Self::Internal {
                 detail: other.to_string(),
             },

@@ -185,6 +185,50 @@ pub(super) fn is_calvin_foldable(plan: &PhysicalPlan) -> bool {
     }
 }
 
+/// Allow-list of the point-write plans the in-transaction path stages at
+/// statement time. Explicit match on the exact staged variants (Document point
+/// writes only, no RETURNING) — KV point writes stay on the buffer path.
+pub(super) fn is_point_write(plan: &PhysicalPlan) -> bool {
+    matches!(
+        plan,
+        PhysicalPlan::Document(
+            DocumentOp::PointPut { .. }
+                | DocumentOp::PointInsert { .. }
+                | DocumentOp::PointDelete {
+                    returning: None,
+                    ..
+                }
+                | DocumentOp::PointUpdate {
+                    returning: None,
+                    ..
+                }
+        )
+    )
+}
+
+/// Synthesise the `CommandComplete` tag for a staged point write, carrying the
+/// real affected-row count (1 for an applied write, 0 for an
+/// `ON CONFLICT DO NOTHING` no-op).
+///
+/// Caller invariant: `plan` must have passed [`is_point_write`].
+pub(super) fn point_write_tag(plan: &PhysicalPlan, rows: usize) -> Tag {
+    match plan {
+        PhysicalPlan::Document(DocumentOp::PointPut { .. } | DocumentOp::PointInsert { .. }) => {
+            Tag::new("INSERT").with_rows(rows)
+        }
+        PhysicalPlan::Document(DocumentOp::PointUpdate {
+            returning: None, ..
+        }) => Tag::new("UPDATE").with_rows(rows),
+        PhysicalPlan::Document(DocumentOp::PointDelete {
+            returning: None, ..
+        }) => Tag::new("DELETE").with_rows(rows),
+        other => unreachable!(
+            "point_write_tag called on a non-point-write plan; \
+             is_point_write invariant broken: {other:?}"
+        ),
+    }
+}
+
 /// Synthesise the pgwire `CommandComplete` tag for a Calvin-foldable plan.
 ///
 /// Caller invariant: `plan` must already have passed `is_calvin_foldable`.
@@ -219,7 +263,7 @@ pub(super) fn calvin_tag_for_plan(plan: &PhysicalPlan) -> Tag {
 /// Extract affected row count from a JSON or MessagePack payload.
 ///
 /// Looks for `"affected"`, `"truncated"`, `"inserted"`, or `"accepted"` fields.
-fn extract_affected_count(payload: &[u8]) -> Option<u64> {
+pub(super) fn extract_affected_count(payload: &[u8]) -> Option<u64> {
     if payload.is_empty() {
         return None;
     }

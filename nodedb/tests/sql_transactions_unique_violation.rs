@@ -27,34 +27,33 @@ async fn tx_duplicate_pk_insert_raises_unique_violation() {
 
     server.exec("BEGIN").await.unwrap();
 
-    // NOTE on WHERE the violation surfaces: NodeDB currently *defers execution*
-    // of in-transaction writes until COMMIT (the buffered-write model), so the
-    // duplicate INSERT returns OK at statement time and the UNIQUE violation is
-    // raised when the buffered batch executes at COMMIT. PostgreSQL raises it at
-    // the offending statement; making NodeDB do the same is the job of the
-    // staged-write execution redesign. What this test locks in regardless of
-    // that timing is the *correctness* property U6a delivered: UNIQUE IS enforced
-    // inside a transaction — the duplicate is rejected, never silently accepted.
-    server
+    // In-transaction point writes execute at STATEMENT time (staged into the
+    // per-transaction overlay), so a duplicate primary key is rejected with
+    // SQLSTATE 23505 AT THE OFFENDING STATEMENT — as PostgreSQL does — rather
+    // than deferred to COMMIT. The correctness property is unchanged: UNIQUE is
+    // enforced inside a transaction and the duplicate is never applied.
+    match server
         .client
         .simple_query("INSERT INTO tx_dup (id, n) VALUES ('dup', 2)")
         .await
-        .expect("buffered in-tx INSERT returns OK at statement time (deferred execution)");
-
-    // COMMIT must reject the duplicate with SQLSTATE 23505.
-    match server.client.simple_query("COMMIT").await {
-        Ok(_) => panic!("COMMIT must reject the duplicate-PK insert — UNIQUE unenforced in tx"),
+    {
+        Ok(_) => panic!(
+            "duplicate-PK insert must raise 23505 at the statement — UNIQUE unenforced in tx"
+        ),
         Err(e) => {
-            let db_err = e.as_db_error().expect("expected DbError at COMMIT");
+            let db_err = e.as_db_error().expect("expected DbError at the statement");
             assert_eq!(
                 db_err.code().code(),
                 "23505",
-                "expected SQLSTATE 23505 at COMMIT, got {}: {}",
+                "expected SQLSTATE 23505 at the statement, got {}: {}",
                 db_err.code().code(),
                 db_err.message()
             );
         }
     }
+
+    // The transaction is now aborted; ROLLBACK returns to a clean state.
+    let _ = server.client.simple_query("ROLLBACK").await;
 
     // The duplicate must not be present / must not have overwritten the original.
     let rows = server

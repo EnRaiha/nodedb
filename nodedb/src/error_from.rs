@@ -92,6 +92,9 @@ impl From<Error> for NodeDbError {
                 collection, detail, ..
             } => NodeDbError::constraint_violation(collection, detail),
             Error::RejectedAuthz { resource, .. } => NodeDbError::authorization_denied(resource),
+            err @ Error::TxnOverlayMemoryExceeded { .. } => {
+                NodeDbError::bad_request(err.to_string())
+            }
             err @ Error::OffsetRegression { .. } => NodeDbError::bad_request(err.to_string()),
             Error::DeadlineExceeded { .. } => NodeDbError::deadline_exceeded(),
             Error::ConflictRetry {

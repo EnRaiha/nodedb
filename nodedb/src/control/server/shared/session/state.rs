@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::types::{DatabaseId, Lsn, TenantId, TxnId};
+use crate::types::{DatabaseId, Lsn, TenantId, TxnId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 /// PostgreSQL transaction state for ReadyForQuery status byte.
@@ -68,6 +68,11 @@ pub struct ConnSession {
     /// and cleared on `COMMIT`/`ROLLBACK`. Keys the per-transaction staging
     /// overlay. `None` outside a transaction block.
     pub tx_id: Option<TxnId>,
+    /// vShard this transaction's staged writes were homed on, captured on the
+    /// first staged/buffered write. Under the single-vshard-per-transaction
+    /// assumption, this is where the staging overlay lives — used to target
+    /// `MetaOp::DropTxnOverlay` at COMMIT/ROLLBACK. `None` until the first write.
+    pub tx_vshard: Option<VShardId>,
     /// Read-set: (collection, document_id, read_lsn) tuples for write
     /// conflict detection. At COMMIT, each entry is checked — if the
     /// document's current LSN > read_lsn, a concurrent write occurred
@@ -144,6 +149,7 @@ impl ConnSession {
             tx_buffer: Vec::new(),
             tx_snapshot_lsn: None,
             tx_id: None,
+            tx_vshard: None,
             tx_read_set: Vec::new(),
             savepoints: Vec::new(),
             pending_offset_commits: Vec::new(),

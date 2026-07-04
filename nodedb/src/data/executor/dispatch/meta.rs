@@ -226,10 +226,11 @@ impl CoreLoop {
                 new_collection,
             ),
 
-            // Pure scaffolding removal. Nothing populates the overlay yet,
-            // so this is a no-op `HashMap::remove` on an absent key today;
-            // wiring the call site (session commit/rollback) lands
-            // separately.
+            MetaOp::StageWrite { plan } => self.execute_stage_write(task, tid, plan),
+
+            // Release the staging overlay once a transaction resolves (commit
+            // or rollback). `HashMap::remove` on an absent key is a no-op, so
+            // this is safe even when no overlay was ever populated.
             MetaOp::DropTxnOverlay { txn_id } => {
                 self.txn_overlays.remove(txn_id);
                 self.response_ok(task)

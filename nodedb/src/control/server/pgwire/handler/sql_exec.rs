@@ -78,7 +78,7 @@ impl NodeDbPgHandler {
         }
 
         if upper == "ROLLBACK" || upper == "ABORT" {
-            return self.handle_rollback(identity, addr);
+            return self.handle_rollback(identity, addr).await;
         }
 
         if let Some(result) = self.try_handle_deferred_offset(identity, addr, sql_trimmed, &upper) {

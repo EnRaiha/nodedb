@@ -49,6 +49,9 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::RejectedConstraint { detail, .. } => {
             ("ERROR", sqlstate::UNIQUE_VIOLATION, detail.clone())
         }
+        crate::Error::TxnOverlayMemoryExceeded { .. } => {
+            ("ERROR", sqlstate::PROGRAM_LIMIT_EXCEEDED, err.to_string())
+        }
         crate::Error::DeadlineExceeded { .. } => {
             ("ERROR", sqlstate::QUERY_CANCELED, err.to_string())
         }

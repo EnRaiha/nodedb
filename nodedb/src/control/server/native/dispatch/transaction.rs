@@ -148,12 +148,44 @@ pub(crate) async fn handle_commit(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResp
                 format!("transaction commit failed: {msg}"),
             );
         }
+
+        // Release the staging overlay now that the durable batch has flushed.
+        if let Some(txn_id) = buffered[0].txn_id {
+            drop_txn_overlay(ctx, tenant_id, vshard_id, txn_id).await;
+        }
     }
 
     NativeResponse::status_row(seq, "COMMIT")
 }
 
-pub(crate) fn handle_rollback(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
+pub(crate) async fn handle_rollback(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
+    // Snapshot overlay identity BEFORE rollback() clears session state.
+    let (overlay_txn_id, overlay_vshard) = ctx.sessions.txn_identity(ctx.peer_addr);
     let _ = ctx.sessions.rollback(ctx.peer_addr);
+    if let (Some(txn_id), Some(vshard_id)) = (overlay_txn_id, overlay_vshard) {
+        drop_txn_overlay(ctx, ctx.identity.tenant_id, vshard_id, txn_id).await;
+    }
     NativeResponse::status_row(seq, "ROLLBACK")
+}
+
+/// Best-effort release of a transaction's staging overlay on its home vShard.
+async fn drop_txn_overlay(
+    ctx: &DispatchCtx<'_>,
+    tenant_id: crate::types::TenantId,
+    vshard_id: crate::types::VShardId,
+    txn_id: crate::types::TxnId,
+) {
+    let plan = PhysicalPlan::Meta(MetaOp::DropTxnOverlay { txn_id });
+    if let Err(e) = dispatch_utils::dispatch_to_data_plane(
+        ctx.state,
+        tenant_id,
+        DatabaseId::DEFAULT,
+        vshard_id,
+        plan,
+        TraceId::ZERO,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "failed to drop per-transaction staging overlay");
+    }
 }

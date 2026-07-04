@@ -17,9 +17,64 @@ use crate::control::trigger::dml_hook::DmlWriteInfo;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
-use super::super::super::types::error_to_sqlstate;
+use super::super::super::types::{error_to_sqlstate, response_status_to_sqlstate};
 use super::super::core::NodeDbPgHandler;
 use super::super::plan::PlanKind;
+
+impl NodeDbPgHandler {
+    /// Stage an in-transaction point write into the per-transaction overlay and
+    /// return its real command-tag response (INSERT 0 1 / UPDATE 1 / DELETE 1,
+    /// or 0 rows for an `ON CONFLICT DO NOTHING` no-op). A constraint violation
+    /// surfaces here as the pgwire error. The plan is STILL buffered afterwards
+    /// so COMMIT's WAL + `TransactionBatch` flush remains the sole durable apply.
+    pub(super) async fn stage_in_tx_point_write(
+        &self,
+        task: PhysicalTask,
+        addr: &std::net::SocketAddr,
+        identity: &AuthenticatedIdentity,
+    ) -> PgWireResult<Response> {
+        let stage_task = PhysicalTask {
+            tenant_id: task.tenant_id,
+            vshard_id: task.vshard_id,
+            database_id: task.database_id,
+            plan: crate::bridge::envelope::PhysicalPlan::Meta(
+                nodedb_physical::physical_plan::MetaOp::StageWrite {
+                    plan: Box::new(task.plan.clone()),
+                },
+            ),
+            post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+            txn_id: self.sessions.tx_id(addr),
+        };
+        let user_id: Option<std::sync::Arc<str>> =
+            Some(std::sync::Arc::from(identity.username.as_str()));
+        let resp = self
+            .dispatch_task(stage_task, user_id, Some(identity))
+            .await
+            .map_err(|e| {
+                let (severity, code, message) = error_to_sqlstate(&e);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            })?;
+        if let Some((severity, code, message)) =
+            response_status_to_sqlstate(resp.status, &resp.error_code)
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            ))));
+        }
+        let affected =
+            super::super::plan::extract_affected_count(resp.payload.as_ref()).unwrap_or(1) as usize;
+        let tag = super::super::plan::point_write_tag(&task.plan, affected);
+        // Durable path unchanged: still buffered, replayed at COMMIT.
+        self.sessions.buffer_write(addr, task);
+        Ok(Response::Execution(tag))
+    }
+}
 
 /// Outcome of running the pre-dispatch hooks for a single task.
 pub(super) enum PreDispatchOutcome {

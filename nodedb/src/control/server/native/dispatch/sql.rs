@@ -90,7 +90,7 @@ async fn handle_sql_inner(
         return resp(handle_commit(ctx, seq).await);
     }
     if upper == "ROLLBACK" || upper == "ABORT" {
-        return resp(handle_rollback(ctx, seq));
+        return resp(handle_rollback(ctx, seq).await);
     }
     if upper.starts_with("SAVEPOINT ") {
         return resp(NativeResponse::status_row(seq, "SAVEPOINT"));

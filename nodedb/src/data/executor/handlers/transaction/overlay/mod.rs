@@ -2,4 +2,4 @@
 
 mod staged;
 
-pub use staged::{CollectionOverlay, Staged, TxnOverlay};
+pub use staged::{CollectionOverlay, MAX_TXN_OVERLAY_BYTES, Staged, TxnOverlay};
