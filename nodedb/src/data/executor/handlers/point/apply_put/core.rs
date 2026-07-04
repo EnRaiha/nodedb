@@ -404,8 +404,10 @@ impl CoreLoop {
         }
 
         let mut vector_inserts = Vec::new();
+        let mut spatial_inserts = Vec::new();
         if enable_side_indexes {
-            self.apply_point_put_spatial(database_id, tid, collection, document_id, value);
+            spatial_inserts =
+                self.apply_point_put_spatial(database_id, tid, collection, document_id, value);
             vector_inserts = self.apply_point_put_vector_indexes(
                 database_id,
                 tid,
@@ -422,6 +424,7 @@ impl CoreLoop {
             secondary_index_added,
             secondary_index_removed,
             vector_inserts,
+            spatial_inserts,
         })
     }
 }

@@ -7,6 +7,7 @@ pub(super) mod balanced;
 pub(super) mod document;
 pub(super) mod entry;
 pub(super) mod rollback;
+pub(super) mod spatial;
 
 #[cfg(test)]
 mod tests;

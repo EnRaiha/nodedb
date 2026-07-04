@@ -13,6 +13,11 @@ impl CoreLoop {
     /// insert into the per-field R-tree, maintain the reverse entry→doc map,
     /// and (when geometry present) ingest into the columnar memtable so bare
     /// scans/aggregates over spatial collections work.
+    ///
+    /// Returns the `(spatial_index_key, entry_id)` pairs inserted so a
+    /// transactional caller can push `UndoEntry::SpatialInsert` reversals. The
+    /// spatial writes are in-memory (an aborted redb txn does not reverse them),
+    /// so explicit undo is required. Empty when no geometry fields are present.
     pub(in crate::data::executor) fn apply_point_put_spatial(
         &mut self,
         database_id: u64,
@@ -20,7 +25,16 @@ impl CoreLoop {
         collection: &str,
         document_id: &str,
         value: &[u8],
-    ) {
+    ) -> Vec<(
+        (
+            nodedb_types::DatabaseId,
+            crate::types::TenantId,
+            String,
+            String,
+        ),
+        u64,
+    )> {
+        let mut inserts = Vec::new();
         // Spatial index: detect geometry fields and insert into R-tree.
         // Tries to parse each object field as a GeoJSON Geometry.
         // If successful, computes bbox and inserts into the per-field R-tree.
@@ -53,6 +67,7 @@ impl CoreLoop {
                         ),
                         document_id.to_string(),
                     );
+                    inserts.push((spatial_key, entry_id));
                 }
             }
 
@@ -62,6 +77,8 @@ impl CoreLoop {
                 self.ingest_doc_to_columnar(database_id, tid, collection, obj);
             }
         }
+
+        inserts
     }
 
     /// Strict-schema `Vector(dim)` column names + dims declared on

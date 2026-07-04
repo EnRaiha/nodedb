@@ -14,6 +14,7 @@ use crate::data::executor::enforcement::{append_only, period_lock, retention};
 use nodedb_types::Surrogate;
 
 use crate::data::executor::handlers::point::apply_put::map_enforcement_error;
+use crate::data::executor::spatial_key::SpatialIndexKey;
 
 /// Parameters for [`CoreLoop::apply_point_delete`].
 pub(in crate::data::executor) struct PointDeleteParams<'a> {
@@ -75,6 +76,15 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
         (nodedb_types::DatabaseId, crate::types::TenantId, String),
         u32,
     )>,
+    /// `(spatial_index_key, entry_id, bbox, document_id)` tuples this delete
+    /// removed from per-field spatial R-trees (and the reverse
+    /// `spatial_doc_map`). The bbox is captured BEFORE the R-tree `delete`
+    /// (which does not return it) so a transactional caller can push
+    /// `UndoEntry::SpatialDelete` re-insert reversals. Populated only when the
+    /// EXTRA cascade runs (`enable_extra_cascades == true`, i.e. autocommit);
+    /// empty on the transactional path until that flag flips. Autocommit callers
+    /// ignore it (an aborted redb txn does not reverse in-memory spatial writes).
+    pub spatial_deletes: Vec<(SpatialIndexKey, u64, nodedb_types::BoundingBox, String)>,
 }
 
 impl CoreLoop {
@@ -297,6 +307,10 @@ impl CoreLoop {
         // `apply_point_put` hashes the substrate row key as the R-tree entry
         // id, so delete must hash the same key to find the entry. Hashing the
         // user PK would leak ghost bbox entries that survive the row's removal.
+        // `(spatial_index_key, entry_id, bbox, document_id)` tuples removed by
+        // the spatial cascade below, so a transactional caller can reverse them.
+        // Populated only when the cascade runs (autocommit); empty otherwise.
+        let mut spatial_deletes = Vec::new();
         if enable_extra_cascades {
             let entry_id = crate::util::fnv1a_hash(row_key.as_bytes());
             let db_id = nodedb_types::DatabaseId::new(database_id);
@@ -309,16 +323,27 @@ impl CoreLoop {
                 .collect();
             for field in spatial_fields {
                 let skey = (db_id, tid_id, collection.to_string(), field.clone());
+                // Read the bbox BEFORE deleting — the R-tree `delete` does not
+                // return the removed geometry, so a reversible undo must capture
+                // it here (the reverse `spatial_doc_map` stores only the doc id).
+                let bbox = self
+                    .spatial_indexes
+                    .get(&skey)
+                    .and_then(|rtree| rtree.entries().into_iter().find(|e| e.id == entry_id))
+                    .map(|e| e.bbox);
                 if let Some(rtree) = self.spatial_indexes.get_mut(&skey) {
                     rtree.delete(entry_id);
                 }
-                self.spatial_doc_map.remove(&(
+                let removed_doc = self.spatial_doc_map.remove(&(
                     db_id,
                     tid_id,
                     collection.to_string(),
                     field,
                     entry_id,
                 ));
+                if let (Some(bbox), Some(doc)) = (bbox, removed_doc) {
+                    spatial_deletes.push((skey, entry_id, bbox, doc));
+                }
             }
 
             // Record deletion for edge referential integrity.
@@ -374,6 +399,7 @@ impl CoreLoop {
             bitemporal_index_tuples,
             secondary_index_tuples,
             vector_deletes,
+            spatial_deletes,
         })
     }
 }

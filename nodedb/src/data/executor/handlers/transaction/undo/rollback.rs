@@ -49,6 +49,9 @@ impl CoreLoop {
             UndoEntry::InsertVector { .. } | UndoEntry::DeleteVector { .. } => {
                 self.apply_undo_vector(tid, entry_index, entry)
             }
+            UndoEntry::SpatialInsert { .. } | UndoEntry::SpatialDelete { .. } => {
+                self.apply_undo_spatial(entry_index, entry)
+            }
             UndoEntry::PutEdge { .. } | UndoEntry::DeleteEdge { .. } => {
                 self.apply_undo_edge(did, tid, entry_index, entry)
             }

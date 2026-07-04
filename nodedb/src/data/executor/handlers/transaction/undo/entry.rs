@@ -2,6 +2,7 @@
 
 //! `UndoEntry` — tracks a single write operation for rollback purposes.
 
+use crate::data::executor::spatial_key::SpatialIndexKey;
 use crate::types::TenantId;
 
 /// Tracks a write operation for rollback purposes.
@@ -67,6 +68,26 @@ pub(in crate::data::executor) enum UndoEntry {
     DeleteVector {
         index_key: (nodedb_types::DatabaseId, TenantId, String),
         vector_id: u32,
+    },
+    /// Undo a spatial R-tree insert by removing the entry from the per-field
+    /// R-tree and deleting its reverse `spatial_doc_map` record.
+    ///
+    /// `key` is the `(database, tenant, collection, field)` spatial index key;
+    /// `entry_id` is the FNV-1a hash of the substrate row key used as the
+    /// R-tree entry id.
+    SpatialInsert { key: SpatialIndexKey, entry_id: u64 },
+    /// Undo a spatial R-tree removal by re-inserting the entry (with its
+    /// captured bounding box) into the per-field R-tree and re-populating the
+    /// reverse `spatial_doc_map` record.
+    ///
+    /// `bbox` is the entry's geometry captured BEFORE the forward `delete`
+    /// (the R-tree `delete` does not return it); `document_id` is the reverse
+    /// map value removed by the forward cascade.
+    SpatialDelete {
+        key: SpatialIndexKey,
+        entry_id: u64,
+        bbox: nodedb_types::BoundingBox,
+        document_id: String,
     },
     /// Undo an EdgePut by deleting the edge (or restoring old properties).
     PutEdge {

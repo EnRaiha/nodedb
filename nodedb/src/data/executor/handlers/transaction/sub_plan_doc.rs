@@ -240,6 +240,14 @@ impl CoreLoop {
             });
         }
 
+        // Reverse any spatial R-tree inserts on rollback. Empty today (the
+        // transactional path disables spatial side-indexing via
+        // `enable_side_indexes: false`), so this is a no-op until that flag
+        // flips — wired now so it stays correct when it does.
+        for (key, entry_id) in outcome.spatial_inserts {
+            undo_log.push(UndoEntry::SpatialInsert { key, entry_id });
+        }
+
         if is_insert
             && let Some(config) = self.doc_configs.get(&config_key)
             && !config.enforcement.materialized_sum_sources.is_empty()
@@ -334,6 +342,20 @@ impl CoreLoop {
             undo_log.push(UndoEntry::DeleteVector {
                 index_key,
                 vector_id,
+            });
+        }
+
+        // Reverse any spatial R-tree removals on rollback. Empty today (the
+        // transactional path disables the EXTRA cascade via
+        // `enable_extra_cascades: false`, so `apply_point_delete` removes no
+        // spatial entries), so this is a no-op until that flag flips — wired now
+        // so it stays correct when it does.
+        for (key, entry_id, bbox, document_id) in outcome.spatial_deletes {
+            undo_log.push(UndoEntry::SpatialDelete {
+                key,
+                entry_id,
+                bbox,
+                document_id,
             });
         }
         Ok(self.response_ok(dummy_task))

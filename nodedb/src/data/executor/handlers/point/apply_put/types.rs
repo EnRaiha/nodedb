@@ -6,6 +6,7 @@
 use nodedb_types::Surrogate;
 
 use crate::bridge::envelope::ErrorCode;
+use crate::data::executor::spatial_key::SpatialIndexKey;
 
 /// Parameters for [`CoreLoop::apply_point_put`](crate::data::executor::core_loop::CoreLoop::apply_point_put).
 pub(in crate::data::executor) struct PointPutParams<'a> {
@@ -83,6 +84,13 @@ pub(in crate::data::executor) struct PointPutOutcome {
         (nodedb_types::DatabaseId, crate::types::TenantId, String),
         u32,
     )>,
+    /// `(spatial_index_key, entry_id)` pairs this put inserted into per-field
+    /// spatial R-trees, so a transactional caller can push
+    /// `UndoEntry::SpatialInsert` reversals. Empty unless `enable_side_indexes`
+    /// was set (the transactional path currently disables spatial side-indexing,
+    /// so this stays empty there until that flag flips). Autocommit callers
+    /// ignore it.
+    pub spatial_inserts: Vec<(SpatialIndexKey, u64)>,
 }
 
 /// Map an enforcement check's `ErrorCode` onto the crate's typed `Error`.

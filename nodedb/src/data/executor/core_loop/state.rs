@@ -9,6 +9,7 @@ use nodedb_bridge::buffer::{Consumer, Producer};
 
 use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
 use crate::control::array_catalog::ArrayCatalogHandle;
+use crate::data::executor::spatial_key::SpatialIndexKey;
 use crate::data::io::IoMetrics;
 use crate::engine::array::ArrayEngine;
 use crate::engine::crdt::tenant_state::TenantCrdtEngine;
@@ -111,10 +112,8 @@ pub struct CoreLoop {
     /// Per-collection spatial R-tree indexes, keyed by
     /// (DatabaseId, TenantId, collection, field).
     /// Lazily initialized when a spatial query or geometry insert first targets a field.
-    pub(in crate::data::executor) spatial_indexes: std::collections::HashMap<
-        (DatabaseId, TenantId, String, String),
-        crate::engine::spatial::RTree,
-    >,
+    pub(in crate::data::executor) spatial_indexes:
+        std::collections::HashMap<SpatialIndexKey, crate::engine::spatial::RTree>,
 
     /// Reverse map from R-tree entry ID → document ID,
     /// keyed by (DatabaseId, TenantId, collection, field, entry_id).
