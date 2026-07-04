@@ -13,7 +13,10 @@ use crate::bridge::envelope::{Response, Status};
 use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::describe_plan;
-use crate::control::server::shared::session::TransactionState;
+use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+use crate::control::server::shared::session::staging_gate::{
+    InTxnRoute, StagingGateError, route_in_tx_write,
+};
 use crate::types::DatabaseId;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -58,20 +61,37 @@ pub(super) async fn run_dispatch_loop(
             ));
         }
 
-        // In transaction: buffer writes.
-        if ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::InBlock {
-            let is_write = crate::control::wal_replication::to_replicated_entry(
-                task.tenant_id,
-                task.vshard_id,
-                &task.plan,
-            )
-            .is_some();
-            if is_write {
-                ctx.sessions.buffer_write(ctx.peer_addr, task);
+        // In transaction: route through the protocol-neutral staging gate.
+        // Reads (including in-transaction reads) come back as `Read` with
+        // `txn_id` stamped for read-your-own-writes; non-stageable writes are
+        // buffered for COMMIT-time replay; stageable writes are applied to
+        // the per-transaction overlay immediately for a real affected count
+        // and statement-time constraint errors. Outside a transaction block,
+        // `route_in_tx_write` always returns `Read(task)` unchanged, so the
+        // autocommit path is untouched.
+        let task = match route_in_tx_write(ctx.sessions, ctx.peer_addr, task, |stage_task| {
+            dispatch_task(ctx, stage_task)
+        })
+        .await
+        {
+            Ok(InTxnRoute::Read(routed_task)) => *routed_task,
+            Ok(InTxnRoute::Buffered) => {
                 total_affected += 1;
                 continue;
             }
-        }
+            Ok(InTxnRoute::Staged(outcome)) => {
+                total_affected += outcome.affected as u64;
+                continue;
+            }
+            Err(StagingGateError::Dispatch(e)) => return resp(error_to_native(seq, &e)),
+            Err(StagingGateError::Rejected { code }) => {
+                let (_, sqlstate, message) = match code {
+                    Some(code) => error_code_to_sqlstate(&code),
+                    None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
+                };
+                return resp(NativeResponse::error(seq, sqlstate, message));
+            }
+        };
 
         let plan_for_response = task.plan.clone();
         let task_resp = match dispatch_task(ctx, task).await {

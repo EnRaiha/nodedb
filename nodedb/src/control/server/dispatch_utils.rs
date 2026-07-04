@@ -120,6 +120,74 @@ pub async fn dispatch_to_data_plane_with_source(
     trace_id: TraceId,
     event_source: crate::event::EventSource,
 ) -> crate::Result<Response> {
+    dispatch_to_data_plane_inner(
+        shared,
+        DataPlaneDispatch {
+            tenant_id,
+            database_id,
+            vshard_id,
+            plan,
+            trace_id,
+            event_source,
+            txn_id: None,
+        },
+    )
+    .await
+}
+
+/// Dispatch a physical plan to the Data Plane carrying an explicit transaction
+/// id so the Data Plane can resolve this transaction's staging overlay
+/// (read-your-own-writes) and route `StageWrite`. Used by the native endpoint,
+/// whose in-transaction tasks flow through this shared path.
+pub async fn dispatch_to_data_plane_with_txn(
+    shared: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    vshard_id: VShardId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+    txn_id: Option<crate::types::TxnId>,
+) -> crate::Result<Response> {
+    dispatch_to_data_plane_inner(
+        shared,
+        DataPlaneDispatch {
+            tenant_id,
+            database_id,
+            vshard_id,
+            plan,
+            trace_id,
+            event_source: crate::event::EventSource::User,
+            txn_id,
+        },
+    )
+    .await
+}
+
+/// Inputs for [`dispatch_to_data_plane_inner`]: the Data Plane request identity
+/// plus the write's event source and optional owning transaction.
+struct DataPlaneDispatch {
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    vshard_id: VShardId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+    event_source: crate::event::EventSource,
+    txn_id: Option<crate::types::TxnId>,
+}
+
+async fn dispatch_to_data_plane_inner(
+    shared: &SharedState,
+    params: DataPlaneDispatch,
+) -> crate::Result<Response> {
+    let DataPlaneDispatch {
+        tenant_id,
+        database_id,
+        vshard_id,
+        plan,
+        trace_id,
+        event_source,
+        txn_id,
+    } = params;
     // Resolve any Exchange data-movement nodes before dispatch: a root-level
     // Gather fans the child to all cores and returns the merged response here;
     // a Broadcast join child is gathered and embedded so the plan reaching a
@@ -181,7 +249,7 @@ pub async fn dispatch_to_data_plane_with_source(
         user_roles: Vec::new(),
         user_id: None,
         statement_digest: None,
-        txn_id: None,
+        txn_id,
     };
 
     let mut rx = shared.tracker.register(request_id);

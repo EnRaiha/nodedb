@@ -26,9 +26,11 @@ pub(super) async fn dispatch_task_via_gateway(
     ctx: &DispatchCtx<'_>,
     task: PhysicalTask,
 ) -> crate::Result<Response> {
-    // Pre-compute vshard before plan is moved.
+    // Pre-compute routing identity before plan is moved.
     let vshard_id = task.vshard_id;
     let tenant_id = task.tenant_id;
+    let database_id = task.database_id;
+    let txn_id = task.txn_id;
     let plan = task.plan;
 
     match ctx.state.gateway.as_ref() {
@@ -54,16 +56,17 @@ pub(super) async fn dispatch_task_via_gateway(
                 &ctx.state.wal,
                 tenant_id,
                 vshard_id,
-                crate::types::DatabaseId::DEFAULT,
+                database_id,
                 &plan,
             )?;
-            dispatch_utils::dispatch_to_data_plane(
+            dispatch_utils::dispatch_to_data_plane_with_txn(
                 ctx.state,
                 tenant_id,
-                crate::types::DatabaseId::DEFAULT,
+                database_id,
                 vshard_id,
                 plan,
                 TraceId::ZERO,
+                txn_id,
             )
             .await
         }
