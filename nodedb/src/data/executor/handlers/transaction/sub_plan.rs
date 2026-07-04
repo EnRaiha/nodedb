@@ -10,6 +10,7 @@ use nodedb_physical::physical_plan::{
     ColumnarOp, CrdtOp, DocumentOp, GraphOp, MetaOp, TimeseriesOp, VectorOp,
 };
 
+use super::sub_plan_doc::{TxPointDelete, TxPointPut};
 use super::undo::UndoEntry;
 
 impl CoreLoop {
@@ -60,14 +61,16 @@ impl CoreLoop {
                 surrogate,
                 ..
             }) => self.tx_point_put(
-                &dummy_task,
-                tid,
-                collection,
-                document_id,
-                *surrogate,
-                value,
+                TxPointPut {
+                    task: &dummy_task,
+                    tid,
+                    collection,
+                    document_id,
+                    surrogate: *surrogate,
+                    value,
+                    user_roles,
+                },
                 undo_log,
-                user_roles,
             ),
 
             PhysicalPlan::Document(DocumentOp::PointInsert {
@@ -97,14 +100,16 @@ impl CoreLoop {
                     });
                 }
                 self.tx_point_put(
-                    &dummy_task,
-                    tid,
-                    collection,
-                    document_id,
-                    *surrogate,
-                    value,
+                    TxPointPut {
+                        task: &dummy_task,
+                        tid,
+                        collection,
+                        document_id,
+                        surrogate: *surrogate,
+                        value,
+                        user_roles,
+                    },
                     undo_log,
-                    user_roles,
                 )
             }
 
@@ -114,11 +119,14 @@ impl CoreLoop {
                 surrogate,
                 ..
             }) => self.tx_point_delete(
-                &dummy_task,
-                tid,
-                collection,
-                document_id,
-                *surrogate,
+                TxPointDelete {
+                    task: &dummy_task,
+                    tid,
+                    collection,
+                    document_id,
+                    surrogate: *surrogate,
+                    user_roles,
+                },
                 undo_log,
             ),
 

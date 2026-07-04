@@ -39,8 +39,9 @@ impl CoreLoop {
             surrogate,
             user_roles: &task.request.user_roles,
             enforce: true,
+            enable_extra_cascades: true,
         }) {
-            Ok(p) => p,
+            Ok(outcome) => outcome.prior_value,
             Err(e) => {
                 return self.response_error(
                     task,

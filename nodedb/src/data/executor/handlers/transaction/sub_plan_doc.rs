@@ -5,29 +5,51 @@
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
-use crate::data::executor::enforcement::{
-    append_only, hash_chain, materialized_sum, period_lock, retention,
-};
+use crate::data::executor::enforcement::{hash_chain, materialized_sum};
+use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
 
 use super::undo::UndoEntry;
 
+/// Parameters for [`CoreLoop::tx_point_put`].
+pub(super) struct TxPointPut<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub surrogate: nodedb_types::Surrogate,
+    pub value: &'a [u8],
+    pub user_roles: &'a [String],
+}
+
+/// Parameters for [`CoreLoop::tx_point_delete`].
+pub(super) struct TxPointDelete<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub surrogate: nodedb_types::Surrogate,
+    pub user_roles: &'a [String],
+}
+
 impl CoreLoop {
     /// Execute a PointPut within a transaction.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn tx_point_put(
         &mut self,
-        dummy_task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        document_id: &str,
-        surrogate: nodedb_types::Surrogate,
-        value: &[u8],
+        p: TxPointPut<'_>,
         undo_log: &mut Vec<UndoEntry>,
-        user_roles: &[String],
     ) -> Result<Response, ErrorCode> {
+        let TxPointPut {
+            task: dummy_task,
+            tid,
+            collection,
+            document_id,
+            surrogate,
+            value,
+            user_roles,
+        } = p;
         let row_key = crate::engine::document::store::surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
         let database_id = dummy_task.request.database_id.as_u64();
@@ -167,86 +189,56 @@ impl CoreLoop {
     }
 
     /// Execute a PointDelete within a transaction.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn tx_point_delete(
         &mut self,
-        dummy_task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        document_id: &str,
-        surrogate: nodedb_types::Surrogate,
+        p: TxPointDelete<'_>,
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
+        let TxPointDelete {
+            task: dummy_task,
+            tid,
+            collection,
+            document_id,
+            surrogate,
+            user_roles,
+        } = p;
         let row_key = crate::engine::document::store::surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
-        let _ = document_id;
-        let config_key = (TenantId::new(tid), collection.to_string());
         let database_id = dummy_task.request.database_id.as_u64();
-        let old_value = self
-            .sparse
-            .get(database_id, tid, collection, row_key)
-            .ok()
-            .flatten();
-        if let Some(config) = self.doc_configs.get(&config_key) {
-            append_only::check_point_delete(collection, &config.enforcement)?;
-            if let Some(ref pl) = config.enforcement.period_lock
-                && let Some(ref old_bytes) = old_value
-            {
-                period_lock::check_period_lock(
-                    &self.sparse,
-                    database_id,
-                    tid,
-                    collection,
-                    old_bytes,
-                    pl,
-                )?;
-            }
-            let created_at = old_value
-                .as_ref()
-                .and_then(|b| retention::extract_created_at_secs(b));
-            retention::check_delete_allowed(collection, &config.enforcement, created_at)?;
-        }
-        match self.sparse.delete(database_id, tid, collection, row_key) {
-            Ok(_) => {
-                if let Some(s) = crate::engine::document::store::doc_id_to_surrogate(row_key) {
-                    let _ = self.inverted.remove_document(
-                        database_id,
-                        TenantId::new(tid),
-                        collection,
-                        s,
-                    );
-                }
-                let _ =
-                    self.sparse
-                        .delete_indexes_for_document(database_id, tid, collection, row_key);
-                let edges_removed = self
-                    .csr_partition_mut(database_id, tid)
-                    .remove_node_edges(row_key);
-                if edges_removed > 0 {
-                    let cascade_ord = self.hlc.next_ordinal();
-                    let _ = self.edge_store.delete_edges_for_node(
-                        database_id,
-                        nodedb_types::TenantId::new(tid),
-                        row_key,
-                        cascade_ord,
-                    );
-                }
 
-                if let Some(old) = old_value {
-                    undo_log.push(UndoEntry::DeleteDocument {
-                        collection: collection.to_string(),
-                        document_id: row_key.to_string(),
-                        old_value: old,
-                        bitemporal_sys_from_ms: None,
-                        bitemporal_index_tuples: Vec::new(),
-                        chain_hash_prior: None,
-                    });
-                }
-                Ok(self.response_ok(dummy_task))
-            }
-            Err(e) => Err(ErrorCode::Internal {
-                detail: e.to_string(),
-            }),
+        // Core delete path shared with the autocommit caller: bitemporal-vs-plain
+        // primary tombstone/delete (including versioned index tombstones),
+        // FTS/inverted removal, secondary-index cascade, graph-edge cascade,
+        // doc_cache invalidation, and stateless DELETE enforcement. The EXTRA
+        // cascades (spatial R-tree removal, mark_node_deleted) are disabled in
+        // the transactional path — they have no undo variant yet, so enabling
+        // them here would leave a rollback hole. `apply_point_delete` opens and
+        // commits its own doc-store write txn internally.
+        let outcome = self.apply_point_delete(PointDeleteParams {
+            database_id,
+            tid,
+            collection,
+            document_id,
+            surrogate,
+            user_roles,
+            enforce: true,
+            enable_extra_cascades: false,
+        })?;
+
+        self.checkpoint_coordinator.mark_dirty("sparse", 1);
+
+        // Only push an undo entry when a row was actually removed — a delete
+        // against a non-existent key has nothing to reverse.
+        if let Some(old) = outcome.prior_value {
+            undo_log.push(UndoEntry::DeleteDocument {
+                collection: collection.to_string(),
+                document_id: row_key.to_string(),
+                old_value: old,
+                bitemporal_sys_from_ms: outcome.bitemporal_sys_from_ms,
+                bitemporal_index_tuples: outcome.bitemporal_index_tuples,
+                chain_hash_prior: None,
+            });
         }
+        Ok(self.response_ok(dummy_task))
     }
 }

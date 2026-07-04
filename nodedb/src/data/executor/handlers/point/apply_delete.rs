@@ -34,6 +34,32 @@ pub(in crate::data::executor) struct PointDeleteParams<'a> {
     /// deletes (e.g. CRDT-sync materialization) whose admission already
     /// happened on their origin replica.
     pub enforce: bool,
+    /// Whether to apply the EXTRA delete cascades that have no undo variant
+    /// yet: the spatial R-tree removal and `mark_node_deleted` bookkeeping.
+    ///
+    /// `true` for autocommit user-DML callers (autocommit PointDelete),
+    /// which own the full delete. `false` for the transactional path
+    /// (`tx_point_delete`): those two side-effects have no rollback
+    /// reversal, so enabling them inside a transaction would leave a
+    /// rollback hole. The CORE side-effects (bitemporal tombstone or plain
+    /// delete — including versioned index tombstones, FTS/inverted index
+    /// removal, secondary-index cascade, graph-edge cascade, doc_cache
+    /// invalidation) run regardless.
+    pub enable_extra_cascades: bool,
+}
+
+/// Capture of the mutations an [`CoreLoop::apply_point_delete`] performed, so
+/// a transactional caller can build an undo entry that fully reverses it.
+pub(in crate::data::executor) struct PointDeleteOutcome {
+    /// Prior stored bytes when a row was actually removed, else `None`.
+    pub prior_value: Option<Vec<u8>>,
+    /// System-time key the bitemporal tombstone row (and its versioned index
+    /// tombstones) were appended at. `Some(t)` on the bitemporal branch,
+    /// `None` on the plain delete branch.
+    pub bitemporal_sys_from_ms: Option<i64>,
+    /// `(field, value)` pairs whose versioned index tombstones this op wrote
+    /// at `bitemporal_sys_from_ms`. Empty when not bitemporal / none written.
+    pub bitemporal_index_tuples: Vec<(String, String)>,
 }
 
 impl CoreLoop {
@@ -55,12 +81,15 @@ impl CoreLoop {
     /// Does NOT emit WriteEvents, mark checkpoints dirty, or build
     /// RETURNING payloads — those stay with the caller.
     ///
-    /// Returns the prior stored bytes when a row was actually removed, or
-    /// `None` when nothing matched.
+    /// Returns a [`PointDeleteOutcome`] capturing the prior stored bytes
+    /// (present when a row was actually removed) plus the bitemporal system
+    /// time and versioned index tombstone tuples written, so a transactional
+    /// caller can build a fully-reversible undo entry. Autocommit callers
+    /// read only `prior_value`.
     pub(in crate::data::executor) fn apply_point_delete(
         &mut self,
         params: PointDeleteParams<'_>,
-    ) -> crate::Result<Option<Vec<u8>>> {
+    ) -> crate::Result<PointDeleteOutcome> {
         let PointDeleteParams {
             database_id,
             tid,
@@ -69,6 +98,7 @@ impl CoreLoop {
             surrogate,
             user_roles,
             enforce,
+            enable_extra_cascades,
         } = params;
         let _ = user_roles;
 
@@ -83,6 +113,8 @@ impl CoreLoop {
         // Current-state-only indexes (text, graph, spatial, vector) are
         // still cascaded below — they track "what exists now" regardless
         // of bitemporal history.
+        let mut bitemporal_sys_from_ms: Option<i64> = None;
+        let mut bitemporal_index_tuples: Vec<(String, String)> = Vec::new();
         let prior = if bitemporal {
             let prior = self
                 .sparse
@@ -99,6 +131,7 @@ impl CoreLoop {
                     )?;
                 }
                 let sys_from = self.bitemporal_now_ms();
+                bitemporal_sys_from_ms = Some(sys_from);
                 let txn = self.sparse.begin_write()?;
                 self.sparse.versioned_tombstone_in_txn(
                     &txn,
@@ -137,6 +170,7 @@ impl CoreLoop {
                                     sys_from_ms: sys_from,
                                 },
                             )?;
+                            bitemporal_index_tuples.push((path.path.clone(), value));
                         }
                     }
                 }
@@ -202,37 +236,52 @@ impl CoreLoop {
             tracing::trace!(core = self.core_id, %document_id, edges_removed, "EDGE_CASCADE_DELETE");
         }
 
-        // Cascade 4: Remove from spatial R-tree indexes + reverse map.
-        // `apply_point_put` hashes the substrate row key as the R-tree
-        // entry id, so delete must hash the same key to find the entry.
-        // Hashing the user PK would leak ghost bbox entries that survive
-        // the row's removal.
-        let entry_id = crate::util::fnv1a_hash(row_key.as_bytes());
-        let db_id = nodedb_types::DatabaseId::new(database_id);
-        let tid_id = crate::types::TenantId::new(tid);
-        let spatial_fields: Vec<String> = self
-            .spatial_indexes
-            .keys()
-            .filter(|(d, t, c, _)| *d == db_id && *t == tid_id && c == collection)
-            .map(|(_, _, _, f)| f.clone())
-            .collect();
-        for field in spatial_fields {
-            let skey = (db_id, tid_id, collection.to_string(), field.clone());
-            if let Some(rtree) = self.spatial_indexes.get_mut(&skey) {
-                rtree.delete(entry_id);
+        // Cascade 4 (SIDE): Remove from spatial R-tree indexes + reverse map,
+        // and record the node deletion for edge referential integrity. Both
+        // have no undo reversal yet, so they run only for autocommit callers
+        // (`enable_extra_cascades == true`); the transactional path skips them
+        // to avoid a rollback hole.
+        //
+        // `apply_point_put` hashes the substrate row key as the R-tree entry
+        // id, so delete must hash the same key to find the entry. Hashing the
+        // user PK would leak ghost bbox entries that survive the row's removal.
+        if enable_extra_cascades {
+            let entry_id = crate::util::fnv1a_hash(row_key.as_bytes());
+            let db_id = nodedb_types::DatabaseId::new(database_id);
+            let tid_id = crate::types::TenantId::new(tid);
+            let spatial_fields: Vec<String> = self
+                .spatial_indexes
+                .keys()
+                .filter(|(d, t, c, _)| *d == db_id && *t == tid_id && c == collection)
+                .map(|(_, _, _, f)| f.clone())
+                .collect();
+            for field in spatial_fields {
+                let skey = (db_id, tid_id, collection.to_string(), field.clone());
+                if let Some(rtree) = self.spatial_indexes.get_mut(&skey) {
+                    rtree.delete(entry_id);
+                }
+                self.spatial_doc_map.remove(&(
+                    db_id,
+                    tid_id,
+                    collection.to_string(),
+                    field,
+                    entry_id,
+                ));
             }
-            self.spatial_doc_map
-                .remove(&(db_id, tid_id, collection.to_string(), field, entry_id));
-        }
 
-        // Record deletion for edge referential integrity.
-        self.mark_node_deleted(database_id, tid, document_id);
+            // Record deletion for edge referential integrity.
+            self.mark_node_deleted(database_id, tid, document_id);
+        }
 
         // Invalidate document cache.
         self.doc_cache
             .invalidate(database_id, tid, collection, row_key);
 
-        Ok(prior)
+        Ok(PointDeleteOutcome {
+            prior_value: prior,
+            bitemporal_sys_from_ms,
+            bitemporal_index_tuples,
+        })
     }
 }
 
