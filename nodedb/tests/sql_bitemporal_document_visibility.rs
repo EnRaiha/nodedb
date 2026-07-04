@@ -142,3 +142,60 @@ async fn bitemporal_update_reflected_in_default_select() {
         "default SELECT must return the latest version, got {rows:?}"
     );
 }
+
+/// #72 regression: an INSERT issued inside `BEGIN;...;COMMIT;` on a
+/// bitemporal collection must not be silently lost. A fresh SELECT (a new
+/// implicit read, not reusing the transaction's own view) must see the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bitemporal_tx_insert_survives_commit() {
+    let srv = TestServer::start().await;
+    create_bitemporal(&srv, "bt_tx_ins").await;
+
+    srv.exec("BEGIN").await.unwrap();
+    srv.exec("INSERT INTO bt_tx_ins (id, value) VALUES ('tx1', 'v1')")
+        .await
+        .unwrap();
+    srv.exec("COMMIT").await.unwrap();
+
+    let rows = srv
+        .query_rows("SELECT id, value FROM bt_tx_ins WHERE id = 'tx1'")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "committed transactional INSERT into a bitemporal collection must be \
+         visible to a fresh SELECT, got {rows:?}"
+    );
+    assert_eq!(rows[0][0], "tx1");
+    assert_eq!(rows[0][1], "v1");
+}
+
+/// #72 regression: a DELETE issued inside `BEGIN;...;COMMIT;` on a
+/// bitemporal collection must actually remove the row — a fresh SELECT must
+/// return zero rows, not the pre-delete version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bitemporal_tx_delete_survives_commit() {
+    let srv = TestServer::start().await;
+    create_bitemporal(&srv, "bt_tx_del").await;
+
+    srv.exec("INSERT INTO bt_tx_del (id, value) VALUES ('tx2', 'v1')")
+        .await
+        .unwrap();
+
+    srv.exec("BEGIN").await.unwrap();
+    srv.exec("DELETE FROM bt_tx_del WHERE id = 'tx2'")
+        .await
+        .unwrap();
+    srv.exec("COMMIT").await.unwrap();
+
+    let rows = srv
+        .query_rows("SELECT id FROM bt_tx_del WHERE id = 'tx2'")
+        .await
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "committed transactional DELETE on a bitemporal collection must remove \
+         the row from a fresh SELECT, got {rows:?}"
+    );
+}

@@ -92,7 +92,7 @@ pub(crate) async fn handle_commit(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResp
         let plans: Vec<PhysicalPlan> = buffered.iter().map(|t| t.plan.clone()).collect();
         let batch_plan = PhysicalPlan::Meta(MetaOp::TransactionBatch { plans });
 
-        let dispatch_err = match ctx.state.gateway.as_ref() {
+        let dispatch_err: Option<(&'static str, String)> = match ctx.state.gateway.as_ref() {
             Some(gw) => {
                 let gw_ctx = GatewayQueryContext {
                     tenant_id,
@@ -101,7 +101,7 @@ pub(crate) async fn handle_commit(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResp
                 };
                 gw.execute(&gw_ctx, batch_plan).await.err().map(|e| {
                     let (_code, msg) = GatewayErrorMap::to_native(&e);
-                    msg
+                    ("40001", msg)
                 })
             }
             None => {
@@ -112,7 +112,7 @@ pub(crate) async fn handle_commit(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResp
                     plan: batch_plan,
                     post_set_op: PostSetOp::None,
                 };
-                dispatch_utils::dispatch_to_data_plane(
+                match dispatch_utils::dispatch_to_data_plane(
                     ctx.state,
                     batch_task.tenant_id,
                     batch_task.database_id,
@@ -121,15 +121,29 @@ pub(crate) async fn handle_commit(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResp
                     TraceId::ZERO,
                 )
                 .await
-                .err()
-                .map(|e| e.to_string())
+                {
+                    Err(e) => Some(("40001", e.to_string())),
+                    Ok(resp) if resp.status != crate::bridge::envelope::Status::Ok => {
+                        let code = resp.error_code.clone().unwrap_or(
+                            crate::bridge::envelope::ErrorCode::RejectedPrevalidation {
+                                reason: "transaction commit failed".to_owned(),
+                            },
+                        );
+                        let (_severity, sqlstate, message) =
+                            crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(
+                                &code,
+                            );
+                        Some((sqlstate, message))
+                    }
+                    Ok(_) => None,
+                }
             }
         };
 
-        if let Some(msg) = dispatch_err {
+        if let Some((sqlstate, msg)) = dispatch_err {
             return NativeResponse::error(
                 seq,
-                "40001",
+                sqlstate,
                 format!("transaction commit failed: {msg}"),
             );
         }
