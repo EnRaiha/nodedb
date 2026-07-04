@@ -16,7 +16,8 @@ use pgwire::api::{ClientInfo, ClientPortalStore, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
-use crate::control::server::response_shape::project::ProjectionItem;
+use crate::control::server::response_shape::schema::{OutputColumn, OutputSchema};
+use crate::control::server::response_shape::types::DdlColType;
 
 use super::super::core::NodeDbPgHandler;
 use super::statement::ParsedStatement;
@@ -103,18 +104,21 @@ impl NodeDbPgHandler {
         // DML RETURNING rows are shaped as multi-column `RowsPayload` by the
         // `ReturningRows` producer (which ignores projection), so they stay
         // correct without any guard.
-        let projection: Option<Vec<ProjectionItem>> = if stmt.result_fields.is_empty() {
+        let projection: Option<OutputSchema> = if stmt.result_fields.is_empty() {
             None
         } else {
-            Some(
-                stmt.result_fields
+            Some(OutputSchema {
+                columns: stmt
+                    .result_fields
                     .iter()
-                    .map(|f| ProjectionItem::Named {
-                        lookup_key: f.name().into(),
+                    .map(|f| OutputColumn {
                         display_name: f.name().into(),
+                        lookup_key: f.name().into(),
+                        ty: DdlColType::Text,
                     })
                     .collect(),
-            )
+                is_star: false,
+            })
         };
 
         // Execute through the planned SQL path with AST-level parameter binding.
@@ -125,7 +129,7 @@ impl NodeDbPgHandler {
                 tenant_id,
                 &addr,
                 &params,
-                projection.as_deref(),
+                projection.as_ref(),
             )
             .await?;
         Ok(results.pop().unwrap_or(Response::EmptyQuery))

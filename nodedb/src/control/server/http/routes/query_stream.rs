@@ -23,7 +23,7 @@ use crate::control::gateway::core::QueryContext;
 use crate::control::server::exchange::gather::gather_all_cores_stream;
 use crate::control::server::exchange::streamable::streamable_gather_child;
 use crate::control::server::response_shape::compose::shape_decoded_rows;
-use crate::control::server::response_shape::project::ProjectionItem;
+use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::result_stream::ResultStream;
 use crate::data::executor::response_codec::decode_payload_to_json;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -88,7 +88,7 @@ pub(super) async fn try_open_stream(
 pub(super) fn ndjson_body_stream(
     stream: ResultStream,
     limit: usize,
-    projection: Option<Vec<ProjectionItem>>,
+    projection: Option<OutputSchema>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
         let mut emitted: usize = 0;
@@ -120,7 +120,7 @@ pub(super) fn ndjson_body_stream(
                     return;
                 }
             };
-            let shaped = shape_decoded_rows(&value, projection.as_deref());
+            let shaped = shape_decoded_rows(&value, projection.as_ref());
             for row in shaped.rows {
                 if emitted >= limit {
                     break;

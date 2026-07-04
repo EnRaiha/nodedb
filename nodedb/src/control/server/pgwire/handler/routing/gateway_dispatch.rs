@@ -16,7 +16,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
-use crate::control::server::response_shape::project::ProjectionItem;
+use crate::control::server::response_shape::schema::OutputSchema;
 use crate::types::{ReadConsistency, TenantId, TraceId};
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -88,7 +88,7 @@ impl NodeDbPgHandler {
         tasks: Vec<PhysicalTask>,
         tenant_id: TenantId,
         database_id: nodedb_types::id::DatabaseId,
-        projection: Option<&[ProjectionItem]>,
+        projection: Option<&OutputSchema>,
     ) -> PgWireResult<Vec<Response>> {
         let gateway = self.state.gateway.as_ref().ok_or_else(|| {
             PgWireError::UserError(Box::new(ErrorInfo::new(

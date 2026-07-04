@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nodedb_cluster::DescriptorId;
 
 use crate::control::planner::descriptor_set::DescriptorVersionSet;
+use crate::control::server::response_shape::schema::OutputSchema;
 use nodedb_physical::physical_task::PhysicalTask;
 
 /// Monotonic schema version counter retained for backwards
@@ -57,6 +58,7 @@ impl Default for SchemaVersion {
 struct CachedEntry {
     tasks: Vec<PhysicalTask>,
     versions: DescriptorVersionSet,
+    output_schema: OutputSchema,
 }
 
 /// Per-session LRU plan cache.
@@ -87,9 +89,10 @@ impl PlanCache {
 
     /// Look up cached physical tasks for the given SQL.
     ///
-    /// On a hit returns both the cached tasks and the
-    /// `DescriptorVersionSet` they were built against — the
-    /// caller feeds the set into
+    /// On a hit returns the cached tasks, the
+    /// `DescriptorVersionSet` they were built against, and the
+    /// `OutputSchema` they were compiled with — the caller feeds
+    /// the version set into
     /// `SharedState::acquire_plan_lease_scope` so cache hits
     /// and fresh plans share the same lease-acquisition path.
     ///
@@ -100,14 +103,18 @@ impl PlanCache {
         &mut self,
         sql: &str,
         current_version: F,
-    ) -> Option<(Vec<PhysicalTask>, DescriptorVersionSet)>
+    ) -> Option<(Vec<PhysicalTask>, DescriptorVersionSet, OutputSchema)>
     where
         F: Fn(&DescriptorId) -> Option<u64>,
     {
         let key = hash_sql(sql);
         let entry = self.entries.get(&key)?;
         if entry.versions.all_fresh(&current_version) {
-            return Some((entry.tasks.clone(), entry.versions.clone()));
+            return Some((
+                entry.tasks.clone(),
+                entry.versions.clone(),
+                entry.output_schema.clone(),
+            ));
         }
         // Stale — evict.
         self.entries.remove(&key);
@@ -116,12 +123,24 @@ impl PlanCache {
     }
 
     /// Store compiled physical tasks in the cache along with
-    /// the descriptor version set they were built against.
-    pub fn put(&mut self, sql: &str, tasks: Vec<PhysicalTask>, versions: DescriptorVersionSet) {
+    /// the descriptor version set and output schema they were
+    /// built against.
+    pub fn put(
+        &mut self,
+        sql: &str,
+        tasks: Vec<PhysicalTask>,
+        versions: DescriptorVersionSet,
+        output_schema: OutputSchema,
+    ) {
         let key = hash_sql(sql);
+        let entry = CachedEntry {
+            tasks,
+            versions,
+            output_schema,
+        };
 
         if let std::collections::hash_map::Entry::Occupied(mut e) = self.entries.entry(key) {
-            e.insert(CachedEntry { tasks, versions });
+            e.insert(entry);
             return;
         }
 
@@ -134,7 +153,7 @@ impl PlanCache {
             }
         }
 
-        self.entries.insert(key, CachedEntry { tasks, versions });
+        self.entries.insert(key, entry);
         self.order.push_back(key);
     }
 
@@ -197,14 +216,24 @@ mod tests {
     #[test]
     fn cache_hit_same_version() {
         let mut cache = PlanCache::new(10);
-        cache.put("SELECT 1", dummy_tasks(), versions_for(&[("foo", 1)]));
+        cache.put(
+            "SELECT 1",
+            dummy_tasks(),
+            versions_for(&[("foo", 1)]),
+            OutputSchema::default(),
+        );
         assert!(cache.get("SELECT 1", always_v(1)).is_some());
     }
 
     #[test]
     fn cache_miss_version_bump() {
         let mut cache = PlanCache::new(10);
-        cache.put("SELECT 1", dummy_tasks(), versions_for(&[("foo", 1)]));
+        cache.put(
+            "SELECT 1",
+            dummy_tasks(),
+            versions_for(&[("foo", 1)]),
+            OutputSchema::default(),
+        );
         assert!(cache.get("SELECT 1", always_v(2)).is_none());
         // Re-lookup returns None — the stale entry was evicted.
         assert!(cache.get("SELECT 1", always_v(1)).is_none());
@@ -213,7 +242,12 @@ mod tests {
     #[test]
     fn cache_miss_descriptor_dropped() {
         let mut cache = PlanCache::new(10);
-        cache.put("SELECT 1", dummy_tasks(), versions_for(&[("foo", 1)]));
+        cache.put(
+            "SELECT 1",
+            dummy_tasks(),
+            versions_for(&[("foo", 1)]),
+            OutputSchema::default(),
+        );
         assert!(cache.get("SELECT 1", |_: &DescriptorId| None).is_none());
     }
 
@@ -224,6 +258,7 @@ mod tests {
             "SELECT FROM foo",
             dummy_tasks(),
             versions_for(&[("foo", 1)]),
+            OutputSchema::default(),
         );
         // bar bumps but we only track foo → cache hit still.
         let lookup = version_map(vec![("foo", 1), ("bar", 99)]);
@@ -233,9 +268,24 @@ mod tests {
     #[test]
     fn lru_eviction() {
         let mut cache = PlanCache::new(2);
-        cache.put("SELECT 1", dummy_tasks(), versions_for(&[("a", 1)]));
-        cache.put("SELECT 2", dummy_tasks(), versions_for(&[("b", 1)]));
-        cache.put("SELECT 3", dummy_tasks(), versions_for(&[("c", 1)]));
+        cache.put(
+            "SELECT 1",
+            dummy_tasks(),
+            versions_for(&[("a", 1)]),
+            OutputSchema::default(),
+        );
+        cache.put(
+            "SELECT 2",
+            dummy_tasks(),
+            versions_for(&[("b", 1)]),
+            OutputSchema::default(),
+        );
+        cache.put(
+            "SELECT 3",
+            dummy_tasks(),
+            versions_for(&[("c", 1)]),
+            OutputSchema::default(),
+        );
         assert!(cache.get("SELECT 1", always_v(1)).is_none());
         assert!(cache.get("SELECT 2", always_v(1)).is_some());
         assert!(cache.get("SELECT 3", always_v(1)).is_some());
@@ -244,7 +294,12 @@ mod tests {
     #[test]
     fn clear_empties_cache() {
         let mut cache = PlanCache::new(10);
-        cache.put("SELECT 1", dummy_tasks(), versions_for(&[("foo", 1)]));
+        cache.put(
+            "SELECT 1",
+            dummy_tasks(),
+            versions_for(&[("foo", 1)]),
+            OutputSchema::default(),
+        );
         cache.clear();
         assert!(cache.get("SELECT 1", always_v(1)).is_none());
     }

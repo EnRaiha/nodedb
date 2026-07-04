@@ -9,21 +9,47 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pgwire::api::results::FieldInfo;
+use pgwire::api::results::{FieldFormat, FieldInfo};
 use pgwire::api::stmt::QueryParser;
 use pgwire::api::{ClientInfo, Type};
 use pgwire::error::PgWireResult;
 
+use crate::control::server::response_shape::types::DdlColType;
 use crate::control::state::SharedState;
 
 use super::statement::ParsedStatement;
 use parser_schema::{
-    count_placeholders, fields_from_projection, infer_result_fields, is_dsl_statement,
-    parse_select_projection, result_fields_for_returning, substitute_placeholders_with_null,
+    count_placeholders, is_dsl_statement, result_fields_for_returning,
+    substitute_placeholders_with_null,
 };
 
 #[path = "parser_schema.rs"]
 mod parser_schema;
+
+/// Maps the response shaper's protocol-neutral wire type to a pgwire
+/// `Type` for RowDescription. Mirrors the (now-deleted) SQL-reparse path's
+/// `sql_data_type_to_pg`; variants with no dedicated wire type still fall
+/// back to `Type::TEXT` where that was the prior fallback, matching
+/// today's behavior.
+fn ddl_col_type_to_pg(ty: &DdlColType) -> Type {
+    match ty {
+        DdlColType::Int8 => Type::INT8,
+        DdlColType::Int4 => Type::INT4,
+        DdlColType::Int2 => Type::INT2,
+        DdlColType::Float8 => Type::FLOAT8,
+        DdlColType::Float4 => Type::FLOAT4,
+        DdlColType::Text => Type::TEXT,
+        DdlColType::Bool => Type::BOOL,
+        DdlColType::Bytea => Type::BYTEA,
+        DdlColType::Json => Type::JSON,
+        DdlColType::Jsonb => Type::JSONB,
+        DdlColType::Timestamp => Type::TIMESTAMP,
+        DdlColType::Timestamptz => Type::TIMESTAMPTZ,
+        DdlColType::Varchar => Type::VARCHAR,
+        DdlColType::Float4Array => Type::FLOAT4_ARRAY,
+        DdlColType::Float8Array => Type::FLOAT8_ARRAY,
+    }
+}
 
 /// Implements pgwire's `QueryParser` trait for NodeDB.
 ///
@@ -96,20 +122,31 @@ impl NodeDbQueryParser {
             return (param_types, fields);
         }
 
-        // Infer result fields.
-        //
-        // Prefer the explicit SELECT list from sqlparser: the planner
-        // drops it for PointGet/PointLookup variants, but the projection
-        // the client sees must match what they wrote in the SQL. When
-        // the list is `*` or missing, fall back to the plan's collection
-        // schema.
-        let result_fields = if let Some(projection) = parse_select_projection(&sql_for_inference) {
-            fields_from_projection(&projection, plans.first(), &catalog)
-        } else if let Some(plan) = plans.first() {
-            infer_result_fields(plan, &catalog)
-        } else {
-            Vec::new()
-        };
+        // Infer result fields from the planner's authoritative output
+        // schema — the same derivation used to shape response rows, so
+        // Describe's RowDescription always matches what Execute returns.
+        // Empty `plans` (already handled above) or a plan variant with no
+        // resolvable projection yields an empty `OutputSchema`, matching
+        // today's `Vec::new()` fallback for DSL/non-SELECT statements.
+        let output_schema =
+            crate::control::planner::sql_plan_convert::output_schema::build_output_schema(
+                &plans,
+                &catalog,
+                crate::types::DatabaseId::DEFAULT,
+            );
+        let result_fields: Vec<FieldInfo> = output_schema
+            .columns
+            .iter()
+            .map(|c| {
+                FieldInfo::new(
+                    c.display_name.clone(),
+                    None,
+                    None,
+                    ddl_col_type_to_pg(&c.ty),
+                    FieldFormat::Text,
+                )
+            })
+            .collect();
 
         (param_types, result_fields)
     }

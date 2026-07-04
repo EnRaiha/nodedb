@@ -13,7 +13,7 @@ use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::server::response_shape::compose::shape_decoded_rows;
-use crate::control::server::response_shape::project::ProjectionItem;
+use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::result_stream::ResultStream;
 use crate::data::executor::response_codec::decode_payload_to_json;
 
@@ -95,21 +95,18 @@ pub(crate) fn streaming_multirow_response(stream: ResultStream, limit: usize) ->
 pub(crate) fn streaming_shaped_response(
     stream: ResultStream,
     limit: usize,
-    items: &[ProjectionItem],
+    schema_out: OutputSchema,
 ) -> Response {
     use futures::StreamExt;
 
-    let display_columns: Vec<String> = items
+    let display_columns: Vec<String> = schema_out
+        .columns
         .iter()
-        .filter_map(|i| match i {
-            ProjectionItem::Named { display_name, .. } => Some(display_name.clone()),
-            ProjectionItem::Star => None,
-        })
+        .map(|c| c.display_name.clone())
         .collect();
     let fields: Vec<FieldInfo> = display_columns.iter().map(|n| text_field(n)).collect();
     let schema = Arc::new(fields);
     let row_schema = schema.clone();
-    let items: Vec<ProjectionItem> = items.to_vec();
 
     let row_stream = async_stream::try_stream! {
         let mut emitted: usize = 0;
@@ -136,7 +133,7 @@ pub(crate) fn streaming_shaped_response(
                     format!("failed to decode streamed batch: {e}"),
                 )))
             })?;
-            let shaped = shape_decoded_rows(&value, Some(items.as_slice()));
+            let shaped = shape_decoded_rows(&value, Some(&schema_out));
             for row in &shaped.rows {
                 if emitted >= limit {
                     break;

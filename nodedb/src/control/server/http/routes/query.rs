@@ -17,7 +17,6 @@ use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::identity::{required_permission, role_grants_permission};
-use crate::control::server::response_shape::project::parse_select_projection;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::types::{TraceId, VShardId};
 
@@ -138,7 +137,7 @@ pub async fn query(
         roles: &state.shared.roles,
         permission_cache: Some(&*perm_cache),
     };
-    let (tasks, _output_schema) = state
+    let (tasks, output_schema) = state
         .query_ctx
         .plan_sql_with_rls(&clean_sql, tenant_id, database_id, &sec)
         .await
@@ -150,10 +149,6 @@ pub async fn query(
 
     // Track active request for quota accounting.
     state.shared.tenant_request_start(tenant_id);
-
-    // Parsed once, matching pgwire: drives the protocol-neutral shaping
-    // core's SELECT-list column selection below.
-    let projection = parse_select_projection(sql);
 
     // Execute each task via the SPSC bridge.
     let mut result_rows = Vec::new();
@@ -235,7 +230,7 @@ pub async fn query(
                     payload,
                     &plan_for_shape,
                     plan_kind,
-                    projection.as_deref(),
+                    Some(&output_schema),
                     &state.shared,
                     database_id,
                     tenant_id,
@@ -350,7 +345,7 @@ pub async fn query_ndjson(
         roles: &state.shared.roles,
         permission_cache: Some(&*perm_cache),
     };
-    let (tasks, _output_schema) = match query_ctx
+    let (tasks, output_schema) = match query_ctx
         .plan_sql_with_rls(sql, tenant_id, database_id, &sec)
         .await
     {
@@ -359,11 +354,6 @@ pub async fn query_ndjson(
     };
 
     let trace_id = crate::control::trace_context::generate_trace_id();
-
-    // Parsed once, matching pgwire: drives the protocol-neutral shaping
-    // core's SELECT-list column selection in both the lazy stream below and
-    // the materialized fallback.
-    let projection = parse_select_projection(sql);
 
     // Lazy fast path: an eligible single-task, unordered, multi-row SELECT
     // streams its rows straight off a `ResultStream` as NDJSON lines instead
@@ -378,7 +368,7 @@ pub async fn query_ndjson(
             let body = axum::body::Body::from_stream(super::query_stream::ndjson_body_stream(
                 stream,
                 limit,
-                projection.clone(),
+                Some(output_schema.clone()),
             ));
             return Response::builder()
                 .header("Content-Type", "application/x-ndjson")
@@ -439,7 +429,7 @@ pub async fn query_ndjson(
                         payload,
                         &plan_for_shape,
                         plan_kind,
-                        projection.as_deref(),
+                        Some(&output_schema),
                         &state.shared,
                         database_id,
                         tenant_id,

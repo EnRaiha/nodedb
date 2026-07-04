@@ -20,7 +20,7 @@ use crate::control::server::pgwire::handler::plan::{PlanKind, payload_to_respons
 use crate::control::server::pgwire::handler::shape_encode;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::kv::apply_kv_wrap;
-use crate::control::server::response_shape::project::ProjectionItem;
+use crate::control::server::response_shape::schema::OutputSchema;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -42,7 +42,7 @@ impl NodeDbPgHandler {
         tasks: Vec<PhysicalTask>,
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
-        projection: Option<&[ProjectionItem]>,
+        projection: Option<&OutputSchema>,
     ) -> PgWireResult<Option<Vec<Response>>> {
         // Compute query LSN and wall-ms for the resolver.
         //

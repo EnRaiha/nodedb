@@ -20,7 +20,7 @@ use super::super::plan::{describe_plan, extract_collection, payload_to_response}
 use super::super::shape_encode;
 use super::planning::consistency_for_tasks;
 use super::set_ops;
-use crate::control::server::response_shape::project::{ProjectionItem, parse_select_projection};
+use crate::control::server::response_shape::schema::OutputSchema;
 
 impl NodeDbPgHandler {
     /// Plan and dispatch SQL after quota and DDL checks have passed.
@@ -42,11 +42,11 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
     ) -> PgWireResult<Vec<Response>> {
-        // Parse the SELECT projection list once. Each SELECT-read producer
-        // shapes and projects its own response via the neutral shaping core,
-        // so there is no post-hoc reproject seam here.
-        let items = parse_select_projection(sql);
-        self.execute_planned_sql_inner(identity, sql, tenant_id, addr, &[], items.as_deref())
+        // The planner's authoritative output schema is computed inside
+        // `execute_planned_sql_inner` and used to shape/project every SELECT-read
+        // producer's response via the neutral shaping core, so there is no
+        // post-hoc reproject seam here.
+        self.execute_planned_sql_inner(identity, sql, tenant_id, addr, &[], None)
             .await
     }
 
@@ -58,7 +58,7 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
         params: &[nodedb_sql::ParamValue],
-        projection: Option<&[ProjectionItem]>,
+        projection: Option<&OutputSchema>,
     ) -> PgWireResult<Vec<Response>> {
         self.execute_planned_sql_inner(identity, sql, tenant_id, addr, params, projection)
             .await
@@ -71,15 +71,20 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
         params: &[nodedb_sql::ParamValue],
-        projection: Option<&[ProjectionItem]>,
+        projection: Option<&OutputSchema>,
     ) -> PgWireResult<Vec<Response>> {
-        let (mut tasks, _output_schema, _plan_lease_scope) = self
+        let (mut tasks, output_schema, _plan_lease_scope) = self
             .plan_statement_to_tasks(identity, sql, tenant_id, addr, params)
             .await?;
 
         if tasks.is_empty() {
             return Ok(vec![Response::Execution(Tag::new("OK"))]);
         }
+
+        // An externally-supplied prepared-statement schema (from the Describe
+        // phase) wins; otherwise use the planner's fresh output schema for this
+        // statement.
+        let effective_schema = projection.or(Some(&output_schema));
 
         // Implicit graph-edge extraction: a schemaless document carrying
         // `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task, homed and
@@ -111,7 +116,7 @@ impl NodeDbPgHandler {
         // Returns Some(responses) when clone dispatch is fully handled.
         // Returns None when this is not a cloned collection (fast path).
         if let Some(clone_responses) = self
-            .maybe_dispatch_clone_reads(tasks.clone(), tenant_id, addr, projection)
+            .maybe_dispatch_clone_reads(tasks.clone(), tenant_id, addr, effective_schema)
             .await?
         {
             return Ok(clone_responses);
@@ -168,7 +173,7 @@ impl NodeDbPgHandler {
                 .get_current_database(addr)
                 .unwrap_or(crate::types::DatabaseId::DEFAULT);
             return self
-                .dispatch_tasks_via_gateway(tasks, tenant_id, database_id, projection)
+                .dispatch_tasks_via_gateway(tasks, tenant_id, database_id, effective_schema)
                 .await;
         }
 
@@ -213,7 +218,7 @@ impl NodeDbPgHandler {
             }
         }
 
-        self.dispatch_task_loop(tasks, tenant_id, identity, addr, projection)
+        self.dispatch_task_loop(tasks, tenant_id, identity, addr, effective_schema)
             .await
     }
 
@@ -224,7 +229,7 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         identity: &AuthenticatedIdentity,
         addr: &std::net::SocketAddr,
-        projection: Option<&[ProjectionItem]>,
+        projection: Option<&OutputSchema>,
     ) -> PgWireResult<Vec<Response>> {
         let needs_set_op = tasks.iter().any(|t| t.post_set_op != PostSetOp::None);
         let mut dedup_payloads: Vec<Vec<u8>> = Vec::new();

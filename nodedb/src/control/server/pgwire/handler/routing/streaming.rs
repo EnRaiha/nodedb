@@ -14,7 +14,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use crate::control::server::response_shape::project::{ProjectionItem, needs_projection};
+use crate::control::server::response_shape::schema::OutputSchema;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
@@ -42,7 +42,7 @@ impl NodeDbPgHandler {
         plan_kind: PlanKind,
         post_set_op: PostSetOp,
         addr: &std::net::SocketAddr,
-        projection: Option<&[ProjectionItem]>,
+        projection: Option<&OutputSchema>,
     ) -> PgWireResult<Option<Response>> {
         if post_set_op != PostSetOp::None
             || !matches!(plan_kind, PlanKind::MultiRow)
@@ -107,12 +107,10 @@ impl NodeDbPgHandler {
         //   - `SELECT *`      -> materialize, then id-first column union
         //   - anything else   -> raw single-column envelope passthrough
         let response = match projection {
-            Some(items) if needs_projection(items) => {
-                stream_response::streaming_shaped_response(stream, limit, items)
+            Some(s) if !s.is_star && !s.columns.is_empty() => {
+                stream_response::streaming_shaped_response(stream, limit, s.clone())
             }
-            Some([ProjectionItem::Star]) => {
-                stream_response::streaming_star_response(stream, limit).await
-            }
+            Some(s) if s.is_star => stream_response::streaming_star_response(stream, limit).await,
             _ => stream_response::streaming_multirow_response(stream, limit),
         };
 

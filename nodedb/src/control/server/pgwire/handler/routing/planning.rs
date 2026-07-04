@@ -254,13 +254,9 @@ impl NodeDbPgHandler {
                 output_schema,
                 crate::control::lease::QueryLeaseScope::empty(),
             )
-        } else if let Some((tasks, versions)) = cached_tasks {
+        } else if let Some((tasks, versions, output_schema)) = cached_tasks {
             let scope = self.state.acquire_plan_lease_scope(&versions);
-            (
-                tasks,
-                crate::control::server::response_shape::schema::OutputSchema::default(),
-                scope,
-            )
+            (tasks, output_schema, scope)
         } else {
             let (planned, output_schema, versions) =
                 super::super::retry::retry_on_schema_change(|| async {
@@ -299,8 +295,13 @@ impl NodeDbPgHandler {
             // does not encode the session knob, so caching it would leak a
             // strategy-specific plan into later default queries on this session.
             if !bypass_cache {
-                self.sessions
-                    .put_cached_plan(addr, &clean_sql, planned.clone(), versions);
+                self.sessions.put_cached_plan(
+                    addr,
+                    &clean_sql,
+                    planned.clone(),
+                    versions,
+                    output_schema.clone(),
+                );
             }
             (planned, output_schema, scope)
         };

@@ -13,7 +13,7 @@ use nodedb_types::protocol::{NativeResponse, ResponseStatus};
 
 use crate::control::server::conn_stream::ConnStream;
 use crate::control::server::response_shape::compose::shape_decoded_rows;
-use crate::control::server::response_shape::project::ProjectionItem;
+use crate::control::server::response_shape::schema::OutputSchema;
 use crate::data::executor::response_codec::decode_payload_to_json;
 
 use super::codec::{self, FrameFormat};
@@ -37,7 +37,7 @@ use super::dispatch::{self, SqlStream, to_native_columns_rows};
 /// produced for an undecodable batch.
 fn decode_batch_to_columns_rows(
     json_text: &str,
-    projection: Option<&[ProjectionItem]>,
+    projection: Option<&OutputSchema>,
 ) -> (Vec<String>, Vec<Vec<Value>>) {
     match sonic_rs::from_str::<serde_json::Value>(json_text) {
         Ok(decoded) => {
@@ -94,8 +94,7 @@ pub(super) async fn emit_sql_stream(
         last_lsn = batch.watermark_lsn.as_u64();
 
         let json_text = decode_payload_to_json(&batch.payload);
-        let (cols, mut batch_rows) =
-            decode_batch_to_columns_rows(&json_text, projection.as_deref());
+        let (cols, mut batch_rows) = decode_batch_to_columns_rows(&json_text, projection.as_ref());
         if batch_rows.is_empty() {
             continue;
         }

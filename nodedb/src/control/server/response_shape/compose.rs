@@ -31,9 +31,8 @@ use crate::data::executor::response_codec::{
 use nodedb_types::{DatabaseId, NodeDbError, TenantId};
 
 use super::kv::apply_kv_wrap;
-use super::project::{
-    ProjectionItem, lookup_keys_for_projection, needs_projection, push_flat_rows,
-};
+use super::project::push_flat_rows;
+use super::schema::OutputSchema;
 use super::types::{PlanKind, ShapedRows};
 
 /// NOTICE text for an `AS OF SYSTEM TIME` cutoff older than the oldest
@@ -62,7 +61,7 @@ pub fn shape_response_materialized(
     payload: &[u8],
     plan: &PhysicalPlan,
     plan_kind: PlanKind,
-    projection: Option<&[ProjectionItem]>,
+    projection: Option<&OutputSchema>,
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: TenantId,
@@ -105,7 +104,7 @@ pub fn shape_response_materialized(
 pub fn shape_payload_no_plan(
     payload: &[u8],
     plan_kind: PlanKind,
-    projection: Option<&[ProjectionItem]>,
+    projection: Option<&OutputSchema>,
 ) -> ShapeOutcome {
     match plan_kind {
         PlanKind::Execution | PlanKind::DmlResult(_) => ShapeOutcome::Passthrough,
@@ -211,7 +210,7 @@ fn shape_returning_rows(payload: &[u8]) -> ShapedRows {
 ///
 /// Non-JSON scalar payloads (undecodable envelope) fall back to a single
 /// "result" column, matching pgwire's single-row fallback.
-fn shape_generic_rows(payload: &[u8], projection: Option<&[ProjectionItem]>) -> ShapedRows {
+fn shape_generic_rows(payload: &[u8], projection: Option<&OutputSchema>) -> ShapedRows {
     if payload.is_empty() {
         return empty_shaped();
     }
@@ -235,23 +234,15 @@ fn shape_generic_rows(payload: &[u8], projection: Option<&[ProjectionItem]>) -> 
 /// `emit_sql_stream`) call directly, since a streamed scan batch has no plan
 /// to KV-wrap or vector-translate but still needs the same envelope-unwrap +
 /// projection logic applied per batch.
-pub fn shape_decoded_rows(
-    decoded: &JsonValue,
-    projection: Option<&[ProjectionItem]>,
-) -> ShapedRows {
+pub fn shape_decoded_rows(decoded: &JsonValue, projection: Option<&OutputSchema>) -> ShapedRows {
     let mut rows = Vec::new();
     push_flat_rows(decoded.clone(), &mut rows);
 
     match projection {
-        Some(items) if needs_projection(items) => {
-            let lookup_keys = lookup_keys_for_projection(items);
-            let display_names: Vec<String> = items
-                .iter()
-                .filter_map(|i| match i {
-                    ProjectionItem::Named { display_name, .. } => Some(display_name.clone()),
-                    ProjectionItem::Star => None,
-                })
-                .collect();
+        Some(s) if !s.is_star && !s.columns.is_empty() => {
+            let lookup_keys: Vec<String> = s.columns.iter().map(|c| c.lookup_key.clone()).collect();
+            let display_names: Vec<String> =
+                s.columns.iter().map(|c| c.display_name.clone()).collect();
             let projected_rows = rows
                 .iter()
                 .map(|row| project_row(row, &lookup_keys, &display_names))

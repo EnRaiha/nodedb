@@ -12,7 +12,7 @@
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
-use crate::control::server::response_shape::project::ProjectionItem;
+use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::PlanKind;
 use crate::control::state::SharedState;
 use nodedb_types::{DatabaseId, NodeDbError, TenantId};
@@ -33,7 +33,7 @@ pub(super) fn shape_http_payload(
     payload: &[u8],
     plan: &PhysicalPlan,
     plan_kind: PlanKind,
-    projection: Option<&[ProjectionItem]>,
+    projection: Option<&OutputSchema>,
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: TenantId,

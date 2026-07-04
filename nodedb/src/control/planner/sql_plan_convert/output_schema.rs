@@ -22,8 +22,8 @@ use crate::control::server::response_shape::types::DdlColType;
 /// Maps one `Projection` entry to an `OutputColumn`, given a map of bare
 /// column name -> resolved wire type for the collection in scope.
 ///
-/// Mirrors `response_shape::project::expr_column_names`'s derivation rule:
-/// for a qualified `table.column` reference, `lookup_key` keeps the full
+/// This is the authoritative derivation rule (see also `schema_from_projection`
+/// in this module): for a qualified `table.column` reference, `lookup_key` keeps the full
 /// dot-joined form (the join executor prefixes every key with its source
 /// collection name) while `display_name` is the last segment. For a bare
 /// column both are identical.
@@ -51,11 +51,27 @@ fn projection_to_column(
                 ty,
             })
         }
-        Projection::Computed { alias, .. } => Some(OutputColumn {
-            display_name: alias.clone(),
-            lookup_key: alias.clone(),
-            ty: DdlColType::Text,
-        }),
+        Projection::Computed { expr, alias } => {
+            // For an aliased column reference (`o.id AS oid`) the Data Plane
+            // keys the value by the underlying column, not the alias — so the
+            // lookup_key must be the qualified expression (matching the join
+            // executor's prefixed keys) while the alias is only the display
+            // name. A genuine computed expression (`price * qty AS total`) is
+            // emitted by the executor under its alias, so that stays the key.
+            let lookup_key = match expr {
+                SqlExpr::Column {
+                    table: Some(t),
+                    name,
+                } => format!("{t}.{name}"),
+                SqlExpr::Column { table: None, name } => name.clone(),
+                _ => alias.clone(),
+            };
+            Some(OutputColumn {
+                display_name: alias.clone(),
+                lookup_key,
+                ty: DdlColType::Text,
+            })
+        }
         Projection::Star | Projection::QualifiedStar(_) => None,
     }
 }
@@ -110,17 +126,55 @@ fn group_by_key_column(expr: &SqlExpr, index: usize) -> OutputColumn {
     }
 }
 
+/// Returns the collection's columns in declared catalog order, mapped to
+/// `OutputColumn`s (`display_name` = `lookup_key` = column name). Returns an
+/// empty `Vec` when the catalog/collection lookup fails or the collection has
+/// no declared columns (e.g. a schemaless collection) — so a schemaless
+/// `SELECT *` still yields empty columns, deriving its shape from the rows.
+fn ordered_columns_for<C: SqlCatalog>(
+    catalog: &C,
+    database_id: nodedb_types::DatabaseId,
+    collection: &str,
+) -> Vec<OutputColumn> {
+    match catalog.get_collection(database_id, collection) {
+        Ok(Some(info)) => info
+            .columns
+            .iter()
+            .map(|c| OutputColumn {
+                display_name: c.name.clone(),
+                lookup_key: c.name.clone(),
+                ty: sql_data_type_to_ddl_col_type(&c.data_type),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Maps a projection list to an `OutputSchema` fragment using `types`.
+///
+/// A `Star` / `QualifiedStar` in the projection sets `is_star` and expands
+/// into `ordered_cols` (the collection's catalog columns in declared order),
+/// appending only entries not already produced by a named projection. When
+/// the projection has no star, `ordered_cols` is ignored and behavior is the
+/// named-columns-only, `is_star=false` case.
 fn schema_from_projection(
     projection: &[Projection],
     types: &HashMap<String, DdlColType>,
+    ordered_cols: &[OutputColumn],
 ) -> OutputSchema {
     let mut columns = Vec::with_capacity(projection.len());
     let mut is_star = false;
     for p in projection {
         match projection_to_column(p, types) {
             Some(col) => columns.push(col),
-            None => is_star = true,
+            None => {
+                is_star = true;
+                for oc in ordered_cols {
+                    if !columns.iter().any(|c| c.lookup_key == oc.lookup_key) {
+                        columns.push(oc.clone());
+                    }
+                }
+            }
         }
     }
     OutputSchema { columns, is_star }
@@ -163,16 +217,58 @@ pub fn build_output_schema<C: SqlCatalog>(
             collection,
             projection,
             ..
+        }
+        | SqlPlan::PointGet {
+            collection,
+            projection,
+            ..
+        }
+        | SqlPlan::RangeScan {
+            collection,
+            projection,
+            ..
+        }
+        | SqlPlan::RecursiveScan {
+            collection,
+            projection,
+            ..
+        }
+        | SqlPlan::VectorSearch {
+            collection,
+            projection,
+            ..
+        }
+        | SqlPlan::MultiVectorSearch {
+            collection,
+            projection,
+            ..
+        }
+        | SqlPlan::TextSearch {
+            collection,
+            projection,
+            ..
+        }
+        | SqlPlan::HybridSearch {
+            collection,
+            projection,
+            ..
+        }
+        | SqlPlan::HybridSearchTriple {
+            collection,
+            projection,
+            ..
         } => {
             let types = column_types_for(catalog, database_id, collection);
-            schema_from_projection(projection, &types)
+            let ordered_cols = ordered_columns_for(catalog, database_id, collection);
+            schema_from_projection(projection, &types, &ordered_cols)
         }
         SqlPlan::Join { projection, .. } => {
             // A join has no single source collection; column types default
             // to `Text` for every projected field rather than picking one
-            // side arbitrarily.
+            // side arbitrarily. A star here has no single catalog to expand
+            // against, so no ordered columns are supplied.
             let types = HashMap::new();
-            schema_from_projection(projection, &types)
+            schema_from_projection(projection, &types, &[])
         }
         SqlPlan::ConstantResult { columns, .. } => OutputSchema {
             columns: columns
@@ -198,19 +294,16 @@ pub fn build_output_schema<C: SqlCatalog>(
                 // `AggregateExpr::alias` is always populated by the planner:
                 // either the user's explicit alias, or (for unnamed
                 // projections) the lowercased unparsed expression text —
-                // e.g. `count(*)` — matching
-                // `response_shape::project::expr_column_names`'s own
+                // e.g. `count(*)` — matching this module's own
                 // lowercasing of non-column expressions. So the alias is
                 // already the canonical name; no separate derivation needed.
-                let ty = if agg.function.eq_ignore_ascii_case("count") {
-                    DdlColType::Int8
-                } else {
-                    DdlColType::Text
-                };
+                // All aggregate result values currently ship as TEXT (typed
+                // OIDs are a separately-parked change); advertising a numeric
+                // type here would break clients reading the column as a string.
                 columns.push(OutputColumn {
                     display_name: agg.alias.clone(),
                     lookup_key: agg.alias.clone(),
-                    ty,
+                    ty: DdlColType::Text,
                 });
             }
             OutputSchema {
@@ -246,9 +339,10 @@ pub fn build_output_schema<C: SqlCatalog>(
         SqlPlan::LateralTopK { projection, .. } | SqlPlan::LateralLoop { projection, .. } => {
             // No single source collection spans both outer and inner rows;
             // default every projected field to `Text` rather than picking
-            // one side's catalog arbitrarily.
+            // one side's catalog arbitrarily. A star has no single catalog to
+            // expand against, so no ordered columns are supplied.
             let types = HashMap::new();
-            schema_from_projection(projection, &types)
+            schema_from_projection(projection, &types, &[])
         }
         SqlPlan::ArraySlice {
             attr_projection, ..
@@ -266,18 +360,40 @@ pub fn build_output_schema<C: SqlCatalog>(
                 .collect(),
             is_star: false,
         },
-        // `Merge` carries no output projection (it reports affected-row
-        // counts, optionally with `RETURNING`, which isn't a static column
-        // list on the plan) and `ArrayAgg` / `ArrayElementwise` compute a
-        // single synthesized value column with no name carried on the plan
-        // either; both are left to a later unit rather than guessed here.
-        //
-        // Other plan variants (VectorSearch, HybridSearch, Match, etc.) are
-        // handled by later units in this effort.
-        _ => OutputSchema {
-            columns: Vec::new(),
-            is_star: false,
-        },
+        // Writes / DDL: no output rows, nothing to shape.
+        SqlPlan::Insert { .. }
+        | SqlPlan::KvInsert { .. }
+        | SqlPlan::Upsert { .. }
+        | SqlPlan::Update { .. }
+        | SqlPlan::UpdateFrom { .. }
+        | SqlPlan::Delete { .. }
+        | SqlPlan::Truncate { .. }
+        | SqlPlan::TimeseriesIngest { .. }
+        | SqlPlan::InsertSelect { .. }
+        | SqlPlan::CreateArray { .. }
+        | SqlPlan::DropArray { .. }
+        | SqlPlan::AlterArray { .. }
+        | SqlPlan::InsertArray { .. }
+        | SqlPlan::DeleteArray { .. }
+        | SqlPlan::VectorPrimaryInsert { .. }
+        | SqlPlan::CreateIndex { .. }
+        | SqlPlan::DropIndex { .. }
+        | SqlPlan::ArrayFlush { .. }
+        | SqlPlan::ArrayCompact { .. } => OutputSchema::default(),
+        // `Merge` (with or without RETURNING) and `Update`/`UpdateFrom` with
+        // `returning: true` are shaped downstream via
+        // `PlanKind::ReturningRows` -> `shape_returning_rows`, which reads
+        // column names/values directly out of the response payload
+        // (`RowsPayload` msgpack) and never consults `OutputSchema`. An
+        // empty schema here is therefore correct, not a placeholder.
+        SqlPlan::Merge { .. } => OutputSchema::default(),
+        // `ArrayAgg` / `ArrayElementwise` compile to `ArrayOp::Aggregate` /
+        // `ArrayOp::Elementwise`, which `describe_plan` classifies as
+        // `PlanKind::MultiRow`. `MultiRow` responses are shaped by
+        // `shape_generic_rows` -> `shape_decoded_rows`, which derives column
+        // names from the decoded JSON payload itself, not from
+        // `OutputSchema`. An empty schema here is therefore correct.
+        SqlPlan::ArrayAgg { .. } | SqlPlan::ArrayElementwise { .. } => OutputSchema::default(),
     }
 }
 
@@ -421,7 +537,7 @@ mod tests {
         assert_eq!(schema.columns[1].ty, DdlColType::Text);
         assert_eq!(schema.columns[2].display_name, "count(*)");
         assert_eq!(schema.columns[2].lookup_key, "count(*)");
-        assert_eq!(schema.columns[2].ty, DdlColType::Int8);
+        assert_eq!(schema.columns[2].ty, DdlColType::Text);
         assert!(!schema.is_star);
     }
 
@@ -456,5 +572,96 @@ mod tests {
         assert_eq!(schema.columns[0].lookup_key, "n");
         assert_eq!(schema.columns[0].ty, DdlColType::Text);
         assert!(!schema.is_star);
+    }
+
+    /// Shared projection for the leaf-variant tests below: a bare `id`
+    /// column plus a computed `dist` alias.
+    fn id_and_dist_projection() -> Vec<Projection> {
+        vec![
+            Projection::Column("id".to_string()),
+            Projection::Computed {
+                expr: SqlExpr::Wildcard,
+                alias: "dist".to_string(),
+            },
+        ]
+    }
+
+    fn assert_id_and_dist_schema(schema: &OutputSchema) {
+        assert_eq!(schema.columns.len(), 2);
+        assert_eq!(schema.columns[0].display_name, "id");
+        assert_eq!(schema.columns[0].lookup_key, "id");
+        assert_eq!(schema.columns[0].ty, DdlColType::Text);
+        assert_eq!(schema.columns[1].display_name, "dist");
+        assert_eq!(schema.columns[1].lookup_key, "dist");
+        assert_eq!(schema.columns[1].ty, DdlColType::Text);
+        assert!(!schema.is_star);
+    }
+
+    #[test]
+    fn point_get_uses_its_own_projection() {
+        let plans = vec![SqlPlan::PointGet {
+            collection: "users".to_string(),
+            alias: None,
+            engine: nodedb_sql::types::query::EngineType::DocumentSchemaless,
+            key_column: "id".to_string(),
+            key_value: nodedb_sql::types_expr::SqlValue::Null,
+            projection: id_and_dist_projection(),
+        }];
+        let schema = build_output_schema(&plans, &NoCatalog, nodedb_types::DatabaseId::DEFAULT);
+        assert_id_and_dist_schema(&schema);
+    }
+
+    #[test]
+    fn vector_search_uses_its_own_projection() {
+        let plans = vec![SqlPlan::VectorSearch {
+            collection: "docs".to_string(),
+            field: "embedding".to_string(),
+            query_vector: vec![0.0, 1.0],
+            top_k: 10,
+            ef_search: 64,
+            metric: nodedb_sql::types::DistanceMetric::L2,
+            filters: Vec::new(),
+            array_prefilter: None,
+            ann_options: nodedb_sql::types::VectorAnnOptions::default(),
+            skip_payload_fetch: false,
+            payload_filters: Vec::new(),
+            projection: id_and_dist_projection(),
+        }];
+        let schema = build_output_schema(&plans, &NoCatalog, nodedb_types::DatabaseId::DEFAULT);
+        assert_id_and_dist_schema(&schema);
+    }
+
+    #[test]
+    fn hybrid_search_uses_its_own_projection() {
+        let plans = vec![SqlPlan::HybridSearch {
+            collection: "docs".to_string(),
+            query_vector: vec![0.0, 1.0],
+            query_text: "hello".to_string(),
+            top_k: 10,
+            ef_search: 64,
+            vector_weight: 0.5,
+            fuzzy: false,
+            score_alias: None,
+            projection: id_and_dist_projection(),
+        }];
+        let schema = build_output_schema(&plans, &NoCatalog, nodedb_types::DatabaseId::DEFAULT);
+        assert_id_and_dist_schema(&schema);
+    }
+
+    #[test]
+    fn text_search_uses_its_own_projection() {
+        let plans = vec![SqlPlan::TextSearch {
+            collection: "docs".to_string(),
+            query: nodedb_sql::types::FtsQuery::Plain {
+                text: "hello".to_string(),
+                fuzzy: false,
+            },
+            top_k: 10,
+            filters: Vec::new(),
+            score_alias: None,
+            projection: id_and_dist_projection(),
+        }];
+        let schema = build_output_schema(&plans, &NoCatalog, nodedb_types::DatabaseId::DEFAULT);
+        assert_id_and_dist_schema(&schema);
     }
 }

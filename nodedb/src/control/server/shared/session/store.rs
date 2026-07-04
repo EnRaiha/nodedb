@@ -70,9 +70,10 @@ impl SessionStore {
     /// (or `None` if dropped). The cache returns a hit only
     /// when every recorded `(id, version)` pair still matches.
     ///
-    /// On a hit returns both the cached tasks and the
-    /// `DescriptorVersionSet` they were built against — the
-    /// caller passes the set into
+    /// On a hit returns the cached tasks, the
+    /// `DescriptorVersionSet` they were built against, and the
+    /// `OutputSchema` they were compiled with — the caller
+    /// passes the version set into
     /// `SharedState::acquire_plan_lease_scope` so cache hits
     /// and fresh plans share the same lease-acquisition path.
     pub fn get_cached_plan<F>(
@@ -83,6 +84,7 @@ impl SessionStore {
     ) -> Option<(
         Vec<nodedb_physical::physical_task::PhysicalTask>,
         crate::control::planner::descriptor_set::DescriptorVersionSet,
+        crate::control::server::response_shape::schema::OutputSchema,
     )>
     where
         F: Fn(&nodedb_cluster::DescriptorId) -> Option<u64>,
@@ -94,18 +96,19 @@ impl SessionStore {
     }
 
     /// Store compiled physical tasks in the session's plan
-    /// cache along with the descriptor version set they were
-    /// built against.
+    /// cache along with the descriptor version set and output
+    /// schema they were built against.
     pub fn put_cached_plan(
         &self,
         addr: &SocketAddr,
         sql: &str,
         tasks: Vec<nodedb_physical::physical_task::PhysicalTask>,
         versions: crate::control::planner::descriptor_set::DescriptorVersionSet,
+        output_schema: crate::control::server::response_shape::schema::OutputSchema,
     ) {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
         if let Some(session) = sessions.get_mut(addr) {
-            session.plan_cache.put(sql, tasks, versions);
+            session.plan_cache.put(sql, tasks, versions, output_schema);
         }
     }
 

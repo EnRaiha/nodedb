@@ -11,7 +11,7 @@ use nodedb_types::value::Value;
 
 use crate::bridge::envelope::{Response, Status};
 use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
-use crate::control::server::response_shape::project::parse_select_projection;
+use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::session::TransactionState;
 use crate::types::DatabaseId;
@@ -40,14 +40,9 @@ pub(super) async fn run_dispatch_loop(
     ctx: &DispatchCtx<'_>,
     seq: u64,
     tasks: Vec<PhysicalTask>,
-    sql: &str,
+    output_schema: Option<&OutputSchema>,
     database_id: DatabaseId,
 ) -> SqlOutcome {
-    // Parsed once, up front — mirrors pgwire's `execute_planned_sql`, which
-    // parses the SELECT projection list once per statement and applies it to
-    // every task's response.
-    let projection = parse_select_projection(sql);
-
     let mut all_columns: Option<Vec<String>> = None;
     let mut all_rows: Vec<Vec<Value>> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -107,7 +102,7 @@ pub(super) async fn run_dispatch_loop(
                 &task_resp.payload,
                 &plan_for_response,
                 plan_kind,
-                projection.as_deref(),
+                output_schema,
                 ctx.state,
                 database_id,
                 ctx.tenant_id(),

@@ -9,7 +9,7 @@ use pgwire::api::results::Response;
 use nodedb_physical::physical_task::PostSetOp;
 
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
-use crate::control::server::response_shape::project::ProjectionItem;
+use crate::control::server::response_shape::schema::OutputSchema;
 
 use super::super::plan::{PlanKind, payload_to_response};
 use super::super::shape_encode;
@@ -19,7 +19,7 @@ use super::super::shape_encode;
 pub(super) fn apply_set_ops(
     dedup_payloads: &[Vec<u8>],
     dedup_set_op: PostSetOp,
-    projection: Option<&[ProjectionItem]>,
+    projection: Option<&OutputSchema>,
 ) -> (Response, Option<String>) {
     let merged = match dedup_set_op {
         PostSetOp::Intersect | PostSetOp::IntersectAll => {
