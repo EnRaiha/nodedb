@@ -90,6 +90,7 @@ mod tests {
                 if_absent: false,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }
     }
 
@@ -113,6 +114,7 @@ mod tests {
                 prefilter: None,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }
     }
 

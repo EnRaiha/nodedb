@@ -24,6 +24,7 @@ fn doc_insert_task(vshard: u32) -> PhysicalTask {
             if_absent: false,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn scan_task(vshard: u32) -> PhysicalTask {
             prefilter: None,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }
 }
 
@@ -64,6 +66,7 @@ fn bulk_update_task(vshard: u32) -> PhysicalTask {
             ollp_predicted_edges: None,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }
 }
 

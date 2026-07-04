@@ -54,5 +54,6 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_spatial_scan(
             prefilter: None,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }

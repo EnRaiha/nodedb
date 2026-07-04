@@ -247,6 +247,7 @@ fn build_scan_task(
             valid_at_ms: None,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }
 }
 

@@ -186,6 +186,7 @@ mod tests {
             database_id: crate::types::DatabaseId::DEFAULT,
             plan: PhysicalPlan::Meta(MetaOp::Checkpoint),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]
     }
 

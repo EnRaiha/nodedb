@@ -54,6 +54,7 @@ pub(super) async fn dispatch_local(
         user_roles: Vec::new(),
         user_id: None,
         statement_digest: None,
+        txn_id: None,
     };
     let mut rx = state.tracker.register(req_id);
     match state.dispatcher.lock() {

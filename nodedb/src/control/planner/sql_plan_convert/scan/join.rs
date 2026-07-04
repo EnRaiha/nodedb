@@ -236,5 +236,6 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
         database_id: p.ctx.database_id,
         plan,
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }

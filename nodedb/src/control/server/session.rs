@@ -714,6 +714,7 @@ impl Session {
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         };
 
         // Register for response routing before dispatching.

@@ -73,6 +73,7 @@ pub(super) async fn push_edge_delete(
             dst_surrogate,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     });
     Ok(())
 }
@@ -141,6 +142,7 @@ pub(super) async fn push_edge_put(
             dst_surrogate,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     });
     Ok(())
 }

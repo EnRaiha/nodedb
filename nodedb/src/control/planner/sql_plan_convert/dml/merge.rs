@@ -66,6 +66,7 @@ pub(in super::super) fn convert_merge(
             returning: None,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 

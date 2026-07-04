@@ -101,6 +101,7 @@ pub(crate) fn convert_slice(
         database_id: ctx.database_id,
         plan,
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 

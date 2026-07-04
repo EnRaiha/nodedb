@@ -66,6 +66,7 @@ pub(in super::super) fn convert_update(
                     updates: field_updates,
                 }),
                 post_set_op: PostSetOp::None,
+                txn_id: None,
             });
         }
         return Ok(tasks);
@@ -108,6 +109,7 @@ pub(in super::super) fn convert_update(
                 updates: columnar_updates,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -156,6 +158,7 @@ pub(in super::super) fn convert_update(
                 ollp_predicted_edges: None,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -184,6 +187,7 @@ pub(in super::super) fn convert_update(
                     returning: None,
                 }),
                 post_set_op: PostSetOp::None,
+                txn_id: None,
             });
         }
         Ok(tasks)
@@ -218,6 +222,7 @@ pub(in super::super) fn convert_update(
                 ollp_predicted_edges: None,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }])
     }
 }
@@ -245,6 +250,7 @@ pub(in super::super) fn convert_delete(
                 keys,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -272,6 +278,7 @@ pub(in super::super) fn convert_delete(
                 ollp_predicted_edges: None,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -299,6 +306,7 @@ pub(in super::super) fn convert_delete(
                     returning: None,
                 }),
                 post_set_op: PostSetOp::None,
+                txn_id: None,
             });
         }
         Ok(tasks)
@@ -316,6 +324,7 @@ pub(in super::super) fn convert_delete(
                 ollp_predicted_edges: None,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }])
     }
 }
@@ -445,6 +454,7 @@ pub(in super::super) fn convert_update_from(
             returning: None,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 

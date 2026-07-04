@@ -231,6 +231,7 @@ mod tests {
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         })
     }
 
@@ -413,6 +414,7 @@ mod tests {
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         };
         tx.try_push(BridgeRequest { inner: req }).unwrap();
         // Set suspend flag.
@@ -453,6 +455,7 @@ mod tests {
                 user_roles: Vec::new(),
                 user_id: None,
                 statement_digest: None,
+                txn_id: None,
             };
             tx.try_push(BridgeRequest { inner: req }).unwrap();
         }

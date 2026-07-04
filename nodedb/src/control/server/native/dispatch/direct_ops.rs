@@ -73,6 +73,7 @@ pub(crate) async fn handle_direct_op(
         database_id: DatabaseId::DEFAULT,
         plan,
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }];
     if let Err(e) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
         ctx.state,

@@ -162,6 +162,7 @@ pub(in super::super) fn convert_create_array(
             prefix_bits,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -222,6 +223,7 @@ pub(in super::super) fn convert_drop_array(
         database_id: ctx.database_id,
         plan: PhysicalPlan::Array(ArrayOp::DropArray { array_id: aid }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 

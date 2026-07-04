@@ -30,6 +30,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_recursive_scan(
             limit: *p.limit,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -53,5 +54,6 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_recursive_value(
             distinct: *p.distinct,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }

@@ -54,6 +54,7 @@ impl TestClusterNode {
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         };
 
         // Register for response routing before dispatching, then submit through
@@ -122,6 +123,7 @@ impl TestClusterNode {
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         };
 
         let mut rx = self.shared.tracker.register(request_id);

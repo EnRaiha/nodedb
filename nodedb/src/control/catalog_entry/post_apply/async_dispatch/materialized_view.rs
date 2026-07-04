@@ -49,6 +49,7 @@ pub async fn delete_async(tenant_id: u64, name: String, shared: Arc<SharedState>
                 user_roles: Vec::new(),
                 user_id: None,
                 statement_digest: None,
+                txn_id: None,
             };
             let rx = shared.tracker.register(request_id);
             if d.dispatch_to_core(core_id, request).is_err() {

@@ -169,6 +169,7 @@ pub async fn insert_edge(
             database_id,
             plan: PhysicalPlan::Graph(edge_put),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         };
         let tx_class = build_static_tx_class(&[task], tenant_id)
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
@@ -283,6 +284,7 @@ pub async fn delete_edge(
             database_id,
             plan: PhysicalPlan::Graph(edge_delete),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         };
         let tx_class = build_static_tx_class(&[task], tenant_id)
             .map_err(|e| ddl_err("XX000", e.to_string()))?;

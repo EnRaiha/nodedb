@@ -83,6 +83,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
             valid_at_ms: valid_at_from_scope(temporal),
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -134,5 +135,6 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(
             provenance: None,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }

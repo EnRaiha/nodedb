@@ -270,6 +270,7 @@ mod tests {
             user_roles: vec![],
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         })
     }
 

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::types::{DatabaseId, Lsn, TenantId};
+use crate::types::{DatabaseId, Lsn, TenantId, TxnId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 /// PostgreSQL transaction state for ReadyForQuery status byte.
@@ -64,6 +64,10 @@ pub struct ConnSession {
     /// All reads within the transaction see data as of this LSN.
     /// Concurrent writes after this point are invisible to the transaction.
     pub tx_snapshot_lsn: Option<Lsn>,
+    /// Identity of the current session transaction block, minted on `BEGIN`
+    /// and cleared on `COMMIT`/`ROLLBACK`. Keys the per-transaction staging
+    /// overlay. `None` outside a transaction block.
+    pub tx_id: Option<TxnId>,
     /// Read-set: (collection, document_id, read_lsn) tuples for write
     /// conflict detection. At COMMIT, each entry is checked — if the
     /// document's current LSN > read_lsn, a concurrent write occurred
@@ -139,6 +143,7 @@ impl ConnSession {
             parameters,
             tx_buffer: Vec::new(),
             tx_snapshot_lsn: None,
+            tx_id: None,
             tx_read_set: Vec::new(),
             savepoints: Vec::new(),
             pending_offset_commits: Vec::new(),

@@ -66,6 +66,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
                 distinct: *distinct,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -169,6 +170,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
         database_id,
         plan: physical,
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -209,6 +211,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_document_index_look
         database_id,
         plan: physical,
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -311,5 +314,6 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_point_get(
         database_id: ctx.database_id,
         plan: physical,
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }

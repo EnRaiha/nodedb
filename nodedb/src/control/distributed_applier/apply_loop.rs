@@ -51,6 +51,7 @@ fn build_request(
         user_roles: Vec::new(),
         user_id: None,
         statement_digest: None,
+        txn_id: None,
     }
 }
 

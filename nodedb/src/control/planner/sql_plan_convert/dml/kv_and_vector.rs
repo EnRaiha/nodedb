@@ -84,6 +84,7 @@ pub(in super::super) fn convert_kv_insert(
             database_id: ctx.database_id,
             plan: PhysicalPlan::Kv(op),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         });
     }
     Ok(tasks)
@@ -153,6 +154,7 @@ pub(in super::super) fn convert_vector_primary_insert(
                 payload_indexes: cfg.payload_indexes.to_vec(),
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         });
     }
     Ok(tasks)

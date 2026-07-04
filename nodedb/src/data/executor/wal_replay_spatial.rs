@@ -53,6 +53,7 @@ impl CoreLoop {
                 user_roles: Vec::new(),
                 user_id: None,
                 statement_digest: None,
+                txn_id: None,
             },
             state: TaskState::Running,
         }

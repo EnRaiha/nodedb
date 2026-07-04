@@ -233,12 +233,14 @@ impl NodeDbPgHandler {
         user_id: Option<Arc<str>>,
     ) -> crate::Result<Response> {
         self.wal_append_if_write(task.tenant_id, task.vshard_id, task.database_id, &task.plan)?;
+        let txn_id = task.txn_id;
         self.submit_to_data_plane(
             task.tenant_id,
             task.vshard_id,
             task.database_id,
             task.plan,
             user_id,
+            txn_id,
         )
         .await
     }
@@ -271,12 +273,14 @@ impl NodeDbPgHandler {
                 database_id: task.database_id,
             });
         }
+        let txn_id = task.txn_id;
         self.submit_to_data_plane(
             task.tenant_id,
             task.vshard_id,
             task.database_id,
             task.plan,
             user_id,
+            txn_id,
         )
         .await
     }
@@ -290,6 +294,7 @@ impl NodeDbPgHandler {
         database_id: DatabaseId,
         plan: crate::bridge::envelope::PhysicalPlan,
         user_id: Option<Arc<str>>,
+        txn_id: Option<crate::types::TxnId>,
     ) -> crate::Result<Response> {
         let request_id = self.next_request_id();
         let request = Request {
@@ -308,6 +313,7 @@ impl NodeDbPgHandler {
             user_roles: Vec::new(),
             user_id,
             statement_digest: None,
+            txn_id,
         };
 
         let mut rx = self.state.tracker.register(request_id);

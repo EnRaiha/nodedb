@@ -114,6 +114,7 @@ pub async fn append_implicit_edge_tasks(
                 dst_surrogate,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         });
     }
 

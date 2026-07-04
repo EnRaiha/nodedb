@@ -111,6 +111,7 @@ pub(crate) async fn handle_commit(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResp
                     database_id: DatabaseId::DEFAULT,
                     plan: batch_plan,
                     post_set_op: PostSetOp::None,
+                    txn_id: None,
                 };
                 match dispatch_utils::dispatch_to_data_plane(
                     ctx.state,

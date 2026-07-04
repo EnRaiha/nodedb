@@ -172,5 +172,6 @@ pub(super) fn convert_alter_array(
             minimum_audit_retain_ms: minimum_audit_retain_ms.map(Some),
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }

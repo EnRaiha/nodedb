@@ -36,5 +36,6 @@ pub(crate) fn convert_project(
             attr_indices,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }

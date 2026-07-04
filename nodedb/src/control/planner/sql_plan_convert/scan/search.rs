@@ -52,6 +52,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_vector_search(
             payload_filters,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -183,6 +184,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_text_search(
                     rls_filters: Vec::new(),
                 }),
                 post_set_op: PostSetOp::None,
+                txn_id: None,
             }]);
         }
         return Ok(vec![PhysicalTask {
@@ -196,6 +198,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_text_search(
                 prefilter: None,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -236,6 +239,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_text_search(
         database_id,
         plan: PhysicalPlan::Text(op),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -274,6 +278,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_hybrid_search(
             score_alias: score_alias.map(|s| s.to_string()),
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -318,5 +323,6 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_hybrid_search_tripl
             score_alias: score_alias.map(|s| s.to_string()),
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }

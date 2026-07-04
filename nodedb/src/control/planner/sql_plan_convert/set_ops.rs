@@ -47,6 +47,7 @@ pub(super) fn convert_constant_result(
             distinct: false,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -68,6 +69,7 @@ pub(super) fn convert_truncate(
             restart_identity,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -195,6 +197,7 @@ pub(super) fn convert_insert_select(
             source_limit: limit.unwrap_or(10_000),
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 

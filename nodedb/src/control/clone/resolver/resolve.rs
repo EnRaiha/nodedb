@@ -179,6 +179,7 @@ pub fn resolve_read(
                     database_id: src_db_id,
                     plan: source_plan,
                     post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+                    txn_id: None,
                 };
                 this_level_tasks.push(task);
             }

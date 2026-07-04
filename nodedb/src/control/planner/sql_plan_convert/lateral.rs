@@ -65,6 +65,7 @@ pub(super) fn convert_lateral_top_k(
             left_join,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -113,6 +114,7 @@ pub(super) fn convert_lateral_loop(
             outer_row_cap,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 

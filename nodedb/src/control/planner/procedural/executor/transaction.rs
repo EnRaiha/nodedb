@@ -113,6 +113,7 @@ mod tests {
                 pk_bytes: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }
     }
 

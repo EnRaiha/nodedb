@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 // ── Re-export shared types from nodedb-types ──
-pub use nodedb_types::id::{DatabaseId, DocumentId, RequestId, TenantId, VShardId};
+pub use nodedb_types::id::{DatabaseId, DocumentId, RequestId, TenantId, TxnId, VShardId};
 
 #[cfg(test)]
 mod tests {

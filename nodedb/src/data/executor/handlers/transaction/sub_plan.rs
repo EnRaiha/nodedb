@@ -50,6 +50,7 @@ impl CoreLoop {
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         });
 
         match plan {
@@ -368,6 +369,7 @@ impl CoreLoop {
                     user_roles: Vec::new(),
                     user_id: None,
                     statement_digest: None,
+                    txn_id: None,
                 }));
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {

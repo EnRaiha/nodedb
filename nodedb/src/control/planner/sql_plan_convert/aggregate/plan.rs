@@ -130,6 +130,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
                 right_bitmap: None,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -204,6 +205,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
                 sort_keys: bridge_sort_keys,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -237,6 +239,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
                 valid_at_ms: None,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -321,6 +324,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
         database_id: ctx.database_id,
         plan,
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 

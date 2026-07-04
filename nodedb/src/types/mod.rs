@@ -6,7 +6,7 @@ pub mod lsn;
 pub mod snapshot;
 
 pub use consistency::ReadConsistency;
-pub use id::{DatabaseId, DocumentId, RequestId, TenantId, VShardId};
+pub use id::{DatabaseId, DocumentId, RequestId, TenantId, TxnId, VShardId};
 pub use lsn::Lsn;
 pub use nodedb_types::{SpanId, TraceId};
 pub use snapshot::{

@@ -212,6 +212,7 @@ impl Scheduler {
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         };
 
         let resp_rx = self.shared.tracker.register(request_id);
@@ -330,6 +331,7 @@ impl Scheduler {
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         };
 
         let resp_rx = self.shared.tracker.register(request_id);

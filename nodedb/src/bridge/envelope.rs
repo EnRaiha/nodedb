@@ -74,7 +74,9 @@ impl From<Arc<[u8]>> for Payload {
     }
 }
 use crate::event::types::EventSource;
-use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+use crate::types::{
+    DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, TxnId, VShardId,
+};
 
 /// Request envelope: Control Plane -> Data Plane.
 ///
@@ -133,6 +135,11 @@ pub struct Request {
     /// Reuses the plan digest already computed by nodedb-sql. `None` for
     /// non-user writes.
     pub statement_digest: Option<Arc<str>>,
+
+    /// Set when this write originates inside a session transaction block;
+    /// keys the per-transaction staging overlay. `None` for autocommit /
+    /// non-transactional / system requests.
+    pub txn_id: Option<TxnId>,
 }
 
 /// Response envelope: Data Plane -> Control Plane.
@@ -363,6 +370,7 @@ mod tests {
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         }
     }
 
@@ -430,6 +438,7 @@ mod tests {
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         };
         match req.plan {
             PhysicalPlan::Meta(MetaOp::Cancel { target_request_id }) => {

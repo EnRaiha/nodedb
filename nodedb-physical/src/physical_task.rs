@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use nodedb_types::id::VShardId;
+use nodedb_types::id::{TxnId, VShardId};
 use nodedb_types::{DatabaseId, TenantId};
 
 use crate::physical_plan::PhysicalPlan;
@@ -43,4 +43,9 @@ pub struct PhysicalTask {
 
     /// Post-execution merge operation for set operations (UNION, INTERSECT, EXCEPT).
     pub post_set_op: PostSetOp,
+
+    /// Set when this task originates inside a session transaction block;
+    /// keys the per-transaction staging overlay. `None` for autocommit /
+    /// non-transactional / system tasks.
+    pub txn_id: Option<TxnId>,
 }

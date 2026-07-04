@@ -178,6 +178,7 @@ pub async fn dispatch_to_data_plane_with_source(
         user_roles: Vec::new(),
         user_id: None,
         statement_digest: None,
+        txn_id: None,
     };
 
     let mut rx = shared.tracker.register(request_id);

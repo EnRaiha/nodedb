@@ -75,6 +75,7 @@ pub(crate) fn eager_dispatch_to_all_cores(
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         };
 
         let rx = state.tracker.register(request_id);

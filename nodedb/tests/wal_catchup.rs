@@ -535,6 +535,7 @@ fn startup_replay_recovers_all_wal_data() {
                 user_roles: Vec::new(),
                 user_id: None,
                 statement_digest: None,
+                txn_id: None,
             },
         })
         .unwrap();

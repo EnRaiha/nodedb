@@ -3,12 +3,19 @@
 //! Transaction lifecycle methods on SessionStore.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::types::Lsn;
+use crate::types::{Lsn, TxnId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::state::TransactionState;
 use super::store::SessionStore;
+
+/// Global monotonic counter minting `TxnId`s across all sessions on this
+/// shard. Unique per shard for the lifetime of the process — sufficient
+/// for keying the per-transaction staging overlay, which is scoped to a
+/// single shard's in-memory state.
+static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
 
 impl SessionStore {
     /// Get transaction state for a connection.
@@ -27,6 +34,7 @@ impl SessionStore {
                 session.tx_state = TransactionState::InBlock;
                 session.tx_snapshot_lsn = Some(current_lsn);
                 session.tx_read_set.clear();
+                session.tx_id = Some(TxnId::new(NEXT_TXN_ID.fetch_add(1, Ordering::Relaxed)));
                 Ok(())
             }
             TransactionState::InBlock => {
@@ -76,6 +84,7 @@ impl SessionStore {
             let buffer = std::mem::take(&mut session.tx_buffer);
             session.tx_state = TransactionState::Idle;
             session.tx_snapshot_lsn = None;
+            session.tx_id = None;
             session.savepoints.clear();
             // Note: pending_sequence_reservations are taken separately via
             // take_pending_reservations() so the caller can finalize them
@@ -131,10 +140,16 @@ impl SessionStore {
 
     /// Buffer a write task during a transaction block.
     ///
+    /// Stamps the task's `txn_id` from the session's active transaction
+    /// identity before buffering, inside the same session-lock scope, so
+    /// there is no separate lock acquisition that could race or deadlock
+    /// against `buffer_write`'s own lock.
+    ///
     /// Returns `true` if buffered (in transaction), `false` if not (dispatch immediately).
-    pub fn buffer_write(&self, addr: &SocketAddr, task: PhysicalTask) -> bool {
+    pub fn buffer_write(&self, addr: &SocketAddr, mut task: PhysicalTask) -> bool {
         self.write_session(addr, |session| {
             if session.tx_state == TransactionState::InBlock {
+                task.txn_id = session.tx_id;
                 session.tx_buffer.push(task);
                 true
             } else {
@@ -155,6 +170,7 @@ impl SessionStore {
                 session.tx_buffer.clear();
                 session.tx_state = TransactionState::Idle;
                 session.tx_snapshot_lsn = None;
+                session.tx_id = None;
                 session.tx_read_set.clear();
                 session.savepoints.clear();
                 session.pending_offset_commits.clear();

@@ -10,6 +10,7 @@ pub mod node;
 pub mod request;
 pub mod shape;
 pub mod tenant;
+pub mod txn;
 pub mod vshard;
 
 pub use collection::CollectionId;
@@ -22,4 +23,5 @@ pub use node::NodeId;
 pub use request::RequestId;
 pub use shape::ShapeId;
 pub use tenant::TenantId;
+pub use txn::TxnId;
 pub use vshard::VShardId;

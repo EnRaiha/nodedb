@@ -107,6 +107,7 @@ pub(in super::super) fn convert_insert_array(
                 prefix_bits: entry.prefix_bits,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -147,6 +148,7 @@ pub(in super::super) fn convert_insert_array(
             provenance: None,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -222,6 +224,7 @@ pub(in super::super) fn convert_delete_array(
                 prefix_bits: entry.prefix_bits,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         }]);
     }
 
@@ -250,5 +253,6 @@ pub(in super::super) fn convert_delete_array(
             provenance: None,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }

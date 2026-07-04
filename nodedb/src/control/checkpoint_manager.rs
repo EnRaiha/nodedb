@@ -103,6 +103,7 @@ pub async fn run_checkpoint_cycle(
                 user_roles: Vec::new(),
                 user_id: None,
                 statement_digest: None,
+                txn_id: None,
             };
 
             let rx = tracker.register(request_id);

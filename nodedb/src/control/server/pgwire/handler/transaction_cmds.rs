@@ -186,6 +186,7 @@ impl NodeDbPgHandler {
                             nodedb_physical::physical_plan::MetaOp::TransactionBatch { plans },
                         ),
                         post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+                        txn_id: None,
                     };
                     batch_dispatch_to_commit_error(
                         self.dispatch_task_no_wal(batch_task, None).await,
@@ -300,6 +301,7 @@ impl NodeDbPgHandler {
                                         },
                                     ),
                                     post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+                                    txn_id: None,
                                 };
                                 batch_dispatch_to_commit_error(
                                     self.dispatch_task_no_wal(batch_task, None).await,

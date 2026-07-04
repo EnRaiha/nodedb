@@ -32,6 +32,7 @@ pub(crate) fn convert_flush(
             wal_lsn,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }
 
@@ -52,5 +53,6 @@ pub(crate) fn convert_compact(
             audit_retain_ms: entry.audit_retain_ms,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     }])
 }

@@ -50,6 +50,7 @@ pub(super) async fn execute_facet_counts_sql(
             limit_per_facet: parsed.limit_per_facet,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     };
 
     let resp = handler.dispatch_task(task, None, None).await.map_err(|e| {
@@ -106,6 +107,7 @@ pub(super) async fn execute_search_with_facets_sql(
             limit_per_facet: 0, // All values.
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     };
 
     let facet_resp = handler

@@ -222,6 +222,7 @@ pub(in super::super) fn convert_insert(
                         surrogate,
                     }),
                     post_set_op: PostSetOp::None,
+                    txn_id: None,
                 });
             }
             EngineType::Array => {
@@ -259,6 +260,7 @@ pub(in super::super) fn convert_insert(
                 wal_lsn: None,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         });
     }
 
@@ -318,6 +320,7 @@ pub(in super::super) fn convert_upsert(
                         surrogate,
                     }),
                     post_set_op: PostSetOp::None,
+                    txn_id: None,
                 });
             }
             EngineType::Columnar | EngineType::Spatial => {
@@ -353,6 +356,7 @@ pub(in super::super) fn convert_upsert(
                 wal_lsn: None,
             }),
             post_set_op: PostSetOp::None,
+            txn_id: None,
         });
     }
 

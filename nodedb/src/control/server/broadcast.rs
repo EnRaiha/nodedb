@@ -108,6 +108,7 @@ pub async fn broadcast_count_to_all_cores(
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         };
 
         let rx = shared.tracker.register(request_id);
@@ -214,6 +215,7 @@ pub async fn broadcast_register_to_all_cores(
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
+            txn_id: None,
         };
 
         let rx = shared.tracker.register(request_id);
