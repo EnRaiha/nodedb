@@ -5,6 +5,7 @@ mod bitemporal_time;
 mod decode_stored;
 pub(in crate::data::executor) mod deferred;
 mod event_emit;
+pub(in crate::data::executor) mod filter_match;
 mod graph_partition;
 pub(in crate::data::executor) mod maintenance;
 mod open;

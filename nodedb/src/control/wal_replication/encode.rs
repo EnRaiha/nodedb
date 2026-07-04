@@ -450,6 +450,22 @@ pub fn to_replicated_entry(
             is_update: true,
             updates: updates.clone(),
         },
+        // `INSERT ... SELECT ... WHERE <predicate>` replicates as a plain
+        // `InsertSelect` entry: each replica re-scans the source at the
+        // committed log position and copies the predicate matches, reusing each
+        // source row's surrogate/doc_id. Deterministic by Raft log order ⇒
+        // identical prior state ⇒ identical copied set.
+        PhysicalPlan::Document(DocumentOp::InsertSelect {
+            target_collection,
+            source_collection,
+            source_filters,
+            source_limit,
+        }) => ReplicatedWrite::InsertSelect {
+            target_collection: target_collection.clone(),
+            source_collection: source_collection.clone(),
+            source_filters: source_filters.clone(),
+            source_limit: *source_limit,
+        },
         // Not a write — reads, system ops, etc. (Also: OLLP-prepared bulk plans
         // carrying predicted surrogates/edges, which route via Calvin.)
         _ => return None,

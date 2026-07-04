@@ -114,17 +114,19 @@ impl CoreLoop {
         // before evaluating (`matches_binary` operates on MessagePack).
         // Schemaless bodies are already MessagePack. An empty filter set matches
         // every row.
+        // `strict_schema` is already resolved above (needed again later for
+        // sort/projection normalization) — reuse it here instead of paying
+        // the `doc_configs` lookup a second time per row via
+        // `strict_aware_filter_matches`.
         let matches = |value: &[u8]| -> bool {
             if filter_predicates.is_empty() {
                 return true;
             }
-            match strict_schema.as_ref() {
-                Some(schema) => match strict_format::binary_tuple_to_msgpack(value, schema) {
-                    Some(mp) => filter_predicates.iter().all(|f| f.matches_binary(&mp)),
-                    None => false,
-                },
-                None => filter_predicates.iter().all(|f| f.matches_binary(value)),
-            }
+            crate::data::executor::core_loop::filter_match::matches_with_resolved_schema(
+                strict_schema.as_ref(),
+                &filter_predicates,
+                value,
+            )
         };
 
         // Scan strategy:

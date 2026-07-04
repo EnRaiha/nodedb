@@ -465,6 +465,23 @@ pub enum ReplicatedWrite {
         updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
     },
 
+    /// A single-shard `INSERT INTO <target> SELECT ... FROM <source> WHERE
+    /// <predicate>` to be replicated to the data group's Raft members and
+    /// re-executed on apply. Like `BulkDml`, a single shard is ONE Raft group,
+    /// so re-scanning the source at the committed log position yields the
+    /// byte-identical copied set on every replica (deterministic by Raft
+    /// ordering); the copied rows reuse each source row's own surrogate/doc_id.
+    ///
+    /// `source_filters` is the msgpack-encoded `Vec<ScanFilter>` predicate on
+    /// the source (empty = no WHERE clause, match all); `source_limit` bounds
+    /// the copied set. The affected collection is `target_collection`.
+    InsertSelect {
+        target_collection: String,
+        source_collection: String,
+        source_filters: Vec<u8>,
+        source_limit: usize,
+    },
+
     /// Per-collection Loro snapshot import. Used by RESTORE to durably
     /// replicate a collection's CRDT doc to all Raft replicas of a data group
     /// (replacing the race-prone per-node direct dispatch). `bytes` is one

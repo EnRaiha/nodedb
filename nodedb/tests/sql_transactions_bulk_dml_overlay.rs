@@ -280,6 +280,89 @@ async fn strict_bulk_update_visible_via_index_lookup() {
     bulk_update_visible_via_index_lookup("document_strict", "bu_st_idx").await;
 }
 
+/// A predicate UPDATE's BASE ∪ OVERLAY resolution must fold in a row inserted
+/// earlier in the SAME transaction by a plain point `INSERT`, not just rows
+/// already durable at BEGIN. Strict (Binary Tuple) collections store the
+/// staged row as a Binary Tuple; the predicate must be decoded against the
+/// collection's schema before evaluation, or the staged-earlier row is
+/// silently dropped from the matched set (it never fails, it just isn't
+/// counted or updated).
+async fn strict_bulk_update_sees_row_staged_earlier_in_txn(coll: &str) {
+    let server = TestServer::start().await;
+    setup(&server, coll, "document_strict").await;
+
+    server.exec("BEGIN").await.unwrap();
+    server
+        .exec(&format!("INSERT INTO {coll} (id, n) VALUES ('fresh', 1)"))
+        .await
+        .unwrap();
+
+    let msgs = server
+        .client
+        .simple_query(&format!("UPDATE {coll} SET n = 9 WHERE n = 1"))
+        .await
+        .expect("in-tx bulk update should succeed at the statement");
+    assert_eq!(
+        command_count(&msgs),
+        Some(3),
+        "strict: predicate UPDATE must include the row staged earlier \
+         in this txn by a point INSERT (base 'a','b' + staged 'fresh')"
+    );
+
+    let seen = scan_ints(&server, &format!("SELECT n FROM {coll} WHERE n = 9")).await;
+    assert_eq!(
+        seen,
+        vec![9, 9, 9],
+        "strict: in-tx scan must show the staged-earlier row updated too"
+    );
+
+    server.client.simple_query("ROLLBACK").await.unwrap();
+}
+
+/// Same latent bug, exercised via predicate `DELETE`: a row inserted earlier
+/// in the transaction must be tombstoned by a later matching bulk delete.
+async fn strict_bulk_delete_sees_row_staged_earlier_in_txn(coll: &str) {
+    let server = TestServer::start().await;
+    setup(&server, coll, "document_strict").await;
+
+    server.exec("BEGIN").await.unwrap();
+    server
+        .exec(&format!("INSERT INTO {coll} (id, n) VALUES ('fresh', 1)"))
+        .await
+        .unwrap();
+
+    let msgs = server
+        .client
+        .simple_query(&format!("DELETE FROM {coll} WHERE n = 1"))
+        .await
+        .expect("in-tx bulk delete should succeed at the statement");
+    assert_eq!(
+        command_count(&msgs),
+        Some(3),
+        "strict: predicate DELETE must include the row staged earlier \
+         in this txn by a point INSERT (base 'a','b' + staged 'fresh')"
+    );
+
+    let remaining = scan_ints(&server, &format!("SELECT n FROM {coll}")).await;
+    assert_eq!(
+        remaining,
+        vec![2, 100],
+        "strict: in-tx scan must hide both base and staged-earlier deleted rows"
+    );
+
+    server.client.simple_query("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_bulk_update_sees_row_staged_earlier_in_txn_case() {
+    strict_bulk_update_sees_row_staged_earlier_in_txn("bu_st_ov_upd").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_bulk_delete_sees_row_staged_earlier_in_txn_case() {
+    strict_bulk_delete_sees_row_staged_earlier_in_txn("bu_st_ov_del").await;
+}
+
 // A RETURNING bulk-update-in-transaction test (documenting the intentional
 // buffer+OK deferral) was considered but skipped: asserting the exact client
 // side parse of a bare "OK" command tag would require verifying

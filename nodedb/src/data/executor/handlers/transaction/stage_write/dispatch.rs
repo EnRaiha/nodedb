@@ -7,7 +7,7 @@ use nodedb_physical::physical_plan::{DocumentOp, UpdateValue};
 
 use super::constraint::OverlayPk;
 use super::context::StageCtx;
-use super::{StageBulkDeleteParams, StageBulkUpdateParams};
+use super::{StageBulkDeleteParams, StageBulkUpdateParams, StageInsertSelectParams};
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
@@ -137,6 +137,26 @@ impl CoreLoop {
                 returning: Some(_), ..
             } => self.stage_not_point_write(task),
 
+            // `INSERT ... SELECT ... WHERE <predicate>` staged at statement
+            // time — resolve the source's BASE ∪ OVERLAY matching set and
+            // copy each matched row into the target overlay under its own
+            // surrogate/doc_id. `InsertSelect` has no `RETURNING` variant, so
+            // it is always stageable (see `is_point_write`).
+            DocumentOp::InsertSelect {
+                target_collection,
+                source_collection,
+                source_filters,
+                source_limit,
+            } => self.stage_insert_select(StageInsertSelectParams {
+                task,
+                tid,
+                txn_id,
+                target_collection,
+                source_collection,
+                filter_bytes: source_filters,
+                source_limit: *source_limit,
+            }),
+
             DocumentOp::PointGet { .. }
             | DocumentOp::Scan { .. }
             | DocumentOp::BatchInsert { .. }
@@ -148,7 +168,6 @@ impl CoreLoop {
             | DocumentOp::BackfillIndex { .. }
             | DocumentOp::Truncate { .. }
             | DocumentOp::EstimateCount { .. }
-            | DocumentOp::InsertSelect { .. }
             | DocumentOp::Upsert { .. }
             | DocumentOp::UpdateFromJoin { .. }
             | DocumentOp::Merge { .. }

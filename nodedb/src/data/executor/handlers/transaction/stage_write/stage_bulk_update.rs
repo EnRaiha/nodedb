@@ -98,8 +98,10 @@ impl CoreLoop {
         // drops tombstoned rows, re-checks staged puts against the predicate
         // (an earlier staged update may have moved a row in or out), and
         // appends overlay-only rows that now match.
-        let matches = |body: &[u8]| filters.iter().all(|f| f.matches_binary(body));
-        self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &matches);
+        {
+            let matches = self.strict_aware_matcher(tid, collection, &filters);
+            self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &matches);
+        }
 
         let mut affected = 0u64;
         for (row_key, current_body) in &rows {

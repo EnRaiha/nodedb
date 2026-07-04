@@ -77,8 +77,10 @@ impl CoreLoop {
             Err(resp) => return resp,
         };
 
-        let matches = |body: &[u8]| filters.iter().all(|f| f.matches_binary(body));
-        self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &matches);
+        {
+            let matches = self.strict_aware_matcher(tid, collection, &filters);
+            self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &matches);
+        }
 
         let mut affected = 0u64;
         for (row_key, _body) in &rows {

@@ -684,6 +684,17 @@ fn to_physical_plan(
                 })
             }
         }
+        ReplicatedWrite::InsertSelect {
+            target_collection,
+            source_collection,
+            source_filters,
+            source_limit,
+        } => PhysicalPlan::Document(DocumentOp::InsertSelect {
+            target_collection: target_collection.clone(),
+            source_collection: source_collection.clone(),
+            source_filters: source_filters.clone(),
+            source_limit: *source_limit,
+        }),
         // The following variants are intercepted upstream (Array CRDT ops by
         // `from_replicated_entry`, CalvinReadResult by the apply loop) and never
         // dispatched through the generic Data Plane path. These arms exist only

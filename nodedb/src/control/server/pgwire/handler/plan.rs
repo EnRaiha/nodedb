@@ -187,12 +187,14 @@ pub(super) fn is_calvin_foldable(plan: &PhysicalPlan) -> bool {
 }
 
 /// Allow-list of the plans the in-transaction path stages at statement time:
-/// point writes plus predicate `BulkUpdate` / `BulkDelete` (bulk predicate
-/// DML, no RETURNING). Explicit match on the exact staged variants — KV point
-/// writes and any RETURNING variant stay on the buffer path. Named for the
-/// point-write case historically; also covers bulk predicate DML now that
-/// `stage_bulk_update` / `stage_bulk_delete` stage the matched rows the same
-/// way.
+/// point writes, predicate `BulkUpdate` / `BulkDelete` (bulk predicate DML,
+/// no RETURNING), and `InsertSelect` (`INSERT ... SELECT`, which has no
+/// RETURNING variant so it is always stageable). Explicit match on the exact
+/// staged variants — KV point writes and any RETURNING variant stay on the
+/// buffer path. Named for the point-write case historically; also covers
+/// bulk predicate DML and `InsertSelect` now that `stage_bulk_update` /
+/// `stage_bulk_delete` / `stage_insert_select` stage the matched rows the
+/// same way.
 pub(super) fn is_point_write(plan: &PhysicalPlan) -> bool {
     matches!(
         plan,
@@ -215,6 +217,7 @@ pub(super) fn is_point_write(plan: &PhysicalPlan) -> bool {
                     returning: None,
                     ..
                 }
+                | DocumentOp::InsertSelect { .. }
         )
     )
 }
@@ -246,6 +249,9 @@ pub(super) fn point_write_tag(plan: &PhysicalPlan, rows: usize) -> Tag {
                 returning: None, ..
             },
         ) => Tag::new("DELETE").with_rows(rows),
+        PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => {
+            Tag::new("INSERT").with_rows(rows)
+        }
         other => unreachable!(
             "point_write_tag called on a non-point-write plan; \
              is_point_write invariant broken: {other:?}"
