@@ -7,9 +7,23 @@ use crate::types::TenantId;
 
 use crate::wal::replay::SyncHwmReplayMaps;
 
+use crate::types::Lsn;
+
 use super::CoreLoop;
 
 impl CoreLoop {
+    pub fn core_id(&self) -> usize {
+        self.core_id
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.task_queue.len()
+    }
+
+    pub fn advance_watermark(&mut self, lsn: Lsn) {
+        self.watermark = lsn;
+    }
+
     /// Install reconstructed sync HWM state from WAL replay.
     ///
     /// Called once by `spawn_core` (in `data/runtime.rs`) immediately after

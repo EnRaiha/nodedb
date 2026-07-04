@@ -225,6 +225,15 @@ impl CoreLoop {
                 old_collection,
                 new_collection,
             ),
+
+            // Pure scaffolding removal. Nothing populates the overlay yet,
+            // so this is a no-op `HashMap::remove` on an absent key today;
+            // wiring the call site (session commit/rollback) lands
+            // separately.
+            MetaOp::DropTxnOverlay { txn_id } => {
+                self.txn_overlays.remove(txn_id);
+                self.response_ok(task)
+            }
         }
     }
 }

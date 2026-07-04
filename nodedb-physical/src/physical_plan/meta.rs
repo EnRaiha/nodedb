@@ -429,4 +429,15 @@ pub enum MetaOp {
         old_collection: String,
         new_collection: String,
     },
+
+    /// Drop the per-transaction staging overlay for a completed (committed
+    /// or rolled-back) transaction on this core.
+    ///
+    /// The overlay (`crate::data::executor::handlers::transaction::overlay::TxnOverlay`)
+    /// holds not-yet-durable writes staged during a transaction; once the
+    /// transaction resolves, its overlay entry must be released so it does
+    /// not leak across the `CoreLoop`'s lifetime. `HashMap::remove` on an
+    /// absent key is a no-op, so this is safe to dispatch even when no
+    /// overlay was ever populated for the given `txn_id`.
+    DropTxnOverlay { txn_id: nodedb_types::id::TxnId },
 }

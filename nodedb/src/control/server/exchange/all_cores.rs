@@ -178,7 +178,8 @@ pub async fn execute_plan_all_local_cores(
             | MetaOp::RebuildIndex { .. }
             | MetaOp::PutSynonymGroup { .. }
             | MetaOp::DeleteSynonymGroup { .. }
-            | MetaOp::RenameCollection { .. } => {
+            | MetaOp::RenameCollection { .. }
+            | MetaOp::DropTxnOverlay { .. } => {
                 generic_gather(state, tenant_id, database_id, plan, trace_id).await
             }
         },

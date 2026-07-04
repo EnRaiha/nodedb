@@ -175,6 +175,7 @@ impl CoreLoop {
             // duration of a batch and restores it afterward — followers in a
             // group skip verification and apply the leader's predicted set.
             ollp_is_group_leader: true,
+            txn_overlays: HashMap::new(),
         })
     }
 }

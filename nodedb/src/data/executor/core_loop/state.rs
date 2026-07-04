@@ -480,18 +480,16 @@ pub struct CoreLoop {
     /// paths never set predicted surrogates, so the flag is never read there).
     /// Safe for the same single-threaded `!Send` reasons as `epoch_system_ms`.
     pub(in crate::data::executor) ollp_is_group_leader: bool,
-}
 
-impl CoreLoop {
-    pub fn core_id(&self) -> usize {
-        self.core_id
-    }
-
-    pub fn pending_count(&self) -> usize {
-        self.task_queue.len()
-    }
-
-    pub fn advance_watermark(&mut self, lsn: Lsn) {
-        self.watermark = lsn;
-    }
+    /// Per-transaction staging overlay: not-yet-durable writes for each
+    /// in-flight transaction on this core, keyed by `TxnId`.
+    ///
+    /// Scaffolding: nothing populates or reads this yet. Entries are
+    /// released via `MetaOp::DropTxnOverlay` once a transaction resolves
+    /// (commit or rollback); that dispatch wiring has not landed yet, so
+    /// today this map is always empty.
+    pub(in crate::data::executor) txn_overlays: HashMap<
+        crate::types::TxnId,
+        crate::data::executor::handlers::transaction::overlay::TxnOverlay,
+    >,
 }
