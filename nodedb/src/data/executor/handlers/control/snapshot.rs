@@ -11,6 +11,16 @@ use crate::types::RequestId;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// Parameters for a document range scan (`field` within `[lower, upper)`).
+pub(in crate::data::executor) struct RangeScanArgs<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub field: &'a str,
+    pub lower: Option<&'a [u8]>,
+    pub upper: Option<&'a [u8]>,
+    pub limit: usize,
+}
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_wal_append(
         &self,
@@ -104,17 +114,28 @@ impl CoreLoop {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_range_scan(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        field: &str,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: usize,
+        args: RangeScanArgs<'_>,
     ) -> Response {
+        // Bitemporal collections keep every write on the versioned redb table;
+        // their plain INDEXES / DOCUMENTS tables are empty, so the index probe
+        // + plain-table fallback below would return ZERO rows. Route them to
+        // the versioned current-state scan instead (full-scan + range filter,
+        // matching `execute_document_scan`).
+        if self.is_bitemporal(args.tid, args.collection) {
+            return self.execute_range_scan_bitemporal(task, args);
+        }
+
+        let RangeScanArgs {
+            tid,
+            collection,
+            field,
+            lower,
+            upper,
+            limit,
+        } = args;
         debug!(core = self.core_id, %collection, %field, limit, "range scan");
 
         // Try index-backed range scan first.

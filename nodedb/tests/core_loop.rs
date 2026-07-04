@@ -38,6 +38,8 @@ mod test_kv_advanced;
 mod test_kv_scan_budget;
 #[path = "executor_tests/test_ollp_verification.rs"]
 mod test_ollp_verification;
+#[path = "executor_tests/test_range_scan_bitemporal.rs"]
+mod test_range_scan_bitemporal;
 #[path = "executor_tests/test_security_and_isolation.rs"]
 mod test_security_and_isolation;
 #[path = "executor_tests/test_tenant_cache_isolation.rs"]

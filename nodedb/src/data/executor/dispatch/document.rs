@@ -203,12 +203,14 @@ impl CoreLoop {
                 limit,
             } => self.execute_range_scan(
                 task,
-                tid,
-                collection,
-                field,
-                lower.as_deref(),
-                upper.as_deref(),
-                *limit,
+                super::super::handlers::control::snapshot::RangeScanArgs {
+                    tid,
+                    collection: collection.as_str(),
+                    field: field.as_str(),
+                    lower: lower.as_deref(),
+                    upper: upper.as_deref(),
+                    limit: *limit,
+                },
             ),
 
             DocumentOp::UpdateFromJoin {

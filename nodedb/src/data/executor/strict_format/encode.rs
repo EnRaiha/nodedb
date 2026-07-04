@@ -111,7 +111,22 @@ pub fn value_to_binary_tuple_bitemporal(
         }
     };
 
-    let user_columns = &schema.columns[3..];
+    // A bitemporal strict schema must carry the three reserved timestamp
+    // columns in slots 0/1/2 ahead of the user columns (see
+    // `StrictSchema::new_bitemporal`). Guard the slice so a malformed or
+    // short schema surfaces a typed error instead of panicking on the
+    // out-of-range index.
+    let reserved = nodedb_types::columnar::BITEMPORAL_RESERVED_COLUMNS.len();
+    if schema.columns.len() < reserved {
+        return Err(crate::Error::BadRequest {
+            detail: format!(
+                "bitemporal strict schema must have the {reserved} reserved columns \
+                 in slots 0..{reserved}, found only {}",
+                schema.columns.len()
+            ),
+        });
+    }
+    let user_columns = &schema.columns[reserved..];
     let user_names: std::collections::HashSet<&str> =
         user_columns.iter().map(|c| c.name.as_str()).collect();
     if let Some(unknown) = map.keys().find(|k| {
