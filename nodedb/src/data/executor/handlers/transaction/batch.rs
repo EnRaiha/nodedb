@@ -251,6 +251,7 @@ impl CoreLoop {
                     document_id,
                     old_value,
                     surrogate: _,
+                    ..
                 } => Some(DeferredWrite {
                     collection,
                     op: if old_value.is_some() {
@@ -266,6 +267,7 @@ impl CoreLoop {
                     collection,
                     document_id,
                     old_value,
+                    ..
                 } => Some(DeferredWrite {
                     collection,
                     op: crate::event::WriteOp::Delete,

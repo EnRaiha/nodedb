@@ -136,6 +136,9 @@ impl CoreLoop {
                     document_id: row_key.to_string(),
                     surrogate,
                     old_value: old_value.clone(),
+                    bitemporal_sys_from_ms: None,
+                    bitemporal_index_tuples: Vec::new(),
+                    chain_hash_prior: None,
                 });
 
                 if old_value.is_none()
@@ -156,6 +159,9 @@ impl CoreLoop {
                             document_id: tw.document_id,
                             surrogate: nodedb_types::Surrogate::ZERO,
                             old_value: tw.old_value,
+                            bitemporal_sys_from_ms: None,
+                            bitemporal_index_tuples: Vec::new(),
+                            chain_hash_prior: None,
                         });
                     }
                 }
@@ -239,6 +245,9 @@ impl CoreLoop {
                         collection: collection.to_string(),
                         document_id: row_key.to_string(),
                         old_value: old,
+                        bitemporal_sys_from_ms: None,
+                        bitemporal_index_tuples: Vec::new(),
+                        chain_hash_prior: None,
                     });
                 }
                 Ok(self.response_ok(dummy_task))
