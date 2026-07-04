@@ -64,7 +64,28 @@ impl CoreLoop {
             tid,
         );
         match doc_engine.index_lookup(collection, path, value, bitemporal) {
-            Ok(doc_ids) => {
+            Ok(mut doc_ids) => {
+                if let Some(txn_id) = task.request.txn_id {
+                    let config_key = (crate::types::TenantId::new(tid), collection.to_string());
+                    let (is_array, case_insensitive) = self.index_path_flags(&config_key, path);
+                    let coll_key = (
+                        task.request.database_id,
+                        crate::types::TenantId::new(tid),
+                        collection.to_string(),
+                    );
+                    self.merge_overlay_into_index_lookup(
+                        super::super::transaction::overlay::IndexOverlayMergeParams {
+                            txn_id,
+                            coll_key: &coll_key,
+                            path,
+                            value,
+                            is_array,
+                            case_insensitive,
+                        },
+                        &mut doc_ids,
+                        &|body| self.decode_indexed_body(&config_key, body),
+                    );
+                }
                 let payload = serde_json::json!(doc_ids);
                 match sonic_rs::to_vec(&payload) {
                     Ok(bytes) => self.response_with_payload(task, bytes),
@@ -130,7 +151,7 @@ impl CoreLoop {
         let bitemporal = self.is_bitemporal(tid, collection);
         let doc_engine =
             crate::engine::document::store::DocumentEngine::new(&self.sparse, database_id, tid);
-        let doc_ids = match doc_engine.index_lookup(collection, path, value, bitemporal) {
+        let mut doc_ids = match doc_engine.index_lookup(collection, path, value, bitemporal) {
             Ok(ids) => ids,
             Err(e) => {
                 return self.response_error(
@@ -156,16 +177,50 @@ impl CoreLoop {
             }
         });
 
+        // Read-your-own-writes for the index-lookup path: the INDEXES table
+        // (plain or versioned) is never staged, only body storage is, so a
+        // staged insert/update/delete that changes `path == value` is
+        // invisible to `doc_engine.index_lookup` above. Decode each
+        // candidate's staged body and re-extract `path` the same way the
+        // index write path does, dropping doc IDs the staged write moved
+        // off the value and adding doc IDs it moved onto it.
+        let coll_key = (
+            task.request.database_id,
+            crate::types::TenantId::new(tid),
+            collection.to_string(),
+        );
+        if let Some(txn_id) = task.request.txn_id {
+            let (is_array, case_insensitive) = self.index_path_flags(&config_key, path);
+            self.merge_overlay_into_index_lookup(
+                super::super::transaction::overlay::IndexOverlayMergeParams {
+                    txn_id,
+                    coll_key: &coll_key,
+                    path,
+                    value,
+                    is_array,
+                    case_insensitive,
+                },
+                &mut doc_ids,
+                &|body| self.decode_indexed_body(&config_key, body),
+            );
+        }
+
         let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
         for doc_id in doc_ids.iter().skip(offset).take(limit) {
             // Bitemporal collections keep the current body on the versioned
             // document table; the plain DOCUMENTS table is empty for them.
-            let fetched = if bitemporal {
-                self.sparse
-                    .versioned_get_current(database_id, tid, collection, doc_id)
-            } else {
-                self.sparse.get(database_id, tid, collection, doc_id)
-            };
+            // A doc ID the overlay merge added or superseded above has no
+            // correct body in base storage — `overlay_or_base_body` prefers
+            // the staged `Put` bytes and only falls back to a base fetch
+            // when the overlay has nothing staged for this surrogate.
+            let fetched = self.overlay_or_base_body(task.request.txn_id, &coll_key, doc_id, || {
+                if bitemporal {
+                    self.sparse
+                        .versioned_get_current(database_id, tid, collection, doc_id)
+                } else {
+                    self.sparse.get(database_id, tid, collection, doc_id)
+                }
+            });
             match fetched {
                 Ok(Some(bytes)) => {
                     let payload = if let Some(ref schema) = strict_schema {
