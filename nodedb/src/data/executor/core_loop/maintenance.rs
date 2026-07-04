@@ -5,6 +5,21 @@ use std::sync::Arc;
 use super::CoreLoop;
 use crate::engine::sparse::doc_cache::DocCache;
 
+/// (added, removed) secondary-index (field, value) tuples.
+type SecondaryIndexDiff = (Vec<(String, String)>, Vec<(String, String)>);
+
+/// Shared parameters for [`CoreLoop::apply_secondary_indexes`] and
+/// [`CoreLoop::apply_secondary_indexes_in_txn`].
+pub(in crate::data::executor) struct SecondaryIndexInputs<'a> {
+    pub database_id: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub old_doc: Option<&'a serde_json::Value>,
+    pub new_doc: &'a serde_json::Value,
+    pub doc_id: &'a str,
+    pub index_paths: &'a [crate::engine::document::store::IndexPath],
+}
+
 impl CoreLoop {
     /// Set compaction parameters (called after open, before event loop).
     pub fn set_compaction_config(
@@ -77,41 +92,63 @@ impl CoreLoop {
         self.graph_tuning = tuning;
     }
 
-    /// Apply secondary index extraction for a document (opens its own txn).
+    /// Apply the secondary-index SET diff for a document (opens its own txn).
     ///
     /// Used by `execute_document_batch_insert` after `batch_put` has already
     /// committed its document transaction. Callers that already hold a
     /// write transaction (PointPut) MUST call
     /// [`apply_secondary_indexes_in_txn`](Self::apply_secondary_indexes_in_txn)
     /// instead — a nested `begin_write` deadlocks redb's single-writer lock.
+    ///
+    /// `old_doc` is the pre-write document (`None` for a fresh insert). The set
+    /// of indexed values is diffed against the new document: values only in the
+    /// new set are inserted, values only in the old set are removed — so an
+    /// UPDATE that changes a field value drops the stale entry. Returns
+    /// `(added, removed)` as `(field, value)` tuples.
     pub(in crate::data::executor) fn apply_secondary_indexes(
         &mut self,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        doc: &serde_json::Value,
-        doc_id: &str,
-        index_paths: &[crate::engine::document::store::IndexPath],
-    ) {
+        inputs: SecondaryIndexInputs<'_>,
+    ) -> SecondaryIndexDiff {
+        let SecondaryIndexInputs {
+            database_id,
+            tid,
+            collection,
+            old_doc,
+            new_doc,
+            doc_id,
+            index_paths,
+        } = inputs;
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
         for index_path in index_paths {
-            if let Some(ref p) = index_path.predicate
-                && !p.evaluate_json(doc)
-            {
-                continue;
+            let new_vals = index_values_for(new_doc, index_path);
+            let old_vals = old_doc
+                .map(|d| index_values_for(d, index_path))
+                .unwrap_or_default();
+            for v in new_vals.difference(&old_vals) {
+                if let Err(e) =
+                    self.sparse
+                        .index_put(database_id, tid, collection, &index_path.path, v, doc_id)
+                {
+                    tracing::warn!(
+                        core = self.core_id,
+                        %collection,
+                        doc_id = %doc_id,
+                        path = %index_path.path,
+                        error = %e,
+                        "secondary index insert failed"
+                    );
+                    continue;
+                }
+                added.push((index_path.path.clone(), v.clone()));
             }
-            let values = crate::engine::document::store::extract_index_values(
-                doc,
-                &index_path.path,
-                index_path.is_array,
-            );
-            for v in values {
-                let stored = maybe_lowercase(&v, index_path.case_insensitive);
-                if let Err(e) = self.sparse.index_put(
+            for v in old_vals.difference(&new_vals) {
+                if let Err(e) = self.sparse.index_remove(
                     database_id,
                     tid,
                     collection,
                     &index_path.path,
-                    &stored,
+                    v,
                     doc_id,
                 ) {
                     tracing::warn!(
@@ -120,50 +157,54 @@ impl CoreLoop {
                         doc_id = %doc_id,
                         path = %index_path.path,
                         error = %e,
-                        "secondary index extraction failed"
+                        "secondary index stale-entry removal failed"
                     );
+                    continue;
                 }
+                removed.push((index_path.path.clone(), v.clone()));
             }
         }
+        (added, removed)
     }
 
-    /// Apply secondary index extraction within an already-open write txn.
+    /// Apply the secondary-index SET diff within an already-open write txn.
     ///
-    /// Routes writes through [`SparseEngine::index_put_in_txn`] so that
-    /// the document + index entries commit atomically with the caller's
-    /// `WriteTransaction`. Required from `apply_point_put`, which opens
-    /// the outer txn in `execute_point_put`.
-    #[allow(clippy::too_many_arguments)]
+    /// Routes writes through [`SparseEngine::index_put_in_txn`] /
+    /// [`SparseEngine::index_remove_in_txn`] so the document + index entries
+    /// commit atomically with the caller's `WriteTransaction`. Required from
+    /// `apply_point_put`, which opens the outer txn in `execute_point_put`.
+    ///
+    /// See [`apply_secondary_indexes`](Self::apply_secondary_indexes) for the
+    /// `old_doc` diff semantics and the `(added, removed)` return.
     pub(in crate::data::executor) fn apply_secondary_indexes_in_txn(
         &mut self,
         txn: &redb::WriteTransaction,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        doc: &serde_json::Value,
-        doc_id: &str,
-        index_paths: &[crate::engine::document::store::IndexPath],
-    ) {
+        inputs: SecondaryIndexInputs<'_>,
+    ) -> SecondaryIndexDiff {
+        let SecondaryIndexInputs {
+            database_id,
+            tid,
+            collection,
+            old_doc,
+            new_doc,
+            doc_id,
+            index_paths,
+        } = inputs;
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
         for index_path in index_paths {
-            if let Some(ref p) = index_path.predicate
-                && !p.evaluate_json(doc)
-            {
-                continue;
-            }
-            let values = crate::engine::document::store::extract_index_values(
-                doc,
-                &index_path.path,
-                index_path.is_array,
-            );
-            for v in values {
-                let stored = maybe_lowercase(&v, index_path.case_insensitive);
+            let new_vals = index_values_for(new_doc, index_path);
+            let old_vals = old_doc
+                .map(|d| index_values_for(d, index_path))
+                .unwrap_or_default();
+            for v in new_vals.difference(&old_vals) {
                 if let Err(e) = self.sparse.index_put_in_txn(
                     txn,
                     database_id,
                     tid,
                     collection,
                     &index_path.path,
-                    &stored,
+                    v,
                     doc_id,
                 ) {
                     tracing::warn!(
@@ -172,11 +213,38 @@ impl CoreLoop {
                         doc_id = %doc_id,
                         path = %index_path.path,
                         error = %e,
-                        "secondary index extraction failed (in-txn)"
+                        "secondary index insert failed (in-txn)"
                     );
+                    continue;
                 }
+                added.push((index_path.path.clone(), v.clone()));
+            }
+            for v in old_vals.difference(&new_vals) {
+                if let Err(e) = self.sparse.index_remove_in_txn(
+                    txn,
+                    crate::engine::sparse::btree_index::IndexEntryTxn {
+                        database_id,
+                        tenant_id: tid,
+                        collection,
+                        field: &index_path.path,
+                        value: v,
+                        document_id: doc_id,
+                    },
+                ) {
+                    tracing::warn!(
+                        core = self.core_id,
+                        %collection,
+                        doc_id = %doc_id,
+                        path = %index_path.path,
+                        error = %e,
+                        "secondary index stale-entry removal failed (in-txn)"
+                    );
+                    continue;
+                }
+                removed.push((index_path.path.clone(), v.clone()));
             }
         }
+        (added, removed)
     }
 
     /// Pause writes to a vShard (during Phase 3 migration cutover).
@@ -257,4 +325,23 @@ fn maybe_lowercase(v: &str, case_insensitive: bool) -> String {
     } else {
         v.to_string()
     }
+}
+
+/// Extract the set of stored index values a document contributes for one index
+/// path. Applies the path's predicate (empty set when it fails) and the same
+/// case-insensitive folding the forward write path uses, so the SET diff in
+/// `apply_secondary_indexes*` compares like-for-like.
+fn index_values_for(
+    doc: &serde_json::Value,
+    index_path: &crate::engine::document::store::IndexPath,
+) -> std::collections::HashSet<String> {
+    if let Some(ref p) = index_path.predicate
+        && !p.evaluate_json(doc)
+    {
+        return std::collections::HashSet::new();
+    }
+    crate::engine::document::store::extract_index_values(doc, &index_path.path, index_path.is_array)
+        .into_iter()
+        .map(|v| maybe_lowercase(&v, index_path.case_insensitive))
+        .collect()
 }

@@ -2,6 +2,7 @@
 
 pub mod btree;
 pub mod btree_index;
+pub mod btree_index_bulk;
 pub mod btree_scan;
 pub mod btree_versioned;
 pub mod doc_cache;

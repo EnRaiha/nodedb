@@ -8,122 +8,15 @@
 use redb::WriteTransaction;
 use tracing::warn;
 
-use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::{
     append_only, period_lock, state_transition, transition_check,
 };
 use crate::data::executor::handlers::generated;
 use crate::data::executor::{doc_format, strict_format};
-use nodedb_types::Surrogate;
 
+use super::types::{PointPutOutcome, PointPutParams, map_enforcement_error};
 use super::unique::{UniqueCheck, check_unique_constraints};
-
-/// Parameters for [`CoreLoop::apply_point_put`].
-pub(in crate::data::executor) struct PointPutParams<'a> {
-    pub database_id: u64,
-    pub tid: u64,
-    pub collection: &'a str,
-    pub document_id: &'a str,
-    pub surrogate: Surrogate,
-    pub value: &'a [u8],
-    /// Whether to index the document's text into the inverted BM25 index.
-    ///
-    /// `true` for native writes (PointPut/Insert/Upsert/batch/insert-select),
-    /// which own the full write. `false` for CRDT-sync materialization: that
-    /// path receives text via a separate `FtsIndexDoc` sync frame, so indexing
-    /// here too would double-index the same surrogate.
-    pub index_text: bool,
-    /// Roles held by the authenticated user, consumed by role-gated state
-    /// transition constraints. Empty for internal/system callers.
-    pub user_roles: &'a [String],
-    /// Whether to run stateless PUT enforcement (append-only, period lock,
-    /// state transitions, transition-check predicates).
-    ///
-    /// `true` for user-DML callers (PointPut/Insert/Upsert/batch/
-    /// insert-select), which must be admission-checked. `false` for
-    /// CRDT-sync materialization: those deltas already passed admission on
-    /// their origin replica (CRDT constraint validation happens at the Raft
-    /// commit phase), so re-running enforcement here would double-check
-    /// already-accepted writes.
-    pub enforce: bool,
-    /// Whether to apply the SIDE-index side-effects: the secondary-index
-    /// write, the spatial index write, the vector index write, and the
-    /// column-stats observe.
-    ///
-    /// `true` for autocommit user-DML callers (PointPut/Insert/Upsert/batch/
-    /// insert-select/CRDT-materialize), which own the full write. `false` for
-    /// the transactional path (`tx_point_put`): those side-effects have no
-    /// undo variant yet, so enabling them inside a transaction would leave a
-    /// rollback hole. The CORE side-effects (primary doc write — bitemporal
-    /// or plain — including its versioned-index tuples, FTS/inverted index,
-    /// doc_cache, aggregate_cache invalidation, UNIQUE enforcement, generated
-    /// columns) run regardless.
-    pub enable_side_indexes: bool,
-}
-
-/// Capture of the mutations an [`CoreLoop::apply_point_put`] performed, so a
-/// transactional caller can build an undo entry that fully reverses it.
-pub(in crate::data::executor) struct PointPutOutcome {
-    /// Prior stored bytes when this put replaced an existing row, else `None`.
-    pub prior_value: Option<Vec<u8>>,
-    /// System-time key the bitemporal version row (and its versioned index
-    /// entries) were appended at. `Some(t)` on the bitemporal branch, `None`
-    /// on the plain overwrite branch.
-    pub bitemporal_sys_from_ms: Option<i64>,
-    /// `(field, value)` pairs whose versioned index entries this op wrote at
-    /// `bitemporal_sys_from_ms`. Empty when not bitemporal / none written.
-    pub bitemporal_index_tuples: Vec<(String, String)>,
-    /// `(index_key, vector_id)` pairs this put inserted into HNSW vector
-    /// indexes, so a transactional caller can push `UndoEntry::InsertVector`
-    /// reversals. Empty unless `enable_side_indexes` was set (the transactional
-    /// path currently disables vector side-indexing, so this stays empty there
-    /// until that flag flips). Autocommit callers ignore it.
-    pub vector_inserts: Vec<(
-        (nodedb_types::DatabaseId, crate::types::TenantId, String),
-        u32,
-    )>,
-}
-
-/// Map an enforcement check's `ErrorCode` onto the crate's typed `Error`.
-///
-/// The enforcement modules under `enforcement/` are shared with the
-/// transactional path (`tx_point_put`), which surfaces `ErrorCode` directly.
-/// `apply_point_put` runs inside `crate::Result`, so violations are
-/// translated here to the equivalent `crate::Error` variant.
-pub(in crate::data::executor) fn map_enforcement_error(e: ErrorCode) -> crate::Error {
-    match e {
-        ErrorCode::AppendOnlyViolation { collection } => crate::Error::AppendOnlyViolation {
-            collection,
-            detail: "append-only collection: UPDATE rejected".to_string(),
-        },
-        ErrorCode::PeriodLocked { collection } => crate::Error::PeriodLocked {
-            collection,
-            detail: "period is closed or locked".to_string(),
-        },
-        ErrorCode::StateTransitionViolation { collection, detail } => {
-            crate::Error::StateTransitionViolation { collection, detail }
-        }
-        ErrorCode::TransitionCheckViolation { collection } => {
-            crate::Error::TransitionCheckViolation {
-                collection,
-                detail: "transition check predicate failed".to_string(),
-            }
-        }
-        ErrorCode::RetentionViolation { collection } => crate::Error::RetentionViolation {
-            collection,
-            detail: "row is younger than the configured retention period".to_string(),
-        },
-        ErrorCode::LegalHoldActive { collection } => crate::Error::LegalHoldActive {
-            collection,
-            detail: "collection has an active legal hold: DELETE rejected".to_string(),
-        },
-        other => crate::Error::Storage {
-            engine: "enforcement".into(),
-            detail: format!("unexpected enforcement error: {other:?}"),
-        },
-    }
-}
 
 impl CoreLoop {
     /// Apply a PointPut within an externally-owned WriteTransaction.
@@ -250,12 +143,23 @@ impl CoreLoop {
         // PUT checks. The common case (non-bitemporal, no put-enforcement
         // configured) skips this read entirely — `prior` for that case
         // comes solely from `put_in_txn`'s own return value.
+        //
+        // The plain (non-bitemporal) secondary-index diff also needs the old
+        // bytes: an UPDATE that changes an indexed field must drop the stale
+        // index entry, which requires knowing the prior value. So read the old
+        // value whenever side-indexes are enabled and the collection has index
+        // paths — exactly the case that would otherwise leak stale entries.
         let need_old = bitemporal
             || (enforce
                 && self
                     .doc_configs
                     .get(&config_key)
-                    .is_some_and(|config| config.enforcement.has_put_checks()));
+                    .is_some_and(|config| config.enforcement.has_put_checks()))
+            || (enable_side_indexes
+                && self
+                    .doc_configs
+                    .get(&config_key)
+                    .is_some_and(|config| !config.index_paths.is_empty()));
         let old_value = if bitemporal {
             self.sparse
                 .versioned_get_current(database_id, tid, collection, document_id)?
@@ -263,6 +167,22 @@ impl CoreLoop {
             self.sparse.get(database_id, tid, collection, document_id)?
         } else {
             None
+        };
+        // Decode the pre-write document for the non-bitemporal secondary-index
+        // SET diff. Borrowed here (before `old_value` may be moved into `prior`
+        // on the bitemporal branch below); bitemporal reverses via versioned
+        // index tuples instead, so it needs no old-doc diff.
+        // Strict collections store the old row as a Binary Tuple, which
+        // `doc_format::decode_document` cannot decode without the schema —
+        // route through the storage-mode-aware helper so strict UPDATEs also
+        // compute their real old index values (and thus drop stale entries).
+        let old_doc_for_index: Option<serde_json::Value> = if bitemporal {
+            None
+        } else {
+            match (old_value.as_ref(), self.doc_configs.get(&config_key)) {
+                (Some(b), Some(config)) => self.decode_stored_document(config, b),
+                _ => None,
+            }
         };
 
         // Stateless PUT enforcement, unified across the autocommit
@@ -404,6 +324,8 @@ impl CoreLoop {
         // write txn but that's precisely the semantics we want for the
         // "does another row already hold this value" question.
         let mut bitemporal_index_tuples: Vec<(String, String)> = Vec::new();
+        let mut secondary_index_added: Vec<(String, String)> = Vec::new();
+        let mut secondary_index_removed: Vec<(String, String)> = Vec::new();
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
         if let Some(config) = self.doc_configs.get(&config_key)
             && let Some(doc) = doc_format::decode_document(value)
@@ -459,17 +381,25 @@ impl CoreLoop {
                     }
                 }
             } else if enable_side_indexes {
-                // Non-bitemporal secondary index write: SIDE side-effect. It has
-                // no undo variant, so the transactional path skips it.
-                self.apply_secondary_indexes_in_txn(
+                // Non-bitemporal secondary index write: SIDE side-effect. The
+                // SET diff against `old_doc_for_index` inserts new values and
+                // removes stale ones (fixing the leaked-entry-on-UPDATE bug).
+                // The (added, removed) tuples are captured so a transactional
+                // caller can reverse them on rollback.
+                let (added, removed) = self.apply_secondary_indexes_in_txn(
                     txn,
-                    database_id,
-                    tid,
-                    collection,
-                    &doc,
-                    document_id,
-                    &paths,
+                    crate::data::executor::core_loop::maintenance::SecondaryIndexInputs {
+                        database_id,
+                        tid,
+                        collection,
+                        old_doc: old_doc_for_index.as_ref(),
+                        new_doc: &doc,
+                        doc_id: document_id,
+                        index_paths: &paths,
+                    },
                 );
+                secondary_index_added = added;
+                secondary_index_removed = removed;
             }
         }
 
@@ -489,6 +419,8 @@ impl CoreLoop {
             prior_value: prior,
             bitemporal_sys_from_ms: if bitemporal { Some(sys_from_ms) } else { None },
             bitemporal_index_tuples,
+            secondary_index_added,
+            secondary_index_removed,
             vector_inserts,
         })
     }

@@ -24,6 +24,12 @@ pub(in crate::data::executor) enum UndoEntry {
         /// `(field, value)` pairs whose versioned index entries this op wrote at
         /// `bitemporal_sys_from_ms`. Empty = none.
         bitemporal_index_tuples: Vec<(String, String)>,
+        /// `(field, value)` pairs this op INSERTED into the plain secondary
+        /// index. Reversed by `index_remove` on undo. Empty = none.
+        secondary_index_added: Vec<(String, String)>,
+        /// `(field, value)` pairs this op REMOVED from the plain secondary index
+        /// (stale entries on UPDATE). Restored by `index_put` on undo. Empty = none.
+        secondary_index_removed: Vec<(String, String)>,
         /// Pre-image of `chain_hashes[(tenant, collection)]` before this op
         /// mutated it. Outer `None` = op didn't touch the chain (no-op on undo);
         /// `Some(None)` = no prior entry (genesis insert → remove key on undo);
@@ -44,6 +50,10 @@ pub(in crate::data::executor) enum UndoEntry {
         /// `(field, value)` pairs whose versioned index entries this op wrote at
         /// `bitemporal_sys_from_ms`. Empty = none.
         bitemporal_index_tuples: Vec<(String, String)>,
+        /// `(field, value)` pairs the plain secondary-index cascade removed for
+        /// this document. Restored by `index_put` on undo, closing the
+        /// rolled-back-DELETE secondary-index hole. Empty = none.
+        secondary_index_tuples: Vec<(String, String)>,
         /// Pre-image of `chain_hashes[(tenant, collection)]` before this op
         /// mutated it (see [`UndoEntry::PutDocument`] for semantics).
         chain_hash_prior: Option<Option<String>>,

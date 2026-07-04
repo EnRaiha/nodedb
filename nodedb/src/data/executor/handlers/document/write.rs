@@ -83,14 +83,18 @@ impl CoreLoop {
                             }
                         }
 
-                        // Secondary index extraction.
-                        self.apply_secondary_indexes(
-                            task.request.database_id.as_u64(),
-                            tid,
-                            collection,
-                            &doc,
-                            doc_id,
-                            &index_paths,
+                        // Secondary index extraction (insert-only path: no prior
+                        // document, so the diff is pure adds; tuples unused).
+                        let _ = self.apply_secondary_indexes(
+                            crate::data::executor::core_loop::maintenance::SecondaryIndexInputs {
+                                database_id: task.request.database_id.as_u64(),
+                                tid,
+                                collection,
+                                old_doc: None,
+                                new_doc: &doc,
+                                doc_id,
+                                index_paths: &index_paths,
+                            },
                         );
                     }
                 }

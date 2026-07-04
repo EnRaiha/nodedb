@@ -60,6 +60,13 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
     /// `(field, value)` pairs whose versioned index tombstones this op wrote
     /// at `bitemporal_sys_from_ms`. Empty when not bitemporal / none written.
     pub bitemporal_index_tuples: Vec<(String, String)>,
+    /// `(field, value)` pairs the plain (non-bitemporal) secondary-index
+    /// cascade removed for this document. Captured unconditionally (the cascade
+    /// runs for both autocommit and transactional callers) so a transactional
+    /// caller can re-insert them on rollback — closing the pre-existing hole
+    /// where a rolled-back DELETE never restored its secondary-index entries.
+    /// Empty on the bitemporal path (which has no plain INDEXES entries).
+    pub secondary_index_tuples: Vec<(String, String)>,
     /// `(index_key, vector_id)` pairs this delete soft-deleted from HNSW vector
     /// indexes. Populated unconditionally (autocommit and transactional) so the
     /// owning document's vectors never orphan; a transactional caller pushes an
@@ -203,6 +210,43 @@ impl CoreLoop {
             self.sparse.delete(database_id, tid, collection, row_key)?
         };
 
+        // Capture the plain secondary-index `(field, value)` tuples this
+        // document contributed, BEFORE cascade 2 wipes them, so a transactional
+        // caller can restore them on rollback. Only the non-bitemporal path
+        // writes plain INDEXES entries (bitemporal uses versioned tombstones
+        // above), so gate on `!bitemporal`. Applies the same predicate +
+        // case-insensitive folding the forward secondary-index write uses.
+        let mut secondary_index_tuples: Vec<(String, String)> = Vec::new();
+        // `prior` is the STORED blob of the just-deleted row: MessagePack for
+        // schemaless collections, Binary Tuple for strict ones. Decode through
+        // the storage-mode-aware helper so strict tx-DELETEs also capture the
+        // real removed index tuples for rollback restore.
+        if !bitemporal
+            && let Some(ref body) = prior
+            && let Some(config) = self.doc_configs.get(&config_key)
+            && let Some(doc) = self.decode_stored_document(config, body)
+        {
+            for path in config.index_paths.clone() {
+                if let Some(ref pred) = path.predicate
+                    && !pred.evaluate_json(&doc)
+                {
+                    continue;
+                }
+                for v in crate::engine::document::store::extract_index_values(
+                    &doc,
+                    &path.path,
+                    path.is_array,
+                ) {
+                    let value = if path.case_insensitive {
+                        v.to_lowercase()
+                    } else {
+                        v
+                    };
+                    secondary_index_tuples.push((path.path.clone(), value));
+                }
+            }
+        }
+
         // Cascade 1: Remove from full-text inverted index. The inverted
         // index was populated by `apply_point_put` with the substrate row
         // key (hex surrogate), not the user-visible PK — keep the cascade
@@ -328,6 +372,7 @@ impl CoreLoop {
             prior_value: prior,
             bitemporal_sys_from_ms,
             bitemporal_index_tuples,
+            secondary_index_tuples,
             vector_deletes,
         })
     }

@@ -221,6 +221,11 @@ impl CoreLoop {
             old_value: outcome.prior_value,
             bitemporal_sys_from_ms: outcome.bitemporal_sys_from_ms,
             bitemporal_index_tuples: outcome.bitemporal_index_tuples,
+            // Empty today (this path passes `enable_side_indexes: false`, so
+            // `apply_point_put` writes no plain secondary-index entries), but
+            // wired now so rollback stays correct when that flag flips.
+            secondary_index_added: outcome.secondary_index_added,
+            secondary_index_removed: outcome.secondary_index_removed,
             chain_hash_prior,
         });
 
@@ -255,6 +260,8 @@ impl CoreLoop {
                     old_value: tw.old_value,
                     bitemporal_sys_from_ms: None,
                     bitemporal_index_tuples: Vec::new(),
+                    secondary_index_added: Vec::new(),
+                    secondary_index_removed: Vec::new(),
                     chain_hash_prior: None,
                 });
             }
@@ -311,6 +318,10 @@ impl CoreLoop {
                 old_value: old,
                 bitemporal_sys_from_ms: outcome.bitemporal_sys_from_ms,
                 bitemporal_index_tuples: outcome.bitemporal_index_tuples,
+                // NON-empty on non-bitemporal deletes: the cascade removed these
+                // plain secondary-index entries, so a rolled-back DELETE restores
+                // them (closes the pre-existing tx-DELETE rollback hole).
+                secondary_index_tuples: outcome.secondary_index_tuples,
                 chain_hash_prior: None,
             });
         }

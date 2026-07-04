@@ -70,6 +70,8 @@ fn bitemporal_put_undo_removes_version_and_index() {
         old_value: None,
         bitemporal_sys_from_ms: Some(t),
         bitemporal_index_tuples: vec![("status".into(), "active".into())],
+        secondary_index_added: Vec::new(),
+        secondary_index_removed: Vec::new(),
         chain_hash_prior: None,
     };
     core.apply_undo_document(TID, 0, entry).unwrap();
@@ -121,6 +123,7 @@ fn bitemporal_delete_undo_restores_prior_live_version() {
         old_value: b"v1".to_vec(),
         bitemporal_sys_from_ms: Some(2_000),
         bitemporal_index_tuples: vec![("status".into(), "active".into())],
+        secondary_index_tuples: Vec::new(),
         chain_hash_prior: None,
     };
     core.apply_undo_document(TID, 0, entry).unwrap();
@@ -150,6 +153,8 @@ fn chain_hash_undo_restores_prior_and_removes_genesis() {
         old_value: None,
         bitemporal_sys_from_ms: None,
         bitemporal_index_tuples: Vec::new(),
+        secondary_index_added: Vec::new(),
+        secondary_index_removed: Vec::new(),
         chain_hash_prior: Some(Some("h0".into())),
     };
     core.apply_undo_document(TID, 0, restore).unwrap();
@@ -166,6 +171,8 @@ fn chain_hash_undo_restores_prior_and_removes_genesis() {
         old_value: None,
         bitemporal_sys_from_ms: None,
         bitemporal_index_tuples: Vec::new(),
+        secondary_index_added: Vec::new(),
+        secondary_index_removed: Vec::new(),
         chain_hash_prior: Some(None),
     };
     core.apply_undo_document(TID, 0, genesis).unwrap();
@@ -225,6 +232,8 @@ fn rollback_undo_log_restores_pre_txn_state_for_bitemporal_put_then_delete() {
             old_value: None,
             bitemporal_sys_from_ms: Some(1_000),
             bitemporal_index_tuples: vec![("status".into(), "active".into())],
+            secondary_index_added: Vec::new(),
+            secondary_index_removed: Vec::new(),
             chain_hash_prior: None,
         },
         UndoEntry::DeleteDocument {
@@ -233,6 +242,7 @@ fn rollback_undo_log_restores_pre_txn_state_for_bitemporal_put_then_delete() {
             old_value: b"v1".to_vec(),
             bitemporal_sys_from_ms: Some(2_000),
             bitemporal_index_tuples: vec![("status".into(), "active".into())],
+            secondary_index_tuples: Vec::new(),
             chain_hash_prior: None,
         },
     ];
@@ -270,6 +280,8 @@ fn plain_put_undo_backward_compatible() {
         old_value: Some(b"old".to_vec()),
         bitemporal_sys_from_ms: None,
         bitemporal_index_tuples: Vec::new(),
+        secondary_index_added: Vec::new(),
+        secondary_index_removed: Vec::new(),
         chain_hash_prior: None,
     };
     core.apply_undo_document(TID, 0, overwrite).unwrap();
@@ -287,6 +299,8 @@ fn plain_put_undo_backward_compatible() {
         old_value: None,
         bitemporal_sys_from_ms: None,
         bitemporal_index_tuples: Vec::new(),
+        secondary_index_added: Vec::new(),
+        secondary_index_removed: Vec::new(),
         chain_hash_prior: None,
     };
     core.apply_undo_document(TID, 0, insert).unwrap();
@@ -305,6 +319,7 @@ fn plain_delete_undo_backward_compatible() {
         old_value: b"prior".to_vec(),
         bitemporal_sys_from_ms: None,
         bitemporal_index_tuples: Vec::new(),
+        secondary_index_tuples: Vec::new(),
         chain_hash_prior: None,
     };
     core.apply_undo_document(TID, 0, entry).unwrap();

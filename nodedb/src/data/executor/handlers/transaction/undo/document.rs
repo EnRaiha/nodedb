@@ -30,6 +30,8 @@ impl CoreLoop {
                 old_value,
                 bitemporal_sys_from_ms,
                 bitemporal_index_tuples,
+                secondary_index_added,
+                secondary_index_removed,
                 chain_hash_prior,
             } => {
                 if let Some(sys_from_ms) = bitemporal_sys_from_ms {
@@ -84,6 +86,18 @@ impl CoreLoop {
                         )
                     })?;
                 }
+                // Reverse plain secondary-index mutations: undo the inserts and
+                // restore the stale entries this put removed. Empty on the
+                // bitemporal path (its index reversal happened in
+                // `undo_bitemporal_write` above), so this is a no-op there.
+                self.undo_secondary_index(
+                    tid,
+                    entry_index,
+                    &collection,
+                    &document_id,
+                    &secondary_index_added,
+                    &secondary_index_removed,
+                )?;
                 // Revert inverted index — best-effort; FTS index inconsistency is
                 // recoverable via re-index, unlike primary store inconsistency.
                 let _ = self.inverted.remove_document(
@@ -110,6 +124,7 @@ impl CoreLoop {
                 old_value,
                 bitemporal_sys_from_ms,
                 bitemporal_index_tuples,
+                secondary_index_tuples,
                 chain_hash_prior,
             } => {
                 if let Some(sys_from_ms) = bitemporal_sys_from_ms {
@@ -146,6 +161,17 @@ impl CoreLoop {
                             )
                         })?;
                 }
+                // Restore the plain secondary-index entries the forward delete
+                // cascade removed. Empty on the bitemporal path (no plain
+                // INDEXES entries there), so this is a no-op for it.
+                self.undo_secondary_index(
+                    tid,
+                    entry_index,
+                    &collection,
+                    &document_id,
+                    &[],
+                    &secondary_index_tuples,
+                )?;
                 // Evict any cached copy of the reversed document (see the
                 // PutDocument branch): reversing a delete restores the row, so a
                 // stale post-delete cache entry must not linger.
@@ -216,6 +242,51 @@ impl CoreLoop {
                 .map_err(|e| map_err("index remove", e.to_string()))?;
         }
         txn.commit().map_err(|e| map_err("commit", e.to_string()))?;
+        Ok(())
+    }
+
+    /// Reverse plain (non-bitemporal) secondary-index mutations from a
+    /// rolled-back document write.
+    ///
+    /// `to_remove` were INSERTED on the forward path → delete them; `to_restore`
+    /// were REMOVED on the forward path (stale UPDATE entries, or a DELETE's
+    /// cascade) → re-insert them. Fatal on failure like the primary-store
+    /// restore, so a partial index rollback surfaces as `RollbackFailed` rather
+    /// than silently diverging the secondary index from the primary store.
+    fn undo_secondary_index(
+        &self,
+        tid: u64,
+        entry_index: usize,
+        collection: &str,
+        document_id: &str,
+        to_remove: &[(String, String)],
+        to_restore: &[(String, String)],
+    ) -> Result<(), (usize, String)> {
+        let database_id = crate::types::DatabaseId::DEFAULT.as_u64();
+        let map_err = |stage: &str, e: String| {
+            error!(
+                core = self.core_id,
+                entry_index,
+                collection = %collection,
+                document_id = %document_id,
+                error = %e,
+                "transaction undo: secondary-index reversal failed; shard state unknown"
+            );
+            (
+                entry_index,
+                format!("secondary-index {stage} on {collection}/{document_id}: {e}"),
+            )
+        };
+        for (field, value) in to_remove {
+            self.sparse
+                .index_remove(database_id, tid, collection, field, value, document_id)
+                .map_err(|e| map_err("remove", e.to_string()))?;
+        }
+        for (field, value) in to_restore {
+            self.sparse
+                .index_put(database_id, tid, collection, field, value, document_id)
+                .map_err(|e| map_err("restore", e.to_string()))?;
+        }
         Ok(())
     }
 

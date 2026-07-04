@@ -6,9 +6,23 @@
 //! Extracted from `btree.rs` — document CRUD stays there, index ops live here.
 
 use redb::ReadableTable;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::btree::{DOCUMENTS, INDEXES, SparseEngine, coll_prefix, redb_err};
+
+/// Identifies a single secondary-index entry for an in-txn mutation.
+///
+/// Grouping the tenant-scoped key components into one struct keeps
+/// [`SparseEngine::index_remove_in_txn`] to two arguments rather than the
+/// seven positional args its `index_put_in_txn` sibling carries.
+pub struct IndexEntryTxn<'a> {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub collection: &'a str,
+    pub field: &'a str,
+    pub value: &'a str,
+    pub document_id: &'a str,
+}
 
 impl SparseEngine {
     /// Delete all secondary index entries for a document.
@@ -113,140 +127,6 @@ impl SparseEngine {
         }
 
         Ok(removed)
-    }
-
-    /// Delete ALL documents and indexes for a single `(tenant_id, collection)`.
-    ///
-    /// Collection-scoped analogue of [`delete_all_for_tenant`]. Used by
-    /// `execute_unregister_collection` when a collection is hard-dropped.
-    pub fn delete_all_for_collection(
-        &self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-    ) -> crate::Result<(usize, usize)> {
-        let prefix = coll_prefix(database_id, tenant_id, collection);
-        let end = format!("{prefix}\u{ffff}");
-
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| redb_err("write txn", e))?;
-
-        let docs_removed;
-        {
-            let mut table = write_txn
-                .open_table(DOCUMENTS)
-                .map_err(|e| redb_err("open docs", e))?;
-            let keys: Vec<String> = table
-                .range(prefix.as_str()..end.as_str())
-                .map_err(|e| redb_err("doc range", e))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
-                .collect();
-            docs_removed = keys.len();
-            for key in &keys {
-                table
-                    .remove(key.as_str())
-                    .map_err(|e| redb_err("remove doc", e))?;
-            }
-        }
-
-        let idx_removed;
-        {
-            let mut table = write_txn
-                .open_table(INDEXES)
-                .map_err(|e| redb_err("open indexes", e))?;
-            let keys: Vec<String> = table
-                .range(prefix.as_str()..end.as_str())
-                .map_err(|e| redb_err("index range", e))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
-                .collect();
-            idx_removed = keys.len();
-            for key in &keys {
-                table
-                    .remove(key.as_str())
-                    .map_err(|e| redb_err("remove index", e))?;
-            }
-        }
-
-        write_txn
-            .commit()
-            .map_err(|e| redb_err("commit collection purge", e))?;
-
-        if docs_removed > 0 || idx_removed > 0 {
-            info!(
-                tenant_id,
-                collection, docs_removed, idx_removed, "collection data purged from sparse engine"
-            );
-        }
-
-        Ok((docs_removed, idx_removed))
-    }
-
-    /// Delete ALL documents and indexes for a tenant across all collections
-    /// within a single database. A tenant lives in exactly one database, so
-    /// the purge is scoped by `(database_id, tenant_id)`.
-    pub fn delete_all_for_tenant(
-        &self,
-        database_id: u64,
-        tenant_id: u64,
-    ) -> crate::Result<(usize, usize)> {
-        let prefix = super::btree::tenant_prefix(database_id, tenant_id);
-        let end = format!("{prefix}\u{ffff}");
-
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| redb_err("write txn", e))?;
-
-        let docs_removed;
-        {
-            let mut table = write_txn
-                .open_table(DOCUMENTS)
-                .map_err(|e| redb_err("open docs", e))?;
-            let keys: Vec<String> = table
-                .range(prefix.as_str()..end.as_str())
-                .map_err(|e| redb_err("doc range", e))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
-                .collect();
-            docs_removed = keys.len();
-            for key in &keys {
-                table
-                    .remove(key.as_str())
-                    .map_err(|e| redb_err("remove doc", e))?;
-            }
-        }
-
-        let idx_removed;
-        {
-            let mut table = write_txn
-                .open_table(INDEXES)
-                .map_err(|e| redb_err("open indexes", e))?;
-            let keys: Vec<String> = table
-                .range(prefix.as_str()..end.as_str())
-                .map_err(|e| redb_err("index range", e))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
-                .collect();
-            idx_removed = keys.len();
-            for key in &keys {
-                table
-                    .remove(key.as_str())
-                    .map_err(|e| redb_err("remove index", e))?;
-            }
-        }
-
-        write_txn
-            .commit()
-            .map_err(|e| redb_err("commit tenant purge", e))?;
-
-        if docs_removed > 0 || idx_removed > 0 {
-            info!(
-                tenant_id,
-                docs_removed, idx_removed, "tenant data purged from sparse engine"
-            );
-        }
-
-        Ok((docs_removed, idx_removed))
     }
 
     /// Range scan on secondary index entries.
@@ -373,6 +253,73 @@ impl SparseEngine {
                 table
                     .insert(key, [].as_slice())
                     .map_err(|e| redb_err("index insert", e))?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Remove a secondary index entry from an already-open write txn.
+    ///
+    /// Mirror of [`Self::index_put_in_txn`] using the same tenant-scoped key
+    /// format (`with_tenant_key4`), but `remove`s the entry instead of
+    /// inserting it. Used by the UPDATE stale-entry diff so a changed field
+    /// value drops its old index row inside the caller's write transaction.
+    pub fn index_remove_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        entry: IndexEntryTxn<'_>,
+    ) -> crate::Result<()> {
+        super::btree::with_tenant_key4(
+            entry.database_id,
+            entry.tenant_id,
+            entry.collection,
+            entry.field,
+            entry.value,
+            entry.document_id,
+            |key| {
+                let mut table = txn
+                    .open_table(INDEXES)
+                    .map_err(|e| redb_err("open table", e))?;
+                table.remove(key).map_err(|e| redb_err("index remove", e))?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Remove a secondary index entry (tenant-scoped), opening its own write
+    /// transaction.
+    ///
+    /// Mirror of [`Self::index_put`]. Used by the transaction rollback undo
+    /// path, which runs outside any caller-owned write txn, to reverse a
+    /// forward index write.
+    pub fn index_remove(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        field: &str,
+        value: &str,
+        document_id: &str,
+    ) -> crate::Result<()> {
+        super::btree::with_tenant_key4(
+            database_id,
+            tenant_id,
+            collection,
+            field,
+            value,
+            document_id,
+            |key| {
+                let write_txn = self
+                    .db
+                    .begin_write()
+                    .map_err(|e| redb_err("write txn", e))?;
+                {
+                    let mut table = write_txn
+                        .open_table(INDEXES)
+                        .map_err(|e| redb_err("open table", e))?;
+                    table.remove(key).map_err(|e| redb_err("index remove", e))?;
+                }
+                write_txn.commit().map_err(|e| redb_err("commit", e))?;
                 Ok(())
             },
         )
