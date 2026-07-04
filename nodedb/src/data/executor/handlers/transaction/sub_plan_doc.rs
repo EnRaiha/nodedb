@@ -22,6 +22,12 @@ pub(super) struct TxPointPut<'a> {
     pub surrogate: nodedb_types::Surrogate,
     pub value: &'a [u8],
     pub user_roles: &'a [String],
+    /// Insert-vs-upsert semantics. `None` = PUT/upsert (overwrite is allowed,
+    /// no existence probe). `Some(if_absent)` = INSERT semantics: probe for an
+    /// existing primary key under the same write txn and, if present, either
+    /// silently skip (`if_absent = true`, `INSERT ... ON CONFLICT DO NOTHING`)
+    /// or reject with a `unique` constraint violation (`if_absent = false`).
+    pub insert_if_absent: Option<bool>,
 }
 
 /// Parameters for [`CoreLoop::tx_point_delete`].
@@ -35,6 +41,32 @@ pub(super) struct TxPointDelete<'a> {
 }
 
 impl CoreLoop {
+    /// Restore a hash-chain head pre-image after an aborted insert.
+    ///
+    /// `mutated` is whether this op actually advanced the chain head (only true
+    /// on an insert into a hash-chain collection). `prior` is the captured
+    /// pre-image: `None` = not a hash-chain collection; `Some(None)` = no prior
+    /// head (genesis); `Some(Some(prev))` = restore this head.
+    fn restore_chain_head(
+        &mut self,
+        mutated: bool,
+        config_key: &(TenantId, String),
+        prior: &Option<Option<String>>,
+    ) {
+        if !mutated {
+            return;
+        }
+        match prior {
+            Some(None) => {
+                self.chain_hashes.remove(config_key);
+            }
+            Some(Some(prev)) => {
+                self.chain_hashes.insert(config_key.clone(), prev.clone());
+            }
+            None => {}
+        }
+    }
+
     /// Execute a PointPut within a transaction.
     pub(super) fn tx_point_put(
         &mut self,
@@ -49,6 +81,7 @@ impl CoreLoop {
             surrogate,
             value,
             user_roles,
+            insert_if_absent,
         } = p;
         let row_key = crate::engine::document::store::surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
@@ -104,6 +137,47 @@ impl CoreLoop {
             detail: e.to_string(),
         })?;
 
+        // INSERT semantics: probe for an existing primary key under the SAME
+        // write txn we will commit through — linearizable with the write, so no
+        // concurrent writer can slip a row in between the probe and the commit.
+        // Mirrors autocommit `execute_point_insert`. PUT/upsert (`None`) skips
+        // this entirely and keeps overwrite behaviour.
+        if let Some(if_absent) = insert_if_absent {
+            let exists_result = if self.is_bitemporal(tid, collection) {
+                self.sparse.versioned_exists_current_in_txn(
+                    &txn,
+                    database_id,
+                    tid,
+                    collection,
+                    row_key,
+                )
+            } else {
+                self.sparse
+                    .exists_in_txn(&txn, database_id, tid, collection, row_key)
+            };
+            let exists = exists_result.map_err(|e| {
+                // Restore any chain-head pre-image mutated above before bailing.
+                self.restore_chain_head(chained.is_some(), &config_key, &chain_hash_prior);
+                ErrorCode::from(e)
+            })?;
+            if exists {
+                // No write, no undo push — drop the txn without committing.
+                self.restore_chain_head(chained.is_some(), &config_key, &chain_hash_prior);
+                if if_absent {
+                    // `INSERT ... ON CONFLICT DO NOTHING`: silent skip.
+                    return Ok(self.response_ok(dummy_task));
+                }
+                return Err(ErrorCode::from(crate::Error::RejectedConstraint {
+                    collection: collection.to_string(),
+                    constraint: "unique".to_string(),
+                    detail: format!(
+                        "duplicate key value '{document_id}' violates primary-key \
+                         uniqueness on '{collection}'"
+                    ),
+                }));
+            }
+        }
+
         // Core write path shared with the autocommit callers: bitemporal-vs-plain
         // primary doc write, FTS/inverted, doc_cache, aggregate-cache
         // invalidation, UNIQUE enforcement, generated columns, and stateless PUT
@@ -130,17 +204,7 @@ impl CoreLoop {
                 // `apply_point_put` rejected the write (e.g. UNIQUE violation)
                 // after we mutated the chain head. Restore the pre-image so the
                 // aborted op leaves no trace, then propagate the typed error.
-                if chained.is_some() {
-                    match &chain_hash_prior {
-                        Some(None) => {
-                            self.chain_hashes.remove(&config_key);
-                        }
-                        Some(Some(prev)) => {
-                            self.chain_hashes.insert(config_key.clone(), prev.clone());
-                        }
-                        None => {}
-                    }
-                }
+                self.restore_chain_head(chained.is_some(), &config_key, &chain_hash_prior);
                 return Err(e.into());
             }
         };

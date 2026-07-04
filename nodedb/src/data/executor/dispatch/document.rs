@@ -94,13 +94,15 @@ impl CoreLoop {
                 if_absent,
                 surrogate,
             } => self.execute_point_insert(
-                task,
-                tid,
-                collection,
-                document_id,
-                *surrogate,
-                value,
-                *if_absent,
+                crate::data::executor::handlers::point::insert::PointInsertParams {
+                    task,
+                    tid,
+                    collection,
+                    document_id,
+                    surrogate: *surrogate,
+                    value,
+                    if_absent: *if_absent,
+                },
             ),
 
             DocumentOp::PointDelete {

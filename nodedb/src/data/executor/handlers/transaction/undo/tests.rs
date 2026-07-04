@@ -172,6 +172,90 @@ fn chain_hash_undo_restores_prior_and_removes_genesis() {
     assert!(!core.chain_hashes.contains_key(&key()));
 }
 
+/// Scenario 4 (unit level): a rolled-back transaction that does a
+/// bitemporal PUT followed by a bitemporal DELETE (tombstone) must, via
+/// `rollback_undo_log` — the same reverse-order driver `execute_transaction_batch`
+/// uses on abort — restore `core.sparse.versioned_get_current` to its
+/// pre-transaction state (nothing) with the version rows and index entries
+/// physically gone, not merely hidden.
+#[test]
+fn rollback_undo_log_restores_pre_txn_state_for_bitemporal_put_then_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+    // Pre-txn state: nothing exists for "d1".
+    assert!(
+        core.sparse
+            .versioned_get_current(DB, TID, "c", "d1")
+            .unwrap()
+            .is_none()
+    );
+
+    // Forward tx: PUT at t=1000, then DELETE (tombstone) at t=2000.
+    seed_version(&core, "d1", 1_000, b"v1");
+    seed_index(&core, "d1", 1_000);
+    core.sparse
+        .versioned_tombstone(DB, TID, "c", "d1", 2_000)
+        .unwrap();
+    core.sparse
+        .versioned_index_tombstone(VersionedIndexEntry {
+            database_id: DB,
+            tenant: TID,
+            coll: "c",
+            field: "status",
+            value: "active",
+            doc_id: "d1",
+            sys_from_ms: 2_000,
+        })
+        .unwrap();
+
+    // Sanity: the forward tx did delete the row (as observed mid-tx).
+    assert!(
+        core.sparse
+            .versioned_get_current(DB, TID, "c", "d1")
+            .unwrap()
+            .is_none()
+    );
+
+    let undo_log = vec![
+        UndoEntry::PutDocument {
+            collection: "c".into(),
+            document_id: "d1".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            old_value: None,
+            bitemporal_sys_from_ms: Some(1_000),
+            bitemporal_index_tuples: vec![("status".into(), "active".into())],
+            chain_hash_prior: None,
+        },
+        UndoEntry::DeleteDocument {
+            collection: "c".into(),
+            document_id: "d1".into(),
+            old_value: b"v1".to_vec(),
+            bitemporal_sys_from_ms: Some(2_000),
+            bitemporal_index_tuples: vec![("status".into(), "active".into())],
+            chain_hash_prior: None,
+        },
+    ];
+
+    // Abort: roll back in reverse order, exactly as `execute_transaction_batch`
+    // does when a sub-plan fails.
+    core.rollback_undo_log(DB, TID, undo_log)
+        .expect("rollback must succeed");
+
+    // Pre-txn state restored: no current version, no index entry.
+    assert!(
+        core.sparse
+            .versioned_get_current(DB, TID, "c", "d1")
+            .unwrap()
+            .is_none(),
+        "aborted bitemporal put+delete must leave no current version behind"
+    );
+    assert!(
+        index_lookup(&core).is_empty(),
+        "aborted bitemporal put+delete must leave no index entry behind"
+    );
+}
+
 #[test]
 fn plain_put_undo_backward_compatible() {
     let dir = tempfile::tempdir().unwrap();

@@ -69,6 +69,7 @@ impl CoreLoop {
                     surrogate: *surrogate,
                     value,
                     user_roles,
+                    insert_if_absent: None,
                 },
                 undo_log,
             ),
@@ -79,39 +80,19 @@ impl CoreLoop {
                 value,
                 if_absent,
                 surrogate,
-            }) => {
-                let row_key = crate::engine::document::store::surrogate_to_doc_id(*surrogate);
-                let exists = self
-                    .sparse
-                    .get(DatabaseId::DEFAULT.as_u64(), tid, collection, &row_key)
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if exists {
-                    if *if_absent {
-                        return Ok(self.response_ok(&dummy_task));
-                    }
-                    return Err(ErrorCode::RejectedConstraint {
-                        constraint: "unique".to_string(),
-                        detail: format!(
-                            "duplicate key value '{document_id}' violates primary-key \
-                             uniqueness on '{collection}'"
-                        ),
-                    });
-                }
-                self.tx_point_put(
-                    TxPointPut {
-                        task: &dummy_task,
-                        tid,
-                        collection,
-                        document_id,
-                        surrogate: *surrogate,
-                        value,
-                        user_roles,
-                    },
-                    undo_log,
-                )
-            }
+            }) => self.tx_point_put(
+                TxPointPut {
+                    task: &dummy_task,
+                    tid,
+                    collection,
+                    document_id,
+                    surrogate: *surrogate,
+                    value,
+                    user_roles,
+                    insert_if_absent: Some(*if_absent),
+                },
+                undo_log,
+            ),
 
             PhysicalPlan::Document(DocumentOp::PointDelete {
                 collection,

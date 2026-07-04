@@ -17,18 +17,33 @@ use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_types::Surrogate;
 
+/// Parameters for [`CoreLoop::execute_point_insert`].
+pub(in crate::data::executor) struct PointInsertParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub surrogate: Surrogate,
+    pub value: &'a [u8],
+    /// `INSERT ... ON CONFLICT DO NOTHING` flag: silently skip on a duplicate
+    /// primary key instead of raising a `unique` constraint violation.
+    pub if_absent: bool,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_point_insert(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        document_id: &str,
-        surrogate: Surrogate,
-        value: &[u8],
-        if_absent: bool,
+        p: PointInsertParams<'_>,
     ) -> Response {
+        let PointInsertParams {
+            task,
+            tid,
+            collection,
+            document_id,
+            surrogate,
+            value,
+            if_absent,
+        } = p;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
         debug!(
