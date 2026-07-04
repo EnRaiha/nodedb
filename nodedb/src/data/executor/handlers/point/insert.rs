@@ -92,6 +92,8 @@ impl CoreLoop {
                 surrogate,
                 value,
                 index_text: true,
+                user_roles: &task.request.user_roles,
+                enforce: true,
             },
         ) {
             return self.response_error(task, e);

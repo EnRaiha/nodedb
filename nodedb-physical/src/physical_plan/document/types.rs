@@ -83,6 +83,19 @@ pub struct EnforcementOptions {
     pub generated_columns: Vec<GeneratedColumnSpec>,
 }
 
+impl EnforcementOptions {
+    /// Whether this collection has any stateless PUT-path enforcement
+    /// configured (append-only, period lock, state transitions, or
+    /// transition-check predicates). Used to decide whether the caller
+    /// needs a pre-write read of the prior document to feed those checks.
+    pub fn has_put_checks(&self) -> bool {
+        self.append_only
+            || self.period_lock.is_some()
+            || !self.state_constraints.is_empty()
+            || !self.transition_checks.is_empty()
+    }
+}
+
 /// A stored generated column: expression evaluated at write time.
 #[derive(
     Debug,

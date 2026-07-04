@@ -8,7 +8,12 @@
 use redb::WriteTransaction;
 use tracing::warn;
 
+use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::{
+    append_only, period_lock, state_transition, transition_check,
+};
+use crate::data::executor::{doc_format, strict_format};
 use nodedb_types::Surrogate;
 
 /// Parameters for [`CoreLoop::apply_point_put`].
@@ -26,6 +31,51 @@ pub(in crate::data::executor) struct PointPutParams<'a> {
     /// path receives text via a separate `FtsIndexDoc` sync frame, so indexing
     /// here too would double-index the same surrogate.
     pub index_text: bool,
+    /// Roles held by the authenticated user, consumed by role-gated state
+    /// transition constraints. Empty for internal/system callers.
+    pub user_roles: &'a [String],
+    /// Whether to run stateless PUT enforcement (append-only, period lock,
+    /// state transitions, transition-check predicates).
+    ///
+    /// `true` for user-DML callers (PointPut/Insert/Upsert/batch/
+    /// insert-select), which must be admission-checked. `false` for
+    /// CRDT-sync materialization: those deltas already passed admission on
+    /// their origin replica (CRDT constraint validation happens at the Raft
+    /// commit phase), so re-running enforcement here would double-check
+    /// already-accepted writes.
+    pub enforce: bool,
+}
+
+/// Map an enforcement check's `ErrorCode` onto the crate's typed `Error`.
+///
+/// The enforcement modules under `enforcement/` are shared with the
+/// transactional path (`tx_point_put`), which surfaces `ErrorCode` directly.
+/// `apply_point_put` runs inside `crate::Result`, so violations are
+/// translated here to the equivalent `crate::Error` variant.
+fn map_enforcement_error(e: ErrorCode) -> crate::Error {
+    match e {
+        ErrorCode::AppendOnlyViolation { collection } => crate::Error::AppendOnlyViolation {
+            collection,
+            detail: "append-only collection: UPDATE rejected".to_string(),
+        },
+        ErrorCode::PeriodLocked { collection } => crate::Error::PeriodLocked {
+            collection,
+            detail: "period is closed or locked".to_string(),
+        },
+        ErrorCode::StateTransitionViolation { collection, detail } => {
+            crate::Error::StateTransitionViolation { collection, detail }
+        }
+        ErrorCode::TransitionCheckViolation { collection } => {
+            crate::Error::TransitionCheckViolation {
+                collection,
+                detail: "transition check predicate failed".to_string(),
+            }
+        }
+        other => crate::Error::Storage {
+            engine: "enforcement".into(),
+            detail: format!("unexpected enforcement error: {other:?}"),
+        },
+    }
 }
 
 impl CoreLoop {
@@ -55,13 +105,15 @@ impl CoreLoop {
             surrogate,
             value,
             index_text,
+            user_roles,
+            enforce,
         } = params;
         // Evaluate generated columns before encoding.
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
         let value = if let Some(config) = self.doc_configs.get(&config_key)
             && !config.enforcement.generated_columns.is_empty()
         {
-            if let Some(mut doc) = super::super::super::doc_format::decode_document(value) {
+            if let Some(mut doc) = doc_format::decode_document(value) {
                 if let Err(e) = super::super::generated::evaluate_generated_columns(
                     &mut doc,
                     &config.enforcement.generated_columns,
@@ -71,12 +123,12 @@ impl CoreLoop {
                         detail: format!("generated column evaluation failed: {e:?}"),
                     });
                 }
-                super::super::super::doc_format::encode_to_msgpack(&doc)
+                doc_format::encode_to_msgpack(&doc)
             } else {
                 value.to_vec()
             }
         } else {
-            super::super::super::doc_format::canonicalize_document_for_storage(value)
+            doc_format::canonicalize_document_for_storage(value)
         };
         let value = &value;
 
@@ -121,7 +173,7 @@ impl CoreLoop {
             };
 
             let stored = if bitemporal && schema.bitemporal {
-                super::super::super::strict_format::bytes_to_binary_tuple_bitemporal(
+                strict_format::bytes_to_binary_tuple_bitemporal(
                     encoded_input,
                     schema,
                     sys_from_ms,
@@ -129,7 +181,7 @@ impl CoreLoop {
                     valid_until_ms,
                 )
             } else {
-                super::super::super::strict_format::bytes_to_binary_tuple(encoded_input, schema)
+                strict_format::bytes_to_binary_tuple(encoded_input, schema)
             }
             .map_err(|e| crate::Error::Serialization {
                 format: "binary_tuple".into(),
@@ -141,14 +193,86 @@ impl CoreLoop {
             (value, value.to_vec())
         };
 
-        // Bitemporal collections version every write: read the current
-        // (pre-write) version for the `prior` slot, then append a new
-        // version at `sys_from = now()`. Non-bitemporal collections use
+        // Read the prior stored value before the write lands, but only when
+        // something downstream actually needs it: bitemporal collections
+        // always need the current version (it becomes `prior` below), and
+        // enforcement-configured collections need it to feed the stateless
+        // PUT checks. The common case (non-bitemporal, no put-enforcement
+        // configured) skips this read entirely — `prior` for that case
+        // comes solely from `put_in_txn`'s own return value.
+        let need_old = bitemporal
+            || (enforce
+                && self
+                    .doc_configs
+                    .get(&config_key)
+                    .is_some_and(|config| config.enforcement.has_put_checks()));
+        let old_value = if bitemporal {
+            self.sparse
+                .versioned_get_current(database_id, tid, collection, document_id)?
+        } else if need_old {
+            self.sparse.get(database_id, tid, collection, document_id)?
+        } else {
+            None
+        };
+
+        // Stateless PUT enforcement, unified across the autocommit
+        // (`apply_point_put`) and transactional (`tx_point_put`) paths.
+        // These checks have no persistent side effect, so a violation here
+        // simply aborts before the write — safe even though the caller
+        // owns a single redb write transaction. Reuses `config_key` from
+        // the generated-columns lookup above.
+        //
+        // Skipped entirely for CRDT-sync materialization (`enforce ==
+        // false`): those deltas already passed admission on their origin
+        // replica at Raft commit time.
+        if enforce && let Some(config) = self.doc_configs.get(&config_key) {
+            append_only::check_point_put(collection, &config.enforcement, &old_value)
+                .map_err(map_enforcement_error)?;
+            if let Some(ref pl) = config.enforcement.period_lock {
+                period_lock::check_period_lock(
+                    &self.sparse,
+                    database_id,
+                    tid,
+                    collection,
+                    value,
+                    pl,
+                )
+                .map_err(map_enforcement_error)?;
+            }
+            if old_value.is_some() {
+                let old_json = old_value
+                    .as_ref()
+                    .and_then(|b| doc_format::decode_document(b));
+                let new_json = doc_format::decode_document(value);
+                if let (Some(old_doc), Some(new_doc)) = (&old_json, &new_json) {
+                    if !config.enforcement.state_constraints.is_empty() {
+                        state_transition::check_state_transitions(
+                            collection,
+                            &config.enforcement.state_constraints,
+                            old_doc,
+                            new_doc,
+                            user_roles,
+                        )
+                        .map_err(map_enforcement_error)?;
+                    }
+                    if !config.enforcement.transition_checks.is_empty() {
+                        transition_check::check_transition_predicates(
+                            collection,
+                            &config.enforcement.transition_checks,
+                            old_doc,
+                            new_doc,
+                        )
+                        .map_err(map_enforcement_error)?;
+                    }
+                }
+            }
+        }
+
+        // Bitemporal collections version every write: append a new version
+        // at `sys_from = now()`, returning the current (pre-write) version
+        // read above as the `prior` slot. Non-bitemporal collections use
         // the legacy overwrite path, returning the old bytes redb replaced.
         let prior = if bitemporal {
-            let current =
-                self.sparse
-                    .versioned_get_current(database_id, tid, collection, document_id)?;
             self.sparse.versioned_put_in_txn(
                 txn,
                 crate::engine::sparse::btree_versioned::VersionedPut {
@@ -162,7 +286,7 @@ impl CoreLoop {
                     body: &stored,
                 },
             )?;
-            current
+            old_value
         } else {
             self.sparse
                 .put_in_txn(txn, database_id, tid, collection, document_id, &stored)?
@@ -171,7 +295,7 @@ impl CoreLoop {
         // Text indexing and stats use the original JSON input, not the stored
         // bytes — Binary Tuple requires a schema to decode, and the input JSON
         // is already available here regardless of storage mode.
-        if let Some(doc) = super::super::super::doc_format::decode_document(value) {
+        if let Some(doc) = doc_format::decode_document(value) {
             if let Some(obj) = doc.as_object() {
                 let text_content: String = obj
                     .values()
@@ -226,18 +350,18 @@ impl CoreLoop {
         // "does another row already hold this value" question.
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
         if let Some(config) = self.doc_configs.get(&config_key)
-            && let Some(doc) = super::super::super::doc_format::decode_document(value)
+            && let Some(doc) = doc_format::decode_document(value)
         {
             let paths = config.index_paths.clone();
-            check_unique_constraints(
-                &self.sparse,
+            check_unique_constraints(UniqueCheck {
+                sparse: &self.sparse,
                 database_id,
                 tid,
                 collection,
-                &doc,
+                doc: &doc,
                 document_id,
-                &paths,
-            )?;
+                paths: &paths,
+            })?;
             if bitemporal {
                 let sys_from = self.bitemporal_now_ms();
                 for path in &paths {
@@ -258,13 +382,15 @@ impl CoreLoop {
                         };
                         self.sparse.versioned_index_put_in_txn(
                             txn,
-                            database_id,
-                            tid,
-                            collection,
-                            &path.path,
-                            &value,
-                            document_id,
-                            sys_from,
+                            crate::engine::sparse::btree_versioned::VersionedIndexEntry {
+                                database_id,
+                                tenant: tid,
+                                coll: collection,
+                                field: &path.path,
+                                value: &value,
+                                doc_id: document_id,
+                                sys_from_ms: sys_from,
+                            },
                         )?;
                     }
                 }
@@ -295,17 +421,29 @@ impl CoreLoop {
 /// transaction is still clean — rejection does not roll anything back.
 /// Same-id re-puts (idempotent overwrites) are allowed through; we only
 /// reject when another row owns the value.
-#[allow(clippy::too_many_arguments)]
-fn check_unique_constraints(
-    sparse: &crate::engine::sparse::btree::SparseEngine,
+/// Parameters for [`check_unique_constraints`].
+struct UniqueCheck<'a> {
+    sparse: &'a crate::engine::sparse::btree::SparseEngine,
     database_id: u64,
     tid: u64,
-    collection: &str,
-    doc: &serde_json::Value,
-    document_id: &str,
-    paths: &[crate::engine::document::store::IndexPath],
-) -> crate::Result<()> {
+    collection: &'a str,
+    doc: &'a serde_json::Value,
+    document_id: &'a str,
+    paths: &'a [crate::engine::document::store::IndexPath],
+}
+
+fn check_unique_constraints(c: UniqueCheck<'_>) -> crate::Result<()> {
     use crate::engine::document::store::extract_index_values;
+
+    let UniqueCheck {
+        sparse,
+        database_id,
+        tid,
+        collection,
+        doc,
+        document_id,
+        paths,
+    } = c;
 
     let doc_engine = crate::engine::document::store::DocumentEngine::new(sparse, database_id, tid);
     for path in paths {

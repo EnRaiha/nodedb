@@ -101,6 +101,8 @@ impl CoreLoop {
                 surrogate,
                 value,
                 index_text: false,
+                user_roles: &task.request.user_roles,
+                enforce: false,
             },
         ) {
             Ok(p) => p,
