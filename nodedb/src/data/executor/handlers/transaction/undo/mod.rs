@@ -8,6 +8,7 @@ pub(super) mod document;
 pub(super) mod entry;
 pub(super) mod rollback;
 pub(super) mod spatial;
+pub(super) mod stats;
 
 #[cfg(test)]
 mod tests;

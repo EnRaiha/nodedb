@@ -248,6 +248,14 @@ impl CoreLoop {
             undo_log.push(UndoEntry::SpatialInsert { key, entry_id });
         }
 
+        // Reverse the column-stats read-modify-write on rollback by restoring
+        // each captured pre-image. Empty today (the transactional path disables
+        // stats writes via `enable_side_indexes: false`), so this is a no-op
+        // until that flag flips — wired now so it stays correct when it does.
+        for (key, prior) in outcome.stats_prior {
+            undo_log.push(UndoEntry::StatsRestore { key, prior });
+        }
+
         if is_insert
             && let Some(config) = self.doc_configs.get(&config_key)
             && !config.enforcement.materialized_sum_sources.is_empty()

@@ -62,6 +62,7 @@ impl CoreLoop {
             | UndoEntry::KvTransferItem { .. } => self.apply_undo_kv(did, tid, entry_index, entry),
             UndoEntry::ColumnarInsert { .. } => self.apply_undo_columnar(entry_index, entry),
             UndoEntry::TimeseriesIngest { .. } => self.apply_undo_timeseries(entry_index, entry),
+            UndoEntry::StatsRestore { .. } => self.apply_undo_stats(entry_index, entry),
         }
     }
 }

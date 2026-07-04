@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
 /// Key: "{database_id}:{tenant}:{collection}:{field}" → Value: serialized ColumnStats.
 const COLUMN_STATS: TableDefinition<&str, &[u8]> = TableDefinition::new("column_stats");
 
+/// Pre-image of a single column's stats captured before a transactional
+/// observe: the composed `COLUMN_STATS` key and the serialized `ColumnStats`
+/// bytes that existed before the merge (`None` = no stats existed for that
+/// key). Because `observe_document_in_txn` is READ-MODIFY-WRITE, restoring
+/// these exact bytes is the only way to reverse a committed stats mutation.
+pub type StatsPreImage = (String, Option<Vec<u8>>);
+
 /// Statistics for a single column in a collection.
 #[derive(
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
@@ -279,6 +286,13 @@ impl StatsStore {
     ///
     /// Opens the COLUMN_STATS table once and reads/writes all fields in a
     /// single table open, eliminating per-field transaction overhead.
+    ///
+    /// Returns one [`StatsPreImage`] per touched `(collection, field)` — the
+    /// exact serialized `ColumnStats` bytes that existed BEFORE the merge (or
+    /// `None` when no stats existed). A transactional caller records these so a
+    /// rollback can restore the pre-image, closing the read-modify-write hole
+    /// (an aborted redb txn does NOT reverse a stats mutation this batch already
+    /// committed).
     pub fn observe_document_in_txn(
         &self,
         txn: &WriteTransaction,
@@ -286,14 +300,15 @@ impl StatsStore {
         tenant_id: u64,
         collection: &str,
         doc: &serde_json::Value,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Vec<StatsPreImage>> {
         let Some(obj) = doc.as_object() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         if obj.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
+        let mut pre_images: Vec<StatsPreImage> = Vec::with_capacity(obj.len());
         let mut table = txn
             .open_table(COLUMN_STATS)
             .map_err(|e| crate::Error::Storage {
@@ -304,12 +319,18 @@ impl StatsStore {
         for (field, value) in obj {
             let key = format!("{database_id}:{tenant_id}:{collection}:{field}");
 
-            // Read existing stats from the same write transaction.
-            let mut stats: ColumnStats = table
+            // Capture the pre-image bytes (the guard is dropped by `to_vec`,
+            // releasing the immutable borrow before the `insert` below), then
+            // deserialize the same bytes for the merge — one read, not two.
+            let prior_bytes: Option<Vec<u8>> = table
                 .get(key.as_str())
                 .ok()
                 .flatten()
-                .and_then(|guard| zerompk::from_msgpack(guard.value()).ok())
+                .map(|guard| guard.value().to_vec());
+
+            let mut stats: ColumnStats = prior_bytes
+                .as_deref()
+                .and_then(|b| zerompk::from_msgpack(b).ok())
                 .unwrap_or_default();
 
             stats.observe(Some(value));
@@ -324,8 +345,55 @@ impl StatsStore {
                     engine: "stats".into(),
                     detail: format!("insert: {e}"),
                 })?;
+
+            pre_images.push((key, prior_bytes));
         }
 
+        Ok(pre_images)
+    }
+
+    /// Restore a column-stats pre-image captured by
+    /// [`observe_document_in_txn`](Self::observe_document_in_txn), reversing a
+    /// committed read-modify-write on rollback. Opens its own write txn.
+    ///
+    /// `prior = Some(bytes)` rewrites the exact `ColumnStats` that existed
+    /// before the op; `prior = None` removes the key (no stats existed before,
+    /// so the op created it). Reuses the same `COLUMN_STATS` table and key that
+    /// `observe_document_in_txn` produced.
+    pub fn restore(&self, key: &str, prior: Option<&[u8]>) -> crate::Result<()> {
+        let write_txn = self.db.begin_write().map_err(|e| crate::Error::Storage {
+            engine: "stats".into(),
+            detail: format!("write txn: {e}"),
+        })?;
+        {
+            let mut table =
+                write_txn
+                    .open_table(COLUMN_STATS)
+                    .map_err(|e| crate::Error::Storage {
+                        engine: "stats".into(),
+                        detail: format!("open table: {e}"),
+                    })?;
+            match prior {
+                Some(bytes) => {
+                    table
+                        .insert(key, bytes)
+                        .map_err(|e| crate::Error::Storage {
+                            engine: "stats".into(),
+                            detail: format!("insert: {e}"),
+                        })?;
+                }
+                None => {
+                    table.remove(key).map_err(|e| crate::Error::Storage {
+                        engine: "stats".into(),
+                        detail: format!("remove: {e}"),
+                    })?;
+                }
+            }
+        }
+        write_txn.commit().map_err(|e| crate::Error::Storage {
+            engine: "stats".into(),
+            detail: format!("commit: {e}"),
+        })?;
         Ok(())
     }
 }

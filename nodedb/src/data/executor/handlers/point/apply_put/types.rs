@@ -91,6 +91,14 @@ pub(in crate::data::executor) struct PointPutOutcome {
     /// so this stays empty there until that flag flips). Autocommit callers
     /// ignore it.
     pub spatial_inserts: Vec<(SpatialIndexKey, u64)>,
+    /// Pre-images of the column-stats read-modify-write this put performed, so a
+    /// transactional caller can push `UndoEntry::StatsRestore` reversals. Each
+    /// element is `(stats_key, prior_bytes)`: `prior_bytes = Some(b)` restores
+    /// the exact `ColumnStats` that existed before, `None` removes a key the op
+    /// created. Empty unless `enable_side_indexes` was set (the transactional
+    /// path currently disables stats writes, so this stays empty there until
+    /// that flag flips). Autocommit callers ignore it.
+    pub stats_prior: Vec<crate::engine::sparse::stats::StatsPreImage>,
 }
 
 /// Map an enforcement check's `ErrorCode` onto the crate's typed `Error`.

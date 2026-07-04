@@ -172,4 +172,20 @@ pub(in crate::data::executor) enum UndoEntry {
         collection_key: (nodedb_types::DatabaseId, TenantId, String),
         row_count_before: u64,
     },
+    /// Undo a column-stats observe by restoring the pre-image captured before
+    /// the read-modify-write.
+    ///
+    /// Column stats are a READ-MODIFY-WRITE side-effect: each op reads the
+    /// stored `ColumnStats` for a `(collection, field)`, merges the new doc's
+    /// value, and writes it back. Because each tx sub-plan commits its own
+    /// per-row redb txn, an aborted redb txn does NOT reverse a stats mutation a
+    /// prior sub-plan already committed — so rollback must restore the EXACT
+    /// pre-image, not merely delete.
+    ///
+    /// `key` is the composed `COLUMN_STATS` key (`"{db}:{tenant}:{coll}:{field}"`)
+    /// exactly as `observe_document_in_txn` produced it. `prior = Some(bytes)`
+    /// = the serialized `ColumnStats` that existed before (undo rewrites them);
+    /// `prior = None` = no stats existed for this `(coll, field)` before (undo
+    /// removes the key).
+    StatsRestore { key: String, prior: Option<Vec<u8>> },
 }

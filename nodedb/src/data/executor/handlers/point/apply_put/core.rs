@@ -262,6 +262,12 @@ impl CoreLoop {
                 .put_in_txn(txn, database_id, tid, collection, document_id, &stored)?
         };
 
+        // Pre-image capture for the column-stats read-modify-write, so a
+        // transactional caller can restore the exact prior stats on rollback.
+        // Empty unless `enable_side_indexes` (the transactional path disables
+        // stats writes, so this stays empty there until that flag flips).
+        let mut stats_prior: Vec<crate::engine::sparse::stats::StatsPreImage> = Vec::new();
+
         // Text indexing and stats use the original JSON input, not the stored
         // bytes — Binary Tuple requires a schema to decode, and the input JSON
         // is already available here regardless of storage mode.
@@ -289,16 +295,19 @@ impl CoreLoop {
                 }
             }
 
-            if enable_side_indexes
-                && let Err(e) = self.stats_store.observe_document_in_txn(
+            if enable_side_indexes {
+                match self.stats_store.observe_document_in_txn(
                     txn,
                     database_id,
                     tid,
                     collection,
                     &doc,
-                )
-            {
-                warn!(core = self.core_id, %collection, error = %e, "column stats update failed");
+                ) {
+                    Ok(pre) => stats_prior = pre,
+                    Err(e) => {
+                        warn!(core = self.core_id, %collection, error = %e, "column stats update failed");
+                    }
+                }
             }
 
             let tid_key = crate::types::TenantId::new(tid);
@@ -425,6 +434,7 @@ impl CoreLoop {
             secondary_index_removed,
             vector_inserts,
             spatial_inserts,
+            stats_prior,
         })
     }
 }
