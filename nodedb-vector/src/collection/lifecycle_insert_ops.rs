@@ -118,12 +118,33 @@ impl VectorCollection {
     }
 
     /// Un-delete a previously soft-deleted vector (for transaction rollback).
+    ///
+    /// Symmetric to [`Self::delete_inner`]: the vector may live in the growing
+    /// segment (the common case for a just-inserted vector), a sealed HNSW
+    /// segment, or an in-flight building segment — reverse the tombstone
+    /// wherever it landed. Only clearing sealed tombstones (the prior behavior)
+    /// silently failed to restore growing/building vectors, leaving a
+    /// rolled-back delete permanently unsearchable.
     pub fn undelete(&mut self, id: u32) -> bool {
+        if id >= self.growing_base_id {
+            let local = id - self.growing_base_id;
+            if (local as usize) < self.growing.len() {
+                return self.growing.undelete(local);
+            }
+        }
         for seg in &mut self.sealed {
             if id >= seg.base_id {
                 let local = id - seg.base_id;
                 if (local as usize) < seg.index.len() {
                     return seg.index.undelete(local);
+                }
+            }
+        }
+        for seg in &mut self.building {
+            if id >= seg.base_id {
+                let local = id - seg.base_id;
+                if (local as usize) < seg.flat.len() {
+                    return seg.flat.undelete(local);
                 }
             }
         }

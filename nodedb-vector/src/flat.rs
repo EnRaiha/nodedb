@@ -69,6 +69,22 @@ impl FlatIndex {
         }
     }
 
+    /// Un-delete (clear the soft-delete tombstone of) a vector by ID. Reverses
+    /// [`FlatIndex::delete`] — used for transaction rollback so a rolled-back
+    /// delete restores the vector to the searchable set. Returns `true` if a
+    /// tombstone was actually cleared, `false` if the id was out of range or
+    /// already live.
+    pub fn undelete(&mut self, id: u32) -> bool {
+        let idx = id as usize;
+        if idx < self.deleted.len() && self.deleted[idx] {
+            self.deleted[idx] = false;
+            self.live_count += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Brute-force k-NN search with an explicit distance metric override.
     /// Overrides the `self.metric` configured at collection creation time.
     pub fn search_with_metric(
