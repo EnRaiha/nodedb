@@ -27,9 +27,10 @@ use sqlparser::ast;
 
 use super::super::helpers::{
     extract_float, extract_float_array, extract_func_args, extract_string_literal,
+    source_projection,
 };
 use crate::error::{Result, SqlError};
-use crate::types::SqlPlan;
+use crate::types::{Projection, SqlPlan};
 
 /// Build a `SqlPlan::HybridSearch` or `SqlPlan::HybridSearchTriple` from a
 /// `rrf_score(...)` call depending on argument arity.
@@ -47,15 +48,16 @@ pub(super) fn plan_hybrid_from_sort(
         SqlPlan::Scan { limit, .. } => limit.unwrap_or(10),
         _ => 10,
     };
+    let projection = source_projection(plan);
 
     // Determine whether args[2] (if present) is a function call (graph source)
     // or a numeric literal (k-constant for the two-source form).
     let third_is_graph_score = args.get(2).is_some_and(is_function_call);
 
     if third_is_graph_score {
-        plan_hybrid_triple(args, collection, limit, score_alias)
+        plan_hybrid_triple(args, collection, limit, score_alias, projection)
     } else {
-        plan_hybrid_two_source(args, collection, limit, score_alias)
+        plan_hybrid_two_source(args, collection, limit, score_alias, projection)
     }
 }
 
@@ -65,6 +67,7 @@ fn plan_hybrid_two_source(
     collection: &str,
     limit: usize,
     score_alias: Option<&str>,
+    projection: Vec<Projection>,
 ) -> Result<Option<SqlPlan>> {
     // args[2] and args[3] are optional k-constants. If there are more than 4
     // args in the two-source form, something is wrong.
@@ -102,6 +105,7 @@ fn plan_hybrid_two_source(
         vector_weight,
         fuzzy: true,
         score_alias: score_alias.map(|s| s.to_string()),
+        projection,
     }))
 }
 
@@ -111,6 +115,7 @@ fn plan_hybrid_triple(
     collection: &str,
     limit: usize,
     score_alias: Option<&str>,
+    projection: Vec<Projection>,
 ) -> Result<Option<SqlPlan>> {
     // After the three source functions, we accept 0 or 3 k-constants.
     // Anything else (e.g. 1 or 2 k-constants) is an inconsistent arity.
@@ -163,6 +168,7 @@ fn plan_hybrid_triple(
         fuzzy: true,
         rrf_k: (k1, k2, k3),
         score_alias: score_alias.map(|s| s.to_string()),
+        projection,
     }))
 }
 

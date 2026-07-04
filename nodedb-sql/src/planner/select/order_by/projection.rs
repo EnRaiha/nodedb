@@ -132,6 +132,7 @@ fn build_text_search_score_scan(
             query,
             top_k,
             filters,
+            projection,
             ..
         } => SqlPlan::TextSearch {
             collection: collection.to_string(),
@@ -139,8 +140,14 @@ fn build_text_search_score_scan(
             top_k: *top_k,
             filters: filters.clone(),
             score_alias: Some(score_alias),
+            projection: projection.clone(),
         },
-        SqlPlan::Scan { filters, limit, .. } => SqlPlan::TextSearch {
+        SqlPlan::Scan {
+            filters,
+            limit,
+            projection,
+            ..
+        } => SqlPlan::TextSearch {
             collection: collection.to_string(),
             query: FtsQuery::Plain {
                 text: query_text,
@@ -149,6 +156,7 @@ fn build_text_search_score_scan(
             top_k: limit.unwrap_or(10_000),
             filters: filters.clone(),
             score_alias: Some(score_alias),
+            projection: projection.clone(),
         },
         _ => SqlPlan::TextSearch {
             collection: collection.to_string(),
@@ -159,6 +167,7 @@ fn build_text_search_score_scan(
             top_k: 10_000,
             filters: Vec::new(),
             score_alias: Some(score_alias),
+            projection: Vec::new(),
         },
     }
 }

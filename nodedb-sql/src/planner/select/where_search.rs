@@ -40,8 +40,9 @@ pub(super) fn try_extract_where_search(
     expr: &ast::Expr,
     table: &crate::resolver::columns::ResolvedTable,
     functions: &FunctionRegistry,
+    projection: &[Projection],
 ) -> Result<Option<SqlPlan>> {
-    try_extract_with_extra_filters(expr, table, functions, None)
+    try_extract_with_extra_filters(expr, table, functions, None, projection)
 }
 
 /// Internal entry that threads an optional sibling-AND filter through to the
@@ -54,11 +55,12 @@ fn try_extract_with_extra_filters(
     table: &crate::resolver::columns::ResolvedTable,
     functions: &FunctionRegistry,
     extra_filter: Option<&ast::Expr>,
+    projection: &[Projection],
 ) -> Result<Option<SqlPlan>> {
     match expr {
         ast::Expr::Function(func) => {
             let name = function_name(func);
-            dispatch_trigger(&name, func, table, functions, extra_filter)
+            dispatch_trigger(&name, func, table, functions, extra_filter, projection)
         }
         // AND: recurse on each side, carrying the other side as a scan filter.
         ast::Expr::BinaryOp {
@@ -67,15 +69,23 @@ fn try_extract_with_extra_filters(
             right,
         } => {
             // Try left as the trigger, with right as the carried filter.
-            if let Some(plan) =
-                try_extract_with_extra_filters(left, table, functions, Some(right.as_ref()))?
-            {
+            if let Some(plan) = try_extract_with_extra_filters(
+                left,
+                table,
+                functions,
+                Some(right.as_ref()),
+                projection,
+            )? {
                 return Ok(Some(plan));
             }
             // Try right as the trigger, with left as the carried filter.
-            if let Some(plan) =
-                try_extract_with_extra_filters(right, table, functions, Some(left.as_ref()))?
-            {
+            if let Some(plan) = try_extract_with_extra_filters(
+                right,
+                table,
+                functions,
+                Some(left.as_ref()),
+                projection,
+            )? {
                 return Ok(Some(plan));
             }
             Ok(None)
@@ -102,19 +112,26 @@ fn dispatch_trigger(
     table: &crate::resolver::columns::ResolvedTable,
     functions: &FunctionRegistry,
     extra_filter: Option<&ast::Expr>,
+    projection: &[Projection],
 ) -> Result<Option<SqlPlan>> {
     // Exhaustive match on `SearchTrigger`: when a new trigger is added,
     // this fails to compile until a WHERE-clause routing decision is made
     // for it. This is the structural fix for the original bug class —
     // silent fall-through on unhandled triggers.
     match functions.search_trigger(name) {
-        SearchTrigger::TextMatch => plan_text_from_where(func, table, extra_filter),
+        SearchTrigger::TextMatch => plan_text_from_where(func, table, extra_filter, projection),
         SearchTrigger::SpatialDWithin
         | SearchTrigger::SpatialContains
         | SearchTrigger::SpatialIntersects
-        | SearchTrigger::SpatialWithin => plan_spatial_from_where(name, func, table, extra_filter),
-        SearchTrigger::VectorSearch => plan_vector_from_where(name, func, table, extra_filter),
-        SearchTrigger::MultiVectorSearch => plan_multi_vector_from_where(func, table, extra_filter),
+        | SearchTrigger::SpatialWithin => {
+            plan_spatial_from_where(name, func, table, extra_filter, projection)
+        }
+        SearchTrigger::VectorSearch => {
+            plan_vector_from_where(name, func, table, extra_filter, projection)
+        }
+        SearchTrigger::MultiVectorSearch => {
+            plan_multi_vector_from_where(func, table, extra_filter, projection)
+        }
         // The remaining triggers either have no WHERE-clause shape advertised
         // anywhere in the docs (`HybridSearch`, `TextSearch`, the array TVFs,
         // `TimeBucket`) or are not search triggers at all (`None`). We fall
@@ -149,6 +166,7 @@ fn plan_text_from_where(
     func: &ast::Function,
     table: &crate::resolver::columns::ResolvedTable,
     extra_filter: Option<&ast::Expr>,
+    projection: &[Projection],
 ) -> Result<Option<SqlPlan>> {
     use crate::fts_types::FtsQuery;
 
@@ -187,6 +205,7 @@ fn plan_text_from_where(
         top_k: 1000,
         filters: extra_filter_to_filters(extra_filter)?,
         score_alias: None,
+        projection: projection.to_vec(),
     }))
 }
 
@@ -195,6 +214,7 @@ fn plan_vector_from_where(
     func: &ast::Function,
     table: &crate::resolver::columns::ResolvedTable,
     extra_filter: Option<&ast::Expr>,
+    projection: &[Projection],
 ) -> Result<Option<SqlPlan>> {
     let args = extract_func_args(func)?;
     if args.len() < 2 {
@@ -229,6 +249,7 @@ fn plan_vector_from_where(
         // and need no special handling here.
         skip_payload_fetch: false,
         payload_filters: Vec::new(),
+        projection: projection.to_vec(),
     }))
 }
 
@@ -236,6 +257,7 @@ fn plan_multi_vector_from_where(
     func: &ast::Function,
     table: &crate::resolver::columns::ResolvedTable,
     extra_filter: Option<&ast::Expr>,
+    projection: &[Projection],
 ) -> Result<Option<SqlPlan>> {
     let args = extract_func_args(func)?;
     if args.len() < 2 {
@@ -261,6 +283,7 @@ fn plan_multi_vector_from_where(
         query_vector,
         top_k: DEFAULT_TOP_K,
         ef_search: DEFAULT_TOP_K * DEFAULT_EF_SEARCH_MULTIPLIER,
+        projection: projection.to_vec(),
     }))
 }
 
@@ -269,6 +292,7 @@ fn plan_spatial_from_where(
     func: &ast::Function,
     table: &crate::resolver::columns::ResolvedTable,
     extra_filter: Option<&ast::Expr>,
+    projection: &[Projection],
 ) -> Result<Option<SqlPlan>> {
     let predicate = match name {
         "st_dwithin" => SpatialPredicate::DWithin,
@@ -313,6 +337,6 @@ fn plan_spatial_from_where(
         distance_meters: distance,
         attribute_filters: extra_filter_to_filters(extra_filter)?,
         limit: 1000,
-        projection: Vec::new(),
+        projection: projection.to_vec(),
     }))
 }

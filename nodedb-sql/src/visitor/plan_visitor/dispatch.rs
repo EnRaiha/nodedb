@@ -37,6 +37,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             engine,
             key_column,
             key_value,
+            projection: _,
         } => visitor.point_get(collection, alias.as_deref(), *engine, key_column, key_value),
         SqlPlan::DocumentIndexLookup {
             collection,
@@ -75,6 +76,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             lower,
             upper,
             limit,
+            projection: _,
         } => visitor.range_scan(collection, field, lower.as_ref(), upper.as_ref(), *limit),
         SqlPlan::Insert {
             collection,
@@ -242,6 +244,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             ann_options,
             skip_payload_fetch,
             payload_filters,
+            projection: _,
         } => visitor.vector_search(
             collection,
             field,
@@ -260,6 +263,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             query_vector,
             top_k,
             ef_search,
+            projection: _,
         } => visitor.multi_vector_search(collection, query_vector, *top_k, *ef_search),
         SqlPlan::TextSearch {
             collection,
@@ -267,6 +271,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             top_k,
             filters,
             score_alias,
+            projection: _,
         } => visitor.text_search(collection, query, *top_k, filters, score_alias.as_deref()),
         SqlPlan::HybridSearch {
             collection,
@@ -277,6 +282,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             vector_weight,
             fuzzy,
             score_alias,
+            projection: _,
         } => visitor.hybrid_search(
             collection,
             query_vector,
@@ -299,6 +305,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             fuzzy,
             rrf_k,
             score_alias,
+            projection: _,
         } => visitor.hybrid_search_triple(
             collection,
             query_vector,
@@ -342,6 +349,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             max_iterations,
             distinct,
             limit,
+            projection: _,
         } => visitor.recursive_scan(
             collection,
             base_filters,

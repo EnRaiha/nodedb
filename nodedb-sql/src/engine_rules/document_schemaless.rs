@@ -70,6 +70,7 @@ impl EngineRules for SchemalessRules {
             engine: EngineType::DocumentSchemaless,
             key_column: p.key_column,
             key_value: p.key_value,
+            projection: p.projection,
         })
     }
 

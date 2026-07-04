@@ -140,6 +140,13 @@ fn plan_recursive_scan_from_parts(
         Err(_) => extract_recursive_info(right, cte_name)?,
     };
 
+    // The anchor plan carries the CTE's resolved output columns; propagate
+    // them so the recursive scan self-describes its output schema.
+    let projection = match base {
+        SqlPlan::Scan { projection, .. } | SqlPlan::Join { projection, .. } => projection.clone(),
+        _ => Vec::new(),
+    };
+
     Ok(SqlPlan::RecursiveScan {
         collection,
         base_filters: extract_filters(base),
@@ -148,6 +155,7 @@ fn plan_recursive_scan_from_parts(
         max_iterations: DEFAULT_MAX_RECURSION_DEPTH,
         distinct: *distinct,
         limit: 10000,
+        projection,
     })
 }
 

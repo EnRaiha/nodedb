@@ -69,6 +69,7 @@ impl EngineRules for ColumnarRules {
             engine: EngineType::Columnar,
             key_column: p.key_column,
             key_value: p.key_value,
+            projection: p.projection,
         })
     }
 

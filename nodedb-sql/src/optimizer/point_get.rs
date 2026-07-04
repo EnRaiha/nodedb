@@ -45,6 +45,7 @@ pub fn optimize(plan: SqlPlan, catalog: &dyn SqlCatalog) -> SqlPlan {
                     engine: *engine,
                     key_column: key_col,
                     key_value: key_val,
+                    projection: projection.clone(),
                 };
             }
             plan

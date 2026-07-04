@@ -12,7 +12,7 @@ use sqlparser::ast::{self, FunctionArg, FunctionArguments};
 use super::super::entry_ann::parse_ann_options;
 use super::super::helpers::{
     extract_column_name, extract_float_array, extract_func_args, extract_string_literal,
-    metric_from_func_name,
+    metric_from_func_name, source_projection,
 };
 use super::aliases::function_call_name;
 use super::hybrid::{no_args_rrf_score_error, plan_hybrid_from_sort};
@@ -91,6 +91,7 @@ pub(super) fn try_extract_sort_search(
                 // fields after `apply_order_by` returns.
                 skip_payload_fetch: false,
                 payload_filters: Vec::new(),
+                projection: source_projection(plan),
             }))
         }
         SearchTrigger::TextSearch if args.len() >= 2 => {
@@ -111,6 +112,7 @@ pub(super) fn try_extract_sort_search(
                     _ => Vec::new(),
                 },
                 score_alias: score_alias.map(|s| s.to_string()),
+                projection: source_projection(plan),
             }))
         }
         SearchTrigger::TextSearch => Ok(None),

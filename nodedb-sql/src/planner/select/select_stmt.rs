@@ -156,13 +156,21 @@ pub(super) fn plan_select(
         (Vec::new(), None)
     };
 
-    // 5. Convert remaining WHERE filters.
+    // 5. Convert remaining WHERE filters. When a WHERE clause is present the
+    // projection is converted here (needed for WHERE-search detection) and
+    // cached so step 7 doesn't redo the same conversion.
+    let mut cached_projection = None;
     let filters = match &effective_where {
         Some(expr) => {
-            // Check for search-triggering functions in WHERE.
-            if let Some(plan) = try_extract_where_search(expr, table, functions)? {
+            // Check for search-triggering functions in WHERE. The resolved
+            // SELECT target list is threaded through so the search plan
+            // self-describes its output columns.
+            let where_projection = convert_projection(&select.projection)?;
+            if let Some(plan) = try_extract_where_search(expr, table, functions, &where_projection)?
+            {
                 return Ok(plan);
             }
+            cached_projection = Some(where_projection);
             convert_where_to_filters(expr)?
         }
         None => Vec::new(),
@@ -222,8 +230,12 @@ pub(super) fn plan_select(
         return Ok(plan);
     }
 
-    // 7. Convert projection.
-    let projection = convert_projection(&select.projection)?;
+    // 7. Convert projection (reuse the WHERE-search conversion if we already
+    // did it in step 5, to avoid converting the same projection twice).
+    let projection = match cached_projection {
+        Some(p) => p,
+        None => convert_projection(&select.projection)?,
+    };
 
     // 8. Convert window functions (SELECT with OVER).
     let window_functions = crate::planner::window::extract_window_functions(select, functions)?;

@@ -70,6 +70,7 @@ impl EngineRules for SpatialRules {
             engine: EngineType::Spatial,
             key_column: p.key_column,
             key_value: p.key_value,
+            projection: p.projection,
         })
     }
 

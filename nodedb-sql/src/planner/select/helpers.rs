@@ -11,6 +11,19 @@ use crate::parser::normalize::{SCHEMA_QUALIFIED_MSG, normalize_ident};
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
+/// Output projection carried by a base read plan, used to seed the
+/// `projection` of a search variant rewritten from it. Returns the resolved
+/// SELECT target list for the plans that carry one (`Scan`, `Join`,
+/// `TextSearch`); an empty list for shapes that do not.
+pub(super) fn source_projection(plan: &SqlPlan) -> Vec<Projection> {
+    match plan {
+        SqlPlan::Scan { projection, .. }
+        | SqlPlan::Join { projection, .. }
+        | SqlPlan::TextSearch { projection, .. } => projection.clone(),
+        _ => Vec::new(),
+    }
+}
+
 /// Convert SELECT projection items.
 pub fn convert_projection(items: &[ast::SelectItem]) -> Result<Vec<Projection>> {
     let mut result = Vec::new();

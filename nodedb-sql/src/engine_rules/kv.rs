@@ -63,6 +63,7 @@ impl EngineRules for KvRules {
             engine: EngineType::KeyValue,
             key_column: p.key_column,
             key_value: p.key_value,
+            projection: p.projection,
         })
     }
 

@@ -64,6 +64,9 @@ pub struct PointGetParams {
     pub alias: Option<String>,
     pub key_column: String,
     pub key_value: SqlValue,
+    /// Resolved SELECT target list, propagated onto [`SqlPlan::PointGet`] so the
+    /// physical plan self-describes its output columns.
+    pub projection: Vec<Projection>,
 }
 
 /// Parameters for planning an UPDATE operation.

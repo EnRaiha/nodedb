@@ -50,6 +50,8 @@ pub enum SqlPlan {
         engine: EngineType,
         key_column: String,
         key_value: SqlValue,
+        /// Resolved SELECT target list, for output-schema derivation.
+        projection: Vec<Projection>,
     },
     /// Document fetch via a secondary index: equality predicate on an
     /// indexed field. The executor performs an index lookup to resolve
@@ -89,6 +91,8 @@ pub enum SqlPlan {
         lower: Option<SqlValue>,
         upper: Option<SqlValue>,
         limit: usize,
+        /// Resolved SELECT target list, for output-schema derivation.
+        projection: Vec<Projection>,
     },
 
     // ── Writes ──
@@ -294,12 +298,16 @@ pub enum SqlPlan {
         /// the resulting bitmap with the HNSW candidate set via the
         /// per-collection `PayloadIndexSet::pre_filter`.
         payload_filters: Vec<SqlPayloadAtom>,
+        /// Resolved SELECT target list, for output-schema derivation.
+        projection: Vec<Projection>,
     },
     MultiVectorSearch {
         collection: String,
         query_vector: Vec<f32>,
         top_k: usize,
         ef_search: usize,
+        /// Resolved SELECT target list, for output-schema derivation.
+        projection: Vec<Projection>,
     },
     TextSearch {
         collection: String,
@@ -317,6 +325,8 @@ pub enum SqlPlan {
         /// appear in the response with `null` for the score when they do not
         /// contain the term.
         score_alias: Option<String>,
+        /// Resolved SELECT target list, for output-schema derivation.
+        projection: Vec<Projection>,
     },
     HybridSearch {
         collection: String,
@@ -331,6 +341,8 @@ pub enum SqlPlan {
         /// internal field name `rrf_score`. Set by the planner from the
         /// SELECT projection's `AS <alias>` for the `rrf_score(...)` call.
         score_alias: Option<String>,
+        /// Resolved SELECT target list, for output-schema derivation.
+        projection: Vec<Projection>,
     },
 
     /// Three-source hybrid search: vector + BM25 text + graph BFS, fused via weighted RRF.
@@ -354,6 +366,8 @@ pub enum SqlPlan {
         rrf_k: (f64, f64, f64),
         /// SELECT-list alias for the fused RRF score column.
         score_alias: Option<String>,
+        /// Resolved SELECT target list, for output-schema derivation.
+        projection: Vec<Projection>,
     },
     SpatialScan {
         collection: String,
@@ -393,6 +407,8 @@ pub enum SqlPlan {
         max_iterations: usize,
         distinct: bool,
         limit: usize,
+        /// Resolved SELECT target list, for output-schema derivation.
+        projection: Vec<Projection>,
     },
 
     /// Value-generating recursive CTE (`WITH RECURSIVE name(cols) AS (anchor UNION [ALL] step)`).
