@@ -40,8 +40,8 @@ impl CoreLoop {
 
         let doc_op = match plan {
             PhysicalPlan::Document(op) => op,
+            PhysicalPlan::Kv(op) => return self.execute_stage_kv(task, tid, txn_id, op),
             PhysicalPlan::Vector(_)
-            | PhysicalPlan::Kv(_)
             | PhysicalPlan::Text(_)
             | PhysicalPlan::Columnar(_)
             | PhysicalPlan::Timeseries(_)
@@ -175,7 +175,7 @@ impl CoreLoop {
         }
     }
 
-    fn stage_not_point_write(&self, task: &ExecutionTask) -> Response {
+    pub(super) fn stage_not_point_write(&self, task: &ExecutionTask) -> Response {
         self.response_error(
             task,
             ErrorCode::Internal {
@@ -241,7 +241,7 @@ impl CoreLoop {
         self.txn_overlays
             .entry(ctx.txn_id)
             .or_default()
-            .insert_tombstone(ctx.coll_key.clone(), ctx.surrogate.0, ctx.document_id);
+            .insert_tombstone(ctx.coll_key.clone(), ctx.surrogate.0, &ctx.document_id);
         self.stage_count_response(ctx.task, 1)
     }
 
@@ -304,7 +304,7 @@ impl CoreLoop {
 
     // ── Shared helpers ──────────────────────────────────────────────────────
 
-    fn stage_overlay_pk(&self, ctx: &StageCtx<'_>) -> OverlayPk {
+    pub(super) fn stage_overlay_pk(&self, ctx: &StageCtx<'_>) -> OverlayPk {
         match self
             .txn_overlays
             .get(&ctx.txn_id)
@@ -355,7 +355,11 @@ impl CoreLoop {
     }
 
     /// Stage a put after enforcing the per-transaction overlay memory cap.
-    fn stage_put_capped(&mut self, ctx: &StageCtx<'_>, body: Vec<u8>) -> crate::Result<()> {
+    pub(super) fn stage_put_capped(
+        &mut self,
+        ctx: &StageCtx<'_>,
+        body: Vec<u8>,
+    ) -> crate::Result<()> {
         let current = self
             .txn_overlays
             .get(&ctx.txn_id)
@@ -369,13 +373,13 @@ impl CoreLoop {
         self.txn_overlays.entry(ctx.txn_id).or_default().insert_put(
             ctx.coll_key.clone(),
             ctx.surrogate.0,
-            ctx.document_id,
+            &ctx.document_id,
             body,
         );
         Ok(())
     }
 
-    fn stage_count_response(&self, task: &ExecutionTask, affected: usize) -> Response {
+    pub(super) fn stage_count_response(&self, task: &ExecutionTask, affected: usize) -> Response {
         match response_codec::encode_count("affected", affected) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, e),

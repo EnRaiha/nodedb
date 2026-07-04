@@ -109,6 +109,60 @@ impl CoreLoop {
         }
     }
 
+    /// Fold a transaction's staging overlay into a KV scan result's `(key,
+    /// value)` pairs, so an in-transaction KV `SCAN` observes the
+    /// transaction's own uncommitted point writes (read-your-own-writes).
+    ///
+    /// Unlike [`merge_overlay_into_scan`](Self::merge_overlay_into_scan),
+    /// whose row identity is the Document scan's hex-surrogate row key, a
+    /// KV row's scan identity is its raw key bytes -- so this merges by
+    /// [`hex_key`](super::super::stage_write::hex_key) identity instead,
+    /// via [`TxnOverlay::iter_doc_entries_for_collection`] and
+    /// [`unhex_key`](super::super::stage_write::unhex_key) to recover the
+    /// raw key bytes for a staged addition. `matches` is the SAME predicate
+    /// the base KV scan applied, evaluated on the value bytes.
+    pub(in crate::data::executor) fn merge_kv_overlay_into_scan(
+        &self,
+        txn_id: TxnId,
+        coll_key: &(DatabaseId, TenantId, String),
+        rows: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        matches: &dyn Fn(&[u8]) -> bool,
+    ) {
+        let Some(overlay) = self.txn_overlays.get(&txn_id) else {
+            return;
+        };
+
+        let mut seen: HashSet<String> = rows
+            .iter()
+            .map(|(key, _)| super::super::stage_write::hex_key(key))
+            .collect();
+
+        rows.retain_mut(|(key, value)| {
+            let doc_id = super::super::stage_write::hex_key(key);
+            match overlay.get_by_doc_id(coll_key, &doc_id) {
+                Some(Staged::Tombstone) => false,
+                Some(Staged::Put(staged_value)) => {
+                    *value = staged_value.clone();
+                    matches(value)
+                }
+                None => true,
+            }
+        });
+
+        for (doc_id, staged) in overlay.iter_doc_entries_for_collection(coll_key) {
+            if seen.contains(doc_id) {
+                continue;
+            }
+            if let Staged::Put(value) = staged
+                && matches(value)
+                && let Some(key) = super::super::stage_write::unhex_key(doc_id)
+            {
+                rows.push((key, value.clone()));
+                seen.insert(doc_id.to_string());
+            }
+        }
+    }
+
     /// Fold a transaction's staging overlay into a base secondary-index
     /// lookup's doc-ID list, so an in-transaction `WHERE indexed_field =
     /// value` observes the transaction's own uncommitted point writes.

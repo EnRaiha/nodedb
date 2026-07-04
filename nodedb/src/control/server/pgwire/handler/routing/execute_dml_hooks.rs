@@ -69,7 +69,7 @@ impl NodeDbPgHandler {
         }
         let affected =
             super::super::plan::extract_affected_count(resp.payload.as_ref()).unwrap_or(1) as usize;
-        let tag = super::super::plan::point_write_tag(&task.plan, affected);
+        let tag = super::super::plan::point_write_tag(&task.plan, affected, resp.payload.as_ref());
         // Durable path unchanged: still buffered, replayed at COMMIT.
         self.sessions.buffer_write(addr, task);
         Ok(Response::Execution(tag))

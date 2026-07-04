@@ -11,9 +11,11 @@ use sonic_rs;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::data::executor::response_codec::decode_payload_to_json;
 use nodedb_physical::physical_plan::{
-    ColumnarOp, CrdtOp, DocumentOp, GraphOp, MetaOp, QueryOp, SpatialOp, TextOp, TimeseriesOp,
-    VectorOp,
+    ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, MetaOp, QueryOp, SpatialOp, TextOp,
+    TimeseriesOp, VectorOp,
 };
+
+use super::plan_kv::kv_write_tag;
 
 use super::super::types::text_field;
 
@@ -222,13 +224,39 @@ pub(super) fn is_point_write(plan: &PhysicalPlan) -> bool {
     )
 }
 
+/// Allow-list of plans the in-transaction path stages at statement time via
+/// `MetaOp::StageWrite`: everything [`is_point_write`] accepts (Document
+/// point writes, predicate `BulkUpdate` / `BulkDelete`, `InsertSelect`),
+/// plus the five stageable KV point writes -- `KvOp::Put`, `KvOp::Insert`,
+/// `KvOp::InsertIfAbsent`, `KvOp::InsertOnConflictUpdate`, `KvOp::Delete`.
+/// KV is the first non-Document engine to stage at statement time; this
+/// predicate is the shared gate later engine units extend the same way.
+/// Every other `KvOp` (Incr, Cas, FieldSet, BatchPut, Expire, Transfer, the
+/// sorted-index family, etc.) stays on the pre-existing buffer + "OK"
+/// deferral, same as any other non-stageable write.
+pub(super) fn is_stageable_write(plan: &PhysicalPlan) -> bool {
+    is_point_write(plan)
+        || matches!(
+            plan,
+            PhysicalPlan::Kv(
+                KvOp::Put { .. }
+                    | KvOp::Insert { .. }
+                    | KvOp::InsertIfAbsent { .. }
+                    | KvOp::InsertOnConflictUpdate { .. }
+                    | KvOp::Delete { .. }
+            )
+        )
+}
+
 /// Synthesise the `CommandComplete` tag for a staged point write or staged
 /// bulk predicate DML, carrying the real affected-row count (1 for an applied
 /// point write, 0 for an `ON CONFLICT DO NOTHING` no-op, or the real matched
-/// count for `BulkUpdate` / `BulkDelete`).
+/// count for `BulkUpdate` / `BulkDelete`). `payload` is the stage handler's
+/// raw response payload -- only `KvOp::InsertOnConflictUpdate` consults it
+/// (to pick INSERT vs UPDATE); every other arm ignores it.
 ///
-/// Caller invariant: `plan` must have passed [`is_point_write`].
-pub(super) fn point_write_tag(plan: &PhysicalPlan, rows: usize) -> Tag {
+/// Caller invariant: `plan` must have passed [`is_stageable_write`].
+pub(super) fn point_write_tag(plan: &PhysicalPlan, rows: usize, payload: &[u8]) -> Tag {
     match plan {
         PhysicalPlan::Document(DocumentOp::PointPut { .. } | DocumentOp::PointInsert { .. }) => {
             Tag::new("INSERT").with_rows(rows)
@@ -252,9 +280,10 @@ pub(super) fn point_write_tag(plan: &PhysicalPlan, rows: usize) -> Tag {
         PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => {
             Tag::new("INSERT").with_rows(rows)
         }
+        PhysicalPlan::Kv(op) => kv_write_tag(op, rows, payload),
         other => unreachable!(
-            "point_write_tag called on a non-point-write plan; \
-             is_point_write invariant broken: {other:?}"
+            "point_write_tag called on a non-stageable-write plan; \
+             is_stageable_write invariant broken: {other:?}"
         ),
     }
 }

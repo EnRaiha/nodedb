@@ -7,9 +7,12 @@ use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::transaction::overlay::Staged;
+use crate::data::executor::handlers::transaction::stage_write::hex_key;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::current_ms;
+use crate::types::TenantId;
 
 /// Parameters for `INSERT ... ON CONFLICT (key) DO UPDATE SET ...` on KV.
 pub(in crate::data::executor) struct KvInsertOnConflictUpdateParams<'a> {
@@ -36,6 +39,39 @@ impl CoreLoop {
         surrogate_ceiling: Option<u32>,
     ) -> Response {
         debug!(core = self.core_id, %collection, "kv get");
+
+        // Read-your-own-writes: an in-transaction get consults this
+        // transaction's staging overlay before falling back to the base KV
+        // engine, keyed by the same hex-encoded identity the staging path
+        // uses for KV rows.
+        if let Some(txn_id) = task.request.txn_id {
+            let coll_key = (
+                task.request.database_id,
+                TenantId::new(tid),
+                collection.to_string(),
+            );
+            let doc_id = hex_key(key);
+            if let Some(staged) = self
+                .txn_overlays
+                .get(&txn_id)
+                .and_then(|o| o.get_by_doc_id(&coll_key, &doc_id))
+            {
+                return match staged {
+                    Staged::Put(body) => {
+                        if !crate::data::executor::handlers::rls_eval::rls_check_msgpack_bytes(
+                            rls_filters,
+                            body,
+                        ) {
+                            self.response_with_payload(task, Vec::new())
+                        } else {
+                            self.response_with_payload(task, body.clone())
+                        }
+                    }
+                    Staged::Tombstone => self.response_with_payload(task, Vec::new()),
+                };
+            }
+        }
+
         let now_ms = current_ms();
         let fetched = match surrogate_ceiling {
             Some(ceiling) => {

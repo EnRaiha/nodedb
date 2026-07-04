@@ -109,6 +109,21 @@ impl TxnOverlay {
         overlay.by_surrogate.get(surrogate)
     }
 
+    /// Resolve the surrogate a staged `doc_id` is bound to, without
+    /// consulting the staged mutation itself. Used by callers that need the
+    /// row's identity (e.g. to write a tombstone) rather than its body.
+    pub fn surrogate_for_doc_id(
+        &self,
+        coll_key: &(DatabaseId, TenantId, String),
+        doc_id: &str,
+    ) -> Option<u32> {
+        self.collections
+            .get(coll_key)?
+            .doc_id_to_surrogate
+            .get(doc_id)
+            .copied()
+    }
+
     /// Iterate all staged `(surrogate, Staged)` pairs for a collection.
     /// Yields nothing if the collection has no overlay entries.
     pub fn iter_for_collection<'a>(
@@ -119,6 +134,33 @@ impl TxnOverlay {
             .get(coll_key)
             .into_iter()
             .flat_map(|overlay| overlay.by_surrogate.iter().map(|(k, v)| (*k, v)))
+    }
+
+    /// Iterate all staged `(doc_id, Staged)` pairs for a collection.
+    ///
+    /// Unlike [`iter_for_collection`](Self::iter_for_collection) (keyed by
+    /// surrogate, the Document scan's row identity), this is keyed by the
+    /// overlay's doc-id -- the identity a KV scan merge needs, since a KV
+    /// row's scan identity is its raw key bytes (hex-encoded into the
+    /// doc-id), not a surrogate.
+    pub fn iter_doc_entries_for_collection<'a>(
+        &'a self,
+        coll_key: &(DatabaseId, TenantId, String),
+    ) -> impl Iterator<Item = (&'a str, &'a Staged)> {
+        self.collections
+            .get(coll_key)
+            .into_iter()
+            .flat_map(|overlay| {
+                overlay
+                    .doc_id_to_surrogate
+                    .iter()
+                    .filter_map(move |(doc_id, surrogate)| {
+                        overlay
+                            .by_surrogate
+                            .get(surrogate)
+                            .map(|staged| (doc_id.as_str(), staged))
+                    })
+            })
     }
 
     /// True if no collection has any staged mutation.

@@ -70,7 +70,7 @@ impl CoreLoop {
 
         // Try to extract a single equality filter for index pushdown.
         let (filter_field, filter_value) = extract_eq_filter(filters);
-        let (entries, _next_cursor) = self.kv_engine.scan(KvScanParams {
+        let (mut entries, _next_cursor) = self.kv_engine.scan(KvScanParams {
             database_id: did,
             tenant_id: tid,
             collection,
@@ -82,6 +82,22 @@ impl CoreLoop {
             filter_value: filter_value.as_deref(),
             surrogate_ceiling,
         });
+
+        // Read-your-own-writes: fold this transaction's staged KV writes
+        // into the base scan result before the shared filter/sort/encode
+        // pipeline below, which then treats merged and base rows alike.
+        // `matches` always accepts here -- the per-entry filter loop further
+        // down re-applies `filter_predicates` uniformly to every row
+        // (base or merged), so there is no need to duplicate that check
+        // in the merge itself.
+        if let Some(txn_id) = task.request.txn_id {
+            let coll_key = (
+                crate::types::DatabaseId::new(did),
+                crate::types::TenantId::new(tid),
+                collection.to_string(),
+            );
+            self.merge_kv_overlay_into_scan(txn_id, &coll_key, &mut entries, &|_value: &[u8]| true);
+        }
 
         // Bound an unbounded (no-LIMIT) scan by the memory budget. Sum the raw
         // key+value bytes and surface a deterministic error if the result would

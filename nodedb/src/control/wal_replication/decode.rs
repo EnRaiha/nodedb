@@ -513,6 +513,68 @@ fn to_physical_plan(
             collection: collection.clone(),
             keys: keys.clone(),
         }),
+        ReplicatedWrite::KvInsert {
+            collection,
+            key,
+            value,
+            ttl_ms,
+            surrogate,
+        } => {
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate = match assigner {
+                Some(a) => a.bind(database_id, tenant_id, collection, key, carried)?,
+                None => carried,
+            };
+            PhysicalPlan::Kv(KvOp::Insert {
+                collection: collection.clone(),
+                key: key.clone(),
+                value: value.clone(),
+                ttl_ms: *ttl_ms,
+                surrogate,
+            })
+        }
+        ReplicatedWrite::KvInsertIfAbsent {
+            collection,
+            key,
+            value,
+            ttl_ms,
+            surrogate,
+        } => {
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate = match assigner {
+                Some(a) => a.bind(database_id, tenant_id, collection, key, carried)?,
+                None => carried,
+            };
+            PhysicalPlan::Kv(KvOp::InsertIfAbsent {
+                collection: collection.clone(),
+                key: key.clone(),
+                value: value.clone(),
+                ttl_ms: *ttl_ms,
+                surrogate,
+            })
+        }
+        ReplicatedWrite::KvInsertOnConflictUpdate {
+            collection,
+            key,
+            value,
+            ttl_ms,
+            updates,
+            surrogate,
+        } => {
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate = match assigner {
+                Some(a) => a.bind(database_id, tenant_id, collection, key, carried)?,
+                None => carried,
+            };
+            PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
+                collection: collection.clone(),
+                key: key.clone(),
+                value: value.clone(),
+                ttl_ms: *ttl_ms,
+                updates: updates.clone(),
+                surrogate,
+            })
+        }
         ReplicatedWrite::KvBatchPut {
             collection,
             entries,

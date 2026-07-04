@@ -361,6 +361,39 @@ pub enum ReplicatedWrite {
         collection: String,
         keys: Vec<Vec<u8>>,
     },
+    /// SQL `INSERT` semantics (write only if absent). Mirrors `PointInsert`:
+    /// carries the same fields `KvOp::Insert` does, and replay re-runs the
+    /// duplicate check deterministically on the follower rather than
+    /// replicating a precomputed outcome.
+    KvInsert {
+        collection: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_ms: u64,
+        /// Leader-assigned global surrogate (binding key = `key` raw bytes).
+        surrogate: u32,
+    },
+    /// SQL `INSERT ... ON CONFLICT DO NOTHING` semantics. Replay re-runs the
+    /// existence check deterministically on the follower, same as `KvInsert`.
+    KvInsertIfAbsent {
+        collection: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_ms: u64,
+        surrogate: u32,
+    },
+    /// SQL `INSERT ... ON CONFLICT (key) DO UPDATE SET ...` semantics.
+    /// `value` is the would-be-inserted row (`EXCLUDED`), not a precomputed
+    /// merge result -- replay re-runs the read-modify-write deterministically
+    /// on the follower using `updates`, same as `PointUpdate`.
+    KvInsertOnConflictUpdate {
+        collection: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_ms: u64,
+        updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
+        surrogate: u32,
+    },
     KvBatchPut {
         collection: String,
         entries: Vec<(Vec<u8>, Vec<u8>)>,

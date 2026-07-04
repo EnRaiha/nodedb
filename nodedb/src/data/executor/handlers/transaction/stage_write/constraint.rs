@@ -82,7 +82,7 @@ impl CoreLoop {
             tid: ctx.tid,
             collection,
             doc: incoming_doc,
-            document_id: ctx.document_id,
+            document_id: &ctx.document_id,
             paths: &config.index_paths,
             bitemporal: config.bitemporal,
         })?;
