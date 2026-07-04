@@ -8,28 +8,55 @@ use super::store::{BaseKey, EDGES, EdgeStore, redb_err};
 use super::temporal::{EdgeRef, is_sentinel, parse_versioned_edge_key};
 use nodedb_types::{DatabaseId, TenantId};
 
+/// A single cascaded edge removal captured for transactional rollback:
+/// `(collection, src, label, dst, old_properties)`. `old_properties` is the
+/// edge's current-state value read BEFORE the soft-delete, so an
+/// `UndoEntry::DeleteEdge` can re-insert the exact edge into both the CSR
+/// partition and the persistent edge store on rollback.
+pub type EdgeRestore = (String, String, String, String, Vec<u8>);
+
 impl EdgeStore {
     /// Soft-delete every edge incident on `node` (as either src or dst) in
     /// the caller's tenant, across all collections. Emits a tombstone
     /// version at `system_from` for each distinct base edge that has a
     /// live (non-sentinel) latest version.
+    ///
+    /// Returns the set of edges actually soft-deleted, each paired with its
+    /// pre-delete `old_properties`, so a transactional caller can push one
+    /// `UndoEntry::DeleteEdge` per edge and fully reverse the cascade on
+    /// rollback. The returned edges are exactly the live bases that existed
+    /// before this call (already-tombstoned bases are skipped and not
+    /// returned — they were not removed by this op).
     pub fn delete_edges_for_node(
         &self,
         db: u64,
         tid: TenantId,
         node: &str,
         system_from: i64,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Vec<EdgeRestore>> {
         // Snapshot all live bases touching `node`. Done in a read txn first
         // so the write txn can call soft_delete_edge without nested locks.
         let bases = self.live_bases_touching_node(db, tid, node)?;
+        let mut removed = Vec::with_capacity(bases.len());
         for (collection, src, label, dst) in &bases {
+            // Capture the current-state properties BEFORE the soft-delete so a
+            // rolled-back transactional delete can restore the exact edge value.
+            let old_properties = self
+                .get_edge(db, tid, collection, src, label, dst)?
+                .unwrap_or_default();
             self.soft_delete_edge(
                 EdgeRef::new(DatabaseId::new(db), tid, collection, src, label, dst),
                 system_from,
             )?;
+            removed.push((
+                collection.clone(),
+                src.clone(),
+                label.clone(),
+                dst.clone(),
+                old_properties,
+            ));
         }
-        Ok(())
+        Ok(removed)
     }
 
     /// Enumerate `(collection, src, label, dst)` tuples for every base edge
@@ -128,9 +155,22 @@ mod tests {
         put(&store, &clock, "eve", "KNOWS", "frank", b"4");
 
         let purge_ord = clock.next_ordinal();
-        store
+        let removed = store
             .delete_edges_for_node(D, T, "alice", purge_ord)
             .unwrap();
+        // Three live bases touch alice (alice→bob, alice→carol, dave→alice),
+        // each returned with its captured pre-delete properties.
+        assert_eq!(removed.len(), 3);
+        assert!(
+            removed
+                .iter()
+                .any(|(_, s, _, d, p)| s == "alice" && d == "bob" && p == b"1")
+        );
+        assert!(
+            removed
+                .iter()
+                .any(|(_, s, _, d, p)| s == "dave" && d == "alice" && p == b"3")
+        );
 
         assert!(
             store
@@ -169,9 +209,10 @@ mod tests {
             .unwrap();
 
         // Should be a no-op — no live bases to cascade through.
-        store
+        let removed = store
             .delete_edges_for_node(D, T, "alice", clock.next_ordinal())
             .unwrap();
+        assert!(removed.is_empty());
         assert!(
             store
                 .get_edge(D, T, COLL, "alice", "KNOWS", "bob")

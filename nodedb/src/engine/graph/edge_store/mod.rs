@@ -9,6 +9,7 @@ pub mod stats;
 pub mod store;
 pub mod temporal;
 
+pub use cascade::EdgeRestore;
 pub use stats::CollectionStats;
 pub use store::{Direction, Edge, EdgeRecord, EdgeStore};
 pub use temporal::{

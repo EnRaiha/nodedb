@@ -366,6 +366,23 @@ impl CoreLoop {
                 document_id,
             });
         }
+
+        // The graph-edge cascade unconditionally removed every edge incident on
+        // this document from BOTH the CSR partition and the persistent edge
+        // store. In the transactional path a rollback must restore them, so push
+        // one `DeleteEdge` undo per cascaded edge — `apply_undo_edge` re-inserts
+        // each into both stores with its captured old properties. NON-empty
+        // whenever the deleted document had edges: this closes the pre-existing
+        // hole where a rolled-back tx DELETE permanently lost cascaded edges.
+        for (collection, src_id, label, dst_id, old_properties) in outcome.edge_deletes {
+            undo_log.push(UndoEntry::DeleteEdge {
+                collection,
+                src_id,
+                label,
+                dst_id,
+                old_properties,
+            });
+        }
         Ok(self.response_ok(dummy_task))
     }
 }

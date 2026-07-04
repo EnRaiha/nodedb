@@ -418,6 +418,121 @@ fn spatial_delete_undo_reinserts_entry_with_bbox() {
     );
 }
 
+// ── Graph edge-cascade undo ─────────────────────────────────────────────────
+
+/// A rolled-back transactional document DELETE must restore every edge the
+/// unconditional graph-edge cascade removed — into BOTH the persistent edge
+/// store (`get_edge`) AND the in-memory CSR partition (`neighbors`), with the
+/// original edge properties intact. This exercises the full capture→restore
+/// path: `delete_edges_for_node` returns the removed edges, and
+/// `apply_undo_edge` re-inserts each via a `DeleteEdge` undo entry.
+#[test]
+fn edge_cascade_delete_rollback_restores_csr_and_edge_store() {
+    use crate::engine::graph::csr::Direction;
+    use crate::engine::graph::edge_store::EdgeRef;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+    let tenant = TenantId::new(TID);
+
+    // Seed alice-[KNOWS]->bob in BOTH stores, as a forward EdgePut would.
+    let seed_ord = core.hlc.next_ordinal();
+    core.edge_store
+        .put_edge_versioned(
+            EdgeRef::new(
+                nodedb_types::DatabaseId::new(DB),
+                tenant,
+                "c",
+                "alice",
+                "KNOWS",
+                "bob",
+            ),
+            b"p1",
+            seed_ord,
+            nodedb_types::ordinal_to_ms(seed_ord),
+            i64::MAX,
+        )
+        .unwrap();
+    core.csr_partition_mut(DB, TID)
+        .add_edge("alice", "KNOWS", "bob")
+        .unwrap();
+
+    // Sanity: edge present in both stores.
+    assert_eq!(
+        core.edge_store
+            .get_edge(DB, tenant, "c", "alice", "KNOWS", "bob")
+            .unwrap(),
+        Some(b"p1".to_vec())
+    );
+    assert_eq!(
+        core.csr_partition_mut(DB, TID)
+            .neighbors("alice", None, Direction::Out),
+        vec![("KNOWS".to_string(), "bob".to_string())]
+    );
+
+    // Forward document-delete cascade (Cascade 3): remove from CSR + edge store,
+    // capturing the removed edges for rollback.
+    core.csr_partition_mut(DB, TID).remove_node_edges("alice");
+    let cascade_ord = core.hlc.next_ordinal();
+    let removed = core
+        .edge_store
+        .delete_edges_for_node(DB, tenant, "alice", cascade_ord)
+        .unwrap();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(
+        removed[0],
+        (
+            "c".to_string(),
+            "alice".to_string(),
+            "KNOWS".to_string(),
+            "bob".to_string(),
+            b"p1".to_vec()
+        )
+    );
+
+    // Both stores now show the edge gone.
+    assert!(
+        core.edge_store
+            .get_edge(DB, tenant, "c", "alice", "KNOWS", "bob")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        core.csr_partition_mut(DB, TID)
+            .neighbors("alice", None, Direction::Out)
+            .is_empty()
+    );
+
+    // Rollback: push one DeleteEdge undo per captured edge and apply it.
+    for (idx, (collection, src_id, label, dst_id, old_properties)) in
+        removed.into_iter().enumerate()
+    {
+        let undo = UndoEntry::DeleteEdge {
+            collection,
+            src_id,
+            label,
+            dst_id,
+            old_properties,
+        };
+        core.apply_undo_edge(DB, TID, idx, undo).unwrap();
+    }
+
+    // Both stores fully restored, properties intact.
+    assert_eq!(
+        core.edge_store
+            .get_edge(DB, tenant, "c", "alice", "KNOWS", "bob")
+            .unwrap(),
+        Some(b"p1".to_vec()),
+        "edge store must be restored with original properties"
+    );
+    assert_eq!(
+        core.csr_partition_mut(DB, TID)
+            .neighbors("alice", None, Direction::Out),
+        vec![("KNOWS".to_string(), "bob".to_string())],
+        "CSR adjacency must be restored"
+    );
+}
+
 // ── Column-stats undo ─────────────────────────────────────────────────────────
 
 fn stats_key_str() -> String {

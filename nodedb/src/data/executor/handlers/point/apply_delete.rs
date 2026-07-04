@@ -85,6 +85,13 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
     /// empty on the transactional path until that flag flips. Autocommit callers
     /// ignore it (an aborted redb txn does not reverse in-memory spatial writes).
     pub spatial_deletes: Vec<(SpatialIndexKey, u64, nodedb_types::BoundingBox, String)>,
+    /// Graph edges the unconditional graph-edge cascade removed from BOTH the
+    /// in-memory CSR partition AND the persistent edge store — each captured as
+    /// `(collection, src, label, dst, old_properties)`. Populated regardless of
+    /// caller (the cascade is unconditional), so a transactional caller pushes
+    /// one `UndoEntry::DeleteEdge` per entry and a rolled-back delete restores
+    /// every cascaded edge into both stores. Autocommit callers ignore it.
+    pub edge_deletes: Vec<crate::engine::graph::edge_store::EdgeRestore>,
 }
 
 impl CoreLoop {
@@ -281,19 +288,29 @@ impl CoreLoop {
         }
 
         // Cascade 3: Remove graph edges where this document is src or dst.
+        // Captured unconditionally (the cascade runs for both autocommit and
+        // transactional callers) so a transactional caller can restore every
+        // removed edge on rollback via `UndoEntry::DeleteEdge`, which re-inserts
+        // into BOTH the CSR partition and the persistent edge store — matching
+        // the two stores this cascade removes from.
+        let mut edge_deletes: Vec<crate::engine::graph::edge_store::EdgeRestore> = Vec::new();
         let edges_removed = self
             .csr_partition_mut(database_id, tid)
             .remove_node_edges(document_id);
         if edges_removed > 0 {
-            // Also tombstone in persistent edge store.
+            // Also tombstone in persistent edge store, capturing each removed
+            // edge (with its pre-delete properties) for rollback restore.
             let cascade_ord = self.hlc.next_ordinal();
-            if let Err(e) = self.edge_store.delete_edges_for_node(
+            match self.edge_store.delete_edges_for_node(
                 database_id,
                 nodedb_types::TenantId::new(tid),
                 document_id,
                 cascade_ord,
             ) {
-                warn!(core = self.core_id, %document_id, error = %e, "edge cascade failed");
+                Ok(removed) => edge_deletes = removed,
+                Err(e) => {
+                    warn!(core = self.core_id, %document_id, error = %e, "edge cascade failed");
+                }
             }
             tracing::trace!(core = self.core_id, %document_id, edges_removed, "EDGE_CASCADE_DELETE");
         }
@@ -400,6 +417,7 @@ impl CoreLoop {
             secondary_index_tuples,
             vector_deletes,
             spatial_deletes,
+            edge_deletes,
         })
     }
 }
