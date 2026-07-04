@@ -120,6 +120,7 @@ fn bitemporal_delete_undo_restores_prior_live_version() {
     let entry = UndoEntry::DeleteDocument {
         collection: "c".into(),
         document_id: "d1".into(),
+        surrogate: nodedb_types::Surrogate::ZERO,
         old_value: b"v1".to_vec(),
         bitemporal_sys_from_ms: Some(2_000),
         bitemporal_index_tuples: vec![("status".into(), "active".into())],
@@ -239,6 +240,7 @@ fn rollback_undo_log_restores_pre_txn_state_for_bitemporal_put_then_delete() {
         UndoEntry::DeleteDocument {
             collection: "c".into(),
             document_id: "d1".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
             old_value: b"v1".to_vec(),
             bitemporal_sys_from_ms: Some(2_000),
             bitemporal_index_tuples: vec![("status".into(), "active".into())],
@@ -316,6 +318,7 @@ fn plain_delete_undo_backward_compatible() {
     let entry = UndoEntry::DeleteDocument {
         collection: "c".into(),
         document_id: "d1".into(),
+        surrogate: nodedb_types::Surrogate::ZERO,
         old_value: b"prior".to_vec(),
         bitemporal_sys_from_ms: None,
         bitemporal_index_tuples: Vec::new(),

@@ -324,6 +324,7 @@ impl CoreLoop {
             undo_log.push(UndoEntry::DeleteDocument {
                 collection: collection.to_string(),
                 document_id: row_key.to_string(),
+                surrogate,
                 old_value: old,
                 bitemporal_sys_from_ms: outcome.bitemporal_sys_from_ms,
                 bitemporal_index_tuples: outcome.bitemporal_index_tuples,

@@ -42,6 +42,10 @@ pub(in crate::data::executor) enum UndoEntry {
         collection: String,
         /// Hex-encoded surrogate (the redb storage key).
         document_id: String,
+        /// Numeric surrogate for FTS inverted-index rollback re-indexing. The
+        /// forward delete cascade removed this document's postings; a rolled-back
+        /// delete recomputes and re-inserts them under this surrogate.
+        surrogate: nodedb_types::Surrogate,
         old_value: Vec<u8>,
         /// System-time key of the versioned tombstone row this op appended on a
         /// bitemporal collection. `None` = plain op → re-insert via the

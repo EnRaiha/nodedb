@@ -268,27 +268,23 @@ impl CoreLoop {
         // bytes — Binary Tuple requires a schema to decode, and the input JSON
         // is already available here regardless of storage mode.
         if let Some(doc) = doc_format::decode_document(value) {
-            if let Some(obj) = doc.as_object() {
-                let text_content: String = obj
-                    .values()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if index_text
-                    && !text_content.is_empty()
-                    && let Err(e) = self.inverted.index_document_in_txn(
-                        txn,
-                        crate::engine::sparse::inverted::IndexDocScope {
-                            database_id,
-                            tid: crate::types::TenantId::new(tid),
-                            collection,
-                            surrogate,
-                        },
-                        &text_content,
-                    )
-                {
-                    warn!(core = self.core_id, %collection, %document_id, error = %e, "inverted index update failed");
-                }
+            // Shared extraction: the DELETE-rollback re-index path recomputes
+            // the exact same text from the restored body via this helper.
+            let text_content = crate::data::executor::fts_text::extract_fts_text(&doc);
+            if index_text
+                && !text_content.is_empty()
+                && let Err(e) = self.inverted.index_document_in_txn(
+                    txn,
+                    crate::engine::sparse::inverted::IndexDocScope {
+                        database_id,
+                        tid: crate::types::TenantId::new(tid),
+                        collection,
+                        surrogate,
+                    },
+                    &text_content,
+                )
+            {
+                warn!(core = self.core_id, %collection, %document_id, error = %e, "inverted index update failed");
             }
 
             match self

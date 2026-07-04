@@ -98,14 +98,31 @@ impl CoreLoop {
                     &secondary_index_added,
                     &secondary_index_removed,
                 )?;
-                // Revert inverted index — best-effort; FTS index inconsistency is
-                // recoverable via re-index, unlike primary store inconsistency.
-                let _ = self.inverted.remove_document(
-                    crate::types::DatabaseId::DEFAULT.as_u64(),
-                    crate::types::TenantId::new(tid),
-                    &collection,
-                    surrogate,
-                );
+                // Revert inverted index: remove the postings this rolled-back
+                // put wrote. FATAL on failure — a rollback that leaves stale FTS
+                // postings behind is the same silent-partial-success corruption
+                // the primary-store restore guards against.
+                self.inverted
+                    .remove_document(
+                        crate::types::DatabaseId::DEFAULT.as_u64(),
+                        crate::types::TenantId::new(tid),
+                        &collection,
+                        surrogate,
+                    )
+                    .map_err(|e| {
+                        error!(
+                            core = self.core_id,
+                            entry_index,
+                            collection = %collection,
+                            document_id = %document_id,
+                            error = %e,
+                            "transaction undo: FTS posting removal failed; shard state unknown"
+                        );
+                        (
+                            entry_index,
+                            format!("fts posting removal on {collection}/{document_id}: {e}"),
+                        )
+                    })?;
                 // Evict any cached copy of the reversed document. Always safe:
                 // a stale hit would otherwise resurrect a rolled-back put; the
                 // worst case here is a cache miss.
@@ -121,6 +138,7 @@ impl CoreLoop {
             UndoEntry::DeleteDocument {
                 collection,
                 document_id,
+                surrogate,
                 old_value,
                 bitemporal_sys_from_ms,
                 bitemporal_index_tuples,
@@ -171,6 +189,19 @@ impl CoreLoop {
                     &document_id,
                     &[],
                     &secondary_index_tuples,
+                )?;
+                // Re-index the restored document into the full-text inverted
+                // index. The forward delete cascade removed its postings
+                // unconditionally, so a rollback that restored the row but not
+                // its postings would leave it restored-but-unsearchable. FATAL
+                // on failure — a half-restored FTS index is corruption.
+                self.reindex_restored_document_fts(
+                    tid,
+                    entry_index,
+                    &collection,
+                    &document_id,
+                    surrogate,
+                    &old_value,
                 )?;
                 // Evict any cached copy of the reversed document (see the
                 // PutDocument branch): reversing a delete restores the row, so a

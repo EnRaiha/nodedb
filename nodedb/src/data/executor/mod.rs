@@ -6,6 +6,7 @@ pub(crate) mod crdt_checkpoint;
 mod dispatch;
 pub(crate) mod doc_format;
 pub mod enforcement;
+pub(crate) mod fts_text;
 pub mod handlers;
 pub(super) mod msgpack_utils;
 pub mod response_codec;

@@ -6,10 +6,10 @@
 //! carrying a secondary index + spatial R-tree + HNSW vector index + column
 //! stats + graph edges.
 //!
-//! SCOPE: FTS/inverted-index posting restoration on DELETE-rollback is a
-//! SEPARATE pre-existing gap (the DELETE undo does not re-add inverted-index
-//! postings, pending a dedicated FTS-undo fix), so it is intentionally NOT
-//! asserted on delete-rollback. Every non-FTS side-effect IS asserted.
+//! SCOPE: FTS/inverted-index postings are included — a rolled-back DELETE
+//! re-indexes the restored body (recomputed deterministically), and a
+//! rolled-back PUT removes the postings it wrote. Both directions are asserted
+//! via `fts_searchable`.
 
 use std::time::{Duration, Instant};
 
@@ -121,6 +121,28 @@ fn spatial_entry_present(core: &Core) -> bool {
         .get(&spatial_key())
         .map(|rt| rt.entries().into_iter().any(|e| e.id == entry_id))
         .unwrap_or(false)
+}
+
+/// Whether the document's text (`status: "active"`) is findable in the
+/// full-text inverted index. This is the direct probe for the
+/// restored-but-unsearchable gap: a rolled-back DELETE must make it true again.
+fn fts_searchable(core: &Core) -> bool {
+    !core
+        .inverted
+        .search(
+            DB,
+            TenantId::new(TID),
+            COLL,
+            nodedb_fts::FtsSearchParams {
+                query: "active",
+                top_k: 10,
+                fuzzy_enabled: false,
+                mode: nodedb_fts::posting::QueryMode::And,
+                prefilter: None,
+            },
+        )
+        .unwrap()
+        .is_empty()
 }
 
 /// Whether the collection's single vector is searchable (not soft-deleted).
@@ -276,6 +298,8 @@ fn tx_put_commit_matches_autocommit_across_all_indexes() {
     assert!(spatial_entry_present(&b));
     assert_eq!(vector_searchable(&a), vector_searchable(&b));
     assert!(vector_searchable(&b));
+    assert_eq!(fts_searchable(&a), fts_searchable(&b));
+    assert!(fts_searchable(&b), "text must be searchable after tx PUT");
 }
 
 #[test]
@@ -289,6 +313,7 @@ fn tx_put_rollback_restores_pre_tx_state_across_all_indexes() {
     assert_eq!(stats_row_count(&core), None);
     assert!(!spatial_entry_present(&core));
     assert!(!vector_searchable(&core));
+    assert!(!fts_searchable(&core));
 
     let task = dummy_task();
     let mut undo_log = Vec::new();
@@ -311,6 +336,7 @@ fn tx_put_rollback_restores_pre_tx_state_across_all_indexes() {
     assert_eq!(secondary_index_docs(&core), vec![row_key()]);
     assert!(spatial_entry_present(&core));
     assert!(vector_searchable(&core));
+    assert!(fts_searchable(&core));
 
     core.rollback_undo_log(DB, TID, undo_log)
         .expect("rollback must succeed");
@@ -332,6 +358,10 @@ fn tx_put_rollback_restores_pre_tx_state_across_all_indexes() {
     assert!(
         !vector_searchable(&core),
         "vector must be soft-deleted (unsearchable) after put-rollback"
+    );
+    assert!(
+        !fts_searchable(&core),
+        "text must be unsearchable after put-rollback (postings removed)"
     );
 }
 
@@ -373,6 +403,11 @@ fn tx_delete_commit_matches_autocommit_across_all_indexes() {
     assert!(!spatial_entry_present(&b));
     assert_eq!(vector_searchable(&a), vector_searchable(&b));
     assert!(!vector_searchable(&b));
+    assert_eq!(fts_searchable(&a), fts_searchable(&b));
+    assert!(
+        !fts_searchable(&b),
+        "text must be unsearchable after delete"
+    );
     assert_eq!(edge_present(&mut a), edge_present(&mut b));
     assert!(!edge_present(&mut b));
     assert_eq!(
@@ -394,6 +429,7 @@ fn tx_delete_rollback_restores_pre_tx_state_across_all_indexes() {
     assert_eq!(secondary_index_docs(&core), vec![row_key()]);
     assert!(spatial_entry_present(&core));
     assert!(vector_searchable(&core));
+    assert!(fts_searchable(&core));
     assert!(edge_present(&mut core));
     assert!(!core.is_node_deleted(DB, TID, PK));
 
@@ -414,6 +450,7 @@ fn tx_delete_rollback_restores_pre_tx_state_across_all_indexes() {
     // Mid-tx: the delete cascaded.
     assert!(!spatial_entry_present(&core));
     assert!(!vector_searchable(&core));
+    assert!(!fts_searchable(&core));
     assert!(core.is_node_deleted(DB, TID, PK));
 
     core.rollback_undo_log(DB, TID, undo_log)
@@ -441,9 +478,10 @@ fn tx_delete_rollback_restores_pre_tx_state_across_all_indexes() {
         !core.is_node_deleted(DB, TID, PK),
         "deleted-node tombstone must be un-marked after delete-rollback"
     );
-    // NOTE: FTS/inverted-index posting restoration is intentionally NOT asserted
-    // here — DELETE-undo does not re-add inverted-index postings (a separate
-    // pre-existing gap pending a dedicated FTS-undo fix).
+    assert!(
+        fts_searchable(&core),
+        "FTS postings must be restored (doc searchable again) after delete-rollback"
+    );
 }
 
 // ── mark_node_deleted "was-newly-marked" handling ─────────────────────────────
