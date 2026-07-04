@@ -16,3 +16,8 @@ mod body;
 mod constraint;
 mod context;
 mod dispatch;
+mod stage_bulk_delete;
+mod stage_bulk_update;
+
+pub(in crate::data::executor) use stage_bulk_delete::StageBulkDeleteParams;
+pub(in crate::data::executor) use stage_bulk_update::StageBulkUpdateParams;

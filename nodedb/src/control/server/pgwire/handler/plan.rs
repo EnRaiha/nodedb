@@ -186,9 +186,13 @@ pub(super) fn is_calvin_foldable(plan: &PhysicalPlan) -> bool {
     }
 }
 
-/// Allow-list of the point-write plans the in-transaction path stages at
-/// statement time. Explicit match on the exact staged variants (Document point
-/// writes only, no RETURNING) — KV point writes stay on the buffer path.
+/// Allow-list of the plans the in-transaction path stages at statement time:
+/// point writes plus predicate `BulkUpdate` / `BulkDelete` (bulk predicate
+/// DML, no RETURNING). Explicit match on the exact staged variants — KV point
+/// writes and any RETURNING variant stay on the buffer path. Named for the
+/// point-write case historically; also covers bulk predicate DML now that
+/// `stage_bulk_update` / `stage_bulk_delete` stage the matched rows the same
+/// way.
 pub(super) fn is_point_write(plan: &PhysicalPlan) -> bool {
     matches!(
         plan,
@@ -203,13 +207,22 @@ pub(super) fn is_point_write(plan: &PhysicalPlan) -> bool {
                     returning: None,
                     ..
                 }
+                | DocumentOp::BulkUpdate {
+                    returning: None,
+                    ..
+                }
+                | DocumentOp::BulkDelete {
+                    returning: None,
+                    ..
+                }
         )
     )
 }
 
-/// Synthesise the `CommandComplete` tag for a staged point write, carrying the
-/// real affected-row count (1 for an applied write, 0 for an
-/// `ON CONFLICT DO NOTHING` no-op).
+/// Synthesise the `CommandComplete` tag for a staged point write or staged
+/// bulk predicate DML, carrying the real affected-row count (1 for an applied
+/// point write, 0 for an `ON CONFLICT DO NOTHING` no-op, or the real matched
+/// count for `BulkUpdate` / `BulkDelete`).
 ///
 /// Caller invariant: `plan` must have passed [`is_point_write`].
 pub(super) fn point_write_tag(plan: &PhysicalPlan, rows: usize) -> Tag {
@@ -217,12 +230,22 @@ pub(super) fn point_write_tag(plan: &PhysicalPlan, rows: usize) -> Tag {
         PhysicalPlan::Document(DocumentOp::PointPut { .. } | DocumentOp::PointInsert { .. }) => {
             Tag::new("INSERT").with_rows(rows)
         }
-        PhysicalPlan::Document(DocumentOp::PointUpdate {
-            returning: None, ..
-        }) => Tag::new("UPDATE").with_rows(rows),
-        PhysicalPlan::Document(DocumentOp::PointDelete {
-            returning: None, ..
-        }) => Tag::new("DELETE").with_rows(rows),
+        PhysicalPlan::Document(
+            DocumentOp::PointUpdate {
+                returning: None, ..
+            }
+            | DocumentOp::BulkUpdate {
+                returning: None, ..
+            },
+        ) => Tag::new("UPDATE").with_rows(rows),
+        PhysicalPlan::Document(
+            DocumentOp::PointDelete {
+                returning: None, ..
+            }
+            | DocumentOp::BulkDelete {
+                returning: None, ..
+            },
+        ) => Tag::new("DELETE").with_rows(rows),
         other => unreachable!(
             "point_write_tag called on a non-point-write plan; \
              is_point_write invariant broken: {other:?}"

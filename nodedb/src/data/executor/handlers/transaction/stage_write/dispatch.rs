@@ -7,6 +7,7 @@ use nodedb_physical::physical_plan::{DocumentOp, UpdateValue};
 
 use super::constraint::OverlayPk;
 use super::context::StageCtx;
+use super::{StageBulkDeleteParams, StageBulkUpdateParams};
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
@@ -93,6 +94,49 @@ impl CoreLoop {
                 let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
                 self.stage_point_update(&ctx, updates)
             }
+            // Predicate UPDATE staged at statement time — same treatment as a
+            // point update, resolved against the BASE ∪ OVERLAY matching set.
+            // The Control Plane only builds `StageWrite` for the `returning:
+            // None` variant (see `is_point_write`); a `RETURNING` bulk update
+            // stays on the pre-existing buffer + "OK" deferral.
+            DocumentOp::BulkUpdate {
+                collection,
+                filters,
+                updates,
+                returning: None,
+                ollp_predicted_surrogates: _,
+                ollp_predicted_edges: _,
+            } => self.stage_bulk_update(StageBulkUpdateParams {
+                task,
+                tid,
+                txn_id,
+                collection,
+                filter_bytes: filters,
+                updates,
+            }),
+            DocumentOp::BulkUpdate {
+                returning: Some(_), ..
+            } => self.stage_not_point_write(task),
+
+            // Predicate DELETE staged at statement time — same treatment as a
+            // point delete, resolved against the BASE ∪ OVERLAY matching set.
+            DocumentOp::BulkDelete {
+                collection,
+                filters,
+                returning: None,
+                ollp_predicted_surrogates: _,
+                ollp_predicted_edges: _,
+            } => self.stage_bulk_delete(StageBulkDeleteParams {
+                task,
+                tid,
+                txn_id,
+                collection,
+                filter_bytes: filters,
+            }),
+            DocumentOp::BulkDelete {
+                returning: Some(_), ..
+            } => self.stage_not_point_write(task),
+
             DocumentOp::PointGet { .. }
             | DocumentOp::Scan { .. }
             | DocumentOp::BatchInsert { .. }
@@ -107,8 +151,6 @@ impl CoreLoop {
             | DocumentOp::InsertSelect { .. }
             | DocumentOp::Upsert { .. }
             | DocumentOp::UpdateFromJoin { .. }
-            | DocumentOp::BulkUpdate { .. }
-            | DocumentOp::BulkDelete { .. }
             | DocumentOp::Merge { .. }
             | DocumentOp::MaterializeScan { .. } => self.stage_not_point_write(task),
         }
