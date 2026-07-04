@@ -52,7 +52,7 @@ pub(in crate::data::executor) struct PointPutParams<'a> {
 /// transactional path (`tx_point_put`), which surfaces `ErrorCode` directly.
 /// `apply_point_put` runs inside `crate::Result`, so violations are
 /// translated here to the equivalent `crate::Error` variant.
-fn map_enforcement_error(e: ErrorCode) -> crate::Error {
+pub(in crate::data::executor) fn map_enforcement_error(e: ErrorCode) -> crate::Error {
     match e {
         ErrorCode::AppendOnlyViolation { collection } => crate::Error::AppendOnlyViolation {
             collection,
@@ -71,6 +71,14 @@ fn map_enforcement_error(e: ErrorCode) -> crate::Error {
                 detail: "transition check predicate failed".to_string(),
             }
         }
+        ErrorCode::RetentionViolation { collection } => crate::Error::RetentionViolation {
+            collection,
+            detail: "row is younger than the configured retention period".to_string(),
+        },
+        ErrorCode::LegalHoldActive { collection } => crate::Error::LegalHoldActive {
+            collection,
+            detail: "collection has an active legal hold: DELETE rejected".to_string(),
+        },
         other => crate::Error::Storage {
             engine: "enforcement".into(),
             detail: format!("unexpected enforcement error: {other:?}"),

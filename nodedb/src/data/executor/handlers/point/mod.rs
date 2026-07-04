@@ -7,6 +7,7 @@
 //! blocks that share the same type. Dispatch sees them via the normal method
 //! lookup — no re-export needed.
 
+pub mod apply_delete;
 pub mod apply_put;
 pub mod apply_put_index;
 pub mod delete;
