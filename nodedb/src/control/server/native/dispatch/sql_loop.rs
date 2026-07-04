@@ -196,6 +196,7 @@ async fn dispatch_task(ctx: &DispatchCtx<'_>, mut task: PhysicalTask) -> crate::
         task.tenant_id,
         task.plan,
         TraceId::ZERO,
+        task.txn_id,
     )
     .await?
     {

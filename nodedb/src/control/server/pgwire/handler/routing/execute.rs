@@ -343,15 +343,17 @@ impl NodeDbPgHandler {
             let task_database_id = task.database_id;
             let plan_for_response = task.plan.clone();
 
-            // --- Single-node pgwire streaming fast path ---
-            //
-            // Permission was already checked at the top of the loop. An eligible
-            // autocommit unordered SELECT streams its rows straight to the
-            // client (see `maybe_stream_select`); everything else falls through
-            // to the normal dispatch path below.
-            if let Some(stream_response) = self
-                .maybe_stream_select(&task, plan_kind, resp_post_set_op, addr, projection)
-                .await?
+            // Single-node pgwire streaming fast path (autocommit SELECT only).
+            // In-transaction reads skip streaming so the transaction id rides on
+            // the request and the data plane merges the transaction's own staged
+            // writes into the scan (read-your-own-writes); the streaming path
+            // builds per-core requests without the transaction id.
+            let in_transaction = self.sessions.transaction_state(addr)
+                == crate::control::server::shared::session::TransactionState::InBlock;
+            if !in_transaction
+                && let Some(stream_response) = self
+                    .maybe_stream_select(&task, plan_kind, resp_post_set_op, addr, projection)
+                    .await?
             {
                 responses.push(stream_response);
                 continue;

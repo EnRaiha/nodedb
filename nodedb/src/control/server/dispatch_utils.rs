@@ -126,12 +126,15 @@ pub async fn dispatch_to_data_plane_with_source(
     // core is self-contained. Safe no-op for the many non-Exchange callers
     // (writes, metrics, triggers). Catalog materialization is identity-scoped
     // and already done upstream on the pgwire/native paths.
+    // Internal funnel (COPY, cursors, materialized-view refresh, constraint
+    // subqueries): not session-transaction-scoped, so `None`.
     let plan = match crate::control::server::exchange::resolve_exchange_in_plan(
         shared,
         database_id,
         tenant_id,
         plan,
         trace_id,
+        None,
     )
     .await?
     {

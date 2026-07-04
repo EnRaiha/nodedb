@@ -158,6 +158,7 @@ impl NodeDbPgHandler {
                 task.tenant_id,
                 task.plan,
                 TraceId::ZERO,
+                task.txn_id,
             )
             .await?
             {

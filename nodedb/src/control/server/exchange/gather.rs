@@ -24,7 +24,9 @@ use crate::control::gateway::core::QueryContext;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::server::result_stream::ResultStream;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+use crate::types::{
+    DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, TxnId, VShardId,
+};
 
 /// Eagerly dispatch a plan to every local Data-Plane core, registering a tracker
 /// receiver per core BEFORE returning so all cores have the request in flight
@@ -36,11 +38,18 @@ use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceI
 ///
 /// Does NOT call `broadcast_call_count_increment()` — each caller is responsible
 /// for its own observability increment.
+///
+/// `txn_id` is the originating session transaction id (if the dispatching
+/// task ran inside a transaction block); it is threaded onto every per-core
+/// `Request` so the Data-Plane scan handler can merge the transaction's
+/// staging overlay (read-your-own-writes). Autocommit / non-transactional
+/// callers pass `None`, which reproduces prior behaviour exactly.
 pub(crate) fn eager_dispatch_to_all_cores(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
     plan_for_core: impl Fn(usize) -> PhysicalPlan,
 ) -> crate::Result<
     Vec<(
@@ -75,7 +84,7 @@ pub(crate) fn eager_dispatch_to_all_cores(
             user_roles: Vec::new(),
             user_id: None,
             statement_digest: None,
-            txn_id: None,
+            txn_id,
         };
 
         let rx = state.tracker.register(request_id);
@@ -116,6 +125,7 @@ pub async fn gather_all_cores(
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<GatherOutcome> {
     // Track broadcast calls for observability (shared counter with broadcast.rs).
     crate::control::server::broadcast::broadcast_call_count_increment();
@@ -126,7 +136,9 @@ pub async fn gather_all_cores(
     // This ensures every core has the request in flight before we block on any
     // of them, matching true parallelism semantics.
     let receivers =
-        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, |_| plan.clone())?;
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, txn_id, |_| {
+            plan.clone()
+        })?;
 
     // Await all responses in parallel using join_all. Each core's scan result
     // may stream as several `Partial` frames before its terminal frame, so drain
@@ -248,6 +260,7 @@ pub fn gather_all_cores_stream(
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<ResultStream> {
     use crate::control::server::result_stream::stream_response_channel;
 
@@ -260,10 +273,12 @@ pub fn gather_all_cores_stream(
     // BEFORE returning the stream, so every core has the request in flight
     // immediately (matching `gather_all_cores`'s true-parallelism prologue).
     let per_core: Vec<ResultStream> =
-        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, |_| plan.clone())?
-            .into_iter()
-            .map(|(_core_id, rx)| stream_response_channel(rx, max_result_bytes, true))
-            .collect();
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, txn_id, |_| {
+            plan.clone()
+        })?
+        .into_iter()
+        .map(|(_core_id, rx)| stream_response_channel(rx, max_result_bytes, true))
+        .collect();
 
     Ok(Box::pin(futures::stream::select_all(per_core)))
 }
@@ -305,10 +320,11 @@ pub async fn gather_all_vshards(
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<GatherOutcome> {
     let Some(gateway) = state.gateway.as_ref() else {
         // Single-node: delegate to the local fan-out path unchanged.
-        return gather_all_cores(state, tenant_id, database_id, plan, trace_id).await;
+        return gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await;
     };
 
     if nodedb_physical::physical_plan::plan_contains_cluster_partitioned_leaf(&plan) {
@@ -321,7 +337,7 @@ pub async fn gather_all_vshards(
         // vshard-scoped path. Do not replace this fallback with Exchange{Gather}
         // broadcasting — that path is only correct for single-vShard-homed
         // collections.
-        return gather_all_cores(state, tenant_id, database_id, plan, trace_id).await;
+        return gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await;
     }
 
     // Single-vShard-homed source (document/kv/columnar/ts/spatial/vector/text):

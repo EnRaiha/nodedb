@@ -20,7 +20,7 @@ use crate::bridge::envelope::Response;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::flatten_to_relational_rows;
-use crate::types::{DatabaseId, TenantId, TraceId};
+use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 
 use crate::control::server::exchange::gather::{
     GatherOutcome, finalize_aggregate, gather_all_cores, gather_all_cores_stream,
@@ -49,6 +49,12 @@ pub enum Resolved {
 /// Materialize catalog providers and resolve Exchange nodes in `plan`.
 ///
 /// See module-level documentation for the two-pass behaviour.
+///
+/// `txn_id` is the originating session transaction id (if the dispatching
+/// task ran inside a transaction block); it is threaded down to every
+/// per-core `Request` built by the gather primitives so in-transaction scans
+/// can merge the transaction's staging overlay (read-your-own-writes).
+/// Autocommit / non-transactional callers pass `None`.
 pub async fn resolve_and_materialize(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -56,12 +62,13 @@ pub async fn resolve_and_materialize(
     tenant_id: TenantId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<Resolved> {
     // Pass 1: fill empty ProviderScan rows (identity-scoped, per-request).
     let plan = materialize_providers(state, identity, plan).await?;
 
     // Pass 2: resolve Exchange nodes.
-    resolve_exchange(state, database_id, tenant_id, plan, trace_id).await
+    resolve_exchange(state, database_id, tenant_id, plan, trace_id, txn_id).await
 }
 
 /// Resolve only `Exchange` nodes (pass 2), without catalog provider
@@ -72,14 +79,17 @@ pub async fn resolve_and_materialize(
 /// correctly. Identity-free: catalog materialization happens earlier on the
 /// pgwire/native paths that own the request identity. A no-op for plans with no
 /// `Exchange` node.
+///
+/// See `resolve_and_materialize` for `txn_id` semantics.
 pub async fn resolve_exchange_in_plan(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: TenantId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<Resolved> {
-    resolve_exchange(state, database_id, tenant_id, plan, trace_id).await
+    resolve_exchange(state, database_id, tenant_id, plan, trace_id, txn_id).await
 }
 
 // ── pass 2 ───────────────────────────────────────────────────────────────────
@@ -99,6 +109,7 @@ async fn resolve_exchange(
     tenant_id: TenantId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<Resolved> {
     match plan {
         // Root-level Gather: fan child to all vShards and merge. First resolve any
@@ -115,6 +126,7 @@ async fn resolve_exchange(
                 tenant_id,
                 *child,
                 trace_id,
+                txn_id,
             ))
             .await?
             {
@@ -146,15 +158,19 @@ async fn resolve_exchange(
                         trace_id,
                         database_id,
                     };
+                    // NOTE: cluster mode does not yet thread `txn_id` through
+                    // `gateway.execute_stream` — cross-node in-transaction
+                    // read-your-own-writes is a tracked gap; single-node
+                    // (`gather_all_cores_stream` below) is fixed.
                     gw.execute_stream(&ctx, child).await?
                 } else {
-                    gather_all_cores_stream(state, tenant_id, database_id, child, trace_id)?
+                    gather_all_cores_stream(state, tenant_id, database_id, child, trace_id, txn_id)?
                 };
                 return Ok(Resolved::Stream(stream));
             }
 
             let outcome: GatherOutcome =
-                gather_all_vshards(state, tenant_id, database_id, child, trace_id).await?;
+                gather_all_vshards(state, tenant_id, database_id, child, trace_id, txn_id).await?;
             let payload = if as_aggregate {
                 finalize_aggregate(&outcome.merged_array)
             } else {
@@ -172,7 +188,7 @@ async fn resolve_exchange(
             mode: ExchangeMode::Broadcast,
         })) => {
             let outcome =
-                gather_all_vshards(state, tenant_id, database_id, *child, trace_id).await?;
+                gather_all_vshards(state, tenant_id, database_id, *child, trace_id, txn_id).await?;
             Ok(Resolved::Gathered(outcome_to_response(
                 outcome.merged_array,
                 outcome.watermark_lsn,
@@ -239,9 +255,11 @@ async fn resolve_exchange(
             right_bitmap,
         }) => {
             let left_input =
-                resolve_join_input(state, database_id, tenant_id, left_input, trace_id).await?;
+                resolve_join_input(state, database_id, tenant_id, left_input, trace_id, txn_id)
+                    .await?;
             let mut right_input =
-                resolve_join_input(state, database_id, tenant_id, right_input, trace_id).await?;
+                resolve_join_input(state, database_id, tenant_id, right_input, trace_id, txn_id)
+                    .await?;
 
             // Cross-node build-side gather (cluster only).
             //
@@ -267,6 +285,7 @@ async fn resolve_exchange(
                     tenant_id,
                     &right_collection,
                     trace_id,
+                    txn_id,
                 )
                 .await?;
             }
@@ -307,6 +326,7 @@ async fn resolve_join_input(
     tenant_id: TenantId,
     input: Option<Box<PhysicalPlan>>,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<Option<Box<PhysicalPlan>>> {
     let Some(boxed) = input else {
         return Ok(None);
@@ -326,7 +346,8 @@ async fn resolve_join_input(
             // producing a Response whose payload is exactly `merged_array`.
             // `decode_response_to_docs` in `hash_handlers.rs` then reads that
             // Response as a msgpack array — so the two shapes match.
-            let outcome = gather_all_cores(state, tenant_id, database_id, *child, trace_id).await?;
+            let outcome =
+                gather_all_cores(state, tenant_id, database_id, *child, trace_id, txn_id).await?;
             let provider_scan = PhysicalPlan::Query(QueryOp::ProviderScan {
                 provider: None,
                 rows: flatten_to_relational_rows(&outcome.merged_array),
@@ -372,7 +393,8 @@ async fn resolve_join_input(
             child,
             mode: ExchangeMode::Gather { as_aggregate },
         })) => {
-            let outcome = gather_all_cores(state, tenant_id, database_id, *child, trace_id).await?;
+            let outcome =
+                gather_all_cores(state, tenant_id, database_id, *child, trace_id, txn_id).await?;
             let merged = if as_aggregate {
                 finalize_aggregate(&outcome.merged_array)
             } else {
@@ -415,6 +437,7 @@ async fn gather_join_build_side(
     tenant_id: TenantId,
     collection: &str,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<Option<Box<PhysicalPlan>>> {
     // Build a minimal, unfiltered, unprojected full-collection scan for the
     // engine via the shared builder. `Ok(None)` (no catalog / unknown
@@ -451,6 +474,7 @@ async fn gather_join_build_side(
         database_id,
         scan_plan,
         trace_id,
+        txn_id,
     ))
     .await?;
 

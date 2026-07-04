@@ -52,12 +52,14 @@ pub async fn broadcast_to_all_cores(
     plan: PhysicalPlan,
     trace_id: TraceId,
 ) -> crate::Result<Response> {
+    // Graph/DDL all-core broadcast: not session-transaction-scoped, so `None`.
     let outcome = crate::control::server::exchange::gather_all_cores(
         shared,
         tenant_id,
         database_id,
         plan,
         trace_id,
+        None,
     )
     .await?;
     Ok(Response {

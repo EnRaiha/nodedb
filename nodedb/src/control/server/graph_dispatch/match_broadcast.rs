@@ -204,8 +204,11 @@ pub async fn broadcast_match_to_all_cores(
     // Eager dispatch: register a tracker receiver and dispatch to each core
     // BEFORE awaiting any response, matching gather_all_cores' true-parallelism
     // prologue.
+    // MATCH pattern broadcast: not session-transaction-scoped, so `None`.
     let receivers =
-        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, |_| plan.clone())?;
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, None, |_| {
+            plan.clone()
+        })?;
 
     // Await all cores in parallel, draining the full bounded response per core
     // (a core's result may stream as several Partial frames before its terminal

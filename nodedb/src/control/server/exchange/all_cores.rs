@@ -214,7 +214,10 @@ async fn generic_gather(
 ) -> crate::Result<NodeLevelResult> {
     use crate::control::server::exchange::gather::gather_all_cores;
 
-    let outcome = gather_all_cores(state, tenant_id, database_id, plan, trace_id).await?;
+    // Cluster RPC receiver path (remote-node local execution): no session
+    // transaction context crosses the node boundary yet, so `txn_id` is
+    // `None` here. TRACKED: cross-node in-transaction reads are a known gap.
+    let outcome = gather_all_cores(state, tenant_id, database_id, plan, trace_id, None).await?;
     Ok(NodeLevelResult {
         payload: outcome.merged_array,
         watermark_lsn: outcome.watermark_lsn,
@@ -484,8 +487,9 @@ async fn gather_graph_op_all_cores(
     // CRITICAL: scope each core's `owned_vshards` to the vShards round-robin homed
     // on THAT core (`vshard % num_cores == core_id`) so owned sets are genuinely
     // disjoint across cores. See function-level doc for details.
+    // Graph BSP superstep fan-out: not session-transaction-scoped, so `None`.
     let receivers =
-        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, |core_id| {
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, None, |core_id| {
             let mut core_plan = plan.clone();
             match &mut core_plan {
                 PhysicalPlan::Graph(g) => match g {

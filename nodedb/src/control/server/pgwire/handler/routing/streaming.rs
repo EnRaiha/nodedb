@@ -90,6 +90,7 @@ impl NodeDbPgHandler {
                 task.database_id,
                 child_plan,
                 crate::types::TraceId::ZERO,
+                task.txn_id,
             )
         }
         .map_err(|e| {

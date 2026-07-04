@@ -108,6 +108,25 @@ impl CoreLoop {
         // Tuple for strict), so the same push-down predicates apply unchanged.
         let bitemporal = self.is_bitemporal(tid, collection);
 
+        // Single scan predicate, shared by the base scan and the transaction
+        // overlay merge so both admit rows on identical terms. Strict
+        // collections store Binary Tuples: decode to MessagePack via the schema
+        // before evaluating (`matches_binary` operates on MessagePack).
+        // Schemaless bodies are already MessagePack. An empty filter set matches
+        // every row.
+        let matches = |value: &[u8]| -> bool {
+            if filter_predicates.is_empty() {
+                return true;
+            }
+            match strict_schema.as_ref() {
+                Some(schema) => match strict_format::binary_tuple_to_msgpack(value, schema) {
+                    Some(mp) => filter_predicates.iter().all(|f| f.matches_binary(&mp)),
+                    None => false,
+                },
+                None => filter_predicates.iter().all(|f| f.matches_binary(value)),
+            }
+        };
+
         // Scan strategy:
         // 1. Try sparse engine first (with optimized push-down filters when present).
         // 2. If sparse returns empty, fall back to scan_collection which routes
@@ -159,12 +178,7 @@ impl CoreLoop {
                     _ => sparse_result,
                 }
             }
-        } else if let Some(ref schema) = strict_schema {
-            let predicate =
-                |value: &[u8]| match strict_format::binary_tuple_to_msgpack(value, schema) {
-                    Some(mp) => filter_predicates.iter().all(|f| f.matches_binary(&mp)),
-                    None => false,
-                };
+        } else if strict_schema.is_some() {
             if bitemporal {
                 self.sparse.versioned_scan_as_of(
                     crate::engine::sparse::btree_versioned::VersionedScanParams {
@@ -175,7 +189,7 @@ impl CoreLoop {
                         valid_at_ms: None,
                         limit: fetch_limit,
                     },
-                    &predicate,
+                    &matches,
                 )
             } else {
                 self.sparse.scan_documents_filtered(
@@ -183,49 +197,39 @@ impl CoreLoop {
                     tid,
                     collection,
                     fetch_limit,
-                    &predicate,
+                    &matches,
                 )
             }
+        } else if bitemporal {
+            self.sparse.versioned_scan_as_of(
+                crate::engine::sparse::btree_versioned::VersionedScanParams {
+                    database_id: task.request.database_id.as_u64(),
+                    tenant: tid,
+                    coll: collection,
+                    sys_cutoff_ms: None,
+                    valid_at_ms: None,
+                    limit: fetch_limit,
+                },
+                &matches,
+            )
         } else {
-            let predicate =
-                |value: &[u8]| filter_predicates.iter().all(|f| f.matches_binary(value));
-            if bitemporal {
-                self.sparse.versioned_scan_as_of(
-                    crate::engine::sparse::btree_versioned::VersionedScanParams {
-                        database_id: task.request.database_id.as_u64(),
-                        tenant: tid,
-                        coll: collection,
-                        sys_cutoff_ms: None,
-                        valid_at_ms: None,
-                        limit: fetch_limit,
-                    },
-                    &predicate,
-                )
-            } else {
-                let sparse_result = self.sparse.scan_documents_filtered(
-                    task.request.database_id.as_u64(),
-                    tid,
-                    collection,
-                    fetch_limit,
-                    &predicate,
-                );
-                match &sparse_result {
-                    Ok(docs) if docs.is_empty() => self
-                        .scan_collection(
-                            task.request.database_id.as_u64(),
-                            tid,
-                            collection,
-                            fetch_limit,
-                        )
-                        .map(|docs| {
-                            docs.into_iter()
-                                .filter(|(_, data)| {
-                                    filter_predicates.iter().all(|f| f.matches_binary(data))
-                                })
-                                .collect()
-                        }),
-                    _ => sparse_result,
-                }
+            let sparse_result = self.sparse.scan_documents_filtered(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                fetch_limit,
+                &matches,
+            );
+            match &sparse_result {
+                Ok(docs) if docs.is_empty() => self
+                    .scan_collection(
+                        task.request.database_id.as_u64(),
+                        tid,
+                        collection,
+                        fetch_limit,
+                    )
+                    .map(|docs| docs.into_iter().filter(|(_, data)| matches(data)).collect()),
+                _ => sparse_result,
             }
         };
 
@@ -233,6 +237,23 @@ impl CoreLoop {
             Ok(mut filtered) => {
                 if let Some(ref m) = self.metrics {
                     m.record_document_read();
+                }
+
+                // Read-your-own-writes for scans: fold this transaction's
+                // staging overlay onto the base result before any budget /
+                // sort / projection / limit stage, so staged inserts count
+                // against the budget and flow through sort+limit unchanged.
+                // `execute_document_scan` only serves current-version reads
+                // (temporal scans route to the dedicated as-of handlers), so
+                // the merge is always safe here — staged bodies are
+                // current-version only.
+                if let Some(txn_id) = task.request.txn_id {
+                    let coll_key = (
+                        task.request.database_id,
+                        crate::types::TenantId::new(tid),
+                        collection.to_string(),
+                    );
+                    self.merge_overlay_into_scan(txn_id, &coll_key, &mut filtered, &matches);
                 }
 
                 // Bound an unbounded (no-LIMIT) scan by the memory budget. If

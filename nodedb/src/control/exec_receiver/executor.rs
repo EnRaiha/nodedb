@@ -312,12 +312,15 @@ impl LocalPlanExecutor {
         let tenant_id = crate::types::TenantId::new(req.tenant_id);
         let trace_id = nodedb_types::TraceId(req.trace_id);
 
+        // Cluster RPC receiver (remote-node local execution): `ExecuteRequest`
+        // carries no session-transaction context yet, so `None`.
         let mut stream = match crate::control::server::exchange::gather::gather_all_cores_stream(
             &self.state,
             tenant_id,
             database_id,
             plan,
             trace_id,
+            None,
         ) {
             Ok(s) => s,
             Err(e) => {

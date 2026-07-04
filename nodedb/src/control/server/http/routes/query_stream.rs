@@ -70,6 +70,7 @@ pub(super) async fn try_open_stream(
             task.database_id,
             child_plan,
             trace_id,
+            task.txn_id,
         )
     }?;
 

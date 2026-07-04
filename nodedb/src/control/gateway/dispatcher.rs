@@ -107,12 +107,16 @@ pub async fn dispatch_route_stream(
     version_set: &GatewayVersionSet,
 ) -> Result<ResultStream, Error> {
     match route.decision {
+        // Cluster gateway route dispatch: no session-transaction context
+        // crosses this boundary yet, so `None`. TRACKED: cross-node
+        // in-transaction reads are a known gap (see resolve/exchange.rs).
         RouteDecision::Local => crate::control::server::exchange::gather::gather_all_cores_stream(
             shared,
             tenant_id,
             database_id,
             route.plan,
             trace_id,
+            None,
         ),
         RouteDecision::Remote { node_id, vshard_id } => {
             dispatch_remote_stream(RemoteDispatchArgs {
@@ -201,12 +205,16 @@ async fn dispatch_remote(args: RemoteDispatchArgs<'_>) -> Result<Vec<Vec<u8>>, E
     // already done upstream on the pgwire/native paths that own the identity.
     // (`Box::pin` breaks the async-recursion cycle: resolving a Broadcast build
     // side calls `gather_all_vshards` → `gateway.execute` → routing → here.)
+    // Cluster remote-dispatch: no session-transaction context crosses this
+    // boundary yet, so `None`. TRACKED: cross-node in-transaction reads are a
+    // known gap (see resolve/exchange.rs).
     let plan = match Box::pin(crate::control::server::exchange::resolve_exchange_in_plan(
         shared,
         database_id,
         tenant_id,
         plan,
         trace_id,
+        None,
     ))
     .await?
     {
@@ -322,12 +330,14 @@ async fn dispatch_remote_stream(args: RemoteDispatchArgs<'_>) -> Result<ResultSt
     })?;
 
     // Resolve Exchange nodes before shipping (symmetric with `dispatch_remote`).
+    // No session-transaction context crosses this boundary yet, so `None`.
     let plan = match Box::pin(crate::control::server::exchange::resolve_exchange_in_plan(
         shared,
         database_id,
         tenant_id,
         plan,
         trace_id,
+        None,
     ))
     .await?
     {

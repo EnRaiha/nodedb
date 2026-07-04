@@ -115,6 +115,7 @@ pub(crate) async fn try_open_sql_stream(
             task.database_id,
             child_plan,
             crate::types::TraceId::ZERO,
+            task.txn_id,
         )?
     };
 
