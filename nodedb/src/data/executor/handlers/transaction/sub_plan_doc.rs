@@ -6,11 +6,9 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::enforcement::{
-    append_only, hash_chain, materialized_sum, period_lock, retention, state_transition,
-    transition_check,
+    append_only, hash_chain, materialized_sum, period_lock, retention,
 };
-use crate::data::executor::handlers::document::extract_indexable_text;
-use crate::data::executor::strict_format;
+use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
 
@@ -33,145 +31,139 @@ impl CoreLoop {
         let row_key = crate::engine::document::store::surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
         let database_id = dummy_task.request.database_id.as_u64();
-        let old_value = self
+
+        // Pre-read the plain-table value only to decide insert-vs-update for the
+        // hash-chain and materialized-sum side-effects (both fire on insert).
+        // The authoritative prior value for the undo entry comes from
+        // `apply_point_put`'s outcome, which is bitemporal-aware.
+        let config_key = (TenantId::new(tid), collection.to_string());
+        let is_insert = self
             .sparse
             .get(database_id, tid, collection, row_key)
             .ok()
-            .flatten();
+            .flatten()
+            .is_none();
 
-        let config_key = (TenantId::new(tid), collection.to_string());
-        if let Some(config) = self.doc_configs.get(&config_key) {
-            append_only::check_point_put(collection, &config.enforcement, &old_value)?;
-            if let Some(ref pl) = config.enforcement.period_lock {
-                period_lock::check_period_lock(
-                    &self.sparse,
-                    database_id,
-                    tid,
-                    collection,
-                    value,
-                    pl,
-                )?;
-            }
-            if old_value.is_some() {
-                let old_json = old_value
-                    .as_ref()
-                    .and_then(|b| doc_format::decode_document(b));
-                let new_json = doc_format::decode_document(value);
-                if let (Some(old_doc), Some(new_doc)) = (&old_json, &new_json) {
-                    if !config.enforcement.state_constraints.is_empty() {
-                        state_transition::check_state_transitions(
-                            collection,
-                            &config.enforcement.state_constraints,
-                            old_doc,
-                            new_doc,
-                            user_roles,
-                        )?;
-                    }
-                    if !config.enforcement.transition_checks.is_empty() {
-                        transition_check::check_transition_predicates(
-                            collection,
-                            &config.enforcement.transition_checks,
-                            old_doc,
-                            new_doc,
-                        )?;
-                    }
-                }
-            }
-        }
+        let hash_chain_enabled = self
+            .doc_configs
+            .get(&config_key)
+            .is_some_and(|c| c.enforcement.hash_chain);
 
-        let encode_for_storage = |bytes: &[u8]| -> Result<Vec<u8>, ErrorCode> {
-            if let Some(config) = self.doc_configs.get(&config_key)
-                && let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                    config.storage_mode
-            {
-                strict_format::bytes_to_binary_tuple(bytes, schema).map_err(|e| {
-                    ErrorCode::Internal {
-                        detail: format!("strict encode: {e}"),
-                    }
-                })
-            } else {
-                Ok(doc_format::canonicalize_document_for_storage(bytes))
-            }
+        // Capture the hash-chain head pre-image BEFORE `apply_chain_on_insert`
+        // overwrites it, so the undo entry can restore it exactly.
+        // `None` = not a hash-chain collection; `Some(None)` = no prior head
+        // (genesis insert); `Some(Some(prev))` = prior head present.
+        let chain_hash_prior: Option<Option<String>> = if hash_chain_enabled {
+            Some(self.chain_hashes.get(&config_key).cloned())
+        } else {
+            None
         };
 
-        let stored = if old_value.is_none() {
-            let hash_chain_enabled = self
-                .doc_configs
-                .get(&config_key)
-                .is_some_and(|c| c.enforcement.hash_chain);
-            match hash_chain::apply_chain_on_insert(
+        // Hash-chain wraps the document with a `_chain_hash` field on insert;
+        // feed that wrapped value into `apply_point_put` so it stores/indexes
+        // the chained form.
+        let chained: Option<Vec<u8>> = if is_insert {
+            hash_chain::apply_chain_on_insert(
                 &mut self.chain_hashes,
                 tid,
                 collection,
                 document_id,
                 value,
                 hash_chain_enabled,
-            ) {
-                Some(chained) => chained,
-                None => encode_for_storage(value)?,
-            }
+            )
         } else {
-            encode_for_storage(value)?
+            None
         };
-        match self
-            .sparse
-            .put(database_id, tid, collection, row_key, &stored)
-        {
-            Ok(_prior) => {
-                if let Some(doc) = doc_format::decode_document(value) {
-                    let text_content = extract_indexable_text(&doc);
-                    if !text_content.is_empty() {
-                        let _ = self.inverted.index_document(
-                            database_id,
-                            TenantId::new(tid),
-                            collection,
-                            surrogate,
-                            &text_content,
-                        );
+        let effective_value: &[u8] = chained.as_deref().unwrap_or(value);
+
+        // Each transaction sub-plan owns its own per-row redb write txn; the
+        // batch is stitched together by the undo log, not one big txn.
+        let txn = self.sparse.begin_write().map_err(|e| ErrorCode::Internal {
+            detail: e.to_string(),
+        })?;
+
+        // Core write path shared with the autocommit callers: bitemporal-vs-plain
+        // primary doc write, FTS/inverted, doc_cache, aggregate-cache
+        // invalidation, UNIQUE enforcement, generated columns, and stateless PUT
+        // enforcement. Side indexes (secondary/spatial/vector/stats) are disabled
+        // in the transactional path — they have no undo variant yet, so enabling
+        // them here would leave a rollback hole.
+        let outcome = match self.apply_point_put(
+            &txn,
+            PointPutParams {
+                database_id,
+                tid,
+                collection,
+                document_id: row_key,
+                surrogate,
+                value: effective_value,
+                index_text: true,
+                user_roles,
+                enforce: true,
+                enable_side_indexes: false,
+            },
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                // `apply_point_put` rejected the write (e.g. UNIQUE violation)
+                // after we mutated the chain head. Restore the pre-image so the
+                // aborted op leaves no trace, then propagate the typed error.
+                if chained.is_some() {
+                    match &chain_hash_prior {
+                        Some(None) => {
+                            self.chain_hashes.remove(&config_key);
+                        }
+                        Some(Some(prev)) => {
+                            self.chain_hashes.insert(config_key.clone(), prev.clone());
+                        }
+                        None => {}
                     }
                 }
+                return Err(e.into());
+            }
+        };
 
+        txn.commit().map_err(|e| ErrorCode::Internal {
+            detail: format!("commit: {e}"),
+        })?;
+        self.checkpoint_coordinator.mark_dirty("sparse", 1);
+
+        undo_log.push(UndoEntry::PutDocument {
+            collection: collection.to_string(),
+            document_id: row_key.to_string(),
+            surrogate,
+            old_value: outcome.prior_value,
+            bitemporal_sys_from_ms: outcome.bitemporal_sys_from_ms,
+            bitemporal_index_tuples: outcome.bitemporal_index_tuples,
+            chain_hash_prior,
+        });
+
+        if is_insert
+            && let Some(config) = self.doc_configs.get(&config_key)
+            && !config.enforcement.materialized_sum_sources.is_empty()
+            && let Some(src_doc) = doc_format::decode_document(value)
+        {
+            let target_writes = materialized_sum::apply_materialized_sums(
+                &self.sparse,
+                database_id,
+                tid,
+                &config.enforcement.materialized_sum_sources,
+                &src_doc,
+            )?;
+            for tw in target_writes {
                 undo_log.push(UndoEntry::PutDocument {
-                    collection: collection.to_string(),
-                    document_id: row_key.to_string(),
-                    surrogate,
-                    old_value: old_value.clone(),
+                    collection: tw.collection,
+                    document_id: tw.document_id,
+                    surrogate: nodedb_types::Surrogate::ZERO,
+                    old_value: tw.old_value,
                     bitemporal_sys_from_ms: None,
                     bitemporal_index_tuples: Vec::new(),
                     chain_hash_prior: None,
                 });
-
-                if old_value.is_none()
-                    && let Some(config) = self.doc_configs.get(&config_key)
-                    && !config.enforcement.materialized_sum_sources.is_empty()
-                    && let Some(src_doc) = doc_format::decode_document(value)
-                {
-                    let target_writes = materialized_sum::apply_materialized_sums(
-                        &self.sparse,
-                        database_id,
-                        tid,
-                        &config.enforcement.materialized_sum_sources,
-                        &src_doc,
-                    )?;
-                    for tw in target_writes {
-                        undo_log.push(UndoEntry::PutDocument {
-                            collection: tw.collection,
-                            document_id: tw.document_id,
-                            surrogate: nodedb_types::Surrogate::ZERO,
-                            old_value: tw.old_value,
-                            bitemporal_sys_from_ms: None,
-                            bitemporal_index_tuples: Vec::new(),
-                            chain_hash_prior: None,
-                        });
-                    }
-                }
-
-                Ok(self.response_ok(dummy_task))
             }
-            Err(e) => Err(ErrorCode::Internal {
-                detail: e.to_string(),
-            }),
         }
+
+        Ok(self.response_ok(dummy_task))
     }
 
     /// Execute a PointDelete within a transaction.

@@ -253,6 +253,7 @@ impl CoreLoop {
                         index_text: true,
                         user_roles: &task.request.user_roles,
                         enforce: true,
+                        enable_side_indexes: true,
                     },
                 ) {
                     Ok(p) => p,
@@ -275,7 +276,14 @@ impl CoreLoop {
                     );
                 }
 
-                self.emit_put_event(task, tid, collection, row_key, value, prior.as_deref());
+                self.emit_put_event(
+                    task,
+                    tid,
+                    collection,
+                    row_key,
+                    value,
+                    prior.prior_value.as_deref(),
+                );
 
                 self.response_ok(task)
             }

@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::point::apply_put::PointPutParams;
+use crate::data::executor::handlers::point::apply_put::{PointPutOutcome, PointPutParams};
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::DocumentOp;
 
@@ -76,7 +76,7 @@ impl CoreLoop {
         // Track per-task success/failure for individual responses, and
         // capture the prior stored bytes per row so the Event Plane emit
         // below can resolve Insert vs Update from the actual mutation.
-        let mut results: Vec<Result<Option<Vec<u8>>, crate::bridge::envelope::Response>> =
+        let mut results: Vec<Result<PointPutOutcome, crate::bridge::envelope::Response>> =
             Vec::with_capacity(batch.len());
         for task in &batch {
             let PhysicalPlan::Document(DocumentOp::PointPut {
@@ -105,6 +105,7 @@ impl CoreLoop {
                         index_text: true,
                         user_roles: &task.request.user_roles,
                         enforce: true,
+                        enable_side_indexes: true,
                     },
                 )
                 .map_err(|e| {
@@ -160,7 +161,7 @@ impl CoreLoop {
                     {
                         let tid = task.request.tenant_id.as_u64();
                         let prior = match result {
-                            Ok(p) => p.as_deref(),
+                            Ok(p) => p.prior_value.as_deref(),
                             Err(_) => None,
                         };
                         self.emit_put_event(task, tid, collection, document_id, value, prior);

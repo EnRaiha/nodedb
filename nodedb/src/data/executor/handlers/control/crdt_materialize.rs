@@ -103,6 +103,7 @@ impl CoreLoop {
                 index_text: false,
                 user_roles: &task.request.user_roles,
                 enforce: false,
+                enable_side_indexes: true,
             },
         ) {
             Ok(p) => p,
@@ -134,7 +135,7 @@ impl CoreLoop {
             collection,
             storage_key.as_str(),
             value,
-            prior.as_deref(),
+            prior.prior_value.as_deref(),
         );
     }
 }

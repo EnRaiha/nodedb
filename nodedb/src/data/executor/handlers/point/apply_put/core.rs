@@ -13,8 +13,11 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::{
     append_only, period_lock, state_transition, transition_check,
 };
+use crate::data::executor::handlers::generated;
 use crate::data::executor::{doc_format, strict_format};
 use nodedb_types::Surrogate;
+
+use super::unique::{UniqueCheck, check_unique_constraints};
 
 /// Parameters for [`CoreLoop::apply_point_put`].
 pub(in crate::data::executor) struct PointPutParams<'a> {
@@ -44,6 +47,33 @@ pub(in crate::data::executor) struct PointPutParams<'a> {
     /// commit phase), so re-running enforcement here would double-check
     /// already-accepted writes.
     pub enforce: bool,
+    /// Whether to apply the SIDE-index side-effects: the secondary-index
+    /// write, the spatial index write, the vector index write, and the
+    /// column-stats observe.
+    ///
+    /// `true` for autocommit user-DML callers (PointPut/Insert/Upsert/batch/
+    /// insert-select/CRDT-materialize), which own the full write. `false` for
+    /// the transactional path (`tx_point_put`): those side-effects have no
+    /// undo variant yet, so enabling them inside a transaction would leave a
+    /// rollback hole. The CORE side-effects (primary doc write — bitemporal
+    /// or plain — including its versioned-index tuples, FTS/inverted index,
+    /// doc_cache, aggregate_cache invalidation, UNIQUE enforcement, generated
+    /// columns) run regardless.
+    pub enable_side_indexes: bool,
+}
+
+/// Capture of the mutations an [`CoreLoop::apply_point_put`] performed, so a
+/// transactional caller can build an undo entry that fully reverses it.
+pub(in crate::data::executor) struct PointPutOutcome {
+    /// Prior stored bytes when this put replaced an existing row, else `None`.
+    pub prior_value: Option<Vec<u8>>,
+    /// System-time key the bitemporal version row (and its versioned index
+    /// entries) were appended at. `Some(t)` on the bitemporal branch, `None`
+    /// on the plain overwrite branch.
+    pub bitemporal_sys_from_ms: Option<i64>,
+    /// `(field, value)` pairs whose versioned index entries this op wrote at
+    /// `bitemporal_sys_from_ms`. Empty when not bitemporal / none written.
+    pub bitemporal_index_tuples: Vec<(String, String)>,
 }
 
 /// Map an enforcement check's `ErrorCode` onto the crate's typed `Error`.
@@ -96,15 +126,17 @@ impl CoreLoop {
     /// to key the inverted index. `document_id` is the hex-encoded form of
     /// the surrogate (the redb storage key).
     ///
-    /// Returns the prior stored bytes when this put replaced an existing row,
-    /// or `None` when it was a fresh insert. The caller threads the prior
-    /// bytes into `emit_write_event` so the Event Plane's `WriteOp` tag
-    /// reflects the actual mutation.
+    /// Returns a [`PointPutOutcome`] capturing the prior stored bytes (present
+    /// when this put replaced an existing row) plus the bitemporal system time
+    /// and versioned index tuples written, so a transactional caller can build
+    /// a fully-reversible undo entry. Autocommit callers read only
+    /// `prior_value` and thread it into `emit_write_event` so the Event Plane's
+    /// `WriteOp` tag reflects the actual mutation.
     pub(in crate::data::executor) fn apply_point_put(
         &mut self,
         txn: &WriteTransaction,
         params: PointPutParams<'_>,
-    ) -> crate::Result<Option<Vec<u8>>> {
+    ) -> crate::Result<PointPutOutcome> {
         let PointPutParams {
             database_id,
             tid,
@@ -115,6 +147,7 @@ impl CoreLoop {
             index_text,
             user_roles,
             enforce,
+            enable_side_indexes,
         } = params;
         // Evaluate generated columns before encoding.
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
@@ -122,7 +155,7 @@ impl CoreLoop {
             && !config.enforcement.generated_columns.is_empty()
         {
             if let Some(mut doc) = doc_format::decode_document(value) {
-                if let Err(e) = super::super::generated::evaluate_generated_columns(
+                if let Err(e) = generated::evaluate_generated_columns(
                     &mut doc,
                     &config.enforcement.generated_columns,
                 ) {
@@ -327,9 +360,14 @@ impl CoreLoop {
                 }
             }
 
-            if let Err(e) =
-                self.stats_store
-                    .observe_document_in_txn(txn, database_id, tid, collection, &doc)
+            if enable_side_indexes
+                && let Err(e) = self.stats_store.observe_document_in_txn(
+                    txn,
+                    database_id,
+                    tid,
+                    collection,
+                    &doc,
+                )
             {
                 warn!(core = self.core_id, %collection, error = %e, "column stats update failed");
             }
@@ -356,11 +394,15 @@ impl CoreLoop {
         // transaction (redb MVCC) — the read view won't see our outer
         // write txn but that's precisely the semantics we want for the
         // "does another row already hold this value" question.
+        let mut bitemporal_index_tuples: Vec<(String, String)> = Vec::new();
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
         if let Some(config) = self.doc_configs.get(&config_key)
             && let Some(doc) = doc_format::decode_document(value)
         {
             let paths = config.index_paths.clone();
+            // UNIQUE enforcement is a CORE side-effect: it must run in both the
+            // autocommit and transactional paths (a violation rejects the write
+            // before commit).
             check_unique_constraints(UniqueCheck {
                 sparse: &self.sparse,
                 database_id,
@@ -371,7 +413,11 @@ impl CoreLoop {
                 paths: &paths,
             })?;
             if bitemporal {
-                let sys_from = self.bitemporal_now_ms();
+                // Versioned index entries are keyed at the SAME system time as
+                // the primary version row written above (`sys_from_ms`), so a
+                // single `bitemporal_sys_from_ms` in the undo entry reverses
+                // both together. These are CORE (undoable via the captured
+                // tuples), so they run regardless of `enable_side_indexes`.
                 for path in &paths {
                     if let Some(ref pred) = path.predicate
                         && !pred.evaluate_json(&doc)
@@ -397,12 +443,15 @@ impl CoreLoop {
                                 field: &path.path,
                                 value: &value,
                                 doc_id: document_id,
-                                sys_from_ms: sys_from,
+                                sys_from_ms,
                             },
                         )?;
+                        bitemporal_index_tuples.push((path.path.clone(), value));
                     }
                 }
-            } else {
+            } else if enable_side_indexes {
+                // Non-bitemporal secondary index write: SIDE side-effect. It has
+                // no undo variant, so the transactional path skips it.
                 self.apply_secondary_indexes_in_txn(
                     txn,
                     database_id,
@@ -415,79 +464,15 @@ impl CoreLoop {
             }
         }
 
-        self.apply_point_put_spatial(database_id, tid, collection, document_id, value);
-        self.apply_point_put_vector_indexes(database_id, tid, collection, value);
+        if enable_side_indexes {
+            self.apply_point_put_spatial(database_id, tid, collection, document_id, value);
+            self.apply_point_put_vector_indexes(database_id, tid, collection, value);
+        }
 
-        Ok(prior)
+        Ok(PointPutOutcome {
+            prior_value: prior,
+            bitemporal_sys_from_ms: if bitemporal { Some(sys_from_ms) } else { None },
+            bitemporal_index_tuples,
+        })
     }
-}
-
-/// Reject the write if any `unique: true` index already holds one of the
-/// incoming document's extracted values under a *different* `document_id`.
-///
-/// Runs before `apply_secondary_indexes_in_txn` so the caller's write
-/// transaction is still clean — rejection does not roll anything back.
-/// Same-id re-puts (idempotent overwrites) are allowed through; we only
-/// reject when another row owns the value.
-/// Parameters for [`check_unique_constraints`].
-struct UniqueCheck<'a> {
-    sparse: &'a crate::engine::sparse::btree::SparseEngine,
-    database_id: u64,
-    tid: u64,
-    collection: &'a str,
-    doc: &'a serde_json::Value,
-    document_id: &'a str,
-    paths: &'a [crate::engine::document::store::IndexPath],
-}
-
-fn check_unique_constraints(c: UniqueCheck<'_>) -> crate::Result<()> {
-    use crate::engine::document::store::extract_index_values;
-
-    let UniqueCheck {
-        sparse,
-        database_id,
-        tid,
-        collection,
-        doc,
-        document_id,
-        paths,
-    } = c;
-
-    let doc_engine = crate::engine::document::store::DocumentEngine::new(sparse, database_id, tid);
-    for path in paths {
-        if !path.unique {
-            continue;
-        }
-        // A partial UNIQUE index only applies to rows the predicate
-        // accepts; rows outside the predicate's scope are not part of
-        // the uniqueness domain. Skipping the check here mirrors the
-        // skip in `apply_secondary_indexes_in_txn` so the two paths
-        // agree on which rows the index governs.
-        if let Some(ref p) = path.predicate
-            && !p.evaluate_json(doc)
-        {
-            continue;
-        }
-        for raw in extract_index_values(doc, &path.path, path.is_array) {
-            let needle = if path.case_insensitive {
-                raw.to_lowercase()
-            } else {
-                raw
-            };
-            let existing = doc_engine
-                .index_lookup(collection, &path.path, &needle)
-                .unwrap_or_default();
-            if existing.iter().any(|id| id != document_id) {
-                return Err(crate::Error::RejectedConstraint {
-                    collection: collection.to_string(),
-                    constraint: "unique".to_string(),
-                    detail: format!(
-                        "unique index '{}' violation on field '{}' (value '{}')",
-                        path.name, path.path, needle
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
 }

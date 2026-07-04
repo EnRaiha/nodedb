@@ -6,6 +6,7 @@
 //! core document-write transaction.
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::doc_format;
 
 impl CoreLoop {
     /// Spatial R-tree + columnar ingest side-effect: parse geometry fields,
@@ -25,7 +26,7 @@ impl CoreLoop {
         // If successful, computes bbox and inserts into the per-field R-tree.
         // Also writes the document to columnar_memtables so that bare table scans
         // and aggregates on spatial collections read from columnar (spatial extends columnar).
-        if let Some(doc) = super::super::super::doc_format::decode_document(value)
+        if let Some(doc) = doc_format::decode_document(value)
             && let Some(obj) = doc.as_object()
         {
             let mut has_geometry = false;

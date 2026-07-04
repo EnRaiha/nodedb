@@ -92,6 +92,15 @@ impl CoreLoop {
                     &collection,
                     surrogate,
                 );
+                // Evict any cached copy of the reversed document. Always safe:
+                // a stale hit would otherwise resurrect a rolled-back put; the
+                // worst case here is a cache miss.
+                self.doc_cache.invalidate(
+                    crate::types::DatabaseId::DEFAULT.as_u64(),
+                    tid,
+                    &collection,
+                    &document_id,
+                );
                 self.undo_chain_hash(tid, &collection, chain_hash_prior);
                 Ok(())
             }
@@ -137,6 +146,15 @@ impl CoreLoop {
                             )
                         })?;
                 }
+                // Evict any cached copy of the reversed document (see the
+                // PutDocument branch): reversing a delete restores the row, so a
+                // stale post-delete cache entry must not linger.
+                self.doc_cache.invalidate(
+                    crate::types::DatabaseId::DEFAULT.as_u64(),
+                    tid,
+                    &collection,
+                    &document_id,
+                );
                 self.undo_chain_hash(tid, &collection, chain_hash_prior);
                 Ok(())
             }
