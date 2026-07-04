@@ -36,19 +36,6 @@ pub(in crate::data::executor) struct PointPutParams<'a> {
     /// commit phase), so re-running enforcement here would double-check
     /// already-accepted writes.
     pub enforce: bool,
-    /// Whether to apply the SIDE-index side-effects: the secondary-index
-    /// write, the spatial index write, the vector index write, and the
-    /// column-stats observe.
-    ///
-    /// `true` for autocommit user-DML callers (PointPut/Insert/Upsert/batch/
-    /// insert-select/CRDT-materialize), which own the full write. `false` for
-    /// the transactional path (`tx_point_put`): those side-effects have no
-    /// undo variant yet, so enabling them inside a transaction would leave a
-    /// rollback hole. The CORE side-effects (primary doc write — bitemporal
-    /// or plain — including its versioned-index tuples, FTS/inverted index,
-    /// doc_cache, aggregate_cache invalidation, UNIQUE enforcement, generated
-    /// columns) run regardless.
-    pub enable_side_indexes: bool,
 }
 
 /// Capture of the mutations an [`CoreLoop::apply_point_put`](crate::data::executor::core_loop::CoreLoop::apply_point_put)
@@ -66,38 +53,32 @@ pub(in crate::data::executor) struct PointPutOutcome {
     pub bitemporal_index_tuples: Vec<(String, String)>,
     /// `(field, value)` pairs this op INSERTED into the plain (non-bitemporal)
     /// secondary index. Empty on the bitemporal path (which uses
-    /// `bitemporal_index_tuples`) and when `enable_side_indexes` was unset (the
-    /// transactional path). A transactional caller pushes the reverse (remove)
-    /// on rollback. Autocommit callers ignore it.
+    /// `bitemporal_index_tuples`). A transactional caller pushes the reverse
+    /// (remove) on rollback. Autocommit callers ignore it.
     pub secondary_index_added: Vec<(String, String)>,
     /// `(field, value)` pairs this op REMOVED from the plain (non-bitemporal)
     /// secondary index because an UPDATE changed the field value. Empty on the
-    /// bitemporal path and when `enable_side_indexes` was unset. A transactional
-    /// caller re-inserts these on rollback. Autocommit callers ignore it.
+    /// bitemporal path. A transactional caller re-inserts these on rollback.
+    /// Autocommit callers ignore it.
     pub secondary_index_removed: Vec<(String, String)>,
     /// `(index_key, vector_id)` pairs this put inserted into HNSW vector
     /// indexes, so a transactional caller can push `UndoEntry::InsertVector`
-    /// reversals. Empty unless `enable_side_indexes` was set (the transactional
-    /// path currently disables vector side-indexing, so this stays empty there
-    /// until that flag flips). Autocommit callers ignore it.
+    /// reversals. Empty when the document had no vector fields. Autocommit
+    /// callers ignore it.
     pub vector_inserts: Vec<(
         (nodedb_types::DatabaseId, crate::types::TenantId, String),
         u32,
     )>,
     /// `(spatial_index_key, entry_id)` pairs this put inserted into per-field
     /// spatial R-trees, so a transactional caller can push
-    /// `UndoEntry::SpatialInsert` reversals. Empty unless `enable_side_indexes`
-    /// was set (the transactional path currently disables spatial side-indexing,
-    /// so this stays empty there until that flag flips). Autocommit callers
-    /// ignore it.
+    /// `UndoEntry::SpatialInsert` reversals. Empty when the document had no
+    /// spatial fields. Autocommit callers ignore it.
     pub spatial_inserts: Vec<(SpatialIndexKey, u64)>,
     /// Pre-images of the column-stats read-modify-write this put performed, so a
     /// transactional caller can push `UndoEntry::StatsRestore` reversals. Each
     /// element is `(stats_key, prior_bytes)`: `prior_bytes = Some(b)` restores
     /// the exact `ColumnStats` that existed before, `None` removes a key the op
-    /// created. Empty unless `enable_side_indexes` was set (the transactional
-    /// path currently disables stats writes, so this stays empty there until
-    /// that flag flips). Autocommit callers ignore it.
+    /// created. Autocommit callers ignore it.
     pub stats_prior: Vec<crate::engine::sparse::stats::StatsPreImage>,
 }
 

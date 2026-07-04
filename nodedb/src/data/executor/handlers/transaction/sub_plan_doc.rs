@@ -180,10 +180,11 @@ impl CoreLoop {
 
         // Core write path shared with the autocommit callers: bitemporal-vs-plain
         // primary doc write, FTS/inverted, doc_cache, aggregate-cache
-        // invalidation, UNIQUE enforcement, generated columns, and stateless PUT
-        // enforcement. Side indexes (secondary/spatial/vector/stats) are disabled
-        // in the transactional path — they have no undo variant yet, so enabling
-        // them here would leave a rollback hole.
+        // invalidation, UNIQUE enforcement, generated columns, stateless PUT
+        // enforcement, and the side indexes (secondary/spatial/vector/stats).
+        // Every side-effect is captured in the outcome and reversed via the undo
+        // log below, so the transactional write is identical to autocommit and
+        // fully rollback-safe.
         let outcome = match self.apply_point_put(
             &txn,
             PointPutParams {
@@ -196,7 +197,6 @@ impl CoreLoop {
                 index_text: true,
                 user_roles,
                 enforce: true,
-                enable_side_indexes: false,
             },
         ) {
             Ok(o) => o,
@@ -221,18 +221,15 @@ impl CoreLoop {
             old_value: outcome.prior_value,
             bitemporal_sys_from_ms: outcome.bitemporal_sys_from_ms,
             bitemporal_index_tuples: outcome.bitemporal_index_tuples,
-            // Empty today (this path passes `enable_side_indexes: false`, so
-            // `apply_point_put` writes no plain secondary-index entries), but
-            // wired now so rollback stays correct when that flag flips.
+            // Plain secondary-index entries this put added/removed; reversed on
+            // rollback so the index returns to its pre-tx state.
             secondary_index_added: outcome.secondary_index_added,
             secondary_index_removed: outcome.secondary_index_removed,
             chain_hash_prior,
         });
 
-        // Reverse any HNSW vector inserts on rollback. Empty today (the
-        // transactional path disables vector side-indexing via
-        // `enable_side_indexes: false`), so this is a no-op until that flag
-        // flips — wired now so it stays correct when it does.
+        // Reverse any HNSW vector inserts on rollback (one `InsertVector` undo
+        // per vector this put added to a per-field index).
         for (index_key, vector_id) in outcome.vector_inserts {
             undo_log.push(UndoEntry::InsertVector {
                 index_key,
@@ -240,18 +237,14 @@ impl CoreLoop {
             });
         }
 
-        // Reverse any spatial R-tree inserts on rollback. Empty today (the
-        // transactional path disables spatial side-indexing via
-        // `enable_side_indexes: false`), so this is a no-op until that flag
-        // flips — wired now so it stays correct when it does.
+        // Reverse any spatial R-tree inserts on rollback (one `SpatialInsert`
+        // undo per per-field R-tree entry this put added).
         for (key, entry_id) in outcome.spatial_inserts {
             undo_log.push(UndoEntry::SpatialInsert { key, entry_id });
         }
 
         // Reverse the column-stats read-modify-write on rollback by restoring
-        // each captured pre-image. Empty today (the transactional path disables
-        // stats writes via `enable_side_indexes: false`), so this is a no-op
-        // until that flag flips — wired now so it stays correct when it does.
+        // each captured pre-image.
         for (key, prior) in outcome.stats_prior {
             undo_log.push(UndoEntry::StatsRestore { key, prior });
         }
@@ -307,11 +300,12 @@ impl CoreLoop {
         // Core delete path shared with the autocommit caller: bitemporal-vs-plain
         // primary tombstone/delete (including versioned index tombstones),
         // FTS/inverted removal, secondary-index cascade, graph-edge cascade,
-        // doc_cache invalidation, and stateless DELETE enforcement. The EXTRA
-        // cascades (spatial R-tree removal, mark_node_deleted) are disabled in
-        // the transactional path — they have no undo variant yet, so enabling
-        // them here would leave a rollback hole. `apply_point_delete` opens and
-        // commits its own doc-store write txn internally.
+        // spatial R-tree removal, `mark_node_deleted` bookkeeping, doc_cache
+        // invalidation, and stateless DELETE enforcement. Every side-effect is
+        // captured in the outcome and reversed via the undo log below, so the
+        // transactional delete is identical to autocommit and fully
+        // rollback-safe. `apply_point_delete` opens and commits its own doc-store
+        // write txn internally.
         let outcome = self.apply_point_delete(PointDeleteParams {
             database_id,
             tid,
@@ -320,7 +314,6 @@ impl CoreLoop {
             surrogate,
             user_roles,
             enforce: true,
-            enable_extra_cascades: false,
         })?;
 
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
@@ -353,17 +346,27 @@ impl CoreLoop {
             });
         }
 
-        // Reverse any spatial R-tree removals on rollback. Empty today (the
-        // transactional path disables the EXTRA cascade via
-        // `enable_extra_cascades: false`, so `apply_point_delete` removes no
-        // spatial entries), so this is a no-op until that flag flips — wired now
-        // so it stays correct when it does.
+        // Reverse any spatial R-tree removals on rollback (one `SpatialDelete`
+        // undo per per-field R-tree entry the delete removed, re-inserting it
+        // with its captured bbox).
         for (key, entry_id, bbox, document_id) in outcome.spatial_deletes {
             undo_log.push(UndoEntry::SpatialDelete {
                 key,
                 entry_id,
                 bbox,
                 document_id,
+            });
+        }
+
+        // Reverse the `mark_node_deleted` bookkeeping on rollback: un-mark the
+        // node in the in-memory `deleted_nodes` tracker. `Some` only when this
+        // delete NEWLY marked the node (a pre-existing tombstone from a prior
+        // committed op is never resurrected — see `apply_point_delete`).
+        if let Some(node_id) = outcome.mark_node_deleted {
+            undo_log.push(UndoEntry::MarkNodeDeleted {
+                database_id,
+                tid,
+                node_id,
             });
         }
 

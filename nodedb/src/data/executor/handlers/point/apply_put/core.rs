@@ -49,7 +49,6 @@ impl CoreLoop {
             index_text,
             user_roles,
             enforce,
-            enable_side_indexes,
         } = params;
         // Evaluate generated columns before encoding.
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
@@ -147,19 +146,18 @@ impl CoreLoop {
         // The plain (non-bitemporal) secondary-index diff also needs the old
         // bytes: an UPDATE that changes an indexed field must drop the stale
         // index entry, which requires knowing the prior value. So read the old
-        // value whenever side-indexes are enabled and the collection has index
-        // paths — exactly the case that would otherwise leak stale entries.
+        // value whenever the collection has index paths — exactly the case that
+        // would otherwise leak stale entries.
         let need_old = bitemporal
             || (enforce
                 && self
                     .doc_configs
                     .get(&config_key)
                     .is_some_and(|config| config.enforcement.has_put_checks()))
-            || (enable_side_indexes
-                && self
-                    .doc_configs
-                    .get(&config_key)
-                    .is_some_and(|config| !config.index_paths.is_empty()));
+            || self
+                .doc_configs
+                .get(&config_key)
+                .is_some_and(|config| !config.index_paths.is_empty());
         let old_value = if bitemporal {
             self.sparse
                 .versioned_get_current(database_id, tid, collection, document_id)?
@@ -264,8 +262,6 @@ impl CoreLoop {
 
         // Pre-image capture for the column-stats read-modify-write, so a
         // transactional caller can restore the exact prior stats on rollback.
-        // Empty unless `enable_side_indexes` (the transactional path disables
-        // stats writes, so this stays empty there until that flag flips).
         let mut stats_prior: Vec<crate::engine::sparse::stats::StatsPreImage> = Vec::new();
 
         // Text indexing and stats use the original JSON input, not the stored
@@ -295,18 +291,13 @@ impl CoreLoop {
                 }
             }
 
-            if enable_side_indexes {
-                match self.stats_store.observe_document_in_txn(
-                    txn,
-                    database_id,
-                    tid,
-                    collection,
-                    &doc,
-                ) {
-                    Ok(pre) => stats_prior = pre,
-                    Err(e) => {
-                        warn!(core = self.core_id, %collection, error = %e, "column stats update failed");
-                    }
+            match self
+                .stats_store
+                .observe_document_in_txn(txn, database_id, tid, collection, &doc)
+            {
+                Ok(pre) => stats_prior = pre,
+                Err(e) => {
+                    warn!(core = self.core_id, %collection, error = %e, "column stats update failed");
                 }
             }
 
@@ -357,7 +348,7 @@ impl CoreLoop {
                 // the primary version row written above (`sys_from_ms`), so a
                 // single `bitemporal_sys_from_ms` in the undo entry reverses
                 // both together. These are CORE (undoable via the captured
-                // tuples), so they run regardless of `enable_side_indexes`.
+                // tuples).
                 for path in &paths {
                     if let Some(ref pred) = path.predicate
                         && !pred.evaluate_json(&doc)
@@ -389,8 +380,8 @@ impl CoreLoop {
                         bitemporal_index_tuples.push((path.path.clone(), value));
                     }
                 }
-            } else if enable_side_indexes {
-                // Non-bitemporal secondary index write: SIDE side-effect. The
+            } else {
+                // Non-bitemporal secondary index write. The
                 // SET diff against `old_doc_for_index` inserts new values and
                 // removes stale ones (fixing the leaked-entry-on-UPDATE bug).
                 // The (added, removed) tuples are captured so a transactional
@@ -412,19 +403,10 @@ impl CoreLoop {
             }
         }
 
-        let mut vector_inserts = Vec::new();
-        let mut spatial_inserts = Vec::new();
-        if enable_side_indexes {
-            spatial_inserts =
-                self.apply_point_put_spatial(database_id, tid, collection, document_id, value);
-            vector_inserts = self.apply_point_put_vector_indexes(
-                database_id,
-                tid,
-                collection,
-                document_id,
-                value,
-            );
-        }
+        let spatial_inserts =
+            self.apply_point_put_spatial(database_id, tid, collection, document_id, value);
+        let vector_inserts =
+            self.apply_point_put_vector_indexes(database_id, tid, collection, document_id, value);
 
         Ok(PointPutOutcome {
             prior_value: prior,

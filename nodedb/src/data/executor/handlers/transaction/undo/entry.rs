@@ -154,6 +154,23 @@ pub(in crate::data::executor) enum UndoEntry {
         source_prior: Vec<u8>,
         dest_prior: Option<Vec<u8>>,
     },
+    /// Undo a `mark_node_deleted` by removing the node from the in-memory
+    /// deleted-nodes set (edge referential-integrity tracker).
+    ///
+    /// The delete cascade records a deleted document's node id so a later
+    /// `EdgePut` to it is rejected as dangling. This tracker is IN-MEMORY, so
+    /// an aborted redb txn does not reverse it — a rolled-back tx DELETE must
+    /// explicitly un-mark the node. Pushed ONLY when the forward mark newly
+    /// inserted the node (`mark_node_deleted` returned `true`); a node a prior
+    /// committed op already tombstoned is never un-marked here. `database_id`
+    /// and `tid` are captured from the forward op (the rollback driver's own
+    /// `did` is the DEFAULT database, not necessarily the op's), keying the
+    /// exact `deleted_nodes` partition.
+    MarkNodeDeleted {
+        database_id: u64,
+        tid: u64,
+        node_id: String,
+    },
     /// Undo a columnar insert by rolling back in-memory state.
     ///
     /// `row_count_before` is the memtable row count snapshot taken before the

@@ -3,8 +3,11 @@
 //! Shared "apply a PointDelete" helper — manages its own doc-store write
 //! transaction internally (see doc comment on `apply_point_delete`).
 //!
-//! Reused by the autocommit PointDelete path and (in a later unit) by the
-//! transactional `tx_point_delete` path.
+//! Reused by both the autocommit PointDelete path and the transactional
+//! `tx_point_delete` path. Every side-effect it performs (including the EXTRA
+//! spatial-removal + node-tombstone cascade) is captured in the returned
+//! [`PointDeleteOutcome`] so a transactional caller can build a fully
+//! reversible undo log.
 
 use tracing::warn;
 
@@ -35,18 +38,6 @@ pub(in crate::data::executor) struct PointDeleteParams<'a> {
     /// deletes (e.g. CRDT-sync materialization) whose admission already
     /// happened on their origin replica.
     pub enforce: bool,
-    /// Whether to apply the EXTRA delete cascades that have no undo variant
-    /// yet: the spatial R-tree removal and `mark_node_deleted` bookkeeping.
-    ///
-    /// `true` for autocommit user-DML callers (autocommit PointDelete),
-    /// which own the full delete. `false` for the transactional path
-    /// (`tx_point_delete`): those two side-effects have no rollback
-    /// reversal, so enabling them inside a transaction would leave a
-    /// rollback hole. The CORE side-effects (bitemporal tombstone or plain
-    /// delete — including versioned index tombstones, FTS/inverted index
-    /// removal, secondary-index cascade, graph-edge cascade, doc_cache
-    /// invalidation) run regardless.
-    pub enable_extra_cascades: bool,
 }
 
 /// Capture of the mutations an [`CoreLoop::apply_point_delete`] performed, so
@@ -80,10 +71,9 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
     /// removed from per-field spatial R-trees (and the reverse
     /// `spatial_doc_map`). The bbox is captured BEFORE the R-tree `delete`
     /// (which does not return it) so a transactional caller can push
-    /// `UndoEntry::SpatialDelete` re-insert reversals. Populated only when the
-    /// EXTRA cascade runs (`enable_extra_cascades == true`, i.e. autocommit);
-    /// empty on the transactional path until that flag flips. Autocommit callers
-    /// ignore it (an aborted redb txn does not reverse in-memory spatial writes).
+    /// `UndoEntry::SpatialDelete` re-insert reversals. Empty when the document
+    /// had no spatial fields. Autocommit callers ignore it (an aborted redb txn
+    /// does not reverse in-memory spatial writes).
     pub spatial_deletes: Vec<(SpatialIndexKey, u64, nodedb_types::BoundingBox, String)>,
     /// Graph edges the unconditional graph-edge cascade removed from BOTH the
     /// in-memory CSR partition AND the persistent edge store — each captured as
@@ -92,6 +82,15 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
     /// one `UndoEntry::DeleteEdge` per entry and a rolled-back delete restores
     /// every cascaded edge into both stores. Autocommit callers ignore it.
     pub edge_deletes: Vec<crate::engine::graph::edge_store::EdgeRestore>,
+    /// The node id this delete NEWLY marked deleted in the in-memory
+    /// `deleted_nodes` edge referential-integrity tracker, if any. `Some(id)`
+    /// only when `mark_node_deleted` newly inserted the node (it was not already
+    /// tombstoned by a prior committed op). A transactional caller pushes an
+    /// `UndoEntry::MarkNodeDeleted` so a rolled-back delete un-marks exactly the
+    /// node it added — never resurrecting a pre-existing tombstone. `None` when
+    /// the cascade didn't run or the node was already marked. Autocommit callers
+    /// ignore it.
+    pub mark_node_deleted: Option<String>,
 }
 
 impl CoreLoop {
@@ -130,7 +129,6 @@ impl CoreLoop {
             surrogate,
             user_roles,
             enforce,
-            enable_extra_cascades,
         } = params;
         let _ = user_roles;
 
@@ -315,56 +313,60 @@ impl CoreLoop {
             tracing::trace!(core = self.core_id, %document_id, edges_removed, "EDGE_CASCADE_DELETE");
         }
 
-        // Cascade 4 (SIDE): Remove from spatial R-tree indexes + reverse map,
-        // and record the node deletion for edge referential integrity. Both
-        // have no undo reversal yet, so they run only for autocommit callers
-        // (`enable_extra_cascades == true`); the transactional path skips them
-        // to avoid a rollback hole.
+        // Cascade 4: Remove from spatial R-tree indexes + reverse map, and
+        // record the node deletion for edge referential integrity. Both are
+        // fully captured (`spatial_deletes` + `mark_node_deleted` in the
+        // outcome) and reversed on rollback, so they run unconditionally for
+        // both the autocommit and transactional delete paths.
         //
         // `apply_point_put` hashes the substrate row key as the R-tree entry
         // id, so delete must hash the same key to find the entry. Hashing the
         // user PK would leak ghost bbox entries that survive the row's removal.
         // `(spatial_index_key, entry_id, bbox, document_id)` tuples removed by
-        // the spatial cascade below, so a transactional caller can reverse them.
-        // Populated only when the cascade runs (autocommit); empty otherwise.
+        // the spatial cascade below are captured so a transactional caller can
+        // reverse them.
         let mut spatial_deletes = Vec::new();
-        if enable_extra_cascades {
-            let entry_id = crate::util::fnv1a_hash(row_key.as_bytes());
-            let db_id = nodedb_types::DatabaseId::new(database_id);
-            let tid_id = crate::types::TenantId::new(tid);
-            let spatial_fields: Vec<String> = self
+        let mut mark_node_deleted_capture: Option<String> = None;
+        let entry_id = crate::util::fnv1a_hash(row_key.as_bytes());
+        let db_id = nodedb_types::DatabaseId::new(database_id);
+        let tid_id = crate::types::TenantId::new(tid);
+        let spatial_fields: Vec<String> = self
+            .spatial_indexes
+            .keys()
+            .filter(|(d, t, c, _)| *d == db_id && *t == tid_id && c == collection)
+            .map(|(_, _, _, f)| f.clone())
+            .collect();
+        for field in spatial_fields {
+            let skey = (db_id, tid_id, collection.to_string(), field.clone());
+            // Read the bbox BEFORE deleting — the R-tree `delete` does not
+            // return the removed geometry, so a reversible undo must capture
+            // it here (the reverse `spatial_doc_map` stores only the doc id).
+            let bbox = self
                 .spatial_indexes
-                .keys()
-                .filter(|(d, t, c, _)| *d == db_id && *t == tid_id && c == collection)
-                .map(|(_, _, _, f)| f.clone())
-                .collect();
-            for field in spatial_fields {
-                let skey = (db_id, tid_id, collection.to_string(), field.clone());
-                // Read the bbox BEFORE deleting — the R-tree `delete` does not
-                // return the removed geometry, so a reversible undo must capture
-                // it here (the reverse `spatial_doc_map` stores only the doc id).
-                let bbox = self
-                    .spatial_indexes
-                    .get(&skey)
-                    .and_then(|rtree| rtree.entries().into_iter().find(|e| e.id == entry_id))
-                    .map(|e| e.bbox);
-                if let Some(rtree) = self.spatial_indexes.get_mut(&skey) {
-                    rtree.delete(entry_id);
-                }
-                let removed_doc = self.spatial_doc_map.remove(&(
-                    db_id,
-                    tid_id,
-                    collection.to_string(),
-                    field,
-                    entry_id,
-                ));
-                if let (Some(bbox), Some(doc)) = (bbox, removed_doc) {
-                    spatial_deletes.push((skey, entry_id, bbox, doc));
-                }
+                .get(&skey)
+                .and_then(|rtree| rtree.entries().into_iter().find(|e| e.id == entry_id))
+                .map(|e| e.bbox);
+            if let Some(rtree) = self.spatial_indexes.get_mut(&skey) {
+                rtree.delete(entry_id);
             }
+            let removed_doc = self.spatial_doc_map.remove(&(
+                db_id,
+                tid_id,
+                collection.to_string(),
+                field,
+                entry_id,
+            ));
+            if let (Some(bbox), Some(doc)) = (bbox, removed_doc) {
+                spatial_deletes.push((skey, entry_id, bbox, doc));
+            }
+        }
 
-            // Record deletion for edge referential integrity.
-            self.mark_node_deleted(database_id, tid, document_id);
+        // Record deletion for edge referential integrity. Capture the id
+        // for undo ONLY when this call newly marked it — un-marking a node
+        // a prior committed op already tombstoned would wrongly resurrect
+        // it as a valid edge target.
+        if self.mark_node_deleted(database_id, tid, document_id) {
+            mark_node_deleted_capture = Some(document_id.to_string());
         }
 
         // Cascade 5 (CORE, UNCONDITIONAL): soft-delete any HNSW vector entries
@@ -418,6 +420,7 @@ impl CoreLoop {
             vector_deletes,
             spatial_deletes,
             edge_deletes,
+            mark_node_deleted: mark_node_deleted_capture,
         })
     }
 }

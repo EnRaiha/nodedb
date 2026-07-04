@@ -103,7 +103,6 @@ impl CoreLoop {
                 index_text: false,
                 user_roles: &task.request.user_roles,
                 enforce: false,
-                enable_side_indexes: true,
             },
         ) {
             Ok(p) => p,
