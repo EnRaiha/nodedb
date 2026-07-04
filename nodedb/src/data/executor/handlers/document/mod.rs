@@ -4,6 +4,7 @@
 //! Submodules: read (scan), write (batch insert, register, index ops),
 //! sort (external sort, sort helpers), text_extract (FTS indexing).
 
+pub mod index_fetch;
 pub mod read;
 pub mod sort;
 pub mod text_extract;

@@ -87,7 +87,7 @@ fn secondary_index_extraction() {
         .unwrap();
 
     let results = doc_engine
-        .index_lookup("users", "$.email", "alice@example.com")
+        .index_lookup("users", "$.email", "alice@example.com", false)
         .unwrap();
     assert_eq!(results, vec!["u1"]);
 }
@@ -107,11 +107,13 @@ fn array_index_extraction() {
         )
         .unwrap();
 
-    let results = doc_engine.index_lookup("users", "$.tags", "admin").unwrap();
+    let results = doc_engine
+        .index_lookup("users", "$.tags", "admin", false)
+        .unwrap();
     assert_eq!(results, vec!["u1"]);
 
     let results = doc_engine
-        .index_lookup("users", "$.tags", "editor")
+        .index_lookup("users", "$.tags", "editor", false)
         .unwrap();
     assert_eq!(results, vec!["u1"]);
 }
@@ -132,7 +134,7 @@ fn nested_field_index() {
         .unwrap();
 
     let results = doc_engine
-        .index_lookup("docs", "$.metadata.lang", "en")
+        .index_lookup("docs", "$.metadata.lang", "en", false)
         .unwrap();
     assert_eq!(results, vec!["d1"]);
 }
@@ -190,7 +192,7 @@ fn put_raw_with_index_extraction() {
     doc_engine.put_raw("items", "i1", &buf).unwrap();
 
     let results = doc_engine
-        .index_lookup("items", "$.category", "tools")
+        .index_lookup("items", "$.category", "tools", false)
         .unwrap();
     assert_eq!(results, vec!["i1"]);
 }

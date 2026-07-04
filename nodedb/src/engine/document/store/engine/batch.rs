@@ -59,12 +59,31 @@ impl<'a> DocumentEngine<'a> {
     }
 
     /// Lookup documents by a secondary index value.
+    ///
+    /// When `bitemporal` is true the collection never populates the plain
+    /// `INDEXES` table — every secondary-index write lands in the versioned
+    /// index. Resolve current-version doc IDs through
+    /// `versioned_index_lookup_as_of(.., None)`, which groups by doc_id, keeps
+    /// the newest entry, and filters tombstoned entries (so deleted or
+    /// superseded values are hidden). Non-bitemporal collections keep the exact
+    /// plain `range_scan` path below.
     pub fn index_lookup(
         &self,
         collection: &str,
         path: &str,
         value: &str,
+        bitemporal: bool,
     ) -> crate::Result<Vec<String>> {
+        if bitemporal {
+            return self.sparse.versioned_index_lookup_as_of(
+                self.database_id,
+                self.tenant_id,
+                collection,
+                path,
+                value,
+                None,
+            );
+        }
         let prefix_with_value = format!("{value}:");
         let results = self.sparse.range_scan(
             self.database_id,

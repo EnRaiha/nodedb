@@ -237,18 +237,56 @@ impl CoreLoop {
                 };
 
                 let write_result = if bitemporal {
-                    self.sparse
-                        .versioned_put(crate::engine::sparse::btree_versioned::VersionedPut {
-                            database_id,
-                            tenant: tid,
-                            coll: collection,
-                            doc_id: row_key,
-                            sys_from_ms: sys_from_for_encode,
-                            valid_from_ms: i64::MIN,
-                            valid_until_ms: i64::MAX,
-                            body: &updated_bytes,
-                        })
-                        .map(|()| None::<Vec<u8>>)
+                    // Bitemporal collections keep secondary-index entries in the
+                    // versioned index only; the update must tombstone values it
+                    // dropped and assert current values, atomically with the new
+                    // body. Decode old/new docs (storage-mode-aware) so the
+                    // reindex sees the real indexed values for strict + schemaless.
+                    let index_paths = self
+                        .doc_configs
+                        .get(&config_key)
+                        .map(|c| c.index_paths.clone())
+                        .unwrap_or_default();
+                    let old_doc = self
+                        .doc_configs
+                        .get(&config_key)
+                        .and_then(|c| self.decode_stored_document(c, &current_bytes));
+                    let new_doc = self
+                        .doc_configs
+                        .get(&config_key)
+                        .and_then(|c| self.decode_stored_document(c, &updated_bytes));
+                    match new_doc {
+                        Some(new_doc) => self
+                            .bitemporal_update_reindex(
+                                super::update_reindex::BitemporalUpdateReindex {
+                                    database_id,
+                                    tid,
+                                    collection,
+                                    doc_id: row_key,
+                                    sys_from_ms: sys_from_for_encode,
+                                    valid_from_ms: i64::MIN,
+                                    valid_until_ms: i64::MAX,
+                                    new_body: &updated_bytes,
+                                    index_paths: &index_paths,
+                                    old_doc: old_doc.as_ref(),
+                                    new_doc: &new_doc,
+                                },
+                            )
+                            .map(|()| None::<Vec<u8>>),
+                        None => self
+                            .sparse
+                            .versioned_put(crate::engine::sparse::btree_versioned::VersionedPut {
+                                database_id,
+                                tenant: tid,
+                                coll: collection,
+                                doc_id: row_key,
+                                sys_from_ms: sys_from_for_encode,
+                                valid_from_ms: i64::MIN,
+                                valid_until_ms: i64::MAX,
+                                body: &updated_bytes,
+                            })
+                            .map(|()| None::<Vec<u8>>),
+                    }
                 } else {
                     self.sparse
                         .put(database_id, tid, collection, row_key, &updated_bytes)

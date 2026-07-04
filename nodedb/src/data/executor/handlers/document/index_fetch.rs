@@ -1,0 +1,208 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Secondary-index lookup / fetch handlers for the document engine.
+//!
+//! Both `WHERE indexed_field = value` entry points (the native
+//! `IndexLookup` op and the pgwire-rewritten `IndexedFetch` op) resolve
+//! doc IDs through `DocumentEngine::index_lookup`. Bitemporal collections
+//! never populate the plain `INDEXES` table — every secondary-index write
+//! lands in the versioned index and every body lives on the versioned
+//! document table — so both handlers branch on `self.is_bitemporal(..)`
+//! exactly as `execute_document_scan` does: the doc-ID probe goes through
+//! the versioned index and the body fetch through `versioned_get_current`.
+//! Non-bitemporal collections keep the byte-identical plain
+//! `range_scan` + `sparse.get` path.
+
+use tracing::debug;
+
+use crate::bridge::envelope::{ErrorCode, Response};
+use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::task::ExecutionTask;
+
+/// Parameters for `execute_document_indexed_fetch`.
+///
+/// `filters` / `projection` are carried for forward compatibility (the
+/// rewrite only fires for simple equality; richer cases fall back to a full
+/// scan) but are not yet applied by the handler.
+pub(in crate::data::executor) struct IndexedFetchParams<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub path: &'a str,
+    pub value: &'a str,
+    pub filters: &'a [u8],
+    pub projection: &'a [String],
+    pub limit: usize,
+    pub offset: usize,
+}
+
+impl CoreLoop {
+    /// Execute a secondary index lookup: find all doc IDs where `path = value`.
+    ///
+    /// Delegates to `DocumentEngine::index_lookup`, which reads the plain
+    /// `INDEXES` table for ordinary collections and the versioned index for
+    /// bitemporal ones. Returns a JSON array of document IDs as the payload.
+    pub(in crate::data::executor) fn execute_document_index_lookup(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        collection: &str,
+        path: &str,
+        value: &str,
+    ) -> Response {
+        debug!(
+            core = self.core_id,
+            %collection,
+            %path,
+            %value,
+            "document index lookup"
+        );
+
+        let bitemporal = self.is_bitemporal(tid, collection);
+        let doc_engine = crate::engine::document::store::DocumentEngine::new(
+            &self.sparse,
+            task.request.database_id.as_u64(),
+            tid,
+        );
+        match doc_engine.index_lookup(collection, path, value, bitemporal) {
+            Ok(doc_ids) => {
+                let payload = serde_json::json!(doc_ids);
+                match sonic_rs::to_vec(&payload) {
+                    Ok(bytes) => self.response_with_payload(task, bytes),
+                    Err(e) => self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("index lookup encode: {e}"),
+                        },
+                    ),
+                }
+            }
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: e.to_string(),
+                },
+            ),
+        }
+    }
+
+    /// Execute a SELECT rewritten as a secondary-index fetch.
+    ///
+    /// Resolves doc IDs through `DocumentEngine::index_lookup`, fetches each
+    /// document's raw msgpack bytes, applies `offset`/`limit`, and emits rows
+    /// via `encode_raw_document_rows` — the same wire format as a document
+    /// scan — so the pgwire decoder doesn't need a special case.
+    ///
+    /// Bitemporal collections resolve doc IDs through the versioned index and
+    /// bodies through `versioned_get_current` (which hides tombstoned /
+    /// superseded values); ordinary collections use the plain index and
+    /// `sparse.get`.
+    ///
+    /// Post-filters and projection are intentionally not applied here:
+    /// the planner only rewrites to this op when those are empty
+    /// (complex cases fall back to a full scan). Extending this handler
+    /// with filter/projection support is additive.
+    pub(in crate::data::executor) fn execute_document_indexed_fetch(
+        &mut self,
+        task: &ExecutionTask,
+        params: IndexedFetchParams<'_>,
+    ) -> Response {
+        let IndexedFetchParams {
+            tid,
+            collection,
+            path,
+            value,
+            filters: _filters,
+            projection: _projection,
+            limit,
+            offset,
+        } = params;
+        debug!(
+            core = self.core_id,
+            %collection,
+            %path,
+            %value,
+            limit,
+            offset,
+            "document indexed fetch"
+        );
+
+        let database_id = task.request.database_id.as_u64();
+        let bitemporal = self.is_bitemporal(tid, collection);
+        let doc_engine =
+            crate::engine::document::store::DocumentEngine::new(&self.sparse, database_id, tid);
+        let doc_ids = match doc_engine.index_lookup(collection, path, value, bitemporal) {
+            Ok(ids) => ids,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("indexed fetch: {e}"),
+                    },
+                );
+            }
+        };
+
+        // Strict collections store Binary Tuple bytes; the response codec
+        // expects msgpack maps. Decode-then-encode here so cross-engine
+        // result framing (encode_raw_document_rows) sees valid msgpack.
+        let config_key = (crate::types::TenantId::new(tid), collection.to_string());
+        let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
+            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
+                c.storage_mode
+            {
+                Some(schema.clone())
+            } else {
+                None
+            }
+        });
+
+        let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
+        for doc_id in doc_ids.iter().skip(offset).take(limit) {
+            // Bitemporal collections keep the current body on the versioned
+            // document table; the plain DOCUMENTS table is empty for them.
+            let fetched = if bitemporal {
+                self.sparse
+                    .versioned_get_current(database_id, tid, collection, doc_id)
+            } else {
+                self.sparse.get(database_id, tid, collection, doc_id)
+            };
+            match fetched {
+                Ok(Some(bytes)) => {
+                    let payload = if let Some(ref schema) = strict_schema {
+                        match super::super::super::strict_format::binary_tuple_to_msgpack(
+                            &bytes, schema,
+                        ) {
+                            Some(mp) => mp,
+                            None => bytes,
+                        }
+                    } else {
+                        bytes
+                    };
+                    rows.push((doc_id.clone(), payload));
+                }
+                Ok(None) => {
+                    // Index entry pointed at a deleted doc — skip, don't
+                    // fail. A future compaction will purge the orphan.
+                }
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("fetch doc {doc_id}: {e}"),
+                        },
+                    );
+                }
+            }
+        }
+
+        match super::super::super::response_codec::encode_raw_document_rows(&rows) {
+            Ok(bytes) => self.response_with_payload(task, bytes),
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("indexed fetch encode: {e}"),
+                },
+            ),
+        }
+    }
+}

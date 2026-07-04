@@ -14,3 +14,4 @@ pub mod get;
 pub mod insert;
 pub mod put;
 pub mod update;
+pub mod update_reindex;

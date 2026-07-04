@@ -18,6 +18,10 @@ pub(in crate::data::executor) struct UniqueCheck<'a> {
     pub doc: &'a serde_json::Value,
     pub document_id: &'a str,
     pub paths: &'a [crate::engine::document::store::IndexPath],
+    /// Bitemporal collections keep secondary-index entries in the versioned
+    /// index only; the uniqueness probe must read that index, not the empty
+    /// plain one.
+    pub bitemporal: bool,
 }
 
 pub(in crate::data::executor) fn check_unique_constraints(c: UniqueCheck<'_>) -> crate::Result<()> {
@@ -31,6 +35,7 @@ pub(in crate::data::executor) fn check_unique_constraints(c: UniqueCheck<'_>) ->
         doc,
         document_id,
         paths,
+        bitemporal,
     } = c;
 
     let doc_engine = crate::engine::document::store::DocumentEngine::new(sparse, database_id, tid);
@@ -55,7 +60,7 @@ pub(in crate::data::executor) fn check_unique_constraints(c: UniqueCheck<'_>) ->
                 raw
             };
             let existing = doc_engine
-                .index_lookup(collection, &path.path, &needle)
+                .index_lookup(collection, &path.path, &needle, bitemporal)
                 .unwrap_or_default();
             if existing.iter().any(|id| id != document_id) {
                 return Err(crate::Error::RejectedConstraint {

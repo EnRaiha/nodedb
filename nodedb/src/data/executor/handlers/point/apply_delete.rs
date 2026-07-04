@@ -12,7 +12,6 @@
 use tracing::warn;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format;
 use crate::data::executor::enforcement::{append_only, period_lock, retention};
 use nodedb_types::Surrogate;
 
@@ -173,9 +172,13 @@ impl CoreLoop {
                 )?;
                 // Index tombstones: reflect every current value so
                 // `index_lookup_as_of` at or after `sys_from` skips this
-                // doc_id.
+                // doc_id. `body` is the STORED bytes (MessagePack for
+                // schemaless, Binary Tuple for strict) — use the
+                // storage-mode-aware decoder so strict bitemporal deletes
+                // also tombstone their secondary-index entries instead of
+                // silently skipping this loop.
                 if let Some(config) = self.doc_configs.get(&config_key)
-                    && let Some(doc) = doc_format::decode_document(body)
+                    && let Some(doc) = self.decode_stored_document(config, body)
                 {
                     for path in config.index_paths.clone() {
                         for v in crate::engine::document::store::extract_index_values(

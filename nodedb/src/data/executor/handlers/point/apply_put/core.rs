@@ -338,6 +338,7 @@ impl CoreLoop {
                 doc: &doc,
                 document_id,
                 paths: &paths,
+                bitemporal,
             })?;
             if bitemporal {
                 // Versioned index entries are keyed at the SAME system time as

@@ -342,7 +342,17 @@ impl CoreLoop {
                 limit,
                 offset,
             } => self.execute_document_indexed_fetch(
-                task, tid, collection, path, value, filters, projection, *limit, *offset,
+                task,
+                super::super::handlers::document::index_fetch::IndexedFetchParams {
+                    tid,
+                    collection,
+                    path,
+                    value,
+                    filters,
+                    projection,
+                    limit: *limit,
+                    offset: *offset,
+                },
             ),
 
             DocumentOp::DropIndex { collection, field } => {
