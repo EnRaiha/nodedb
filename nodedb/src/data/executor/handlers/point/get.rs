@@ -88,6 +88,13 @@ impl CoreLoop {
                     );
                 }
             }
+        } else if let Some(overlay_data) =
+            self.overlay_point_lookup(task, tid, collection, document_id, surrogate)
+        {
+            match overlay_data {
+                Ok(data) => data,
+                Err(response) => return response,
+            }
         } else {
             let cached = self
                 .doc_cache

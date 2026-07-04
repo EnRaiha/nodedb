@@ -12,6 +12,7 @@ pub mod apply_put;
 pub mod delete;
 pub mod get;
 pub mod insert;
+pub mod overlay_lookup;
 pub mod put;
 pub mod update;
 pub mod update_reindex;

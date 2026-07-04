@@ -85,6 +85,27 @@ impl SessionStore {
             .unwrap_or((None, None))
     }
 
+    /// Collect a value from each buffered write task's plan. Used at commit to
+    /// gather the collections this transaction wrote, so its own reads of those
+    /// collections are excluded from snapshot-isolation conflict detection
+    /// (a read-your-own-write is not a serialization conflict).
+    pub fn buffered_collections<F>(
+        &self,
+        addr: &SocketAddr,
+        extract: F,
+    ) -> std::collections::HashSet<String>
+    where
+        F: Fn(&nodedb_physical::physical_plan::PhysicalPlan) -> Option<String>,
+    {
+        self.read_session(addr, |s| {
+            s.tx_buffer
+                .iter()
+                .filter_map(|task| extract(&task.plan))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     /// Drain the read-set for conflict checking at COMMIT time.
     pub fn take_read_set(&self, addr: &SocketAddr) -> Vec<(String, String, Lsn)> {
         self.write_session(addr, |session| std::mem::take(&mut session.tx_read_set))

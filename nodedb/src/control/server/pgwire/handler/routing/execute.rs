@@ -180,21 +180,12 @@ impl NodeDbPgHandler {
         let tx_state = self.sessions.transaction_state(addr);
         match classify_dispatch(&tasks) {
             DispatchClass::SingleShard { .. } => {
-                // A single-shard dependent-predicate write (`BulkUpdate` /
-                // `BulkDelete` — e.g. `DELETE ... WHERE <non-pk>`) does NOT need
-                // OLLP/Calvin: a single shard is ONE Raft group, so proposing
-                // the bulk write as a log entry makes every replica apply it in
-                // log order and re-evaluate the predicate against byte-identical
-                // prior state (deterministic). It now has a `to_replicated_entry`
-                // encode arm (`ReplicatedWrite::BulkDml`), so the normal dispatch
-                // path (`dispatch_task` → `dispatch_replicated_write` → Raft
-                // propose, forwarded to the data-group leader from a non-leader
-                // coordinator) replicates and applies it correctly. Edge-bearing
-                // dependent predicates are already preempted onto the Calvin OLLP
-                // path by the `plan_needs_implicit_edge_recon` gate above; only
-                // genuine MULTI-shard bulk writes (≥2 vshards → the arm below)
-                // need cross-group OLLP coordination. Fall through to the normal
-                // dispatch loop.
+                // A single-shard dependent-predicate write (e.g. `DELETE ...
+                // WHERE <non-pk>`) doesn't need OLLP/Calvin: one shard is one
+                // Raft group, so the normal replicated-write dispatch path
+                // applies it deterministically. Edge-bearing dependent
+                // predicates are already preempted onto Calvin above; only
+                // genuine multi-shard bulk writes need OLLP. Fall through.
             }
             DispatchClass::MultiShard { .. } => {
                 if tx_state == crate::control::server::shared::session::TransactionState::InBlock {
@@ -339,6 +330,11 @@ impl NodeDbPgHandler {
                     responses.push(Response::Execution(Tag::new("OK")));
                     continue;
                 }
+                // Not a write: an in-transaction read. Stamp the active
+                // transaction id onto the task so the Data Plane can check
+                // this transaction's staging overlay for read-your-own-writes
+                // on point lookups.
+                task.txn_id = self.sessions.tx_id(addr);
             }
 
             let plan_kind = describe_plan(&task.plan);

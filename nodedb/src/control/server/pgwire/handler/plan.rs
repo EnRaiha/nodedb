@@ -33,6 +33,7 @@ pub(super) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Vector(VectorOp::Delete { collection, .. })
         | PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. })
         | PhysicalPlan::Document(DocumentOp::PointPut { collection, .. })
+        | PhysicalPlan::Document(DocumentOp::PointInsert { collection, .. })
         | PhysicalPlan::Document(DocumentOp::PointDelete { collection, .. })
         | PhysicalPlan::Document(DocumentOp::PointUpdate { collection, .. })
         | PhysicalPlan::Document(DocumentOp::Scan { collection, .. })

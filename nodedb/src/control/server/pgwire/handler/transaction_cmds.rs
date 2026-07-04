@@ -126,10 +126,21 @@ impl NodeDbPgHandler {
     ) -> PgWireResult<Vec<Response>> {
         // Snapshot isolation: check for write conflicts before committing.
         let read_set = self.sessions.take_read_set(addr);
+        // Collections this transaction wrote itself. A read of a collection the
+        // same transaction has written is a read-your-own-write, not a
+        // serialization conflict — reading uncommitted own state (served from
+        // the staging overlay, which reports no watermark) must not abort the
+        // commit. The read-set is collection-granular, so exclusion is too.
+        let written_collections = self.sessions.buffered_collections(addr, |plan| {
+            super::plan::extract_collection(plan).map(String::from)
+        });
         if let Some(snapshot_lsn) = self.sessions.snapshot_lsn(addr) {
             let current_lsn = self.state.wal.next_lsn();
             let current = crate::types::Lsn::new(current_lsn.as_u64().saturating_sub(1));
             for (_collection, _doc_id, read_lsn) in &read_set {
+                if written_collections.contains(_collection) {
+                    continue;
+                }
                 if current > *read_lsn && current > snapshot_lsn {
                     // WAL advanced past what we read — concurrent write detected.
                     if let Ok(reservations) = self.sessions.rollback(addr) {
