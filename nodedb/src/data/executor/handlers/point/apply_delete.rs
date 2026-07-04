@@ -60,6 +60,14 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
     /// `(field, value)` pairs whose versioned index tombstones this op wrote
     /// at `bitemporal_sys_from_ms`. Empty when not bitemporal / none written.
     pub bitemporal_index_tuples: Vec<(String, String)>,
+    /// `(index_key, vector_id)` pairs this delete soft-deleted from HNSW vector
+    /// indexes. Populated unconditionally (autocommit and transactional) so the
+    /// owning document's vectors never orphan; a transactional caller pushes an
+    /// `UndoEntry::DeleteVector` per entry so a rolled-back delete restores them.
+    pub vector_deletes: Vec<(
+        (nodedb_types::DatabaseId, crate::types::TenantId, String),
+        u32,
+    )>,
 }
 
 impl CoreLoop {
@@ -273,6 +281,45 @@ impl CoreLoop {
             self.mark_node_deleted(database_id, tid, document_id);
         }
 
+        // Cascade 5 (CORE, UNCONDITIONAL): soft-delete any HNSW vector entries
+        // this document produced. Runs for BOTH autocommit and transactional
+        // callers — leaving them behind orphans the vector index forever (a
+        // deleted doc keeps scoring in KNN). The reverse map `vector_doc_map`
+        // was populated by `apply_point_put_vector_indexes` under the same hex
+        // surrogate row key used here. Soft-delete (not hard) so a rolled-back
+        // transactional delete can `undelete` the exact vector id.
+        //
+        // The candidate fields are known from the same schema/vector_params
+        // enumeration the put path uses, so each `vector_doc_map` entry is
+        // looked up by its exact key rather than scanning the whole map on
+        // every delete.
+        let db_id = nodedb_types::DatabaseId::new(database_id);
+        let tid_id = crate::types::TenantId::new(tid);
+        let strict_fields = self.strict_vector_fields(tid, collection);
+        let candidate_fields: Vec<String> = if !strict_fields.is_empty() {
+            strict_fields.into_iter().map(|(name, _dim)| name).collect()
+        } else {
+            self.schemaless_vector_field_names(database_id, tid, collection)
+        };
+        let mut vector_deletes = Vec::with_capacity(candidate_fields.len());
+        for field in candidate_fields {
+            let doc_key = (
+                db_id,
+                tid_id,
+                collection.to_string(),
+                field.clone(),
+                row_key.to_string(),
+            );
+            let Some(vector_id) = self.vector_doc_map.remove(&doc_key) else {
+                continue;
+            };
+            let index_key = Self::vector_index_key(database_id, tid, collection, &field);
+            if let Some(coll) = self.vector_collections.get_mut(&index_key) {
+                coll.delete(vector_id);
+            }
+            vector_deletes.push((index_key, vector_id));
+        }
+
         // Invalidate document cache.
         self.doc_cache
             .invalidate(database_id, tid, collection, row_key);
@@ -281,6 +328,7 @@ impl CoreLoop {
             prior_value: prior,
             bitemporal_sys_from_ms,
             bitemporal_index_tuples,
+            vector_deletes,
         })
     }
 }

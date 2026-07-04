@@ -64,23 +64,20 @@ impl CoreLoop {
         }
     }
 
-    /// HNSW vector indexing side-effect: index declared strict-schema
-    /// `Vector(dim)` columns, or (schemaless) fields matched by registered
-    /// `vector_params`, into the corresponding `VectorCollection`.
-    pub(in crate::data::executor) fn apply_point_put_vector_indexes(
-        &mut self,
-        database_id: u64,
+    /// Strict-schema `Vector(dim)` column names + dims declared on
+    /// `collection`, or empty if the collection has no strict schema / no
+    /// vector columns. Shared by `apply_point_put_vector_indexes` (which
+    /// needs `dim` to validate extracted float arrays) and
+    /// `apply_point_delete`'s vector cleanup (which only needs the field
+    /// names to construct exact `vector_doc_map` keys without a full-map
+    /// scan).
+    pub(in crate::data::executor) fn strict_vector_fields(
+        &self,
         tid: u64,
         collection: &str,
-        value: &[u8],
-    ) {
+    ) -> Vec<(String, u32)> {
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
-
-        // Vector index: if the strict schema declares Vector(dim) columns,
-        // extract float arrays and insert into HNSW so KNN search works.
-        // Collect vector fields from schema first (avoids borrow conflict).
-        let vector_fields: Vec<(String, u32)> = self
-            .doc_configs
+        self.doc_configs
             .get(&config_key)
             .and_then(|config| {
                 if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
@@ -107,7 +104,67 @@ impl CoreLoop {
                     None
                 }
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// Schemaless vector field names registered via `vector_params` for
+    /// `collection` (named-field entries `"{collection}:{field}"`, plus the
+    /// bare `"{collection}"` key defaulting to `"embedding"`). Shared by the
+    /// put path's schemaless indexing branch and the delete cleanup's exact
+    /// key construction.
+    pub(in crate::data::executor) fn schemaless_vector_field_names(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> Vec<String> {
+        let db_key = nodedb_types::DatabaseId::new(database_id);
+        let tid_key = crate::types::TenantId::new(tid);
+        let field_prefix = format!("{collection}:");
+        let bare_key = (db_key, tid_key, collection.to_string());
+
+        let mut names: Vec<String> = self
+            .vector_params
+            .keys()
+            .filter(|(d, t, coll_key)| {
+                *d == bare_key.0 && *t == bare_key.1 && coll_key.starts_with(&field_prefix)
+            })
+            .map(|k| k.2[field_prefix.len()..].to_string())
+            .collect();
+        if names.is_empty() && self.vector_params.contains_key(&bare_key) {
+            names.push("embedding".to_string());
+        }
+        names
+    }
+
+    /// HNSW vector indexing side-effect: index declared strict-schema
+    /// `Vector(dim)` columns, or (schemaless) fields matched by registered
+    /// `vector_params`, into the corresponding `VectorCollection`.
+    ///
+    /// Returns the `(index_key, vector_id)` pairs inserted so a transactional
+    /// caller can push `UndoEntry::InsertVector` reversals. Each inserted
+    /// vector is also recorded in `vector_doc_map` keyed by the hex surrogate
+    /// row key, so `apply_point_delete` can soft-delete it when the owning
+    /// document is removed (closing the vector-orphan leak).
+    pub(in crate::data::executor) fn apply_point_put_vector_indexes(
+        &mut self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        document_id: &str,
+        value: &[u8],
+    ) -> Vec<(
+        (nodedb_types::DatabaseId, crate::types::TenantId, String),
+        u32,
+    )> {
+        let mut inserts: Vec<(
+            (nodedb_types::DatabaseId, crate::types::TenantId, String),
+            u32,
+        )> = Vec::new();
+
+        // Vector index: if the strict schema declares Vector(dim) columns,
+        // extract float arrays and insert into HNSW so KNN search works.
+        let vector_fields = self.strict_vector_fields(tid, collection);
 
         if !vector_fields.is_empty() {
             // Decode from MessagePack (internal format) — not JSON.
@@ -137,14 +194,28 @@ impl CoreLoop {
                                 .get(&index_key)
                                 .cloned()
                                 .unwrap_or_default();
-                            let coll =
-                                self.vector_collections.entry(index_key).or_insert_with(|| {
+                            let coll = self
+                                .vector_collections
+                                .entry(index_key.clone())
+                                .or_insert_with(|| {
                                     nodedb_vector::VectorCollection::new(*dim as usize, params)
                                 });
                             // Document-engine-owned auto-indexing: surrogate
                             // routing for these implicit vector binds rides
                             // with the document engine retrofit.
-                            coll.insert_with_surrogate(floats, nodedb_types::Surrogate::ZERO);
+                            let vector_id =
+                                coll.insert_with_surrogate(floats, nodedb_types::Surrogate::ZERO);
+                            self.vector_doc_map.insert(
+                                (
+                                    index_key.0,
+                                    index_key.1,
+                                    collection.to_string(),
+                                    field_name.clone(),
+                                    document_id.to_string(),
+                                ),
+                                vector_id,
+                            );
+                            inserts.push((index_key, vector_id));
                         }
                     }
                 }
@@ -160,27 +231,26 @@ impl CoreLoop {
             let tid_key = crate::types::TenantId::new(tid);
             let field_prefix = format!("{collection}:");
             let bare_key = (db_key, tid_key, collection.to_string());
+            let field_names = self.schemaless_vector_field_names(database_id, tid, collection);
 
-            // Collect all vector_params entries for this database+tenant+collection.
-            // Each entry maps to a (params_map_key, field_name) pair.
-            let mut schemaless_keys: Vec<(
+            // Each field name maps back to its `vector_params` map key: either
+            // the field-qualified key (if one was registered) or the bare key
+            // (single default-"embedding" field, no per-field registration).
+            let schemaless_keys: Vec<(
                 (nodedb_types::DatabaseId, crate::types::TenantId, String),
                 String,
-            )> = self
-                .vector_params
-                .keys()
-                .filter(|(d, t, coll_key)| {
-                    *d == bare_key.0 && *t == bare_key.1 && coll_key.starts_with(&field_prefix)
-                })
-                .map(|k| {
-                    let field = k.2[field_prefix.len()..].to_string();
-                    (k.clone(), field)
+            )> = field_names
+                .into_iter()
+                .map(|field| {
+                    let qualified = (db_key, tid_key, format!("{field_prefix}{field}"));
+                    let params_key = if self.vector_params.contains_key(&qualified) {
+                        qualified
+                    } else {
+                        bare_key.clone()
+                    };
+                    (params_key, field)
                 })
                 .collect();
-            // Also check for bare key (no field name) — default to "embedding".
-            if schemaless_keys.is_empty() && self.vector_params.contains_key(&bare_key) {
-                schemaless_keys.push((bare_key.clone(), "embedding".to_string()));
-            }
 
             if !schemaless_keys.is_empty()
                 && let Ok(ndb_val) = nodedb_types::value_from_msgpack(value)
@@ -210,18 +280,34 @@ impl CoreLoop {
                             // Use field-qualified key so search can find it.
                             let store_key =
                                 Self::vector_index_key(database_id, tid, collection, field_name);
-                            let coll =
-                                self.vector_collections.entry(store_key).or_insert_with(|| {
+                            let coll = self
+                                .vector_collections
+                                .entry(store_key.clone())
+                                .or_insert_with(|| {
                                     nodedb_vector::VectorCollection::new(floats.len(), params)
                                 });
                             // Document-engine-owned auto-indexing: surrogate
                             // routing for these implicit vector binds rides
                             // with the document engine retrofit.
-                            coll.insert_with_surrogate(floats, nodedb_types::Surrogate::ZERO);
+                            let vector_id =
+                                coll.insert_with_surrogate(floats, nodedb_types::Surrogate::ZERO);
+                            self.vector_doc_map.insert(
+                                (
+                                    store_key.0,
+                                    store_key.1,
+                                    collection.to_string(),
+                                    field_name.clone(),
+                                    document_id.to_string(),
+                                ),
+                                vector_id,
+                            );
+                            inserts.push((store_key, vector_id));
                         }
                     }
                 }
             }
         }
+
+        inserts
     }
 }

@@ -224,6 +224,17 @@ impl CoreLoop {
             chain_hash_prior,
         });
 
+        // Reverse any HNSW vector inserts on rollback. Empty today (the
+        // transactional path disables vector side-indexing via
+        // `enable_side_indexes: false`), so this is a no-op until that flag
+        // flips — wired now so it stays correct when it does.
+        for (index_key, vector_id) in outcome.vector_inserts {
+            undo_log.push(UndoEntry::InsertVector {
+                index_key,
+                vector_id,
+            });
+        }
+
         if is_insert
             && let Some(config) = self.doc_configs.get(&config_key)
             && !config.enforcement.materialized_sum_sources.is_empty()
@@ -301,6 +312,17 @@ impl CoreLoop {
                 bitemporal_sys_from_ms: outcome.bitemporal_sys_from_ms,
                 bitemporal_index_tuples: outcome.bitemporal_index_tuples,
                 chain_hash_prior: None,
+            });
+        }
+
+        // The delete-cleanup soft-deleted this document's vectors unconditionally
+        // (fixing the orphan leak even in autocommit). In the transactional path
+        // a rollback must restore them, so push one `DeleteVector` undo per
+        // soft-deleted vector — `apply_undo_vector` `undelete`s each on rollback.
+        for (index_key, vector_id) in outcome.vector_deletes {
+            undo_log.push(UndoEntry::DeleteVector {
+                index_key,
+                vector_id,
             });
         }
         Ok(self.response_ok(dummy_task))

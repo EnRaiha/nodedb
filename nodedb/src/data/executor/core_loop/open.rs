@@ -138,6 +138,7 @@ impl CoreLoop {
             segment_compaction_config: crate::storage::compaction::CompactionConfig::default(),
             spatial_indexes: std::collections::HashMap::new(),
             spatial_doc_map: std::collections::HashMap::new(),
+            vector_doc_map: std::collections::HashMap::new(),
             doc_configs: HashMap::new(),
             chain_hashes: HashMap::new(),
             query_tuning: nodedb_types::config::tuning::QueryTuning::default(),

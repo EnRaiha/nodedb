@@ -74,6 +74,15 @@ pub(in crate::data::executor) struct PointPutOutcome {
     /// `(field, value)` pairs whose versioned index entries this op wrote at
     /// `bitemporal_sys_from_ms`. Empty when not bitemporal / none written.
     pub bitemporal_index_tuples: Vec<(String, String)>,
+    /// `(index_key, vector_id)` pairs this put inserted into HNSW vector
+    /// indexes, so a transactional caller can push `UndoEntry::InsertVector`
+    /// reversals. Empty unless `enable_side_indexes` was set (the transactional
+    /// path currently disables vector side-indexing, so this stays empty there
+    /// until that flag flips). Autocommit callers ignore it.
+    pub vector_inserts: Vec<(
+        (nodedb_types::DatabaseId, crate::types::TenantId, String),
+        u32,
+    )>,
 }
 
 /// Map an enforcement check's `ErrorCode` onto the crate's typed `Error`.
@@ -464,15 +473,23 @@ impl CoreLoop {
             }
         }
 
+        let mut vector_inserts = Vec::new();
         if enable_side_indexes {
             self.apply_point_put_spatial(database_id, tid, collection, document_id, value);
-            self.apply_point_put_vector_indexes(database_id, tid, collection, value);
+            vector_inserts = self.apply_point_put_vector_indexes(
+                database_id,
+                tid,
+                collection,
+                document_id,
+                value,
+            );
         }
 
         Ok(PointPutOutcome {
             prior_value: prior,
             bitemporal_sys_from_ms: if bitemporal { Some(sys_from_ms) } else { None },
             bitemporal_index_tuples,
+            vector_inserts,
         })
     }
 }
