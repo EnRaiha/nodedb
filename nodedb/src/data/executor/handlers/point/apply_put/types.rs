@@ -61,14 +61,11 @@ pub(in crate::data::executor) struct PointPutOutcome {
     /// bitemporal path. A transactional caller re-inserts these on rollback.
     /// Autocommit callers ignore it.
     pub secondary_index_removed: Vec<(String, String)>,
-    /// `(index_key, vector_id)` pairs this put inserted into HNSW vector
-    /// indexes, so a transactional caller can push `UndoEntry::InsertVector`
-    /// reversals. Empty when the document had no vector fields. Autocommit
-    /// callers ignore it.
-    pub vector_inserts: Vec<(
-        (nodedb_types::DatabaseId, crate::types::TenantId, String),
-        u32,
-    )>,
+    /// Vector index mutations this put performed, so a transactional caller
+    /// can push `UndoEntry::InsertVector` reversals (which also undo the
+    /// paired `vector_doc_map` entry). Empty when the document had no vector
+    /// fields. Autocommit callers ignore it.
+    pub vector_inserts: Vec<super::index::VectorIndexDelta>,
     /// `(spatial_index_key, entry_id)` pairs this put inserted into per-field
     /// spatial R-trees, so a transactional caller can push
     /// `UndoEntry::SpatialInsert` reversals. Empty when the document had no

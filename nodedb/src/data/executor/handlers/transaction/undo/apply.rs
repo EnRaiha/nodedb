@@ -26,9 +26,28 @@ impl CoreLoop {
             UndoEntry::InsertVector {
                 index_key,
                 vector_id,
+                collection,
+                field,
+                doc_id,
             } => match self.vector_collections.get_mut(&index_key) {
                 Some(index) => {
                     index.delete(vector_id);
+                    // Reverse the forward insert's `vector_doc_map` write —
+                    // without this a rolled-back insert leaves a stale
+                    // doc→vector_id mapping behind (unbounded leak), mirroring
+                    // `apply_undo_spatial`'s `spatial_doc_map.remove`. Empty
+                    // `doc_id` marks the direct primary-vector write path
+                    // (`PhysicalPlan::Vector`), which never populates
+                    // `vector_doc_map` — skip the mutation for that path.
+                    if !doc_id.is_empty() {
+                        self.vector_doc_map.remove(&(
+                            index_key.0,
+                            index_key.1,
+                            collection,
+                            field,
+                            doc_id,
+                        ));
+                    }
                     Ok(())
                 }
                 None => {
@@ -48,9 +67,26 @@ impl CoreLoop {
             UndoEntry::DeleteVector {
                 index_key,
                 vector_id,
+                collection,
+                field,
+                doc_id,
             } => match self.vector_collections.get_mut(&index_key) {
                 Some(index) => {
                     index.undelete(vector_id);
+                    // Restore the `vector_doc_map` entry the forward delete
+                    // removed — without this a rolled-back delete leaves the
+                    // doc→vector reverse lookup missing, so a later delete of
+                    // the same document can never find (and soft-delete) its
+                    // vector: a permanent orphan. Mirrors
+                    // `apply_undo_spatial`'s `spatial_doc_map.insert`. Empty
+                    // `doc_id` marks the direct primary-vector write path,
+                    // which never populates `vector_doc_map` — skip it there.
+                    if !doc_id.is_empty() {
+                        self.vector_doc_map.insert(
+                            (index_key.0, index_key.1, collection, field, doc_id),
+                            vector_id,
+                        );
+                    }
                     Ok(())
                 }
                 None => {

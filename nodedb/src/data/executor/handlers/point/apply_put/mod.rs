@@ -8,4 +8,5 @@ pub(in crate::data::executor::handlers::point) mod index;
 pub(in crate::data::executor::handlers::point) mod types;
 pub(in crate::data::executor::handlers::point) mod unique;
 
+pub(in crate::data::executor) use index::VectorIndexDelta;
 pub(in crate::data::executor) use types::{PointPutOutcome, PointPutParams, map_enforcement_error};

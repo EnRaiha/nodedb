@@ -63,15 +63,34 @@ pub(in crate::data::executor) enum UndoEntry {
         /// mutated it (see [`UndoEntry::PutDocument`] for semantics).
         chain_hash_prior: Option<Option<String>>,
     },
-    /// Undo a VectorInsert by soft-deleting the inserted vector.
+    /// Undo a VectorInsert by soft-deleting the inserted vector and removing
+    /// the stale forward-insert `vector_doc_map` entry it created — mirroring
+    /// `SpatialInsert`'s reverse-map cleanup. Without this, a rolled-back
+    /// insert leaves a `vector_doc_map` entry pointing at a vector id that no
+    /// longer represents a live document: an unbounded leak.
     InsertVector {
         index_key: (nodedb_types::DatabaseId, TenantId, String),
         vector_id: u32,
+        /// Collection, field, and doc id — the `vector_doc_map` key
+        /// components the forward insert wrote, needed to remove them.
+        collection: String,
+        field: String,
+        doc_id: String,
     },
-    /// Undo a VectorDelete by un-deleting (clearing tombstone).
+    /// Undo a VectorDelete by un-deleting (clearing tombstone) and restoring
+    /// the `vector_doc_map` entry the forward delete removed — mirroring
+    /// `SpatialDelete`'s reverse-map restore. Without this, a rolled-back
+    /// delete leaves the doc→vector reverse lookup missing: a future delete
+    /// of the same document can no longer find its vector, orphaning it
+    /// permanently.
     DeleteVector {
         index_key: (nodedb_types::DatabaseId, TenantId, String),
         vector_id: u32,
+        /// Collection, field, and doc id — the `vector_doc_map` key
+        /// components the forward delete removed, needed to restore them.
+        collection: String,
+        field: String,
+        doc_id: String,
     },
     /// Undo a spatial R-tree insert by removing the entry from the per-field
     /// R-tree and deleting its reverse `spatial_doc_map` record.

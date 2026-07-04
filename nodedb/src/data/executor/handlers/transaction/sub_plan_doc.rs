@@ -230,10 +230,13 @@ impl CoreLoop {
 
         // Reverse any HNSW vector inserts on rollback (one `InsertVector` undo
         // per vector this put added to a per-field index).
-        for (index_key, vector_id) in outcome.vector_inserts {
+        for delta in outcome.vector_inserts {
             undo_log.push(UndoEntry::InsertVector {
-                index_key,
-                vector_id,
+                index_key: delta.index_key,
+                vector_id: delta.vector_id,
+                collection: delta.collection,
+                field: delta.field,
+                doc_id: delta.doc_id,
             });
         }
 
@@ -340,10 +343,13 @@ impl CoreLoop {
         // (fixing the orphan leak even in autocommit). In the transactional path
         // a rollback must restore them, so push one `DeleteVector` undo per
         // soft-deleted vector — `apply_undo_vector` `undelete`s each on rollback.
-        for (index_key, vector_id) in outcome.vector_deletes {
+        for delta in outcome.vector_deletes {
             undo_log.push(UndoEntry::DeleteVector {
-                index_key,
-                vector_id,
+                index_key: delta.index_key,
+                vector_id: delta.vector_id,
+                collection: delta.collection,
+                field: delta.field,
+                doc_id: delta.doc_id,
             });
         }
 

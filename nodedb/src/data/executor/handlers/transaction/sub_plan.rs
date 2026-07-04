@@ -151,9 +151,17 @@ impl CoreLoop {
 
                 let vector_id = index.len() as u32;
                 index.insert_with_surrogate(vector.clone(), *surrogate);
+                // This is the direct primary-vector write path (VectorOp), not
+                // the document auto-index cascade — it never populates
+                // `vector_doc_map` (that reverse map is keyed by document id,
+                // which this path doesn't have). Empty `doc_id` tells
+                // `apply_undo_vector` to skip the `vector_doc_map` mutation.
                 undo_log.push(UndoEntry::InsertVector {
                     index_key,
                     vector_id,
+                    collection: collection.clone(),
+                    field: field_name.clone(),
+                    doc_id: String::new(),
                 });
                 Ok(self.response_ok(&dummy_task))
             }
@@ -171,9 +179,15 @@ impl CoreLoop {
                 if let Some(index) = self.vector_collections.get_mut(&index_key)
                     && index.delete(*vector_id)
                 {
+                    // Same direct primary-vector path as `VectorOp::Insert`
+                    // above — no `vector_doc_map` entry to restore, so an
+                    // empty `doc_id` skips that mutation in `apply_undo_vector`.
                     undo_log.push(UndoEntry::DeleteVector {
                         index_key,
                         vector_id: *vector_id,
+                        collection: collection.clone(),
+                        field: String::new(),
+                        doc_id: String::new(),
                     });
                 }
                 Ok(self.response_ok(&dummy_task))

@@ -15,6 +15,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::{append_only, period_lock, retention};
 use nodedb_types::Surrogate;
 
+use crate::data::executor::handlers::point::apply_put::VectorIndexDelta;
 use crate::data::executor::handlers::point::apply_put::map_enforcement_error;
 use crate::data::executor::spatial_key::SpatialIndexKey;
 
@@ -58,14 +59,12 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
     /// where a rolled-back DELETE never restored its secondary-index entries.
     /// Empty on the bitemporal path (which has no plain INDEXES entries).
     pub secondary_index_tuples: Vec<(String, String)>,
-    /// `(index_key, vector_id)` pairs this delete soft-deleted from HNSW vector
+    /// Vector index mutations this delete soft-deleted from HNSW vector
     /// indexes. Populated unconditionally (autocommit and transactional) so the
     /// owning document's vectors never orphan; a transactional caller pushes an
-    /// `UndoEntry::DeleteVector` per entry so a rolled-back delete restores them.
-    pub vector_deletes: Vec<(
-        (nodedb_types::DatabaseId, crate::types::TenantId, String),
-        u32,
-    )>,
+    /// `UndoEntry::DeleteVector` per entry so a rolled-back delete restores
+    /// them, including the paired `vector_doc_map` entry this cascade removed.
+    pub vector_deletes: Vec<VectorIndexDelta>,
     /// `(spatial_index_key, entry_id, bbox, document_id)` tuples this delete
     /// removed from per-field spatial R-trees (and the reverse
     /// `spatial_doc_map`). The bbox is captured BEFORE the R-tree `delete`
@@ -408,7 +407,13 @@ impl CoreLoop {
             if let Some(coll) = self.vector_collections.get_mut(&index_key) {
                 coll.delete(vector_id);
             }
-            vector_deletes.push((index_key, vector_id));
+            vector_deletes.push(VectorIndexDelta {
+                index_key,
+                vector_id,
+                collection: collection.to_string(),
+                field,
+                doc_id: row_key.to_string(),
+            });
         }
 
         // Invalidate document cache.

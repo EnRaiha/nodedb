@@ -8,6 +8,20 @@
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 
+/// Capture of a single HNSW vector index mutation (insert or soft-delete),
+/// carrying everything needed to both key the `VectorCollection` (`index_key`,
+/// `vector_id`) AND reverse the paired `vector_doc_map` entry on rollback
+/// (`collection`, `field`, `doc_id`). Replaces a raw `(index_key, vector_id)`
+/// tuple so undo can restore/remove the reverse-lookup map symmetrically with
+/// the R-tree's `SpatialInsert`/`SpatialDelete` undo pattern.
+pub(in crate::data::executor) struct VectorIndexDelta {
+    pub index_key: (nodedb_types::DatabaseId, crate::types::TenantId, String),
+    pub vector_id: u32,
+    pub collection: String,
+    pub field: String,
+    pub doc_id: String,
+}
+
 impl CoreLoop {
     /// Spatial R-tree + columnar ingest side-effect: parse geometry fields,
     /// insert into the per-field R-tree, maintain the reverse entry→doc map,
@@ -170,14 +184,8 @@ impl CoreLoop {
         collection: &str,
         document_id: &str,
         value: &[u8],
-    ) -> Vec<(
-        (nodedb_types::DatabaseId, crate::types::TenantId, String),
-        u32,
-    )> {
-        let mut inserts: Vec<(
-            (nodedb_types::DatabaseId, crate::types::TenantId, String),
-            u32,
-        )> = Vec::new();
+    ) -> Vec<VectorIndexDelta> {
+        let mut inserts: Vec<VectorIndexDelta> = Vec::new();
 
         // Vector index: if the strict schema declares Vector(dim) columns,
         // extract float arrays and insert into HNSW so KNN search works.
@@ -232,7 +240,13 @@ impl CoreLoop {
                                 ),
                                 vector_id,
                             );
-                            inserts.push((index_key, vector_id));
+                            inserts.push(VectorIndexDelta {
+                                index_key,
+                                vector_id,
+                                collection: collection.to_string(),
+                                field: field_name.clone(),
+                                doc_id: document_id.to_string(),
+                            });
                         }
                     }
                 }
@@ -318,7 +332,13 @@ impl CoreLoop {
                                 ),
                                 vector_id,
                             );
-                            inserts.push((store_key, vector_id));
+                            inserts.push(VectorIndexDelta {
+                                index_key: store_key,
+                                vector_id,
+                                collection: collection.to_string(),
+                                field: field_name.clone(),
+                                doc_id: document_id.to_string(),
+                            });
                         }
                     }
                 }

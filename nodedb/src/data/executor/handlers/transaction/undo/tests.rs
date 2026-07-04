@@ -421,6 +421,101 @@ fn spatial_delete_undo_reinserts_entry_with_bbox() {
     );
 }
 
+// ── Vector undo (vector_doc_map symmetry) ───────────────────────────────────
+
+fn vector_index_key() -> (nodedb_types::DatabaseId, TenantId, String) {
+    crate::data::executor::core_loop::CoreLoop::vector_index_key(DB, TID, "c", "emb")
+}
+
+fn vector_doc_key() -> (nodedb_types::DatabaseId, TenantId, String, String, String) {
+    let key = vector_index_key();
+    (
+        key.0,
+        key.1,
+        "c".to_string(),
+        "emb".to_string(),
+        "d1".to_string(),
+    )
+}
+
+/// A rolled-back transactional document INSERT must remove the stale
+/// `vector_doc_map` entry the forward `apply_point_put_vector_indexes`
+/// insert created — otherwise the reverse doc→vector_id mapping leaks
+/// unboundedly (it never gets cleaned up since the document that would have
+/// triggered a delete cascade doesn't actually exist post-rollback). Mirrors
+/// `spatial_insert_undo_removes_entry_and_reverse_map`.
+#[test]
+fn vector_insert_undo_removes_stale_doc_map_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+    let index_key = vector_index_key();
+    let coll = core
+        .vector_collections
+        .entry(index_key.clone())
+        .or_insert_with(|| nodedb_vector::VectorCollection::new(2, Default::default()));
+    let vector_id = coll.insert_with_surrogate(vec![1.0, 2.0], nodedb_types::Surrogate::ZERO);
+
+    // Seed as though the forward `apply_point_put_vector_indexes` insert had
+    // run: it populates `vector_doc_map` alongside the HNSW insert.
+    core.vector_doc_map.insert(vector_doc_key(), vector_id);
+    assert!(core.vector_doc_map.contains_key(&vector_doc_key()));
+
+    let undo = UndoEntry::InsertVector {
+        index_key,
+        vector_id,
+        collection: "c".to_string(),
+        field: "emb".to_string(),
+        doc_id: "d1".to_string(),
+    };
+    core.apply_undo_vector(TID, 0, undo).unwrap();
+
+    assert!(
+        !core.vector_doc_map.contains_key(&vector_doc_key()),
+        "stale vector_doc_map entry must be removed on rolled-back insert"
+    );
+}
+
+/// A rolled-back transactional document DELETE must restore the
+/// `vector_doc_map` entry the forward delete cascade removed — otherwise the
+/// doc→vector reverse lookup is permanently missing and a later delete of the
+/// same document can never find (and soft-delete) its vector: a permanent
+/// orphan. Mirrors `spatial_delete_undo_reinserts_entry_with_bbox`. Also
+/// verifies the restored mapping is immediately usable by a subsequent delete
+/// cascade lookup (the exact key `apply_point_delete` probes).
+#[test]
+fn vector_delete_undo_restores_doc_map_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+    let index_key = vector_index_key();
+    let coll = core
+        .vector_collections
+        .entry(index_key.clone())
+        .or_insert_with(|| nodedb_vector::VectorCollection::new(2, Default::default()));
+    let vector_id = coll.insert_with_surrogate(vec![3.0, 4.0], nodedb_types::Surrogate::ZERO);
+    coll.delete(vector_id);
+
+    // The forward delete cascade already removed the reverse-map entry (as
+    // `apply_point_delete` does) — it must be absent before undo runs.
+    assert!(!core.vector_doc_map.contains_key(&vector_doc_key()));
+
+    let undo = UndoEntry::DeleteVector {
+        index_key,
+        vector_id,
+        collection: "c".to_string(),
+        field: "emb".to_string(),
+        doc_id: "d1".to_string(),
+    };
+    core.apply_undo_vector(TID, 0, undo).unwrap();
+
+    assert_eq!(
+        core.vector_doc_map.get(&vector_doc_key()).copied(),
+        Some(vector_id),
+        "vector_doc_map entry must be restored so a later delete can find the vector again"
+    );
+}
+
 // ── Graph edge-cascade undo ─────────────────────────────────────────────────
 
 /// A rolled-back transactional document DELETE must restore every edge the
