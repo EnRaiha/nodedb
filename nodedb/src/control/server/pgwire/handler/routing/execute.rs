@@ -307,34 +307,19 @@ impl NodeDbPgHandler {
                 continue;
             }
 
-            if self.sessions.transaction_state(addr)
-                == crate::control::server::shared::session::TransactionState::InBlock
-            {
-                let is_write = crate::control::wal_replication::to_replicated_entry(
-                    task.tenant_id,
-                    task.vshard_id,
-                    &task.plan,
-                )
-                .is_some();
-                if is_write {
-                    // Point writes execute at STATEMENT time via the staging
-                    // overlay (real tag + statement-time constraint errors);
-                    // the plan is still buffered so COMMIT stays the sole
-                    // durable apply. Other writes keep buffer + "OK".
-                    if super::super::plan::is_stageable_write(&task.plan) {
-                        let staged = self.stage_in_tx_point_write(task, addr, identity).await?;
-                        responses.push(staged);
-                        continue;
-                    }
-                    self.sessions.buffer_write(addr, task);
-                    responses.push(Response::Execution(Tag::new("OK")));
+            // In-transaction write-routing gate: protocol-neutral decision of
+            // read / buffer-for-COMMIT / stage-now-and-buffer, shared with
+            // every other dispatch loop (native, DSL/UPSERT). Moved to
+            // `execute_dml_hooks.rs` to keep this file under the size limit;
+            // behavior is unchanged.
+            match self.route_task_in_txn(addr, identity, task).await? {
+                super::execute_dml_hooks::TxnRouteOutcome::Proceed(routed_task) => {
+                    task = *routed_task;
+                }
+                super::execute_dml_hooks::TxnRouteOutcome::Handled(resp) => {
+                    responses.push(resp);
                     continue;
                 }
-                // Not a write: an in-transaction read. Stamp the active
-                // transaction id onto the task so the Data Plane can check
-                // this transaction's staging overlay for read-your-own-writes
-                // on point lookups.
-                task.txn_id = self.sessions.tx_id(addr);
             }
 
             let plan_kind = describe_plan(&task.plan);

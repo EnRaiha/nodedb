@@ -11,11 +11,13 @@ use sonic_rs;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::data::executor::response_codec::decode_payload_to_json;
 use nodedb_physical::physical_plan::{
-    ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, MetaOp, QueryOp, SpatialOp, TextOp,
-    TimeseriesOp, VectorOp,
+    ColumnarOp, CrdtOp, DocumentOp, GraphOp, MetaOp, QueryOp, SpatialOp, TextOp, TimeseriesOp,
+    VectorOp,
 };
 
-use super::plan_kv::kv_write_tag;
+use crate::control::server::shared::sql::staging_predicates::{
+    StagedTagKind, extract_affected_count,
+};
 
 use super::super::types::text_field;
 
@@ -188,103 +190,19 @@ pub(super) fn is_calvin_foldable(plan: &PhysicalPlan) -> bool {
     }
 }
 
-/// Allow-list of the plans the in-transaction path stages at statement time:
-/// point writes, predicate `BulkUpdate` / `BulkDelete` (bulk predicate DML,
-/// no RETURNING), and `InsertSelect` (`INSERT ... SELECT`, which has no
-/// RETURNING variant so it is always stageable). Explicit match on the exact
-/// staged variants — KV point writes and any RETURNING variant stay on the
-/// buffer path. Named for the point-write case historically; also covers
-/// bulk predicate DML and `InsertSelect` now that `stage_bulk_update` /
-/// `stage_bulk_delete` / `stage_insert_select` stage the matched rows the
-/// same way.
-pub(super) fn is_point_write(plan: &PhysicalPlan) -> bool {
-    matches!(
-        plan,
-        PhysicalPlan::Document(
-            DocumentOp::PointPut { .. }
-                | DocumentOp::PointInsert { .. }
-                | DocumentOp::PointDelete {
-                    returning: None,
-                    ..
-                }
-                | DocumentOp::PointUpdate {
-                    returning: None,
-                    ..
-                }
-                | DocumentOp::BulkUpdate {
-                    returning: None,
-                    ..
-                }
-                | DocumentOp::BulkDelete {
-                    returning: None,
-                    ..
-                }
-                | DocumentOp::InsertSelect { .. }
-        )
-    )
-}
-
-/// Allow-list of plans the in-transaction path stages at statement time via
-/// `MetaOp::StageWrite`: everything [`is_point_write`] accepts (Document
-/// point writes, predicate `BulkUpdate` / `BulkDelete`, `InsertSelect`),
-/// plus the five stageable KV point writes -- `KvOp::Put`, `KvOp::Insert`,
-/// `KvOp::InsertIfAbsent`, `KvOp::InsertOnConflictUpdate`, `KvOp::Delete`.
-/// KV is the first non-Document engine to stage at statement time; this
-/// predicate is the shared gate later engine units extend the same way.
-/// Every other `KvOp` (Incr, Cas, FieldSet, BatchPut, Expire, Transfer, the
-/// sorted-index family, etc.) stays on the pre-existing buffer + "OK"
-/// deferral, same as any other non-stageable write.
-pub(super) fn is_stageable_write(plan: &PhysicalPlan) -> bool {
-    is_point_write(plan)
-        || matches!(
-            plan,
-            PhysicalPlan::Kv(
-                KvOp::Put { .. }
-                    | KvOp::Insert { .. }
-                    | KvOp::InsertIfAbsent { .. }
-                    | KvOp::InsertOnConflictUpdate { .. }
-                    | KvOp::Delete { .. }
-            )
-        )
-}
-
-/// Synthesise the `CommandComplete` tag for a staged point write or staged
-/// bulk predicate DML, carrying the real affected-row count (1 for an applied
-/// point write, 0 for an `ON CONFLICT DO NOTHING` no-op, or the real matched
-/// count for `BulkUpdate` / `BulkDelete`). `payload` is the stage handler's
-/// raw response payload -- only `KvOp::InsertOnConflictUpdate` consults it
-/// (to pick INSERT vs UPDATE); every other arm ignores it.
-///
-/// Caller invariant: `plan` must have passed [`is_stageable_write`].
-pub(super) fn point_write_tag(plan: &PhysicalPlan, rows: usize, payload: &[u8]) -> Tag {
-    match plan {
-        PhysicalPlan::Document(DocumentOp::PointPut { .. } | DocumentOp::PointInsert { .. }) => {
-            Tag::new("INSERT").with_rows(rows)
-        }
-        PhysicalPlan::Document(
-            DocumentOp::PointUpdate {
-                returning: None, ..
-            }
-            | DocumentOp::BulkUpdate {
-                returning: None, ..
-            },
-        ) => Tag::new("UPDATE").with_rows(rows),
-        PhysicalPlan::Document(
-            DocumentOp::PointDelete {
-                returning: None, ..
-            }
-            | DocumentOp::BulkDelete {
-                returning: None, ..
-            },
-        ) => Tag::new("DELETE").with_rows(rows),
-        PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => {
-            Tag::new("INSERT").with_rows(rows)
-        }
-        PhysicalPlan::Kv(op) => kv_write_tag(op, rows, payload),
-        other => unreachable!(
-            "point_write_tag called on a non-stageable-write plan; \
-             is_stageable_write invariant broken: {other:?}"
-        ),
+/// Render a neutral [`StagedTagKind`] (decided by the protocol-neutral
+/// staging gate) as the pgwire `CommandComplete` tag, preserving the exact
+/// tag strings the pre-refactor `point_write_tag` / `kv_write_tag` produced:
+/// `INSERT 0 n` / `UPDATE n` / `DELETE n`, and for a KV
+/// `InsertOnConflictUpdate` outcome, `UPDATE n` when the stage handler
+/// resolved to an update or `INSERT 0 n` when it resolved to an insert.
+pub(super) fn tag_from_staged(kind: StagedTagKind, affected: usize) -> Tag {
+    match kind {
+        StagedTagKind::Insert => Tag::new("INSERT").with_rows(affected),
+        StagedTagKind::Update => Tag::new("UPDATE").with_rows(affected),
+        StagedTagKind::Delete => Tag::new("DELETE").with_rows(affected),
+        StagedTagKind::KvUpsert { updated: true } => Tag::new("UPDATE").with_rows(affected),
+        StagedTagKind::KvUpsert { updated: false } => Tag::new("INSERT").with_rows(affected),
     }
 }
 
@@ -317,23 +235,6 @@ pub(super) fn calvin_tag_for_plan(plan: &PhysicalPlan) -> Tag {
              is_calvin_foldable invariant broken: {other:?}"
         ),
     }
-}
-
-/// Extract affected row count from a JSON or MessagePack payload.
-///
-/// Looks for `"affected"`, `"truncated"`, `"inserted"`, or `"accepted"` fields.
-pub(super) fn extract_affected_count(payload: &[u8]) -> Option<u64> {
-    if payload.is_empty() {
-        return None;
-    }
-    let v: serde_json::Value = nodedb_types::json_from_msgpack(payload)
-        .ok()
-        .or_else(|| sonic_rs::from_slice(payload).ok())?;
-    v.get("affected")
-        .or_else(|| v.get("truncated"))
-        .or_else(|| v.get("inserted"))
-        .or_else(|| v.get("accepted"))
-        .and_then(|n| n.as_u64())
 }
 
 /// Outcome of shaping a Data Plane payload into a pgwire `Response`.
@@ -407,16 +308,5 @@ pub(super) fn payload_to_response(payload: &[u8], kind: PlanKind) -> ShapedRespo
             let row = encoder.take_row();
             Response::Query(QueryResponse::new(schema, stream::iter(vec![Ok(row)]))).into()
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::extract_affected_count;
-
-    #[test]
-    fn extract_affected_count_reads_msgpack_payload() {
-        let payload = nodedb_types::json_to_msgpack(&serde_json::json!({ "inserted": 3 })).unwrap();
-        assert_eq!(extract_affected_count(&payload), Some(3));
     }
 }

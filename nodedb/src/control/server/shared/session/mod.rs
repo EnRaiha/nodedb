@@ -10,6 +10,7 @@ mod live;
 mod notice;
 mod params;
 pub mod read_consistency;
+pub mod staging_gate;
 mod state;
 mod store;
 pub mod temp_tables;
@@ -24,6 +25,9 @@ pub use self::cross_shard_mode::{CrossShardTxnMode, parse_value as parse_cross_s
 pub use self::params::{
     is_known_pg_runtime_parameter, is_known_settable_runtime_parameter, parse_set_command,
     parse_show_command,
+};
+pub use self::staging_gate::{
+    InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError, route_in_tx_write,
 };
 pub use self::state::{ConnSession, CursorState, TransactionState};
 pub use self::store::SessionStore;

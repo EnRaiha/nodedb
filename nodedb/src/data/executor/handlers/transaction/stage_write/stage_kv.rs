@@ -52,7 +52,7 @@ pub(in crate::data::executor) fn hex_key(key: &[u8]) -> String {
 /// `String`, so the scan-merge caller stays defensive rather than panicking).
 pub(in crate::data::executor) fn unhex_key(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
