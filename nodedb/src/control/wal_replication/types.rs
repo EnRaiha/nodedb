@@ -456,6 +456,34 @@ pub enum ReplicatedWrite {
     KvDropSortedIndex {
         index_name: String,
     },
+    /// HSET-style read-modify-write field merge. Replay re-runs the merge
+    /// deterministically on the follower against its own current value,
+    /// same as `KvInsertOnConflictUpdate` / `PointUpdate`.
+    KvFieldSet {
+        collection: String,
+        key: Vec<u8>,
+        updates: Vec<(String, Vec<u8>)>,
+    },
+    /// Atomic fungible transfer (`source.field -= amount`, `dest.field +=
+    /// amount`). Replay re-runs the read-validate-write deterministically on
+    /// the follower against its own current source/dest values -- no
+    /// precomputed balances are carried, matching the "replay recomputes"
+    /// contract every other RMW `KvOp` variant follows here.
+    KvTransfer {
+        collection: String,
+        source_key: Vec<u8>,
+        dest_key: Vec<u8>,
+        field: String,
+        amount: f64,
+    },
+    /// Atomic non-fungible item transfer (verify + delete + insert). Replay
+    /// re-runs the same verify-then-move on the follower.
+    KvTransferItem {
+        source_collection: String,
+        dest_collection: String,
+        item_key: Vec<u8>,
+        dest_key: Vec<u8>,
+    },
     /// An array CRDT op (Put or Delete) from a Lite peer, to be applied via
     /// the distributed applier on all replicas.
     ///

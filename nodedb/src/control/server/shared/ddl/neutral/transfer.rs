@@ -17,18 +17,20 @@
 //! read-validate-write executes in a single TPC core pass — no TOCTOU race.
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, VShardId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 
 use super::super::result::{DdlError, DdlResult};
-use super::kv_atomic::{parse_function_args, single_text_col};
+use super::kv_atomic::{dispatch_and_respond, parse_function_args};
 
 /// Handle `SELECT TRANSFER(collection, source_key, dest_key, field, amount)`
 pub async fn transfer(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql, "TRANSFER")?;
     if args.len() < 5 {
@@ -54,10 +56,15 @@ pub async fn transfer(
         return Err(ddl_err("42601", "TRANSFER: amount must be positive"));
     }
 
-    let tenant_id = identity.tenant_id;
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
 
-    // Dispatch to Data Plane — entire read+validate+write is atomic (single TPC core).
+    // Dispatch to Data Plane — entire read+validate+write is atomic (single TPC
+    // core). Routed through the protocol-neutral in-transaction staging gate
+    // (`dispatch_and_respond`, shared with `KV_INCR` et al.): outside a
+    // transaction it dispatches immediately, byte-identical to before;
+    // inside a `BEGIN..COMMIT` block `KvOp::Transfer` is staged into the
+    // per-transaction overlay so a same-transaction read observes both
+    // updated balances and COMMIT durably replays the same op.
     let plan = PhysicalPlan::Kv(KvOp::Transfer {
         collection,
         source_key: source_key.into_bytes(),
@@ -66,23 +73,7 @@ pub async fn transfer(
         amount,
     });
 
-    match crate::control::server::dispatch_utils::dispatch_to_data_plane(
-        state,
-        tenant_id,
-        crate::types::DatabaseId::DEFAULT,
-        vshard,
-        plan,
-        TraceId::ZERO,
-    )
-    .await
-    {
-        Ok(resp) => {
-            let payload_text =
-                crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            Ok(vec![single_text_col("transfer", payload_text)])
-        }
-        Err(e) => Err(ddl_err("XX000", e.to_string())),
-    }
+    dispatch_and_respond(state, identity, vshard, plan, "TRANSFER", txn_ctx).await
 }
 
 /// Handle `SELECT TRANSFER_ITEM(source_collection, dest_collection, item_id, source_owner, dest_owner)`
@@ -90,6 +81,7 @@ pub async fn transfer_item(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql, "TRANSFER_ITEM")?;
     if args.len() < 5 {
@@ -120,11 +112,11 @@ pub async fn transfer_item(
         ));
     }
 
-    let tenant_id = identity.tenant_id;
     let item_key = format!("{source_owner}:{item_id}");
     let dest_key = format!("{dest_owner}:{item_id}");
 
-    // Dispatch to Data Plane — verify + delete + insert is atomic.
+    // Dispatch to Data Plane — verify + delete + insert is atomic. Routed
+    // through the same in-transaction staging gate as `TRANSFER` (see above).
     let plan = PhysicalPlan::Kv(KvOp::TransferItem {
         source_collection,
         dest_collection,
@@ -132,23 +124,7 @@ pub async fn transfer_item(
         dest_key: dest_key.into_bytes(),
     });
 
-    match crate::control::server::dispatch_utils::dispatch_to_data_plane(
-        state,
-        tenant_id,
-        crate::types::DatabaseId::DEFAULT,
-        vshard_src,
-        plan,
-        TraceId::ZERO,
-    )
-    .await
-    {
-        Ok(resp) => {
-            let payload_text =
-                crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            Ok(vec![single_text_col("transfer_item", payload_text)])
-        }
-        Err(e) => Err(ddl_err("XX000", e.to_string())),
-    }
+    dispatch_and_respond(state, identity, vshard_src, plan, "TRANSFER_ITEM", txn_ctx).await
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────

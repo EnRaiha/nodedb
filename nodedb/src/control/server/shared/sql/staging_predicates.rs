@@ -61,9 +61,11 @@ pub fn is_point_write(plan: &PhysicalPlan) -> bool {
 /// `BatchPut`) lives outside the value body (`KvEntry.expire_at_ms`) and the
 /// overlay has no slot for it, so an in-transaction TTL reset is applied at
 /// COMMIT (via the unchanged buffered replay) but not reflected in a
-/// same-transaction `GetTtl` read. Every other `KvOp` (FieldSet, Expire,
-/// Transfer, the sorted-index family, etc.) stays on the pre-existing
-/// buffer + "OK" deferral, same as any other non-stageable write.
+/// same-transaction `GetTtl` read. `FieldSet` / `Transfer` / `TransferItem`
+/// are also stageable -- like the atomics they stage only the computed
+/// value bytes (`stage_kv_transfer.rs`). Every other `KvOp` (Expire, the
+/// sorted-index family, etc.) stays on the pre-existing buffer + "OK"
+/// deferral, same as any other non-stageable write.
 pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
     is_point_write(plan)
         || matches!(
@@ -79,6 +81,9 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
                     | KvOp::IncrFloat { .. }
                     | KvOp::Cas { .. }
                     | KvOp::GetSet { .. }
+                    | KvOp::FieldSet { .. }
+                    | KvOp::Transfer { .. }
+                    | KvOp::TransferItem { .. }
             )
         )
         || matches!(plan, PhysicalPlan::Columnar(ColumnarOp::Insert { .. }))
@@ -214,12 +219,12 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
 
 /// Decide the [`StagedTagKind`] for a staged `KvOp` write.
 ///
-/// Caller invariant: `op` must be one of the nine stageable KV writes --
+/// Caller invariant: `op` must be one of the twelve stageable KV writes --
 /// `Put`, `Insert`, `InsertIfAbsent`, `InsertOnConflictUpdate`, `Delete`,
-/// `BatchPut`, `Incr`, `IncrFloat`, `Cas`, `GetSet` -- i.e. the enclosing
-/// plan already passed [`is_stageable_write`]. Every other `KvOp` variant is
-/// unreachable here because the staging dispatch never routes them through
-/// this path.
+/// `BatchPut`, `Incr`, `IncrFloat`, `Cas`, `GetSet`, `FieldSet`, `Transfer`,
+/// `TransferItem` -- i.e. the enclosing plan already passed
+/// [`is_stageable_write`]. Every other `KvOp` variant is unreachable here
+/// because the staging dispatch never routes them through this path.
 fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
     match op {
         KvOp::Put { .. } | KvOp::Insert { .. } | KvOp::InsertIfAbsent { .. } => {
@@ -235,10 +240,18 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
         // `Incr` / `IncrFloat` / `Cas` / `GetSet` return a computed value
         // (`{"value": ..}` / `{"success": .., "current_value": ..}` /
         // `{"old_value": ..}`), not a row count -- forward the payload
-        // verbatim.
-        KvOp::Incr { .. } | KvOp::IncrFloat { .. } | KvOp::Cas { .. } | KvOp::GetSet { .. } => {
-            StagedTagKind::RawPayload
-        }
+        // verbatim. `FieldSet` (`{"fields_added": ..}`), `Transfer`
+        // (`{"source_key": .., "dest_key": .., "source_balance": ..,
+        // "dest_balance": ..}`), and `TransferItem` (`{"item_key": ..,
+        // "dest_key": .., ..}`) are the same shape of "computed result, not
+        // a row count" and forward the same way.
+        KvOp::Incr { .. }
+        | KvOp::IncrFloat { .. }
+        | KvOp::Cas { .. }
+        | KvOp::GetSet { .. }
+        | KvOp::FieldSet { .. }
+        | KvOp::Transfer { .. }
+        | KvOp::TransferItem { .. } => StagedTagKind::RawPayload,
         KvOp::Get { .. }
         | KvOp::Scan { .. }
         | KvOp::Expire { .. }
@@ -247,7 +260,6 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
         | KvOp::RegisterIndex { .. }
         | KvOp::DropIndex { .. }
         | KvOp::FieldGet { .. }
-        | KvOp::FieldSet { .. }
         | KvOp::GetTtl { .. }
         | KvOp::Truncate { .. }
         | KvOp::RegisterSortedIndex { .. }
@@ -257,8 +269,6 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
         | KvOp::SortedIndexRange { .. }
         | KvOp::SortedIndexCount { .. }
         | KvOp::SortedIndexScore { .. }
-        | KvOp::Transfer { .. }
-        | KvOp::TransferItem { .. }
         | KvOp::MaterializeScan { .. } => unreachable!(
             "staged_kv_tag_kind called on a non-stageable KvOp; \
              is_stageable_write invariant broken: {op:?}"

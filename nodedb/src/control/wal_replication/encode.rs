@@ -392,6 +392,39 @@ pub fn to_replicated_entry(
                 index_name: index_name.clone(),
             }
         }
+        PhysicalPlan::Kv(KvOp::FieldSet {
+            collection,
+            key,
+            updates,
+        }) => ReplicatedWrite::KvFieldSet {
+            collection: collection.clone(),
+            key: key.clone(),
+            updates: updates.clone(),
+        },
+        PhysicalPlan::Kv(KvOp::Transfer {
+            collection,
+            source_key,
+            dest_key,
+            field,
+            amount,
+        }) => ReplicatedWrite::KvTransfer {
+            collection: collection.clone(),
+            source_key: source_key.clone(),
+            dest_key: dest_key.clone(),
+            field: field.clone(),
+            amount: *amount,
+        },
+        PhysicalPlan::Kv(KvOp::TransferItem {
+            source_collection,
+            dest_collection,
+            item_key,
+            dest_key,
+        }) => ReplicatedWrite::KvTransferItem {
+            source_collection: source_collection.clone(),
+            dest_collection: dest_collection.clone(),
+            item_key: item_key.clone(),
+            dest_key: dest_key.clone(),
+        },
         PhysicalPlan::Columnar(ColumnarOp::Insert {
             collection,
             payload,

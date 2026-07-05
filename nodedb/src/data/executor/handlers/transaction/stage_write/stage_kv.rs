@@ -19,10 +19,11 @@
 //! `Incr` / `IncrFloat` / `Cas` / `GetSet` / `BatchPut` are also stageable,
 //! but their handlers live in the sibling `stage_kv_atomic.rs` (kept
 //! separate to stay under the file-size limit) -- see that module's doc for
-//! their surrogate-resolution and value-computation reuse. Every other
-//! `KvOp` (FieldSet, Expire, Transfer, the sorted-index family, etc.) is out
-//! of scope: it never reaches this file because `is_stageable_write` only
-//! routes the nine ops above here.
+//! their surrogate-resolution and value-computation reuse. `FieldSet` /
+//! `Transfer` / `TransferItem` are stageable too, in the sibling
+//! `stage_kv_transfer.rs`. Every other `KvOp` (Expire, the sorted-index
+//! family, etc.) is out of scope: it never reaches this file because
+//! `is_stageable_write` only routes the twelve ops above here.
 
 use nodedb_physical::physical_plan::{KvOp, UpdateValue};
 use nodedb_types::Surrogate;
@@ -131,6 +132,9 @@ impl CoreLoop {
             | KvOp::IncrFloat { .. }
             | KvOp::Cas { .. }
             | KvOp::GetSet { .. } => self.execute_stage_kv_atomic(task, tid, txn_id, op),
+            KvOp::FieldSet { .. } | KvOp::Transfer { .. } | KvOp::TransferItem { .. } => {
+                self.execute_stage_kv_transfer(task, tid, txn_id, op)
+            }
             KvOp::Get { .. }
             | KvOp::Scan { .. }
             | KvOp::Expire { .. }
@@ -139,7 +143,6 @@ impl CoreLoop {
             | KvOp::RegisterIndex { .. }
             | KvOp::DropIndex { .. }
             | KvOp::FieldGet { .. }
-            | KvOp::FieldSet { .. }
             | KvOp::GetTtl { .. }
             | KvOp::Truncate { .. }
             | KvOp::RegisterSortedIndex { .. }
@@ -149,8 +152,6 @@ impl CoreLoop {
             | KvOp::SortedIndexRange { .. }
             | KvOp::SortedIndexCount { .. }
             | KvOp::SortedIndexScore { .. }
-            | KvOp::Transfer { .. }
-            | KvOp::TransferItem { .. }
             | KvOp::MaterializeScan { .. } => self.stage_not_point_write(task),
         }
     }

@@ -13,3 +13,6 @@ mod scan;
 mod sorted;
 mod transfer;
 mod ttl;
+
+pub(in crate::data::executor) mod field_compute;
+pub(in crate::data::executor) mod transfer_compute;

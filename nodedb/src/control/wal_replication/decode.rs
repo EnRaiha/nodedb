@@ -686,6 +686,39 @@ fn to_physical_plan(
                 index_name: index_name.clone(),
             })
         }
+        ReplicatedWrite::KvFieldSet {
+            collection,
+            key,
+            updates,
+        } => PhysicalPlan::Kv(KvOp::FieldSet {
+            collection: collection.clone(),
+            key: key.clone(),
+            updates: updates.clone(),
+        }),
+        ReplicatedWrite::KvTransfer {
+            collection,
+            source_key,
+            dest_key,
+            field,
+            amount,
+        } => PhysicalPlan::Kv(KvOp::Transfer {
+            collection: collection.clone(),
+            source_key: source_key.clone(),
+            dest_key: dest_key.clone(),
+            field: field.clone(),
+            amount: *amount,
+        }),
+        ReplicatedWrite::KvTransferItem {
+            source_collection,
+            dest_collection,
+            item_key,
+            dest_key,
+        } => PhysicalPlan::Kv(KvOp::TransferItem {
+            source_collection: source_collection.clone(),
+            dest_collection: dest_collection.clone(),
+            item_key: item_key.clone(),
+            dest_key: dest_key.clone(),
+        }),
         ReplicatedWrite::ColumnarIngest {
             collection,
             payload,

@@ -186,7 +186,12 @@ pub async fn kv_getset(
 /// `BEGIN..COMMIT` returns the same value the staged overlay now holds, and
 /// a following `SELECT KV_INCR(...)` on the same key in the same
 /// transaction chains off it.
-async fn dispatch_and_respond(
+///
+/// `pub(super)` so the sibling `transfer.rs` module reuses the identical
+/// in-transaction routing for `TRANSFER` / `TRANSFER_ITEM` instead of the
+/// direct `dispatch_to_data_plane` call it used before those two `KvOp`s
+/// became stageable.
+pub(super) async fn dispatch_and_respond(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     vshard: VShardId,

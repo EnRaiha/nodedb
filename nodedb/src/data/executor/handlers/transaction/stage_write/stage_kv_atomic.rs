@@ -121,7 +121,11 @@ impl CoreLoop {
 
     /// Build the [`StageCtx`] for a KV atomic op, resolving a stable
     /// collection-local overlay surrogate slot (see module doc).
-    fn kv_atomic_stage_ctx<'a>(
+    ///
+    /// `pub(super)` so the sibling `stage_kv_transfer.rs` module reuses the
+    /// exact same surrogate-resolution logic for `FieldSet` / `Transfer` /
+    /// `TransferItem`, which carry no surrogate on their plan either.
+    pub(super) fn kv_atomic_stage_ctx<'a>(
         &self,
         task: &'a ExecutionTask,
         tid: u64,

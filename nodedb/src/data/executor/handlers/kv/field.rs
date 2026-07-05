@@ -79,54 +79,13 @@ impl CoreLoop {
         // Read current value.
         let current = self.kv_engine.get(did, tid, collection, key, now_ms);
 
-        // Decode current value as standard msgpack map.
-        let mut doc: serde_json::Map<String, serde_json::Value> = current
-            .as_ref()
-            .and_then(|v| nodedb_types::json_from_msgpack(v).ok())
-            .and_then(|v| {
-                if let serde_json::Value::Object(m) = v {
-                    Some(m)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
-        // Merge field updates, tracking how many fields are new (not previously existing).
-        let mut fields_added = 0u64;
-        for (field, value_bytes) in updates {
-            let new_value = if value_bytes.is_empty() {
-                serde_json::Value::Null
-            } else {
-                match nodedb_types::json_from_msgpack(value_bytes) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: format!("field set '{field}': msgpack decode: {e}"),
-                            },
-                        );
-                    }
-                }
-            };
-            if !doc.contains_key(field) {
-                fields_added += 1;
-            }
-            doc.insert(field.clone(), new_value);
-        }
-
-        // Serialize back as standard msgpack (not zerompk tagged).
-        let new_value = match nodedb_types::json_to_msgpack(&serde_json::Value::Object(doc)) {
-            Ok(v) => v,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("field set serialization: {e}"),
-                    },
-                );
-            }
+        // Merge field updates via the pure computation shared with the
+        // in-transaction staging handler (`stage_kv_transfer.rs`), so a
+        // staged value and its COMMIT-time durable replay never diverge.
+        let computed = match super::field_compute::merge_field_updates(current.as_deref(), updates)
+        {
+            Ok(c) => c,
+            Err(e) => return self.response_error(task, e),
         };
 
         self.kv_engine.put(
@@ -134,12 +93,14 @@ impl CoreLoop {
             tid,
             collection,
             key,
-            &new_value,
+            &computed.new_value,
             0,
             now_ms,
             nodedb_types::Surrogate::ZERO,
         );
-        match response_codec::encode_json(&serde_json::json!({ "fields_added": fields_added })) {
+        match response_codec::encode_json(
+            &serde_json::json!({ "fields_added": computed.fields_added }),
+        ) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,

@@ -75,10 +75,10 @@ pub(super) async fn try_string(
 
     // Atomic transfer functions.
     if upper.starts_with("SELECT TRANSFER(") || upper.starts_with("SELECT TRANSFER (") {
-        return Some(transfer::transfer(state, identity, sql).await);
+        return Some(transfer::transfer(state, identity, sql, txn_ctx).await);
     }
     if upper.starts_with("SELECT TRANSFER_ITEM(") || upper.starts_with("SELECT TRANSFER_ITEM (") {
-        return Some(transfer::transfer_item(state, identity, sql).await);
+        return Some(transfer::transfer_item(state, identity, sql, txn_ctx).await);
     }
 
     // Sorted index DDL.

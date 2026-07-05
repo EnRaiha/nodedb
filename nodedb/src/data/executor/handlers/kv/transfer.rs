@@ -8,6 +8,7 @@
 
 use tracing::debug;
 
+use super::transfer_compute::{TransferError, compute_transfer};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
@@ -59,58 +60,41 @@ impl CoreLoop {
             return self.response_error(task, ErrorCode::NotFound);
         };
 
-        // Step 2: Extract and validate source balance.
-        let source_balance = match extract_numeric_field(&source_bytes, field) {
-            Some(v) => v,
-            None => {
+        // Step 2 + 3: validate + compute new values via the pure computation
+        // shared with the in-transaction staging handler
+        // (`stage_kv_transfer.rs`), so a staged pair of writes and their
+        // COMMIT-time durable replay never diverge.
+        let dest_bytes = dest_val.unwrap_or_default();
+        let dest_ref = if dest_bytes.is_empty() {
+            None
+        } else {
+            Some(dest_bytes.as_slice())
+        };
+        let computed = match compute_transfer(&source_bytes, dest_ref, field, amount) {
+            Ok(c) => c,
+            Err(TransferError::TypeMismatch(detail)) => {
                 return self.response_error(
                     task,
                     ErrorCode::TypeMismatch {
                         collection: collection.to_string(),
-                        detail: format!("field '{field}' is not numeric or missing"),
+                        detail,
+                    },
+                );
+            }
+            Err(TransferError::InsufficientBalance { have, need }) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::InsufficientBalance {
+                        collection: collection.to_string(),
+                        detail: format!("source has {have}, need {need}"),
                     },
                 );
             }
         };
-
-        if source_balance < amount {
-            return self.response_error(
-                task,
-                ErrorCode::InsufficientBalance {
-                    collection: collection.to_string(),
-                    detail: format!("source has {source_balance}, need {amount}"),
-                },
-            );
-        }
-
-        let dest_bytes = dest_val.unwrap_or_default();
-        let dest_balance = extract_numeric_field(&dest_bytes, field).unwrap_or(0.0);
-
-        // Step 3: Compute new values.
-        let new_source = match update_numeric_field(&source_bytes, field, source_balance - amount) {
-            Ok(v) => v,
-            Err(e) => return self.response_error(task, e),
-        };
-        let new_dest = if dest_bytes.is_empty() {
-            // Dest key doesn't exist — create with just the field.
-            let doc = serde_json::json!({ field: dest_balance + amount });
-            match nodedb_types::json_to_msgpack(&doc) {
-                Ok(v) => v,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("serialize destination: {e}"),
-                        },
-                    );
-                }
-            }
-        } else {
-            match update_numeric_field(&dest_bytes, field, dest_balance + amount) {
-                Ok(v) => v,
-                Err(e) => return self.response_error(task, e),
-            }
-        };
+        let new_source = computed.new_source;
+        let new_dest = computed.new_dest;
+        let source_balance_after = computed.source_balance_after;
+        let dest_balance_after = computed.dest_balance_after;
 
         // Step 4: Write both atomically (deterministic order for consistency).
         // Write lower key first to match the documented lock ordering.
@@ -192,8 +176,8 @@ impl CoreLoop {
             "dest_key": dst_str,
             "field": field,
             "amount": amount,
-            "source_balance": source_balance - amount,
-            "dest_balance": dest_balance + amount,
+            "source_balance": source_balance_after,
+            "dest_balance": dest_balance_after,
         })) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
@@ -287,30 +271,4 @@ impl CoreLoop {
             ),
         }
     }
-}
-
-/// Extract a numeric field from a MessagePack-encoded KV value.
-fn extract_numeric_field(value: &[u8], field: &str) -> Option<f64> {
-    let doc: serde_json::Value = nodedb_types::json_from_msgpack(value).ok()?;
-    let v = doc.get(field)?;
-    v.as_f64().or_else(|| v.as_i64().map(|i| i as f64))
-}
-
-/// Update a numeric field in a MessagePack-encoded KV value, preserving other fields.
-fn update_numeric_field(value: &[u8], field: &str, new_value: f64) -> Result<Vec<u8>, ErrorCode> {
-    let mut doc: serde_json::Value =
-        nodedb_types::json_from_msgpack(value).map_err(|e| ErrorCode::Internal {
-            detail: format!("deserialize value: {e}"),
-        })?;
-    if let Some(obj) = doc.as_object_mut() {
-        if new_value.fract() == 0.0 && new_value >= i64::MIN as f64 && new_value <= i64::MAX as f64
-        {
-            obj.insert(field.to_string(), serde_json::json!(new_value as i64));
-        } else {
-            obj.insert(field.to_string(), serde_json::json!(new_value));
-        }
-    }
-    nodedb_types::json_to_msgpack(&doc).map_err(|e| ErrorCode::Internal {
-        detail: format!("serialize value: {e}"),
-    })
 }
