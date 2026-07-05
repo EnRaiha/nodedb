@@ -13,6 +13,19 @@ use super::value::{
 };
 use crate::engine::sparse::btree::{SparseEngine, redb_err};
 
+/// One row of an audit-log (`AS OF SYSTEM TIME NULL`) scan: a single
+/// system-time version of a document plus the temporal coordinates read from
+/// the row's real stored envelope. `valid_from_ms` / `valid_until_ms` carry the
+/// raw envelope sentinels (`i64::MIN` / `i64::MAX` when unbounded) so the
+/// handler can surface them uniformly across engines.
+pub struct VersionedRow {
+    pub doc_id: String,
+    pub system_from_ms: i64,
+    pub valid_from_ms: i64,
+    pub valid_until_ms: i64,
+    pub body: Vec<u8>,
+}
+
 /// Versioned document table. Distinct from `super::super::btree::DOCUMENTS`
 /// so bitemporal and current-only collections coexist. Keys carry the leading
 /// `{database_id}:` component.
@@ -364,8 +377,9 @@ impl SparseEngine {
     /// [`Self::versioned_scan_as_of`] this does **not** collapse to the
     /// newest-per-id — it yields the full history (`AS OF SYSTEM TIME NULL`).
     ///
-    /// Returns `(doc_id, sys_from_ms, body)` tuples. The handler projects
-    /// `sys_from_ms` into the output as the system-time column.
+    /// Returns [`VersionedRow`] values carrying `doc_id`, `system_from_ms`, the
+    /// row's stored valid-time interval, and `body`. The handler projects these
+    /// into the output as the synthetic temporal columns.
     ///
     /// `predicate` is evaluated against each version's document body **before**
     /// the `limit` truncation, so a selective filter never causes the scan to
@@ -380,7 +394,7 @@ impl SparseEngine {
         valid_at_ms: Option<i64>,
         limit: usize,
         predicate: &dyn Fn(&[u8]) -> bool,
-    ) -> crate::Result<Vec<(String, i64, Vec<u8>)>> {
+    ) -> crate::Result<Vec<VersionedRow>> {
         let lo = coll_prefix(database_id, tenant, coll);
         let hi = coll_prefix_end(database_id, tenant, coll);
         let txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
@@ -391,7 +405,7 @@ impl SparseEngine {
             .range(lo.as_str()..hi.as_str())
             .map_err(|e| redb_err("range", e))?;
 
-        let mut all: Vec<(String, i64, Vec<u8>)> = Vec::new();
+        let mut all: Vec<VersionedRow> = Vec::new();
         for r in range {
             let (k, v) = r.map_err(|e| redb_err("entry", e))?;
             let key_str = k.value();
@@ -419,10 +433,20 @@ impl SparseEngine {
             if !predicate(decoded.body) {
                 continue;
             }
-            all.push((doc_id.to_string(), sf, decoded.body.to_vec()));
+            all.push(VersionedRow {
+                doc_id: doc_id.to_string(),
+                system_from_ms: sf,
+                valid_from_ms: decoded.valid_from_ms,
+                valid_until_ms: decoded.valid_until_ms,
+                body: decoded.body.to_vec(),
+            });
         }
         // Global ascending order by system time; deterministic on ties.
-        all.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        all.sort_by(|a, b| {
+            a.system_from_ms
+                .cmp(&b.system_from_ms)
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        });
         all.truncate(limit);
         Ok(all)
     }

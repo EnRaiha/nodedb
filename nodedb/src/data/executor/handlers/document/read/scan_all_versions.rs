@@ -2,8 +2,10 @@
 
 //! `AS OF SYSTEM TIME NULL` (audit-log) scan handler. Emits every
 //! system-time version of every matching document, ordered ascending by
-//! system time, with the system-time column (`_ts_system`) projected into
-//! each output row.
+//! system time, with the three synthetic user-facing temporal columns
+//! (`_ts_system`, `_ts_valid_from`, `_ts_valid_until`) projected into each
+//! output row from the version's real stored temporal coordinates. Uniform
+//! across both Document engines and columnar/timeseries.
 
 use tracing::debug;
 
@@ -12,10 +14,11 @@ use super::scan_params::VersionedScanParams;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::strict_format;
 use crate::data::executor::task::ExecutionTask;
-
-/// Output column name carrying the system-time of each version.
-const SYSTEM_TIME_COLUMN: &str = "_ts_system";
+use nodedb_types::columnar::schema::{
+    BITEMPORAL_RESERVED_COLUMNS, StrictSchema, TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL,
+};
 
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_document_scan_all_versions(
@@ -46,6 +49,21 @@ impl CoreLoop {
             Ok(g) => g,
             Err(resp) => return resp,
         };
+
+        // Strict collections store the row body as a Binary Tuple, not
+        // msgpack; resolve the schema so it can be decoded before any
+        // msgpack-shaped operation (projection, system-time injection) runs
+        // on it. Mirrors the lookup in `scan.rs`'s current-version scan.
+        let config_key = (crate::types::TenantId::new(tid), collection.to_string());
+        let strict_schema: Option<StrictSchema> = self.doc_configs.get(&config_key).and_then(|c| {
+            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
+                c.storage_mode
+            {
+                Some(schema.clone())
+            } else {
+                None
+            }
+        });
 
         let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
             Vec::new()
@@ -106,34 +124,104 @@ impl CoreLoop {
         let sliced = rows.into_iter().skip(offset).take(limit);
 
         let mut out: Vec<(String, Vec<u8>)> = Vec::new();
-        for (doc_id, sys_from_ms, body) in sliced {
-            let projected = if projection.is_empty() {
-                body
-            } else {
-                apply_projection_msgpack(&body, &[], projection)
+        for row in sliced {
+            let msgpack_body = match &strict_schema {
+                Some(schema) => match strict_audit_body(&row.body, schema) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("decode strict audit-log body: {e}"),
+                            },
+                        );
+                    }
+                },
+                None => row.body,
             };
-            let with_ts = match inject_system_time(&projected, sys_from_ms) {
+            let projected = if projection.is_empty() {
+                msgpack_body
+            } else {
+                apply_projection_msgpack(&msgpack_body, &[], projection)
+            };
+            let with_ts = match inject_temporal_columns(
+                &projected,
+                row.system_from_ms,
+                row.valid_from_ms,
+                row.valid_until_ms,
+            ) {
                 Ok(b) => b,
                 Err(e) => {
                     return self.response_error(
                         task,
                         ErrorCode::Internal {
-                            detail: format!("inject _ts_system: {e}"),
+                            detail: format!("inject temporal columns: {e}"),
                         },
                     );
                 }
             };
-            out.push((doc_id, with_ts));
+            out.push((row.doc_id, with_ts));
         }
 
         self.send_document_rows_raw(task, &out, 1024)
     }
 }
 
-/// Decode the MessagePack document body, insert/overwrite the `_ts_system`
-/// field with `sys_from_ms`, and re-encode. Non-object bodies are wrapped in
-/// a fresh object carrying only the system-time column.
-fn inject_system_time(body: &[u8], sys_from_ms: i64) -> crate::Result<Vec<u8>> {
+/// Decode a strict row's Binary Tuple `body` into MessagePack via the
+/// collection's schema, then strip the reserved bitemporal bookkeeping
+/// columns (`__system_from_ms`, `__valid_from_ms`, `__valid_until_ms`) so the
+/// audit-log output shape stays identical to the schemaless path: user
+/// columns plus the synthetic temporal triple (injected by the caller via
+/// `inject_temporal_columns`). The reserved strict-tuple slots are stripped
+/// here; the authoritative valid-time is taken from the row's stored envelope
+/// (carried on `VersionedRow`), not from these slots, so both Document engines
+/// surface identical temporal columns.
+fn strict_audit_body(body: &[u8], schema: &StrictSchema) -> crate::Result<Vec<u8>> {
+    use nodedb_types::Value;
+
+    let msgpack = strict_format::binary_tuple_to_msgpack(body, schema).ok_or_else(|| {
+        crate::Error::Serialization {
+            format: "binary-tuple".into(),
+            detail: "decode strict document body for audit-log scan".into(),
+        }
+    })?;
+    let value =
+        nodedb_types::value_from_msgpack(&msgpack).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("decode strict document body for audit-log scan: {e}"),
+        })?;
+    let mut obj = match value {
+        Value::Object(map) => map,
+        other => {
+            return Err(crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("strict audit-log body decoded to non-object value: {other:?}"),
+            });
+        }
+    };
+    for reserved in BITEMPORAL_RESERVED_COLUMNS {
+        obj.remove(reserved);
+    }
+    nodedb_types::value_to_msgpack(&Value::Object(obj)).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("re-encode stripped strict audit-log body: {e}"),
+    })
+}
+
+/// Decode the MessagePack document body, insert/overwrite the three synthetic
+/// user-facing audit temporal columns (`_ts_system`, `_ts_valid_from`,
+/// `_ts_valid_until`) from the version's real stored temporal coordinates, and
+/// re-encode. Valid-time is surfaced raw — `i64::MIN` / `i64::MAX` sentinels
+/// mean "unbounded" (matching how columnar/timeseries emit their real Int64
+/// temporal columns). Non-object bodies are wrapped in a fresh object carrying
+/// only the temporal columns. The triple is uniform across both Document
+/// engines and columnar/timeseries.
+fn inject_temporal_columns(
+    body: &[u8],
+    system_from_ms: i64,
+    valid_from_ms: i64,
+    valid_until_ms: i64,
+) -> crate::Result<Vec<u8>> {
     use nodedb_types::Value;
     let value =
         nodedb_types::value_from_msgpack(body).map_err(|e| crate::Error::Serialization {
@@ -144,10 +232,12 @@ fn inject_system_time(body: &[u8], sys_from_ms: i64) -> crate::Result<Vec<u8>> {
         Value::Object(map) => map,
         _ => std::collections::HashMap::new(),
     };
-    obj.insert(SYSTEM_TIME_COLUMN.to_string(), Value::Integer(sys_from_ms));
+    obj.insert(TS_SYSTEM.to_string(), Value::Integer(system_from_ms));
+    obj.insert(TS_VALID_FROM.to_string(), Value::Integer(valid_from_ms));
+    obj.insert(TS_VALID_UNTIL.to_string(), Value::Integer(valid_until_ms));
     nodedb_types::value_to_msgpack(&Value::Object(obj)).map_err(|e| crate::Error::Serialization {
         format: "msgpack".into(),
-        detail: format!("re-encode document body with {SYSTEM_TIME_COLUMN}: {e}"),
+        detail: format!("re-encode document body with audit temporal columns: {e}"),
     })
 }
 
@@ -172,45 +262,59 @@ mod tests {
     }
 
     #[test]
-    fn inject_adds_system_time_and_preserves_body_fields() {
+    fn inject_adds_temporal_columns_and_preserves_body_fields() {
         let body = obj(&[
             ("v", Value::Integer(1)),
             ("name", Value::String("alice".into())),
         ]);
-        let out = inject_system_time(&body, 1_700_000_000_123).unwrap();
+        let out = inject_temporal_columns(&body, 1_700_000_000_123, 10, 20).unwrap();
         let m = decode(&out);
         assert_eq!(m.get("v"), Some(&Value::Integer(1)));
         assert_eq!(m.get("name"), Some(&Value::String("alice".into())));
-        assert_eq!(
-            m.get(SYSTEM_TIME_COLUMN),
-            Some(&Value::Integer(1_700_000_000_123))
-        );
+        assert_eq!(m.get(TS_SYSTEM), Some(&Value::Integer(1_700_000_000_123)));
+        assert_eq!(m.get(TS_VALID_FROM), Some(&Value::Integer(10)));
+        assert_eq!(m.get(TS_VALID_UNTIL), Some(&Value::Integer(20)));
     }
 
     #[test]
-    fn inject_overwrites_any_preexisting_system_time_column() {
-        // A document that happens to carry a `_ts_system` field of its own must
-        // not shadow the version's true system time in the audit-log output.
+    fn inject_overwrites_any_preexisting_temporal_columns() {
+        // A document that happens to carry temporal fields of its own must not
+        // shadow the version's true temporal coordinates in the audit output.
         let body = obj(&[
-            (SYSTEM_TIME_COLUMN, Value::Integer(-1)),
+            (TS_SYSTEM, Value::Integer(-1)),
+            (TS_VALID_FROM, Value::Integer(-2)),
+            (TS_VALID_UNTIL, Value::Integer(-3)),
             ("v", Value::Integer(2)),
         ]);
-        let out = inject_system_time(&body, 999).unwrap();
+        let out = inject_temporal_columns(&body, 999, 111, 222).unwrap();
         let m = decode(&out);
-        assert_eq!(m.get(SYSTEM_TIME_COLUMN), Some(&Value::Integer(999)));
+        assert_eq!(m.get(TS_SYSTEM), Some(&Value::Integer(999)));
+        assert_eq!(m.get(TS_VALID_FROM), Some(&Value::Integer(111)));
+        assert_eq!(m.get(TS_VALID_UNTIL), Some(&Value::Integer(222)));
         assert_eq!(m.get("v"), Some(&Value::Integer(2)));
+    }
+
+    #[test]
+    fn inject_surfaces_unbounded_valid_time_sentinels() {
+        let body = obj(&[("v", Value::Integer(1))]);
+        let out = inject_temporal_columns(&body, 5, i64::MIN, i64::MAX).unwrap();
+        let m = decode(&out);
+        assert_eq!(m.get(TS_VALID_FROM), Some(&Value::Integer(i64::MIN)));
+        assert_eq!(m.get(TS_VALID_UNTIL), Some(&Value::Integer(i64::MAX)));
     }
 
     #[test]
     fn inject_wraps_non_object_body_in_fresh_object() {
         let body = nodedb_types::value_to_msgpack(&Value::Integer(42)).unwrap();
-        let out = inject_system_time(&body, 7).unwrap();
+        let out = inject_temporal_columns(&body, 7, 8, 9).unwrap();
         let m = decode(&out);
-        assert_eq!(m.get(SYSTEM_TIME_COLUMN), Some(&Value::Integer(7)));
+        assert_eq!(m.get(TS_SYSTEM), Some(&Value::Integer(7)));
+        assert_eq!(m.get(TS_VALID_FROM), Some(&Value::Integer(8)));
+        assert_eq!(m.get(TS_VALID_UNTIL), Some(&Value::Integer(9)));
         assert_eq!(
             m.len(),
-            1,
-            "non-object body yields a fresh object carrying only the system-time column"
+            3,
+            "non-object body yields a fresh object carrying only the temporal columns"
         );
     }
 }

@@ -207,13 +207,15 @@ fn scan_all_returns_every_version_in_system_time_order() {
     // Every version is present (no newest-per-id collapse).
     assert_eq!(all.len(), 4);
     // Ascending by system time globally.
-    let times: Vec<i64> = all.iter().map(|(_, sf, _)| *sf).collect();
+    let times: Vec<i64> = all.iter().map(|r| r.system_from_ms).collect();
     assert_eq!(times, vec![100, 150, 200, 300]);
     // System-time and body line up per version.
-    assert_eq!(all[0], ("a".to_string(), 100, b"a1".to_vec()));
-    assert_eq!(all[1], ("b".to_string(), 150, b"b1".to_vec()));
-    assert_eq!(all[2], ("a".to_string(), 200, b"a2".to_vec()));
-    assert_eq!(all[3], ("a".to_string(), 300, b"a3".to_vec()));
+    let row_of =
+        |r: &super::doc::VersionedRow| (r.doc_id.clone(), r.system_from_ms, r.body.clone());
+    assert_eq!(row_of(&all[0]), ("a".to_string(), 100, b"a1".to_vec()));
+    assert_eq!(row_of(&all[1]), ("b".to_string(), 150, b"b1".to_vec()));
+    assert_eq!(row_of(&all[2]), ("a".to_string(), 200, b"a2".to_vec()));
+    assert_eq!(row_of(&all[3]), ("a".to_string(), 300, b"a3".to_vec()));
 }
 
 #[test]
@@ -226,7 +228,7 @@ fn scan_all_skips_tombstoned_versions() {
         .versioned_scan_all(1, 1, "c", None, 100, &|_: &[u8]| true)
         .unwrap();
     // The tombstone version is excluded; the two live versions remain.
-    let times: Vec<i64> = all.iter().map(|(_, sf, _)| *sf).collect();
+    let times: Vec<i64> = all.iter().map(|r| r.system_from_ms).collect();
     assert_eq!(times, vec![100, 300]);
 }
 
@@ -249,7 +251,7 @@ fn scan_all_pushes_predicate_down_so_limit_counts_matches() {
         3,
         "limit must count matching versions, not scanned rows"
     );
-    let bodies: Vec<Vec<u8>> = rows.into_iter().map(|(_, _, b)| b).collect();
+    let bodies: Vec<Vec<u8>> = rows.into_iter().map(|r| r.body).collect();
     // Oldest three matches in ascending system-time order.
     assert_eq!(bodies, vec![b"v1".to_vec(), b"v3".to_vec(), b"v5".to_vec()]);
 }

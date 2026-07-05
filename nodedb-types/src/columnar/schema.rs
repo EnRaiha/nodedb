@@ -112,6 +112,17 @@ pub const BITEMPORAL_RESERVED_COLUMNS: [&str; 3] = [
     BITEMPORAL_VALID_UNTIL,
 ];
 
+/// Canonical user-facing audit temporal column names, uniform across every
+/// engine. An `AS OF SYSTEM TIME NULL` (all-versions / audit-log) scan surfaces
+/// each row's real stored temporal data under these three synthetic columns —
+/// `_ts_system` (system-time of the version), `_ts_valid_from` /
+/// `_ts_valid_until` (the row's valid-time interval, raw i64 sentinels
+/// `i64::MIN` / `i64::MAX` when unbounded). Columnar/timeseries and both
+/// Document engines emit the identical triple.
+pub const TS_SYSTEM: &str = "_ts_system";
+pub const TS_VALID_FROM: &str = "_ts_valid_from";
+pub const TS_VALID_UNTIL: &str = "_ts_valid_until";
+
 /// Single source of truth for "is this a reserved internal strict-tuple
 /// bitemporal column that must be hidden from user-facing projections
 /// (`SELECT *`, JSON/msgpack decode boundaries, etc.)". Covers the

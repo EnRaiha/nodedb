@@ -18,6 +18,7 @@ pub mod value;
 #[cfg(test)]
 mod tests;
 
+pub use doc::VersionedRow;
 pub use key::{
     coll_prefix, coll_prefix_end, doc_prefix, doc_prefix_end, format_sys_from, parse_doc_id,
     parse_sys_from, versioned_doc_key,
