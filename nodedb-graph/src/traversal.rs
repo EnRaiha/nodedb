@@ -17,6 +17,7 @@ pub use nodedb_types::config::tuning::DEFAULT_MAX_VISITED;
 use crate::bfs_params::BfsParams;
 use crate::csr::{CsrIndex, Direction};
 use crate::overlay_delta::GraphOverlayDelta;
+use crate::path_params::ShortestPathParams;
 
 impl CsrIndex {
     /// BFS traversal. Returns all reachable node IDs within max_depth hops.
@@ -197,15 +198,34 @@ impl CsrIndex {
     ///
     /// `frontier_bitmap`: when `Some`, only nodes whose surrogate is present in the
     /// bitmap are eligible for expansion. Start and end nodes are not gated.
+    ///
+    /// `overlay`: when `Some` and non-empty, the search observes the
+    /// transaction's staged edge writes/deletes (read-your-own-writes),
+    /// including a path that must pass through a node reachable only via a
+    /// staged edge. When `None` or empty, the durable-only dense bidirectional
+    /// fast path runs unchanged.
     pub fn shortest_path(
         &self,
-        src: &str,
-        dst: &str,
-        label_filter: Option<&str>,
-        max_depth: usize,
-        max_visited: usize,
-        frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+        params: ShortestPathParams<'_>,
+        overlay: Option<&GraphOverlayDelta>,
     ) -> Option<Vec<String>> {
+        match overlay {
+            Some(ov) if !ov.is_empty() => self.shortest_path_overlay(params, ov),
+            _ => self.shortest_path_dense(params),
+        }
+    }
+
+    /// Durable-only bidirectional BFS over the dense u32 CSR ids. Behavior and
+    /// performance are identical to the pre-overlay shortest path.
+    fn shortest_path_dense(&self, params: ShortestPathParams<'_>) -> Option<Vec<String>> {
+        let ShortestPathParams {
+            src,
+            dst,
+            label_filter,
+            max_depth,
+            max_visited,
+            frontier_bitmap,
+        } = params;
         let src_id = *self.node_to_id.get(src)?;
         let dst_id = *self.node_to_id.get(dst)?;
         if src_id == dst_id {
@@ -495,11 +515,28 @@ mod tests {
         assert_eq!(map["d"], 3);
     }
 
+    fn path_params<'a>(
+        src: &'a str,
+        dst: &'a str,
+        label_filter: Option<&'a str>,
+        max_depth: usize,
+        frontier_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
+    ) -> ShortestPathParams<'a> {
+        ShortestPathParams {
+            src,
+            dst,
+            label_filter,
+            max_depth,
+            max_visited: DEFAULT_MAX_VISITED,
+            frontier_bitmap,
+        }
+    }
+
     #[test]
     fn shortest_path_direct() {
         let csr = make_csr();
         let path = csr
-            .shortest_path("a", "c", Some("KNOWS"), 5, DEFAULT_MAX_VISITED, None)
+            .shortest_path(path_params("a", "c", Some("KNOWS"), 5, None), None)
             .unwrap();
         assert_eq!(path, vec!["a", "b", "c"]);
     }
@@ -508,7 +545,7 @@ mod tests {
     fn shortest_path_same_node() {
         let csr = make_csr();
         let path = csr
-            .shortest_path("a", "a", None, 5, DEFAULT_MAX_VISITED, None)
+            .shortest_path(path_params("a", "a", None, 5, None), None)
             .unwrap();
         assert_eq!(path, vec!["a"]);
     }
@@ -516,14 +553,14 @@ mod tests {
     #[test]
     fn shortest_path_unreachable() {
         let csr = make_csr();
-        let path = csr.shortest_path("d", "a", Some("KNOWS"), 5, DEFAULT_MAX_VISITED, None);
+        let path = csr.shortest_path(path_params("d", "a", Some("KNOWS"), 5, None), None);
         assert!(path.is_none());
     }
 
     #[test]
     fn shortest_path_depth_limit() {
         let csr = make_csr();
-        let path = csr.shortest_path("a", "d", Some("KNOWS"), 1, DEFAULT_MAX_VISITED, None);
+        let path = csr.shortest_path(path_params("a", "d", Some("KNOWS"), 1, None), None);
         assert!(path.is_none());
     }
 
@@ -560,7 +597,7 @@ mod tests {
         assert_eq!(result.len(), 101);
 
         let path = csr
-            .shortest_path("n0", "n50", Some("NEXT"), 100, DEFAULT_MAX_VISITED, None)
+            .shortest_path(path_params("n0", "n50", Some("NEXT"), 100, None), None)
             .unwrap();
         assert_eq!(path.len(), 51);
     }
@@ -613,7 +650,7 @@ mod tests {
         let mut bm = SurrogateBitmap::new();
         bm.insert(Surrogate::new(20)); // only "c" is in the bitmap
 
-        let path = csr.shortest_path("a", "c", Some("KNOWS"), 5, DEFAULT_MAX_VISITED, Some(&bm));
+        let path = csr.shortest_path(path_params("a", "c", Some("KNOWS"), 5, Some(&bm)), None);
         // "b" (surrogate 10) is not in the bitmap so expansion through it is
         // blocked, making the path from "a" to "c" unreachable.
         assert!(path.is_none());

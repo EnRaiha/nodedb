@@ -11,6 +11,7 @@ pub mod rebuild;
 
 // Re-export all shared crate types.
 pub use nodedb_graph::GraphOverlayDelta;
+pub use nodedb_graph::ShortestPathParams;
 pub use nodedb_graph::csr::index::{CsrIndex, Direction};
 pub use nodedb_graph::csr::memory;
 pub use nodedb_graph::csr::slice_accessors;

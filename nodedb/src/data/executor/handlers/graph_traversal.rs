@@ -25,14 +25,31 @@ impl CoreLoop {
             max_depth.min(crate::engine::graph::traversal_options::MAX_GRAPH_TRAVERSAL_DEPTH);
         debug!(core = self.core_id, tid, %src, %dst, ?edge_label, max_depth, "graph path");
         let database_id = task.request.database_id.as_u64();
+        // Read-your-own-writes: fold this transaction's staged edges/tombstones
+        // into the bidirectional search, including a path that must pass
+        // through a node reachable only via a staged edge.
+        let delta = task
+            .request
+            .txn_id
+            .and_then(|txn_id| self.graph_txn_overlays.get(&txn_id))
+            .map(|ov| {
+                super::graph_txn_merge::build_graph_overlay_delta(
+                    ov,
+                    task.request.database_id,
+                    crate::types::TenantId::new(tid),
+                )
+            });
         let path = match self.csr_partition(database_id, tid) {
             Some(partition) => partition.shortest_path(
-                src,
-                dst,
-                edge_label.as_deref(),
-                max_depth,
-                self.graph_tuning.max_visited,
-                frontier_bitmap,
+                crate::engine::graph::csr::ShortestPathParams {
+                    src,
+                    dst,
+                    label_filter: edge_label.as_deref(),
+                    max_depth,
+                    max_visited: self.graph_tuning.max_visited,
+                    frontier_bitmap,
+                },
+                delta.as_ref(),
             ),
             None => None,
         };
