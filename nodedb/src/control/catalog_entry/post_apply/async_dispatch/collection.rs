@@ -37,7 +37,13 @@ pub async fn put_async(stored: StoredCollection, shared: Arc<SharedState>) {
 /// 3. Dispatch `MetaOp::UnregisterCollection` into the Data Plane to
 ///    reclaim engine-local storage.
 pub async fn purge_async(tenant_id: u64, name: String, purge_lsn: u64, shared: Arc<SharedState>) {
-    reclaim_collection_storage(&shared, tenant_id, &name, purge_lsn).await;
+    // The Result is already durably captured inside
+    // `reclaim_collection_storage` (failure → `_system.pending_reclaim`
+    // for at-least-once retry). This raft post-apply path runs on every
+    // node and must not itself fail the apply, so it consumes the Result
+    // here. There is deliberately NO warn-and-forget of the engine-purge
+    // error on this path — the durable record IS the handling.
+    let _ = reclaim_collection_storage(&shared, tenant_id, &name, purge_lsn).await;
 }
 
 /// Borrowed core of [`purge_async`]: reclaim every engine's storage for
@@ -55,7 +61,7 @@ pub(crate) async fn reclaim_collection_storage(
     tenant_id: u64,
     name: &str,
     purge_lsn: u64,
-) {
+) -> crate::Result<()> {
     // 1. Persist to redb (every node has its own catalog).
     if let Some(catalog) = shared.credentials.catalog()
         && let Err(e) = catalog.record_wal_tombstone(tenant_id, name, purge_lsn)
@@ -128,11 +134,22 @@ pub(crate) async fn reclaim_collection_storage(
     shared.quiesce.begin_drain(tenant_id, name);
     shared.quiesce.wait_until_drained(tenant_id, name).await;
 
-    // 4. Reclaim on local Data Plane.
-    crate::control::server::shared::ddl::neutral::collection::purge::dispatch_unregister_collection(
-        shared, tenant_id, name, purge_lsn,
-    )
-    .await;
+    // 4. Reclaim on local Data Plane. RESULT-CHECKED: the redb +
+    //    versioned engine purge is correctness-critical (the catalog
+    //    row is already gone, so surviving engine rows are permanent
+    //    divergence that resurrects the dropped collection's history on
+    //    re-CREATE). The dispatch `.await`s a Data-Plane SPSC round-trip
+    //    bounded by the dispatcher's own deadline timeout — no unbounded
+    //    block is introduced on this off-critical-path spawn. On any
+    //    failure we record a durable `_system.pending_reclaim` entry so
+    //    a worker (and a boot-time drain) retries the purge to
+    //    completion, then propagate the error so the interactive
+    //    re-CREATE caller can fail closed.
+    let purge_result =
+        crate::control::server::shared::ddl::neutral::collection::purge::dispatch_unregister_collection(
+            shared, tenant_id, name, purge_lsn,
+        )
+        .await;
 
     // 4b. Broadcast `CollectionPurged` to every connected Lite
     //     session subscribed to this collection. Fire-and-forget;
@@ -146,10 +163,94 @@ pub(crate) async fn reclaim_collection_storage(
     // 5. Drop the quiesce entry. From here on, the catalog has no
     //    record of the collection; queries return `collection_not_found`.
     shared.quiesce.forget(tenant_id, name);
-    debug!(
-        collection = %name,
-        tenant = tenant_id,
+
+    if let Err(e) = &purge_result {
+        record_pending_reclaim(shared, tenant_id, name, purge_lsn, &e.to_string());
+    } else {
+        // A prior failed attempt may have left a durable entry; a
+        // succeeding purge clears it so the worker stops retrying.
+        if let Some(catalog) = shared.credentials.catalog()
+            && let Err(rm) = catalog.remove_pending_reclaim(tenant_id, name)
+        {
+            warn!(
+                collection = %name,
+                tenant = tenant_id,
+                error = %rm,
+                "failed to reap _system.pending_reclaim entry after successful engine purge"
+            );
+        }
+        debug!(
+            collection = %name,
+            tenant = tenant_id,
+            purge_lsn,
+            "catalog_entry: UnregisterCollection reclaimed on local Data Plane"
+        );
+    }
+
+    purge_result
+}
+
+/// Persist a durable `_system.pending_reclaim` entry so the failed
+/// engine purge is retried at-least-once by the pending-reclaim worker
+/// and the boot-time drain, instead of being lost to a warn log. This
+/// is the whole point of the fix: NEVER warn-and-forget a failed
+/// engine purge.
+fn record_pending_reclaim(
+    shared: &SharedState,
+    tenant_id: u64,
+    name: &str,
+    purge_lsn: u64,
+    last_error: &str,
+) {
+    let Some(catalog) = shared.credentials.catalog() else {
+        // No durable catalog (single-node in-memory-only mode). The
+        // purge failure still surfaces as the propagated Err; there is
+        // no durable table to record it in.
+        warn!(
+            collection = %name,
+            tenant = tenant_id,
+            purge_lsn,
+            error = %last_error,
+            "engine purge failed and no durable catalog is configured to \
+             record a pending-reclaim entry — purge will be retried only if \
+             the DROP is re-proposed"
+        );
+        return;
+    };
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let entry = crate::control::security::catalog::StoredPendingReclaim {
+        database_id: crate::types::DatabaseId::DEFAULT.as_u64(),
+        tenant_id,
+        name: name.to_string(),
         purge_lsn,
-        "catalog_entry: UnregisterCollection dispatched to local Data Plane"
-    );
+        enqueued_at_ns: now_ns,
+        last_error: last_error.to_string(),
+        attempts: 0,
+    };
+    if let Err(e) = catalog.enqueue_pending_reclaim(&entry) {
+        // The durable record itself failed. This is the one place we
+        // cannot make durable — log loudly at error so operators see it.
+        tracing::error!(
+            collection = %name,
+            tenant = tenant_id,
+            purge_lsn,
+            purge_error = %last_error,
+            record_error = %e,
+            "engine purge failed AND recording the pending-reclaim entry failed — \
+             collection storage may survive behind a removed catalog row until the \
+             DROP is re-proposed or the node reboots and re-drains"
+        );
+    } else {
+        warn!(
+            collection = %name,
+            tenant = tenant_id,
+            purge_lsn,
+            error = %last_error,
+            "engine purge failed — recorded _system.pending_reclaim entry for \
+             at-least-once retry by the pending-reclaim worker"
+        );
+    }
 }

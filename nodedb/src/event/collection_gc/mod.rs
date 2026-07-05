@@ -12,9 +12,11 @@
 //! (including the per-node Data Plane reclaim dispatch).
 
 pub mod l2_cleanup;
+pub mod pending_reclaim;
 pub mod policy;
 pub mod sweeper;
 
 pub use l2_cleanup::{L2CleanupWorker, spawn_l2_cleanup};
+pub use pending_reclaim::{PendingReclaimWorker, spawn_pending_reclaim};
 pub use policy::{PurgeDecision, resolve_retention};
 pub use sweeper::{CollectionGcSweeper, spawn_collection_gc};

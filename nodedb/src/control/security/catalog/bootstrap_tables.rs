@@ -75,6 +75,7 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "metadata" => METADATA,
     "wal_tombstones" => WAL_TOMBSTONES,
     "l2_cleanup_queue" => L2_CLEANUP_QUEUE,
+    "pending_reclaim" => PENDING_RECLAIM,
     "column_stats" => COLUMN_STATS,
     "vector_model_metadata" => VECTOR_MODEL_METADATA,
     "checkpoints" => CHECKPOINTS,

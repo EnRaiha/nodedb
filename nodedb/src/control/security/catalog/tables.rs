@@ -72,6 +72,21 @@ pub(super) const WAL_TOMBSTONES: TableDefinition<(u64, &str), u64> =
 pub(super) const L2_CLEANUP_QUEUE: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("_system.l2_cleanup_queue");
 
+/// Table: `(tenant_id, collection_name)` -> MessagePack-serialized
+/// `StoredPendingReclaim`.
+///
+/// Populated when the synchronous, result-checked engine purge for a
+/// dropped collection (`clear_collection_all_engines` via
+/// `MetaOp::UnregisterCollection`) FAILS on this node after the catalog
+/// row has already been removed. Left unrecorded, that failure would
+/// leave engine storage rows behind a gone catalog row — permanent
+/// divergence that resurrects the dropped collection's history on
+/// re-CREATE. A Tokio worker (and a boot-time drain) retries the engine
+/// purge for each entry until it succeeds, then removes the row. This
+/// gives durable at-least-once purge without wedging the node.
+pub(super) const PENDING_RECLAIM: TableDefinition<(u64, &str), &[u8]> =
+    TableDefinition::new("_system.pending_reclaim");
+
 // ── DDL objects ───────────────────────────────────────────────────────
 
 /// Table: "{tenant_id}:{name}" -> MessagePack-serialized materialized view metadata.

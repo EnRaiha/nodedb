@@ -181,6 +181,12 @@ pub fn spawn_background_loops(
     // L2 cleanup worker.
     let _l2_cleanup = crate::event::collection_gc::spawn_l2_cleanup(Arc::clone(shared));
 
+    // Pending engine-reclaim worker: retries the redb + versioned engine
+    // purge for any dropped collection whose result-checked purge failed
+    // on this node, so a per-node hiccup can never leave engine storage
+    // rows behind a removed catalog row.
+    let _pending_reclaim = crate::event::collection_gc::spawn_pending_reclaim(Arc::clone(shared));
+
     // Tenant rate counter reset (1-second timer).
     let shared_rate = Arc::clone(shared);
     crate::control::shutdown::spawn_loop(

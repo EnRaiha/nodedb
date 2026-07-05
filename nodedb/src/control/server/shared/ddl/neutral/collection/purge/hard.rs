@@ -34,18 +34,18 @@ use crate::control::state::SharedState;
 /// callers pass the current WAL `next_lsn` — every pre-drop row sits
 /// below it while every post-CREATE row sits at or above it.
 ///
-/// Returns `Err` if the catalog-row removal fails so the re-CREATE
-/// caller can ABORT rather than register a new collection over
-/// un-purged data (the failure-path resurrection hole). Unlike the
-/// raft applier — which runs symmetrically on every node and
-/// log-and-continues — this interactive path is fail-closed.
+/// Returns `Err` if the catalog-row removal OR the engine storage
+/// reclaim fails, so the re-CREATE caller can ABORT rather than register
+/// a new collection over un-purged data (the failure-path resurrection
+/// hole). This interactive path is fail-closed on both halves.
 ///
 /// The storage-reclaim half (`reclaim_collection_storage`) is
-/// fire-and-forget by design: it returns `()` and each of its steps
-/// (WAL tombstone, redb tombstone, L2 enqueue, quiesce drain, Data
-/// Plane `UnregisterCollection` dispatch, Lite broadcast) log-and-
-/// continues on a per-node hiccup with no gating failure signal to
-/// thread, so there is nothing to propagate from it.
+/// result-checked: its correctness-critical redb + versioned engine
+/// purge propagates a failure here (and also records a durable
+/// `_system.pending_reclaim` entry so the purge is retried
+/// at-least-once even though this caller aborts). Its best-effort
+/// substeps (WAL tombstone, redb tombstone, L2 enqueue, quiesce drain,
+/// Lite broadcast) still log-and-continue.
 pub(crate) async fn hard_purge_collection(
     state: &SharedState,
     tenant_id: u64,
@@ -67,7 +67,7 @@ pub(crate) async fn hard_purge_collection(
     crate::control::catalog_entry::post_apply::reclaim_collection_storage(
         state, tenant_id, name, purge_lsn,
     )
-    .await;
+    .await?;
 
     Ok(())
 }
