@@ -426,22 +426,26 @@ pub enum ReplicatedWrite {
         key: Vec<u8>,
         delta: i64,
         ttl_ms: u64,
+        surrogate: u32,
     },
     KvIncrFloat {
         collection: String,
         key: Vec<u8>,
         delta: f64,
+        surrogate: u32,
     },
     KvCas {
         collection: String,
         key: Vec<u8>,
         expected: Vec<u8>,
         new_value: Vec<u8>,
+        surrogate: u32,
     },
     KvGetSet {
         collection: String,
         key: Vec<u8>,
         new_value: Vec<u8>,
+        surrogate: u32,
     },
     KvRegisterSortedIndex {
         collection: String,

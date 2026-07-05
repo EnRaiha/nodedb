@@ -88,11 +88,21 @@ pub async fn rate_check(
 
     let actual_ttl = if key_exists { 0 } else { ttl_ms };
 
+    let surrogate = state
+        .surrogate_assigner
+        .assign(
+            DatabaseId::DEFAULT,
+            tenant_id,
+            RATE_COLLECTION,
+            rate_key.as_bytes(),
+        )
+        .map_err(|e| super::kv_atomic::ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::Incr {
         collection: RATE_COLLECTION.to_string(),
         key: rate_key.as_bytes().to_vec(),
         delta: 1,
         ttl_ms: actual_ttl,
+        surrogate,
     });
 
     match crate::control::server::dispatch_utils::dispatch_to_data_plane(

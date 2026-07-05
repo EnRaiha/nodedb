@@ -235,10 +235,22 @@ impl CoreLoop {
                 key,
                 delta,
                 ttl_ms,
+                surrogate,
             } => {
                 let now_ms = current_ms();
                 let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
-                let resp = self.execute_kv_incr(task, did, tid, collection, key, *delta, *ttl_ms);
+                let resp = self.execute_kv_incr(
+                    crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
+                        task,
+                        did,
+                        tid,
+                        collection,
+                        key,
+                        surrogate: *surrogate,
+                    },
+                    *delta,
+                    *ttl_ms,
+                );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv incr failed".into(),
@@ -256,10 +268,21 @@ impl CoreLoop {
                 collection,
                 key,
                 delta,
+                surrogate,
             } => {
                 let now_ms = current_ms();
                 let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
-                let resp = self.execute_kv_incr_float(task, did, tid, collection, key, *delta);
+                let resp = self.execute_kv_incr_float(
+                    crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
+                        task,
+                        did,
+                        tid,
+                        collection,
+                        key,
+                        surrogate: *surrogate,
+                    },
+                    *delta,
+                );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv incr float failed".into(),
@@ -278,11 +301,22 @@ impl CoreLoop {
                 key,
                 expected,
                 new_value,
+                surrogate,
             } => {
                 let now_ms = current_ms();
                 let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
-                let resp =
-                    self.execute_kv_cas(task, did, tid, collection, key, expected, new_value);
+                let resp = self.execute_kv_cas(
+                    crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
+                        task,
+                        did,
+                        tid,
+                        collection,
+                        key,
+                        surrogate: *surrogate,
+                    },
+                    expected,
+                    new_value,
+                );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv cas failed".into(),
@@ -301,10 +335,21 @@ impl CoreLoop {
                 collection,
                 key,
                 new_value,
+                surrogate,
             } => {
                 let now_ms = current_ms();
                 let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
-                let resp = self.execute_kv_getset(task, did, tid, collection, key, new_value);
+                let resp = self.execute_kv_getset(
+                    crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
+                        task,
+                        did,
+                        tid,
+                        collection,
+                        key,
+                        surrogate: *surrogate,
+                    },
+                    new_value,
+                );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv get-set failed".into(),

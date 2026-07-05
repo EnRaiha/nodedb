@@ -19,7 +19,7 @@ pub mod slab;
 pub mod sorted_index;
 
 pub use engine::KvEngine;
-pub use engine_atomic::{AtomicError, CasResult};
+pub use engine_atomic::{AtomicError, AtomicKeyCtx, CasResult};
 pub use engine_atomic_compute as atomic_compute;
 pub use engine_stats::{ExpiredKey, KvStats};
 pub use scan::KvScanParams;

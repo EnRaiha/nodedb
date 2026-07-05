@@ -94,10 +94,10 @@ pub(crate) fn build_plan(
         OpCode::KvDropIndex => kv::build_drop_index(fields, collection),
         OpCode::KvTruncate => kv::build_truncate(collection),
         // KV atomic operations.
-        OpCode::KvIncr => kv::build_incr(collection, fields),
-        OpCode::KvIncrFloat => kv::build_incr_float(collection, fields),
-        OpCode::KvCas => kv::build_cas(collection, fields),
-        OpCode::KvGetSet => kv::build_getset(collection, fields),
+        OpCode::KvIncr => kv::build_incr(ctx, collection, fields),
+        OpCode::KvIncrFloat => kv::build_incr_float(ctx, collection, fields),
+        OpCode::KvCas => kv::build_cas(ctx, collection, fields),
+        OpCode::KvGetSet => kv::build_getset(ctx, collection, fields),
         // KV sorted index operations.
         OpCode::KvRegisterSortedIndex => kv::build_register_sorted_index(collection, fields),
         OpCode::KvDropSortedIndex => kv::build_drop_sorted_index(fields),

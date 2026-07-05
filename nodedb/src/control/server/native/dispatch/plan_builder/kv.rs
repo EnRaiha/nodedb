@@ -5,6 +5,7 @@
 use nodedb_types::protocol::TextFields;
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::KvOp;
 
 pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
@@ -202,7 +203,24 @@ pub(crate) fn build_truncate(collection: &str) -> crate::Result<PhysicalPlan> {
     }))
 }
 
-pub(crate) fn build_incr(collection: &str, fields: &TextFields) -> crate::Result<PhysicalPlan> {
+/// Resolve the stable cross-engine surrogate for a KV atomic op, content-
+/// addressed on `(collection, key)` — the same binding a normal insert of that
+/// key allocated, so an atomic op on an existing key keeps its identity.
+fn assign_kv_surrogate(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+    key: &[u8],
+) -> crate::Result<nodedb_types::Surrogate> {
+    ctx.state
+        .surrogate_assigner
+        .assign(ctx.database_id(), ctx.tenant_id(), collection, key)
+}
+
+pub(crate) fn build_incr(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+    fields: &TextFields,
+) -> crate::Result<PhysicalPlan> {
     let key = fields
         .key
         .as_deref()
@@ -211,16 +229,19 @@ pub(crate) fn build_incr(collection: &str, fields: &TextFields) -> crate::Result
         })?;
     let delta = fields.incr_delta.unwrap_or(1);
     let ttl_ms = fields.ttl_ms.unwrap_or(0);
+    let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
 
     Ok(PhysicalPlan::Kv(KvOp::Incr {
         collection: collection.to_string(),
         key: key.as_bytes().to_vec(),
         delta,
         ttl_ms,
+        surrogate,
     }))
 }
 
 pub(crate) fn build_incr_float(
+    ctx: &DispatchCtx<'_>,
     collection: &str,
     fields: &TextFields,
 ) -> crate::Result<PhysicalPlan> {
@@ -231,15 +252,21 @@ pub(crate) fn build_incr_float(
             detail: "missing 'key'".to_string(),
         })?;
     let delta = fields.incr_float_delta.unwrap_or(1.0);
+    let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
 
     Ok(PhysicalPlan::Kv(KvOp::IncrFloat {
         collection: collection.to_string(),
         key: key.as_bytes().to_vec(),
         delta,
+        surrogate,
     }))
 }
 
-pub(crate) fn build_cas(collection: &str, fields: &TextFields) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_cas(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+    fields: &TextFields,
+) -> crate::Result<PhysicalPlan> {
     let key = fields
         .key
         .as_deref()
@@ -253,16 +280,22 @@ pub(crate) fn build_cas(collection: &str, fields: &TextFields) -> crate::Result<
         .ok_or_else(|| crate::Error::BadRequest {
             detail: "missing 'new_value'".to_string(),
         })?;
+    let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
 
     Ok(PhysicalPlan::Kv(KvOp::Cas {
         collection: collection.to_string(),
         key: key.as_bytes().to_vec(),
         expected,
         new_value,
+        surrogate,
     }))
 }
 
-pub(crate) fn build_getset(collection: &str, fields: &TextFields) -> crate::Result<PhysicalPlan> {
+pub(crate) fn build_getset(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+    fields: &TextFields,
+) -> crate::Result<PhysicalPlan> {
     let key = fields
         .key
         .as_deref()
@@ -275,11 +308,13 @@ pub(crate) fn build_getset(collection: &str, fields: &TextFields) -> crate::Resu
         .ok_or_else(|| crate::Error::BadRequest {
             detail: "missing 'new_value'".to_string(),
         })?;
+    let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
 
     Ok(PhysicalPlan::Kv(KvOp::GetSet {
         collection: collection.to_string(),
         key: key.as_bytes().to_vec(),
         new_value,
+        surrogate,
     }))
 }
 

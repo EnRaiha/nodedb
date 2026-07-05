@@ -30,6 +30,24 @@ pub enum AtomicError {
     Overflow,
 }
 
+/// Shared key-identity context for a single-key atomic KV operation
+/// (INCR / INCR_FLOAT / CAS / GETSET).
+#[derive(Clone, Copy)]
+pub struct AtomicKeyCtx<'a> {
+    /// Owning database.
+    pub database_id: u64,
+    /// Owning tenant.
+    pub tenant_id: u64,
+    /// Collection name.
+    pub collection: &'a str,
+    /// Key bytes.
+    pub key: &'a [u8],
+    /// Current time in milliseconds, used for TTL/expiry evaluation.
+    pub now_ms: u64,
+    /// Global cross-engine surrogate assigned to this write.
+    pub surrogate: nodedb_types::Surrogate,
+}
+
 impl KvEngine {
     /// Atomically increment an i64 value by `delta`. Returns the new value.
     ///
@@ -38,33 +56,18 @@ impl KvEngine {
     /// - On i64 overflow: returns `Overflow` (never wraps silently).
     /// - TTL behavior: if `ttl_ms > 0` and key is new, sets TTL.
     ///   If key exists and `ttl_ms > 0`, resets TTL. If `ttl_ms == 0`, preserves.
-    #[allow(clippy::too_many_arguments)]
     pub fn incr(
         &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        key: &[u8],
+        ctx: AtomicKeyCtx<'_>,
         delta: i64,
         ttl_ms: u64,
-        now_ms: u64,
     ) -> Result<i64, AtomicError> {
-        let tkey = table_key(database_id, tenant_id, collection);
-        let table = self.ensure_table(tkey, tenant_id, collection);
+        let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
+        let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
-        let current = table.get(key, now_ms).map(|v| v.to_vec());
+        let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
         let (new_i64, new_bytes) = compute::incr(current.as_deref(), delta)?;
-        self.atomic_put(
-            database_id,
-            tenant_id,
-            collection,
-            tkey,
-            key,
-            &new_bytes,
-            ttl_ms,
-            now_ms,
-            current.is_none(),
-        );
+        self.atomic_put(ctx, tkey, &new_bytes, ttl_ms, current.is_none());
 
         Ok(new_i64)
     }
@@ -75,32 +78,14 @@ impl KvEngine {
     /// - If value is not a MessagePack float or integer: returns `TypeMismatch`.
     /// - f64 does not overflow in the traditional sense (it goes to infinity),
     ///   but NaN/Infinity results are rejected as `Overflow`.
-    pub fn incr_float(
-        &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        key: &[u8],
-        delta: f64,
-        now_ms: u64,
-    ) -> Result<f64, AtomicError> {
-        let tkey = table_key(database_id, tenant_id, collection);
-        let table = self.ensure_table(tkey, tenant_id, collection);
+    pub fn incr_float(&mut self, ctx: AtomicKeyCtx<'_>, delta: f64) -> Result<f64, AtomicError> {
+        let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
+        let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
-        let current = table.get(key, now_ms).map(|v| v.to_vec());
+        let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
         let (new_f64, new_bytes) = compute::incr_float(current.as_deref(), delta)?;
         // incr_float always preserves existing TTL (ttl_ms = 0).
-        self.atomic_put(
-            database_id,
-            tenant_id,
-            collection,
-            tkey,
-            key,
-            &new_bytes,
-            0,
-            now_ms,
-            current.is_none(),
-        );
+        self.atomic_put(ctx, tkey, &new_bytes, 0, current.is_none());
 
         Ok(new_f64)
     }
@@ -110,36 +95,16 @@ impl KvEngine {
     /// If current value equals `expected`, sets to `new_value` and returns success.
     /// If current value differs, returns the actual current value.
     /// If key doesn't exist and `expected` is empty, creates the key (create-if-not-exists).
-    #[allow(clippy::too_many_arguments)]
-    pub fn cas(
-        &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        key: &[u8],
-        expected: &[u8],
-        new_value: &[u8],
-        now_ms: u64,
-    ) -> CasResult {
-        let tkey = table_key(database_id, tenant_id, collection);
-        let table = self.ensure_table(tkey, tenant_id, collection);
+    pub fn cas(&mut self, ctx: AtomicKeyCtx<'_>, expected: &[u8], new_value: &[u8]) -> CasResult {
+        let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
+        let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
-        let current = table.get(key, now_ms).map(|v| v.to_vec());
+        let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
 
         let (matches, write_bytes) = compute::cas(current.as_deref(), expected, new_value);
 
         if matches {
-            self.atomic_put(
-                database_id,
-                tenant_id,
-                collection,
-                tkey,
-                key,
-                &write_bytes,
-                0,
-                now_ms,
-                current.is_none(),
-            );
+            self.atomic_put(ctx, tkey, &write_bytes, 0, current.is_none());
             CasResult {
                 success: true,
                 current_value: current,
@@ -156,32 +121,14 @@ impl KvEngine {
     ///
     /// If key didn't exist, returns `None`.
     /// Preserves existing TTL.
-    pub fn getset(
-        &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        key: &[u8],
-        new_value: &[u8],
-        now_ms: u64,
-    ) -> Option<Vec<u8>> {
-        let tkey = table_key(database_id, tenant_id, collection);
-        let table = self.ensure_table(tkey, tenant_id, collection);
-        let old = table.get(key, now_ms).map(|v| v.to_vec());
+    pub fn getset(&mut self, ctx: AtomicKeyCtx<'_>, new_value: &[u8]) -> Option<Vec<u8>> {
+        let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
+        let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
+        let old = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
         let write_bytes = compute::getset(old.as_deref(), new_value);
 
         // GetSet preserves existing TTL (ttl_ms = 0).
-        self.atomic_put(
-            database_id,
-            tenant_id,
-            collection,
-            tkey,
-            key,
-            &write_bytes,
-            0,
-            now_ms,
-            old.is_none(),
-        );
+        self.atomic_put(ctx, tkey, &write_bytes, 0, old.is_none());
         old
     }
 
@@ -209,19 +156,22 @@ impl KvEngine {
     ///
     /// If `ttl_ms == 0`, preserves the existing TTL on an existing key.
     /// If `ttl_ms > 0`, sets/resets TTL. If key is new and `ttl_ms == 0`, no TTL.
-    #[allow(clippy::too_many_arguments)]
     fn atomic_put(
         &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
+        ctx: AtomicKeyCtx<'_>,
         tkey: u64,
-        key: &[u8],
         value: &[u8],
         ttl_ms: u64,
-        now_ms: u64,
         is_new_key: bool,
     ) {
+        let AtomicKeyCtx {
+            database_id,
+            tenant_id,
+            collection,
+            key,
+            now_ms,
+            surrogate,
+        } = ctx;
         // Cache metadata lookup to avoid double HashMap access.
         let old_meta = if is_new_key {
             None
@@ -265,7 +215,7 @@ impl KvEngine {
 
         // Write the value.
         let table = self.tables.get_mut(&tkey).expect("table ensured");
-        table.put(key, value, expire_at, nodedb_types::Surrogate::ZERO);
+        table.put(key, value, expire_at, surrogate);
 
         // Schedule new expiry if needed.
         if expire_at != NO_EXPIRY {
@@ -304,28 +254,38 @@ mod tests {
         KvEngine::new(1000, 16, 0.75, 4, 64, 1000, 1024)
     }
 
+    /// Build a key context for tests (database 0, tenant 1, now_ms 1000).
+    fn ctx<'a>(collection: &'a str, key: &'a [u8]) -> AtomicKeyCtx<'a> {
+        AtomicKeyCtx {
+            database_id: 0,
+            tenant_id: 1,
+            collection,
+            key,
+            now_ms: 1000,
+            surrogate: Surrogate::ZERO,
+        }
+    }
+
     #[test]
     fn incr_new_key() {
         let mut engine = make_engine();
-        let result = engine.incr(0, 1, "counters", b"hits", 10, 0, 1000);
+        let result = engine.incr(ctx("counters", b"hits"), 10, 0);
         assert_eq!(result.unwrap(), 10);
     }
 
     #[test]
     fn incr_existing_key() {
         let mut engine = make_engine();
-        engine.incr(0, 1, "counters", b"hits", 10, 0, 1000).unwrap();
-        let result = engine.incr(0, 1, "counters", b"hits", 5, 0, 1000);
+        engine.incr(ctx("counters", b"hits"), 10, 0).unwrap();
+        let result = engine.incr(ctx("counters", b"hits"), 5, 0);
         assert_eq!(result.unwrap(), 15);
     }
 
     #[test]
     fn incr_negative_delta() {
         let mut engine = make_engine();
-        engine
-            .incr(0, 1, "counters", b"gold", 100, 0, 1000)
-            .unwrap();
-        let result = engine.incr(0, 1, "counters", b"gold", -30, 0, 1000);
+        engine.incr(ctx("counters", b"gold"), 100, 0).unwrap();
+        let result = engine.incr(ctx("counters", b"gold"), -30, 0);
         assert_eq!(result.unwrap(), 70);
     }
 
@@ -335,7 +295,7 @@ mod tests {
         // Set to MAX.
         let bytes = zerompk::to_msgpack_vec(&i64::MAX).unwrap();
         engine.put(0, 1, "counters", b"max", &bytes, 0, 1000, Surrogate::ZERO);
-        let result = engine.incr(0, 1, "counters", b"max", 1, 0, 1000);
+        let result = engine.incr(ctx("counters", b"max"), 1, 0);
         assert!(matches!(result, Err(AtomicError::Overflow)));
     }
 
@@ -344,7 +304,7 @@ mod tests {
         let mut engine = make_engine();
         let bytes = zerompk::to_msgpack_vec(&"hello").unwrap();
         engine.put(0, 1, "counters", b"str", &bytes, 0, 1000, Surrogate::ZERO);
-        let result = engine.incr(0, 1, "counters", b"str", 1, 0, 1000);
+        let result = engine.incr(ctx("counters", b"str"), 1, 0);
         assert!(matches!(result, Err(AtomicError::TypeMismatch { .. })));
     }
 
@@ -352,7 +312,7 @@ mod tests {
     fn incr_with_ttl_new_key() {
         let mut engine = make_engine();
         engine
-            .incr(0, 1, "counters", b"daily", 1, 86_400_000, 1000)
+            .incr(ctx("counters", b"daily"), 1, 86_400_000)
             .unwrap();
         let ttl = engine.get_ttl_ms(0, 1, "counters", b"daily", 1000);
         assert!(ttl.is_some());
@@ -375,7 +335,7 @@ mod tests {
             Surrogate::ZERO,
         );
         // Incr with ttl_ms=0 should preserve existing TTL.
-        engine.incr(0, 1, "counters", b"temp", 10, 0, 1000).unwrap();
+        engine.incr(ctx("counters", b"temp"), 10, 0).unwrap();
         let ttl = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
         assert!(ttl.is_some());
         assert!(ttl.unwrap() > 0);
@@ -384,17 +344,15 @@ mod tests {
     #[test]
     fn incr_float_new_key() {
         let mut engine = make_engine();
-        let result = engine.incr_float(0, 1, "scores", b"dmg", 3.125, 1000);
+        let result = engine.incr_float(ctx("scores", b"dmg"), 3.125);
         assert!((result.unwrap() - 3.125).abs() < f64::EPSILON);
     }
 
     #[test]
     fn incr_float_existing() {
         let mut engine = make_engine();
-        engine
-            .incr_float(0, 1, "scores", b"dmg", 3.0, 1000)
-            .unwrap();
-        let result = engine.incr_float(0, 1, "scores", b"dmg", 1.5, 1000);
+        engine.incr_float(ctx("scores", b"dmg"), 3.0).unwrap();
+        let result = engine.incr_float(ctx("scores", b"dmg"), 1.5);
         assert!((result.unwrap() - 4.5).abs() < f64::EPSILON);
     }
 
@@ -403,14 +361,14 @@ mod tests {
         let mut engine = make_engine();
         let bytes = zerompk::to_msgpack_vec(&f64::MAX).unwrap();
         engine.put(0, 1, "scores", b"big", &bytes, 0, 1000, Surrogate::ZERO);
-        let result = engine.incr_float(0, 1, "scores", b"big", f64::MAX, 1000);
+        let result = engine.incr_float(ctx("scores", b"big"), f64::MAX);
         assert!(matches!(result, Err(AtomicError::Overflow)));
     }
 
     #[test]
     fn cas_create_if_not_exists() {
         let mut engine = make_engine();
-        let result = engine.cas(0, 1, "state", b"player1", b"", b"idle", 1000);
+        let result = engine.cas(ctx("state", b"player1"), b"", b"idle");
         assert!(result.success);
         assert!(result.current_value.is_none());
         // Verify key was created.
@@ -422,7 +380,7 @@ mod tests {
     fn cas_success() {
         let mut engine = make_engine();
         engine.put(0, 1, "state", b"p1", b"idle", 0, 1000, Surrogate::ZERO);
-        let result = engine.cas(0, 1, "state", b"p1", b"idle", b"in_match", 1000);
+        let result = engine.cas(ctx("state", b"p1"), b"idle", b"in_match");
         assert!(result.success);
         assert_eq!(result.current_value.as_deref(), Some(b"idle".as_slice()));
         let val = engine.get(0, 1, "state", b"p1", 1000);
@@ -433,7 +391,7 @@ mod tests {
     fn cas_failure() {
         let mut engine = make_engine();
         engine.put(0, 1, "state", b"p1", b"fighting", 0, 1000, Surrogate::ZERO);
-        let result = engine.cas(0, 1, "state", b"p1", b"idle", b"in_match", 1000);
+        let result = engine.cas(ctx("state", b"p1"), b"idle", b"in_match");
         assert!(!result.success);
         assert_eq!(
             result.current_value.as_deref(),
@@ -447,7 +405,7 @@ mod tests {
     #[test]
     fn getset_new_key() {
         let mut engine = make_engine();
-        let old = engine.getset(0, 1, "session", b"tok", b"new-token", 1000);
+        let old = engine.getset(ctx("session", b"tok"), b"new-token");
         assert!(old.is_none());
         let val = engine.get(0, 1, "session", b"tok", 1000);
         assert_eq!(val.as_deref(), Some(b"new-token".as_slice()));
@@ -466,7 +424,7 @@ mod tests {
             1000,
             Surrogate::ZERO,
         );
-        let old = engine.getset(0, 1, "session", b"tok", b"new-token", 1000);
+        let old = engine.getset(ctx("session", b"tok"), b"new-token");
         assert_eq!(old.as_deref(), Some(b"old-token".as_slice()));
         let val = engine.get(0, 1, "session", b"tok", 1000);
         assert_eq!(val.as_deref(), Some(b"new-token".as_slice()));

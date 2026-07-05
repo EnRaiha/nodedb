@@ -54,11 +54,21 @@ pub async fn kv_incr(
     let ttl_ms = parse_optional_ttl(&args[3..])?;
 
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let surrogate = state
+        .surrogate_assigner
+        .assign(
+            DatabaseId::DEFAULT,
+            identity.tenant_id,
+            &collection,
+            key.as_bytes(),
+        )
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::Incr {
         collection,
         key: key.as_bytes().to_vec(),
         delta,
         ttl_ms,
+        surrogate,
     });
 
     dispatch_and_respond(state, identity, vshard, plan, func_name, txn_ctx).await
@@ -92,10 +102,20 @@ pub async fn kv_incr_float(
     })?;
 
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let surrogate = state
+        .surrogate_assigner
+        .assign(
+            DatabaseId::DEFAULT,
+            identity.tenant_id,
+            &collection,
+            key.as_bytes(),
+        )
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::IncrFloat {
         collection,
         key: key.as_bytes().to_vec(),
         delta,
+        surrogate,
     });
 
     dispatch_and_respond(state, identity, vshard, plan, "KV_INCR_FLOAT", txn_ctx).await
@@ -125,11 +145,21 @@ pub async fn kv_cas(
     let new_value = unquote(&args[3]);
 
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let surrogate = state
+        .surrogate_assigner
+        .assign(
+            DatabaseId::DEFAULT,
+            identity.tenant_id,
+            &collection,
+            key.as_bytes(),
+        )
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::Cas {
         collection,
         key: key.as_bytes().to_vec(),
         expected: expected.into_bytes(),
         new_value: new_value.into_bytes(),
+        surrogate,
     });
 
     dispatch_and_respond(state, identity, vshard, plan, "KV_CAS", txn_ctx).await
@@ -158,10 +188,20 @@ pub async fn kv_getset(
     let new_value = unquote(&args[2]);
 
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let surrogate = state
+        .surrogate_assigner
+        .assign(
+            DatabaseId::DEFAULT,
+            identity.tenant_id,
+            &collection,
+            key.as_bytes(),
+        )
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::GetSet {
         collection,
         key: key.as_bytes().to_vec(),
         new_value: new_value.into_bytes(),
+        surrogate,
     });
 
     dispatch_and_respond(state, identity, vshard, plan, "KV_GETSET", txn_ctx).await

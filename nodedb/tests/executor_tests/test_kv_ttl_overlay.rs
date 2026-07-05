@@ -322,6 +322,7 @@ fn staged_incr_with_ttl_is_observed_by_in_tx_get_ttl() {
             key: b"ctr".to_vec(),
             delta: 5,
             ttl_ms: 30_000,
+            surrogate: nodedb_types::Surrogate::ZERO,
         })),
     });
     let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, stage_incr);

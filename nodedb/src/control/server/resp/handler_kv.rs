@@ -13,6 +13,26 @@ use super::command::RespCommand;
 use super::handler::{dispatch_kv, dispatch_kv_write, parse_json_field_i64};
 use super::session::RespSession;
 
+/// Resolve the stable cross-engine surrogate for a KV atomic op on this
+/// session's collection, content-addressed on `(collection, key)` — the same
+/// binding a normal insert of that key allocated, so an atomic op on an
+/// existing key keeps its identity.
+fn resp_kv_surrogate(
+    state: &SharedState,
+    session: &RespSession,
+    key: &[u8],
+) -> Result<nodedb_types::Surrogate, RespValue> {
+    state
+        .surrogate_assigner
+        .assign(
+            crate::types::DatabaseId::DEFAULT,
+            session.tenant_id,
+            &session.collection,
+            key,
+        )
+        .map_err(|e| RespValue::err(format!("ERR {e}")))
+}
+
 pub(super) async fn handle_get(
     cmd: &RespCommand,
     session: &RespSession,
@@ -267,11 +287,16 @@ pub(super) async fn handle_incr(
         return RespValue::err("ERR wrong number of arguments for 'incr' command");
     };
 
+    let surrogate = match resp_kv_surrogate(state, session, key) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let plan = PhysicalPlan::Kv(KvOp::Incr {
         collection: session.collection.clone(),
         key: key.to_vec(),
         delta: default_delta,
         ttl_ms: 0,
+        surrogate,
     });
 
     match dispatch_kv_write(state, session, plan).await {
@@ -298,11 +323,16 @@ pub(super) async fn handle_incrby(
         return RespValue::err("ERR value is not an integer or out of range");
     };
 
+    let surrogate = match resp_kv_surrogate(state, session, &key) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let plan = PhysicalPlan::Kv(KvOp::Incr {
         collection: session.collection.clone(),
         key,
         delta,
         ttl_ms: 0,
+        surrogate,
     });
 
     match dispatch_kv_write(state, session, plan).await {
@@ -332,11 +362,16 @@ pub(super) async fn handle_decrby(
         return RespValue::err("ERR value is not an integer or out of range");
     };
 
+    let surrogate = match resp_kv_surrogate(state, session, &key) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let plan = PhysicalPlan::Kv(KvOp::Incr {
         collection: session.collection.clone(),
         key,
         delta: neg_delta,
         ttl_ms: 0,
+        surrogate,
     });
 
     match dispatch_kv_write(state, session, plan).await {
@@ -368,10 +403,15 @@ pub(super) async fn handle_incrbyfloat(
         Err(_) => return RespValue::err("ERR value is not a valid float"),
     };
 
+    let surrogate = match resp_kv_surrogate(state, session, &key) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let plan = PhysicalPlan::Kv(KvOp::IncrFloat {
         collection: session.collection.clone(),
         key,
         delta,
+        surrogate,
     });
 
     match dispatch_kv_write(state, session, plan).await {
@@ -403,10 +443,15 @@ pub(super) async fn handle_getset(
     let key = cmd.args[0].clone();
     let new_value = cmd.args[1].clone();
 
+    let surrogate = match resp_kv_surrogate(state, session, &key) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let plan = PhysicalPlan::Kv(KvOp::GetSet {
         collection: session.collection.clone(),
         key,
         new_value,
+        surrogate,
     });
 
     match dispatch_kv_write(state, session, plan).await {

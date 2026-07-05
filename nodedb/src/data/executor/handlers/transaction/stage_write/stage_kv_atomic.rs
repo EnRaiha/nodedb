@@ -21,12 +21,12 @@
 //! `execute_kv_incr` / `execute_kv_batch_put` path unchanged -- the overlay
 //! TTL delta only affects in-transaction reads.
 //!
-//! `Incr` / `IncrFloat` / `Cas` / `GetSet` carry no surrogate on their plan
-//! (unlike `Put`/`Insert`, whose surrogate is allocated by the planner for
-//! cross-engine identity). The base `KvEngine`'s own atomic ops mirror this:
-//! `atomic_put` always writes with `Surrogate::ZERO`, i.e. these rows never
-//! participate in cross-engine surrogate identity. The staging overlay,
-//! however, keys its per-collection `by_surrogate` map by `u32`, so distinct
+//! `Incr` / `IncrFloat` / `Cas` / `GetSet` carry a planner-assigned surrogate
+//! on their plan (content-addressed on the key, same as `Put`/`Insert`) so the
+//! durable COMMIT-time replay through `execute_kv_incr` writes each row with
+//! its stable cross-engine identity. The statement-time staging overlay,
+//! however, does not persist and keys its per-collection `by_surrogate` map by
+//! its own `u32` slot, so it ignores the plan surrogate here. Distinct
 //! keys need distinct overlay slots or a second key's staged Put would
 //! silently clobber a first key's slot. [`kv_atomic_stage_ctx`] resolves a
 //! stable slot: the overlay's own doc_id → surrogate binding when this key
@@ -80,6 +80,10 @@ impl CoreLoop {
                 key,
                 delta,
                 ttl_ms,
+                // The plan's cross-engine surrogate is applied by the durable
+                // COMMIT-time replay through `execute_kv_incr`; the staging
+                // overlay keys its own slots (see module doc) and ignores it.
+                surrogate: _,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
                 self.stage_kv_ttl_side_effect(&ctx, *ttl_ms);
@@ -89,6 +93,7 @@ impl CoreLoop {
                 collection,
                 key,
                 delta,
+                surrogate: _,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
                 self.stage_kv_incr_float(&ctx, key, *delta)
@@ -98,6 +103,7 @@ impl CoreLoop {
                 key,
                 expected,
                 new_value,
+                surrogate: _,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
                 self.stage_kv_cas(&ctx, key, expected, new_value)
@@ -106,6 +112,7 @@ impl CoreLoop {
                 collection,
                 key,
                 new_value,
+                surrogate: _,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
                 self.stage_kv_getset(&ctx, key, new_value)

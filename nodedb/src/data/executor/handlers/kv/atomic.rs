@@ -11,18 +11,32 @@ use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::AtomicError;
 use crate::engine::kv::current_ms;
 
+/// Shared identity context for a single-key KV atomic operation
+/// (INCR_FLOAT / GETSET) dispatched to this core.
+pub(in crate::data::executor) struct KvAtomicCtx<'a> {
+    pub(in crate::data::executor) task: &'a ExecutionTask,
+    pub(in crate::data::executor) did: u64,
+    pub(in crate::data::executor) tid: u64,
+    pub(in crate::data::executor) collection: &'a str,
+    pub(in crate::data::executor) key: &'a [u8],
+    pub(in crate::data::executor) surrogate: nodedb_types::Surrogate,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_incr(
         &mut self,
-        task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
+        ctx: KvAtomicCtx<'_>,
         delta: i64,
         ttl_ms: u64,
     ) -> Response {
+        let KvAtomicCtx {
+            task,
+            did,
+            tid,
+            collection,
+            key,
+            surrogate,
+        } = ctx;
         debug!(core = self.core_id, %collection, delta, "kv incr");
 
         if self.kv_engine.is_over_budget() {
@@ -33,10 +47,18 @@ impl CoreLoop {
             .epoch_system_ms
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
-        match self
-            .kv_engine
-            .incr(did, tid, collection, key, delta, ttl_ms, now_ms)
-        {
+        match self.kv_engine.incr(
+            crate::engine::kv::AtomicKeyCtx {
+                database_id: did,
+                tenant_id: tid,
+                collection,
+                key,
+                now_ms,
+                surrogate,
+            },
+            delta,
+            ttl_ms,
+        ) {
             Ok(new_value) => {
                 if let Some(ref m) = self.metrics {
                     m.record_kv_put();
@@ -79,13 +101,17 @@ impl CoreLoop {
 
     pub(in crate::data::executor) fn execute_kv_incr_float(
         &mut self,
-        task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
+        ctx: KvAtomicCtx<'_>,
         delta: f64,
     ) -> Response {
+        let KvAtomicCtx {
+            task,
+            did,
+            tid,
+            collection,
+            key,
+            surrogate,
+        } = ctx;
         debug!(core = self.core_id, %collection, delta, "kv incr_float");
 
         if self.kv_engine.is_over_budget() {
@@ -96,10 +122,17 @@ impl CoreLoop {
             .epoch_system_ms
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
-        match self
-            .kv_engine
-            .incr_float(did, tid, collection, key, delta, now_ms)
-        {
+        match self.kv_engine.incr_float(
+            crate::engine::kv::AtomicKeyCtx {
+                database_id: did,
+                tenant_id: tid,
+                collection,
+                key,
+                now_ms,
+                surrogate,
+            },
+            delta,
+        ) {
             Ok(new_value) => {
                 if let Some(ref m) = self.metrics {
                     m.record_kv_put();
@@ -140,17 +173,20 @@ impl CoreLoop {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_cas(
         &mut self,
-        task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
+        ctx: KvAtomicCtx<'_>,
         expected: &[u8],
         new_value: &[u8],
     ) -> Response {
+        let KvAtomicCtx {
+            task,
+            did,
+            tid,
+            collection,
+            key,
+            surrogate,
+        } = ctx;
         debug!(core = self.core_id, %collection, "kv cas");
 
         if self.kv_engine.is_over_budget() {
@@ -161,9 +197,18 @@ impl CoreLoop {
             .epoch_system_ms
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
-        let result = self
-            .kv_engine
-            .cas(did, tid, collection, key, expected, new_value, now_ms);
+        let result = self.kv_engine.cas(
+            crate::engine::kv::AtomicKeyCtx {
+                database_id: did,
+                tenant_id: tid,
+                collection,
+                key,
+                now_ms,
+                surrogate,
+            },
+            expected,
+            new_value,
+        );
 
         if result.success {
             if let Some(ref m) = self.metrics {
@@ -200,13 +245,17 @@ impl CoreLoop {
 
     pub(in crate::data::executor) fn execute_kv_getset(
         &mut self,
-        task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
+        ctx: KvAtomicCtx<'_>,
         new_value: &[u8],
     ) -> Response {
+        let KvAtomicCtx {
+            task,
+            did,
+            tid,
+            collection,
+            key,
+            surrogate,
+        } = ctx;
         debug!(core = self.core_id, %collection, "kv getset");
 
         if self.kv_engine.is_over_budget() {
@@ -217,9 +266,17 @@ impl CoreLoop {
             .epoch_system_ms
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
-        let old = self
-            .kv_engine
-            .getset(did, tid, collection, key, new_value, now_ms);
+        let old = self.kv_engine.getset(
+            crate::engine::kv::AtomicKeyCtx {
+                database_id: did,
+                tenant_id: tid,
+                collection,
+                key,
+                now_ms,
+                surrogate,
+            },
+            new_value,
+        );
 
         if let Some(ref m) = self.metrics {
             m.record_kv_put();

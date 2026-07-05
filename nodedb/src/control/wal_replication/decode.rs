@@ -627,41 +627,69 @@ fn to_physical_plan(
             key,
             delta,
             ttl_ms,
-        } => PhysicalPlan::Kv(KvOp::Incr {
-            collection: collection.clone(),
-            key: key.clone(),
-            delta: *delta,
-            ttl_ms: *ttl_ms,
-        }),
+            surrogate,
+        } => {
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate =
+                bind_or_lookup(assigner, database_id, tenant_id, collection, key, carried)?;
+            PhysicalPlan::Kv(KvOp::Incr {
+                collection: collection.clone(),
+                key: key.clone(),
+                delta: *delta,
+                ttl_ms: *ttl_ms,
+                surrogate,
+            })
+        }
         ReplicatedWrite::KvIncrFloat {
             collection,
             key,
             delta,
-        } => PhysicalPlan::Kv(KvOp::IncrFloat {
-            collection: collection.clone(),
-            key: key.clone(),
-            delta: *delta,
-        }),
+            surrogate,
+        } => {
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate =
+                bind_or_lookup(assigner, database_id, tenant_id, collection, key, carried)?;
+            PhysicalPlan::Kv(KvOp::IncrFloat {
+                collection: collection.clone(),
+                key: key.clone(),
+                delta: *delta,
+                surrogate,
+            })
+        }
         ReplicatedWrite::KvCas {
             collection,
             key,
             expected,
             new_value,
-        } => PhysicalPlan::Kv(KvOp::Cas {
-            collection: collection.clone(),
-            key: key.clone(),
-            expected: expected.clone(),
-            new_value: new_value.clone(),
-        }),
+            surrogate,
+        } => {
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate =
+                bind_or_lookup(assigner, database_id, tenant_id, collection, key, carried)?;
+            PhysicalPlan::Kv(KvOp::Cas {
+                collection: collection.clone(),
+                key: key.clone(),
+                expected: expected.clone(),
+                new_value: new_value.clone(),
+                surrogate,
+            })
+        }
         ReplicatedWrite::KvGetSet {
             collection,
             key,
             new_value,
-        } => PhysicalPlan::Kv(KvOp::GetSet {
-            collection: collection.clone(),
-            key: key.clone(),
-            new_value: new_value.clone(),
-        }),
+            surrogate,
+        } => {
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate =
+                bind_or_lookup(assigner, database_id, tenant_id, collection, key, carried)?;
+            PhysicalPlan::Kv(KvOp::GetSet {
+                collection: collection.clone(),
+                key: key.clone(),
+                new_value: new_value.clone(),
+                surrogate,
+            })
+        }
         ReplicatedWrite::KvRegisterSortedIndex {
             collection,
             index_name,

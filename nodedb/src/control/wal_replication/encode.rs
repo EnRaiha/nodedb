@@ -333,40 +333,48 @@ pub fn to_replicated_entry(
             key,
             delta,
             ttl_ms,
+            surrogate,
         }) => ReplicatedWrite::KvIncr {
             collection: collection.clone(),
             key: key.clone(),
             delta: *delta,
             ttl_ms: *ttl_ms,
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Kv(KvOp::IncrFloat {
             collection,
             key,
             delta,
+            surrogate,
         }) => ReplicatedWrite::KvIncrFloat {
             collection: collection.clone(),
             key: key.clone(),
             delta: *delta,
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Kv(KvOp::Cas {
             collection,
             key,
             expected,
             new_value,
+            surrogate,
         }) => ReplicatedWrite::KvCas {
             collection: collection.clone(),
             key: key.clone(),
             expected: expected.clone(),
             new_value: new_value.clone(),
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Kv(KvOp::GetSet {
             collection,
             key,
             new_value,
+            surrogate,
         }) => ReplicatedWrite::KvGetSet {
             collection: collection.clone(),
             key: key.clone(),
             new_value: new_value.clone(),
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Kv(KvOp::RegisterSortedIndex {
             collection,

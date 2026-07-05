@@ -146,24 +146,39 @@ pub fn wal_append_kv_op(
             key,
             delta,
             ttl_ms,
+            surrogate,
         } => {
-            let entry = zerompk::to_msgpack_vec(&("kv_incr", collection, key, delta, ttl_ms))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv incr: {e}"),
-                })?;
+            let entry = zerompk::to_msgpack_vec(&(
+                "kv_incr",
+                collection,
+                key,
+                delta,
+                ttl_ms,
+                surrogate.as_u32(),
+            ))
+            .map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal kv incr: {e}"),
+            })?;
             wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
         }
         KvOp::IncrFloat {
             collection,
             key,
             delta,
+            surrogate,
         } => {
-            let entry = zerompk::to_msgpack_vec(&("kv_incr_float", collection, key, delta))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv incr_float: {e}"),
-                })?;
+            let entry = zerompk::to_msgpack_vec(&(
+                "kv_incr_float",
+                collection,
+                key,
+                delta,
+                surrogate.as_u32(),
+            ))
+            .map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal kv incr_float: {e}"),
+            })?;
             wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
         }
         KvOp::Cas {
@@ -171,24 +186,39 @@ pub fn wal_append_kv_op(
             key,
             expected,
             new_value,
+            surrogate,
         } => {
-            let entry = zerompk::to_msgpack_vec(&("kv_cas", collection, key, expected, new_value))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv cas: {e}"),
-                })?;
+            let entry = zerompk::to_msgpack_vec(&(
+                "kv_cas",
+                collection,
+                key,
+                expected,
+                new_value,
+                surrogate.as_u32(),
+            ))
+            .map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal kv cas: {e}"),
+            })?;
             wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
         }
         KvOp::GetSet {
             collection,
             key,
             new_value,
+            surrogate,
         } => {
-            let entry = zerompk::to_msgpack_vec(&("kv_getset", collection, key, new_value))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv getset: {e}"),
-                })?;
+            let entry = zerompk::to_msgpack_vec(&(
+                "kv_getset",
+                collection,
+                key,
+                new_value,
+                surrogate.as_u32(),
+            ))
+            .map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal kv getset: {e}"),
+            })?;
             wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
         }
         KvOp::RegisterSortedIndex {

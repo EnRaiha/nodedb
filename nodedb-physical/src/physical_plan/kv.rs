@@ -213,6 +213,12 @@ pub enum KvOp {
         delta: i64,
         /// TTL in milliseconds. 0 = preserve existing TTL.
         ttl_ms: u64,
+        /// Stable cross-engine identity, content-addressed on `(collection,
+        /// key)` by the CP-side `SurrogateAssigner`. Threaded to the engine
+        /// write-back so a row touched by an atomic op keeps the same
+        /// surrogate its original insert assigned. `Surrogate::ZERO` only in
+        /// test fixtures / when no assigner is wired.
+        surrogate: Surrogate,
     },
 
     /// Atomic float increment on a numeric value. Returns new value.
@@ -223,6 +229,8 @@ pub enum KvOp {
         collection: String,
         key: Vec<u8>,
         delta: f64,
+        /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
+        surrogate: Surrogate,
     },
 
     /// Compare-and-swap: set value to `new_value` only if current equals `expected`.
@@ -234,6 +242,8 @@ pub enum KvOp {
         key: Vec<u8>,
         expected: Vec<u8>,
         new_value: Vec<u8>,
+        /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
+        surrogate: Surrogate,
     },
 
     /// Atomic get-and-set: set new value, return old value.
@@ -243,6 +253,8 @@ pub enum KvOp {
         collection: String,
         key: Vec<u8>,
         new_value: Vec<u8>,
+        /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
+        surrogate: Surrogate,
     },
 
     // ── Atomic Transfer Operations ───────────────────────────────────
