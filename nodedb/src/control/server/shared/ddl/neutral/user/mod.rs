@@ -6,6 +6,7 @@ mod alter;
 mod create;
 mod drop;
 mod iso8601;
+mod reassign_owned;
 
 pub use alter::alter_user;
 pub use create::create_user;

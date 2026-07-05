@@ -284,4 +284,21 @@ impl SystemCatalog {
         }
         Ok(owners)
     }
+
+    /// Every `StoredOwner` row owned by `owner_username` within
+    /// `tenant_id`, across every `object_type`. Used by `DROP USER` to
+    /// enumerate the objects that must be reassigned before the user
+    /// row is removed, so no dangling `owner → user` reference can
+    /// survive the drop and brick the next boot's integrity check.
+    pub fn owners_for_user(
+        &self,
+        owner_username: &str,
+        tenant_id: u64,
+    ) -> crate::Result<Vec<StoredOwner>> {
+        Ok(self
+            .load_all_owners()?
+            .into_iter()
+            .filter(|o| o.owner_username == owner_username && o.tenant_id == tenant_id)
+            .collect())
+    }
 }

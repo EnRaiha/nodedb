@@ -2,14 +2,13 @@
 
 //! Protocol-neutral `DROP USER` DDL handler.
 //!
-//! Ported from the pgwire `ddl::user::drop` handler. All non-return logic
-//! (tenant-admin gate, self-drop guard, IF EXISTS short-circuit, owner-tenant
-//! lookup, `DropUser` catalog propose + single-node `log_index == 0` fallback,
-//! collection-ownership reassignment to the tenant admin, and `audit_record`)
-//! is preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `PgWireError` to [`DdlResult`] / [`DdlError`].
-
-use nodedb_types::DatabaseId;
+//! Ownership of every object the user owns (all owner-bearing kinds, not
+//! just collections) is reassigned to the tenant admin, and every grant
+//! made to the user is revoked, BEFORE the user row is removed — so no
+//! dangling `owner → user` or `permission.grantee → user` reference can
+//! survive the drop and brick the next boot's catalog integrity check.
+//! The reassignment is fail-closed: if it errors, the user is not
+//! dropped. See [`super::reassign_owned`].
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -17,6 +16,7 @@ use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status, strip_if_exists};
+use super::reassign_owned::reassign_owned_and_sweep_grants;
 
 /// DROP USER [IF EXISTS] <name>
 pub fn drop_user(
@@ -65,6 +65,14 @@ pub fn drop_user(
         });
     }
 
+    // Reassign every object owned by the user (all owner-bearing
+    // kinds) to the tenant admin, and revoke every grant made to the
+    // user, BEFORE removing the user row. Fail-closed: any error here
+    // aborts the drop, because a partially-reassigned-then-deleted user
+    // is exactly the dangling-reference bug this guards against.
+    let admin_name = format!("{}_admin", user_tenant.as_u64());
+    reassign_owned_and_sweep_grants(state, username, user_tenant, &admin_name)?;
+
     // `DropUser` fully removes the identity record on every node —
     // in-memory cache and redb catalog — so the username is freed
     // for reuse. A soft-delete tombstone would block a later
@@ -97,55 +105,6 @@ pub fn drop_user(
     };
 
     if dropped {
-        // Reassign owned collections to the tenant_admin of the
-        // user's tenant. Mutating the parent `StoredCollection`
-        // and re-proposing `PutCollection` is the durable path —
-        // a bare `PutOwner` would be silently overwritten the
-        // next time anyone re-proposed the parent.
-        let admin_name = format!("{}_admin", user_tenant.as_u64());
-        let grants = state.permissions.grants_for(&format!("user:{username}"));
-        if let Some(catalog) = state.credentials.catalog() {
-            for grant in &grants {
-                let Some(owner_obj) = extract_collection_from_target(&grant.target) else {
-                    continue;
-                };
-                if state
-                    .permissions
-                    .get_owner("collection", user_tenant, owner_obj)
-                    .as_deref()
-                    != Some(username)
-                {
-                    continue;
-                }
-                let mut stored = match catalog.get_collection(
-                    DatabaseId::DEFAULT,
-                    user_tenant.as_u64(),
-                    owner_obj,
-                ) {
-                    Ok(Some(c)) => c,
-                    _ => continue,
-                };
-                stored.owner = admin_name.clone();
-                let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(
-                    stored.clone(),
-                ));
-                if let Ok(idx) =
-                    crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-                    && idx == 0
-                {
-                    let _ = catalog.put_collection(DatabaseId::DEFAULT, &stored);
-                    state.permissions.install_replicated_owner(
-                        &crate::control::security::catalog::StoredOwner {
-                            object_type: "collection".into(),
-                            object_name: stored.name.clone(),
-                            tenant_id: stored.tenant_id,
-                            owner_username: stored.owner.clone(),
-                        },
-                    );
-                }
-            }
-        }
-
         state.audit_record(
             AuditEvent::PrivilegeChange,
             Some(identity.tenant_id),
@@ -158,15 +117,5 @@ pub fn drop_user(
             sqlstate: "42704".to_string(),
             message: format!("user '{username}' does not exist"),
         })
-    }
-}
-
-/// Extract collection name from a permission target like "collection:1:users".
-fn extract_collection_from_target(target: &str) -> Option<&str> {
-    let parts: Vec<&str> = target.splitn(3, ':').collect();
-    if parts.len() == 3 && parts[0] == "collection" {
-        Some(parts[2])
-    } else {
-        None
     }
 }
