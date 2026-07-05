@@ -108,20 +108,28 @@ fn is_auto_rowid_pk(primary_key: Option<&str>) -> bool {
     primary_key == Some("_rowid")
 }
 
+/// Mirrors the document-engine identity path (`extract_doc_id` +
+/// `is_auto_rowid_pk` + `assign_fresh` / `assign_for_pk`) for
+/// columnar/spatial rows. The declared `primary_key` — not the legacy
+/// `id`/`document_id`/`key` name guess — determines each row's identity, so
+/// a natural key on any column (e.g. `sku`) gets its own surrogate. A
+/// missing/empty key mints a fresh unique surrogate rather than collapsing
+/// onto `Surrogate::ZERO`, which would silently merge distinct rows.
 pub(super) fn columnar_row_surrogates(
     ctx: &ConvertContext,
     collection: &str,
     columnar_rows: &[&Vec<(String, SqlValue)>],
+    primary_key: Option<&str>,
 ) -> crate::Result<Vec<Surrogate>> {
     let mut out = Vec::with_capacity(columnar_rows.len());
     for row in columnar_rows {
-        let pk = row
-            .iter()
-            .find(|(k, _)| k == "id" || k == "document_id" || k == "key")
-            .map(|(_, v)| sql_value_to_string(v))
-            .unwrap_or_default();
+        if is_auto_rowid_pk(primary_key) {
+            out.push(assign_fresh(ctx, collection)?);
+            continue;
+        }
+        let pk = extract_doc_id(row, primary_key);
         if pk.is_empty() {
-            out.push(Surrogate::ZERO);
+            out.push(assign_fresh(ctx, collection)?);
         } else {
             out.push(assign_for_pk(ctx, collection, pk.as_bytes())?);
         }
@@ -242,7 +250,7 @@ pub(in super::super) fn convert_insert(
         } else {
             ColumnarInsertIntent::Insert
         };
-        let surrogates = columnar_row_surrogates(ctx, collection, &columnar_rows)?;
+        let surrogates = columnar_row_surrogates(ctx, collection, &columnar_rows, primary_key)?;
         let schema_bytes = build_schema_bytes(column_schema);
         tasks.push(PhysicalTask {
             tenant_id,
@@ -338,7 +346,7 @@ pub(in super::super) fn convert_upsert(
 
     if !columnar_rows.is_empty() {
         let payload = rows_to_msgpack_array(&columnar_rows, column_defaults)?;
-        let surrogates = columnar_row_surrogates(ctx, collection, &columnar_rows)?;
+        let surrogates = columnar_row_surrogates(ctx, collection, &columnar_rows, primary_key)?;
         let schema_bytes = build_schema_bytes(column_schema);
         tasks.push(PhysicalTask {
             tenant_id,
