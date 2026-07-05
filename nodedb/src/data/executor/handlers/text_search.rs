@@ -11,9 +11,10 @@ use crate::bridge::envelope::{ErrorCode, Response};
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::document::read::decode::decode_scanned_document;
+use crate::data::executor::handlers::transaction::overlay::FtsMergeParams;
 use crate::data::executor::response_codec::DocumentRow;
 use crate::data::executor::task::ExecutionTask;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId, TxnId};
 
 /// Parameters for [`CoreLoop::execute_text_search`].
 pub(in crate::data::executor) struct TextSearchParams<'a> {
@@ -37,6 +38,11 @@ pub(in crate::data::executor) struct HydrateTextHitsParams<'a> {
     pub top_k: usize,
     pub rls_filters: &'a [u8],
     pub strict_schema: Option<&'a nodedb_types::columnar::StrictSchema>,
+    /// The issuing transaction, when this read runs inside `BEGIN..COMMIT`.
+    /// A matched surrogate's body is resolved from this transaction's
+    /// staging overlay first (a doc inserted/updated in THIS transaction is
+    /// not yet in base storage), falling back to base storage otherwise.
+    pub txn_id: Option<TxnId>,
 }
 
 impl CoreLoop {
@@ -94,9 +100,31 @@ impl CoreLoop {
             }
         };
 
+        // Read-your-own-writes for FTS: fold this transaction's staged
+        // document bodies into the base search result before hydration, so
+        // a doc inserted/updated earlier in the same transaction appears
+        // (and one deleted is excluded) before COMMIT.
+        let mut merged: Vec<(nodedb_types::Surrogate, f32, bool)> = results
+            .iter()
+            .map(|r| (r.doc_id, r.score, r.fuzzy))
+            .collect();
+        if let Some(txn_id) = task.request.txn_id {
+            self.merge_fts_overlay_into_results(
+                FtsMergeParams {
+                    txn_id,
+                    database_id: task.request.database_id,
+                    tid: tenant_id,
+                    collection,
+                    query,
+                    top_k: fetch_k,
+                },
+                &mut merged,
+            );
+        }
+
         let strict_schema = self.strict_schema_for(tenant_id, collection);
         let rows = self.hydrate_text_hits(
-            results.iter().map(|r| (r.doc_id, r.score, r.fuzzy)),
+            merged,
             HydrateTextHitsParams {
                 database_id: task.request.database_id.as_u64(),
                 tid,
@@ -104,6 +132,7 @@ impl CoreLoop {
                 top_k,
                 rls_filters,
                 strict_schema: strict_schema.as_ref(),
+                txn_id: task.request.txn_id,
             },
         );
 
@@ -153,14 +182,28 @@ impl CoreLoop {
             top_k,
             rls_filters,
             strict_schema,
+            txn_id,
         } = params;
+        // Read-your-own-writes for the projection step: a matched surrogate
+        // added by the overlay merge (a doc inserted/updated in THIS
+        // transaction) has no body in base storage yet, so its columns must
+        // be projected from the staged `Put` bytes. Resolve every matched
+        // surrogate's body from the transaction's overlay first, falling
+        // back to base storage — mirroring the index-lookup fetch fix.
+        let coll_key = (
+            DatabaseId::new(database_id),
+            TenantId::new(tid),
+            collection.to_string(),
+        );
         let mut rows: Vec<DocumentRow> = Vec::new();
         for (surrogate, score, fuzzy) in hits {
             if rows.len() >= top_k {
                 break;
             }
             let hex_key = crate::engine::document::store::surrogate_to_doc_id(surrogate);
-            let bytes_opt = match self.sparse.get(database_id, tid, collection, &hex_key) {
+            let bytes_opt = match self.overlay_or_base_body(txn_id, &coll_key, &hex_key, || {
+                self.sparse.get(database_id, tid, collection, &hex_key)
+            }) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(

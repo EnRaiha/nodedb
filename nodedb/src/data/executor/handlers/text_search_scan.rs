@@ -14,6 +14,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::document::read::decode::decode_scanned_document;
 use crate::data::executor::handlers::text_search::HydrateTextHitsParams;
+use crate::data::executor::handlers::transaction::overlay::FtsMergeParams;
 use crate::data::executor::response_codec::DocumentRow;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
@@ -68,9 +69,32 @@ impl CoreLoop {
             }
         };
 
+        // Read-your-own-writes for FTS phrase search: fold staged document
+        // bodies into the base result with FAITHFUL phrase semantics. The
+        // staged doc's own analyzed token positions are self-contained, so
+        // the merge verifies the phrase's terms occur as a contiguous,
+        // in-order run (zero slop — the same adjacency the durable phrase
+        // search enforces on stored postings), NOT mere term presence.
+        let mut merged: Vec<(nodedb_types::Surrogate, f32, bool)> =
+            results.iter().map(|r| (r.doc_id, r.score, false)).collect();
+        if let Some(txn_id) = task.request.txn_id {
+            self.merge_fts_phrase_overlay_into_results(
+                FtsMergeParams {
+                    txn_id,
+                    database_id: task.request.database_id,
+                    tid: tenant_id,
+                    collection,
+                    query: "",
+                    top_k,
+                },
+                terms,
+                &mut merged,
+            );
+        }
+
         let strict_schema = self.strict_schema_for(tenant_id, collection);
         let rows = self.hydrate_text_hits(
-            results.iter().map(|r| (r.doc_id, r.score, false)),
+            merged,
             HydrateTextHitsParams {
                 database_id: task.request.database_id.as_u64(),
                 tid,
@@ -78,6 +102,7 @@ impl CoreLoop {
                 top_k,
                 rls_filters: &[],
                 strict_schema: strict_schema.as_ref(),
+                txn_id: task.request.txn_id,
             },
         );
         if let Some(ref m) = self.metrics {
@@ -120,7 +145,7 @@ impl CoreLoop {
         // Build a surrogate → score map from FTS hits. Bounded top_k: heap
         // allocation in BMW search is `Vec::with_capacity(top_k)`, so a literal
         // `usize::MAX` overflows on `top_k * size_of::<Element>()`.
-        let score_map: HashMap<nodedb_types::Surrogate, f32> = match self.inverted.search(
+        let mut score_map: HashMap<nodedb_types::Surrogate, f32> = match self.inverted.search(
             task.request.database_id.as_u64(),
             tenant_id,
             collection,
@@ -143,6 +168,23 @@ impl CoreLoop {
             }
         };
 
+        // Read-your-own-writes for FTS: fold staged document bodies into
+        // the score map (staged put re-scored/added, staged tombstone
+        // removed) before the collection scan renders rows below.
+        if let Some(txn_id) = task.request.txn_id {
+            self.merge_fts_overlay_into_score_map(
+                FtsMergeParams {
+                    txn_id,
+                    database_id: task.request.database_id,
+                    tid: tenant_id,
+                    collection,
+                    query,
+                    top_k: BM25_SCAN_MAX_HITS,
+                },
+                &mut score_map,
+            );
+        }
+
         // Retrieve the strict schema (if any) so binary-tuple rows decode correctly.
         let config_key = (tenant_id, collection.to_string());
         let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
@@ -162,7 +204,7 @@ impl CoreLoop {
             collection,
             BM25_SCAN_MAX_HITS,
         );
-        let docs = match scan_result {
+        let mut docs = match scan_result {
             Ok(d) => d,
             Err(e) => {
                 return self.response_error(
@@ -173,6 +215,29 @@ impl CoreLoop {
                 );
             }
         };
+
+        // Read-your-own-writes: fold staged document bodies into the row
+        // list, gating staged-row membership on the FTS match. `score_map`
+        // above was already narrowed to matching surrogates (staged puts
+        // that match inserted, non-matches / tombstones removed), so a
+        // staged doc appears as a row ONLY when it is in `score_map` —
+        // `text_match(...)` as a predicate must not surface a staged doc
+        // that does not contain the query term. A staged tombstone or a
+        // staged update that dropped the term removes its base row too.
+        if let Some(txn_id) = task.request.txn_id {
+            self.merge_fts_rows_from_score_map(
+                FtsMergeParams {
+                    txn_id,
+                    database_id: task.request.database_id,
+                    tid: tenant_id,
+                    collection,
+                    query,
+                    top_k: BM25_SCAN_MAX_HITS,
+                },
+                &mut docs,
+                &score_map,
+            );
+        }
 
         let mut rows: Vec<DocumentRow> = Vec::with_capacity(docs.len());
         for (hex_key, bytes) in &docs {

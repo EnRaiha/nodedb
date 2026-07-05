@@ -15,6 +15,7 @@
 
 mod compaction;
 mod core;
+mod corpus_stats;
 mod errors;
 mod indexing;
 mod search;
