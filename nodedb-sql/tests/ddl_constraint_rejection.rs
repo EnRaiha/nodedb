@@ -222,6 +222,81 @@ fn not_null_and_default_accepted() {
     }
 }
 
+// ── ENGINE = <name> trailing suffix (E1/#157 regression) ─────────────────────
+//
+// A MySQL-style trailing `ENGINE = <name>` (or `ENGINE=<name>`) after the
+// column list must feed the same `engine` field as `WITH (engine='<name>')`,
+// so both forms resolve to byte-identical `CollectionStmt::CreateCollection`
+// / `CreateTable` `engine` values.
+
+fn engine_field(sql: &str) -> Option<String> {
+    match parse_ok(sql) {
+        nodedb_sql::ddl_ast::NodedbStatement::Collection(
+            nodedb_sql::ddl_ast::CollectionStmt::CreateTable { engine, .. },
+        ) => engine,
+        nodedb_sql::ddl_ast::NodedbStatement::Collection(
+            nodedb_sql::ddl_ast::CollectionStmt::CreateCollection { engine, .. },
+        ) => engine,
+        other => panic!("expected CreateTable/CreateCollection, got {other:?} for: {sql}"),
+    }
+}
+
+#[test]
+fn engine_suffix_matches_with_clause() {
+    let suffix = engine_field("CREATE COLLECTION t (id INT PRIMARY KEY) ENGINE = timeseries");
+    let with_clause =
+        engine_field("CREATE COLLECTION t (id INT PRIMARY KEY) WITH (engine='timeseries')");
+    assert_eq!(suffix, Some("timeseries".to_string()));
+    assert_eq!(suffix, with_clause);
+}
+
+#[test]
+fn engine_suffix_no_spaces_around_equals() {
+    let engine = engine_field("CREATE COLLECTION t (id INT PRIMARY KEY) ENGINE=columnar");
+    assert_eq!(engine, Some("columnar".to_string()));
+}
+
+#[test]
+fn engine_suffix_survives_nested_paren_column_types() {
+    let stmt = parse_ok(
+        "CREATE COLLECTION t (id INT PRIMARY KEY, v VECTOR(3), amt NUMERIC(10,2)) ENGINE = kv",
+    );
+    if let nodedb_sql::ddl_ast::NodedbStatement::Collection(
+        nodedb_sql::ddl_ast::CollectionStmt::CreateCollection {
+            engine, columns, ..
+        },
+    ) = stmt
+    {
+        assert_eq!(engine, Some("kv".to_string()));
+        assert_eq!(columns.len(), 3, "columns: {columns:?}");
+    } else {
+        panic!("expected CreateCollection");
+    }
+}
+
+#[test]
+fn conflicting_with_and_suffix_engine_rejected() {
+    match ddl_parse(
+        "CREATE COLLECTION t (id INT PRIMARY KEY) WITH (engine='kv') ENGINE = timeseries",
+    ) {
+        Some(Err(SqlError::ConflictingEngineClause {
+            with_engine,
+            suffix_engine,
+        })) => {
+            assert_eq!(with_engine, "kv");
+            assert_eq!(suffix_engine, "timeseries");
+        }
+        other => panic!("expected ConflictingEngineClause, got {other:?}"),
+    }
+}
+
+#[test]
+fn agreeing_with_and_suffix_engine_accepted() {
+    let engine =
+        engine_field("CREATE COLLECTION t (id INT PRIMARY KEY) WITH (engine='kv') ENGINE = kv");
+    assert_eq!(engine, Some("kv".to_string()));
+}
+
 // ── CREATE COLLECTION regression pin ─────────────────────────────────────────
 
 #[test]

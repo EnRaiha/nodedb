@@ -83,10 +83,11 @@ pub async fn try_dispatch(
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
         Some(Ok(stmt)) => stmt,
         Some(Err(e)) => {
-            // UnsupportedConstraint → 0A000 (feature_not_supported).
+            // UnsupportedConstraint / ConflictingEngineClause → 0A000 (feature_not_supported).
             // All other parse errors → 42601 (syntax error).
             let sqlstate = match &e {
-                nodedb_sql::SqlError::UnsupportedConstraint { .. } => "0A000",
+                nodedb_sql::SqlError::UnsupportedConstraint { .. }
+                | nodedb_sql::SqlError::ConflictingEngineClause { .. } => "0A000",
                 _ => "42601",
             };
             return Some(Err(DdlError {

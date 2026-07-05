@@ -4,6 +4,33 @@
 
 use crate::error::SqlError;
 
+/// Find the byte offset of the closing paren that matches the first `(` in
+/// `body` (depth-aware, so nested parens like `VECTOR(128)` are handled).
+///
+/// Returns `None` when there is no column list (or it is unterminated).
+/// This is the single source of truth for the column-list boundary — any
+/// other consumer that needs to know "where does the column list end"
+/// (e.g. the trailing `ENGINE = <name>` suffix scan) MUST call this instead
+/// of re-deriving the boundary with a naive `find(')')`.
+pub(super) fn find_column_list_paren_end(body: &str) -> Option<usize> {
+    let paren_start = body.find('(')?;
+
+    let mut depth = 0usize;
+    for (i, b) in body.bytes().enumerate().skip(paren_start) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Extract `(name, type)` pairs from the first parenthesised column list
 /// in `body` (the text after the collection name). Returns an empty Vec
 /// when no column list is present or parsing fails.
@@ -15,23 +42,7 @@ pub(super) fn extract_column_pairs(body: &str) -> Result<Vec<(String, String)>, 
         None => return Ok(Vec::new()),
     };
 
-    // Stop at the matching close paren (depth-aware).
-    let mut depth = 0usize;
-    let mut paren_end = None;
-    for (i, b) in body.bytes().enumerate().skip(paren_start) {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    paren_end = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let paren_end = match paren_end {
+    let paren_end = match find_column_list_paren_end(body) {
         Some(p) => p,
         None => return Ok(Vec::new()),
     };

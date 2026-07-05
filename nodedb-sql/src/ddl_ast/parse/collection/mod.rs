@@ -14,6 +14,7 @@ mod alter_ops;
 mod body;
 mod column_list;
 mod dispatcher;
+mod engine_suffix;
 mod with_clause;
 
 pub(super) use dispatcher::try_parse;

@@ -53,6 +53,22 @@ pub enum SqlError {
     #[error("unsupported constraint: {feature}; {hint}")]
     UnsupportedConstraint { feature: String, hint: String },
 
+    /// Both a `WITH (engine='...')` clause and a trailing `ENGINE = ...`
+    /// suffix were given on the same `CREATE COLLECTION` / `CREATE TABLE`
+    /// statement, naming different engines.
+    ///
+    /// Rendered as SQLSTATE `0A000` (feature_not_supported), matching the
+    /// existing duplicate-axis rejection precedent for `WITH (profile=...)`.
+    #[error(
+        "conflicting engine selection: WITH (engine='{with_engine}') and \
+         ENGINE = {suffix_engine} name different engines; only one engine-selection \
+         clause is allowed"
+    )]
+    ConflictingEngineClause {
+        with_engine: String,
+        suffix_engine: String,
+    },
+
     /// WITH RECURSIVE used a set operator other than UNION or UNION ALL.
     ///
     /// Only `UNION` and `UNION ALL` are permitted in the recursive term of a
