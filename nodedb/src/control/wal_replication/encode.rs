@@ -78,6 +78,19 @@ pub fn to_replicated_entry(
             updates: updates.clone(),
             surrogate: surrogate.as_u32(),
         },
+        PhysicalPlan::Document(DocumentOp::Upsert {
+            collection,
+            document_id,
+            value,
+            on_conflict_updates,
+            surrogate,
+        }) => ReplicatedWrite::DocUpsert {
+            collection: collection.clone(),
+            document_id: document_id.clone(),
+            value: value.clone(),
+            on_conflict_updates: on_conflict_updates.clone(),
+            surrogate: surrogate.as_u32(),
+        },
         PhysicalPlan::Vector(VectorOp::Insert {
             collection,
             vector,

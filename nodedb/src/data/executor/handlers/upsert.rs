@@ -336,7 +336,14 @@ pub(in crate::data::executor) fn apply_on_conflict_updates(
 }
 
 /// Merge two `nodedb_types::Value` objects: overlay `new` fields onto `existing`.
-fn merge_values(existing: nodedb_types::Value, new: nodedb_types::Value) -> nodedb_types::Value {
+///
+/// Shared with the in-transaction staging path (`stage_write/stage_upsert.rs`)
+/// so a staged `UPSERT INTO` with no `ON CONFLICT DO UPDATE` clause merges
+/// identically to the autocommit handler above.
+pub(in crate::data::executor) fn merge_values(
+    existing: nodedb_types::Value,
+    new: nodedb_types::Value,
+) -> nodedb_types::Value {
     match (existing, new) {
         (nodedb_types::Value::Object(mut existing_map), nodedb_types::Value::Object(new_map)) => {
             for (k, v) in new_map {

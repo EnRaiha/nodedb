@@ -20,6 +20,7 @@ mod stage_bulk_delete;
 mod stage_bulk_update;
 mod stage_insert_select;
 mod stage_kv;
+mod stage_upsert;
 
 pub(in crate::data::executor) use stage_bulk_delete::StageBulkDeleteParams;
 pub(in crate::data::executor) use stage_bulk_update::StageBulkUpdateParams;

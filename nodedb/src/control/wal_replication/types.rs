@@ -147,6 +147,19 @@ pub enum ReplicatedWrite {
         /// Leader-assigned global surrogate (binding key = `document_id`).
         surrogate: u32,
     },
+    /// `UPSERT INTO` semantics (insert if absent, else merge/`ON CONFLICT DO
+    /// UPDATE SET ...`). `value` is the would-be-inserted document, not a
+    /// precomputed merge result -- replay re-runs the read-modify-write
+    /// deterministically on the follower using `on_conflict_updates`, same
+    /// as `KvInsertOnConflictUpdate` / `PointUpdate`.
+    DocUpsert {
+        collection: String,
+        document_id: String,
+        value: Vec<u8>,
+        on_conflict_updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
+        /// Leader-assigned global surrogate (binding key = `document_id`).
+        surrogate: u32,
+    },
     VectorInsert {
         collection: String,
         vector: Vec<f32>,

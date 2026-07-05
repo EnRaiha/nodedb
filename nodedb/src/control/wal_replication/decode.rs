@@ -227,6 +227,31 @@ fn to_physical_plan(
                 returning: None,
             })
         }
+        ReplicatedWrite::DocUpsert {
+            collection,
+            document_id,
+            value,
+            on_conflict_updates,
+            surrogate,
+        } => {
+            let pk_bytes = document_id.as_bytes().to_vec();
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate = bind_or_lookup(
+                assigner,
+                database_id,
+                tenant_id,
+                collection,
+                &pk_bytes,
+                carried,
+            )?;
+            PhysicalPlan::Document(DocumentOp::Upsert {
+                collection: collection.clone(),
+                document_id: document_id.clone(),
+                value: value.clone(),
+                on_conflict_updates: on_conflict_updates.clone(),
+                surrogate,
+            })
+        }
         ReplicatedWrite::VectorInsert {
             collection,
             vector,

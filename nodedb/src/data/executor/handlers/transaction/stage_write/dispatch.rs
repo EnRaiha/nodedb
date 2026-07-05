@@ -157,6 +157,22 @@ impl CoreLoop {
                 source_limit: *source_limit,
             }),
 
+            // `UPSERT INTO` staged at statement time -- resolve the current
+            // body under BASE ∪ OVERLAY and either insert or merge/apply
+            // `ON CONFLICT DO UPDATE SET`, mirroring the autocommit
+            // `execute_upsert` handler exactly. `Upsert` has no `RETURNING`
+            // variant, so it is always stageable (see `is_point_write`).
+            DocumentOp::Upsert {
+                collection,
+                document_id,
+                value,
+                on_conflict_updates,
+                surrogate,
+            } => {
+                let ctx = StageCtx::new(task, tid, txn_id, collection, document_id, *surrogate);
+                self.stage_document_upsert(&ctx, value, on_conflict_updates)
+            }
+
             DocumentOp::PointGet { .. }
             | DocumentOp::Scan { .. }
             | DocumentOp::BatchInsert { .. }
@@ -168,7 +184,6 @@ impl CoreLoop {
             | DocumentOp::BackfillIndex { .. }
             | DocumentOp::Truncate { .. }
             | DocumentOp::EstimateCount { .. }
-            | DocumentOp::Upsert { .. }
             | DocumentOp::UpdateFromJoin { .. }
             | DocumentOp::Merge { .. }
             | DocumentOp::MaterializeScan { .. } => self.stage_not_point_write(task),
