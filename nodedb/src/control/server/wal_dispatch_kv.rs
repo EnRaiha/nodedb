@@ -133,12 +133,19 @@ pub fn wal_append_kv_op(
             collection,
             key,
             updates,
+            surrogate,
         } => {
-            let entry = zerompk::to_msgpack_vec(&("kv_field_set", collection, key, updates))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv field set: {e}"),
-                })?;
+            let entry = zerompk::to_msgpack_vec(&(
+                "kv_field_set",
+                collection,
+                key,
+                updates,
+                surrogate.as_u32(),
+            ))
+            .map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal kv field set: {e}"),
+            })?;
             wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
         }
         KvOp::Incr {

@@ -13,9 +13,14 @@
 //! are never derived from different code paths -- mirrors `stage_kv_atomic.rs`'s
 //! reuse of `engine_atomic_compute`.
 //!
-//! Like `Incr` / `IncrFloat` / `Cas` / `GetSet`, these three ops carry no
-//! surrogate on their plan, so [`CoreLoop::kv_atomic_stage_ctx`] (shared with
-//! `stage_kv_atomic.rs`) resolves a stable overlay slot per key.
+//! Like `Incr` / `IncrFloat` / `Cas` / `GetSet`, these three ops carry a
+//! planner-assigned cross-engine surrogate on their plan. That surrogate binds
+//! the durable identity at COMMIT-time replay (`execute_kv_field_set` /
+//! `execute_kv_transfer` / `execute_kv_transfer_item`); the statement-time
+//! staging overlay does not persist and keys its own slots, so
+//! [`CoreLoop::kv_atomic_stage_ctx`] (shared with `stage_kv_atomic.rs`)
+//! resolves a stable overlay slot per key and the plan surrogate is ignored
+//! here.
 
 use nodedb_physical::physical_plan::KvOp;
 
@@ -55,6 +60,9 @@ impl CoreLoop {
                 collection,
                 key,
                 updates,
+                // Durable identity binds at COMMIT-time replay; the overlay
+                // keys its own slots (see module doc) and ignores it.
+                surrogate: _,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
                 self.stage_kv_field_set(&ctx, key, updates)
@@ -65,12 +73,15 @@ impl CoreLoop {
                 dest_key,
                 field,
                 amount,
+                debit_surrogate: _,
+                credit_surrogate: _,
             } => self.stage_kv_transfer(&cx, collection, source_key, dest_key, field, *amount),
             KvOp::TransferItem {
                 source_collection,
                 dest_collection,
                 item_key,
                 dest_key,
+                surrogate: _,
             } => self.stage_kv_transfer_item(
                 &cx,
                 source_collection,

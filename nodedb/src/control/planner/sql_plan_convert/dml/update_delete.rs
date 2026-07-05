@@ -56,14 +56,23 @@ pub(in super::super) fn convert_update(
                     }
                 })
                 .collect();
+            let key_bytes = sql_value_to_bytes(key);
+            // Content-addressed cross-engine identity so the merged row keeps
+            // the surrogate its original insert assigned. `Surrogate::ZERO`
+            // only when no assigner is wired (test / embedded-without-catalog).
+            let surrogate = match ctx.surrogate_assigner.as_ref() {
+                Some(a) => a.assign(ctx.database_id, ctx.tenant_id, collection, &key_bytes)?,
+                None => Surrogate::ZERO,
+            };
             tasks.push(PhysicalTask {
                 tenant_id,
                 vshard_id: vshard,
                 database_id: ctx.database_id,
                 plan: PhysicalPlan::Kv(KvOp::FieldSet {
                     collection: collection.into(),
-                    key: sql_value_to_bytes(key),
+                    key: key_bytes,
                     updates: field_updates,
+                    surrogate,
                 }),
                 post_set_op: PostSetOp::None,
                 txn_id: None,

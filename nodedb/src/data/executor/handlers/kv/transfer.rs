@@ -24,6 +24,22 @@ pub(in crate::data::executor) struct TransferParams<'a> {
     pub dest_key: &'a [u8],
     pub field: &'a str,
     pub amount: f64,
+    /// Cross-engine surrogate of the debit (source) row.
+    pub debit_surrogate: nodedb_types::Surrogate,
+    /// Cross-engine surrogate of the credit (dest) row.
+    pub credit_surrogate: nodedb_types::Surrogate,
+}
+
+/// Parameters for an atomic non-fungible item transfer.
+pub(in crate::data::executor) struct TransferItemParams<'a> {
+    pub did: u64,
+    pub tid: u64,
+    pub source_collection: &'a str,
+    pub dest_collection: &'a str,
+    pub item_key: &'a [u8],
+    pub dest_key: &'a [u8],
+    /// Cross-engine surrogate of the moved row at its destination.
+    pub surrogate: nodedb_types::Surrogate,
 }
 
 impl CoreLoop {
@@ -43,6 +59,8 @@ impl CoreLoop {
             dest_key,
             field,
             amount,
+            debit_surrogate,
+            credit_surrogate,
         } = params;
         debug!(core = self.core_id, %collection, %field, amount, "kv transfer");
 
@@ -107,7 +125,7 @@ impl CoreLoop {
                 &new_source,
                 0,
                 now_ms,
-                nodedb_types::Surrogate::ZERO,
+                debit_surrogate,
             );
             self.kv_engine.put(
                 did,
@@ -117,7 +135,7 @@ impl CoreLoop {
                 &new_dest,
                 0,
                 now_ms,
-                nodedb_types::Surrogate::ZERO,
+                credit_surrogate,
             );
         } else {
             self.kv_engine.put(
@@ -128,7 +146,7 @@ impl CoreLoop {
                 &new_dest,
                 0,
                 now_ms,
-                nodedb_types::Surrogate::ZERO,
+                credit_surrogate,
             );
             self.kv_engine.put(
                 did,
@@ -138,7 +156,7 @@ impl CoreLoop {
                 &new_source,
                 0,
                 now_ms,
-                nodedb_types::Surrogate::ZERO,
+                debit_surrogate,
             );
         }
 
@@ -190,17 +208,20 @@ impl CoreLoop {
     }
 
     /// Atomic non-fungible item transfer: verify + delete + insert in one pass.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_transfer_item(
         &mut self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        source_collection: &str,
-        dest_collection: &str,
-        item_key: &[u8],
-        dest_key: &[u8],
+        params: TransferItemParams<'_>,
     ) -> Response {
+        let TransferItemParams {
+            did,
+            tid,
+            source_collection,
+            dest_collection,
+            item_key,
+            dest_key,
+            surrogate,
+        } = params;
         debug!(core = self.core_id, %source_collection, %dest_collection, "kv transfer item");
 
         if self.kv_engine.is_over_budget() {
@@ -228,7 +249,7 @@ impl CoreLoop {
             &item_data,
             0,
             now_ms,
-            nodedb_types::Surrogate::ZERO,
+            surrogate,
         );
 
         if let Some(ref m) = self.metrics {

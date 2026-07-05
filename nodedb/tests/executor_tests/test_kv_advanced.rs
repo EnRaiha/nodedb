@@ -374,6 +374,7 @@ fn kv_field_get_and_set() {
                 nodedb_types::value_to_msgpack(&nodedb_types::Value::String("eu-west".into()))
                     .unwrap(),
             )],
+            surrogate: nodedb_types::Surrogate::ZERO,
         }),
     );
 

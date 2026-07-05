@@ -143,7 +143,18 @@ impl CoreLoop {
                 collection,
                 key,
                 updates,
-            } => self.execute_kv_field_set(task, did, tid, collection, key, updates),
+                surrogate,
+            } => self.execute_kv_field_set(
+                super::atomic::KvAtomicCtx {
+                    task,
+                    did,
+                    tid,
+                    collection,
+                    key,
+                    surrogate: *surrogate,
+                },
+                updates,
+            ),
             KvOp::GetTtl { collection, key } => {
                 self.execute_kv_get_ttl(task, did, tid, collection, key)
             }
@@ -275,6 +286,8 @@ impl CoreLoop {
                 dest_key,
                 field,
                 amount,
+                debit_surrogate,
+                credit_surrogate,
             } => self.execute_kv_transfer(
                 task,
                 super::transfer::TransferParams {
@@ -285,6 +298,8 @@ impl CoreLoop {
                     dest_key,
                     field,
                     amount: *amount,
+                    debit_surrogate: *debit_surrogate,
+                    credit_surrogate: *credit_surrogate,
                 },
             ),
             KvOp::TransferItem {
@@ -292,14 +307,18 @@ impl CoreLoop {
                 dest_collection,
                 item_key,
                 dest_key,
+                surrogate,
             } => self.execute_kv_transfer_item(
                 task,
-                did,
-                tid,
-                source_collection,
-                dest_collection,
-                item_key,
-                dest_key,
+                super::transfer::TransferItemParams {
+                    did,
+                    tid,
+                    source_collection,
+                    dest_collection,
+                    item_key,
+                    dest_key,
+                    surrogate: *surrogate,
+                },
             ),
             KvOp::MaterializeScan {
                 collection,

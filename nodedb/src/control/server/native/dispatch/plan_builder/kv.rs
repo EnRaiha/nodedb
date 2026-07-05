@@ -125,6 +125,7 @@ pub(crate) fn build_field_get(
 }
 
 pub(crate) fn build_field_set(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -136,11 +137,13 @@ pub(crate) fn build_field_set(
             detail: "missing 'updates'".to_string(),
         })?
         .clone();
+    let surrogate = assign_kv_surrogate(ctx, collection, &key)?;
 
     Ok(PhysicalPlan::Kv(KvOp::FieldSet {
         collection: collection.to_string(),
         key,
         updates,
+        surrogate,
     }))
 }
 

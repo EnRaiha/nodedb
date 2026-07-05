@@ -404,10 +404,12 @@ pub fn to_replicated_entry(
             collection,
             key,
             updates,
+            surrogate,
         }) => ReplicatedWrite::KvFieldSet {
             collection: collection.clone(),
             key: key.clone(),
             updates: updates.clone(),
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Kv(KvOp::Transfer {
             collection,
@@ -415,23 +417,29 @@ pub fn to_replicated_entry(
             dest_key,
             field,
             amount,
+            debit_surrogate,
+            credit_surrogate,
         }) => ReplicatedWrite::KvTransfer {
             collection: collection.clone(),
             source_key: source_key.clone(),
             dest_key: dest_key.clone(),
             field: field.clone(),
             amount: *amount,
+            debit_surrogate: debit_surrogate.as_u32(),
+            credit_surrogate: credit_surrogate.as_u32(),
         },
         PhysicalPlan::Kv(KvOp::TransferItem {
             source_collection,
             dest_collection,
             item_key,
             dest_key,
+            surrogate,
         }) => ReplicatedWrite::KvTransferItem {
             source_collection: source_collection.clone(),
             dest_collection: dest_collection.clone(),
             item_key: item_key.clone(),
             dest_key: dest_key.clone(),
+            surrogate: surrogate.as_u32(),
         },
         PhysicalPlan::Columnar(ColumnarOp::Insert {
             collection,

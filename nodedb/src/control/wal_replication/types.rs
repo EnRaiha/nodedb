@@ -467,6 +467,9 @@ pub enum ReplicatedWrite {
         collection: String,
         key: Vec<u8>,
         updates: Vec<(String, Vec<u8>)>,
+        /// Leader-assigned cross-engine surrogate for the merged row. The
+        /// follower binds this exact identity via `bind_or_lookup`.
+        surrogate: u32,
     },
     /// Atomic fungible transfer (`source.field -= amount`, `dest.field +=
     /// amount`). Replay re-runs the read-validate-write deterministically on
@@ -479,6 +482,10 @@ pub enum ReplicatedWrite {
         dest_key: Vec<u8>,
         field: String,
         amount: f64,
+        /// Leader-assigned surrogate of the debit (source) row.
+        debit_surrogate: u32,
+        /// Leader-assigned surrogate of the credit (dest) row.
+        credit_surrogate: u32,
     },
     /// Atomic non-fungible item transfer (verify + delete + insert). Replay
     /// re-runs the same verify-then-move on the follower.
@@ -487,6 +494,8 @@ pub enum ReplicatedWrite {
         dest_collection: String,
         item_key: Vec<u8>,
         dest_key: Vec<u8>,
+        /// Leader-assigned surrogate of the moved row at its destination.
+        surrogate: u32,
     },
     /// An array CRDT op (Put or Delete) from a Lite peer, to be applied via
     /// the distributed applier on all replicas.

@@ -11,7 +11,7 @@ mod index;
 mod materialize_scan;
 mod scan;
 mod sorted;
-mod transfer;
+pub(in crate::data::executor) mod transfer;
 mod ttl;
 
 pub(in crate::data::executor) mod field_compute;

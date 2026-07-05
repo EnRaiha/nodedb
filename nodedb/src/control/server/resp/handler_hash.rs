@@ -104,10 +104,23 @@ pub(super) async fn handle_hset(
         })
         .collect();
 
+    // Content-addressed cross-engine identity so the merged row keeps the
+    // surrogate its original insert assigned.
+    let surrogate = match state.surrogate_assigner.assign(
+        nodedb_types::DatabaseId::DEFAULT,
+        session.tenant_id,
+        &session.collection,
+        &key,
+    ) {
+        Ok(s) => s,
+        Err(e) => return RespValue::err(format!("ERR {e}")),
+    };
+
     let plan = PhysicalPlan::Kv(KvOp::FieldSet {
         collection: session.collection.clone(),
         key,
         updates,
+        surrogate,
     });
 
     match dispatch_kv_write(state, session, plan).await {

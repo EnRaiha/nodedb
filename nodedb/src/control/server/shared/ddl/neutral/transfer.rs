@@ -65,12 +65,38 @@ pub async fn transfer(
     // inside a `BEGIN..COMMIT` block `KvOp::Transfer` is staged into the
     // per-transaction overlay so a same-transaction read observes both
     // updated balances and COMMIT durably replays the same op.
+    // Content-addressed cross-engine identity per key: the debited (source)
+    // row and the credited (dest) row each keep the surrogate their original
+    // insert assigned. Distinct keys → distinct surrogates, so the two rows
+    // never collapse onto one identity.
+    let source_bytes = source_key.into_bytes();
+    let dest_bytes = dest_key.into_bytes();
+    let debit_surrogate = state
+        .surrogate_assigner
+        .assign(
+            DatabaseId::DEFAULT,
+            identity.tenant_id,
+            &collection,
+            &source_bytes,
+        )
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+    let credit_surrogate = state
+        .surrogate_assigner
+        .assign(
+            DatabaseId::DEFAULT,
+            identity.tenant_id,
+            &collection,
+            &dest_bytes,
+        )
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::Transfer {
         collection,
-        source_key: source_key.into_bytes(),
-        dest_key: dest_key.into_bytes(),
+        source_key: source_bytes,
+        dest_key: dest_bytes,
         field,
         amount,
+        debit_surrogate,
+        credit_surrogate,
     });
 
     dispatch_and_respond(state, identity, vshard, plan, "TRANSFER", txn_ctx).await
@@ -115,13 +141,27 @@ pub async fn transfer_item(
     let item_key = format!("{source_owner}:{item_id}");
     let dest_key = format!("{dest_owner}:{item_id}");
 
+    // The moved row's identity is content-addressed at its DESTINATION
+    // `(dest_collection, dest_key)`, matching the engine write-back.
+    let dest_bytes = dest_key.into_bytes();
+    let surrogate = state
+        .surrogate_assigner
+        .assign(
+            DatabaseId::DEFAULT,
+            identity.tenant_id,
+            &dest_collection,
+            &dest_bytes,
+        )
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
+
     // Dispatch to Data Plane — verify + delete + insert is atomic. Routed
     // through the same in-transaction staging gate as `TRANSFER` (see above).
     let plan = PhysicalPlan::Kv(KvOp::TransferItem {
         source_collection,
         dest_collection,
         item_key: item_key.into_bytes(),
-        dest_key: dest_key.into_bytes(),
+        dest_key: dest_bytes,
+        surrogate,
     });
 
     dispatch_and_respond(state, identity, vshard_src, plan, "TRANSFER_ITEM", txn_ctx).await

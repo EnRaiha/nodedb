@@ -64,7 +64,7 @@ pub(crate) fn build_plan(
         OpCode::KvBatchGet => kv::build_batch_get(fields, collection),
         OpCode::KvBatchPut => kv::build_batch_put(fields, collection),
         OpCode::KvFieldGet => kv::build_field_get(fields, collection),
-        OpCode::KvFieldSet => kv::build_field_set(fields, collection),
+        OpCode::KvFieldSet => kv::build_field_set(ctx, fields, collection),
         // CRDT.
         OpCode::CrdtRead => crdt::build_read(fields, collection),
         OpCode::CrdtApply => crdt::build_apply(ctx, fields, collection),

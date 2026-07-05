@@ -213,10 +213,21 @@ impl CoreLoop {
                 collection,
                 key,
                 updates,
+                surrogate,
             } => {
                 let now_ms = current_ms();
                 let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
-                let resp = self.execute_kv_field_set(task, did, tid, collection, key, updates);
+                let resp = self.execute_kv_field_set(
+                    crate::data::executor::handlers::kv::atomic::KvAtomicCtx {
+                        task,
+                        did,
+                        tid,
+                        collection,
+                        key,
+                        surrogate: *surrogate,
+                    },
+                    updates,
+                );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv field set failed".into(),
@@ -399,6 +410,7 @@ impl CoreLoop {
                 dest_collection,
                 item_key,
                 dest_key,
+                surrogate,
             } => {
                 let now_ms = current_ms();
                 let source_prior =
@@ -409,12 +421,15 @@ impl CoreLoop {
                     .get(did, tid, dest_collection, dest_key, now_ms);
                 let resp = self.execute_kv_transfer_item(
                     task,
-                    did,
-                    tid,
-                    source_collection,
-                    dest_collection,
-                    item_key,
-                    dest_key,
+                    crate::data::executor::handlers::kv::transfer::TransferItemParams {
+                        did,
+                        tid,
+                        source_collection,
+                        dest_collection,
+                        item_key,
+                        dest_key,
+                        surrogate: *surrogate,
+                    },
                 );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {

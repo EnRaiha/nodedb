@@ -718,35 +718,79 @@ fn to_physical_plan(
             collection,
             key,
             updates,
-        } => PhysicalPlan::Kv(KvOp::FieldSet {
-            collection: collection.clone(),
-            key: key.clone(),
-            updates: updates.clone(),
-        }),
+            surrogate,
+        } => {
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate =
+                bind_or_lookup(assigner, database_id, tenant_id, collection, key, carried)?;
+            PhysicalPlan::Kv(KvOp::FieldSet {
+                collection: collection.clone(),
+                key: key.clone(),
+                updates: updates.clone(),
+                surrogate,
+            })
+        }
         ReplicatedWrite::KvTransfer {
             collection,
             source_key,
             dest_key,
             field,
             amount,
-        } => PhysicalPlan::Kv(KvOp::Transfer {
-            collection: collection.clone(),
-            source_key: source_key.clone(),
-            dest_key: dest_key.clone(),
-            field: field.clone(),
-            amount: *amount,
-        }),
+            debit_surrogate,
+            credit_surrogate,
+        } => {
+            let carried_debit = nodedb_types::Surrogate::new(*debit_surrogate);
+            let debit_surrogate = bind_or_lookup(
+                assigner,
+                database_id,
+                tenant_id,
+                collection,
+                source_key,
+                carried_debit,
+            )?;
+            let carried_credit = nodedb_types::Surrogate::new(*credit_surrogate);
+            let credit_surrogate = bind_or_lookup(
+                assigner,
+                database_id,
+                tenant_id,
+                collection,
+                dest_key,
+                carried_credit,
+            )?;
+            PhysicalPlan::Kv(KvOp::Transfer {
+                collection: collection.clone(),
+                source_key: source_key.clone(),
+                dest_key: dest_key.clone(),
+                field: field.clone(),
+                amount: *amount,
+                debit_surrogate,
+                credit_surrogate,
+            })
+        }
         ReplicatedWrite::KvTransferItem {
             source_collection,
             dest_collection,
             item_key,
             dest_key,
-        } => PhysicalPlan::Kv(KvOp::TransferItem {
-            source_collection: source_collection.clone(),
-            dest_collection: dest_collection.clone(),
-            item_key: item_key.clone(),
-            dest_key: dest_key.clone(),
-        }),
+            surrogate,
+        } => {
+            let carried = nodedb_types::Surrogate::new(*surrogate);
+            let surrogate = bind_or_lookup(
+                assigner,
+                database_id,
+                tenant_id,
+                dest_collection,
+                dest_key,
+                carried,
+            )?;
+            PhysicalPlan::Kv(KvOp::TransferItem {
+                source_collection: source_collection.clone(),
+                dest_collection: dest_collection.clone(),
+                item_key: item_key.clone(),
+                dest_key: dest_key.clone(),
+                surrogate,
+            })
+        }
         ReplicatedWrite::ColumnarIngest {
             collection,
             payload,

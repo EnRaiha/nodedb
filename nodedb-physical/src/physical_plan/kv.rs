@@ -195,6 +195,12 @@ pub enum KvOp {
         key: Vec<u8>,
         /// Field name → new value (JSON-encoded bytes).
         updates: Vec<(String, Vec<u8>)>,
+        /// Stable cross-engine identity, content-addressed on `(collection,
+        /// key)` by the CP-side `SurrogateAssigner`. Threaded to the engine
+        /// write-back so a row touched by a field merge keeps the same
+        /// surrogate its original insert assigned. `Surrogate::ZERO` only in
+        /// test fixtures / when no assigner is wired.
+        surrogate: Surrogate,
     },
 
     /// Truncate: delete ALL entries in a KV collection.
@@ -269,6 +275,16 @@ pub enum KvOp {
         field: String,
         /// Amount to transfer (encoded as f64 bytes).
         amount: f64,
+        /// Stable cross-engine identity of the debit (source) row, content-
+        /// addressed on `(collection, source_key)`. Threaded to the source
+        /// write-back so the debited row keeps its surrogate. `Surrogate::ZERO`
+        /// only in test fixtures / when no assigner is wired.
+        debit_surrogate: Surrogate,
+        /// Stable cross-engine identity of the credit (dest) row, content-
+        /// addressed on `(collection, dest_key)`. Threaded to the dest
+        /// write-back so the credited row keeps its surrogate. Distinct from
+        /// `debit_surrogate` so the two rows never collapse onto one identity.
+        credit_surrogate: Surrogate,
     },
 
     /// Atomic non-fungible item transfer: verify + delete + insert in one pass.
@@ -280,6 +296,11 @@ pub enum KvOp {
         dest_collection: String,
         item_key: Vec<u8>,
         dest_key: Vec<u8>,
+        /// Stable cross-engine identity of the moved row at its destination,
+        /// content-addressed on `(dest_collection, dest_key)`. Threaded to the
+        /// dest write-back so the inserted row carries its surrogate.
+        /// `Surrogate::ZERO` only in test fixtures / when no assigner is wired.
+        surrogate: Surrogate,
     },
 
     // ── Sorted Index (Leaderboard) Operations ──────────────────────────

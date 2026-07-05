@@ -66,13 +66,17 @@ impl CoreLoop {
 
     pub(in crate::data::executor) fn execute_kv_field_set(
         &mut self,
-        task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
+        ctx: super::atomic::KvAtomicCtx<'_>,
         updates: &[(String, Vec<u8>)],
     ) -> Response {
+        let super::atomic::KvAtomicCtx {
+            task,
+            did,
+            tid,
+            collection,
+            key,
+            surrogate,
+        } = ctx;
         debug!(core = self.core_id, %collection, field_count = updates.len(), "kv field set");
         let now_ms = current_ms();
 
@@ -96,7 +100,7 @@ impl CoreLoop {
             &computed.new_value,
             0,
             now_ms,
-            nodedb_types::Surrogate::ZERO,
+            surrogate,
         );
         match response_codec::encode_json(
             &serde_json::json!({ "fields_added": computed.fields_added }),
