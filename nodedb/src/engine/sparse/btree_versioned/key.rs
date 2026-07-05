@@ -51,6 +51,19 @@ pub fn coll_prefix_end(database_id: u64, tenant: u64, coll: &str) -> String {
     format!("{database_id}:{tenant}:{coll};")
 }
 
+/// Prefix matching every version of every doc_id in every collection of a
+/// single `(database_id, tenant)` — used by the whole-tenant hard drop.
+pub fn tenant_prefix(database_id: u64, tenant: u64) -> String {
+    format!("{database_id}:{tenant}:")
+}
+
+/// Upper-bound exclusive companion of [`tenant_prefix`]. The tenant field is
+/// terminated by `:` (0x3A); `;` (0x3B) is the next byte, giving a clean
+/// exclusive upper bound over every collection under this tenant.
+pub fn tenant_prefix_end(database_id: u64, tenant: u64) -> String {
+    format!("{database_id}:{tenant};")
+}
+
 /// Extract `sys_from_ms` from a versioned key. Returns `None` if the key
 /// has no NUL separator (defensive — should not happen for keys produced
 /// by [`versioned_doc_key`]).

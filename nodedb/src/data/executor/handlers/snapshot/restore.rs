@@ -34,12 +34,22 @@ impl CoreLoop {
             // Preserve the collection definition: clear-then-install replaces row
             // data from the snapshot, but the snapshot does not carry the schema,
             // so the reinstalled rows must land in the still-defined collection.
-            self.clear_collection_all_engines(
+            // Fail-closed: if stale state cannot be cleared, abort the restore
+            // rather than install the snapshot over rows that survived — those
+            // would linger as un-owned data on this follower.
+            if let Err(e) = self.clear_collection_all_engines(
                 nodedb_types::DatabaseId::DEFAULT,
                 crate::types::TenantId::new(*tid_raw),
                 coll,
                 true,
-            );
+            ) {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("clear-then-install purge failed for '{coll}': {e}"),
+                    },
+                );
+            }
         }
 
         let snap: crate::types::TenantDataSnapshot = match zerompk::from_msgpack(snapshot_bytes) {

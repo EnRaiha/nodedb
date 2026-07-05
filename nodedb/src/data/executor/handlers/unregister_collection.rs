@@ -22,14 +22,18 @@
 //! timeseries, spatial, columnar, CRDT, cache, doc-config, chain-hash,
 //! and sparse-vector-index maps.
 //!
-//! Persistent, redb-backed engines (sparse documents, inverted index,
-//! graph edges) are reclaimed here via collection-scoped purge methods
-//! on each store.
+//! Persistent, redb-backed engines (sparse current documents, sparse
+//! bitemporal versioned document/index history, inverted index, graph
+//! edges) are reclaimed here via collection-scoped purge methods on each
+//! store. The versioned tables must be cleared unconditionally: a
+//! `bitemporal=true` collection re-CREATEd under the same name reuses the
+//! same key prefix, so surviving versioned rows would resurrect its
+//! dropped history.
 
 use nodedb_types::DatabaseId;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::bridge::envelope::Response;
+use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::reclaim;
 use crate::data::executor::task::ExecutionTask;
@@ -55,17 +59,28 @@ pub(in crate::data::executor) struct ClearCollectionStats {
     pub l1: reclaim::ReclaimStats,
 }
 
-/// Bounded retry wrapper for L1 reclaim ops.
+/// Bounded retry wrapper for collection-purge reclaim ops.
 ///
 /// Runs the op up to `MAX_ATTEMPTS` times; returns the first `Ok(T)`
-/// it sees. On every failure it captures the error text for the final
-/// warn. No sleep between attempts — the Data Plane is single-threaded
+/// it sees. No sleep between attempts — the Data Plane is single-threaded
 /// per core and a `sleep` here would stall every other request on the
 /// shard; an immediate retry still recovers the vast majority of
 /// transient fs-level errors (momentary lock, inflight fsync race).
+///
+/// **Fail-closed:** after exhausting all attempts this returns the last
+/// error rather than swallowing it. The purge path must not warn-and-
+/// continue: a partially-purged collection whose catalog row is then
+/// removed leaves addressable storage rows that a re-CREATE of the same
+/// name would resurrect. The caller propagates the error so the DROP
+/// fails and the collection remains fully intact for the next attempt.
 const L1_RECLAIM_MAX_ATTEMPTS: u32 = 3;
 
-fn retry_reclaim<T, E, F>(op_name: &str, tenant_id: u64, collection: &str, mut op: F) -> Option<T>
+fn retry_reclaim<T, E, F>(
+    op_name: &str,
+    tenant_id: u64,
+    collection: &str,
+    mut op: F,
+) -> crate::Result<T>
 where
     F: FnMut() -> Result<T, E>,
     E: std::fmt::Display,
@@ -80,26 +95,24 @@ where
                         collection,
                         op = op_name,
                         attempt,
-                        "L1 reclaim recovered after transient failure"
+                        "collection-purge reclaim recovered after transient failure"
                     );
                 }
-                return Some(v);
+                return Ok(v);
             }
             Err(e) => {
                 last_err = Some(e.to_string());
             }
         }
     }
-    warn!(
-        tenant_id,
-        collection,
-        op = op_name,
-        attempts = L1_RECLAIM_MAX_ATTEMPTS,
-        error = last_err.as_deref().unwrap_or("(no detail)"),
-        "L1 reclaim failed after all retries; leaving partial state \
-         for next purge attempt (idempotent)"
-    );
-    None
+    Err(crate::Error::Storage {
+        engine: "collection-purge".into(),
+        detail: format!(
+            "reclaim op '{op_name}' for tenant {tenant_id} collection '{collection}' \
+             failed after {L1_RECLAIM_MAX_ATTEMPTS} attempts: {}",
+            last_err.as_deref().unwrap_or("(no detail)")
+        ),
+    })
 }
 
 impl CoreLoop {
@@ -127,12 +140,25 @@ impl CoreLoop {
             kv_removed,
             crdt_rows_removed,
             l1: l1_stats,
-        } = self.clear_collection_all_engines(
+        } = match self.clear_collection_all_engines(
             task.request.database_id,
             TenantId::new(tenant_id),
             collection,
             false,
-        );
+        ) {
+            Ok(stats) => stats,
+            // Fail-closed: a failed engine purge must surface as an error so
+            // the DROP does not finalize the catalog-row removal over storage
+            // rows that survive — the resurrection hole on re-CREATE.
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        };
 
         // Surface the L1 byte reclaim to the purge metrics. Stays in the
         // caller: the reusable clear is side-effect-only and metrics are an
@@ -203,13 +229,17 @@ impl CoreLoop {
     /// Idempotent: missing in-memory state is a no-op; missing files are a
     /// no-op. Metrics emission and audit/response building are the caller's
     /// concern.
+    ///
+    /// Fail-closed: any persistent-engine reclaim that fails after its bounded
+    /// retries propagates as `Err`; the caller must abort the purge rather than
+    /// let a partially-cleared collection have its catalog row removed.
     pub(in crate::data::executor) fn clear_collection_all_engines(
         &mut self,
         database_id: DatabaseId,
         tenant_id: TenantId,
         collection: &str,
         preserve_collection_metadata: bool,
-    ) -> ClearCollectionStats {
+    ) -> crate::Result<ClearCollectionStats> {
         let db = database_id;
         let tid = tenant_id;
         let db_raw = database_id.as_u64();
@@ -218,8 +248,8 @@ impl CoreLoop {
 
         // ── Persistent engines (redb-backed, collection-scoped range drop) ──
 
-        // Sparse engine: documents + secondary indexes.
-        let (docs_removed, idxs_removed) = retry_reclaim(
+        // Sparse engine: current documents + secondary indexes.
+        let (mut docs_removed, mut idxs_removed) = retry_reclaim(
             "sparse.delete_all_for_collection",
             tid_raw,
             collection,
@@ -227,21 +257,34 @@ impl CoreLoop {
                 self.sparse
                     .delete_all_for_collection(db_raw, tid_raw, collection)
             },
-        )
-        .unwrap_or((0, 0));
+        )?;
+
+        // Sparse engine: bitemporal versioned document + index history. Cleared
+        // unconditionally — a `bitemporal=true` collection reuses the same key
+        // prefix on re-CREATE, so surviving versioned rows would resurrect the
+        // dropped collection's history (and yield a corrupt current row).
+        let (v_docs, v_idxs) = retry_reclaim(
+            "sparse.delete_all_versioned_for_collection",
+            tid_raw,
+            collection,
+            || {
+                self.sparse
+                    .delete_all_versioned_for_collection(db_raw, tid_raw, collection)
+            },
+        )?;
+        docs_removed += v_docs;
+        idxs_removed += v_idxs;
 
         // Inverted index: postings + doc_lengths + stats + segments.
         let inv_removed = retry_reclaim("inverted.purge_collection", tid_raw, collection, || {
             self.inverted.purge_collection(db_raw, tid, collection)
-        })
-        .unwrap_or(0);
+        })?;
 
         // Graph edge store: remove all edges scoped to this (database, collection).
         let edges_removed =
             retry_reclaim("edge_store.purge_collection", tid_raw, collection, || {
                 self.edge_store.purge_collection(db_raw, tid, collection)
-            })
-            .unwrap_or(0);
+            })?;
         // The CSR in-memory index is collection-agnostic. Stale edges will
         // be absent from the next CSR rebuild (which reads from EdgeStore).
         self.csr.drop_collection(db, tid, collection);
@@ -312,8 +355,7 @@ impl CoreLoop {
         let crdt_rows_removed = match self.crdt_engines.get_mut(&tid) {
             Some(engine) => retry_reclaim("crdt.purge_collection", tid_raw, collection, || {
                 engine.purge_collection(collection)
-            })
-            .unwrap_or(0),
+            })?,
             None => 0,
         };
 
@@ -364,7 +406,7 @@ impl CoreLoop {
                 .retain(|(t, c), _| !(*t == tid && c == &coll));
         }
 
-        ClearCollectionStats {
+        Ok(ClearCollectionStats {
             docs_removed,
             idxs_removed,
             inv_removed,
@@ -375,6 +417,6 @@ impl CoreLoop {
             kv_removed,
             crdt_rows_removed,
             l1,
-        }
+        })
     }
 }

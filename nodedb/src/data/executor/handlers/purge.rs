@@ -32,7 +32,7 @@ impl CoreLoop {
         // A tenant lives in exactly one database, so the purge is scoped by
         // (database_id, tenant_id).
         let database_id = task.request.database_id.as_u64();
-        let (docs, idxs) = match self.sparse.delete_all_for_tenant(database_id, tenant_id) {
+        let (mut docs, mut idxs) = match self.sparse.delete_all_for_tenant(database_id, tenant_id) {
             Ok(counts) => counts,
             Err(e) => {
                 warn!(tenant_id, error = %e, "sparse purge failed");
@@ -44,6 +44,28 @@ impl CoreLoop {
                 );
             }
         };
+
+        // 1b. Sparse engine: bitemporal versioned document + index history for
+        // every collection of this tenant. Cleared unconditionally so a tenant
+        // re-created under the same id cannot resurrect dropped versioned rows.
+        match self
+            .sparse
+            .delete_all_versioned_for_tenant(database_id, tenant_id)
+        {
+            Ok((v_docs, v_idxs)) => {
+                docs += v_docs;
+                idxs += v_idxs;
+            }
+            Err(e) => {
+                warn!(tenant_id, error = %e, "sparse versioned purge failed");
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("sparse versioned purge: {e}"),
+                    },
+                );
+            }
+        }
 
         // 2. Graph engine: edges in redb. DB-scoped — a tenant's graph in
         // database A must not be purged by a purge in database B.
