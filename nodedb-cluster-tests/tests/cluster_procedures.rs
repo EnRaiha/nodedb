@@ -85,6 +85,7 @@ fn tx_ctx_commit_yields_independent_tasks() {
             pk_bytes: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     });
     ctx.buffer_task(PhysicalTask {
         tenant_id: TenantId::new(1),
@@ -98,6 +99,7 @@ fn tx_ctx_commit_yields_independent_tasks() {
             returning: None,
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     });
 
     // COMMIT flushes both tasks.
@@ -138,6 +140,7 @@ fn procedure_can_target_multiple_vshards() {
             pk_bytes: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     });
     // Task on vshard 1 (different shard)
     ctx.buffer_task(PhysicalTask {
@@ -152,6 +155,7 @@ fn procedure_can_target_multiple_vshards() {
             pk_bytes: Vec::new(),
         }),
         post_set_op: PostSetOp::None,
+        txn_id: None,
     });
 
     let tasks = ctx.take_buffered_tasks();

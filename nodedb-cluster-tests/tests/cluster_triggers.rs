@@ -162,7 +162,6 @@ fn event_source_preserved_through_write_event() {
         valid_time_ms: None,
         user_id: None,
         statement_digest: None,
-        txn_id: None,
     };
     // After leader failover, new leader's Event Plane replays from WAL.
     // The replayed events have source: User → triggers fire.
