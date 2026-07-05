@@ -21,7 +21,11 @@ async fn assert_miss_then_insert_then_hit(srv: &TestServer, create: &str, pk_col
         ))
         .await
         .expect("point-get miss");
-    assert_eq!(miss.len(), 0, "key k1 must be absent before insert, got: {miss:?}");
+    assert_eq!(
+        miss.len(),
+        0,
+        "key k1 must be absent before insert, got: {miss:?}"
+    );
 
     // 2. Insert the key that just missed.
     srv.exec(&format!(
@@ -62,7 +66,11 @@ async fn assert_miss_then_insert_then_hit(srv: &TestServer, create: &str, pk_col
         .query_rows("SELECT v FROM poison")
         .await
         .expect("full scan after insert");
-    assert_eq!(scan.len(), 1, "full scan must see the inserted row, got: {scan:?}");
+    assert_eq!(
+        scan.len(),
+        1,
+        "full scan must see the inserted row, got: {scan:?}"
+    );
 
     srv.exec("DROP COLLECTION poison").await.expect("drop");
 }
