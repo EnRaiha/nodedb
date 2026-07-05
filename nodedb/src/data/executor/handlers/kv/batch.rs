@@ -21,7 +21,21 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, %collection, count = keys.len(), "kv batch get");
         let now_ms = current_ms();
-        let results = self.kv_engine.batch_get(did, tid, collection, keys, now_ms);
+
+        // Read-your-own-writes: consult this transaction's staging overlay
+        // per key before falling back to base storage. `kv_overlay_body`
+        // returns `None` immediately (no txn, or no overlay entry for this
+        // key) so an autocommit `BatchGet` takes the exact base-only path it
+        // always has.
+        let results: Vec<Option<Vec<u8>>> = keys
+            .iter()
+            .map(
+                |key| match self.kv_overlay_body(task, tid, collection, key) {
+                    Some(overlay_result) => overlay_result,
+                    None => self.kv_engine.get(did, tid, collection, key, now_ms),
+                },
+            )
+            .collect();
 
         let json_results: Vec<serde_json::Value> = results
             .into_iter()

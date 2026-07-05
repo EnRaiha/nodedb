@@ -12,9 +12,11 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::result::{DdlError, DdlResult};
 
@@ -26,6 +28,7 @@ pub async fn kv_incr(
     identity: &AuthenticatedIdentity,
     sql: &str,
     negate: bool,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let func_name = if negate { "KV_DECR" } else { "KV_INCR" };
     let args = parse_function_args(sql, func_name)?;
@@ -58,7 +61,7 @@ pub async fn kv_incr(
         ttl_ms,
     });
 
-    dispatch_and_respond(state, identity, vshard, plan, func_name).await
+    dispatch_and_respond(state, identity, vshard, plan, func_name, txn_ctx).await
 }
 
 /// Handle `SELECT KV_INCR_FLOAT(collection, key, delta)`
@@ -68,6 +71,7 @@ pub async fn kv_incr_float(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql, "KV_INCR_FLOAT")?;
 
@@ -94,7 +98,7 @@ pub async fn kv_incr_float(
         delta,
     });
 
-    dispatch_and_respond(state, identity, vshard, plan, "KV_INCR_FLOAT").await
+    dispatch_and_respond(state, identity, vshard, plan, "KV_INCR_FLOAT", txn_ctx).await
 }
 
 /// Handle `SELECT KV_CAS(collection, key, expected, new_value)`
@@ -104,6 +108,7 @@ pub async fn kv_cas(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql, "KV_CAS")?;
 
@@ -127,7 +132,7 @@ pub async fn kv_cas(
         new_value: new_value.into_bytes(),
     });
 
-    dispatch_and_respond(state, identity, vshard, plan, "KV_CAS").await
+    dispatch_and_respond(state, identity, vshard, plan, "KV_CAS", txn_ctx).await
 }
 
 /// Handle `SELECT KV_GETSET(collection, key, new_value)`
@@ -137,6 +142,7 @@ pub async fn kv_getset(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let args = parse_function_args(sql, "KV_GETSET")?;
 
@@ -158,42 +164,103 @@ pub async fn kv_getset(
         new_value: new_value.into_bytes(),
     });
 
-    dispatch_and_respond(state, identity, vshard, plan, "KV_GETSET").await
+    dispatch_and_respond(state, identity, vshard, plan, "KV_GETSET", txn_ctx).await
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Dispatch a KvOp to the Data Plane and return the JSON response as a single
-/// text-column row keyed by the lower-cased function name.
+/// Dispatch a KvOp through the protocol-neutral in-transaction staging gate
+/// and return the JSON response as a single text-column row keyed by the
+/// lower-cased function name.
+///
+/// Outside a transaction block (or for the read half of the gate, which
+/// never applies here since every `KvOp` this module builds is a write),
+/// `route_in_tx_write` dispatches immediately -- byte-identical to the
+/// pre-staging behavior. Inside a transaction, `KvOp::Incr` / `IncrFloat` /
+/// `Cas` / `GetSet` are staged into the per-transaction overlay
+/// (`is_stageable_write`) and this function reads the computed value back
+/// from `StagedWriteOutcome::payload` (forwarded verbatim by the staging
+/// gate for `StagedTagKind::RawPayload`), so a `SELECT KV_INCR(...)` inside
+/// `BEGIN..COMMIT` returns the same value the staged overlay now holds, and
+/// a following `SELECT KV_INCR(...)` on the same key in the same
+/// transaction chains off it.
 async fn dispatch_and_respond(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     vshard: VShardId,
     plan: PhysicalPlan,
     func_name: &str,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let tenant_id = identity.tenant_id;
+    use crate::control::server::shared::session::staging_gate::{
+        InTxnRoute, StagingGateError, route_in_tx_write,
+    };
 
-    match crate::control::server::dispatch_utils::dispatch_to_data_plane(
-        state,
+    let tenant_id = identity.tenant_id;
+    let database_id = DatabaseId::DEFAULT;
+
+    let task = PhysicalTask {
         tenant_id,
-        crate::types::DatabaseId::DEFAULT,
-        vshard,
+        vshard_id: vshard,
+        database_id,
         plan,
-        TraceId::ZERO,
-    )
-    .await
-    {
-        Ok(resp) => {
-            let payload_text =
-                crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            let col_name = func_name.to_lowercase();
-            Ok(vec![single_text_col(&col_name, payload_text)])
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    };
+
+    let routed = route_in_tx_write(txn_ctx.sessions, txn_ctx.addr, task, |staged| {
+        crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn(
+            state,
+            staged.tenant_id,
+            staged.database_id,
+            staged.vshard_id,
+            staged.plan,
+            TraceId::ZERO,
+            staged.txn_id,
+        )
+    })
+    .await;
+
+    let payload = match routed {
+        Ok(InTxnRoute::Read(task)) => {
+            let task = *task;
+            match crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn(
+                state,
+                task.tenant_id,
+                task.database_id,
+                task.vshard_id,
+                task.plan,
+                TraceId::ZERO,
+                task.txn_id,
+            )
+            .await
+            {
+                Ok(resp) => resp.payload.as_ref().to_vec(),
+                Err(e) => return Err(ddl_err("XX000", e.to_string())),
+            }
         }
-        Err(e) => Err(ddl_err("XX000", e.to_string())),
-    }
+        // Every `KvOp` this module builds is stageable once in a
+        // transaction (`is_stageable_write`), so `Buffered` never occurs;
+        // handled defensively with an empty payload rather than a panic.
+        Ok(InTxnRoute::Buffered) => Vec::new(),
+        Ok(InTxnRoute::Staged(outcome)) => outcome.payload,
+        Err(StagingGateError::Dispatch(e)) => return Err(ddl_err("XX000", e.to_string())),
+        Err(StagingGateError::Rejected { code }) => {
+            let (_, sqlstate, message) = match code {
+                Some(code) => {
+                    crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code)
+                }
+                None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
+            };
+            return Err(ddl_err(sqlstate, message));
+        }
+    };
+
+    let payload_text = crate::data::executor::response_codec::decode_payload_to_json(&payload);
+    let col_name = func_name.to_lowercase();
+    Ok(vec![single_text_col(&col_name, payload_text)])
 }
 
 /// Build a single-text-column row set carrying `text` under `col`.

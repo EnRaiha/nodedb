@@ -49,6 +49,13 @@ pub enum InTxnRoute {
 pub struct StagedWriteOutcome {
     pub kind: StagedTagKind,
     pub affected: usize,
+    /// The stage handler's raw response payload, verbatim. Every staged
+    /// write's response carries a payload here; only [`StagedTagKind::
+    /// RawPayload`] outcomes (KV `Incr` / `IncrFloat` / `Cas` / `GetSet`,
+    /// which return a computed value rather than an affected-row count) are
+    /// expected to be forwarded to the client instead of being reduced to a
+    /// tag + count.
+    pub payload: Vec<u8>,
 }
 
 /// Session store + connection address, bundled so the protocol-neutral DDL
@@ -201,9 +208,14 @@ where
 
     let affected = extract_affected_count(resp.payload.as_ref()).unwrap_or(1) as usize;
     let kind = staged_tag_kind(&task.plan, resp.payload.as_ref());
+    let payload = resp.payload.as_ref().to_vec();
 
     // Durable path unchanged: still buffered, replayed at COMMIT.
     sessions.buffer_write(addr, task);
 
-    Ok(InTxnRoute::Staged(StagedWriteOutcome { kind, affected }))
+    Ok(InTxnRoute::Staged(StagedWriteOutcome {
+        kind,
+        affected,
+        payload,
+    }))
 }

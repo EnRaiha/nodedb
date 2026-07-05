@@ -208,6 +208,14 @@ pub(super) fn tag_from_staged(kind: StagedTagKind, affected: usize) -> Tag {
         // (see `response_shape::types::describe_plan`'s `DmlResult("UPSERT")`
         // arm and `payload_to_response`'s `PlanKind::DmlResult` rendering).
         StagedTagKind::DocUpsert => Tag::new("UPSERT").with_rows(affected),
+        // KV `Incr` / `IncrFloat` / `Cas` / `GetSet` never reach pgwire's
+        // generic tag-rendering path today: their sole SQL surface (`SELECT
+        // KV_INCR(..)` and friends, in `ddl/neutral/kv_atomic.rs`) reads
+        // `StagedWriteOutcome::payload` directly and never calls
+        // `tag_from_staged`. This arm exists only so the match stays
+        // exhaustive against a new `PhysicalPlan::Kv` caller; it renders the
+        // same tag pgwire uses for a function-call `SELECT`.
+        StagedTagKind::RawPayload => Tag::new("SELECT").with_rows(affected),
     }
 }
 

@@ -7,6 +7,7 @@
 //! to exactly one core.
 
 use super::engine::KvEngine;
+use super::engine_atomic_compute as compute;
 use super::engine_helpers::{expiry_key, table_key};
 use super::entry::NO_EXPIRY;
 use super::hash_table::KvHashTable;
@@ -52,42 +53,7 @@ impl KvEngine {
         let table = self.ensure_table(tkey, tenant_id, collection);
 
         let current = table.get(key, now_ms).map(|v| v.to_vec());
-        let old_i64 = match &current {
-            None => 0i64,
-            Some(bytes) => decode_msgpack_i64(bytes)?,
-        };
-
-        let new_i64 = old_i64.checked_add(delta).ok_or(AtomicError::Overflow)?;
-
-        // If value is a map (typed KV entry), update the numeric field in-place.
-        let new_bytes = if let Some(ref cur) = current
-            && let Ok(nodedb_types::Value::Object(mut map)) = nodedb_types::value_from_msgpack(cur)
-            && map.len() > 1
-        {
-            // Find and update the first numeric field.
-            let mut updated = false;
-            for (k, v) in map.iter_mut() {
-                if k == "key" {
-                    continue;
-                }
-                if matches!(
-                    v,
-                    nodedb_types::Value::Integer(_) | nodedb_types::Value::Float(_)
-                ) {
-                    *v = nodedb_types::Value::Integer(new_i64);
-                    updated = true;
-                    break;
-                }
-            }
-            if updated {
-                nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(map))
-                    .unwrap_or_else(|_| zerompk::to_msgpack_vec(&new_i64).expect("i64 serializes"))
-            } else {
-                zerompk::to_msgpack_vec(&new_i64).expect("i64 always serializes")
-            }
-        } else {
-            zerompk::to_msgpack_vec(&new_i64).expect("i64 always serializes")
-        };
+        let (new_i64, new_bytes) = compute::incr(current.as_deref(), delta)?;
         self.atomic_put(
             database_id,
             tenant_id,
@@ -122,17 +88,7 @@ impl KvEngine {
         let table = self.ensure_table(tkey, tenant_id, collection);
 
         let current = table.get(key, now_ms).map(|v| v.to_vec());
-        let old_f64 = match &current {
-            None => 0.0f64,
-            Some(bytes) => decode_msgpack_f64(bytes)?,
-        };
-
-        let new_f64 = old_f64 + delta;
-        if new_f64.is_nan() || new_f64.is_infinite() {
-            return Err(AtomicError::Overflow);
-        }
-
-        let new_bytes = zerompk::to_msgpack_vec(&new_f64).expect("f64 always serializes");
+        let (new_f64, new_bytes) = compute::incr_float(current.as_deref(), delta)?;
         // incr_float always preserves existing TTL (ttl_ms = 0).
         self.atomic_put(
             database_id,
@@ -170,55 +126,9 @@ impl KvEngine {
 
         let current = table.get(key, now_ms).map(|v| v.to_vec());
 
-        // For typed KV entries (maps), compare against the first non-key string field.
-        let matches = match &current {
-            None => expected.is_empty(),
-            Some(v) => {
-                if v.as_slice() == expected {
-                    true
-                } else if let Ok(nodedb_types::Value::Object(map)) =
-                    nodedb_types::value_from_msgpack(v)
-                {
-                    // Compare expected string against the first non-key string field.
-                    let expected_str = String::from_utf8_lossy(expected);
-                    map.iter().any(|(k, val)| {
-                        k != "key"
-                            && matches!(val, nodedb_types::Value::String(s) if s == expected_str.as_ref())
-                    })
-                } else {
-                    false
-                }
-            }
-        };
+        let (matches, write_bytes) = compute::cas(current.as_deref(), expected, new_value);
 
         if matches {
-            // For typed KV: update the field value within the map.
-            let write_bytes = if let Some(ref cur) = current
-                && let Ok(nodedb_types::Value::Object(mut map)) =
-                    nodedb_types::value_from_msgpack(cur)
-                && map.len() > 1
-            {
-                let new_str = String::from_utf8_lossy(new_value).to_string();
-                let mut updated = false;
-                for (k, v) in map.iter_mut() {
-                    if k == "key" {
-                        continue;
-                    }
-                    if matches!(v, nodedb_types::Value::String(_)) {
-                        *v = nodedb_types::Value::String(new_str.clone());
-                        updated = true;
-                        break;
-                    }
-                }
-                if updated {
-                    nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(map))
-                        .unwrap_or_else(|_| new_value.to_vec())
-                } else {
-                    new_value.to_vec()
-                }
-            } else {
-                new_value.to_vec()
-            };
             self.atomic_put(
                 database_id,
                 tenant_id,
@@ -258,33 +168,7 @@ impl KvEngine {
         let tkey = table_key(database_id, tenant_id, collection);
         let table = self.ensure_table(tkey, tenant_id, collection);
         let old = table.get(key, now_ms).map(|v| v.to_vec());
-
-        // For typed KV: update the first non-key string field in the map.
-        let write_bytes = if let Some(ref cur) = old
-            && let Ok(nodedb_types::Value::Object(mut map)) = nodedb_types::value_from_msgpack(cur)
-            && map.len() > 1
-        {
-            let new_str = String::from_utf8_lossy(new_value).to_string();
-            let mut updated = false;
-            for (k, v) in map.iter_mut() {
-                if k == "key" {
-                    continue;
-                }
-                if matches!(v, nodedb_types::Value::String(_)) {
-                    *v = nodedb_types::Value::String(new_str.clone());
-                    updated = true;
-                    break;
-                }
-            }
-            if updated {
-                nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(map))
-                    .unwrap_or_else(|_| new_value.to_vec())
-            } else {
-                new_value.to_vec()
-            }
-        } else {
-            new_value.to_vec()
-        };
+        let write_bytes = compute::getset(old.as_deref(), new_value);
 
         // GetSet preserves existing TTL (ttl_ms = 0).
         self.atomic_put(
@@ -408,75 +292,6 @@ impl KvEngine {
             }
         }
     }
-}
-
-/// Decode a MessagePack-encoded value as i64.
-///
-/// If the value is a map (typed KV entry), extracts the first numeric field.
-fn decode_msgpack_i64(bytes: &[u8]) -> Result<i64, AtomicError> {
-    // Try i64 first, then u64 (MessagePack encodes small positive as u64).
-    if let Ok(v) = zerompk::from_msgpack::<i64>(bytes) {
-        return Ok(v);
-    }
-    if let Ok(v) = zerompk::from_msgpack::<u64>(bytes) {
-        return i64::try_from(v).map_err(|_| AtomicError::Overflow);
-    }
-    // Try f64 → i64 truncation for values stored as float.
-    if let Ok(v) = zerompk::from_msgpack::<f64>(bytes)
-        && v.fract() == 0.0
-        && v >= i64::MIN as f64
-        && v <= i64::MAX as f64
-    {
-        return Ok(v as i64);
-    }
-    // If value is a map (typed KV entry), find the first numeric field.
-    if let Ok(nodedb_types::Value::Object(map)) = nodedb_types::value_from_msgpack(bytes) {
-        for (k, v) in &map {
-            if k == "key" {
-                continue;
-            }
-            match v {
-                nodedb_types::Value::Integer(i) => return Ok(*i),
-                nodedb_types::Value::Float(f) if f.fract() == 0.0 => return Ok(*f as i64),
-                _ => {}
-            }
-        }
-    }
-    Err(AtomicError::TypeMismatch {
-        detail: "value is not an integer".into(),
-    })
-}
-
-/// Decode a MessagePack-encoded value as f64.
-///
-/// If the value is a map (typed KV entry), extracts the first numeric field.
-fn decode_msgpack_f64(bytes: &[u8]) -> Result<f64, AtomicError> {
-    if let Ok(v) = zerompk::from_msgpack::<f64>(bytes) {
-        return Ok(v);
-    }
-    // Accept integer values promoted to float.
-    if let Ok(v) = zerompk::from_msgpack::<i64>(bytes) {
-        return Ok(v as f64);
-    }
-    if let Ok(v) = zerompk::from_msgpack::<u64>(bytes) {
-        return Ok(v as f64);
-    }
-    // If value is a map, find the first numeric field.
-    if let Ok(nodedb_types::Value::Object(map)) = nodedb_types::value_from_msgpack(bytes) {
-        for (k, v) in &map {
-            if k == "key" {
-                continue;
-            }
-            match v {
-                nodedb_types::Value::Float(f) => return Ok(*f),
-                nodedb_types::Value::Integer(i) => return Ok(*i as f64),
-                _ => {}
-            }
-        }
-    }
-    Err(AtomicError::TypeMismatch {
-        detail: "value is not numeric".into(),
-    })
 }
 
 #[cfg(test)]

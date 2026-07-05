@@ -15,7 +15,7 @@ use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::staging_gate::{
-    InTxnRoute, StagingGateError, route_in_tx_write,
+    InTxnRoute, StagedTagKind, StagingGateError, route_in_tx_write,
 };
 use crate::types::DatabaseId;
 use nodedb_physical::physical_task::PhysicalTask;
@@ -61,6 +61,13 @@ pub(super) async fn run_dispatch_loop(
             ));
         }
 
+        // Cloned before `route_in_tx_write` consumes `task`, so a staged
+        // write whose outcome carries a computed payload (KV `Incr` /
+        // `IncrFloat` / `Cas` / `GetSet` -- see `StagedTagKind::RawPayload`)
+        // can be shaped into the response exactly like the non-staged branch
+        // below shapes `task_resp.payload`.
+        let plan_for_staged_response = task.plan.clone();
+
         // In transaction: route through the protocol-neutral staging gate.
         // Reads (including in-transaction reads) come back as `Read` with
         // `txn_id` stamped for read-your-own-writes; non-stageable writes are
@@ -80,7 +87,36 @@ pub(super) async fn run_dispatch_loop(
                 continue;
             }
             Ok(InTxnRoute::Staged(outcome)) => {
-                total_affected += outcome.affected as u64;
+                if matches!(outcome.kind, StagedTagKind::RawPayload) && !outcome.payload.is_empty()
+                {
+                    let plan_kind = describe_plan(&plan_for_staged_response);
+                    match shape_response_materialized(
+                        &outcome.payload,
+                        &plan_for_staged_response,
+                        plan_kind,
+                        output_schema,
+                        ctx.state,
+                        database_id,
+                        ctx.tenant_id(),
+                    ) {
+                        Ok(ShapeOutcome::Rows(mut shaped)) => {
+                            if let Some(notice) = shaped.notice.take() {
+                                warnings.push(notice);
+                            }
+                            let (cols, rows) = to_native_columns_rows(&shaped);
+                            if !cols.is_empty() && all_columns.is_none() {
+                                all_columns = Some(cols);
+                            }
+                            all_rows.extend(rows);
+                        }
+                        Ok(ShapeOutcome::Passthrough) => {
+                            total_affected += 1;
+                        }
+                        Err(e) => return resp(shape_error_to_native(seq, &e)),
+                    }
+                } else {
+                    total_affected += outcome.affected as u64;
+                }
                 continue;
             }
             Err(StagingGateError::Dispatch(e)) => return resp(error_to_native(seq, &e)),

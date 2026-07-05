@@ -7,6 +7,7 @@
 //! field definitions, and explain tiers.
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -38,6 +39,7 @@ pub(super) async fn try_string(
     sql: &str,
     upper: &str,
     database_id: DatabaseId,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     // Engine-ops SQL functions and DDL. None of these are dispatched from a
     // typed AST arm — the pgwire engine_ops router recognized all of them by
@@ -106,19 +108,19 @@ pub(super) async fn try_string(
 
     // KV_INCR / KV_DECR / KV_INCR_FLOAT / KV_CAS / KV_GETSET — atomic KV operations.
     if upper.starts_with("SELECT KV_INCR(") || upper.starts_with("SELECT KV_INCR (") {
-        return Some(kv_atomic::kv_incr(state, identity, sql, false).await);
+        return Some(kv_atomic::kv_incr(state, identity, sql, false, txn_ctx).await);
     }
     if upper.starts_with("SELECT KV_DECR(") || upper.starts_with("SELECT KV_DECR (") {
-        return Some(kv_atomic::kv_incr(state, identity, sql, true).await);
+        return Some(kv_atomic::kv_incr(state, identity, sql, true, txn_ctx).await);
     }
     if upper.starts_with("SELECT KV_INCR_FLOAT(") || upper.starts_with("SELECT KV_INCR_FLOAT (") {
-        return Some(kv_atomic::kv_incr_float(state, identity, sql).await);
+        return Some(kv_atomic::kv_incr_float(state, identity, sql, txn_ctx).await);
     }
     if upper.starts_with("SELECT KV_CAS(") || upper.starts_with("SELECT KV_CAS (") {
-        return Some(kv_atomic::kv_cas(state, identity, sql).await);
+        return Some(kv_atomic::kv_cas(state, identity, sql, txn_ctx).await);
     }
     if upper.starts_with("SELECT KV_GETSET(") || upper.starts_with("SELECT KV_GETSET (") {
-        return Some(kv_atomic::kv_getset(state, identity, sql).await);
+        return Some(kv_atomic::kv_getset(state, identity, sql, txn_ctx).await);
     }
 
     // Timeseries: CREATE TIMESERIES, ALTER TIMESERIES, REWRITE PARTITIONS.

@@ -55,7 +55,8 @@ pub async fn try_dispatch(
     {
         return Some(r);
     }
-    if let Some(r) = string_engine_ops::try_string(state, identity, sql, &upper, database_id).await
+    if let Some(r) =
+        string_engine_ops::try_string(state, identity, sql, &upper, database_id, txn_ctx).await
     {
         return Some(r);
     }

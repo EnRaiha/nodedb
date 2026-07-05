@@ -23,8 +23,13 @@ impl CoreLoop {
         debug!(core = self.core_id, %collection, field_count = fields.len(), "kv field get");
         let now_ms = current_ms();
 
-        // Get the full value.
-        let Some(value) = self.kv_engine.get(did, tid, collection, key, now_ms) else {
+        // Read-your-own-writes: consult this transaction's staging overlay
+        // before falling back to base storage (see `execute_kv_batch_get`).
+        let value = match self.kv_overlay_body(task, tid, collection, key) {
+            Some(overlay_result) => overlay_result,
+            None => self.kv_engine.get(did, tid, collection, key, now_ms),
+        };
+        let Some(value) = value else {
             return self.response_error(task, ErrorCode::NotFound);
         };
 

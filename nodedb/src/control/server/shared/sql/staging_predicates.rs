@@ -51,13 +51,19 @@ pub fn is_point_write(plan: &PhysicalPlan) -> bool {
 /// Allow-list of plans the in-transaction path stages at statement time via
 /// `MetaOp::StageWrite`: everything [`is_point_write`] accepts (Document
 /// point writes, predicate `BulkUpdate` / `BulkDelete`, `InsertSelect`),
-/// plus the five stageable KV point writes -- `KvOp::Put`, `KvOp::Insert`,
-/// `KvOp::InsertIfAbsent`, `KvOp::InsertOnConflictUpdate`, `KvOp::Delete`.
-/// KV is the first non-Document engine to stage at statement time; this
-/// predicate is the shared gate later engine units extend the same way.
-/// Every other `KvOp` (Incr, Cas, FieldSet, BatchPut, Expire, Transfer, the
-/// sorted-index family, etc.) stays on the pre-existing buffer + "OK"
-/// deferral, same as any other non-stageable write.
+/// plus the nine stageable KV point writes -- `KvOp::Put`, `KvOp::Insert`,
+/// `KvOp::InsertIfAbsent`, `KvOp::InsertOnConflictUpdate`, `KvOp::Delete`,
+/// `KvOp::BatchPut`, `KvOp::Incr`, `KvOp::IncrFloat`, `KvOp::Cas`,
+/// `KvOp::GetSet`. KV is the first non-Document engine to stage at
+/// statement time; this predicate is the shared gate later engine units
+/// extend the same way. `Incr` / `IncrFloat` / `Cas` / `GetSet` stage only
+/// the computed VALUE bytes into the overlay -- `ttl_ms` (on `Incr` /
+/// `BatchPut`) lives outside the value body (`KvEntry.expire_at_ms`) and the
+/// overlay has no slot for it, so an in-transaction TTL reset is applied at
+/// COMMIT (via the unchanged buffered replay) but not reflected in a
+/// same-transaction `GetTtl` read. Every other `KvOp` (FieldSet, Expire,
+/// Transfer, the sorted-index family, etc.) stays on the pre-existing
+/// buffer + "OK" deferral, same as any other non-stageable write.
 pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
     is_point_write(plan)
         || matches!(
@@ -68,6 +74,11 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
                     | KvOp::InsertIfAbsent { .. }
                     | KvOp::InsertOnConflictUpdate { .. }
                     | KvOp::Delete { .. }
+                    | KvOp::BatchPut { .. }
+                    | KvOp::Incr { .. }
+                    | KvOp::IncrFloat { .. }
+                    | KvOp::Cas { .. }
+                    | KvOp::GetSet { .. }
             )
         )
         || matches!(plan, PhysicalPlan::Columnar(ColumnarOp::Insert { .. }))
@@ -137,8 +148,16 @@ pub enum StagedTagKind {
     Insert,
     Update,
     Delete,
-    KvUpsert { updated: bool },
+    KvUpsert {
+        updated: bool,
+    },
     DocUpsert,
+    /// The staged handler computed a value rather than an affected-row count
+    /// (`KvOp::Incr` / `IncrFloat` / `Cas` / `GetSet`). The caller forwards
+    /// [`StagedWriteOutcome::payload`](super::super::session::staging_gate::
+    /// StagedWriteOutcome::payload) to the client verbatim instead of
+    /// rendering a tag from `affected`.
+    RawPayload,
 }
 
 /// Decide the [`StagedTagKind`] for a staged write, given the plan and the
@@ -195,11 +214,12 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
 
 /// Decide the [`StagedTagKind`] for a staged `KvOp` write.
 ///
-/// Caller invariant: `op` must be one of the five stageable KV writes --
-/// `Put`, `Insert`, `InsertIfAbsent`, `InsertOnConflictUpdate`, `Delete` --
-/// i.e. the enclosing plan already passed [`is_stageable_write`]. Every
-/// other `KvOp` variant is unreachable here because the staging dispatch
-/// never routes them through this path.
+/// Caller invariant: `op` must be one of the nine stageable KV writes --
+/// `Put`, `Insert`, `InsertIfAbsent`, `InsertOnConflictUpdate`, `Delete`,
+/// `BatchPut`, `Incr`, `IncrFloat`, `Cas`, `GetSet` -- i.e. the enclosing
+/// plan already passed [`is_stageable_write`]. Every other `KvOp` variant is
+/// unreachable here because the staging dispatch never routes them through
+/// this path.
 fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
     match op {
         KvOp::Put { .. } | KvOp::Insert { .. } | KvOp::InsertIfAbsent { .. } => {
@@ -209,22 +229,27 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
             updated: extract_kv_conflict_op(payload).as_deref() == Some("update"),
         },
         KvOp::Delete { .. } => StagedTagKind::Delete,
+        // `BatchPut` reports an affected/inserted count, same shape as the
+        // other insert-style ops.
+        KvOp::BatchPut { .. } => StagedTagKind::Insert,
+        // `Incr` / `IncrFloat` / `Cas` / `GetSet` return a computed value
+        // (`{"value": ..}` / `{"success": .., "current_value": ..}` /
+        // `{"old_value": ..}`), not a row count -- forward the payload
+        // verbatim.
+        KvOp::Incr { .. } | KvOp::IncrFloat { .. } | KvOp::Cas { .. } | KvOp::GetSet { .. } => {
+            StagedTagKind::RawPayload
+        }
         KvOp::Get { .. }
         | KvOp::Scan { .. }
         | KvOp::Expire { .. }
         | KvOp::Persist { .. }
         | KvOp::BatchGet { .. }
-        | KvOp::BatchPut { .. }
         | KvOp::RegisterIndex { .. }
         | KvOp::DropIndex { .. }
         | KvOp::FieldGet { .. }
         | KvOp::FieldSet { .. }
         | KvOp::GetTtl { .. }
         | KvOp::Truncate { .. }
-        | KvOp::Incr { .. }
-        | KvOp::IncrFloat { .. }
-        | KvOp::Cas { .. }
-        | KvOp::GetSet { .. }
         | KvOp::RegisterSortedIndex { .. }
         | KvOp::DropSortedIndex { .. }
         | KvOp::SortedIndexRank { .. }
@@ -263,5 +288,86 @@ mod tests {
     fn extract_kv_conflict_op_none_when_absent() {
         let payload = nodedb_types::json_to_msgpack(&serde_json::json!({"affected": 1})).unwrap();
         assert_eq!(extract_kv_conflict_op(&payload), None);
+    }
+
+    fn kv_plan(op: KvOp) -> PhysicalPlan {
+        PhysicalPlan::Kv(op)
+    }
+
+    #[test]
+    fn is_stageable_write_accepts_the_kv_atomics_and_batch_put() {
+        assert!(is_stageable_write(&kv_plan(KvOp::Incr {
+            collection: "c".into(),
+            key: b"k".to_vec(),
+            delta: 1,
+            ttl_ms: 0,
+        })));
+        assert!(is_stageable_write(&kv_plan(KvOp::IncrFloat {
+            collection: "c".into(),
+            key: b"k".to_vec(),
+            delta: 1.0,
+        })));
+        assert!(is_stageable_write(&kv_plan(KvOp::Cas {
+            collection: "c".into(),
+            key: b"k".to_vec(),
+            expected: vec![],
+            new_value: b"v".to_vec(),
+        })));
+        assert!(is_stageable_write(&kv_plan(KvOp::GetSet {
+            collection: "c".into(),
+            key: b"k".to_vec(),
+            new_value: b"v".to_vec(),
+        })));
+        assert!(is_stageable_write(&kv_plan(KvOp::BatchPut {
+            collection: "c".into(),
+            entries: vec![(b"k".to_vec(), b"v".to_vec())],
+            ttl_ms: 0,
+        })));
+    }
+
+    #[test]
+    fn staged_kv_tag_kind_atomics_forward_raw_payload() {
+        let payload = nodedb_types::json_to_msgpack(&serde_json::json!({ "value": 5 })).unwrap();
+        for op in [
+            KvOp::Incr {
+                collection: "c".into(),
+                key: b"k".to_vec(),
+                delta: 1,
+                ttl_ms: 0,
+            },
+            KvOp::IncrFloat {
+                collection: "c".into(),
+                key: b"k".to_vec(),
+                delta: 1.0,
+            },
+            KvOp::Cas {
+                collection: "c".into(),
+                key: b"k".to_vec(),
+                expected: vec![],
+                new_value: b"v".to_vec(),
+            },
+            KvOp::GetSet {
+                collection: "c".into(),
+                key: b"k".to_vec(),
+                new_value: b"v".to_vec(),
+            },
+        ] {
+            assert_eq!(
+                staged_kv_tag_kind(&op, &payload),
+                StagedTagKind::RawPayload,
+                "{op:?} must classify as RawPayload"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_kv_tag_kind_batch_put_is_insert() {
+        let payload = nodedb_types::json_to_msgpack(&serde_json::json!({ "inserted": 2 })).unwrap();
+        let op = KvOp::BatchPut {
+            collection: "c".into(),
+            entries: vec![(b"k".to_vec(), b"v".to_vec())],
+            ttl_ms: 0,
+        };
+        assert_eq!(staged_kv_tag_kind(&op, &payload), StagedTagKind::Insert);
     }
 }

@@ -12,6 +12,7 @@
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::overlay::Staged;
+use crate::data::executor::handlers::transaction::stage_write::hex_key;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_types::Surrogate;
 
@@ -58,5 +59,39 @@ impl CoreLoop {
             Staged::Put(body) => Some(Ok(body.clone())),
             Staged::Tombstone => Some(Err(self.response_with_payload(task, Vec::new()))),
         }
+    }
+
+    /// Consult the active transaction's staging overlay for a raw KV key
+    /// (hex-encoded into the overlay's doc-id, same as every KV staging
+    /// path -- see `stage_kv::hex_key`), for read-merge in `BatchGet` /
+    /// `FieldGet`.
+    ///
+    /// Unlike [`overlay_point_lookup`], which is tailored to a single
+    /// point-get's not-found response shape, this returns a plain nested
+    /// `Option`: the outer `None` means "no overlay entry -- fall through to
+    /// base storage"; `Some(None)` means "staged-deleted -- treat as
+    /// absent"; `Some(Some(body))` is a staged put.
+    pub(in crate::data::executor) fn kv_overlay_body(
+        &self,
+        task: &ExecutionTask,
+        tid: u64,
+        collection: &str,
+        key: &[u8],
+    ) -> Option<Option<Vec<u8>>> {
+        let txn_id = task.request.txn_id?;
+        let coll_key = (
+            task.request.database_id,
+            crate::types::TenantId::new(tid),
+            collection.to_string(),
+        );
+        let doc_id = hex_key(key);
+        let staged = self
+            .txn_overlays
+            .get(&txn_id)?
+            .get_by_doc_id(&coll_key, &doc_id)?;
+        Some(match staged {
+            Staged::Put(body) => Some(body.clone()),
+            Staged::Tombstone => None,
+        })
     }
 }

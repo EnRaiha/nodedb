@@ -2,6 +2,7 @@
 
 pub mod engine;
 pub mod engine_atomic;
+pub mod engine_atomic_compute;
 mod engine_helpers;
 mod engine_index;
 mod engine_rename;
@@ -19,6 +20,7 @@ pub mod sorted_index;
 
 pub use engine::KvEngine;
 pub use engine_atomic::{AtomicError, CasResult};
+pub use engine_atomic_compute as atomic_compute;
 pub use engine_stats::{ExpiredKey, KvStats};
 pub use scan::KvScanParams;
 

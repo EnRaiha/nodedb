@@ -16,9 +16,13 @@
 //! `doc_id_to_surrogate` map first, falling back to the base KV engine's
 //! key→surrogate binding (`get_with_surrogate`).
 //!
-//! Every other `KvOp` (Incr, Cas, FieldSet, BatchPut, Expire, Transfer, the
-//! sorted-index family, etc.) is out of scope: it never reaches this file
-//! because `is_stageable_write` only routes the five ops above here.
+//! `Incr` / `IncrFloat` / `Cas` / `GetSet` / `BatchPut` are also stageable,
+//! but their handlers live in the sibling `stage_kv_atomic.rs` (kept
+//! separate to stay under the file-size limit) -- see that module's doc for
+//! their surrogate-resolution and value-computation reuse. Every other
+//! `KvOp` (FieldSet, Expire, Transfer, the sorted-index family, etc.) is out
+//! of scope: it never reaches this file because `is_stageable_write` only
+//! routes the nine ops above here.
 
 use nodedb_physical::physical_plan::{KvOp, UpdateValue};
 use nodedb_types::Surrogate;
@@ -122,22 +126,22 @@ impl CoreLoop {
             KvOp::Delete { collection, keys } => {
                 self.stage_kv_delete(task, tid, txn_id, collection, keys)
             }
+            KvOp::BatchPut { .. }
+            | KvOp::Incr { .. }
+            | KvOp::IncrFloat { .. }
+            | KvOp::Cas { .. }
+            | KvOp::GetSet { .. } => self.execute_stage_kv_atomic(task, tid, txn_id, op),
             KvOp::Get { .. }
             | KvOp::Scan { .. }
             | KvOp::Expire { .. }
             | KvOp::Persist { .. }
             | KvOp::BatchGet { .. }
-            | KvOp::BatchPut { .. }
             | KvOp::RegisterIndex { .. }
             | KvOp::DropIndex { .. }
             | KvOp::FieldGet { .. }
             | KvOp::FieldSet { .. }
             | KvOp::GetTtl { .. }
             | KvOp::Truncate { .. }
-            | KvOp::Incr { .. }
-            | KvOp::IncrFloat { .. }
-            | KvOp::Cas { .. }
-            | KvOp::GetSet { .. }
             | KvOp::RegisterSortedIndex { .. }
             | KvOp::DropSortedIndex { .. }
             | KvOp::SortedIndexRank { .. }
@@ -384,7 +388,12 @@ impl CoreLoop {
 
     /// Resolve the current value for `key` under BASE ∪ OVERLAY, preferring
     /// a staged put/tombstone over the base KV engine.
-    fn resolve_kv_current(&self, ctx: &StageCtx<'_>, key: &[u8]) -> Option<Vec<u8>> {
+    ///
+    /// `pub(super)` (rather than private) so the atomic-op staging handlers
+    /// in `stage_kv_atomic.rs` reuse this exact resolution instead of
+    /// re-deriving it -- a staged `Incr`/`Cas`/`GetSet` reads the same
+    /// BASE ∪ OVERLAY current value a staged `InsertOnConflictUpdate` does.
+    pub(super) fn resolve_kv_current(&self, ctx: &StageCtx<'_>, key: &[u8]) -> Option<Vec<u8>> {
         match self
             .txn_overlays
             .get(&ctx.txn_id)
