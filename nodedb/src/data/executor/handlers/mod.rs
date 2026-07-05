@@ -62,6 +62,7 @@ pub mod upsert;
 pub mod vector;
 pub mod vector_lifecycle;
 pub mod vector_multi;
+mod vector_multi_search_exec;
 pub mod vector_params;
 pub mod vector_search;
 mod vector_search_ann;

@@ -118,8 +118,8 @@ impl CoreLoop {
                 | GraphOp::TemporalAlgorithm { .. }
                 | GraphOp::Stats { .. },
             ) => return self.stage_not_point_write(task),
-            PhysicalPlan::Vector(_)
-            | PhysicalPlan::Text(_)
+            PhysicalPlan::Vector(_) => return self.stage_not_point_write(task),
+            PhysicalPlan::Text(_)
             | PhysicalPlan::Timeseries(_)
             | PhysicalPlan::Crdt(_)
             | PhysicalPlan::Query(_)
