@@ -239,26 +239,40 @@ impl CoreLoop {
                 self.response_ok(task)
             }
 
-            // Return the current overlay undo-journal length as the savepoint
-            // marker (8-byte LE u64). An absent overlay (no staged write yet)
-            // reports marker 0. Graph overlay journaling is a separate unit.
+            // Return a composite savepoint marker spanning BOTH overlays: the
+            // value/TTL overlay's undo-journal length followed by the parallel
+            // GRAPH overlay's, each an 8-byte LE u64 (16 bytes total). An
+            // absent overlay (no staged write of that kind yet) reports 0.
             MetaOp::MarkSavepoint { txn_id } => {
-                let marker = self
+                let value_marker = self
                     .txn_overlays
                     .get(txn_id)
                     .map(|overlay| overlay.journal_len())
                     .unwrap_or(0) as u64;
-                self.response_with_payload(task, marker.to_le_bytes().to_vec())
+                let graph_marker = self
+                    .graph_txn_overlays
+                    .get(txn_id)
+                    .map(|overlay| overlay.journal_len())
+                    .unwrap_or(0) as u64;
+                let mut payload = Vec::with_capacity(16);
+                payload.extend_from_slice(&value_marker.to_le_bytes());
+                payload.extend_from_slice(&graph_marker.to_le_bytes());
+                self.response_with_payload(task, payload)
             }
 
-            // Rewind the value + TTL overlay to the marked journal length. An
-            // absent overlay is a no-op (nothing was staged).
+            // Rewind BOTH the value/TTL overlay and the GRAPH overlay to their
+            // marked journal lengths. An absent overlay is a no-op (nothing of
+            // that kind was staged).
             MetaOp::RollbackToSavepoint {
                 txn_id,
-                journal_marker,
+                value_marker,
+                graph_marker,
             } => {
                 if let Some(overlay) = self.txn_overlays.get_mut(txn_id) {
-                    overlay.rollback_to(*journal_marker as usize);
+                    overlay.rollback_to(*value_marker as usize);
+                }
+                if let Some(overlay) = self.graph_txn_overlays.get_mut(txn_id) {
+                    overlay.rollback_to(*graph_marker as usize);
                 }
                 self.response_ok(task)
             }

@@ -232,13 +232,22 @@ impl SessionStore {
 
     /// Create a savepoint at the current tx_buffer position.
     ///
-    /// `journal_marker` is the Data-Plane overlay undo-journal length captured
-    /// on the transaction's home vShard (via `MetaOp::MarkSavepoint`), so a
-    /// later ROLLBACK TO can rewind the staging overlay to exactly this point.
-    pub fn create_savepoint(&self, addr: &SocketAddr, name: String, journal_marker: usize) {
+    /// `value_marker` / `graph_marker` are the Data-Plane value/TTL and GRAPH
+    /// overlay undo-journal lengths captured on the transaction's home vShard
+    /// (via `MetaOp::MarkSavepoint`), so a later ROLLBACK TO can rewind both
+    /// staging overlays to exactly this point.
+    pub fn create_savepoint(
+        &self,
+        addr: &SocketAddr,
+        name: String,
+        value_marker: usize,
+        graph_marker: usize,
+    ) {
         self.write_session(addr, |session| {
             let pos = session.tx_buffer.len();
-            session.savepoints.push((name, pos, journal_marker));
+            session
+                .savepoints
+                .push((name, pos, value_marker, graph_marker));
         });
     }
 
@@ -250,7 +259,7 @@ impl SessionStore {
             let pos = session
                 .savepoints
                 .iter()
-                .rposition(|(n, _, _)| n == name)
+                .rposition(|(n, _, _, _)| n == name)
                 .ok_or_else(|| crate::Error::BadRequest {
                     detail: format!("savepoint \"{name}\" does not exist"),
                 })?;
@@ -265,24 +274,29 @@ impl SessionStore {
     }
 
     /// Rollback to a savepoint: truncate tx_buffer to the saved position and
-    /// return the overlay journal marker the caller must rewind the Data-Plane
-    /// staging overlay to.
+    /// return the `(value_marker, graph_marker)` overlay journal markers the
+    /// caller must rewind the two Data-Plane staging overlays to.
     ///
     /// Returns `Err` if the savepoint does not exist (matches PostgreSQL behavior).
-    pub fn rollback_to_savepoint(&self, addr: &SocketAddr, name: &str) -> crate::Result<usize> {
+    pub fn rollback_to_savepoint(
+        &self,
+        addr: &SocketAddr,
+        name: &str,
+    ) -> crate::Result<(usize, usize)> {
         self.write_session(addr, |session| {
             let pos = session
                 .savepoints
                 .iter()
-                .rposition(|(n, _, _)| n == name)
+                .rposition(|(n, _, _, _)| n == name)
                 .ok_or_else(|| crate::Error::BadRequest {
                     detail: format!("savepoint \"{name}\" does not exist"),
                 })?;
             let buffer_pos = session.savepoints[pos].1;
-            let journal_marker = session.savepoints[pos].2;
+            let value_marker = session.savepoints[pos].2;
+            let graph_marker = session.savepoints[pos].3;
             session.tx_buffer.truncate(buffer_pos);
             session.savepoints.truncate(pos + 1);
-            Ok(journal_marker)
+            Ok((value_marker, graph_marker))
         })
         .unwrap_or_else(|| {
             Err(crate::Error::BadRequest {

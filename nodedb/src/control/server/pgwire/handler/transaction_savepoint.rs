@@ -144,11 +144,13 @@ impl NodeDbPgHandler {
             .nth(1)
             .unwrap_or("sp")
             .to_string();
-        // Capture the overlay undo-journal marker on the txn's home vShard so a
-        // later ROLLBACK TO reverts staged value/TTL state to exactly here. A
-        // missing/short payload (or no vShard yet) means an empty journal → 0.
+        // Capture the composite overlay undo-journal marker on the txn's home
+        // vShard so a later ROLLBACK TO reverts staged value/TTL AND GRAPH
+        // state to exactly here. The 16-byte payload carries two LE u64s:
+        // value-overlay marker then graph-overlay marker. A missing/short
+        // payload (or no vShard yet) means empty journals → (0, 0).
         let txn_id = self.sessions.tx_id(addr);
-        let journal_marker = match txn_id {
+        let (value_marker, graph_marker) = match txn_id {
             Some(txn_id) => {
                 let payload = self
                     .dispatch_overlay_savepoint(
@@ -158,18 +160,23 @@ impl NodeDbPgHandler {
                     )
                     .await;
                 payload
-                    .filter(|bytes| bytes.len() == 8)
+                    .filter(|bytes| bytes.len() == 16)
                     .map(|bytes| {
-                        let mut arr = [0u8; 8];
-                        arr.copy_from_slice(&bytes);
-                        u64::from_le_bytes(arr) as usize
+                        let mut value = [0u8; 8];
+                        value.copy_from_slice(&bytes[..8]);
+                        let mut graph = [0u8; 8];
+                        graph.copy_from_slice(&bytes[8..16]);
+                        (
+                            u64::from_le_bytes(value) as usize,
+                            u64::from_le_bytes(graph) as usize,
+                        )
                     })
-                    .unwrap_or(0)
+                    .unwrap_or((0, 0))
             }
-            None => 0,
+            None => (0, 0),
         };
         self.sessions
-            .create_savepoint(addr, sp_name, journal_marker);
+            .create_savepoint(addr, sp_name, value_marker, graph_marker);
         Ok(vec![Response::Execution(Tag::new("SAVEPOINT"))])
     }
 
@@ -211,8 +218,9 @@ impl NodeDbPgHandler {
             .last()
             .unwrap_or("sp")
             .to_string();
-        let journal_marker = match self.sessions.rollback_to_savepoint(addr, &sp_name) {
-            Ok(marker) => marker,
+        let (value_marker, graph_marker) = match self.sessions.rollback_to_savepoint(addr, &sp_name)
+        {
+            Ok(markers) => markers,
             Err(msg) => {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
@@ -221,13 +229,15 @@ impl NodeDbPgHandler {
                 ))));
             }
         };
-        // Rewind the Data-Plane value + TTL overlay to the marked journal point.
+        // Rewind BOTH the value/TTL overlay and the GRAPH overlay to the
+        // marked journal points.
         if let Some(txn_id) = self.sessions.tx_id(addr) {
             self.dispatch_overlay_savepoint(
                 identity.tenant_id,
                 nodedb_physical::physical_plan::MetaOp::RollbackToSavepoint {
                     txn_id,
-                    journal_marker: journal_marker as u64,
+                    value_marker: value_marker as u64,
+                    graph_marker: graph_marker as u64,
                 },
                 addr,
             )

@@ -455,22 +455,28 @@ pub enum MetaOp {
     /// overlay was ever populated for the given `txn_id`.
     DropTxnOverlay { txn_id: nodedb_types::id::TxnId },
 
-    /// Mark a savepoint in the per-transaction staging overlay.
+    /// Mark a savepoint in the per-transaction staging overlays.
     ///
-    /// The Data Plane returns the current length of the overlay's undo journal
-    /// (an 8-byte little-endian `u64`) so the Control Plane can record it as the
-    /// savepoint's rollback marker. In-memory only — savepoints append no WAL.
-    /// Keyed by the request's `txn_id`.
+    /// A single savepoint spans BOTH the value/TTL overlay and the parallel
+    /// GRAPH overlay, which keep independent undo journals. The Data Plane
+    /// returns a 16-byte composite marker — two little-endian `u64`s: the
+    /// value overlay's journal length followed by the GRAPH overlay's — so the
+    /// Control Plane can record both as the savepoint's rollback markers.
+    /// In-memory only — savepoints append no WAL. Keyed by the request's
+    /// `txn_id`.
     MarkSavepoint { txn_id: nodedb_types::id::TxnId },
 
-    /// Roll the per-transaction staging overlay back to a savepoint.
+    /// Roll the per-transaction staging overlays back to a savepoint.
     ///
-    /// Replays the overlay's undo journal from its end down to `journal_marker`
-    /// in reverse, restoring each recorded prior value/TTL slot (or removing it
-    /// when the prior slot was absent), then truncates the journal to the
-    /// marker. The transaction stays open. In-memory only. Keyed by `txn_id`.
+    /// Replays BOTH overlays' undo journals from their ends down to their
+    /// respective markers in reverse — restoring each recorded prior slot (or
+    /// removing it when absent) in the value/TTL overlay to `value_marker` and
+    /// in the GRAPH overlay to `graph_marker` — then truncates each journal to
+    /// its marker. The transaction stays open. In-memory only. Keyed by
+    /// `txn_id`.
     RollbackToSavepoint {
         txn_id: nodedb_types::id::TxnId,
-        journal_marker: u64,
+        value_marker: u64,
+        graph_marker: u64,
     },
 }

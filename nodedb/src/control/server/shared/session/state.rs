@@ -78,11 +78,12 @@ pub struct ConnSession {
     /// document's current LSN > read_lsn, a concurrent write occurred
     /// and the transaction is rejected with SERIALIZATION_FAILURE.
     pub tx_read_set: Vec<(String, String, Lsn)>,
-    /// Savepoint stack: each entry is
-    /// `(name, tx_buffer_len_at_savepoint, overlay_journal_marker)`.
-    /// On ROLLBACK TO, truncate tx_buffer to the saved length AND rewind the
-    /// Data-Plane staging overlay to the saved journal marker.
-    pub savepoints: Vec<(String, usize, usize)>,
+    /// Savepoint stack: each entry is `(name, tx_buffer_len_at_savepoint,
+    /// value_overlay_marker, graph_overlay_marker)`.
+    /// On ROLLBACK TO, truncate tx_buffer to the saved length AND rewind both
+    /// Data-Plane staging overlays (value/TTL and GRAPH) to their saved
+    /// journal markers.
+    pub savepoints: Vec<(String, usize, usize, usize)>,
     /// Pending consumer offset commits deferred until COMMIT.
     /// Each entry: (tenant_id, stream_name, group_name, partition_id, lsn).
     /// Flushed atomically on COMMIT, discarded on ROLLBACK.
