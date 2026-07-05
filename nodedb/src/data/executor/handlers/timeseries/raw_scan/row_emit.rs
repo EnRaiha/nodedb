@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+use nodedb_types::columnar::schema::TS_SYSTEM;
+
 use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType};
 
 /// Extract the `_ts_system` value from an rmpv-encoded row for audit-log
@@ -14,7 +16,7 @@ pub(super) fn rmpv_system_time(row: &rmpv::Value) -> i64 {
     };
     for (k, v) in entries {
         if let rmpv::Value::String(s) = k
-            && s.as_str() == Some("_ts_system")
+            && s.as_str() == Some(TS_SYSTEM)
             && let rmpv::Value::Integer(i) = v
         {
             return i.as_i64().unwrap_or(i64::MIN);

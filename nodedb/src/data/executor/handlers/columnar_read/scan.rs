@@ -2,6 +2,7 @@
 
 //! Scan-params struct and the base scan entry point.
 
+use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
 use nodedb_types::surrogate_bitmap::SurrogateBitmap;
 
 use crate::bridge::envelope::{ErrorCode, Response};
@@ -189,15 +190,9 @@ impl CoreLoop {
         // Resolve hidden bitemporal column positions once; `None` means
         // the collection is not bitemporal, so the per-row filter is a
         // no-op regardless of `system_as_of_ms` / `valid_at_ms` values.
-        let ts_system_idx = schema.columns.iter().position(|c| c.name == "_ts_system");
-        let ts_valid_from_idx = schema
-            .columns
-            .iter()
-            .position(|c| c.name == "_ts_valid_from");
-        let ts_valid_until_idx = schema
-            .columns
-            .iter()
-            .position(|c| c.name == "_ts_valid_until");
+        let ts_system_idx = schema.columns.iter().position(|c| c.name == TS_SYSTEM);
+        let ts_valid_from_idx = schema.columns.iter().position(|c| c.name == TS_VALID_FROM);
+        let ts_valid_until_idx = schema.columns.iter().position(|c| c.name == TS_VALID_UNTIL);
 
         // Block-boundary prefilter: if a prefilter is present and none of
         // the memtable's surrogates fall within the bitmap's [min, max]

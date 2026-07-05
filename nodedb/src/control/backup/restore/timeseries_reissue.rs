@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use nodedb_types::columnar::schema::TS_SYSTEM;
 use nodedb_types::value::Value;
 
 use crate::Error;
@@ -54,7 +55,7 @@ const REISSUE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Server-stamped reserved column — re-derived by the ingest path, so it must
 /// NOT be carried back into the re-issued rows (the ingest handler restamps it).
 /// `_ts_valid_from` / `_ts_valid_until` ARE client-provided and preserved.
-const TS_SYSTEM_COLUMN: &str = "_ts_system";
+const TS_SYSTEM_COLUMN: &str = TS_SYSTEM;
 
 /// Decode the memtable section plus every flushed partition of one timeseries
 /// collection into live `Value::Object` rows (keyed by column name).

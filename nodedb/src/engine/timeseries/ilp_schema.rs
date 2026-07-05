@@ -11,6 +11,8 @@
 //!    Int64 slots (`_ts_system`, `_ts_valid_from`, `_ts_valid_until`) to
 //!    a schema that doesn't already carry them.
 
+use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
+
 use super::columnar_memtable::{ColumnType, ColumnarMemtable, ColumnarSchema};
 use super::ilp::{FieldValue, IlpLine};
 
@@ -65,7 +67,7 @@ pub fn infer_schema(lines: &[IlpLine<'_>]) -> ColumnarSchema {
 /// `timestamp_idx = 0` stays valid for the existing time-range pruning
 /// path.
 pub fn ensure_bitemporal_columns(schema: &mut ColumnarSchema) {
-    const RESERVED: [&str; 3] = ["_ts_system", "_ts_valid_from", "_ts_valid_until"];
+    const RESERVED: [&str; 3] = [TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL];
     let existing: std::collections::HashSet<&str> =
         schema.columns.iter().map(|(n, _)| n.as_str()).collect();
     let missing: Vec<&str> = RESERVED

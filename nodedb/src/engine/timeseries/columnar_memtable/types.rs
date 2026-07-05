@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use nodedb_types::columnar::schema::TS_SYSTEM;
 use nodedb_types::timeseries::{SeriesId, SymbolDictionary};
 use serde::{Deserialize, Serialize};
 
@@ -71,7 +72,7 @@ impl ColumnarSchema {
 
     /// Index of the reserved `_ts_system` column, or `None` for non-bitemporal.
     pub fn ts_system_idx(&self) -> Option<usize> {
-        self.columns.iter().position(|(n, _)| n == "_ts_system")
+        self.columns.iter().position(|(n, _)| n == TS_SYSTEM)
     }
 }
 

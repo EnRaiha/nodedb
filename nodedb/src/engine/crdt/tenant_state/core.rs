@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 
 use loro::LoroValue;
+use nodedb_types::columnar::schema::TS_SYSTEM;
 
 use nodedb_crdt::constraint::ConstraintSet;
 use nodedb_crdt::pre_validate::{self, PreValidationResult};
@@ -252,13 +253,13 @@ impl TenantCrdtEngine {
         let mut fields: Vec<(&str, LoroValue)> = change
             .fields
             .iter()
-            .filter(|(k, _)| !(is_bitemporal && k == "_ts_system"))
+            .filter(|(k, _)| !(is_bitemporal && k == TS_SYSTEM))
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
 
         let state = self.state_mut(&change.collection)?;
         if is_bitemporal {
-            fields.push(("_ts_system", LoroValue::I64(now_ms)));
+            fields.push((TS_SYSTEM, LoroValue::I64(now_ms)));
             state
                 .upsert_versioned(&change.collection, &change.row_id, &fields)
                 .map_err(crate::Error::Crdt)

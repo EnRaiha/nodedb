@@ -3,6 +3,7 @@
 //! Schema inference, field coercion, bitemporal column injection, and
 //! schema-ordered row <-> object conversion.
 
+use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
 use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
 use nodedb_types::value::Value;
 
@@ -192,9 +193,9 @@ pub(in crate::data::executor) fn prepend_bitemporal_columns(
     base: ColumnarSchema,
 ) -> ColumnarSchema {
     let mut cols = Vec::with_capacity(3 + base.columns.len());
-    cols.push(ColumnDef::required("_ts_system", ColumnType::Int64));
-    cols.push(ColumnDef::required("_ts_valid_from", ColumnType::Int64));
-    cols.push(ColumnDef::required("_ts_valid_until", ColumnType::Int64));
+    cols.push(ColumnDef::required(TS_SYSTEM, ColumnType::Int64));
+    cols.push(ColumnDef::required(TS_VALID_FROM, ColumnType::Int64));
+    cols.push(ColumnDef::required(TS_VALID_UNTIL, ColumnType::Int64));
     cols.extend(base.columns);
     ColumnarSchema::new(cols).expect("bitemporal columnar schema must be valid")
 }

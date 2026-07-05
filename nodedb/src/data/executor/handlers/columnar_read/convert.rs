@@ -50,7 +50,8 @@ pub(in crate::data::executor) fn row_to_projected_json(
 ) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     for (i, col_def) in schema.columns.iter().enumerate() {
-        let force_system_col = all_versions && col_def.name == "_ts_system";
+        let force_system_col =
+            all_versions && col_def.name == nodedb_types::columnar::schema::TS_SYSTEM;
         if !projection.is_empty()
             && !force_system_col
             && !projection.iter().any(|p| p == &col_def.name)
@@ -78,7 +79,7 @@ pub(in crate::data::executor) fn row_to_projected_json(
             obj.retain(|k, _| {
                 projection.iter().any(|p| p == k)
                     || computed_cols.iter().any(|cc| &cc.alias == k)
-                    || (all_versions && k == "_ts_system")
+                    || (all_versions && k == nodedb_types::columnar::schema::TS_SYSTEM)
             });
         }
     }

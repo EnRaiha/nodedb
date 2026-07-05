@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use super::columnar_memtable::{ColumnType, ColumnValue, ColumnarMemtable};
 use super::ilp::{FieldValue, IlpLine};
+use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
 use nodedb_types::timeseries::{IngestResult, SeriesId, SeriesKey};
 
 pub use super::ilp_schema::{ensure_bitemporal_columns, evolve_schema, infer_schema};
@@ -106,11 +107,11 @@ pub fn ingest_batch_with_lvc(
                 }
                 ColumnType::Int64 => {
                     let val = match (bitemporal, col_name.as_str()) {
-                        (Some(b), "_ts_system") => b.system_ms,
-                        (Some(_), "_ts_valid_from") => {
+                        (Some(b), TS_SYSTEM) => b.system_ms,
+                        (Some(_), TS_VALID_FROM) => {
                             find_field_i64_opt(&line.fields, col_name).unwrap_or(i64::MIN)
                         }
-                        (Some(_), "_ts_valid_until") => {
+                        (Some(_), TS_VALID_UNTIL) => {
                             find_field_i64_opt(&line.fields, col_name).unwrap_or(i64::MAX)
                         }
                         _ => find_field_i64(&line.fields, col_name),

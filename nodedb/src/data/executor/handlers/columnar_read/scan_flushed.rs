@@ -4,6 +4,8 @@
 //! file within the 500-line non-test limit. Logic is verbatim from
 //! `execute_columnar_scan`; only the parameterisation changes.
 
+use nodedb_types::columnar::schema::TS_SYSTEM;
+
 use crate::bridge::expr_eval::ComputedColumn;
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
@@ -201,7 +203,7 @@ impl CoreLoop {
 
                     let mut obj = serde_json::Map::new();
                     for (i, col_def) in schema.columns.iter().enumerate() {
-                        let force_system_col = all_versions && col_def.name == "_ts_system";
+                        let force_system_col = all_versions && col_def.name == TS_SYSTEM;
                         if !projection.is_empty()
                             && !force_system_col
                             && !projection.iter().any(|p| p == &col_def.name)
@@ -230,7 +232,7 @@ impl CoreLoop {
                             obj.retain(|k, _| {
                                 projection.iter().any(|p| p == k)
                                     || computed_cols.iter().any(|cc| &cc.alias == k)
-                                    || (all_versions && k == "_ts_system")
+                                    || (all_versions && k == TS_SYSTEM)
                             });
                         }
                     }

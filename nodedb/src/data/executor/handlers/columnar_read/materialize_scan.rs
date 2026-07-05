@@ -21,6 +21,7 @@
 //! round-trips. `segment_id == 0` means the row came from the active memtable.
 //! Empty cursor = scan complete.
 
+use nodedb_types::columnar::schema::TS_SYSTEM;
 use nodedb_types::value::Value;
 
 use crate::bridge::envelope::Response;
@@ -71,7 +72,7 @@ impl CoreLoop {
         };
 
         let schema = engine.schema().clone();
-        let ts_system_idx = schema.columns.iter().position(|c| c.name == "_ts_system");
+        let ts_system_idx = schema.columns.iter().position(|c| c.name == TS_SYSTEM);
 
         // Cursor encodes (segment_id: u32 BE, row_index: u32 BE).
         // segment_id == 0 means "memtable" (position within memtable rows).
@@ -246,7 +247,7 @@ impl CoreLoop {
                     return build_response(self, task, entries, Vec::new());
                 };
                 let schema = engine.schema().clone();
-                let ts_system_idx = schema.columns.iter().position(|c| c.name == "_ts_system");
+                let ts_system_idx = schema.columns.iter().position(|c| c.name == TS_SYSTEM);
 
                 let rows_with_surrogates: Vec<(Option<nodedb_types::Surrogate>, Vec<Value>)> =
                     engine

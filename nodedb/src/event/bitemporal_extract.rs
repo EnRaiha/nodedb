@@ -17,15 +17,9 @@
 //! BulkInsert/BulkDelete summary events all legitimately produce `(None,
 //! None)`.
 
+use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM};
+
 use crate::event::types::deserialize_event_payload;
-
-/// Field name carrying the receiver-stamped system time. Matches the
-/// reserved column name shared across CRDT, document strict, columnar,
-/// timeseries, and edge engines.
-const TS_SYSTEM: &str = "_ts_system";
-
-/// Field name carrying the user / engine-stamped valid-from time.
-const TS_VALID_FROM: &str = "_ts_valid_from";
 
 /// Extract `(system_time_ms, valid_time_ms)` from a serialized row
 /// payload. See module docs for the contract.

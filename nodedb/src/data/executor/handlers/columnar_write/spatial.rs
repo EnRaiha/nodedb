@@ -4,6 +4,7 @@
 //! schema inference on engine creation).
 
 use nodedb_columnar::MutationEngine;
+use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
 use nodedb_types::value::Value;
 
 use crate::data::executor::core_loop::CoreLoop;
@@ -60,12 +61,12 @@ impl CoreLoop {
             .columns
             .iter()
             .map(|col| match col.name.as_str() {
-                "_ts_system" if bitemporal => Ok(Value::Integer(sys_now)),
-                "_ts_valid_from" if bitemporal => Ok(match ndb_obj.get("_ts_valid_from") {
+                TS_SYSTEM if bitemporal => Ok(Value::Integer(sys_now)),
+                TS_VALID_FROM if bitemporal => Ok(match ndb_obj.get(TS_VALID_FROM) {
                     Some(Value::Integer(i)) => Value::Integer(*i),
                     _ => Value::Integer(i64::MIN),
                 }),
-                "_ts_valid_until" if bitemporal => Ok(match ndb_obj.get("_ts_valid_until") {
+                TS_VALID_UNTIL if bitemporal => Ok(match ndb_obj.get(TS_VALID_UNTIL) {
                     Some(Value::Integer(i)) => Value::Integer(*i),
                     _ => Value::Integer(i64::MAX),
                 }),

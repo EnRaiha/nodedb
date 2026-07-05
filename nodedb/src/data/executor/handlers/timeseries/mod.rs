@@ -17,6 +17,7 @@ use crate::bridge::envelope::{Payload, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_query::agg_key::canonical_agg_key;
+use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
 
 /// Parameters for a timeseries scan operation.
 pub(in crate::data::executor) struct TimeseriesScanParams<'a> {
@@ -93,7 +94,7 @@ impl CoreLoop {
         // against per-block min/max automatically.
         if let Some(cutoff) = system_as_of_ms {
             filter_predicates.push(crate::bridge::scan_filter::ScanFilter {
-                field: "_ts_system".into(),
+                field: TS_SYSTEM.into(),
                 op: crate::bridge::scan_filter::FilterOp::Lte,
                 value: nodedb_types::Value::Integer(cutoff),
                 clauses: Vec::new(),
@@ -102,14 +103,14 @@ impl CoreLoop {
         }
         if let Some(point) = valid_at_ms {
             filter_predicates.push(crate::bridge::scan_filter::ScanFilter {
-                field: "_ts_valid_from".into(),
+                field: TS_VALID_FROM.into(),
                 op: crate::bridge::scan_filter::FilterOp::Lte,
                 value: nodedb_types::Value::Integer(point),
                 clauses: Vec::new(),
                 expr: None,
             });
             filter_predicates.push(crate::bridge::scan_filter::ScanFilter {
-                field: "_ts_valid_until".into(),
+                field: TS_VALID_UNTIL.into(),
                 op: crate::bridge::scan_filter::FilterOp::Gt,
                 value: nodedb_types::Value::Integer(point),
                 clauses: Vec::new(),
