@@ -6,6 +6,7 @@ pub mod constraint_reconcile;
 pub mod credentials;
 pub mod data_plane;
 pub mod listeners;
+pub mod schema_rehydrate;
 pub mod signal;
 pub mod state_wiring;
 pub mod tls;

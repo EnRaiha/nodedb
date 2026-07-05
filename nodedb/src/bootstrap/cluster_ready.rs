@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use tracing::info;
 
+use crate::bootstrap::schema_rehydrate::rehydrate_schema_registry;
 use crate::control::startup::ReadyGate;
 use crate::control::state::SharedState;
 
@@ -72,9 +73,20 @@ pub async fn await_cluster_ready(
         }
     }
     // Metadata raft group has applied its first entry (or we're
-    // in single-node mode with no raft). The post-apply hooks
-    // have rebuilt in-memory registries from redb.
+    // in single-node mode with no raft).
     raft_gate.fire();
+
+    // Authoritatively rehydrate the Data Plane per-core schema registry
+    // from the durable catalog, in both single-node and cluster mode.
+    // This is NOT a raft-replay side effect: it enumerates every active
+    // stored collection and re-registers it directly, awaited and
+    // fail-closed, so no client listener can open against a collection
+    // whose schema (including strict-mode `StrictSchema`) hasn't been
+    // re-registered to every Data Plane core after a restart.
+    if let Err(e) = rehydrate_schema_registry(shared).await {
+        schema_gate.fail(format!("schema registry rehydration failed: {e}"));
+        return Err(anyhow::anyhow!("schema registry rehydration failed: {e}"));
+    }
     schema_gate.fire();
 
     // Catalog sanity check: applied-index gate, redb

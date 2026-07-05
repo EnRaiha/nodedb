@@ -177,26 +177,14 @@ impl TestServer {
         {
             eprintln!("pgwire_harness: failed to reload synonym groups: {e}");
         }
-        let persisted_collections = shared
-            .credentials
-            .catalog()
-            .as_ref()
-            .and_then(|catalog| {
-                if let Ok(entries) = catalog.load_all_arrays()
-                    && let Ok(mut guard) = shared.array_catalog.write()
-                {
-                    for entry in entries {
-                        let _ = guard.register(entry);
-                    }
-                }
-                catalog
-                    .load_collections_for_tenant(
-                        nodedb_types::DatabaseId::DEFAULT,
-                        TenantId::new(1).as_u64(),
-                    )
-                    .ok()
-            })
-            .unwrap_or_default();
+        if let Some(catalog) = shared.credentials.catalog()
+            && let Ok(entries) = catalog.load_all_arrays()
+            && let Ok(mut guard) = shared.array_catalog.write()
+        {
+            for entry in entries {
+                let _ = guard.register(entry);
+            }
+        }
 
         let mut core_stop_txs = Vec::new();
         let mut core_handles = Vec::new();
@@ -244,14 +232,9 @@ impl TestServer {
             }
         });
 
-        for coll in persisted_collections.into_iter().filter(|c| c.is_active) {
-            nodedb::control::server::shared::ddl::neutral::collection::dispatch_register_from_stored(
-                &shared,
-                &coll,
-            )
+        nodedb::bootstrap::schema_rehydrate::rehydrate_schema_registry(&shared)
             .await
-            .unwrap();
-        }
+            .expect("schema rehydration on restart");
 
         // Re-register every persisted continuous aggregate on the local
         // Data Plane manager: the registry is per-core in-memory state

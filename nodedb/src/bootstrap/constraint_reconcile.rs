@@ -186,7 +186,9 @@ pub async fn reconcile_once(
 /// Load every collection across every database the node owns, tagged with its
 /// owning [`DatabaseId`]. `StoredCollection` does not carry its database id, so
 /// it is paired here from the enumeration that produced it.
-fn load_collections(catalog: &SystemCatalog) -> crate::Result<Vec<(DatabaseId, StoredCollection)>> {
+pub(crate) fn load_collections(
+    catalog: &SystemCatalog,
+) -> crate::Result<Vec<(DatabaseId, StoredCollection)>> {
     // Always enumerate the default database, then any explicitly-created ones.
     // Collections created without a `CREATE DATABASE` live under
     // `DatabaseId::DEFAULT`, which has no row in the DATABASES table and so never
