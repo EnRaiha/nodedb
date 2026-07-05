@@ -28,6 +28,7 @@ use crate::control::state::SharedState;
 use crate::data::executor::response_codec::{
     ArraySliceResponse, RowsPayload, decode_payload_to_json,
 };
+use nodedb_types::columnar::schema::is_reserved_bitemporal_column;
 use nodedb_types::{DatabaseId, NodeDbError, TenantId};
 
 use super::kv::apply_kv_wrap;
@@ -318,14 +319,14 @@ fn derive_columns(rows: &[Map<String, JsonValue>]) -> Vec<String> {
             cols.push("id".to_string());
         }
         for key in first.keys() {
-            if key != "id" {
+            if key != "id" && !is_reserved_bitemporal_column(key) {
                 cols.push(key.clone());
             }
         }
     }
     for row in rows.iter().skip(1) {
         for key in row.keys() {
-            if !cols.contains(key) {
+            if !is_reserved_bitemporal_column(key) && !cols.contains(key) {
                 cols.push(key.clone());
             }
         }

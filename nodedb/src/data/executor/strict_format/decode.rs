@@ -3,6 +3,7 @@
 //! Strict document decoding: Binary Tuple → Value/msgpack/JSON.
 
 use nodedb_types::columnar::StrictSchema;
+use nodedb_types::columnar::schema::is_reserved_bitemporal_column;
 use nodedb_types::value::Value;
 
 use super::coerce::value_to_json;
@@ -82,6 +83,9 @@ pub fn binary_tuple_to_json(
         Value::Object(map) => {
             let mut obj = serde_json::Map::with_capacity(map.len());
             for col in &schema.columns {
+                if is_reserved_bitemporal_column(&col.name) {
+                    continue;
+                }
                 let v = map.get(&col.name).unwrap_or(&Value::Null);
                 obj.insert(col.name.clone(), value_to_json(v));
             }

@@ -112,6 +112,19 @@ pub const BITEMPORAL_RESERVED_COLUMNS: [&str; 3] = [
     BITEMPORAL_VALID_UNTIL,
 ];
 
+/// Single source of truth for "is this a reserved internal strict-tuple
+/// bitemporal column that must be hidden from user-facing projections
+/// (`SELECT *`, JSON/msgpack decode boundaries, etc.)". Covers the
+/// strict-tuple triple (`__system_from_ms`, `__valid_from_ms`,
+/// `__valid_until_ms`) that `StrictSchema::new_bitemporal` prepends into the
+/// physical schema. Callers should replace ad-hoc per-site string checks with
+/// this predicate. (The columnar/timeseries `_ts_*` columns are handled by
+/// those engines' own read paths and, for audit queries, are the intended
+/// output — they are deliberately NOT hidden here.)
+pub fn is_reserved_bitemporal_column(name: &str) -> bool {
+    BITEMPORAL_RESERVED_COLUMNS.contains(&name)
+}
+
 /// Schema validation errors.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
