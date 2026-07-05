@@ -70,6 +70,13 @@ fn check_tenant_graph_depth(
 }
 
 /// `GRAPH TRAVERSE FROM '<node_id>' [DEPTH <n>] [LABEL '<label>'] [DIRECTION in|out|both]`
+///
+/// No `txn_id` parameter, unlike [`neighbors`]: `GRAPH TRAVERSE` is a
+/// cross-core subgraph orchestrator (multi-hop, multi-core aggregation,
+/// `cross_core_traverse_subgraph`), not a single-shard `GraphOp::Neighbors` /
+/// depth-1 `GraphOp::Hop` dispatch -- merging staged edges into an N-hop
+/// cross-core BFS is out of scope for this single-hop read-your-own-writes
+/// unit (see `graph_txn_merge`'s doc comment).
 pub async fn traverse(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -109,6 +116,10 @@ pub async fn traverse(
 }
 
 /// `GRAPH NEIGHBORS OF '<node_id>' [LABEL '<label>'] [DIRECTION in|out|both]`
+///
+/// `txn_id` (the caller's active session transaction, if any) is stamped
+/// onto the fan-out request so this read observes the transaction's own
+/// staged edge writes (read-your-own-writes) via `GraphTxnOverlay`.
 pub async fn neighbors(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -116,6 +127,7 @@ pub async fn neighbors(
     node: String,
     edge_label: Option<String>,
     direction: GraphDirection,
+    txn_id: Option<crate::types::TxnId>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     if node.is_empty() {
         return Err(ddl_err("42601", "missing OF '<node_id>'"));
@@ -130,12 +142,13 @@ pub async fn neighbors(
         rls_filters: Vec::new(),
     });
 
-    match crate::control::server::broadcast::broadcast_to_all_cores(
+    match crate::control::server::broadcast::broadcast_to_all_cores_txn(
         state,
         tenant_id,
         database_id,
         plan,
         TraceId::ZERO,
+        txn_id,
     )
     .await
     {

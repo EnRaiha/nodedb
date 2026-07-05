@@ -230,9 +230,12 @@ impl CoreLoop {
 
             // Release the staging overlay once a transaction resolves (commit
             // or rollback). `HashMap::remove` on an absent key is a no-op, so
-            // this is safe even when no overlay was ever populated.
+            // this is safe even when no overlay was ever populated. The GRAPH
+            // overlay is a parallel, independent structure (see
+            // `GraphTxnOverlay`) and is dropped in lockstep.
             MetaOp::DropTxnOverlay { txn_id } => {
                 self.txn_overlays.remove(txn_id);
+                self.graph_txn_overlays.remove(txn_id);
                 self.response_ok(task)
             }
         }

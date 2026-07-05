@@ -482,13 +482,19 @@ pub struct CoreLoop {
     pub(in crate::data::executor) ollp_is_group_leader: bool,
 
     /// Per-transaction staging overlay: not-yet-durable writes for each
-    /// in-flight transaction on this core, keyed by `TxnId`.
-    ///
-    /// Populated by `MetaOp::StageWrite` when an in-transaction point write is
-    /// executed at statement time, and released by `MetaOp::DropTxnOverlay`
-    /// once the transaction resolves (commit or rollback).
+    /// in-flight transaction on this core, keyed by `TxnId`. Populated by
+    /// `MetaOp::StageWrite` at statement time, released by
+    /// `MetaOp::DropTxnOverlay` on commit or rollback.
     pub(in crate::data::executor) txn_overlays: HashMap<
         crate::types::TxnId,
         crate::data::executor::handlers::transaction::overlay::TxnOverlay,
+    >,
+
+    /// Parallel to `txn_overlays`, for GRAPH writes (edge identity is a
+    /// string tuple, not a surrogate -- see `GraphTxnOverlay`). Same
+    /// lifecycle, released by `MetaOp::DropTxnOverlay`.
+    pub(in crate::data::executor) graph_txn_overlays: HashMap<
+        crate::types::TxnId,
+        crate::data::executor::handlers::transaction::overlay::GraphTxnOverlay,
     >,
 }

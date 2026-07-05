@@ -53,13 +53,30 @@ pub async fn broadcast_to_all_cores(
     trace_id: TraceId,
 ) -> crate::Result<Response> {
     // Graph/DDL all-core broadcast: not session-transaction-scoped, so `None`.
+    broadcast_to_all_cores_txn(shared, tenant_id, database_id, plan, trace_id, None).await
+}
+
+/// [`broadcast_to_all_cores`], but session-transaction-scoped: `txn_id`
+/// (when `Some`) is stamped onto every per-core request so a Data Plane
+/// handler can merge that transaction's staged writes into its durable
+/// result -- read-your-own-writes. Used by the GRAPH `Neighbors` single-hop
+/// read so an in-transaction `GRAPH NEIGHBORS` observes the transaction's
+/// own uncommitted edge writes (see `GraphTxnOverlay`).
+pub async fn broadcast_to_all_cores_txn(
+    shared: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+    txn_id: Option<crate::types::TxnId>,
+) -> crate::Result<Response> {
     let outcome = crate::control::server::exchange::gather_all_cores(
         shared,
         tenant_id,
         database_id,
         plan,
         trace_id,
-        None,
+        txn_id,
     )
     .await?;
     Ok(Response {

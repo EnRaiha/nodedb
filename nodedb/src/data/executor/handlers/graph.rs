@@ -28,6 +28,10 @@ use crate::types::TenantId;
 
 #[path = "graph_traversal.rs"]
 mod graph_traversal;
+#[path = "graph_txn_merge.rs"]
+mod graph_txn_merge;
+
+use graph_txn_merge::merge_graph_txn_overlay_neighbors;
 
 impl CoreLoop {
     #[allow(clippy::too_many_arguments)]
@@ -304,6 +308,30 @@ impl CoreLoop {
             ),
             None => Vec::new(),
         };
+        // Read-your-own-writes only for the single-hop case (depth == 1),
+        // matching `execute_graph_neighbors`. Multi-hop `Hop` (depth > 1)
+        // stays durable-only -- see `merge_hop_single_hop`'s doc comment.
+        let overlay = task
+            .request
+            .txn_id
+            .and_then(|txn_id| self.graph_txn_overlays.get(&txn_id));
+        let result: Vec<String> =
+            graph_txn_merge::merge_hop_single_hop(graph_txn_merge::HopMergeParams {
+                overlay,
+                durable_neighbors_of: |start: &str| {
+                    self.csr_partition(database_id, tid)
+                        .map(|p| p.neighbors(start, edge_label.as_deref(), direction))
+                        .unwrap_or_default()
+                },
+                starts: &refs,
+                depth,
+                database_id: task.request.database_id,
+                tenant: TenantId::new(tid),
+                edge_label: edge_label.as_deref(),
+                direction,
+                has_bitmap: frontier_bitmap.is_some(),
+                durable_result: result,
+            });
         if let Some(ref m) = self.metrics {
             m.record_graph_traversal();
         }
@@ -331,10 +359,25 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, tid, %node_id, ?edge_label, ?direction, "graph neighbors");
         let database_id = task.request.database_id.as_u64();
-        let neighbors: Vec<(String, String)> = match self.csr_partition(database_id, tid) {
+        let durable: Vec<(String, String)> = match self.csr_partition(database_id, tid) {
             Some(partition) => partition.neighbors(node_id, edge_label.as_deref(), direction),
             None => Vec::new(),
         };
+        // Read-your-own-writes: fold this transaction's staged edge writes
+        // into the durable result (see `graph_txn_merge`).
+        let overlay = task
+            .request
+            .txn_id
+            .and_then(|txn_id| self.graph_txn_overlays.get(&txn_id));
+        let neighbors = merge_graph_txn_overlay_neighbors(
+            overlay,
+            task.request.database_id,
+            TenantId::new(tid),
+            node_id,
+            edge_label.as_deref(),
+            direction,
+            durable,
+        );
         let result: Vec<_> = neighbors
             .iter()
             .map(

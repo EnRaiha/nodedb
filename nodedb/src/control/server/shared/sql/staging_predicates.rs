@@ -8,7 +8,7 @@
 //! later units). No pgwire types are imported here.
 
 use crate::bridge::envelope::PhysicalPlan;
-use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, KvOp, SpatialOp};
+use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, GraphOp, KvOp, SpatialOp};
 
 /// Allow-list of the plans the in-transaction path stages at statement time:
 /// point writes, predicate `BulkUpdate` / `BulkDelete` (bulk predicate DML,
@@ -74,6 +74,17 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
         || matches!(
             plan,
             PhysicalPlan::Spatial(SpatialOp::Insert { .. } | SpatialOp::Delete { .. })
+        )
+        || matches!(
+            plan,
+            PhysicalPlan::Graph(
+                GraphOp::EdgePut { .. }
+                    | GraphOp::EdgeDelete { .. }
+                    | GraphOp::EdgePutBatch { .. }
+                    | GraphOp::EdgeDeleteBatch { .. }
+                    | GraphOp::SetNodeLabels { .. }
+                    | GraphOp::RemoveNodeLabels { .. }
+            )
         )
 }
 
@@ -161,6 +172,20 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
         PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Spatial(SpatialOp::Insert { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Spatial(SpatialOp::Delete { .. }) => StagedTagKind::Delete,
+        // GraphOp::EdgePut / EdgePutBatch add a new edge tuple -- Insert,
+        // matching the autocommit `execute_edge_put` path (which has no
+        // distinct update outcome; an edge either exists or it doesn't).
+        PhysicalPlan::Graph(GraphOp::EdgePut { .. } | GraphOp::EdgePutBatch { .. }) => {
+            StagedTagKind::Insert
+        }
+        PhysicalPlan::Graph(GraphOp::EdgeDelete { .. } | GraphOp::EdgeDeleteBatch { .. }) => {
+            StagedTagKind::Delete
+        }
+        // SetNodeLabels / RemoveNodeLabels mutate an existing node's label
+        // bitset in place -- Update, not Insert/Delete of a row.
+        PhysicalPlan::Graph(GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. }) => {
+            StagedTagKind::Update
+        }
         other => unreachable!(
             "staged_tag_kind called on a non-stageable-write plan; \
              is_stageable_write invariant broken: {other:?}"

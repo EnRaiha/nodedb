@@ -163,7 +163,13 @@ pub async fn try_dispatch(
     // Recognizing them here on the typed path preserves that: `dispatch_graph`
     // returns `Some` for the graph-overlay variants and `None` otherwise.
     if let NodedbStatement::Graph(_) = &stmt {
-        return graph_ops::dispatch_graph(state, identity, database_id, stmt).await;
+        // Read-your-own-writes for single-hop GRAPH reads (Neighbors/Hop)
+        // needs the session's active `TxnId` so the Data Plane can merge in
+        // this transaction's staged edge writes (see `GraphTxnOverlay`).
+        // Idle sessions (no BEGIN) resolve to `None`, matching every other
+        // read path's autocommit behavior.
+        let (txn_id, _) = txn_ctx.sessions.txn_identity(txn_ctx.addr);
+        return graph_ops::dispatch_graph(state, identity, database_id, stmt, txn_id).await;
     }
 
     if let Some(r) = typed_misc::try_typed(state, identity, sql, database_id, &stmt, txn_ctx).await

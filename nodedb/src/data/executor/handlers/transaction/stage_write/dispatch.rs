@@ -3,7 +3,7 @@
 //! `StageWrite` dispatch: route a point-write plan to the matching staging
 //! path, compute its real affected-row count, and record it in the overlay.
 
-use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, SpatialOp, UpdateValue};
+use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, GraphOp, SpatialOp, UpdateValue};
 
 use super::constraint::OverlayPk;
 use super::context::StageCtx;
@@ -93,12 +93,36 @@ impl CoreLoop {
             PhysicalPlan::Spatial(SpatialOp::Scan { .. }) => {
                 return self.stage_not_point_write(task);
             }
+            PhysicalPlan::Graph(
+                op @ (GraphOp::EdgePut { .. }
+                | GraphOp::EdgeDelete { .. }
+                | GraphOp::EdgePutBatch { .. }
+                | GraphOp::EdgeDeleteBatch { .. }
+                | GraphOp::SetNodeLabels { .. }
+                | GraphOp::RemoveNodeLabels { .. }),
+            ) => return self.execute_stage_graph(task, tid, txn_id, op),
+            PhysicalPlan::Graph(
+                GraphOp::Hop { .. }
+                | GraphOp::Neighbors { .. }
+                | GraphOp::NeighborsMulti { .. }
+                | GraphOp::Path { .. }
+                | GraphOp::Subgraph { .. }
+                | GraphOp::RagFusion { .. }
+                | GraphOp::Algo { .. }
+                | GraphOp::Match { .. }
+                | GraphOp::MatchContinuation { .. }
+                | GraphOp::MatchVarLenResume { .. }
+                | GraphOp::BspSuperstep(_)
+                | GraphOp::WccSuperstep(_)
+                | GraphOp::TemporalNeighbors { .. }
+                | GraphOp::TemporalAlgorithm { .. }
+                | GraphOp::Stats { .. },
+            ) => return self.stage_not_point_write(task),
             PhysicalPlan::Vector(_)
             | PhysicalPlan::Text(_)
             | PhysicalPlan::Timeseries(_)
             | PhysicalPlan::Crdt(_)
             | PhysicalPlan::Query(_)
-            | PhysicalPlan::Graph(_)
             | PhysicalPlan::Meta(_)
             | PhysicalPlan::Array(_)
             | PhysicalPlan::ClusterArray(_) => return self.stage_not_point_write(task),

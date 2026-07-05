@@ -19,6 +19,7 @@ mod dispatch;
 mod stage_bulk_delete;
 mod stage_bulk_update;
 mod stage_columnar;
+mod stage_graph;
 mod stage_insert_select;
 mod stage_kv;
 mod stage_spatial;

@@ -176,6 +176,7 @@ impl CoreLoop {
             // group skip verification and apply the leader's predicted set.
             ollp_is_group_leader: true,
             txn_overlays: HashMap::new(),
+            graph_txn_overlays: HashMap::new(),
         })
     }
 }

@@ -6,7 +6,7 @@ use nodedb_sql::ddl_ast::statement::{GraphStmt, NodedbStatement};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::DatabaseId;
+use crate::types::{DatabaseId, TxnId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::{algo, edge, rag_fusion, stats, traverse};
@@ -22,6 +22,7 @@ pub async fn dispatch_graph(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     stmt: NodedbStatement,
+    txn_id: Option<TxnId>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     match stmt {
         NodedbStatement::Graph(GraphStmt::GraphInsertEdge {
@@ -78,7 +79,16 @@ pub async fn dispatch_graph(
             edge_label,
             direction,
         }) => Some(
-            traverse::neighbors(state, identity, database_id, node, edge_label, direction).await,
+            traverse::neighbors(
+                state,
+                identity,
+                database_id,
+                node,
+                edge_label,
+                direction,
+                txn_id,
+            )
+            .await,
         ),
         NodedbStatement::Graph(GraphStmt::GraphPath {
             src,
