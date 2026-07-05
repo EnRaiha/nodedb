@@ -11,6 +11,7 @@ use nodedb_types::DatabaseId;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 
 use super::parse::{fields_to_upsert_sql, parse_write_statement, plan_and_dispatch};
@@ -28,6 +29,7 @@ pub async fn upsert_document(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     let parsed = match parse_write_statement(state, identity, sql, "UPSERT INTO ")? {
         Ok(p) => p,
@@ -153,7 +155,16 @@ pub async fn upsert_document(
 
     // Build SQL and route through nodedb-sql → EngineRules → sql_plan_convert.
     let upsert_sql = fields_to_upsert_sql(&parsed.coll_name, &fields);
-    if let Err(e) = plan_and_dispatch(state, identity, tenant_id, database_id, &upsert_sql).await {
+    if let Err(e) = plan_and_dispatch(
+        state,
+        identity,
+        tenant_id,
+        database_id,
+        &upsert_sql,
+        txn_ctx,
+    )
+    .await
+    {
         return Some(Err(e));
     }
 

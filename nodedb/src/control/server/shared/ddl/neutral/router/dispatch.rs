@@ -10,6 +10,7 @@
 use nodedb_sql::ddl_ast::statement::{GraphStmt, NodedbStatement};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -37,6 +38,7 @@ pub async fn try_dispatch(
     identity: &AuthenticatedIdentity,
     sql: &str,
     database_id: DatabaseId,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     let upper = sql.to_uppercase();
 
@@ -117,7 +119,8 @@ pub async fn try_dispatch(
                     .unwrap_or(after_into.len());
                 if after_into[coll_end..].trim_start().starts_with('{')
                     && let Some(result) =
-                        collection::insert_document(state, identity, database_id, sql).await
+                        collection::insert_document(state, identity, database_id, sql, txn_ctx)
+                            .await
                 {
                     return Some(result);
                 }
@@ -135,7 +138,7 @@ pub async fn try_dispatch(
                     after_into[coll_end..].trim_start().starts_with('{')
                 })
                 && let Some(result) =
-                    collection::upsert_document(state, identity, database_id, sql).await
+                    collection::upsert_document(state, identity, database_id, sql, txn_ctx).await
             {
                 return Some(result);
             }
@@ -163,7 +166,8 @@ pub async fn try_dispatch(
         return graph_ops::dispatch_graph(state, identity, database_id, stmt).await;
     }
 
-    if let Some(r) = typed_misc::try_typed(state, identity, sql, database_id, &stmt).await {
+    if let Some(r) = typed_misc::try_typed(state, identity, sql, database_id, &stmt, txn_ctx).await
+    {
         return Some(r);
     }
     if let Some(r) = typed_streamview::try_typed(state, identity, sql, database_id, &stmt).await {

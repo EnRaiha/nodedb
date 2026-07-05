@@ -10,6 +10,10 @@
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sql_parse::{parse_sql_value, split_values};
+use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+use crate::control::server::shared::session::{
+    DmlTxnCtx, InTxnRoute, StagingGateError, route_in_tx_write,
+};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use crate::types::TraceId;
@@ -337,6 +341,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     tenant_id: nodedb_types::TenantId,
     database_id: crate::types::DatabaseId,
     sql: &str,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<(), DdlError> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
     let (mut tasks, _output_schema) = query_ctx
@@ -383,19 +388,57 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     }
 
     for task in tasks {
+        let task_vshard_id = task.vshard_id;
+        let task_database_id = task.database_id;
+
+        let routed = route_in_tx_write(txn_ctx.sessions, txn_ctx.addr, task, |staged| {
+            crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn(
+                state,
+                staged.tenant_id,
+                staged.database_id,
+                staged.vshard_id,
+                staged.plan,
+                TraceId::ZERO,
+                staged.txn_id,
+            )
+        })
+        .await;
+
+        let task = match routed {
+            Ok(InTxnRoute::Read(task)) => *task,
+            Ok(InTxnRoute::Buffered) => continue,
+            // Staged into the per-transaction overlay + buffered for COMMIT
+            // replay; `plan_and_dispatch` returns `()` on success so the
+            // affected count has no return path here (its callers already
+            // build their own "OK" result independent of row counts).
+            Ok(InTxnRoute::Staged(_outcome)) => continue,
+            Err(StagingGateError::Dispatch(e)) => {
+                return Err(ddl_err("XX000", e.to_string()));
+            }
+            Err(StagingGateError::Rejected { code }) => {
+                let (_, sqlstate, message) = match code {
+                    Some(code) => error_code_to_sqlstate(&code),
+                    None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
+                };
+                return Err(ddl_err(sqlstate, message));
+            }
+        };
+
+        // Not in a transaction block (or a read): reproduce today's
+        // immediate autocommit path exactly — WAL append then dispatch.
         crate::control::server::wal_dispatch::wal_append_if_write(
             &state.wal,
             tenant_id,
-            task.vshard_id,
-            task.database_id,
+            task_vshard_id,
+            task_database_id,
             &task.plan,
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
         let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,
-            task.database_id,
-            task.vshard_id,
+            task_database_id,
+            task_vshard_id,
             task.plan,
             TraceId::ZERO,
         )

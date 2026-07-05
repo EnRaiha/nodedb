@@ -16,9 +16,11 @@ use nodedb_types::CollectionType;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 
 use super::csv_import::{CsvOptions, import_csv};
+use super::import_ctx::ImportCtx;
 use super::json_import::{import_json_array, import_ndjson};
 
 /// Maximum file size accepted for COPY FROM (16 GiB).
@@ -40,6 +42,7 @@ pub async fn copy_from_file(
     path: &str,
     options: CopyFromOptions<'_>,
     database_id: DatabaseId,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let CopyFromOptions {
         format,
@@ -79,25 +82,26 @@ pub async fn copy_from_file(
 
     let tenant_id = identity.tenant_id;
 
+    let import_ctx = ImportCtx {
+        state,
+        identity,
+        tenant_id,
+        database_id,
+        txn_ctx,
+    };
+
     let row_count = match resolved_format {
-        CopyFormat::Ndjson => {
-            import_ndjson(state, identity, tenant_id, collection, path, database_id).await?
-        }
-        CopyFormat::JsonArray => {
-            import_json_array(state, identity, tenant_id, collection, path, database_id).await?
-        }
+        CopyFormat::Ndjson => import_ndjson(&import_ctx, collection, path).await?,
+        CopyFormat::JsonArray => import_json_array(&import_ctx, collection, path).await?,
         CopyFormat::Csv => {
             import_csv(
-                state,
-                identity,
-                tenant_id,
+                &import_ctx,
                 collection,
                 path,
                 CsvOptions {
                     delimiter: delimiter.unwrap_or(','),
                     has_header: header,
                 },
-                database_id,
             )
             .await?
         }

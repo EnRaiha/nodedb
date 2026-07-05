@@ -95,12 +95,21 @@ pub async fn query(
 
     let sql = body.sql.as_str();
 
+    // HTTP is stateless — there is no BEGIN/COMMIT session concept over this
+    // transport, so a session-less scope satisfies the DDL dispatch signature.
+    // A fresh store reports "not in a transaction block" for any address, so
+    // the staging gate inside `plan_and_dispatch` always takes the immediate
+    // autocommit branch here, unchanged from before the gate existed.
+    let http_scope = crate::control::server::shared::session::DetachedTxnScope::new();
+    let txn_ctx = http_scope.ctx();
+
     // Try DDL commands first (same as pgwire handler).
     if let Some(result) = crate::control::server::shared::ddl::dispatch(
         &state.shared,
         &identity,
         sql.trim(),
         database_id,
+        &txn_ctx,
     )
     .await
     {

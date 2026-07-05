@@ -8,14 +8,13 @@
 //! module's own file-read/parse errors are built as `DdlError` at their call
 //! sites to keep one error type end to end.
 
-use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::neutral::collection::dml::{
     fields_to_insert_sql, plan_and_dispatch,
 };
 use crate::control::server::shared::ddl::result::DdlError;
-use crate::control::state::SharedState;
 
 use super::entry::wrap_row_error;
+use super::import_ctx::ImportCtx;
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
@@ -30,12 +29,9 @@ fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
 /// Parse-then-insert: all rows are parsed before any INSERT is issued so that
 /// a JSON parse error on any line prevents rows from being partially written.
 pub(super) async fn import_ndjson(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: nodedb_types::TenantId,
+    ctx: &ImportCtx<'_>,
     collection: &str,
     path: &str,
-    database_id: nodedb_types::DatabaseId,
 ) -> Result<usize, DdlError> {
     let bytes = tokio::fs::read(path)
         .await
@@ -66,9 +62,16 @@ pub(super) async fn import_ndjson(
     // Insert phase: issue all INSERTs.
     for (line_no, fields) in &parsed {
         let sql = fields_to_insert_sql(collection, fields);
-        plan_and_dispatch(state, identity, tenant_id, database_id, &sql)
-            .await
-            .map_err(|e| wrap_row_error(e, *line_no, "NDJSON"))?;
+        plan_and_dispatch(
+            ctx.state,
+            ctx.identity,
+            ctx.tenant_id,
+            ctx.database_id,
+            &sql,
+            ctx.txn_ctx,
+        )
+        .await
+        .map_err(|e| wrap_row_error(e, *line_no, "NDJSON"))?;
     }
 
     Ok(parsed.len())
@@ -79,12 +82,9 @@ pub(super) async fn import_ndjson(
 /// Parse-then-insert: all rows are deserialized before any INSERT so that
 /// a malformed array prevents partial writes.
 pub(super) async fn import_json_array(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: nodedb_types::TenantId,
+    ctx: &ImportCtx<'_>,
     collection: &str,
     path: &str,
-    database_id: nodedb_types::DatabaseId,
 ) -> Result<usize, DdlError> {
     let bytes = tokio::fs::read(path)
         .await
@@ -119,9 +119,16 @@ pub(super) async fn import_json_array(
     for (idx, fields) in parsed.iter().enumerate() {
         let line_no = idx + 1;
         let sql = fields_to_insert_sql(collection, fields);
-        plan_and_dispatch(state, identity, tenant_id, database_id, &sql)
-            .await
-            .map_err(|e| wrap_row_error(e, line_no, "JSON array"))?;
+        plan_and_dispatch(
+            ctx.state,
+            ctx.identity,
+            ctx.tenant_id,
+            ctx.database_id,
+            &sql,
+            ctx.txn_ctx,
+        )
+        .await
+        .map_err(|e| wrap_row_error(e, line_no, "JSON array"))?;
     }
 
     Ok(parsed.len())

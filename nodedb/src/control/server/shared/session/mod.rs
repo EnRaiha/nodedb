@@ -27,7 +27,8 @@ pub use self::params::{
     parse_show_command,
 };
 pub use self::staging_gate::{
-    InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError, route_in_tx_write,
+    DetachedTxnScope, DmlTxnCtx, InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError,
+    route_in_tx_write,
 };
 pub use self::state::{ConnSession, CursorState, TransactionState};
 pub use self::store::SessionStore;

@@ -14,6 +14,7 @@ use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity, DatabaseSet, Role};
 use nodedb::control::server::pgwire::ddl_encode;
 use nodedb::control::server::shared::ddl;
+use nodedb::control::server::shared::session::DetachedTxnScope;
 use nodedb::control::state::SharedState;
 use nodedb::types::TenantId;
 use nodedb::wal::WalManager;
@@ -80,9 +81,16 @@ pub fn readonly_user() -> AuthenticatedIdentity {
 
 /// Run DDL, expect success.
 pub async fn ddl_ok(state: &SharedState, identity: &AuthenticatedIdentity, sql: &str) {
-    let result = ddl::dispatch(state, identity, sql, nodedb_types::id::DatabaseId::DEFAULT)
-        .await
-        .map(ddl_encode::ddl_results_to_pgwire);
+    let scope = DetachedTxnScope::new();
+    let result = ddl::dispatch(
+        state,
+        identity,
+        sql,
+        nodedb_types::id::DatabaseId::DEFAULT,
+        &scope.ctx(),
+    )
+    .await
+    .map(ddl_encode::ddl_results_to_pgwire);
     assert!(result.is_some(), "DDL not recognized: {sql}");
     result
         .unwrap()
@@ -91,9 +99,16 @@ pub async fn ddl_ok(state: &SharedState, identity: &AuthenticatedIdentity, sql: 
 
 /// Run DDL, expect error; return the error string for assertions.
 pub async fn ddl_err(state: &SharedState, identity: &AuthenticatedIdentity, sql: &str) -> String {
-    let result = ddl::dispatch(state, identity, sql, nodedb_types::id::DatabaseId::DEFAULT)
-        .await
-        .map(ddl_encode::ddl_results_to_pgwire);
+    let scope = DetachedTxnScope::new();
+    let result = ddl::dispatch(
+        state,
+        identity,
+        sql,
+        nodedb_types::id::DatabaseId::DEFAULT,
+        &scope.ctx(),
+    )
+    .await
+    .map(ddl_encode::ddl_results_to_pgwire);
     assert!(result.is_some(), "DDL not recognized: {sql}");
     let err = result.unwrap().unwrap_err();
     err.to_string()
@@ -108,9 +123,16 @@ pub async fn try_ddl(
     identity: &AuthenticatedIdentity,
     sql: &str,
 ) -> Result<(), String> {
-    let result = ddl::dispatch(state, identity, sql, nodedb_types::id::DatabaseId::DEFAULT)
-        .await
-        .map(ddl_encode::ddl_results_to_pgwire);
+    let scope = DetachedTxnScope::new();
+    let result = ddl::dispatch(
+        state,
+        identity,
+        sql,
+        nodedb_types::id::DatabaseId::DEFAULT,
+        &scope.ctx(),
+    )
+    .await
+    .map(ddl_encode::ddl_results_to_pgwire);
     let result = result.expect("DDL not recognized");
     result.map(|_| ()).map_err(|e| e.to_string())
 }

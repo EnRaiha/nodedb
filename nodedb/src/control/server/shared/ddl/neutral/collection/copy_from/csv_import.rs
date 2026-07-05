@@ -8,14 +8,13 @@
 //! module's own file-read/parse errors are built as `DdlError` at their call
 //! sites to keep one error type end to end.
 
-use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::neutral::collection::dml::{
     fields_to_insert_sql, plan_and_dispatch,
 };
 use crate::control::server::shared::ddl::result::DdlError;
-use crate::control::state::SharedState;
 
 use super::entry::wrap_row_error;
+use super::import_ctx::ImportCtx;
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
@@ -34,13 +33,10 @@ pub(super) struct CsvOptions {
 
 /// Import from a CSV file (header row → column names; each subsequent row → INSERT).
 pub(super) async fn import_csv(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: nodedb_types::TenantId,
+    ctx: &ImportCtx<'_>,
     collection: &str,
     path: &str,
     opts: CsvOptions,
-    database_id: nodedb_types::DatabaseId,
 ) -> Result<usize, DdlError> {
     let CsvOptions {
         delimiter,
@@ -122,9 +118,16 @@ pub(super) async fn import_csv(
     // Insert phase.
     for (ln, fields) in &parsed {
         let sql = fields_to_insert_sql(collection, fields);
-        plan_and_dispatch(state, identity, tenant_id, database_id, &sql)
-            .await
-            .map_err(|e| wrap_row_error(e, *ln, "CSV"))?;
+        plan_and_dispatch(
+            ctx.state,
+            ctx.identity,
+            ctx.tenant_id,
+            ctx.database_id,
+            &sql,
+            ctx.txn_ctx,
+        )
+        .await
+        .map_err(|e| wrap_row_error(e, *ln, "CSV"))?;
     }
 
     Ok(parsed.len())

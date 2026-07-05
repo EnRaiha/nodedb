@@ -6,6 +6,7 @@
 use nodedb_sql::ddl_ast::statement::{ClusterStmt, MiscStmt, NodedbStatement};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -19,6 +20,7 @@ pub(super) async fn try_typed(
     _sql: &str,
     database_id: DatabaseId,
     stmt: &NodedbStatement,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     match stmt {
         // `COPY <collection> FROM '<path>' [WITH (...)]` bulk import. Ported
@@ -41,6 +43,7 @@ pub(super) async fn try_typed(
                     header: *header,
                 },
                 database_id,
+                txn_ctx,
             )
             .await,
         ),

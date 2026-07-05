@@ -12,6 +12,7 @@ use nodedb_types::DatabaseId;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 
 use super::parse::{
@@ -26,6 +27,7 @@ pub async fn insert_document(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     let parsed = match parse_write_statement(state, identity, sql, "INSERT INTO ")? {
         Ok(p) => p,
@@ -165,7 +167,16 @@ pub async fn insert_document(
     // Build SQL from fields and route through nodedb-sql → sql_plan_convert.
     // This ensures all engine-type routing goes through the shared EngineRules.
     let insert_sql = fields_to_insert_sql(&parsed.coll_name, &fields);
-    if let Err(e) = plan_and_dispatch(state, identity, tenant_id, database_id, &insert_sql).await {
+    if let Err(e) = plan_and_dispatch(
+        state,
+        identity,
+        tenant_id,
+        database_id,
+        &insert_sql,
+        txn_ctx,
+    )
+    .await
+    {
         return Some(Err(e));
     }
 

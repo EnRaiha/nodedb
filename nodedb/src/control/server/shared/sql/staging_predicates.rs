@@ -12,13 +12,14 @@ use nodedb_physical::physical_plan::{DocumentOp, KvOp};
 
 /// Allow-list of the plans the in-transaction path stages at statement time:
 /// point writes, predicate `BulkUpdate` / `BulkDelete` (bulk predicate DML,
-/// no RETURNING), and `InsertSelect` (`INSERT ... SELECT`, which has no
-/// RETURNING variant so it is always stageable). Explicit match on the exact
-/// staged variants — KV point writes and any RETURNING variant stay on the
+/// no RETURNING), `InsertSelect` (`INSERT ... SELECT`, which has no
+/// RETURNING variant so it is always stageable), and `Upsert` (`UPSERT
+/// INTO`, also RETURNING-free). Explicit match on the exact staged
+/// variants — KV point writes and any RETURNING variant stay on the
 /// buffer path. Named for the point-write case historically; also covers
-/// bulk predicate DML and `InsertSelect` now that `stage_bulk_update` /
-/// `stage_bulk_delete` / `stage_insert_select` stage the matched rows the
-/// same way.
+/// bulk predicate DML, `InsertSelect`, and `Upsert` now that
+/// `stage_bulk_update` / `stage_bulk_delete` / `stage_insert_select` /
+/// `stage_document_upsert` stage the matched rows the same way.
 pub fn is_point_write(plan: &PhysicalPlan) -> bool {
     matches!(
         plan,
@@ -42,6 +43,7 @@ pub fn is_point_write(plan: &PhysicalPlan) -> bool {
                     ..
                 }
                 | DocumentOp::InsertSelect { .. }
+                | DocumentOp::Upsert { .. }
         )
     )
 }
@@ -109,12 +111,18 @@ pub fn extract_kv_conflict_op(payload: &[u8]) -> Option<String> {
 /// update (`true`) or an insert (`false`) -- the one staged write whose
 /// outcome cannot be decided from the plan shape alone; the stage handler
 /// signals it back via the `"op"` field in the response payload.
+///
+/// `DocUpsert` is `DocumentOp::Upsert`'s counterpart: like the autocommit
+/// handler (`handlers/upsert.rs`), the pgwire tag for `UPSERT INTO` is
+/// always the literal `UPSERT` command regardless of insert-vs-update
+/// outcome, so unlike `KvUpsert` it carries no outcome flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagedTagKind {
     Insert,
     Update,
     Delete,
     KvUpsert { updated: bool },
+    DocUpsert,
 }
 
 /// Decide the [`StagedTagKind`] for a staged write, given the plan and the
@@ -143,6 +151,7 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
             },
         ) => StagedTagKind::Delete,
         PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => StagedTagKind::Insert,
+        PhysicalPlan::Document(DocumentOp::Upsert { .. }) => StagedTagKind::DocUpsert,
         PhysicalPlan::Kv(op) => staged_kv_tag_kind(op, payload),
         other => unreachable!(
             "staged_tag_kind called on a non-stageable-write plan; \

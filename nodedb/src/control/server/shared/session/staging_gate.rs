@@ -51,6 +51,54 @@ pub struct StagedWriteOutcome {
     pub affected: usize,
 }
 
+/// Session store + connection address, bundled so the protocol-neutral DDL
+/// dispatch path (`dispatch` -> `try_dispatch` -> `upsert_document` /
+/// `insert_document` -> `plan_and_dispatch`, plus the `COPY FROM` bulk-import
+/// chain) can thread a single extra parameter down to [`route_in_tx_write`]
+/// instead of two positional arguments at every layer.
+pub struct DmlTxnCtx<'a> {
+    pub sessions: &'a SessionStore,
+    pub addr: &'a SocketAddr,
+}
+
+/// An owned, session-less scope for callers with no BEGIN/COMMIT transaction
+/// concept over their transport (stateless HTTP, autocommit test helpers).
+///
+/// It owns a fresh [`SessionStore`] and a placeholder address; because a fresh
+/// store reports [`TransactionState::Idle`] for every address,
+/// [`route_in_tx_write`] always takes the `Read` (immediate autocommit
+/// dispatch) branch through a [`DmlTxnCtx`] borrowed from here — byte-identical
+/// to the pre-gate behavior. Keep the scope alive for the duration of the
+/// dispatch call that borrows its [`ctx`](Self::ctx).
+pub struct DetachedTxnScope {
+    sessions: SessionStore,
+    addr: SocketAddr,
+}
+
+impl Default for DetachedTxnScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DetachedTxnScope {
+    /// Create an owned session-less scope.
+    pub fn new() -> Self {
+        Self {
+            sessions: SessionStore::new(),
+            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+        }
+    }
+
+    /// Borrow a [`DmlTxnCtx`] pointing at this scope's owned store + address.
+    pub fn ctx(&self) -> DmlTxnCtx<'_> {
+        DmlTxnCtx {
+            sessions: &self.sessions,
+            addr: &self.addr,
+        }
+    }
+}
+
 /// Error surfaced by [`route_in_tx_write`]. Kept distinct from
 /// `crate::Error::DataPlane` (used elsewhere for data-plane errors that
 /// arrive as a genuine `Err` from a dispatch call) because this variant

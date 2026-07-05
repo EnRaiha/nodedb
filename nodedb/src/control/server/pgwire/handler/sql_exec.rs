@@ -338,6 +338,11 @@ impl NodeDbPgHandler {
             self.state.database_metrics.record_qps(&desc.name);
         }
 
+        let txn_ctx = crate::control::server::shared::session::DmlTxnCtx {
+            sessions: &self.sessions,
+            addr,
+        };
+
         if let Some(rewritten) =
             super::super::system_functions::rewrite_purge_collection(sql_trimmed, &upper)
             && let Some(result) = crate::control::server::shared::ddl::dispatch(
@@ -345,6 +350,7 @@ impl NodeDbPgHandler {
                 identity,
                 &rewritten,
                 database_id,
+                &txn_ctx,
             )
             .await
         {
@@ -356,6 +362,7 @@ impl NodeDbPgHandler {
             identity,
             sql_trimmed,
             database_id,
+            &txn_ctx,
         )
         .await
         {

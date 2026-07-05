@@ -39,11 +39,16 @@ impl NodeDbPgHandler {
             .sessions
             .get_current_database(addr)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        let txn_ctx = crate::control::server::shared::session::DmlTxnCtx {
+            sessions: &self.sessions,
+            addr,
+        };
         if crate::control::server::shared::ddl::dispatch(
             &self.state,
             identity,
             inner_sql,
             database_id,
+            &txn_ctx,
         )
         .await
         .is_some()

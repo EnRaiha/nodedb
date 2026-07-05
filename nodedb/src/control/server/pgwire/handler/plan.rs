@@ -203,6 +203,11 @@ pub(super) fn tag_from_staged(kind: StagedTagKind, affected: usize) -> Tag {
         StagedTagKind::Delete => Tag::new("DELETE").with_rows(affected),
         StagedTagKind::KvUpsert { updated: true } => Tag::new("UPDATE").with_rows(affected),
         StagedTagKind::KvUpsert { updated: false } => Tag::new("INSERT").with_rows(affected),
+        // Matches the autocommit `DocumentOp::Upsert` tag exactly: always the
+        // literal `UPSERT` command, regardless of insert-vs-update outcome
+        // (see `response_shape::types::describe_plan`'s `DmlResult("UPSERT")`
+        // arm and `payload_to_response`'s `PlanKind::DmlResult` rendering).
+        StagedTagKind::DocUpsert => Tag::new("UPSERT").with_rows(affected),
     }
 }
 
