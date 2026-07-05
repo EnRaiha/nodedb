@@ -238,6 +238,30 @@ impl CoreLoop {
                 self.graph_txn_overlays.remove(txn_id);
                 self.response_ok(task)
             }
+
+            // Return the current overlay undo-journal length as the savepoint
+            // marker (8-byte LE u64). An absent overlay (no staged write yet)
+            // reports marker 0. Graph overlay journaling is a separate unit.
+            MetaOp::MarkSavepoint { txn_id } => {
+                let marker = self
+                    .txn_overlays
+                    .get(txn_id)
+                    .map(|overlay| overlay.journal_len())
+                    .unwrap_or(0) as u64;
+                self.response_with_payload(task, marker.to_le_bytes().to_vec())
+            }
+
+            // Rewind the value + TTL overlay to the marked journal length. An
+            // absent overlay is a no-op (nothing was staged).
+            MetaOp::RollbackToSavepoint {
+                txn_id,
+                journal_marker,
+            } => {
+                if let Some(overlay) = self.txn_overlays.get_mut(txn_id) {
+                    overlay.rollback_to(*journal_marker as usize);
+                }
+                self.response_ok(task)
+            }
         }
     }
 }

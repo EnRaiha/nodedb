@@ -212,8 +212,13 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | MetaOp::DropTxnOverlay { .. },
         ) => Permission::Admin,
 
-        // Staging a point write into the per-transaction overlay is a write.
-        PhysicalPlan::Meta(MetaOp::StageWrite { .. }) => Permission::Write,
+        // Staging a point write into the per-transaction overlay is a write, as
+        // are the savepoint mark / rollback ops that operate on that overlay.
+        PhysicalPlan::Meta(
+            MetaOp::StageWrite { .. }
+            | MetaOp::MarkSavepoint { .. }
+            | MetaOp::RollbackToSavepoint { .. },
+        ) => Permission::Write,
 
         // KV engine: read operations.
         PhysicalPlan::Kv(

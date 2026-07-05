@@ -94,7 +94,7 @@ impl NodeDbPgHandler {
         }
 
         if upper.starts_with("SAVEPOINT ") {
-            return self.handle_savepoint(addr, sql_trimmed);
+            return self.handle_savepoint(identity, addr, sql_trimmed).await;
         }
 
         if upper.starts_with("RELEASE SAVEPOINT ") || upper.starts_with("RELEASE ") {
@@ -102,7 +102,9 @@ impl NodeDbPgHandler {
         }
 
         if upper.starts_with("ROLLBACK TO ") {
-            return self.handle_rollback_to_savepoint(addr, sql_trimmed);
+            return self
+                .handle_rollback_to_savepoint(identity, addr, sql_trimmed)
+                .await;
         }
 
         // ── Cursor commands ───────────────────────────────────────────

@@ -454,4 +454,23 @@ pub enum MetaOp {
     /// absent key is a no-op, so this is safe to dispatch even when no
     /// overlay was ever populated for the given `txn_id`.
     DropTxnOverlay { txn_id: nodedb_types::id::TxnId },
+
+    /// Mark a savepoint in the per-transaction staging overlay.
+    ///
+    /// The Data Plane returns the current length of the overlay's undo journal
+    /// (an 8-byte little-endian `u64`) so the Control Plane can record it as the
+    /// savepoint's rollback marker. In-memory only — savepoints append no WAL.
+    /// Keyed by the request's `txn_id`.
+    MarkSavepoint { txn_id: nodedb_types::id::TxnId },
+
+    /// Roll the per-transaction staging overlay back to a savepoint.
+    ///
+    /// Replays the overlay's undo journal from its end down to `journal_marker`
+    /// in reverse, restoring each recorded prior value/TTL slot (or removing it
+    /// when the prior slot was absent), then truncates the journal to the
+    /// marker. The transaction stays open. In-memory only. Keyed by `txn_id`.
+    RollbackToSavepoint {
+        txn_id: nodedb_types::id::TxnId,
+        journal_marker: u64,
+    },
 }

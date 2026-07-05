@@ -58,18 +58,73 @@ pub struct CollectionOverlay {
     ttl_by_surrogate: HashMap<u32, StagedTtl>,
 }
 
+/// One overlay slot's state captured immediately before a staged value/TTL
+/// mutation overwrote it. The undo journal of these entries is what makes
+/// `ROLLBACK TO SAVEPOINT` correct: last-writer-wins overwrite in
+/// `by_surrogate` / `ttl_by_surrogate` keeps only the newest value, so
+/// dropping post-savepoint entries would lose an earlier same-slot write.
+/// Restoring the recorded prior slot rewinds without that loss.
+#[derive(Debug, Clone)]
+struct OverlayUndo {
+    coll_key: (DatabaseId, TenantId, String),
+    surrogate: u32,
+    doc_id: String,
+    /// Prior `by_surrogate` entry, or `None` if the slot was absent.
+    prev_value: Option<Staged>,
+    /// Prior `ttl_by_surrogate` entry, or `None` if absent.
+    prev_ttl: Option<StagedTtl>,
+    /// Prior `doc_id_to_surrogate` binding, or `None` if unbound.
+    prev_doc_binding: Option<u32>,
+}
+
 /// Per-transaction staging overlay: holds not-yet-durable writes for every
 /// collection touched by the transaction, keyed by
 /// `(DatabaseId, TenantId, collection)`.
 #[derive(Debug, Default)]
 pub struct TxnOverlay {
     collections: HashMap<(DatabaseId, TenantId, String), CollectionOverlay>,
+    /// Append-only undo journal recording each slot's prior state before a
+    /// staged value/TTL mutation. `journal_len` reads its length (the savepoint
+    /// marker); `rollback_to` replays it in reverse down to a marker. Always
+    /// appended to by the value/TTL mutators so nothing escapes it; dropped with
+    /// the overlay when the transaction resolves.
+    journal: Vec<OverlayUndo>,
 }
 
 impl TxnOverlay {
     /// Create an empty overlay.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the current slot state for `(coll_key, surrogate, doc_id)` onto
+    /// the undo journal before a staged mutation overwrites it.
+    ///
+    /// This is the single chokepoint every value/TTL mutator calls, so no
+    /// mutation of `by_surrogate` / `ttl_by_surrogate` / `doc_id_to_surrogate`
+    /// escapes the journal — the guarantee `ROLLBACK TO SAVEPOINT` relies on.
+    fn record_undo(
+        &mut self,
+        coll_key: &(DatabaseId, TenantId, String),
+        surrogate: u32,
+        doc_id: &str,
+    ) {
+        let (prev_value, prev_ttl, prev_doc_binding) = match self.collections.get(coll_key) {
+            Some(overlay) => (
+                overlay.by_surrogate.get(&surrogate).cloned(),
+                overlay.ttl_by_surrogate.get(&surrogate).copied(),
+                overlay.doc_id_to_surrogate.get(doc_id).copied(),
+            ),
+            None => (None, None, None),
+        };
+        self.journal.push(OverlayUndo {
+            coll_key: coll_key.clone(),
+            surrogate,
+            doc_id: doc_id.to_string(),
+            prev_value,
+            prev_ttl,
+            prev_doc_binding,
+        });
     }
 
     /// Stage a put (insert/update) for `surrogate` in the given collection.
@@ -80,6 +135,7 @@ impl TxnOverlay {
         doc_id: &str,
         body: Vec<u8>,
     ) {
+        self.record_undo(&coll_key, surrogate, doc_id);
         let overlay = self.collections.entry(coll_key).or_default();
         overlay.by_surrogate.insert(surrogate, Staged::Put(body));
         overlay
@@ -94,6 +150,7 @@ impl TxnOverlay {
         surrogate: u32,
         doc_id: &str,
     ) {
+        self.record_undo(&coll_key, surrogate, doc_id);
         let overlay = self.collections.entry(coll_key).or_default();
         overlay.by_surrogate.insert(surrogate, Staged::Tombstone);
         overlay
@@ -151,11 +208,63 @@ impl TxnOverlay {
         doc_id: &str,
         ttl: StagedTtl,
     ) {
+        self.record_undo(&coll_key, surrogate, doc_id);
         let overlay = self.collections.entry(coll_key).or_default();
         overlay.ttl_by_surrogate.insert(surrogate, ttl);
         overlay
             .doc_id_to_surrogate
             .insert(doc_id.to_string(), surrogate);
+    }
+
+    /// Current length of the overlay undo journal — the savepoint marker a
+    /// later `rollback_to` rewinds toward. Returned to the Control Plane by
+    /// `MetaOp::MarkSavepoint`.
+    pub fn journal_len(&self) -> usize {
+        self.journal.len()
+    }
+
+    /// Revert every staged value/TTL mutation recorded after `marker`,
+    /// restoring each slot to its pre-mutation state (or removing it when the
+    /// prior slot was absent), then truncate the journal to `marker`.
+    ///
+    /// Entries are replayed strictly in reverse so repeated writes to one slot
+    /// unwind to the exact value present at the marked point. A `marker` at or
+    /// beyond the current length is a no-op.
+    pub fn rollback_to(&mut self, marker: usize) {
+        while self.journal.len() > marker {
+            let Some(undo) = self.journal.pop() else {
+                break;
+            };
+            let Some(overlay) = self.collections.get_mut(&undo.coll_key) else {
+                continue;
+            };
+            match undo.prev_value {
+                Some(staged) => {
+                    overlay.by_surrogate.insert(undo.surrogate, staged);
+                }
+                None => {
+                    overlay.by_surrogate.remove(&undo.surrogate);
+                }
+            }
+            match undo.prev_ttl {
+                Some(ttl) => {
+                    overlay.ttl_by_surrogate.insert(undo.surrogate, ttl);
+                }
+                None => {
+                    overlay.ttl_by_surrogate.remove(&undo.surrogate);
+                }
+            }
+            match undo.prev_doc_binding {
+                Some(surrogate) => {
+                    overlay
+                        .doc_id_to_surrogate
+                        .insert(undo.doc_id.clone(), surrogate);
+                }
+                None => {
+                    overlay.doc_id_to_surrogate.remove(&undo.doc_id);
+                }
+            }
+        }
     }
 
     /// Look up the staged TTL delta for `surrogate` in the given collection.

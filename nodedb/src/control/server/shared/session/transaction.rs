@@ -231,36 +231,58 @@ impl SessionStore {
     }
 
     /// Create a savepoint at the current tx_buffer position.
-    pub fn create_savepoint(&self, addr: &SocketAddr, name: String) {
+    ///
+    /// `journal_marker` is the Data-Plane overlay undo-journal length captured
+    /// on the transaction's home vShard (via `MetaOp::MarkSavepoint`), so a
+    /// later ROLLBACK TO can rewind the staging overlay to exactly this point.
+    pub fn create_savepoint(&self, addr: &SocketAddr, name: String, journal_marker: usize) {
         self.write_session(addr, |session| {
             let pos = session.tx_buffer.len();
-            session.savepoints.push((name, pos));
+            session.savepoints.push((name, pos, journal_marker));
         });
     }
 
-    /// Release a savepoint (remove from stack, keep buffered operations).
-    pub fn release_savepoint(&self, addr: &SocketAddr, name: &str) {
-        self.write_session(addr, |session| {
-            session.savepoints.retain(|(n, _)| n != name);
-        });
-    }
-
-    /// Rollback to a savepoint: truncate tx_buffer to the saved position.
-    ///
-    /// Returns `Err` if the savepoint does not exist (matches PostgreSQL behavior).
-    pub fn rollback_to_savepoint(&self, addr: &SocketAddr, name: &str) -> crate::Result<()> {
+    /// Release a savepoint: destroy the named savepoint and every savepoint
+    /// established after it, keeping their buffered/staged effects (PostgreSQL
+    /// semantics). Returns `Err` (SQLSTATE 3B001) if the name does not exist.
+    pub fn release_savepoint(&self, addr: &SocketAddr, name: &str) -> crate::Result<()> {
         self.write_session(addr, |session| {
             let pos = session
                 .savepoints
                 .iter()
-                .rposition(|(n, _)| n == name)
+                .rposition(|(n, _, _)| n == name)
+                .ok_or_else(|| crate::Error::BadRequest {
+                    detail: format!("savepoint \"{name}\" does not exist"),
+                })?;
+            session.savepoints.truncate(pos);
+            Ok(())
+        })
+        .unwrap_or_else(|| {
+            Err(crate::Error::BadRequest {
+                detail: "no active session".to_string(),
+            })
+        })
+    }
+
+    /// Rollback to a savepoint: truncate tx_buffer to the saved position and
+    /// return the overlay journal marker the caller must rewind the Data-Plane
+    /// staging overlay to.
+    ///
+    /// Returns `Err` if the savepoint does not exist (matches PostgreSQL behavior).
+    pub fn rollback_to_savepoint(&self, addr: &SocketAddr, name: &str) -> crate::Result<usize> {
+        self.write_session(addr, |session| {
+            let pos = session
+                .savepoints
+                .iter()
+                .rposition(|(n, _, _)| n == name)
                 .ok_or_else(|| crate::Error::BadRequest {
                     detail: format!("savepoint \"{name}\" does not exist"),
                 })?;
             let buffer_pos = session.savepoints[pos].1;
+            let journal_marker = session.savepoints[pos].2;
             session.tx_buffer.truncate(buffer_pos);
             session.savepoints.truncate(pos + 1);
-            Ok(())
+            Ok(journal_marker)
         })
         .unwrap_or_else(|| {
             Err(crate::Error::BadRequest {
