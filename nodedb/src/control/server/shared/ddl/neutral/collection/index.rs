@@ -51,6 +51,7 @@ fn normalize_index_field(field: &str) -> String {
 async fn commit_collection_mutation(
     state: &SharedState,
     coll: &crate::control::security::catalog::StoredCollection,
+    database_id: DatabaseId,
 ) -> Result<(), DdlError> {
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
@@ -58,7 +59,7 @@ async fn commit_collection_mutation(
     if log_index == 0 {
         if let Some(catalog) = state.credentials.catalog() {
             catalog
-                .put_collection(DatabaseId::DEFAULT, coll)
+                .put_collection(database_id, coll)
                 .map_err(|e| err("XX000", e.to_string()))?;
         }
         // Single-node path bypasses the applier post-apply hook, so the
@@ -80,6 +81,7 @@ pub struct CreateIndexRequest<'a> {
     pub field: &'a str,
     pub case_insensitive: bool,
     pub where_condition: Option<&'a str>,
+    pub database_id: DatabaseId,
 }
 
 /// CREATE [UNIQUE] INDEX [name] ON <collection> (<field>) [WHERE condition]
@@ -102,6 +104,7 @@ pub async fn create_index(
         field,
         case_insensitive,
         where_condition,
+        database_id,
     } = *req;
     if collection.is_empty() {
         return Err(err(
@@ -126,8 +129,7 @@ pub async fn create_index(
             "catalog unavailable: CREATE INDEX requires persisted collections",
         ));
     };
-    let mut coll = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), collection)
-    {
+    let mut coll = match catalog.get_collection(database_id, tenant_id.as_u64(), collection) {
         Ok(Some(c)) if c.is_active => c,
         _ => {
             return Err(err(
@@ -181,7 +183,7 @@ pub async fn create_index(
         owner: index_owner.clone(),
     });
 
-    commit_collection_mutation(state, &coll).await?;
+    commit_collection_mutation(state, &coll, database_id).await?;
 
     // Phase 2: dispatch the backfill op. This runs on the local Data
     // Plane (single-node) or the leader (cluster — distributed backfill
@@ -190,8 +192,7 @@ pub async fn create_index(
     // surface as a Data Plane error; we propagate as SQLSTATE 23505 and
     // leave the index in `Building` so a subsequent retry can DROP + try
     // with a wider data fix.
-    let vshard =
-        crate::types::VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection);
+    let vshard = crate::types::VShardId::from_collection_in_database(database_id, collection);
     let backfill_plan = crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::BackfillIndex {
             collection: collection.to_string(),
@@ -205,7 +206,7 @@ pub async fn create_index(
     let backfill_resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        crate::types::DatabaseId::DEFAULT,
+        database_id,
         vshard,
         backfill_plan,
         TraceId::ZERO,
@@ -236,6 +237,7 @@ pub async fn create_index(
         state,
         super::index_fanout::PeerBackfill {
             tenant_id,
+            database_id,
             collection,
             path: &extraction_path,
             is_array,
@@ -251,7 +253,7 @@ pub async fn create_index(
     // descriptor drain in cluster mode, serialized by pgwire session in
     // single-node) is folded in before we rewrite the index vector.
     if let Some(latest) = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), collection)
+        .get_collection(database_id, tenant_id.as_u64(), collection)
         .ok()
         .flatten()
     {
@@ -261,7 +263,7 @@ pub async fn create_index(
                 idx.state = IndexBuildState::Ready;
             }
         }
-        commit_collection_mutation(state, &ready_coll).await?;
+        commit_collection_mutation(state, &ready_coll, database_id).await?;
     }
 
     // Ownership record backs SHOW INDEXES — keep the existing ledger.
@@ -302,6 +304,7 @@ pub async fn drop_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 3 {
         return Err(err("42601", "syntax: DROP INDEX <name>"));
@@ -336,7 +339,7 @@ pub async fn drop_index(
         ));
     };
     let collections = catalog
-        .load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id.as_u64())
+        .load_collections_for_tenant(database_id, tenant_id.as_u64())
         .map_err(|e| err("XX000", e.to_string()))?;
     let mut owning = collections
         .into_iter()
@@ -349,17 +352,15 @@ pub async fn drop_index(
             .find(|i| i.name == index_name)
             .map(|i| i.field.clone());
         coll.indexes.retain(|i| i.name != index_name);
-        commit_collection_mutation(state, coll).await?;
+        commit_collection_mutation(state, coll, database_id).await?;
 
         // Purge existing index entries from the sparse engine so stale
         // rows don't leak into future lookups on a re-created index of
         // the same name. Best-effort — the Data Plane itself is the
         // authority, so a failure here is logged rather than propagated.
         if let Some(field) = dropped_field {
-            let vshard = crate::types::VShardId::from_collection_in_database(
-                DatabaseId::DEFAULT,
-                &coll.name,
-            );
+            let vshard =
+                crate::types::VShardId::from_collection_in_database(database_id, &coll.name);
             let plan = crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::DropIndex {
                     collection: coll.name.clone(),
@@ -369,7 +370,7 @@ pub async fn drop_index(
             if let Err(e) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
                 state,
                 tenant_id,
-                crate::types::DatabaseId::DEFAULT,
+                database_id,
                 vshard,
                 plan,
                 TraceId::ZERO,

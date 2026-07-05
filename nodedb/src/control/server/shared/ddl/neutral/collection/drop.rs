@@ -43,6 +43,19 @@ fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     }
 }
 
+/// Parsed `DROP COLLECTION` request. A struct (rather than positional
+/// bools) because the parameter count crosses seven once `database_id`
+/// is threaded through for non-default-database DDL.
+#[derive(Clone, Copy)]
+pub struct DropCollectionRequest<'a> {
+    pub name: &'a str,
+    pub if_exists: bool,
+    pub purge: bool,
+    pub cascade: bool,
+    pub cascade_force: bool,
+    pub database_id: DatabaseId,
+}
+
 /// DROP { COLLECTION | TABLE } [IF EXISTS] <name> [PURGE] [CASCADE [FORCE]]
 ///
 /// All fields arrive pre-parsed from `NodedbStatement::DropCollection`:
@@ -59,12 +72,16 @@ fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
 pub fn drop_collection(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    name: &str,
-    if_exists: bool,
-    purge: bool,
-    cascade: bool,
-    cascade_force: bool,
+    req: &DropCollectionRequest<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    let DropCollectionRequest {
+        name,
+        if_exists,
+        purge,
+        cascade,
+        cascade_force,
+        database_id,
+    } = *req;
     let name_lower = name.to_lowercase();
     let name = name_lower.as_str();
     let tenant_id = identity.tenant_id;
@@ -168,7 +185,7 @@ pub fn drop_collection(
     // spawn extra raft rounds or audit noise. The `if_exists` case
     // joins them on the absent-name branch.
     if let Some(catalog) = state.credentials.catalog().as_ref() {
-        match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), name) {
+        match catalog.get_collection(database_id, tenant_id.as_u64(), name) {
             Ok(Some(coll)) if coll.is_active => {}
             Ok(Some(_)) if purge => {}
             Ok(Some(_)) => {
@@ -233,14 +250,14 @@ pub fn drop_collection(
         // clustered deployment.
         if purge {
             catalog
-                .delete_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), name)
+                .delete_collection(database_id, tenant_id.as_u64(), name)
                 .map_err(|e| err("XX000", e.to_string()))?;
         } else if let Ok(Some(mut coll)) =
-            catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), name)
+            catalog.get_collection(database_id, tenant_id.as_u64(), name)
         {
             coll.is_active = false;
             catalog
-                .put_collection(DatabaseId::DEFAULT, &coll)
+                .put_collection(database_id, &coll)
                 .map_err(|e| err("XX000", e.to_string()))?;
         }
     }

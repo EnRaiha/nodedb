@@ -44,6 +44,7 @@ pub async fn dispatch_register_if_needed(
     identity: &AuthenticatedIdentity,
     parts: &[&str],
     sql: &str,
+    database_id: DatabaseId,
 ) -> crate::Result<()> {
     let name = parts.get(2).map(|s| s.to_lowercase()).unwrap_or_default();
     let tenant_id = identity.tenant_id;
@@ -51,8 +52,7 @@ pub async fn dispatch_register_if_needed(
     let Some(catalog) = state.credentials.catalog() else {
         return Ok(());
     };
-    let Ok(Some(coll)) = catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name)
-    else {
+    let Ok(Some(coll)) = catalog.get_collection(database_id, tenant_id.as_u64(), &name) else {
         return Ok(());
     };
     let (fields, _serial_fields) =
@@ -231,6 +231,7 @@ async fn dispatch_register_from_stored_inner(
             catalog,
             tenant_id.as_u64(),
             &name,
+            coll.database_id,
         ),
         generated_columns: build_generated_column_specs(coll),
     };

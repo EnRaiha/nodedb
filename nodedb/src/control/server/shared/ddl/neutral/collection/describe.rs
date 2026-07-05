@@ -38,6 +38,7 @@ pub fn describe_collection(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 2 {
         return Err(DdlError {
@@ -60,7 +61,7 @@ pub fn describe_collection(
         }
     };
 
-    let coll = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), name) {
+    let coll = match catalog.get_collection(database_id, tenant_id.as_u64(), name) {
         Ok(Some(c)) if c.is_active => c,
         _ => {
             return Err(DdlError {
@@ -156,6 +157,7 @@ pub fn describe_collection(
 pub fn show_collections(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
 
@@ -175,14 +177,14 @@ pub fn show_collections(
     let collections = if let Some(catalog) = state.credentials.catalog() {
         if identity.is_superuser {
             catalog
-                .load_all_collections(DatabaseId::DEFAULT)
+                .load_all_collections(database_id)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|c| c.is_active)
                 .collect::<Vec<_>>()
         } else {
             catalog
-                .load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id.as_u64())
+                .load_collections_for_tenant(database_id, tenant_id.as_u64())
                 .unwrap_or_default()
         }
     } else {

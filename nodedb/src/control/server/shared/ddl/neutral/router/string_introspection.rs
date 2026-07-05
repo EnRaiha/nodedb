@@ -26,7 +26,7 @@ pub(super) async fn try_string(
     identity: &AuthenticatedIdentity,
     sql: &str,
     upper: &str,
-    _database_id: DatabaseId,
+    database_id: DatabaseId,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     // Administrative introspection & audit: SHOW USERS, SHOW TENANTS, SHOW
     // ROLES, SHOW SESSION, EXPORT AUDIT, SHOW AUDIT IN DATABASE / WHERE / LOG,
@@ -322,14 +322,24 @@ pub(super) async fn try_string(
         || upper.starts_with("\\D ")
     {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(collection::describe_collection(state, identity, &parts));
+        return Some(collection::describe_collection(
+            state,
+            identity,
+            &parts,
+            database_id,
+        ));
     }
     if upper.starts_with("UNDROP COLLECTION ") || upper.starts_with("UNDROP TABLE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(collection::undrop_collection(state, identity, &parts));
+        return Some(collection::undrop_collection(
+            state,
+            identity,
+            &parts,
+            database_id,
+        ));
     }
     if upper == "SHOW COLLECTIONS" || upper.starts_with("SHOW COLLECTIONS") {
-        return Some(collection::show_collections(state, identity));
+        return Some(collection::show_collections(state, identity, database_id));
     }
     if upper.starts_with("SHOW INDEXES") || upper.starts_with("SHOW INDEX") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -345,7 +355,7 @@ pub(super) async fn try_string(
     // byte-identical.
     if upper.starts_with("DROP INDEX ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(collection::drop_index(state, identity, &parts).await);
+        return Some(collection::drop_index(state, identity, &parts, database_id).await);
     }
 
     None

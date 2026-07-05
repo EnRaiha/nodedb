@@ -171,7 +171,12 @@ pub(super) async fn try_string(
     // parse gate below, so it is never shadowed by the migrated typed
     // `AlterCollection` dispatch.
     if upper.starts_with("ALTER COLLECTION ") && upper.contains("SET VECTOR METADATA ON") {
-        return Some(collection::handle_set_vector_metadata(state, identity, sql));
+        return Some(collection::handle_set_vector_metadata(
+            state,
+            identity,
+            sql,
+            database_id,
+        ));
     }
     if upper.starts_with("SHOW VECTOR MODELS") {
         return Some(collection::handle_show_vector_models(state, identity));

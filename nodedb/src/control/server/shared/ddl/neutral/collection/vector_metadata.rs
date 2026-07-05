@@ -37,6 +37,7 @@ pub fn handle_set_vector_metadata(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
@@ -66,7 +67,7 @@ pub fn handle_set_vector_metadata(
     // Verify collection exists.
     if let Some(catalog) = state.credentials.catalog()
         && catalog
-            .get_collection(DatabaseId::DEFAULT, tenant_id, &collection)
+            .get_collection(database_id, tenant_id, &collection)
             .ok()
             .flatten()
             .is_none()

@@ -136,11 +136,14 @@ pub(super) async fn try_typed(
         }) => Some(collection::drop_collection(
             state,
             identity,
-            name,
-            *if_exists,
-            *purge,
-            *cascade,
-            *cascade_force,
+            &collection::DropCollectionRequest {
+                name,
+                if_exists: *if_exists,
+                purge: *purge,
+                cascade: *cascade,
+                cascade_force: *cascade_force,
+                database_id,
+            },
         )),
 
         // CREATE [UNIQUE] INDEX [name] ON <collection> (<field>) [WHERE ...].
@@ -165,6 +168,7 @@ pub(super) async fn try_typed(
                     field,
                     case_insensitive: *case_insensitive,
                     where_condition: where_condition.as_deref(),
+                    database_id,
                 },
             )
             .await,

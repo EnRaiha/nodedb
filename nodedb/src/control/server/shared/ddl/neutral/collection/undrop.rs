@@ -31,6 +31,7 @@ pub fn undrop_collection(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 3 {
         return Err(DdlError {
@@ -54,7 +55,7 @@ pub fn undrop_collection(
     //   - row absent: retention already expired or never existed.
     //   - row present + active: nothing to undrop.
     //   - row present + inactive: candidate for restore.
-    let mut stored = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), name) {
+    let mut stored = match catalog.get_collection(database_id, tenant_id.as_u64(), name) {
         Ok(Some(c)) => c,
         Ok(None) => {
             return Err(DdlError {
@@ -133,7 +134,7 @@ pub fn undrop_collection(
     if log_index == 0 {
         // Single-node fallback: write directly.
         catalog
-            .put_collection(DatabaseId::DEFAULT, &stored)
+            .put_collection(database_id, &stored)
             .map_err(|e| DdlError {
                 sqlstate: "XX000".to_string(),
                 message: e.to_string(),

@@ -115,9 +115,10 @@ pub fn find_materialized_sum_bindings(
     catalog: &SystemCatalog,
     tenant_id: u64,
     collection_name: &str,
+    database_id: DatabaseId,
 ) -> Vec<nodedb_physical::physical_plan::MaterializedSumBinding> {
     let all_collections = catalog
-        .load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id)
+        .load_collections_for_tenant(database_id, tenant_id)
         .unwrap_or_default();
 
     let mut bindings = Vec::new();
