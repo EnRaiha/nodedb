@@ -3,13 +3,13 @@
 //! `StageWrite` dispatch: route a point-write plan to the matching staging
 //! path, compute its real affected-row count, and record it in the overlay.
 
-use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, UpdateValue};
+use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, SpatialOp, UpdateValue};
 
 use super::constraint::OverlayPk;
 use super::context::StageCtx;
 use super::{
     StageBulkDeleteParams, StageBulkUpdateParams, StageColumnarInsertParams,
-    StageInsertSelectParams,
+    StageInsertSelectParams, StageSpatialInsertParams,
 };
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -67,10 +67,35 @@ impl CoreLoop {
                 | ColumnarOp::Delete { .. }
                 | ColumnarOp::MaterializeScan { .. },
             ) => return self.stage_not_point_write(task),
+            PhysicalPlan::Spatial(SpatialOp::Insert {
+                collection,
+                field,
+                surrogate,
+                geometry,
+                provenance: _,
+            }) => {
+                return self.stage_spatial_insert(StageSpatialInsertParams {
+                    task,
+                    tid,
+                    txn_id,
+                    collection,
+                    field,
+                    surrogate: *surrogate,
+                    geometry,
+                });
+            }
+            PhysicalPlan::Spatial(SpatialOp::Delete {
+                collection,
+                surrogate,
+                field: _,
+                provenance: _,
+            }) => return self.stage_spatial_delete(task, tid, txn_id, collection, *surrogate),
+            PhysicalPlan::Spatial(SpatialOp::Scan { .. }) => {
+                return self.stage_not_point_write(task);
+            }
             PhysicalPlan::Vector(_)
             | PhysicalPlan::Text(_)
             | PhysicalPlan::Timeseries(_)
-            | PhysicalPlan::Spatial(_)
             | PhysicalPlan::Crdt(_)
             | PhysicalPlan::Query(_)
             | PhysicalPlan::Graph(_)

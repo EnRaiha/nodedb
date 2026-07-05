@@ -102,6 +102,8 @@ impl CoreLoop {
             );
         }
 
+        let coll_key = (db_id, tid_id, collection.to_string());
+
         let rtree = match self.spatial_indexes.get(&spatial_key) {
             Some(rt) => rt,
             None => {
@@ -191,6 +193,23 @@ impl CoreLoop {
             }
 
             results.push(project_doc(&doc, &doc_id, projection));
+        }
+
+        if let Some(txn_id) = task.request.txn_id {
+            self.merge_overlay_into_spatial_scan(
+                super::transaction::overlay::SpatialOverlayMergeParams {
+                    txn_id,
+                    coll_key: &coll_key,
+                    field,
+                    predicate,
+                    query_geom,
+                    distance_meters,
+                    projection,
+                    attr_filters: &attr_filters,
+                    row_level_filters: &row_level_filters,
+                },
+                &mut results,
+            );
         }
 
         match response_codec::encode_value_vec(&results) {
@@ -283,6 +302,28 @@ impl CoreLoop {
             results.push(project_doc(&doc, doc_id, projection));
         }
 
+        if let Some(txn_id) = task.request.txn_id {
+            let coll_key = (
+                task.request.database_id,
+                crate::types::TenantId::new(tid),
+                collection.to_string(),
+            );
+            self.merge_overlay_into_spatial_scan(
+                super::transaction::overlay::SpatialOverlayMergeParams {
+                    txn_id,
+                    coll_key: &coll_key,
+                    field,
+                    predicate,
+                    query_geom,
+                    distance_meters,
+                    projection,
+                    attr_filters,
+                    row_level_filters: rls_filters,
+                },
+                &mut results,
+            );
+        }
+
         match response_codec::encode_value_vec(&results) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
@@ -301,7 +342,10 @@ impl CoreLoop {
 /// - `Value::Geometry(g)` — native geometry (columnar path preserves type)
 /// - `Value::String(s)` — GeoJSON string (from SQL ST_Point → serialized)
 /// - `Value::Object(_)` — GeoJSON object (from schemaless doc storage)
-fn extract_geometry(doc: &Value, field: &str) -> Option<nodedb_types::geometry::Geometry> {
+pub(in crate::data::executor) fn extract_geometry(
+    doc: &Value,
+    field: &str,
+) -> Option<nodedb_types::geometry::Geometry> {
     let field_val = doc.get(field)?;
     match field_val {
         Value::Geometry(g) => Some(g.clone()),
@@ -316,7 +360,7 @@ fn extract_geometry(doc: &Value, field: &str) -> Option<nodedb_types::geometry::
 }
 
 /// Apply the spatial predicate.
-fn apply_predicate(
+pub(in crate::data::executor) fn apply_predicate(
     predicate: &SpatialPredicate,
     query: &nodedb_types::geometry::Geometry,
     doc: &nodedb_types::geometry::Geometry,
@@ -333,7 +377,11 @@ fn apply_predicate(
 }
 
 /// Apply projection to a document, returning `nodedb_types::Value`.
-fn project_doc(doc: &Value, doc_id: &str, projection: &[String]) -> Value {
+pub(in crate::data::executor) fn project_doc(
+    doc: &Value,
+    doc_id: &str,
+    projection: &[String],
+) -> Value {
     if projection.is_empty() {
         // Add id if not present.
         if let Value::Object(mut map) = doc.clone() {

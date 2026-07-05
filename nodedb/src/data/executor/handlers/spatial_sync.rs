@@ -279,7 +279,12 @@ impl CoreLoop {
 ///
 /// Produces a JSON-compatible nested structure matching what a pgwire INSERT
 /// with a GeoJSON geometry value would produce.
-fn geometry_to_value(geometry: &Geometry) -> nodedb_types::Value {
+///
+/// Shared with the in-transaction staging path
+/// (`transaction::stage_write::stage_spatial`), which stages the identical
+/// `{field: geometry, "id": surrogate_hex}` document shape as an overlay
+/// `Put` body.
+pub(in crate::data::executor) fn geometry_to_value(geometry: &Geometry) -> nodedb_types::Value {
     use nodedb_types::Value;
     use nodedb_types::geometry::Geometry::*;
 
