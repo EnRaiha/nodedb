@@ -3,8 +3,7 @@
 //! Columnar insert dispatcher: builds rows, applies ON CONFLICT semantics,
 //! drives the per-row insert, flushes the memtable, updates spatial index.
 
-use nodedb_columnar::MutationEngine;
-use nodedb_types::columnar::{ColumnType, ColumnarSchema};
+use nodedb_types::columnar::ColumnType;
 use nodedb_types::surrogate::Surrogate;
 use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
 use nodedb_types::value::Value;
@@ -18,9 +17,7 @@ use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::ColumnarInsertIntent;
 use nodedb_physical::physical_plan::document::UpdateValue;
 
-use super::schema::{
-    infer_schema_from_value, ndb_field_to_value, prepend_bitemporal_columns, row_values_to_object,
-};
+use super::schema::{ndb_field_to_value, row_values_to_object};
 
 impl CoreLoop {
     /// Execute a columnar insert: write rows from MessagePack payload to
@@ -104,41 +101,20 @@ impl CoreLoop {
         );
         let tid = task.request.tenant_id.as_u64();
         let bitemporal = self.is_bitemporal(tid, collection);
-        // Ensure MutationEngine exists (auto-create on first write).
-        if !self.columnar_engines.contains_key(&engine_key) {
-            // Prefer the DDL schema carried on `schema_bytes` over inference
-            // from the payload. Inference cannot distinguish JSON columns from
-            // plain strings because both arrive as `Value::String`.
-            let base_schema = if !schema_bytes.is_empty() {
-                zerompk::from_msgpack::<ColumnarSchema>(schema_bytes)
-                    .unwrap_or_else(|_| infer_schema_from_value(&ndb_rows[0]))
-            } else {
-                infer_schema_from_value(&ndb_rows[0])
-            };
-            let schema = if bitemporal {
-                prepend_bitemporal_columns(base_schema)
-            } else {
-                base_schema
-            };
-            let engine = MutationEngine::with_flush_threshold(
-                collection.to_string(),
-                schema,
-                self.query_tuning.columnar_flush_threshold,
-            );
-            self.columnar_engines.insert(engine_key.clone(), engine);
-        }
-
-        let schema = match self.columnar_engines.get(&engine_key) {
-            Some(e) => e.schema().clone(),
-            None => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: "columnar engine missing after create".into(),
-                    },
-                );
-            }
-        };
+        // Ensure MutationEngine exists (auto-create on first write). Prefers
+        // the DDL schema carried on `schema_bytes` over inference from the
+        // payload — inference cannot distinguish JSON columns from plain
+        // strings because both arrive as `Value::String`. Shared with the
+        // in-transaction staging path so a staged insert into a brand-new
+        // collection registers the same schema (see
+        // `ensure_columnar_engine_schema` doc comment).
+        let schema = self.ensure_columnar_engine_schema(
+            &engine_key,
+            collection,
+            bitemporal,
+            &ndb_rows[0],
+            schema_bytes,
+        );
         let mut accepted = 0u64;
 
         for (row_idx, row) in ndb_rows.iter().enumerate() {

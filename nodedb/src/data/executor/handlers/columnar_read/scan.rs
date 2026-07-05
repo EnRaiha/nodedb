@@ -12,7 +12,6 @@ use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 
 use super::bitemporal::bitemporal_row_visible;
-use super::convert::value_to_json;
 use super::filter::row_matches_filters;
 use super::sort::sort_rows_by_keys;
 
@@ -47,6 +46,12 @@ pub(in crate::data::executor) struct ColumnarScanParams<'a> {
     /// expressions such as JSON arrow operators. Empty slice means no
     /// computed columns are requested.
     pub computed_columns: &'a [u8],
+    /// The in-transaction identity of the caller, when the scan is issued
+    /// inside `BEGIN..COMMIT`. `Some` gates a post-scan overlay merge
+    /// (`merge_overlay_into_columnar_scan`) so the scan observes the
+    /// transaction's own staged, not-yet-durable `ColumnarOp::Insert` rows
+    /// (read-your-own-writes). `None` for autocommit reads.
+    pub txn_id: Option<crate::types::TxnId>,
 }
 
 impl CoreLoop {
@@ -74,6 +79,7 @@ impl CoreLoop {
             valid_at_ms,
             prefilter,
             computed_columns,
+            txn_id,
         } = params;
 
         use nodedb_types::SystemTimeScope;
@@ -170,7 +176,11 @@ impl CoreLoop {
         // emitted only after ORDER BY + limit are applied. When no sort
         // is requested we short-circuit the limit enforcement inside the
         // loop to avoid materialising the entire memtable.
-        let mut matched: Vec<(Vec<nodedb_types::value::Value>, serde_json::Value)> = Vec::new();
+        let mut matched: Vec<(
+            Option<nodedb_types::Surrogate>,
+            Vec<nodedb_types::value::Value>,
+            serde_json::Value,
+        )> = Vec::new();
         let scan_budget = if sort_keys.is_empty() {
             limit.saturating_mul(10).max(limit)
         } else {
@@ -296,64 +306,61 @@ impl CoreLoop {
                 {
                     continue;
                 }
-                let mut obj = serde_json::Map::new();
-                for (i, col_def) in schema.columns.iter().enumerate() {
-                    // Under all-versions (audit log) the system-time column is
-                    // always projected so callers can order/inspect history.
-                    let force_system_col = all_versions && col_def.name == "_ts_system";
-                    if !projection.is_empty()
-                        && !force_system_col
-                        && !projection.iter().any(|p| p == &col_def.name)
-                        && !computed_cols.iter().any(|cc| cc.alias == col_def.name)
-                    {
-                        continue;
-                    }
-                    if i < row.len() {
-                        obj.insert(col_def.name.clone(), value_to_json(&row[i]));
-                    }
-                }
-                if !computed_cols.is_empty() {
-                    let doc_val = nodedb_types::Value::from(serde_json::Value::Object(obj.clone()));
-                    for cc in &computed_cols {
-                        let existing = obj.get(&cc.alias);
-                        if matches!(existing, Some(v) if !v.is_null()) {
-                            continue;
-                        }
-                        obj.insert(
-                            cc.alias.clone(),
-                            serde_json::Value::from(cc.expr.eval(&doc_val)),
-                        );
-                    }
-                    // Remove base columns that were only fetched to serve as
-                    // expression inputs but are not in the requested projection.
-                    if !projection.is_empty() {
-                        obj.retain(|k, _| {
-                            projection.iter().any(|p| p == k)
-                                || computed_cols.iter().any(|cc| &cc.alias == k)
-                                || (all_versions && k == "_ts_system")
-                        });
-                    }
-                }
-                matched.push((row, serde_json::Value::Object(obj)));
+                let obj = super::convert::row_to_projected_json(
+                    &row,
+                    schema,
+                    projection,
+                    &computed_cols,
+                    all_versions,
+                );
+                matched.push((row_surrogate, row, obj));
                 if sort_keys.is_empty() && matched.len() >= limit {
                     break;
                 }
             }
         }
 
+        // In-transaction read-your-own-writes: fold this transaction's staged
+        // `ColumnarOp::Insert` rows into the base result. Gated on `txn_id`
+        // (autocommit reads never carry one) and skipped for temporal reads —
+        // staged bodies represent the current version only, matching the
+        // Document engine's overlay-merge convention.
+        if let Some(txn_id) = txn_id
+            && !all_versions
+            && system_as_of_ms.is_none()
+        {
+            let coll_key = (
+                task.request.database_id,
+                task.request.tenant_id,
+                collection.to_string(),
+            );
+            self.merge_overlay_into_columnar_scan(
+                crate::data::executor::handlers::transaction::overlay::ColumnarOverlayMergeParams {
+                    txn_id,
+                    coll_key: &coll_key,
+                    schema,
+                    projection,
+                    filter_predicates: &filter_predicates,
+                    computed_cols: &computed_cols,
+                    all_versions,
+                },
+                &mut matched,
+            );
+        }
+
         if !sort_keys.is_empty() {
-            matched.sort_by(|(a, _), (b, _)| sort_rows_by_keys(a, b, schema, sort_keys));
+            matched.sort_by(|(_, a, _), (_, b, _)| sort_rows_by_keys(a, b, schema, sort_keys));
         } else if all_versions {
             // Audit-log order: ascending by system time. The hidden
             // `_ts_system` column index was resolved above.
-            matched.sort_by(|(a, _), (b, _)| {
+            matched.sort_by(|(_, a, _), (_, b, _)| {
                 super::bitemporal::row_system_time(a, ts_system_idx)
                     .cmp(&super::bitemporal::row_system_time(b, ts_system_idx))
             });
         }
 
         let results: Vec<serde_json::Value> =
-            matched.into_iter().take(limit).map(|(_, j)| j).collect();
+            matched.into_iter().take(limit).map(|(_, _, j)| j).collect();
 
         let payload = match response_codec::encode_json_vec(&results) {
             Ok(payload) => payload,
@@ -531,6 +538,7 @@ mod tests {
             valid_at_ms: None,
             prefilter,
             computed_columns: &[],
+            txn_id: None,
         };
         let resp = core.execute_columnar_scan(&task, params);
         let decoded: Vec<nodedb_types::JsonValue> =

@@ -6,6 +6,65 @@
 use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
 use nodedb_types::value::Value;
 
+use crate::data::executor::core_loop::CoreLoop;
+use crate::types::{DatabaseId, TenantId};
+
+impl CoreLoop {
+    /// Ensure a `MutationEngine` is registered for `engine_key`, creating an
+    /// empty one (schema resolved from `schema_bytes`, falling back to
+    /// inference from `first_row`) when absent, then return its schema.
+    ///
+    /// Shared by the durable insert path (`execute_columnar_insert`) and the
+    /// in-transaction staging path (`stage_columnar_insert`) so a staged
+    /// `INSERT` into a collection with no prior durable write registers the
+    /// SAME schema a same-transaction `SELECT` will find — without that, an
+    /// in-transaction `INSERT` immediately followed by a `SELECT` on a
+    /// brand-new collection would hit `execute_columnar_scan`'s "missing
+    /// engine -> empty result" branch and never see the staged row, breaking
+    /// read-your-own-writes for the first insert into a collection.
+    ///
+    /// Creating the engine here (rather than only at COMMIT) is safe on
+    /// ROLLBACK: an empty, zero-row `MutationEngine` is indistinguishable
+    /// from "not yet created" for every read path, and the durable insert
+    /// path already treats engine creation as idempotent
+    /// (`if !self.columnar_engines.contains_key(...)`).
+    pub(in crate::data::executor) fn ensure_columnar_engine_schema(
+        &mut self,
+        engine_key: &(DatabaseId, TenantId, String),
+        collection: &str,
+        bitemporal: bool,
+        first_row: &Value,
+        schema_bytes: &[u8],
+    ) -> ColumnarSchema {
+        if let Some(engine) = self.columnar_engines.get(engine_key) {
+            return engine.schema().clone();
+        }
+        let flush_threshold = self.query_tuning.columnar_flush_threshold;
+        let engine = self
+            .columnar_engines
+            .entry(engine_key.clone())
+            .or_insert_with(|| {
+                let base_schema = if !schema_bytes.is_empty() {
+                    zerompk::from_msgpack::<ColumnarSchema>(schema_bytes)
+                        .unwrap_or_else(|_| infer_schema_from_value(first_row))
+                } else {
+                    infer_schema_from_value(first_row)
+                };
+                let schema = if bitemporal {
+                    prepend_bitemporal_columns(base_schema)
+                } else {
+                    base_schema
+                };
+                nodedb_columnar::MutationEngine::with_flush_threshold(
+                    collection.to_string(),
+                    schema,
+                    flush_threshold,
+                )
+            });
+        engine.schema().clone()
+    }
+}
+
 /// Build a `nodedb_types::Value::Object` from a schema-ordered row. Used
 /// by the ON CONFLICT DO UPDATE path to present `existing` and `EXCLUDED`
 /// rows to `apply_on_conflict_updates` in the same shape the document
@@ -21,7 +80,7 @@ pub(super) fn row_values_to_object(schema: &ColumnarSchema, row: &[Value]) -> no
 /// Coerce a `nodedb_types::Value` field to match the column type.
 ///
 /// Returns `Err` if a millisecond timestamp value overflows `i64` microseconds.
-pub(super) fn ndb_field_to_value(
+pub(in crate::data::executor) fn ndb_field_to_value(
     val: Option<&Value>,
     col_type: &ColumnType,
 ) -> crate::Result<Value> {
@@ -88,7 +147,7 @@ pub(super) fn ndb_field_to_value(
 }
 
 /// Infer a columnar schema from a `nodedb_types::Value::Object` (first row).
-pub(super) fn infer_schema_from_value(row: &Value) -> ColumnarSchema {
+pub(in crate::data::executor) fn infer_schema_from_value(row: &Value) -> ColumnarSchema {
     let obj = match row {
         Value::Object(m) => m,
         _ => {
@@ -129,7 +188,9 @@ pub(super) fn infer_schema_from_value(row: &Value) -> ColumnarSchema {
 /// schema. All three are required Int64; `_ts_system` is engine-stamped
 /// on every write, the valid-time pair is client-provided (or defaults
 /// to the open interval).
-pub(super) fn prepend_bitemporal_columns(base: ColumnarSchema) -> ColumnarSchema {
+pub(in crate::data::executor) fn prepend_bitemporal_columns(
+    base: ColumnarSchema,
+) -> ColumnarSchema {
     let mut cols = Vec::with_capacity(3 + base.columns.len());
     cols.push(ColumnDef::required("_ts_system", ColumnType::Int64));
     cols.push(ColumnDef::required("_ts_valid_from", ColumnType::Int64));

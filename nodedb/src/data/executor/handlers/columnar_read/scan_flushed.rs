@@ -45,7 +45,11 @@ impl CoreLoop {
     pub(in crate::data::executor) fn scan_flushed_columnar_segments(
         &self,
         ctx: FlushedScanCtx<'_>,
-        matched: &mut Vec<(Vec<nodedb_types::value::Value>, serde_json::Value)>,
+        matched: &mut Vec<(
+            Option<nodedb_types::Surrogate>,
+            Vec<nodedb_types::value::Value>,
+            serde_json::Value,
+        )>,
     ) {
         let FlushedScanCtx {
             collection,
@@ -154,6 +158,11 @@ impl CoreLoop {
                         continue;
                     }
 
+                    let row_surrogate: Option<nodedb_types::Surrogate> = seg_surrogates
+                        .and_then(|s| s.get(row_idx))
+                        .copied()
+                        .flatten();
+
                     // Row-boundary cross-engine prefilter, mirroring the live
                     // memtable phase below (which uses `bitmap.contains(s)` on
                     // `Option<Surrogate>`). A row passes only when its recorded
@@ -162,10 +171,6 @@ impl CoreLoop {
                     // cannot satisfy a cross-engine prefilter, so it is skipped.
                     // When no prefilter is active the check is bypassed entirely.
                     if let Some(bitmap) = prefilter {
-                        let row_surrogate = seg_surrogates
-                            .and_then(|s| s.get(row_idx))
-                            .copied()
-                            .flatten();
                         match row_surrogate {
                             Some(s) if bitmap.contains(s) => {}
                             _ => continue,
@@ -229,7 +234,7 @@ impl CoreLoop {
                             });
                         }
                     }
-                    matched.push((row, serde_json::Value::Object(obj)));
+                    matched.push((row_surrogate, row, serde_json::Value::Object(obj)));
                     if sort_keys.is_empty() && matched.len() >= limit {
                         break;
                     }

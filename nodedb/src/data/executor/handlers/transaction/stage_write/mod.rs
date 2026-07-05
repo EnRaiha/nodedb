@@ -18,11 +18,13 @@ mod context;
 mod dispatch;
 mod stage_bulk_delete;
 mod stage_bulk_update;
+mod stage_columnar;
 mod stage_insert_select;
 mod stage_kv;
 mod stage_upsert;
 
 pub(in crate::data::executor) use stage_bulk_delete::StageBulkDeleteParams;
 pub(in crate::data::executor) use stage_bulk_update::StageBulkUpdateParams;
+pub(in crate::data::executor) use stage_columnar::StageColumnarInsertParams;
 pub(in crate::data::executor) use stage_insert_select::StageInsertSelectParams;
 pub(in crate::data::executor) use stage_kv::{hex_key, unhex_key};

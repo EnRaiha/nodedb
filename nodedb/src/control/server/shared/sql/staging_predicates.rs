@@ -8,7 +8,7 @@
 //! later units). No pgwire types are imported here.
 
 use crate::bridge::envelope::PhysicalPlan;
-use nodedb_physical::physical_plan::{DocumentOp, KvOp};
+use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, KvOp};
 
 /// Allow-list of the plans the in-transaction path stages at statement time:
 /// point writes, predicate `BulkUpdate` / `BulkDelete` (bulk predicate DML,
@@ -70,6 +70,7 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
                     | KvOp::Delete { .. }
             )
         )
+        || matches!(plan, PhysicalPlan::Columnar(ColumnarOp::Insert { .. }))
 }
 
 /// Extract affected row count from a JSON or MessagePack payload.
@@ -153,6 +154,7 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
         PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Document(DocumentOp::Upsert { .. }) => StagedTagKind::DocUpsert,
         PhysicalPlan::Kv(op) => staged_kv_tag_kind(op, payload),
+        PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => StagedTagKind::Insert,
         other => unreachable!(
             "staged_tag_kind called on a non-stageable-write plan; \
              is_stageable_write invariant broken: {other:?}"

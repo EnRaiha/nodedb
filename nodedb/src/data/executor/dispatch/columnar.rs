@@ -36,6 +36,7 @@ impl CoreLoop {
                     valid_at_ms: *valid_at_ms,
                     prefilter: prefilter.as_ref(),
                     computed_columns,
+                    txn_id: task.request.txn_id,
                 },
             ),
 

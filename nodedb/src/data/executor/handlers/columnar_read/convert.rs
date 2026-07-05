@@ -36,6 +36,55 @@ pub(in crate::data::executor) fn value_to_json(
     }
 }
 
+/// Project a decoded columnar row into the scan's response JSON shape:
+/// column projection, the forced `_ts_system` audit column, and computed
+/// (scalar-expression) columns. Shared by the base memtable scan loop and
+/// the in-transaction overlay merge (`merge_overlay_into_columnar_scan`) so
+/// a staged row's JSON is built identically to a base row's.
+pub(in crate::data::executor) fn row_to_projected_json(
+    row: &[nodedb_types::value::Value],
+    schema: &nodedb_types::columnar::ColumnarSchema,
+    projection: &[String],
+    computed_cols: &[crate::bridge::expr_eval::ComputedColumn],
+    all_versions: bool,
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for (i, col_def) in schema.columns.iter().enumerate() {
+        let force_system_col = all_versions && col_def.name == "_ts_system";
+        if !projection.is_empty()
+            && !force_system_col
+            && !projection.iter().any(|p| p == &col_def.name)
+            && !computed_cols.iter().any(|cc| cc.alias == col_def.name)
+        {
+            continue;
+        }
+        if i < row.len() {
+            obj.insert(col_def.name.clone(), value_to_json(&row[i]));
+        }
+    }
+    if !computed_cols.is_empty() {
+        let doc_val = nodedb_types::Value::from(serde_json::Value::Object(obj.clone()));
+        for cc in computed_cols {
+            let existing = obj.get(&cc.alias);
+            if matches!(existing, Some(v) if !v.is_null()) {
+                continue;
+            }
+            obj.insert(
+                cc.alias.clone(),
+                serde_json::Value::from(cc.expr.eval(&doc_val)),
+            );
+        }
+        if !projection.is_empty() {
+            obj.retain(|k, _| {
+                projection.iter().any(|p| p == k)
+                    || computed_cols.iter().any(|cc| &cc.alias == k)
+                    || (all_versions && k == "_ts_system")
+            });
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
 /// Write a timeseries columnar memtable cell value directly as msgpack bytes.
 ///
 /// Encodes the column value at the given row index directly into `buf`

@@ -3,11 +3,14 @@
 //! `StageWrite` dispatch: route a point-write plan to the matching staging
 //! path, compute its real affected-row count, and record it in the overlay.
 
-use nodedb_physical::physical_plan::{DocumentOp, UpdateValue};
+use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, UpdateValue};
 
 use super::constraint::OverlayPk;
 use super::context::StageCtx;
-use super::{StageBulkDeleteParams, StageBulkUpdateParams, StageInsertSelectParams};
+use super::{
+    StageBulkDeleteParams, StageBulkUpdateParams, StageColumnarInsertParams,
+    StageInsertSelectParams,
+};
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
@@ -41,9 +44,31 @@ impl CoreLoop {
         let doc_op = match plan {
             PhysicalPlan::Document(op) => op,
             PhysicalPlan::Kv(op) => return self.execute_stage_kv(task, tid, txn_id, op),
+            PhysicalPlan::Columnar(ColumnarOp::Insert {
+                collection,
+                payload,
+                surrogates,
+                schema_bytes,
+                ..
+            }) => {
+                return self.stage_columnar_insert(StageColumnarInsertParams {
+                    task,
+                    tid,
+                    txn_id,
+                    collection,
+                    payload,
+                    surrogates,
+                    schema_bytes,
+                });
+            }
+            PhysicalPlan::Columnar(
+                ColumnarOp::Scan { .. }
+                | ColumnarOp::Update { .. }
+                | ColumnarOp::Delete { .. }
+                | ColumnarOp::MaterializeScan { .. },
+            ) => return self.stage_not_point_write(task),
             PhysicalPlan::Vector(_)
             | PhysicalPlan::Text(_)
-            | PhysicalPlan::Columnar(_)
             | PhysicalPlan::Timeseries(_)
             | PhysicalPlan::Spatial(_)
             | PhysicalPlan::Crdt(_)
