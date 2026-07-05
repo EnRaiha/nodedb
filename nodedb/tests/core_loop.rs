@@ -36,6 +36,8 @@ mod test_kv;
 mod test_kv_advanced;
 #[path = "executor_tests/test_kv_scan_budget.rs"]
 mod test_kv_scan_budget;
+#[path = "executor_tests/test_kv_ttl_overlay.rs"]
+mod test_kv_ttl_overlay;
 #[path = "executor_tests/test_ollp_verification.rs"]
 mod test_ollp_verification;
 #[path = "executor_tests/test_range_scan_bitemporal.rs"]

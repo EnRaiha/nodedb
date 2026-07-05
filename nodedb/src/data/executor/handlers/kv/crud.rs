@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::transaction::overlay::Staged;
+use crate::data::executor::handlers::transaction::overlay::{Staged, StagedTtl};
 use crate::data::executor::handlers::transaction::stage_write::hex_key;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
@@ -51,24 +51,33 @@ impl CoreLoop {
                 collection.to_string(),
             );
             let doc_id = hex_key(key);
-            if let Some(staged) = self
-                .txn_overlays
-                .get(&txn_id)
-                .and_then(|o| o.get_by_doc_id(&coll_key, &doc_id))
-            {
-                return match staged {
-                    Staged::Put(body) => {
-                        if !crate::data::executor::handlers::rls_eval::rls_check_msgpack_bytes(
-                            rls_filters,
-                            body,
-                        ) {
-                            self.response_with_payload(task, Vec::new())
-                        } else {
-                            self.response_with_payload(task, body.clone())
+            if let Some(overlay) = self.txn_overlays.get(&txn_id) {
+                // A staged EXPIRE with an already-past instant makes the row
+                // appear absent to a same-transaction read -- independent of
+                // whether the row's VALUE was also staged this transaction
+                // (an `Expire` on a base-only row stages only the TTL delta,
+                // never a `Staged::Put`).
+                if matches!(
+                    overlay.get_ttl_by_doc_id(&coll_key, &doc_id),
+                    Some(StagedTtl::ExpireAt(t)) if t <= current_ms()
+                ) {
+                    return self.response_with_payload(task, Vec::new());
+                }
+                if let Some(staged) = overlay.get_by_doc_id(&coll_key, &doc_id) {
+                    return match staged {
+                        Staged::Put(body) => {
+                            if !crate::data::executor::handlers::rls_eval::rls_check_msgpack_bytes(
+                                rls_filters,
+                                body,
+                            ) {
+                                self.response_with_payload(task, Vec::new())
+                            } else {
+                                self.response_with_payload(task, body.clone())
+                            }
                         }
-                    }
-                    Staged::Tombstone => self.response_with_payload(task, Vec::new()),
-                };
+                        Staged::Tombstone => self.response_with_payload(task, Vec::new()),
+                    };
+                }
             }
         }
 

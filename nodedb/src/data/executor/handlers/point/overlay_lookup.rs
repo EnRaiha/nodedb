@@ -11,9 +11,10 @@
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::transaction::overlay::Staged;
+use crate::data::executor::handlers::transaction::overlay::{Staged, StagedTtl};
 use crate::data::executor::handlers::transaction::stage_write::hex_key;
 use crate::data::executor::task::ExecutionTask;
+use crate::engine::kv::current_ms;
 use nodedb_types::Surrogate;
 
 impl CoreLoop {
@@ -85,10 +86,20 @@ impl CoreLoop {
             collection.to_string(),
         );
         let doc_id = hex_key(key);
-        let staged = self
-            .txn_overlays
-            .get(&txn_id)?
-            .get_by_doc_id(&coll_key, &doc_id)?;
+        let overlay = self.txn_overlays.get(&txn_id)?;
+
+        // A staged EXPIRE with an already-past instant makes the row appear
+        // absent -- independent of whether the row's VALUE was also staged
+        // this transaction (an `Expire` on a base-only row stages only the
+        // TTL delta, never a `Staged::Put`).
+        if matches!(
+            overlay.get_ttl_by_doc_id(&coll_key, &doc_id),
+            Some(StagedTtl::ExpireAt(t)) if t <= current_ms()
+        ) {
+            return Some(None);
+        }
+
+        let staged = overlay.get_by_doc_id(&coll_key, &doc_id)?;
         Some(match staged {
             Staged::Put(body) => Some(body.clone()),
             Staged::Tombstone => None,

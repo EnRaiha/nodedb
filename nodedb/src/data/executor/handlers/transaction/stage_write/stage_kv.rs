@@ -21,9 +21,10 @@
 //! separate to stay under the file-size limit) -- see that module's doc for
 //! their surrogate-resolution and value-computation reuse. `FieldSet` /
 //! `Transfer` / `TransferItem` are stageable too, in the sibling
-//! `stage_kv_transfer.rs`. Every other `KvOp` (Expire, the sorted-index
-//! family, etc.) is out of scope: it never reaches this file because
-//! `is_stageable_write` only routes the twelve ops above here.
+//! `stage_kv_transfer.rs`. `Expire` / `Persist` are stageable too, in the
+//! sibling `stage_kv_ttl.rs`. Every other `KvOp` (the sorted-index family,
+//! etc.) is out of scope: it never reaches this file because
+//! `is_stageable_write` only routes the fourteen ops above here.
 
 use nodedb_physical::physical_plan::{KvOp, UpdateValue};
 use nodedb_types::Surrogate;
@@ -135,10 +136,16 @@ impl CoreLoop {
             KvOp::FieldSet { .. } | KvOp::Transfer { .. } | KvOp::TransferItem { .. } => {
                 self.execute_stage_kv_transfer(task, tid, txn_id, op)
             }
+            KvOp::Expire {
+                collection,
+                key,
+                ttl_ms,
+            } => self.execute_stage_kv_expire(task, tid, txn_id, collection, key, *ttl_ms),
+            KvOp::Persist { collection, key } => {
+                self.execute_stage_kv_persist(task, tid, txn_id, collection, key)
+            }
             KvOp::Get { .. }
             | KvOp::Scan { .. }
-            | KvOp::Expire { .. }
-            | KvOp::Persist { .. }
             | KvOp::BatchGet { .. }
             | KvOp::RegisterIndex { .. }
             | KvOp::DropIndex { .. }
@@ -374,7 +381,11 @@ impl CoreLoop {
     /// True when `key` is present under BASE ∪ OVERLAY (mirrors
     /// `stage_pk_present`, but against the KV engine rather than the
     /// document sparse store).
-    fn stage_kv_pk_present(&self, ctx: &StageCtx<'_>, key: &[u8]) -> bool {
+    ///
+    /// `pub(super)` so the sibling `stage_kv_ttl.rs` reuses the exact same
+    /// BASE ∪ OVERLAY presence check `Expire` / `Persist` need to decide
+    /// found-vs-not-found, matching the base handlers' `NotFound` semantics.
+    pub(super) fn stage_kv_pk_present(&self, ctx: &StageCtx<'_>, key: &[u8]) -> bool {
         match self.stage_overlay_pk(ctx) {
             super::constraint::OverlayPk::Present => true,
             super::constraint::OverlayPk::Absent => false,

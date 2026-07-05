@@ -24,6 +24,7 @@ mod stage_insert_select;
 mod stage_kv;
 mod stage_kv_atomic;
 mod stage_kv_transfer;
+mod stage_kv_ttl;
 mod stage_spatial;
 mod stage_upsert;
 

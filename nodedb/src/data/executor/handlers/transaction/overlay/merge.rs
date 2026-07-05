@@ -30,8 +30,9 @@ use std::collections::HashSet;
 use nodedb_types::Surrogate;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::transaction::overlay::Staged;
+use crate::data::executor::handlers::transaction::overlay::{Staged, StagedTtl};
 use crate::engine::document::store::{extract_index_values, surrogate_to_doc_id};
+use crate::engine::kv::current_ms;
 use crate::types::{DatabaseId, TenantId, TxnId};
 
 /// Inputs for [`CoreLoop::merge_overlay_into_index_lookup`].
@@ -137,8 +138,24 @@ impl CoreLoop {
             .map(|(key, _)| super::super::stage_write::hex_key(key))
             .collect();
 
+        let now_ms = current_ms();
+        let staged_expired = |doc_id: &str| -> bool {
+            matches!(
+                overlay.get_ttl_by_doc_id(coll_key, doc_id),
+                Some(StagedTtl::ExpireAt(t)) if t <= now_ms
+            )
+        };
+
         rows.retain_mut(|(key, value)| {
             let doc_id = super::super::stage_write::hex_key(key);
+            // A staged EXPIRE with an already-past instant hides the row from
+            // an in-transaction scan -- independent of whether the row's
+            // VALUE was also staged this transaction (an `Expire` on a
+            // base-only row stages only the TTL delta, never a
+            // `Staged::Put`).
+            if staged_expired(&doc_id) {
+                return false;
+            }
             match overlay.get_by_doc_id(coll_key, &doc_id) {
                 Some(Staged::Tombstone) => false,
                 Some(Staged::Put(staged_value)) => {
@@ -154,6 +171,7 @@ impl CoreLoop {
                 continue;
             }
             if let Staged::Put(value) = staged
+                && !staged_expired(doc_id)
                 && matches(value)
                 && let Some(key) = super::super::stage_write::unhex_key(doc_id)
             {

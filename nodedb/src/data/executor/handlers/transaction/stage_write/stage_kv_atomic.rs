@@ -12,13 +12,14 @@
 //! a staged value and its COMMIT-time durable replay never diverge, then
 //! stage the new bytes via [`CoreLoop::stage_put_capped`].
 //!
-//! `ttl_ms` on `Incr` / `BatchPut` is OUT OF SCOPE for the overlay: a KV
-//! entry's TTL lives outside its value body (`KvEntry.expire_at_ms`), and the
-//! staging overlay only ever holds value bytes (`Staged::Put(Vec<u8>)`) — it
-//! has no slot for expiry metadata. The TTL side-effect is still applied
-//! correctly when COMMIT replays the buffered plan through the real
-//! `execute_kv_incr` / `execute_kv_batch_put` path; it is simply not
-//! reflected in a same-transaction `GetTtl` read (a separate, later unit).
+//! `ttl_ms` on `Incr` / `BatchPut` lives outside the value body
+//! (`KvEntry.expire_at_ms`), so it is staged separately from the value: when
+//! non-zero, it is ALSO recorded in the overlay's KV TTL delta map
+//! (`StagedTtl::ExpireAt`, sibling to `Staged`, populated the same way
+//! `stage_kv_ttl.rs` stages `EXPIRE`) so a same-transaction `GetTtl` observes
+//! it. COMMIT still replays the buffered plan through the real
+//! `execute_kv_incr` / `execute_kv_batch_put` path unchanged -- the overlay
+//! TTL delta only affects in-transaction reads.
 //!
 //! `Incr` / `IncrFloat` / `Cas` / `GetSet` carry no surrogate on their plan
 //! (unlike `Put`/`Insert`, whose surrogate is allocated by the planner for
@@ -42,9 +43,10 @@ use super::context::StageCtx;
 use super::stage_kv::hex_key;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::transaction::overlay::StagedTtl;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
-use crate::engine::kv::{AtomicError, atomic_compute};
+use crate::engine::kv::{AtomicError, atomic_compute, current_ms};
 use crate::types::TxnId;
 
 /// FNV-1a 32-bit hash, used only to derive a stable, collection-local overlay
@@ -77,9 +79,10 @@ impl CoreLoop {
                 collection,
                 key,
                 delta,
-                ttl_ms: _,
+                ttl_ms,
             } => {
                 let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
+                self.stage_kv_ttl_side_effect(&ctx, *ttl_ms);
                 self.stage_kv_incr(&ctx, key, *delta)
             }
             KvOp::IncrFloat {
@@ -110,8 +113,8 @@ impl CoreLoop {
             KvOp::BatchPut {
                 collection,
                 entries,
-                ttl_ms: _,
-            } => self.stage_kv_batch_put(task, tid, txn_id, collection, entries),
+                ttl_ms,
+            } => self.stage_kv_batch_put(task, tid, txn_id, collection, entries, *ttl_ms),
             other => unreachable!(
                 "execute_stage_kv_atomic called on a non-atomic KvOp; \
                  caller invariant broken: {other:?}"
@@ -234,9 +237,11 @@ impl CoreLoop {
         txn_id: TxnId,
         collection: &str,
         entries: &[(Vec<u8>, Vec<u8>)],
+        ttl_ms: u64,
     ) -> Response {
         for (key, value) in entries {
             let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
+            self.stage_kv_ttl_side_effect(&ctx, ttl_ms);
             if let Err(e) = self.stage_put_capped(&ctx, value.clone()) {
                 return self.response_error(task, e);
             }
@@ -245,6 +250,26 @@ impl CoreLoop {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, e),
         }
+    }
+
+    /// Stage the TTL side-effect a non-zero `ttl_ms` on `Incr` / `BatchPut`
+    /// carries, so a same-transaction `GetTtl` observes it (see module doc).
+    /// A zero `ttl_ms` means "no TTL requested" and is a no-op here, matching
+    /// the base `atomic_put` / `execute_kv_batch_put` semantics.
+    pub(super) fn stage_kv_ttl_side_effect(&mut self, ctx: &StageCtx<'_>, ttl_ms: u64) {
+        if ttl_ms == 0 {
+            return;
+        }
+        let now_ms: u64 = self
+            .epoch_system_ms
+            .map(|ms| ms as u64)
+            .unwrap_or_else(current_ms);
+        self.txn_overlays.entry(ctx.txn_id).or_default().set_ttl(
+            ctx.coll_key.clone(),
+            ctx.surrogate.0,
+            &ctx.document_id,
+            StagedTtl::ExpireAt(now_ms.saturating_add(ttl_ms)),
+        );
     }
 
     // ── Shared response helpers ──────────────────────────────────────────

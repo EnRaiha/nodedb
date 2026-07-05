@@ -51,21 +51,22 @@ pub fn is_point_write(plan: &PhysicalPlan) -> bool {
 /// Allow-list of plans the in-transaction path stages at statement time via
 /// `MetaOp::StageWrite`: everything [`is_point_write`] accepts (Document
 /// point writes, predicate `BulkUpdate` / `BulkDelete`, `InsertSelect`),
-/// plus the nine stageable KV point writes -- `KvOp::Put`, `KvOp::Insert`,
+/// plus the eleven stageable KV point writes -- `KvOp::Put`, `KvOp::Insert`,
 /// `KvOp::InsertIfAbsent`, `KvOp::InsertOnConflictUpdate`, `KvOp::Delete`,
 /// `KvOp::BatchPut`, `KvOp::Incr`, `KvOp::IncrFloat`, `KvOp::Cas`,
-/// `KvOp::GetSet`. KV is the first non-Document engine to stage at
-/// statement time; this predicate is the shared gate later engine units
-/// extend the same way. `Incr` / `IncrFloat` / `Cas` / `GetSet` stage only
-/// the computed VALUE bytes into the overlay -- `ttl_ms` (on `Incr` /
-/// `BatchPut`) lives outside the value body (`KvEntry.expire_at_ms`) and the
-/// overlay has no slot for it, so an in-transaction TTL reset is applied at
-/// COMMIT (via the unchanged buffered replay) but not reflected in a
-/// same-transaction `GetTtl` read. `FieldSet` / `Transfer` / `TransferItem`
-/// are also stageable -- like the atomics they stage only the computed
-/// value bytes (`stage_kv_transfer.rs`). Every other `KvOp` (Expire, the
-/// sorted-index family, etc.) stays on the pre-existing buffer + "OK"
-/// deferral, same as any other non-stageable write.
+/// `KvOp::GetSet`, `KvOp::Expire`, `KvOp::Persist`. KV is the first
+/// non-Document engine to stage at statement time; this predicate is the
+/// shared gate later engine units extend the same way. `Incr` / `IncrFloat`
+/// / `Cas` / `GetSet` / `BatchPut` stage only the computed VALUE bytes into
+/// the overlay -- a TTL carried on `Incr` / `BatchPut` is ALSO staged into
+/// the overlay's KV TTL delta map (`StagedTtl`, sibling to `Staged`, never
+/// consulted by non-KV engines) so a same-transaction `GetTtl` observes it.
+/// `Expire` / `Persist` stage directly into that same TTL delta map.
+/// `FieldSet` / `Transfer` / `TransferItem` are also stageable -- like the
+/// atomics they stage only the computed value bytes (`stage_kv_transfer.rs`).
+/// Every other `KvOp` (the sorted-index family, etc.) stays on the
+/// pre-existing buffer + "OK" deferral, same as any other non-stageable
+/// write.
 pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
     is_point_write(plan)
         || matches!(
@@ -84,6 +85,8 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
                     | KvOp::FieldSet { .. }
                     | KvOp::Transfer { .. }
                     | KvOp::TransferItem { .. }
+                    | KvOp::Expire { .. }
+                    | KvOp::Persist { .. }
             )
         )
         || matches!(plan, PhysicalPlan::Columnar(ColumnarOp::Insert { .. }))
@@ -219,12 +222,12 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
 
 /// Decide the [`StagedTagKind`] for a staged `KvOp` write.
 ///
-/// Caller invariant: `op` must be one of the twelve stageable KV writes --
+/// Caller invariant: `op` must be one of the fourteen stageable KV writes --
 /// `Put`, `Insert`, `InsertIfAbsent`, `InsertOnConflictUpdate`, `Delete`,
 /// `BatchPut`, `Incr`, `IncrFloat`, `Cas`, `GetSet`, `FieldSet`, `Transfer`,
-/// `TransferItem` -- i.e. the enclosing plan already passed
-/// [`is_stageable_write`]. Every other `KvOp` variant is unreachable here
-/// because the staging dispatch never routes them through this path.
+/// `TransferItem`, `Expire`, `Persist` -- i.e. the enclosing plan already
+/// passed [`is_stageable_write`]. Every other `KvOp` variant is unreachable
+/// here because the staging dispatch never routes them through this path.
 fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
     match op {
         KvOp::Put { .. } | KvOp::Insert { .. } | KvOp::InsertIfAbsent { .. } => {
@@ -252,10 +255,11 @@ fn staged_kv_tag_kind(op: &KvOp, payload: &[u8]) -> StagedTagKind {
         | KvOp::FieldSet { .. }
         | KvOp::Transfer { .. }
         | KvOp::TransferItem { .. } => StagedTagKind::RawPayload,
+        // `Expire` / `Persist` mutate an existing row's TTL metadata in
+        // place -- Update, not Insert/Delete of the row itself.
+        KvOp::Expire { .. } | KvOp::Persist { .. } => StagedTagKind::Update,
         KvOp::Get { .. }
         | KvOp::Scan { .. }
-        | KvOp::Expire { .. }
-        | KvOp::Persist { .. }
         | KvOp::BatchGet { .. }
         | KvOp::RegisterIndex { .. }
         | KvOp::DropIndex { .. }
@@ -379,5 +383,37 @@ mod tests {
             ttl_ms: 0,
         };
         assert_eq!(staged_kv_tag_kind(&op, &payload), StagedTagKind::Insert);
+    }
+
+    #[test]
+    fn is_stageable_write_accepts_expire_and_persist() {
+        assert!(is_stageable_write(&kv_plan(KvOp::Expire {
+            collection: "c".into(),
+            key: b"k".to_vec(),
+            ttl_ms: 1_000,
+        })));
+        assert!(is_stageable_write(&kv_plan(KvOp::Persist {
+            collection: "c".into(),
+            key: b"k".to_vec(),
+        })));
+    }
+
+    #[test]
+    fn staged_kv_tag_kind_expire_and_persist_are_update() {
+        let payload = nodedb_types::json_to_msgpack(&serde_json::json!({})).unwrap();
+        let expire = KvOp::Expire {
+            collection: "c".into(),
+            key: b"k".to_vec(),
+            ttl_ms: 1_000,
+        };
+        let persist = KvOp::Persist {
+            collection: "c".into(),
+            key: b"k".to_vec(),
+        };
+        assert_eq!(staged_kv_tag_kind(&expire, &payload), StagedTagKind::Update);
+        assert_eq!(
+            staged_kv_tag_kind(&persist, &payload),
+            StagedTagKind::Update
+        );
     }
 }

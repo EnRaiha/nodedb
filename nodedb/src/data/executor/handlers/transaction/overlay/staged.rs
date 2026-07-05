@@ -32,6 +32,18 @@ pub enum Staged {
     Tombstone,
 }
 
+/// A staged TTL delta for one KV row, kept OUTSIDE `Staged` because TTL is
+/// KV-specific (only KV entries carry `expire_at_ms`,
+/// `engine/kv/entry.rs::KvEntry.expire_at_ms`) while `Staged` is shared by
+/// every engine's read-merge. Only KV reads ever consult this map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedTtl {
+    /// `EXPIRE` staged: the row expires at this absolute epoch-ms instant.
+    ExpireAt(u64),
+    /// `PERSIST` staged: any base TTL is cleared, the row never expires.
+    Persist,
+}
+
 /// Staged mutations for a single collection within one transaction.
 #[derive(Debug, Default)]
 pub struct CollectionOverlay {
@@ -41,6 +53,9 @@ pub struct CollectionOverlay {
     /// yet been made durable (and therefore have no other way to be looked
     /// up by doc_id).
     doc_id_to_surrogate: HashMap<String, u32>,
+    /// Staged KV TTL delta per surrogate — sibling to `by_surrogate`, never
+    /// consulted by non-KV engines. See [`StagedTtl`].
+    ttl_by_surrogate: HashMap<u32, StagedTtl>,
 }
 
 /// Per-transaction staging overlay: holds not-yet-durable writes for every
@@ -122,6 +137,50 @@ impl TxnOverlay {
             .doc_id_to_surrogate
             .get(doc_id)
             .copied()
+    }
+
+    /// Stage a KV TTL delta (`EXPIRE` / `PERSIST`) for `surrogate` in the
+    /// given collection, binding `doc_id` to `surrogate` the same way
+    /// `insert_put` / `insert_tombstone` do — a `GetTtl` (or a later
+    /// `Expire`/`Persist`/`Incr` in the same transaction) resolves the same
+    /// slot by hex-encoded KV key.
+    pub fn set_ttl(
+        &mut self,
+        coll_key: (DatabaseId, TenantId, String),
+        surrogate: u32,
+        doc_id: &str,
+        ttl: StagedTtl,
+    ) {
+        let overlay = self.collections.entry(coll_key).or_default();
+        overlay.ttl_by_surrogate.insert(surrogate, ttl);
+        overlay
+            .doc_id_to_surrogate
+            .insert(doc_id.to_string(), surrogate);
+    }
+
+    /// Look up the staged TTL delta for `surrogate` in the given collection.
+    pub fn get_ttl(
+        &self,
+        coll_key: &(DatabaseId, TenantId, String),
+        surrogate: u32,
+    ) -> Option<StagedTtl> {
+        self.collections
+            .get(coll_key)?
+            .ttl_by_surrogate
+            .get(&surrogate)
+            .copied()
+    }
+
+    /// Look up the staged TTL delta for `doc_id` in the given collection,
+    /// resolving through `doc_id_to_surrogate` first.
+    pub fn get_ttl_by_doc_id(
+        &self,
+        coll_key: &(DatabaseId, TenantId, String),
+        doc_id: &str,
+    ) -> Option<StagedTtl> {
+        let overlay = self.collections.get(coll_key)?;
+        let surrogate = overlay.doc_id_to_surrogate.get(doc_id)?;
+        overlay.ttl_by_surrogate.get(surrogate).copied()
     }
 
     /// Iterate all staged `(surrogate, Staged)` pairs for a collection.
@@ -239,5 +298,81 @@ mod tests {
 
         assert_eq!(overlay.get(&key("users"), 9), Some(&Staged::Tombstone));
         assert_eq!(overlay.memory_size_estimate(), 0);
+    }
+
+    // ── KV TTL delta (`StagedTtl`) ──────────────────────────────────────
+    //
+    // `KvOp::Expire` / `KvOp::Persist` / `GetTtl` have no SQL or native-DSL
+    // surface in this codebase today (no `KV_EXPIRE`/`KV_PERSIST`/
+    // `KV_GET_TTL` function, unlike `KV_INCR`/`KV_CAS`/`KV_GETSET`), so a
+    // pgwire `TestServer` end-to-end test (as used by
+    // `sql_transactions_kv_overlay.rs` / `sql_transactions_kv_atomic_overlay.rs`)
+    // cannot exercise them -- same gap `BatchPut` was already flagged with in
+    // `sql_transactions_kv_atomic_overlay.rs`. These unit tests cover the
+    // overlay data structure directly instead: staging, doc-id resolution,
+    // `Persist` overriding a prior `ExpireAt`, and that a fresh `TxnOverlay`
+    // (what `MetaOp::DropTxnOverlay` replaces the map entry with on commit /
+    // rollback) starts with no TTL deltas.
+
+    #[test]
+    fn set_ttl_and_get_ttl_round_trip() {
+        let mut overlay = TxnOverlay::new();
+        overlay.set_ttl(key("cache"), 3, "6b6579", StagedTtl::ExpireAt(5_000));
+
+        assert_eq!(
+            overlay.get_ttl(&key("cache"), 3),
+            Some(StagedTtl::ExpireAt(5_000))
+        );
+        assert_eq!(
+            overlay.get_ttl_by_doc_id(&key("cache"), "6b6579"),
+            Some(StagedTtl::ExpireAt(5_000))
+        );
+    }
+
+    #[test]
+    fn set_ttl_persist_overrides_prior_expire() {
+        let mut overlay = TxnOverlay::new();
+        overlay.set_ttl(key("cache"), 3, "6b6579", StagedTtl::ExpireAt(5_000));
+        overlay.set_ttl(key("cache"), 3, "6b6579", StagedTtl::Persist);
+
+        assert_eq!(overlay.get_ttl(&key("cache"), 3), Some(StagedTtl::Persist));
+    }
+
+    #[test]
+    fn get_ttl_none_when_nothing_staged() {
+        let overlay = TxnOverlay::new();
+        assert_eq!(overlay.get_ttl(&key("cache"), 3), None);
+        assert_eq!(overlay.get_ttl_by_doc_id(&key("cache"), "6b6579"), None);
+    }
+
+    #[test]
+    fn set_ttl_binds_doc_id_without_a_staged_value() {
+        // `Expire` on a key whose value was never staged in this transaction
+        // (only a base row exists) must still resolve by doc_id -- `set_ttl`
+        // binds `doc_id_to_surrogate` itself, independent of `insert_put`.
+        let mut overlay = TxnOverlay::new();
+        overlay.set_ttl(key("cache"), 42, "6b6579", StagedTtl::ExpireAt(9_999));
+
+        assert!(overlay.get_by_doc_id(&key("cache"), "6b6579").is_none());
+        assert_eq!(
+            overlay.get_ttl_by_doc_id(&key("cache"), "6b6579"),
+            Some(StagedTtl::ExpireAt(9_999))
+        );
+    }
+
+    #[test]
+    fn ttl_delta_is_per_collection() {
+        let mut overlay = TxnOverlay::new();
+        overlay.set_ttl(key("a"), 1, "6b", StagedTtl::ExpireAt(1_000));
+        assert_eq!(overlay.get_ttl(&key("b"), 1), None);
+    }
+
+    #[test]
+    fn fresh_overlay_has_no_ttl_deltas() {
+        // What `MetaOp::DropTxnOverlay` effectively produces (the map entry
+        // for the transaction is removed, so any later staging starts from a
+        // fresh `TxnOverlay::default()`).
+        let overlay = TxnOverlay::new();
+        assert_eq!(overlay.get_ttl(&key("cache"), 3), None);
     }
 }
