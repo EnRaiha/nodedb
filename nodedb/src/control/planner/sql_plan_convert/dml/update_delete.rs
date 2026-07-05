@@ -15,17 +15,33 @@ use super::super::value::{
 };
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-#[allow(clippy::too_many_arguments)]
+/// Parameters for [`convert_update`], bundled to avoid an unwieldy argument
+/// list. Fields borrow from the caller exactly as the individual arguments
+/// did before this refactor — no new allocations.
+pub(in super::super) struct UpdateParams<'a> {
+    pub collection: &'a str,
+    pub engine: &'a EngineType,
+    pub assignments: &'a [(String, SqlExpr)],
+    pub filters: &'a [Filter],
+    pub target_keys: &'a [SqlValue],
+    pub returning: bool,
+    pub tenant_id: TenantId,
+    pub ctx: &'a ConvertContext,
+}
+
 pub(in super::super) fn convert_update(
-    collection: &str,
-    engine: &EngineType,
-    assignments: &[(String, SqlExpr)],
-    filters: &[Filter],
-    target_keys: &[SqlValue],
-    _returning: bool,
-    tenant_id: TenantId,
-    ctx: &ConvertContext,
+    params: UpdateParams<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let UpdateParams {
+        collection,
+        engine,
+        assignments,
+        filters,
+        target_keys,
+        returning: _returning,
+        tenant_id,
+        ctx,
+    } = params;
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
@@ -407,18 +423,35 @@ fn delete_effective_filter(filters: &[Filter], target_keys: &[SqlValue]) -> crat
 /// The source collection name and alias are extracted from the `source` plan.
 /// Assignments are converted with table-qualified column references so the Data
 /// Plane can resolve `src.col` against the merged `{target + "src.col": ...}` doc.
-#[allow(clippy::too_many_arguments)]
+/// Parameters for [`convert_update_from`], bundled to avoid an unwieldy
+/// argument list. Fields borrow from the caller exactly as the individual
+/// arguments did before this refactor — no new allocations.
+pub(in super::super) struct UpdateFromParams<'a> {
+    pub collection: &'a str,
+    pub source: &'a SqlPlan,
+    pub target_join_col: &'a str,
+    pub source_join_col: &'a str,
+    pub assignments: &'a [(String, SqlExpr)],
+    pub target_filters: &'a [Filter],
+    pub returning: bool,
+    pub tenant_id: TenantId,
+    pub ctx: &'a ConvertContext,
+}
+
 pub(in super::super) fn convert_update_from(
-    collection: &str,
-    source: &SqlPlan,
-    target_join_col: &str,
-    source_join_col: &str,
-    assignments: &[(String, SqlExpr)],
-    target_filters: &[Filter],
-    _returning: bool,
-    tenant_id: TenantId,
-    ctx: &super::super::convert::ConvertContext,
+    params: UpdateFromParams<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let UpdateFromParams {
+        collection,
+        source,
+        target_join_col,
+        source_join_col,
+        assignments,
+        target_filters,
+        returning: _returning,
+        tenant_id,
+        ctx,
+    } = params;
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     // Extract source collection name and alias from the source scan plan.

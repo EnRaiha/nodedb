@@ -10,4 +10,6 @@ pub(super) use kv_and_vector::{
     VectorPrimaryInsertCfg, convert_kv_insert, convert_vector_primary_insert,
 };
 pub(super) use merge::convert_merge;
-pub(super) use update_delete::{convert_delete, convert_update, convert_update_from};
+pub(super) use update_delete::{
+    UpdateFromParams, UpdateParams, convert_delete, convert_update, convert_update_from,
+};

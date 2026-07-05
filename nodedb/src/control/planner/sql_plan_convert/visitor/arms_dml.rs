@@ -81,16 +81,16 @@ macro_rules! impl_dml_arms_for_convert_visitor {
             target_keys: &[nodedb_sql::types_expr::SqlValue],
             returning: bool,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-            super::super::dml::convert_update(
+            super::super::dml::convert_update(super::super::dml::UpdateParams {
                 collection,
-                &engine,
+                engine: &engine,
                 assignments,
                 filters,
                 target_keys,
                 returning,
-                self.tenant_id,
-                self.ctx,
-            )
+                tenant_id: self.tenant_id,
+                ctx: self.ctx,
+            })
         }
 
         fn update_from(
@@ -104,7 +104,7 @@ macro_rules! impl_dml_arms_for_convert_visitor {
             target_filters: &[nodedb_sql::types::filter::Filter],
             returning: bool,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-            super::super::dml::convert_update_from(
+            super::super::dml::convert_update_from(super::super::dml::UpdateFromParams {
                 collection,
                 source,
                 target_join_col,
@@ -112,9 +112,9 @@ macro_rules! impl_dml_arms_for_convert_visitor {
                 assignments,
                 target_filters,
                 returning,
-                self.tenant_id,
-                self.ctx,
-            )
+                tenant_id: self.tenant_id,
+                ctx: self.ctx,
+            })
         }
 
         fn delete(
