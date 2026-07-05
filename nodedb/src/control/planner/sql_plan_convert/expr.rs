@@ -347,6 +347,7 @@ pub(super) fn inline_cte(plan: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> 
         SqlPlan::Aggregate {
             input,
             group_by,
+            group_by_aliases,
             aggregates,
             having,
             limit,
@@ -355,6 +356,7 @@ pub(super) fn inline_cte(plan: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> 
         } => SqlPlan::Aggregate {
             input: Box::new(inline_cte(input, cte_name, cte_plan)),
             group_by: group_by.clone(),
+            group_by_aliases: group_by_aliases.clone(),
             aggregates: aggregates.clone(),
             having: having.clone(),
             limit: *limit,

@@ -97,28 +97,42 @@ fn column_types_for<C: SqlCatalog>(
 
 /// Derives an `OutputColumn` for one GROUP BY key expression.
 ///
-/// Mirrors the `Projection::Column` naming rule: a bare/qualified column
-/// name's `display_name` is its last dot segment while `lookup_key` keeps
-/// the full qualified form; any other expression shape falls back to
-/// `DdlColType::Text` with no resolvable name, using the group index as a
-/// stable placeholder lookup key.
-fn group_by_key_column(expr: &SqlExpr, index: usize) -> OutputColumn {
+/// The `display_name` is the SELECT-list output name: the explicit alias when
+/// the projection aliased the key (`SELECT k AS label ... GROUP BY k` yields
+/// output column `label`, matching Postgres), otherwise the key's own column
+/// name. The `lookup_key` always stays the raw grouped column name (the key
+/// the aggregate executor emits the value under), so `project_row` still finds
+/// the value.
+///
+/// The output type is `DdlColType::Text`: the pgwire SELECT encoder is
+/// text-format only, so advertising a non-TEXT type OID without matching typed
+/// value encoding would break the extended-query protocol. (Typed aggregate /
+/// group-key reporting is deferred to a dedicated pgwire value-encoding unit.)
+///
+/// A non-`Column` GROUP BY key (a computed expression) uses the alias when
+/// present, else a stable `group_{index}` placeholder (also used as the lookup
+/// key).
+fn group_by_key_column(expr: &SqlExpr, index: usize, alias: Option<&str>) -> OutputColumn {
     match expr {
         SqlExpr::Column { table, name } => {
             let lookup_key = match table {
                 Some(t) => format!("{t}.{name}"),
                 None => name.clone(),
             };
+            let display_name = alias.map(str::to_string).unwrap_or_else(|| name.clone());
             OutputColumn {
-                display_name: name.clone(),
+                display_name,
                 lookup_key,
                 ty: DdlColType::Text,
             }
         }
         _ => {
             let placeholder = format!("group_{index}");
+            let display_name = alias
+                .map(str::to_string)
+                .unwrap_or_else(|| placeholder.clone());
             OutputColumn {
-                display_name: placeholder.clone(),
+                display_name,
                 lookup_key: placeholder,
                 ty: DdlColType::Text,
             }
@@ -283,12 +297,17 @@ pub fn build_output_schema<C: SqlCatalog>(
         },
         SqlPlan::Aggregate {
             group_by,
+            group_by_aliases,
             aggregates,
             ..
         } => {
             let mut columns = Vec::with_capacity(group_by.len() + aggregates.len());
             for (index, key) in group_by.iter().enumerate() {
-                columns.push(group_by_key_column(key, index));
+                // `group_by_aliases` is parallel to `group_by` when populated,
+                // but may be empty when the plan was built without a projection
+                // in scope — treat a missing/`None` entry as "no alias".
+                let alias = group_by_aliases.get(index).and_then(|a| a.as_deref());
+                columns.push(group_by_key_column(key, index, alias));
             }
             for agg in aggregates {
                 // `AggregateExpr::alias` is always populated by the planner:
@@ -297,9 +316,9 @@ pub fn build_output_schema<C: SqlCatalog>(
                 // e.g. `count(*)` — matching this module's own
                 // lowercasing of non-column expressions. So the alias is
                 // already the canonical name; no separate derivation needed.
-                // All aggregate result values currently ship as TEXT (typed
-                // OIDs are a separately-parked change); advertising a numeric
-                // type here would break clients reading the column as a string.
+                // All aggregate result values ship as TEXT (the pgwire SELECT
+                // encoder is text-format only; typed OIDs are deferred to a
+                // dedicated value-encoding unit).
                 columns.push(OutputColumn {
                     display_name: agg.alias.clone(),
                     lookup_key: agg.alias.clone(),
@@ -503,6 +522,10 @@ mod tests {
                 table: None,
                 name: "status".to_string(),
             }],
+            // `SELECT status AS state ...` — the group-key output name is the
+            // SELECT-list alias, while the value lookup key stays the raw
+            // grouped column name.
+            group_by_aliases: vec![Some("state".to_string())],
             aggregates: vec![
                 AggregateExpr {
                     function: "sum".to_string(),
@@ -530,10 +553,14 @@ mod tests {
 
         let schema = build_output_schema(&plans, &NoCatalog, nodedb_types::DatabaseId::DEFAULT);
         assert_eq!(schema.columns.len(), 3);
-        assert_eq!(schema.columns[0].display_name, "status");
+        // Group-key display_name is the SELECT-list alias; lookup_key stays
+        // the raw grouped column name (the executor's emitted value key).
+        assert_eq!(schema.columns[0].display_name, "state");
         assert_eq!(schema.columns[0].lookup_key, "status");
         assert_eq!(schema.columns[1].display_name, "total");
         assert_eq!(schema.columns[1].lookup_key, "total");
+        // Aggregate result columns ship as TEXT (pgwire SELECT encoder is
+        // text-format only; typed OIDs deferred to a value-encoding unit).
         assert_eq!(schema.columns[1].ty, DdlColType::Text);
         assert_eq!(schema.columns[2].display_name, "count(*)");
         assert_eq!(schema.columns[2].lookup_key, "count(*)");

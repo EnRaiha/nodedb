@@ -50,7 +50,7 @@ pub fn plan_aggregate(
         extract_timeseries_params(&select.group_by, &select.projection, functions)?;
 
     let rules = engine_rules::resolve_engine_rules(table.info.engine);
-    let base_plan = rules.plan_aggregate(AggregateParams {
+    let mut base_plan = rules.plan_aggregate(AggregateParams {
         collection: table.name.clone(),
         alias: table.alias.clone(),
         filters: filters.to_vec(),
@@ -65,11 +65,25 @@ pub fn plan_aggregate(
         temporal: *temporal,
     })?;
 
+    // The engine rules build the Aggregate node without a projection in scope,
+    // so the SELECT-list output aliases for the GROUP BY keys are attached here
+    // (Postgres: `SELECT k AS label ... GROUP BY k` yields output column
+    // `label`, not `k`).
+    let group_by_aliases = group_by_output_aliases(&select.projection, &group_by_exprs);
+    if let SqlPlan::Aggregate {
+        group_by_aliases: slot,
+        ..
+    } = &mut base_plan
+    {
+        *slot = group_by_aliases.clone();
+    }
+
     // Wrap the plan to attach grouping sets if present.
     if let Some(sets) = grouping_sets {
         return Ok(attach_grouping_sets(
             base_plan,
             group_by_exprs,
+            group_by_aliases,
             aggregates,
             having,
             sets,
@@ -79,11 +93,62 @@ pub fn plan_aggregate(
     Ok(base_plan)
 }
 
+/// Derive the SELECT-list output alias for each GROUP BY key by correlating
+/// each key with the projection item that references the same column. Returns
+/// a `Vec` parallel to `group_by`: `Some(alias)` when a projection item
+/// explicitly aliases that grouped column (`SELECT k AS label ... GROUP BY k`),
+/// otherwise `None` (the output column name falls back to the raw grouped
+/// column name).
+pub fn group_by_output_aliases(
+    projection: &[ast::SelectItem],
+    group_by: &[SqlExpr],
+) -> Vec<Option<String>> {
+    group_by
+        .iter()
+        .map(|key| {
+            key_column_name(key).and_then(|name| projection_alias_for_column(projection, name))
+        })
+        .collect()
+}
+
+/// The bare column name of a GROUP BY key, when the key is a column reference.
+fn key_column_name(key: &SqlExpr) -> Option<&str> {
+    match key {
+        SqlExpr::Column { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// The explicit alias of the projection item that references bare column
+/// `col`, if any. Only `expr AS alias` items where `expr` is that column
+/// (bare or qualified) qualify; unaliased items yield `None`.
+fn projection_alias_for_column(projection: &[ast::SelectItem], col: &str) -> Option<String> {
+    for item in projection {
+        if let ast::SelectItem::ExprWithAlias { expr, alias } = item
+            && expr_column_name(expr).is_some_and(|n| n == col)
+        {
+            return Some(normalize_ident(alias));
+        }
+    }
+    None
+}
+
+/// The bare column name referenced by an `ast::Expr`, when it is a simple or
+/// compound identifier; `None` for any other expression shape.
+fn expr_column_name(expr: &ast::Expr) -> Option<String> {
+    match expr {
+        ast::Expr::Identifier(ident) => Some(normalize_ident(ident)),
+        ast::Expr::CompoundIdentifier(parts) => parts.last().map(normalize_ident),
+        _ => None,
+    }
+}
+
 /// Attach `grouping_sets` to an existing `SqlPlan::Aggregate` node, or wrap it
 /// in a new one when the engine rules returned a non-Aggregate plan.
 fn attach_grouping_sets(
     base_plan: SqlPlan,
     group_by: Vec<SqlExpr>,
+    group_by_aliases: Vec<Option<String>>,
     aggregates: Vec<AggregateExpr>,
     having: Vec<Filter>,
     grouping_sets: Vec<Vec<usize>>,
@@ -98,6 +163,7 @@ fn attach_grouping_sets(
         } => SqlPlan::Aggregate {
             input,
             group_by,
+            group_by_aliases,
             aggregates,
             having,
             limit,
@@ -110,6 +176,7 @@ fn attach_grouping_sets(
             SqlPlan::Aggregate {
                 input: Box::new(other),
                 group_by,
+                group_by_aliases,
                 aggregates,
                 having,
                 limit: 10000,

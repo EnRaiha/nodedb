@@ -225,6 +225,14 @@ pub enum SqlPlan {
     Aggregate {
         input: Box<SqlPlan>,
         group_by: Vec<SqlExpr>,
+        /// SELECT-list output alias for each GROUP BY key, parallel to
+        /// `group_by`. `Some(alias)` when the projection aliased the key
+        /// (`SELECT k AS label ... GROUP BY k` → `Some("label")`); `None`
+        /// when the projection has no explicit alias for that key, so the
+        /// output column name falls back to the raw grouped column name.
+        /// Empty when the plan was built without a projection in scope
+        /// (treated the same as all-`None`).
+        group_by_aliases: Vec<Option<String>>,
         aggregates: Vec<AggregateExpr>,
         having: Vec<Filter>,
         limit: usize,

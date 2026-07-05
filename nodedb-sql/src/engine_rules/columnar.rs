@@ -132,6 +132,7 @@ impl EngineRules for ColumnarRules {
         Ok(SqlPlan::Aggregate {
             input: Box::new(base_scan),
             group_by: p.group_by,
+            group_by_aliases: Vec::new(),
             aggregates: p.aggregates,
             having: p.having,
             limit: p.limit,

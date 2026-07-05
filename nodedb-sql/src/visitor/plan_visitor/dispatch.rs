@@ -190,6 +190,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
         SqlPlan::Aggregate {
             input,
             group_by,
+            group_by_aliases: _,
             aggregates,
             having,
             limit,

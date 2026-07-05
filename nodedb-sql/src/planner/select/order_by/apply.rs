@@ -99,6 +99,7 @@ pub(in crate::planner::select) fn apply_order_by(
         SqlPlan::Aggregate {
             input,
             group_by,
+            group_by_aliases,
             aggregates,
             having,
             limit,
@@ -107,6 +108,7 @@ pub(in crate::planner::select) fn apply_order_by(
         } => Ok(SqlPlan::Aggregate {
             input: input.clone(),
             group_by: group_by.clone(),
+            group_by_aliases: group_by_aliases.clone(),
             aggregates: aggregates.clone(),
             having: having.clone(),
             limit: *limit,
