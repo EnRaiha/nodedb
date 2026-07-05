@@ -10,17 +10,22 @@
 //! and nodes are projected from any data-bearing collection (typically a
 //! `document_strict` collection) via `EDGE` and `NODE` declarations.
 
+pub mod bfs_params;
 pub mod csr;
 pub mod error;
+pub mod overlay_delta;
 pub mod params;
 pub mod sharded;
 pub mod traversal;
 pub mod traversal_options;
+pub mod traversal_overlay;
 
+pub use bfs_params::BfsParams;
 pub use csr::extract_weight_from_properties;
 pub use csr::{CsrIndex, Direction, LocalNodeId};
 pub use csr::{DegreeHistogram, GraphStatistics, LabelStats};
 pub use error::{GraphError, MAX_EDGE_LABELS, MAX_NODES_PER_CSR};
+pub use overlay_delta::GraphOverlayDelta;
 pub use params::{AlgoColumnType, AlgoParams, GraphAlgorithm};
 pub use sharded::ShardedCsrIndex;
 pub use traversal_options::{GraphResponseMeta, GraphTraversalOptions, MAX_GRAPH_TRAVERSAL_DEPTH};

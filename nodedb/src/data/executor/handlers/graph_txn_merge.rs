@@ -16,9 +16,33 @@
 //! unit-testable without constructing a full `CoreLoop`.
 
 use crate::data::executor::handlers::transaction::overlay::GraphTxnOverlay;
+use crate::engine::graph::csr::GraphOverlayDelta;
 use crate::engine::graph::edge_store::Direction;
 use crate::types::TenantId;
 use nodedb_types::DatabaseId;
+
+/// Translate a transaction's [`GraphTxnOverlay`] into a shared-crate
+/// [`GraphOverlayDelta`] scoped to `(database_id, tenant)`, for the multi-hop
+/// `Hop` (depth > 1) and `Subgraph` read-your-own-writes paths.
+///
+/// Neighbors / single-hop `Hop` use [`merge_graph_txn_overlay_neighbors`] /
+/// [`merge_hop_single_hop`] instead; the traversal engine itself cannot merge
+/// staged edges through staged-only intermediate nodes, so multi-hop pushes
+/// the whole delta down into `traverse_bfs` / `subgraph`.
+pub(in crate::data::executor) fn build_graph_overlay_delta(
+    overlay: &GraphTxnOverlay,
+    database_id: DatabaseId,
+    tenant: TenantId,
+) -> GraphOverlayDelta {
+    let mut delta = GraphOverlayDelta::new();
+    for (src, label, dst) in overlay.all_staged_edges(database_id, tenant) {
+        delta.stage_edge(&src, &label, &dst);
+    }
+    for (src, label, dst) in overlay.all_tombstones(database_id, tenant) {
+        delta.stage_tombstone(&src, &label, &dst);
+    }
+    delta
+}
 
 /// Merge a transaction's staged GRAPH edge writes into a durable `(label,
 /// node)` neighbor list for `node_id`, respecting `direction` and
@@ -270,6 +294,31 @@ mod tests {
             Vec::new(),
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn build_delta_carries_staged_edges_and_tombstones() {
+        let mut overlay = GraphTxnOverlay::new();
+        overlay.stage_edge_put(coll_key("g"), "a", "knows", "b", Vec::new());
+        overlay.stage_edge_delete(coll_key("g"), "x", "knows", "y");
+
+        let delta = build_graph_overlay_delta(&overlay, DatabaseId::new(1), tenant());
+        assert!(!delta.is_empty());
+        let out: Vec<_> = delta.out_neighbors("a", None).collect();
+        assert_eq!(out, vec![("knows", "b")]);
+        let inn: Vec<_> = delta.in_neighbors("b", None).collect();
+        assert_eq!(inn, vec![("knows", "a")]);
+        assert!(delta.is_tombstoned("x", "knows", "y"));
+    }
+
+    #[test]
+    fn build_delta_scopes_to_database_tenant() {
+        let mut overlay = GraphTxnOverlay::new();
+        overlay.stage_edge_put(coll_key("g"), "a", "knows", "b", Vec::new());
+
+        // A different database id sees none of the staged edges.
+        let delta = build_graph_overlay_delta(&overlay, DatabaseId::new(999), tenant());
+        assert!(delta.is_empty());
     }
 
     #[test]

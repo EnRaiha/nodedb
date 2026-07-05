@@ -14,7 +14,9 @@ use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 
 pub use nodedb_types::config::tuning::DEFAULT_MAX_VISITED;
 
+use crate::bfs_params::BfsParams;
 use crate::csr::{CsrIndex, Direction};
+use crate::overlay_delta::GraphOverlayDelta;
 
 impl CsrIndex {
     /// BFS traversal. Returns all reachable node IDs within max_depth hops.
@@ -25,15 +27,33 @@ impl CsrIndex {
     /// `frontier_bitmap`: when `Some`, only nodes whose surrogate is present in the
     /// bitmap are eligible as traversal targets. Start nodes are not gated — only
     /// newly discovered frontier nodes are checked.
+    ///
+    /// `overlay`: when `Some` and non-empty, the traversal observes the
+    /// transaction's staged edge writes/deletes (read-your-own-writes),
+    /// including through nodes reachable only via a staged edge. When `None`
+    /// or empty, the durable-only dense fast path runs unchanged.
     pub fn traverse_bfs(
         &self,
-        start_nodes: &[&str],
-        label_filter: Option<&str>,
-        direction: Direction,
-        max_depth: usize,
-        max_visited: usize,
-        frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+        params: BfsParams<'_>,
+        overlay: Option<&GraphOverlayDelta>,
     ) -> Vec<String> {
+        match overlay {
+            Some(ov) if !ov.is_empty() => self.traverse_bfs_overlay(params, ov),
+            _ => self.traverse_bfs_dense(params),
+        }
+    }
+
+    /// Durable-only BFS over the dense u32 CSR ids. Behavior and performance
+    /// are identical to the pre-overlay traversal.
+    fn traverse_bfs_dense(&self, params: BfsParams<'_>) -> Vec<String> {
+        let BfsParams {
+            start_nodes,
+            label_filter,
+            direction,
+            max_depth,
+            max_visited,
+            frontier_bitmap,
+        } = params;
         let label_id = label_filter.and_then(|l| self.label_id(l));
         let mut visited: HashSet<u32> = HashSet::new();
         let mut queue: VecDeque<(u32, usize)> = VecDeque::new();
@@ -295,14 +315,44 @@ impl CsrIndex {
             .collect()
     }
 
-    /// Materialize a subgraph as edge tuples within max_depth.
+    /// Materialize a subgraph as `(src, label, dst)` edge tuples within
+    /// max_depth, expanding in `direction`.
     ///
     /// `max_visited` caps the number of nodes visited to prevent supernode fan-out
     /// explosion. Pass [`DEFAULT_MAX_VISITED`] for the standard limit.
+    ///
+    /// `overlay`: when `Some` and non-empty, staged edges are included and
+    /// staged tombstones subtract durable edges (read-your-own-writes),
+    /// including through staged-only intermediate nodes. When `None` or
+    /// empty, the durable-only dense path runs unchanged.
     pub fn subgraph(
         &self,
         start_nodes: &[&str],
         label_filter: Option<&str>,
+        direction: Direction,
+        max_depth: usize,
+        max_visited: usize,
+        overlay: Option<&GraphOverlayDelta>,
+    ) -> Vec<(String, String, String)> {
+        match overlay {
+            Some(ov) if !ov.is_empty() => self.subgraph_overlay(
+                start_nodes,
+                label_filter,
+                direction,
+                max_depth,
+                max_visited,
+                ov,
+            ),
+            _ => self.subgraph_dense(start_nodes, label_filter, direction, max_depth, max_visited),
+        }
+    }
+
+    /// Durable-only subgraph materialization over the dense u32 CSR ids.
+    fn subgraph_dense(
+        &self,
+        start_nodes: &[&str],
+        label_filter: Option<&str>,
+        direction: Direction,
         max_depth: usize,
         max_visited: usize,
     ) -> Vec<(String, String, String)> {
@@ -324,15 +374,31 @@ impl CsrIndex {
                 continue;
             }
             self.record_access(node_id);
-            for (lid, dst) in self.dense_iter_out(node_id) {
-                if label_id.is_none_or(|f| f == lid) {
-                    edges.push((
-                        self.id_to_node[node_id as usize].clone(),
-                        self.label_name(lid).to_string(),
-                        self.id_to_node[dst as usize].clone(),
-                    ));
-                    if visited.len() < max_visited && visited.insert(dst) {
-                        queue.push_back((dst, depth + 1));
+            if matches!(direction, Direction::Out | Direction::Both) {
+                for (lid, dst) in self.dense_iter_out(node_id) {
+                    if label_id.is_none_or(|f| f == lid) {
+                        edges.push((
+                            self.id_to_node[node_id as usize].clone(),
+                            self.label_name(lid).to_string(),
+                            self.id_to_node[dst as usize].clone(),
+                        ));
+                        if visited.len() < max_visited && visited.insert(dst) {
+                            queue.push_back((dst, depth + 1));
+                        }
+                    }
+                }
+            }
+            if matches!(direction, Direction::In | Direction::Both) {
+                for (lid, src) in self.dense_iter_in(node_id) {
+                    if label_id.is_none_or(|f| f == lid) {
+                        edges.push((
+                            self.id_to_node[src as usize].clone(),
+                            self.label_name(lid).to_string(),
+                            self.id_to_node[node_id as usize].clone(),
+                        ));
+                        if visited.len() < max_visited && visited.insert(src) {
+                            queue.push_back((src, depth + 1));
+                        }
                     }
                 }
             }
@@ -359,11 +425,14 @@ mod tests {
     fn bfs_traversal() {
         let csr = make_csr();
         let mut result = csr.traverse_bfs(
-            &["a"],
-            Some("KNOWS"),
-            Direction::Out,
-            2,
-            DEFAULT_MAX_VISITED,
+            BfsParams {
+                start_nodes: &["a"],
+                label_filter: Some("KNOWS"),
+                direction: Direction::Out,
+                max_depth: 2,
+                max_visited: DEFAULT_MAX_VISITED,
+                frontier_bitmap: None,
+            },
             None,
         );
         result.sort();
@@ -373,8 +442,17 @@ mod tests {
     #[test]
     fn bfs_all_labels() {
         let csr = make_csr();
-        let mut result =
-            csr.traverse_bfs(&["a"], None, Direction::Out, 1, DEFAULT_MAX_VISITED, None);
+        let mut result = csr.traverse_bfs(
+            BfsParams {
+                start_nodes: &["a"],
+                label_filter: None,
+                direction: Direction::Out,
+                max_depth: 1,
+                max_visited: DEFAULT_MAX_VISITED,
+                frontier_bitmap: None,
+            },
+            None,
+        );
         result.sort();
         assert_eq!(result, vec!["a", "b", "e"]);
     }
@@ -385,8 +463,17 @@ mod tests {
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "a").unwrap();
-        let mut result =
-            csr.traverse_bfs(&["a"], None, Direction::Out, 10, DEFAULT_MAX_VISITED, None);
+        let mut result = csr.traverse_bfs(
+            BfsParams {
+                start_nodes: &["a"],
+                label_filter: None,
+                direction: Direction::Out,
+                max_depth: 10,
+                max_visited: DEFAULT_MAX_VISITED,
+                frontier_bitmap: None,
+            },
+            None,
+        );
         result.sort();
         assert_eq!(result, vec!["a", "b", "c"]);
     }
@@ -443,7 +530,7 @@ mod tests {
     #[test]
     fn subgraph_materialization() {
         let csr = make_csr();
-        let edges = csr.subgraph(&["a"], None, 2, DEFAULT_MAX_VISITED);
+        let edges = csr.subgraph(&["a"], None, Direction::Out, 2, DEFAULT_MAX_VISITED, None);
         assert_eq!(edges.len(), 3);
         assert!(edges.contains(&("a".into(), "KNOWS".into(), "b".into())));
         assert!(edges.contains(&("a".into(), "WORKS".into(), "e".into())));
@@ -460,11 +547,14 @@ mod tests {
         csr.compact().expect("no governor, cannot fail");
 
         let result = csr.traverse_bfs(
-            &["n0"],
-            Some("NEXT"),
-            Direction::Out,
-            100,
-            DEFAULT_MAX_VISITED,
+            BfsParams {
+                start_nodes: &["n0"],
+                label_filter: Some("NEXT"),
+                direction: Direction::Out,
+                max_depth: 100,
+                max_visited: DEFAULT_MAX_VISITED,
+                frontier_bitmap: None,
+            },
             None,
         );
         assert_eq!(result.len(), 101);
@@ -492,12 +582,15 @@ mod tests {
         bm.insert(Surrogate::new(10));
 
         let mut result = csr.traverse_bfs(
-            &["a"],
-            Some("KNOWS"),
-            Direction::Out,
-            10,
-            DEFAULT_MAX_VISITED,
-            Some(&bm),
+            BfsParams {
+                start_nodes: &["a"],
+                label_filter: Some("KNOWS"),
+                direction: Direction::Out,
+                max_depth: 10,
+                max_visited: DEFAULT_MAX_VISITED,
+                frontier_bitmap: Some(&bm),
+            },
+            None,
         );
         result.sort();
         // "a" is the start node (not gated). "b" passes the bitmap. "c" is

@@ -297,24 +297,39 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let depth = depth.min(crate::engine::graph::traversal_options::MAX_GRAPH_TRAVERSAL_DEPTH);
         let refs: Vec<&str> = start_nodes.iter().map(String::as_str).collect();
-        let result: Vec<String> = match self.csr_partition(database_id, tid) {
-            Some(partition) => partition.traverse_bfs(
-                &refs,
-                edge_label.as_deref(),
-                direction,
-                depth,
-                self.graph_tuning.max_visited,
-                frontier_bitmap,
-            ),
-            None => Vec::new(),
-        };
-        // Read-your-own-writes only for the single-hop case (depth == 1),
-        // matching `execute_graph_neighbors`. Multi-hop `Hop` (depth > 1)
-        // stays durable-only -- see `merge_hop_single_hop`'s doc comment.
         let overlay = task
             .request
             .txn_id
             .and_then(|txn_id| self.graph_txn_overlays.get(&txn_id));
+        // Read-your-own-writes. Multi-hop (depth > 1) pushes the staged delta
+        // into the traversal so staged-only intermediate nodes expand; the
+        // single-hop case (depth == 1) is handled by `merge_hop_single_hop`
+        // below, so the traversal stays durable-only there.
+        let delta = if depth > 1 {
+            overlay.map(|ov| {
+                graph_txn_merge::build_graph_overlay_delta(
+                    ov,
+                    task.request.database_id,
+                    TenantId::new(tid),
+                )
+            })
+        } else {
+            None
+        };
+        let result: Vec<String> = match self.csr_partition(database_id, tid) {
+            Some(partition) => partition.traverse_bfs(
+                nodedb_graph::BfsParams {
+                    start_nodes: &refs,
+                    label_filter: edge_label.as_deref(),
+                    direction,
+                    max_depth: depth,
+                    max_visited: self.graph_tuning.max_visited,
+                    frontier_bitmap,
+                },
+                delta.as_ref(),
+            ),
+            None => Vec::new(),
+        };
         let result: Vec<String> =
             graph_txn_merge::merge_hop_single_hop(graph_txn_merge::HopMergeParams {
                 overlay,

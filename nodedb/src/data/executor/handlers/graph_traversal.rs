@@ -77,12 +77,31 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let depth = depth.min(crate::engine::graph::traversal_options::MAX_GRAPH_TRAVERSAL_DEPTH);
         let refs: Vec<&str> = start_nodes.iter().map(String::as_str).collect();
+        // Subgraph currently materializes the out-edge closure; `direction` is
+        // threaded through so staged in-edges can surface once the DML surface
+        // carries it.
+        let direction = crate::engine::graph::edge_store::Direction::Out;
+        // Read-your-own-writes: fold this transaction's staged edges/tombstones
+        // into the materialized subgraph, including through staged-only nodes.
+        let delta = task
+            .request
+            .txn_id
+            .and_then(|txn_id| self.graph_txn_overlays.get(&txn_id))
+            .map(|ov| {
+                super::graph_txn_merge::build_graph_overlay_delta(
+                    ov,
+                    task.request.database_id,
+                    crate::types::TenantId::new(tid),
+                )
+            });
         let edges: Vec<(String, String, String)> = match self.csr_partition(database_id, tid) {
             Some(partition) => partition.subgraph(
                 &refs,
                 edge_label.as_deref(),
+                direction,
                 depth,
                 self.graph_tuning.max_visited,
+                delta.as_ref(),
             ),
             None => Vec::new(),
         };

@@ -302,6 +302,45 @@ impl GraphTxnOverlay {
             .find_map(|(_, overlay)| overlay.pending_node_labels.get(node_id).cloned())
     }
 
+    /// Every staged edge put `(src, label, dst)` across every collection this
+    /// transaction has touched for `(database_id, tenant)`. Feeds the
+    /// multi-hop / subgraph read-your-own-writes overlay translation.
+    pub fn all_staged_edges(
+        &self,
+        database_id: DatabaseId,
+        tenant: TenantId,
+    ) -> Vec<(String, String, String)> {
+        self.collections
+            .iter()
+            .filter(|((db, t, _), _)| *db == database_id && *t == tenant)
+            .flat_map(|(_, overlay)| {
+                overlay
+                    .pending_edges
+                    .keys()
+                    .map(|(s, l, d)| (s.clone(), l.clone(), d.clone()))
+            })
+            .collect()
+    }
+
+    /// Every staged edge tombstone `(src, label, dst)` across every collection
+    /// this transaction has touched for `(database_id, tenant)`.
+    pub fn all_tombstones(
+        &self,
+        database_id: DatabaseId,
+        tenant: TenantId,
+    ) -> Vec<(String, String, String)> {
+        self.collections
+            .iter()
+            .filter(|((db, t, _), _)| *db == database_id && *t == tenant)
+            .flat_map(|(_, overlay)| {
+                overlay
+                    .pending_edge_tombstones
+                    .iter()
+                    .map(|(s, l, d)| (s.clone(), l.clone(), d.clone()))
+            })
+            .collect()
+    }
+
     /// Sum of staged edge/tombstone/label-delta byte footprint across every
     /// collection this transaction has touched.
     pub fn memory_size_estimate(&self) -> usize {
