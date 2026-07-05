@@ -16,6 +16,7 @@ mod sql_gateway;
 mod sql_loop;
 mod streaming;
 mod transaction;
+mod transaction_savepoint;
 
 pub(crate) use auth::{handle_auth, handle_ping};
 pub(crate) use conversion::{

@@ -15,6 +15,9 @@ use super::sql_admin::{handle_explain, handle_set_sql, handle_show_sql, is_sessi
 use super::sql_loop::run_dispatch_loop;
 use super::streaming::{SqlOutcome, try_open_sql_stream};
 use super::transaction::{handle_begin, handle_commit, handle_rollback};
+use super::transaction_savepoint::{
+    handle_release_savepoint, handle_rollback_to_savepoint, handle_savepoint,
+};
 use super::{DispatchCtx, error_to_native};
 
 /// Handle a SQL statement: transaction control, SET/SHOW, DDL, or DataFusion.
@@ -93,13 +96,13 @@ async fn handle_sql_inner(
         return resp(handle_rollback(ctx, seq).await);
     }
     if upper.starts_with("SAVEPOINT ") {
-        return resp(NativeResponse::status_row(seq, "SAVEPOINT"));
+        return resp(handle_savepoint(ctx, seq, sql_trimmed).await);
     }
     if upper.starts_with("RELEASE SAVEPOINT ") || upper.starts_with("RELEASE ") {
-        return resp(NativeResponse::status_row(seq, "RELEASE"));
+        return resp(handle_release_savepoint(ctx, seq, sql_trimmed));
     }
     if upper.starts_with("ROLLBACK TO ") {
-        return resp(NativeResponse::status_row(seq, "ROLLBACK"));
+        return resp(handle_rollback_to_savepoint(ctx, seq, sql_trimmed).await);
     }
 
     if ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::Failed {
