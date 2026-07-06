@@ -402,8 +402,14 @@ impl CoreLoop {
 
         let spatial_inserts =
             self.apply_point_put_spatial(database_id, tid, collection, document_id, value);
-        let vector_inserts =
-            self.apply_point_put_vector_indexes(database_id, tid, collection, document_id, value);
+        let vector_inserts = self.apply_point_put_vector_indexes(
+            database_id,
+            tid,
+            collection,
+            document_id,
+            surrogate,
+            value,
+        );
 
         Ok(PointPutOutcome {
             prior_value: prior,

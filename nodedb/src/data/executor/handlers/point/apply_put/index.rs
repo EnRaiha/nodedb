@@ -183,6 +183,7 @@ impl CoreLoop {
         tid: u64,
         collection: &str,
         document_id: &str,
+        surrogate: nodedb_types::Surrogate,
         value: &[u8],
     ) -> Vec<VectorIndexDelta> {
         let mut inserts: Vec<VectorIndexDelta> = Vec::new();
@@ -225,11 +226,12 @@ impl CoreLoop {
                                 .or_insert_with(|| {
                                     nodedb_vector::VectorCollection::new(*dim as usize, params)
                                 });
-                            // Document-engine-owned auto-indexing: surrogate
-                            // routing for these implicit vector binds rides
-                            // with the document engine retrofit.
-                            let vector_id =
-                                coll.insert_with_surrogate(floats, nodedb_types::Surrogate::ZERO);
+                            // Bind the vector node to the document's global
+                            // surrogate so cross-engine identity holds: a search
+                            // hit resolves back to this row's surrogate (and
+                            // thus its user PK at the response boundary) instead
+                            // of leaking a headless local node id.
+                            let vector_id = coll.insert_with_surrogate(floats, surrogate);
                             self.vector_doc_map.insert(
                                 (
                                     index_key.0,
@@ -317,11 +319,12 @@ impl CoreLoop {
                                 .or_insert_with(|| {
                                     nodedb_vector::VectorCollection::new(floats.len(), params)
                                 });
-                            // Document-engine-owned auto-indexing: surrogate
-                            // routing for these implicit vector binds rides
-                            // with the document engine retrofit.
-                            let vector_id =
-                                coll.insert_with_surrogate(floats, nodedb_types::Surrogate::ZERO);
+                            // Bind the vector node to the document's global
+                            // surrogate so cross-engine identity holds: a search
+                            // hit resolves back to this row's surrogate (and
+                            // thus its user PK at the response boundary) instead
+                            // of leaking a headless local node id.
+                            let vector_id = coll.insert_with_surrogate(floats, surrogate);
                             self.vector_doc_map.insert(
                                 (
                                     store_key.0,

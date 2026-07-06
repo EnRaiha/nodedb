@@ -87,8 +87,8 @@ async fn insert_close_vector_visible_in_txn_ranked_then_commit_persists() {
     let query = [0.0, 0.0, 0.0];
     let in_txn = ranked_ids(&server, "vec_ov_close", &query, 2).await;
     // Both rows are returned and the staged vector, being nearest, ranks first.
-    // (Assertions target the staged row's rank; a base row's own id resolution
-    // is a separate, pre-existing concern and not what this test exercises.)
+    // Every hit projects its user PK: the staged row resolves via the overlay's
+    // staged body, the base row via its committed surrogate → PK binding.
     assert_eq!(
         in_txn.len(),
         2,
@@ -101,10 +101,30 @@ async fn insert_close_vector_visible_in_txn_ranked_then_commit_persists() {
 
     server.client.simple_query("COMMIT").await.unwrap();
 
-    // The staged insert persisted durably under its PK, and both rows remain
-    // searchable. (Post-commit the vector-search `id` projection resolves to
-    // the surrogate rather than the PK — a separate, pre-existing concern — so
-    // durability is asserted via a PK point lookup rather than the search id.)
+    // Load-bearing assertion: post-commit the vector-search `id`
+    // projection must resolve to the committed row's user PK ('staged_close'),
+    // NOT its raw surrogate. The staged insert's global surrogate is now bound
+    // in the durable HNSW index (identical to an autocommit insert), so the
+    // Control-Plane response boundary maps surrogate → PK for the search hit.
+    let after_commit = ranked_ids(&server, "vec_ov_close", &query, 2).await;
+    assert_eq!(
+        after_commit.len(),
+        2,
+        "both rows remain searchable after COMMIT: {after_commit:?}"
+    );
+    assert_eq!(
+        after_commit[0], "staged_close",
+        "post-commit vector search must project the committed row's PK \
+         'staged_close' (nearest to the query), not its surrogate: {after_commit:?}"
+    );
+    assert_eq!(
+        after_commit[1], "base_far",
+        "the base row must also project its PK 'base_far', proving surrogate → PK \
+         resolution holds for the whole document+vector-index class: {after_commit:?}"
+    );
+
+    // Additional durability check: the committed row is also reachable by a
+    // direct PK point lookup.
     let persisted = server
         .query_rows("SELECT id FROM vec_ov_close WHERE id = 'staged_close'")
         .await
@@ -113,12 +133,6 @@ async fn insert_close_vector_visible_in_txn_ranked_then_commit_persists() {
         persisted.len(),
         1,
         "committed insert must persist under its PK: {persisted:?}"
-    );
-    let after_commit = ranked_ids(&server, "vec_ov_close", &query, 2).await;
-    assert_eq!(
-        after_commit.len(),
-        2,
-        "both rows remain searchable after COMMIT: {after_commit:?}"
     );
 }
 
