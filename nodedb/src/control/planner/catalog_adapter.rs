@@ -506,15 +506,29 @@ fn convert_collection_type(
                 EngineType::Columnar
             };
             let pk_name = "id";
+            // If the DDL declared its own `id` field, the synthetic primary key
+            // adopts that declared type and is client-supplied — an explicit
+            // `id INT PRIMARY KEY` must stay INT rather than being dropped in
+            // favor of a String surrogate (which would make every insert fail a
+            // type check). With no declared `id`, synthesize a UUID_V7 String
+            // surrogate primary key.
+            let declared_pk = stored
+                .fields
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(pk_name));
             let mut columns = Vec::new();
             if !profile.is_timeseries() {
+                let (pk_type, pk_default, pk_raw) = match declared_pk {
+                    Some((_, type_str)) => (parse_type_str(type_str), None, Some(type_str.clone())),
+                    None => (SqlDataType::String, Some("UUID_V7".into()), None),
+                };
                 columns.push(ColumnInfo {
                     name: pk_name.into(),
-                    data_type: SqlDataType::String,
+                    data_type: pk_type,
                     nullable: false,
                     is_primary_key: true,
-                    default: Some("UUID_V7".into()),
-                    raw_type: None,
+                    default: pk_default,
+                    raw_type: pk_raw,
                 });
             }
             for (name, type_str) in &stored.fields {
@@ -583,7 +597,7 @@ fn parse_type_str(s: &str) -> SqlDataType {
 mod tests {
     use nodedb_types::CollectionType;
 
-    use super::convert_collection_type;
+    use super::{SqlDataType, convert_collection_type};
     use crate::control::security::catalog::StoredCollection;
 
     /// A columnar (or spatial, which shares the same non-timeseries
@@ -621,5 +635,36 @@ mod tests {
     #[test]
     fn spatial_declared_id_field_does_not_duplicate_synthetic_pk() {
         assert_single_id_column(CollectionType::spatial("geom"));
+    }
+
+    /// A columnar collection that declares an explicitly typed `id` primary
+    /// key (`id INT PRIMARY KEY`) must surface that column with the declared
+    /// type — not the String surrogate default. Collapsing it to String makes
+    /// every integer insert fail a type check.
+    #[test]
+    fn declared_typed_id_pk_keeps_its_declared_type() {
+        let mut stored = StoredCollection::new(1, "coll", "owner");
+        stored.collection_type = CollectionType::columnar();
+        stored.fields = vec![
+            ("id".to_string(), "INT".to_string()),
+            ("v".to_string(), "INT".to_string()),
+        ];
+
+        let (_, columns, pk) = convert_collection_type(&stored);
+        let id_col = columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case("id"))
+            .expect("id column present");
+        assert!(id_col.is_primary_key, "declared id must remain the pk");
+        assert_eq!(
+            id_col.data_type,
+            SqlDataType::Int64,
+            "declared `id INT` pk must keep its INT type, not the String surrogate"
+        );
+        assert!(
+            id_col.default.is_none(),
+            "a client-supplied typed id pk must not carry the UUID_V7 surrogate default"
+        );
+        assert_eq!(pk.as_deref(), Some("id"));
     }
 }
