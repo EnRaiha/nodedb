@@ -2,12 +2,13 @@
  
 <img src="assets/wordmark.svg" alt="NodeDB" width="420">
 
-<h3>The distributed multi-model database for AI and agent workloads.</h3>
+<h3>The memory and storage engine for AI agents — from the edge to the cloud.</h3>
 
 <p>
-  Eight database engines in a single Rust binary. One SQL dialect. Zero network hops between
-  vector search, graph traversal, document storage, columnar analytics, timeseries, key-value,
-  full-text search, and multi-dimensional arrays.
+  Durable, queryable, access-guarded memory for AI agents that runs where the agent runs —
+  embedded on device, offline-capable, and syncing to a distributed server when connected.
+  Semantic, relational, episodic, and time-series memory in one engine, one process, with no
+  network hops between them.
 </p>
 
 <p>
@@ -45,13 +46,16 @@
 
 </div>
 
-NodeDB replaces the combination of PostgreSQL + pgvector + Redis + Neo4j + ClickHouse + Elasticsearch with a single process. Graph queries that feed vector search, full-text ranking, and columnar aggregation execute in one engine with shared storage, shared memory, and one planner.
+AI agents need memory: what they were told, how facts relate, what happened when, and what matters right now. The usual answer stitches a cloud vector store to a graph database to a document store — or dumps everything into a markdown file and hopes. NodeDB puts all of it in one engine that runs where the agent runs: the same engine embeds on a laptop, phone, or browser ([NodeDB-Lite](https://github.com/NodeDB-Lab/nodedb-lite)) and scales to a distributed cluster (NodeDB Origin), with CRDT sync between them.
+
+It already powers **ma8e**, an in-development memory-and-knowledge layer for coding agents built entirely on embedded NodeDB — deterministic capture, hybrid retrieval, and access guards in one process with no network hop.
 
 ## Why NodeDB
 
-- **One binary, not a polyglot stack.** No inter-service networking, no schema drift between systems, no data synchronization pipelines. A graph query that feeds a vector search that filters by full-text relevance executes in one process.
+- **Memory that runs where the agent runs.** The same engines embed on device and in the browser (NodeDB-Lite, WASM), work offline, and sync conflict-free to the server (CRDT). A cloud vector store can't embed next to your agent; a markdown file isn't queryable or access-guarded.
+- **All of an agent's memory in one query.** Vector search, graph traversal, full-text ranking, document storage, timeseries, and key-value share one storage core, one identity space, and one planner — so a query flows from semantic search into graph traversal filtered by full-text, in one process with no network hops. Multi-model is *how* NodeDB does this; the point is the capability, not the label.
 - **PostgreSQL wire protocol.** Connect with `psql` or any PostgreSQL client library. Standard SQL with engine-specific extensions where SQL can't express the operation.
-- **Edge to cloud.** The same engines run embedded on phones and browsers (NodeDB-Lite, WASM) with CRDT-based offline-first sync to the server.
+- **One engine instead of a polyglot stack.** When you outgrow the edge, the same engine folds a server-side sprawl of separate systems into a single deployment — fewer services to run, no cross-system sync pipelines, no schema drift.
 - **Serious about performance.** Thread-per-Core data plane with io_uring, SIMD-accelerated distance functions, zero-copy MessagePack transport, per-column compression (ALP, FastLanes, FSST, Gorilla). See benchmarks below.
 
 ## Performance
