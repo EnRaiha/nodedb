@@ -418,6 +418,32 @@ impl CoreLoop {
                     }
                 }
             }
+            UndoEntry::ColumnarUpdate {
+                collection_key,
+                row_count_before,
+                inserted_pks,
+                displaced,
+                restored,
+            } => {
+                if let Some(engine) = self.columnar_engines.get_mut(&collection_key) {
+                    // 1. Remove the appended replacement rows (mirrors ColumnarInsert).
+                    engine.rollback_memtable_inserts(row_count_before, &inserted_pks, &displaced);
+                    // 2. Restore the tombstoned originals.
+                    engine.restore_deleted_rows(&restored);
+                }
+                // Engine absent: no in-memory state to roll back.
+                Ok(())
+            }
+            UndoEntry::ColumnarDelete {
+                collection_key,
+                restored,
+            } => {
+                if let Some(engine) = self.columnar_engines.get_mut(&collection_key) {
+                    engine.restore_deleted_rows(&restored);
+                }
+                // Engine absent: no in-memory state to roll back.
+                Ok(())
+            }
             _ => unreachable!("apply_undo_columnar called with non-columnar entry"),
         }
     }

@@ -207,6 +207,39 @@ pub(in crate::data::executor) enum UndoEntry {
         inserted_pks: Vec<Vec<u8>>,
         displaced: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)>,
     },
+    /// Undo a columnar predicate UPDATE by rolling back in-memory state.
+    ///
+    /// The forward UPDATE reverses each matched row via delete-old +
+    /// insert-new: the original row is positionally tombstoned (its PK index
+    /// entry removed) and the merged replacement is appended to the memtable.
+    /// Reversal has two halves, applied in order by `apply_undo_columnar`:
+    /// 1. Remove the appended replacement rows — identical to
+    ///    [`UndoEntry::ColumnarInsert`]: `row_count_before` is the memtable row
+    ///    count before the whole UPDATE statement; `inserted_pks` are the PK
+    ///    bytes of each appended replacement; `displaced` are
+    ///    `(pk_bytes, prior_location)` pairs for rows a PK-changing update's
+    ///    insert half tombstoned.
+    /// 2. Restore the tombstoned originals via `restored`: each
+    ///    `(pk_bytes, RowLocation)` clears the row's delete-bitmap bit and
+    ///    re-binds the PK index to that location.
+    ColumnarUpdate {
+        collection_key: (nodedb_types::DatabaseId, TenantId, String),
+        row_count_before: usize,
+        inserted_pks: Vec<Vec<u8>>,
+        displaced: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)>,
+        restored: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)>,
+    },
+    /// Undo a columnar predicate DELETE by restoring each tombstoned row.
+    ///
+    /// A columnar DELETE never grows the memtable — it only sets delete-bitmap
+    /// bits and removes PK index entries — so reversal needs no truncation.
+    /// Each `restored` entry `(pk_bytes, RowLocation)` clears the row's
+    /// delete-bitmap bit and re-binds the PK index to that location, mirroring
+    /// the displaced-row restore in `ColumnarInsert`.
+    ColumnarDelete {
+        collection_key: (nodedb_types::DatabaseId, TenantId, String),
+        restored: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)>,
+    },
     /// Undo a timeseries ingest by truncating the in-memory columnar memtable.
     TimeseriesIngest {
         collection_key: (nodedb_types::DatabaseId, TenantId, String),

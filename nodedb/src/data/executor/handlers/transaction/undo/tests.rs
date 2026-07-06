@@ -332,6 +332,159 @@ fn plain_delete_undo_backward_compatible() {
     );
 }
 
+// ── Columnar predicate UPDATE / DELETE undo ─────────────────────────────────
+//
+// A columnar predicate UPDATE / DELETE is staged at statement time and
+// replayed durably at COMMIT through `execute_tx_sub_plan`. Before the undo
+// parity fix, that replay hit the undo-less passthrough arm, so a SIBLING
+// sub-plan failing later in the same COMMIT batch left the columnar mutation
+// applied — a partial, non-atomic commit. These tests drive the real capture
+// path (`execute_tx_sub_plan`) then reverse via `rollback_undo_log` — the same
+// reverse-order driver `execute_transaction_batch` runs on a sibling failure —
+// and assert the columnar state is fully restored.
+//
+// PRE-FIX the `undo_log.len() == 1` assertion fails (the passthrough pushed no
+// undo entry), and the post-rollback state assertion fails (the mutation
+// survived the aborted batch).
+
+use nodedb_physical::physical_plan::{ColumnarOp, PhysicalPlan};
+
+fn columnar_key() -> (nodedb_types::DatabaseId, TenantId, String) {
+    (
+        nodedb_types::DatabaseId::DEFAULT,
+        TenantId::new(TID),
+        "m".to_string(),
+    )
+}
+
+fn seed_columnar_engine(
+    core: &mut crate::data::executor::core_loop::CoreLoop,
+    rows: &[(i64, i64)],
+) {
+    use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
+    use nodedb_types::value::Value;
+
+    let schema = ColumnarSchema {
+        columns: vec![
+            ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+            ColumnDef::required("v", ColumnType::Int64),
+        ],
+        version: 1,
+    };
+    let mut engine = nodedb_columnar::MutationEngine::new("m".to_string(), schema);
+    for (id, v) in rows {
+        engine
+            .insert(&[Value::Integer(*id), Value::Integer(*v)])
+            .expect("seed insert");
+    }
+    core.columnar_engines.insert(columnar_key(), engine);
+}
+
+/// Current (non-tombstoned) memtable rows as `(id, v)` pairs, sorted by id.
+fn columnar_rows(core: &crate::data::executor::core_loop::CoreLoop) -> Vec<(i64, i64)> {
+    use nodedb_types::value::Value;
+    let engine = core
+        .columnar_engines
+        .get(&columnar_key())
+        .expect("engine present");
+    let mut out: Vec<(i64, i64)> = engine
+        .scan_memtable_rows()
+        .filter_map(|row| match (&row[0], &row[1]) {
+            (Value::Integer(id), Value::Integer(v)) => Some((*id, *v)),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+#[test]
+fn columnar_predicate_update_rolls_back_on_sibling_failure() {
+    use nodedb_types::value::Value;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+    seed_columnar_engine(&mut core, &[(1, 10), (2, 20)]);
+    assert_eq!(columnar_rows(&core), vec![(1, 10), (2, 20)]);
+
+    // Durable COMMIT replay of `UPDATE m SET v = 999` (empty filter = all rows).
+    let updates = vec![(
+        "v".to_string(),
+        nodedb_types::value_to_msgpack(&Value::Integer(999)).unwrap(),
+    )];
+    let plan = PhysicalPlan::Columnar(ColumnarOp::Update {
+        collection: "m".to_string(),
+        filters: Vec::new(),
+        updates,
+    });
+
+    let mut undo_log = Vec::new();
+    let mut crdt_deltas = Vec::new();
+    core.execute_tx_sub_plan(TID, &plan, &mut undo_log, &mut crdt_deltas, &[])
+        .expect("columnar update sub-plan must succeed");
+
+    // The mutation applied, and — critically — an undo entry was captured.
+    assert_eq!(columnar_rows(&core), vec![(1, 999), (2, 999)]);
+    assert_eq!(
+        undo_log.len(),
+        1,
+        "columnar UPDATE must push exactly one undo entry (pre-fix: 0, on the undo-less passthrough)"
+    );
+    assert!(matches!(undo_log[0], UndoEntry::ColumnarUpdate { .. }));
+
+    // A sibling sub-plan fails later in the same COMMIT: reverse the batch.
+    core.rollback_undo_log(nodedb_types::DatabaseId::DEFAULT.as_u64(), TID, undo_log)
+        .expect("rollback must succeed");
+
+    assert_eq!(
+        columnar_rows(&core),
+        vec![(1, 10), (2, 20)],
+        "rolled-back columnar UPDATE must restore the original values"
+    );
+}
+
+#[test]
+fn columnar_predicate_delete_rolls_back_on_sibling_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+    seed_columnar_engine(&mut core, &[(1, 10), (2, 20), (3, 30)]);
+    assert_eq!(columnar_rows(&core), vec![(1, 10), (2, 20), (3, 30)]);
+
+    // Durable COMMIT replay of `DELETE FROM m` (empty filter = all rows).
+    let plan = PhysicalPlan::Columnar(ColumnarOp::Delete {
+        collection: "m".to_string(),
+        filters: Vec::new(),
+    });
+
+    let mut undo_log = Vec::new();
+    let mut crdt_deltas = Vec::new();
+    core.execute_tx_sub_plan(TID, &plan, &mut undo_log, &mut crdt_deltas, &[])
+        .expect("columnar delete sub-plan must succeed");
+
+    assert!(
+        columnar_rows(&core).is_empty(),
+        "all rows must be deleted by the durable replay"
+    );
+    assert_eq!(
+        undo_log.len(),
+        1,
+        "columnar DELETE must push exactly one undo entry (pre-fix: 0, on the undo-less passthrough)"
+    );
+    assert!(matches!(undo_log[0], UndoEntry::ColumnarDelete { .. }));
+
+    // A sibling sub-plan fails later in the same COMMIT: reverse the batch.
+    core.rollback_undo_log(nodedb_types::DatabaseId::DEFAULT.as_u64(), TID, undo_log)
+        .expect("rollback must succeed");
+
+    assert_eq!(
+        columnar_rows(&core),
+        vec![(1, 10), (2, 20), (3, 30)],
+        "rolled-back columnar DELETE must restore all deleted rows with their original values"
+    );
+}
+
 // ── Spatial undo ─────────────────────────────────────────────────────────────
 
 fn spatial_key() -> (nodedb_types::DatabaseId, TenantId, String, String) {

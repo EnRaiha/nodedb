@@ -321,6 +321,45 @@ impl CoreLoop {
                 undo_log,
             ),
 
+            // ── Columnar predicate UPDATE / DELETE (tracked) ─────────────────
+            // Staged at statement time; this is the durable COMMIT replay. Undo
+            // is captured here so a sibling sub-plan failing later in the same
+            // COMMIT batch reverses this mutation — without it the columnar
+            // change would survive an atomic-rollback (partial commit).
+            PhysicalPlan::Columnar(ColumnarOp::Update {
+                collection,
+                filters,
+                updates,
+            }) => {
+                let resp = self.execute_columnar_update(
+                    &dummy_task,
+                    collection,
+                    filters,
+                    updates,
+                    Some(undo_log),
+                );
+                if resp.status == Status::Error {
+                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                        detail: "columnar update failed".into(),
+                    }));
+                }
+                Ok(resp)
+            }
+
+            PhysicalPlan::Columnar(ColumnarOp::Delete {
+                collection,
+                filters,
+            }) => {
+                let resp =
+                    self.execute_columnar_delete(&dummy_task, collection, filters, Some(undo_log));
+                if resp.status == Status::Error {
+                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                        detail: "columnar delete failed".into(),
+                    }));
+                }
+                Ok(resp)
+            }
+
             // ── Timeseries ingest (tracked) ──────────────────────────────────
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                 collection,

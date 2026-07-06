@@ -75,7 +75,7 @@ impl CoreLoop {
                 if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
                     return r;
                 }
-                self.execute_columnar_update(task, collection, filters, updates)
+                self.execute_columnar_update(task, collection, filters, updates, None)
             }
 
             ColumnarOp::Delete {
@@ -85,7 +85,7 @@ impl CoreLoop {
                 if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Columnar) {
                     return r;
                 }
-                self.execute_columnar_delete(task, collection, filters)
+                self.execute_columnar_delete(task, collection, filters, None)
             }
 
             ColumnarOp::MaterializeScan {

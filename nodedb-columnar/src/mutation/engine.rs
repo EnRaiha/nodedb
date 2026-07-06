@@ -250,6 +250,24 @@ impl MutationEngine {
         self.memtable_row_counter = row_count_before as u32;
     }
 
+    /// Reverse one or more positional deletes: for each `(pk_bytes, location)`
+    /// clear the row's delete-bitmap bit and re-bind the PK index to that
+    /// location.
+    ///
+    /// Undoes the effect of [`Self::delete`] (and the delete-half of
+    /// [`Self::update`]) so a rolled-back mutation leaves the affected rows
+    /// present with their original values. Used exclusively by the transaction
+    /// undo log; never called on the normal write path. Mirrors the
+    /// displaced-row restore in [`Self::rollback_memtable_inserts`].
+    pub fn restore_deleted_rows(&mut self, rows: &[(Vec<u8>, crate::pk_index::RowLocation)]) {
+        for (pk_bytes, location) in rows {
+            if let Some(bm) = self.delete_bitmaps.get_mut(&location.segment_id) {
+                bm.unmark_deleted(location.row_index);
+            }
+            self.pk_index.upsert(pk_bytes.clone(), *location);
+        }
+    }
+
     /// The segment ID that will be assigned to the next flushed segment.
     ///
     /// Use this to obtain the ID to pass to `on_memtable_flushed`.
