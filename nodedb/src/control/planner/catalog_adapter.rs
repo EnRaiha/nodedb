@@ -505,10 +505,11 @@ fn convert_collection_type(
             } else {
                 EngineType::Columnar
             };
+            let pk_name = "id";
             let mut columns = Vec::new();
             if !profile.is_timeseries() {
                 columns.push(ColumnInfo {
-                    name: "id".into(),
+                    name: pk_name.into(),
                     data_type: SqlDataType::String,
                     nullable: false,
                     is_primary_key: true,
@@ -517,6 +518,9 @@ fn convert_collection_type(
                 });
             }
             for (name, type_str) in &stored.fields {
+                if !profile.is_timeseries() && name.eq_ignore_ascii_case(pk_name) {
+                    continue;
+                }
                 columns.push(ColumnInfo {
                     name: name.clone(),
                     data_type: parse_type_str(type_str),
@@ -529,7 +533,7 @@ fn convert_collection_type(
             let pk = if profile.is_timeseries() {
                 None
             } else {
-                Some("id".into())
+                Some(pk_name.into())
             };
             (engine, columns, pk)
         }
@@ -572,5 +576,50 @@ fn parse_type_str(s: &str) -> SqlDataType {
         "BYTES" | "BYTEA" | "BLOB" => SqlDataType::Bytes,
         "TIMESTAMP" | "TIMESTAMPTZ" => SqlDataType::Timestamp,
         _ => SqlDataType::String,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::CollectionType;
+
+    use super::convert_collection_type;
+    use crate::control::security::catalog::StoredCollection;
+
+    /// A columnar (or spatial, which shares the same non-timeseries
+    /// synthetic-PK path) collection whose DDL declares an explicit
+    /// `id` field must not surface two `id` columns to the planner —
+    /// the synthetic primary-key column and the user-declared field
+    /// must collapse into a single entry.
+    fn assert_single_id_column(collection_type: CollectionType) {
+        let mut stored = StoredCollection::new(1, "coll", "owner");
+        stored.collection_type = collection_type;
+        stored.fields = vec![
+            ("id".to_string(), "STRING".to_string()),
+            ("ID".to_string(), "STRING".to_string()),
+            ("name".to_string(), "STRING".to_string()),
+        ];
+
+        let (_, columns, _) = convert_collection_type(&stored);
+        let id_count = columns
+            .iter()
+            .filter(|c| c.name.eq_ignore_ascii_case("id"))
+            .count();
+        assert_eq!(
+            id_count,
+            1,
+            "expected exactly one `id` column, got: {:?}",
+            columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn columnar_declared_id_field_does_not_duplicate_synthetic_pk() {
+        assert_single_id_column(CollectionType::columnar());
+    }
+
+    #[test]
+    fn spatial_declared_id_field_does_not_duplicate_synthetic_pk() {
+        assert_single_id_column(CollectionType::spatial("geom"));
     }
 }
