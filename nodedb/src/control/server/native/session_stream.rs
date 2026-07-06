@@ -28,7 +28,7 @@ use super::dispatch::{self, SqlStream, to_native_columns_rows};
 /// SELECT-list projection, exactly the pure [`shape_decoded_rows`] core the
 /// materialized dispatch loop also uses (via
 /// `response_shape::compose::shape_response_materialized`). `apply_kv_wrap`
-/// / `translate_if_vector` do not apply to a streamed batch and are
+/// / `translate_search_response` do not apply to a streamed batch and are
 /// deliberately not called here, matching pgwire's own streamed responses,
 /// which likewise only ever get column projection, never kv_wrap/vector.
 ///

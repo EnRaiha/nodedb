@@ -236,3 +236,41 @@ async fn rrf_score_in_select_without_order_by_returns_score() {
         );
     }
 }
+
+// ── 5. `id` must be the user's primary key, not the internal surrogate ─────
+
+/// Pre-fix, `TextOp::HybridSearch` hits carried only `doc_id` (the DP-side
+/// `surrogate_to_doc_id(surrogate)` hex string) with no surrogate->PK
+/// translation on the Text/Hybrid plan path (only the Vector plan path had
+/// one) — so `SELECT id` against a hybrid query had no `id` field to read at
+/// all and the cell came back empty. `create_hybrid_collection` inserts rows
+/// with PKs `'a'` and `'b'`; the fused rows here must show exactly those,
+/// never an empty cell or an 8-hex-digit surrogate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_search_id_is_user_primary_key_not_surrogate_hex() {
+    let server = TestServer::start().await;
+    create_hybrid_collection(&server, "hs_id_pk").await;
+
+    let rows = server
+        .query_rows(
+            "SELECT id, \
+                    rrf_score(\
+                      vector_distance(embedding, ARRAY[0.1, 0.2, 0.3, 0.4]), \
+                      bm25_score(content, 'consensus')\
+                    ) AS score \
+             FROM hs_id_pk \
+             ORDER BY score DESC LIMIT 5",
+        )
+        .await
+        .expect("hybrid query must succeed");
+
+    assert!(!rows.is_empty(), "hybrid query must return fused rows");
+    for row in &rows {
+        let id = &row[0];
+        assert!(
+            id == "a" || id == "b",
+            "id must be the user-facing primary key ('a' or 'b'), not empty \
+             or an internal surrogate; got {id:?} in row {row:?}"
+        );
+    }
+}

@@ -5,7 +5,7 @@
 //! `shape_response_materialized` and `shape_decoded_rows` are the canonical
 //! SELECT-read shaping used by every protocol entrypoint. `shape_response_materialized`
 //! performs the full per-payload shaping order (`apply_kv_wrap` ->
-//! `translate_if_vector` -> decode -> scan-envelope unwrap -> optional
+//! `translate_search_response` -> decode -> scan-envelope unwrap -> optional
 //! SELECT-list projection) as a single call, producing an already-shaped,
 //! already-projected [`ShapeOutcome`]. Every SELECT-read producer — pgwire's
 //! non-streaming dispatch, native's dispatch loop — calls this directly and
@@ -15,7 +15,7 @@
 //!
 //! Producers with no `PhysicalPlan` in scope (ClusterArray, set-op merges,
 //! gateway forwarding, clone merges) call [`shape_payload_no_plan`], which
-//! skips the plan-dependent `apply_kv_wrap` / `translate_if_vector` transforms
+//! skips the plan-dependent `apply_kv_wrap` / `translate_search_response` transforms
 //! those callers never ran. The pure kernel [`shape_decoded_rows`] is shared
 //! with per-batch lazy streaming callers, which have an already-decoded batch
 //! and only need the envelope-unwrap + projection logic.
@@ -23,7 +23,7 @@
 use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::response_translate::vector::translate_if_vector;
+use crate::control::server::response_translate::dispatch::translate_search_response;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::{
     ArraySliceResponse, RowsPayload, decode_payload_to_json,
@@ -76,9 +76,9 @@ pub fn shape_response_materialized(
     }
 
     // Seam-1 order, exactly as pgwire's `dispatch_task_loop` applies it
-    // (apply_kv_wrap -> translate_if_vector) before any decode/shape step.
+    // (apply_kv_wrap -> translate_search_response) before any decode/shape step.
     let wrapped = apply_kv_wrap(plan, payload);
-    let translated = translate_if_vector(&wrapped, plan, state, database_id, tenant_id);
+    let translated = translate_search_response(&wrapped, plan, state, database_id, tenant_id);
 
     let shaped = match plan_kind {
         PlanKind::ArraySlice => shape_array_slice(&translated),
@@ -100,7 +100,7 @@ pub fn shape_response_materialized(
 /// (ClusterArray, set-op merges, gateway forwarding, clone merges) call this
 /// instead of [`shape_response_materialized`]: it applies only the decode +
 /// scan-envelope unwrap + optional SELECT-list projection steps, skipping the
-/// plan-dependent `apply_kv_wrap` / `translate_if_vector` transforms those
+/// plan-dependent `apply_kv_wrap` / `translate_search_response` transforms those
 /// callers never ran.
 pub fn shape_payload_no_plan(
     payload: &[u8],

@@ -13,16 +13,18 @@
 //!    trip unchanged.
 //!  - decode failures are non-fatal — the original payload is returned
 //!    so the client still sees the raw search hits.
+//!
+//! [`resolve_surrogate_pk`] is the single catalog lookup shared by this
+//! translator and the full-text / hybrid translators in `text_hybrid.rs` —
+//! see `dispatch.rs` for the plan-to-translator routing.
 
 use nodedb_types::DatabaseId;
 use nodedb_types::Surrogate;
 use nodedb_types::TenantId;
 use serde::{Deserialize, Serialize};
 
-use crate::bridge::envelope::PhysicalPlan;
 use crate::bridge::scan_filter::ScanFilter;
 use crate::control::state::SharedState;
-use nodedb_physical::physical_plan::VectorOp;
 
 #[derive(Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 #[msgpack(map)]
@@ -66,6 +68,28 @@ fn apply_rls_filter(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize) {
     }
 }
 
+/// Resolve one surrogate to its user-facing primary key via the catalog.
+///
+/// Shared by the vector, full-text, and hybrid (RRF) response translators —
+/// every search-hit path resolves the internal `u32` surrogate back to the
+/// user's PK through this single catalog call. Returns `None` when the
+/// catalog has no PK mapping for the surrogate (headless row, or a document
+/// that was never written) — callers must leave the row's identifier
+/// untouched in that case rather than fabricate a value.
+pub(super) fn resolve_surrogate_pk(
+    state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    collection: &str,
+    surrogate: Surrogate,
+) -> Option<String> {
+    let catalog = state.credentials.catalog().as_ref()?;
+    let pk_bytes = catalog
+        .get_pk_for_surrogate(database_id, tenant_id, collection, surrogate)
+        .ok()??;
+    String::from_utf8(pk_bytes).ok()
+}
+
 /// Decode the DP-side msgpack array of `VectorSearchHit`, fill each
 /// row's `doc_id` from the catalog using `id` as the surrogate, and
 /// re-encode. On any decode failure the payload is returned unchanged.
@@ -93,20 +117,18 @@ pub fn translate_vector_search_payload(
 
     apply_rls_filter(&mut hits, rls_filters, top_k);
 
-    if let Some(catalog) = state.credentials.catalog().as_ref() {
-        for hit in &mut hits {
-            if hit.doc_id.is_some() {
-                continue;
-            }
-            if let Ok(Some(pk_bytes)) = catalog.get_pk_for_surrogate(
-                database_id,
-                tenant_id,
-                collection,
-                Surrogate::new(hit.id),
-            ) && let Ok(s) = String::from_utf8(pk_bytes)
-            {
-                hit.doc_id = Some(s);
-            }
+    for hit in &mut hits {
+        if hit.doc_id.is_some() {
+            continue;
+        }
+        if let Some(pk) = resolve_surrogate_pk(
+            state,
+            database_id,
+            tenant_id,
+            collection,
+            Surrogate::new(hit.id),
+        ) {
+            hit.doc_id = Some(pk);
         }
     }
 
@@ -153,49 +175,4 @@ pub fn translate_vector_search_payload(
         return s.into_bytes();
     }
     zerompk::to_msgpack_vec(&hits).unwrap_or_else(|_| payload.to_vec())
-}
-
-/// Convenience wrapper: inspect the executed plan; if it produced
-/// vector hits, apply surrogate→PK translation. Otherwise return the
-/// payload untouched.
-pub fn translate_if_vector(
-    payload: &[u8],
-    plan: &PhysicalPlan,
-    state: &SharedState,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
-) -> Vec<u8> {
-    // The coordinator wraps sharded reads (including vector search) in an
-    // `Exchange{Gather}` node; unwrap it so the underlying vector op is visible
-    // and surrogate→PK hit translation still runs on the gathered payload.
-    if let PhysicalPlan::Query(nodedb_physical::physical_plan::QueryOp::Exchange(op)) = plan {
-        return translate_if_vector(payload, &op.child, state, database_id, tenant_id);
-    }
-    let (collection, rls_filters, top_k): (&str, &[u8], usize) = match plan {
-        PhysicalPlan::Vector(VectorOp::Search {
-            collection,
-            rls_filters,
-            top_k,
-            ..
-        }) => (collection.as_str(), rls_filters.as_slice(), *top_k),
-        PhysicalPlan::Vector(VectorOp::MultiSearch {
-            collection,
-            rls_filters,
-            top_k,
-            ..
-        }) => (collection.as_str(), rls_filters.as_slice(), *top_k),
-        PhysicalPlan::Vector(VectorOp::MultiVectorScoreSearch {
-            collection, top_k, ..
-        }) => (collection.as_str(), &[][..], *top_k),
-        _ => return payload.to_vec(),
-    };
-    translate_vector_search_payload(
-        payload,
-        state,
-        database_id,
-        tenant_id,
-        collection,
-        rls_filters,
-        top_k,
-    )
 }

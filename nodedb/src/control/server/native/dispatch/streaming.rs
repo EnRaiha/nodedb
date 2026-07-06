@@ -67,7 +67,7 @@ pub(crate) struct SqlStream {
     /// front. Streamable plans are always plain unordered scans (never a
     /// KV point-get or vector search — see `streamable_gather_child`), so
     /// each batch only needs decode + scan-envelope unwrap + this
-    /// projection; no `apply_kv_wrap` / `translate_if_vector` applies here.
+    /// projection; no `apply_kv_wrap` / `translate_search_response` applies here.
     pub projection: Option<OutputSchema>,
 }
 

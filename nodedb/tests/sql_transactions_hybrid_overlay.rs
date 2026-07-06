@@ -15,17 +15,18 @@
 //! COMMIT. Pre-fix the hybrid handler never consulted the overlay and the
 //! staged write was invisible to the fused result.
 //!
-//! Observable note: the hybrid/RRF response projects a per-row RRF `score` plus
-//! an internal surrogate `doc_id`, but NOT the user-facing primary key `id`
-//! (there is no surrogate->PK translation on the Text/Hybrid plan path, only on
-//! the Vector plan path — a separate, pre-existing gap). So these tests observe
-//! RYOW through what the hybrid result reliably projects: the COUNT of fused
-//! rows (an INSERT of a uniquely-matching doc adds one fused row; a DELETE
-//! removes one) and the multiset of RRF SCORES (a staged UPDATE re-scores the
-//! fusion, changing the scores; pre-fix the staged write is ignored and the
-//! scores are identical to the committed-only baseline). Each assertion is a
-//! delta against a baseline captured in the same test, so it is robust to how
-//! many committed rows the fusion returns.
+//! Observable note: the hybrid/RRF response projects a per-row RRF `score`
+//! plus `id`, resolved from the internal surrogate `doc_id` via the same
+//! catalog lookup the Vector plan path uses (see
+//! `response_translate::text_hybrid::translate_hybrid_search_payload`). These
+//! tests still observe RYOW through what is robust to staged-write timing
+//! rather than through `id` directly: the COUNT of fused rows (an INSERT of a
+//! uniquely-matching doc adds one fused row; a DELETE removes one) and the
+//! multiset of RRF SCORES (a staged UPDATE re-scores the fusion, changing the
+//! scores; pre-fix the staged write is ignored and the scores are identical
+//! to the committed-only baseline). Each assertion is a delta against a
+//! baseline captured in the same test, so it is robust to how many committed
+//! rows the fusion returns.
 
 mod common;
 
