@@ -440,10 +440,10 @@ impl CoreLoop {
         // Invalidate cached aggregate results for this collection so that
         // COUNT(*) and GROUP BY queries see the newly written rows.
         if accepted > 0 {
-            let tid_key = task.request.tenant_id;
-            let coll_prefix = format!("{collection}\0");
-            self.aggregate_cache
-                .retain(|(t, rest), _| !(*t == tid_key && rest.starts_with(&coll_prefix)));
+            self.invalidate_aggregate_cache_for_collection(
+                task.request.tenant_id.as_u64(),
+                collection,
+            );
         }
 
         self.checkpoint_coordinator

@@ -420,6 +420,12 @@ impl CoreLoop {
         self.doc_cache
             .invalidate(database_id, tid, collection, row_key);
 
+        // Invalidate aggregate cache — a delete changes count(*) for this
+        // collection. Only needed when a row was actually removed.
+        if prior.is_some() {
+            self.invalidate_aggregate_cache_for_collection(tid, collection);
+        }
+
         Ok(PointDeleteOutcome {
             prior_value: prior,
             bitemporal_sys_from_ms,

@@ -297,10 +297,7 @@ impl CoreLoop {
                 }
             }
 
-            let tid_key = crate::types::TenantId::new(tid);
-            let coll_prefix = format!("{collection}\0");
-            self.aggregate_cache
-                .retain(|(t, rest), _| !(*t == tid_key && rest.starts_with(&coll_prefix)));
+            self.invalidate_aggregate_cache_for_collection(tid, collection);
         }
 
         self.doc_cache

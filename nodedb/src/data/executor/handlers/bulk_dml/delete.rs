@@ -217,6 +217,12 @@ impl CoreLoop {
             }
         }
 
+        // Invalidate aggregate cache — a delete changes count(*) for this
+        // collection. Only needed when at least one row was actually removed.
+        if affected > 0 {
+            self.invalidate_aggregate_cache_for_collection(tid, collection);
+        }
+
         debug!(core = self.core_id, %collection, affected, "bulk delete complete");
 
         if let Some(spec) = returning {

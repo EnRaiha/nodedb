@@ -17,6 +17,7 @@
 
 mod cache_key;
 mod exec;
+mod invalidate;
 mod rows;
 mod shuffle_merge;
 mod state_emit;
