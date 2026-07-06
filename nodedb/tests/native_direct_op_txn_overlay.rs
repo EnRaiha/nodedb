@@ -170,19 +170,12 @@ async fn native_direct_range_scan_sees_own_staged_write_in_txn() {
 /// filters, or limit override, matching `build_scan`'s all-optional
 /// `TextFields` defaults.
 ///
-/// Used instead of `OpCode::KvBatchGet` to observe KV state in the tests
-/// below: `execute_kv_batch_get`'s response is a flat JSON array of
-/// base64-or-null scalars (`response_codec::encode_json_vec`), and the
-/// shared native response shaper's `push_flat_rows`
-/// (`control/server/response_shape/project.rs`) silently drops non-object
-/// array items -- so a native `KvBatchGet`'s fetched values never reach
-/// `NativeResponse.rows` today (a pre-existing response-shaping gap,
-/// independent of the transaction-atomicity bug this test targets).
-/// `execute_kv_scan` (`data/executor/handlers/kv/scan.rs`) instead emits one
-/// JSON *object* per entry (`{"key": ..., "value": ...}`), which
-/// `push_flat_rows` preserves as a real row, and it already merges this
-/// transaction's staging overlay via `merge_kv_overlay_into_scan` whenever
-/// `task.request.txn_id` is `Some` -- giving read-your-own-writes for free.
+/// Used to observe KV state in the transaction-atomicity tests below
+/// (`kv_scan` already merges this transaction's staging overlay via
+/// `merge_kv_overlay_into_scan` whenever `task.request.txn_id` is `Some`,
+/// giving read-your-own-writes for free); `OpCode::KvBatchGet` response
+/// shaping is covered separately by
+/// `native_kv_batch_get_returns_fetched_values` below.
 async fn kv_scan(stream: &mut TcpStream, seq: u64, collection: &str) -> NativeResponse {
     send_request(
         stream,
@@ -215,6 +208,146 @@ async fn kv_batch_put(
         },
     )
     .await
+}
+
+/// Native `OpCode::KvBatchGet` for `keys`.
+async fn kv_batch_get(
+    stream: &mut TcpStream,
+    seq: u64,
+    collection: &str,
+    keys: Vec<Vec<u8>>,
+) -> NativeResponse {
+    send_request(
+        stream,
+        seq,
+        OpCode::KvBatchGet,
+        TextFields {
+            collection: Some(collection.to_string()),
+            keys: Some(keys),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Regression test for TW-16: a native `OpCode::KvBatchGet` fetched the
+/// requested keys' values correctly on the Data Plane
+/// (`execute_kv_batch_get` in `data/executor/handlers/kv/batch.rs`), but the
+/// native-protocol response shaping dropped them -- `apply_kv_wrap`
+/// (`control/server/response_shape/kv.rs`) had a wrapping arm for the
+/// single-key `KvOp::Get` but none for `KvOp::BatchGet`, so `BatchGet`'s
+/// payload (a bare msgpack array of per-key `base64-string-or-null`
+/// scalars, positionally parallel to the requested keys) passed through
+/// unwrapped into the generic row-flattener (`push_flat_rows`), whose
+/// catch-all silently drops scalar array elements (it only keeps
+/// objects/arrays) -- so `NativeResponse.rows` came back empty regardless
+/// of the real fetched values. This test asserts the fetched values
+/// actually reach `rows`; it fails on the pre-fix tree with `rows` empty
+/// (`in_txn` unreachable -- kept autocommit throughout since this is a
+/// response-shaping bug, independent of transactions).
+#[tokio::test]
+async fn native_kv_batch_get_returns_fetched_values() {
+    let server = NativeTestServer::start().await;
+    let (mut stream, _ack) = do_handshake(server.addr, &HelloFrame::current())
+        .await
+        .expect("handshake");
+
+    let create_resp = send_sql(
+        &mut stream,
+        1,
+        "CREATE COLLECTION native_kv_batch_get (key TEXT PRIMARY KEY, val TEXT) \
+         WITH (engine='kv')",
+    )
+    .await;
+    assert_ne!(
+        create_resp.status,
+        ResponseStatus::Error,
+        "CREATE must succeed: {create_resp:?}"
+    );
+
+    let put_resp = kv_batch_put(
+        &mut stream,
+        2,
+        "native_kv_batch_get",
+        vec![
+            (b"bg1".to_vec(), b"value-one".to_vec()),
+            (b"bg2".to_vec(), b"value-two".to_vec()),
+        ],
+    )
+    .await;
+    assert_ne!(
+        put_resp.status,
+        ResponseStatus::Error,
+        "KvBatchPut must succeed: {put_resp:?}"
+    );
+
+    // Autocommit: fetch both present keys plus one key that was never
+    // written. Pre-fix, `rows` is empty (or absent) regardless of what was
+    // fetched -- the load-bearing assertions below fail on that tree.
+    let batch_get = kv_batch_get(
+        &mut stream,
+        3,
+        "native_kv_batch_get",
+        vec![b"bg1".to_vec(), b"bg2".to_vec(), b"bg-missing".to_vec()],
+    )
+    .await;
+    server.shutdown().await;
+    assert_ne!(
+        batch_get.status,
+        ResponseStatus::Error,
+        "KvBatchGet must succeed: {batch_get:?}"
+    );
+
+    let columns = batch_get.columns.clone().expect("columns present");
+    let key_idx = columns
+        .iter()
+        .position(|c| c == "key")
+        .expect("'key' column present");
+    let value_idx = columns
+        .iter()
+        .position(|c| c == "value")
+        .expect("'value' column present");
+
+    let rows = batch_get.rows.expect("rows present");
+    assert_eq!(
+        rows.len(),
+        3,
+        "KvBatchGet must return one row per requested key, present or missing: {rows:?}"
+    );
+
+    let decode_b64 = |v: &Value| -> Vec<u8> {
+        let Value::String(s) = v else {
+            panic!("expected a base64 string value, got: {v:?}");
+        };
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
+            .expect("value must be valid base64")
+    };
+
+    let mut by_key: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for row in &rows {
+        let Value::String(key) = &row[key_idx] else {
+            panic!("expected a string 'key' cell, got: {:?}", row[key_idx]);
+        };
+        by_key.insert(key.clone(), row[value_idx].clone());
+    }
+
+    assert_eq!(
+        decode_b64(by_key.get("bg1").expect("row for 'bg1' present")),
+        b"value-one".to_vec(),
+        "KvBatchGet must return the real stored value for 'bg1': {rows:?}"
+    );
+    assert_eq!(
+        decode_b64(by_key.get("bg2").expect("row for 'bg2' present")),
+        b"value-two".to_vec(),
+        "KvBatchGet must return the real stored value for 'bg2': {rows:?}"
+    );
+    assert_eq!(
+        by_key
+            .get("bg-missing")
+            .expect("row for 'bg-missing' present"),
+        &Value::Null,
+        "a missing key must be represented as a null value, not omitted: {rows:?}"
+    );
 }
 
 /// Regression test for TW-14: a native direct-op `KvBatchPut` issued inside
