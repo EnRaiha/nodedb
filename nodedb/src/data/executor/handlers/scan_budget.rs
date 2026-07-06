@@ -90,23 +90,6 @@ pub(in crate::data::executor::handlers) fn scan_bytes_exceeded(
     budget_exceeded(total, budget_bytes)
 }
 
-/// `scan_bytes_exceeded` for the audit-log / all-versions row shape
-/// (`VersionedRow`). The fixed-width `i64` temporal fields are negligible;
-/// only `doc_id` + `body` bytes are summed.
-pub(in crate::data::executor::handlers) fn version_bytes_exceeded(
-    rows: &[crate::engine::sparse::btree_versioned::VersionedRow],
-    budget_bytes: usize,
-) -> bool {
-    if budget_bytes == 0 {
-        return false;
-    }
-    let total = rows.iter().fold(0usize, |acc, row| {
-        acc.saturating_add(row.body.len())
-            .saturating_add(row.doc_id.len())
-    });
-    budget_exceeded(total, budget_bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

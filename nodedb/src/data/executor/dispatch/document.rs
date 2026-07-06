@@ -8,7 +8,7 @@ use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_types::SystemTimeScope;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::document::read::scan_params::VersionedScanParams;
+use crate::data::executor::handlers::document::read::fetch::DocScanMode;
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
@@ -151,42 +151,36 @@ impl CoreLoop {
                 valid_at_ms,
                 prefilter,
             } => {
-                if system_time.is_all_versions() {
-                    let params = VersionedScanParams {
-                        collection,
-                        limit: *limit,
-                        offset: *offset,
-                        filters,
-                        projection,
+                // The temporal slice differs ONLY in the fetch stage; sort,
+                // computed columns, window functions and DISTINCT are applied by
+                // the same downstream pipeline for every mode.
+                let mode = if system_time.is_all_versions() {
+                    DocScanMode::AllVersions {
                         valid_at_ms: *valid_at_ms,
-                    };
-                    self.execute_document_scan_all_versions(task, tid, params)
+                    }
                 } else if system_time.is_temporal() || valid_at_ms.is_some() {
-                    let params = VersionedScanParams {
-                        collection,
-                        limit: *limit,
-                        offset: *offset,
-                        filters,
-                        projection,
+                    DocScanMode::AsOf {
+                        system_as_of_ms: system_time.as_of_ms(),
                         valid_at_ms: *valid_at_ms,
-                    };
-                    self.execute_document_scan_as_of(task, tid, params, system_time.as_of_ms())
+                    }
                 } else {
-                    self.execute_document_scan(
-                        task,
-                        tid,
-                        collection,
-                        *limit,
-                        *offset,
-                        sort_keys,
-                        filters,
-                        *distinct,
-                        projection,
-                        computed_columns,
-                        window_functions,
-                        prefilter.as_ref(),
-                    )
-                }
+                    DocScanMode::Current
+                };
+                self.execute_document_scan(
+                    task,
+                    tid,
+                    collection,
+                    *limit,
+                    *offset,
+                    sort_keys,
+                    filters,
+                    *distinct,
+                    projection,
+                    computed_columns,
+                    window_functions,
+                    mode,
+                    prefilter.as_ref(),
+                )
             }
 
             DocumentOp::BatchInsert {

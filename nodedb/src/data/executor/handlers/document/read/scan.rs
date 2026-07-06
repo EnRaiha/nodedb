@@ -5,6 +5,7 @@
 use tracing::{debug, warn};
 
 use super::decode::{decode_scanned_document, decode_scanned_document_msgpack};
+use super::fetch::{DocFetchParams, DocScanMode};
 use super::projection::{apply_projection, apply_projection_msgpack};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
@@ -30,6 +31,7 @@ impl CoreLoop {
         projection: &[String],
         computed_columns_bytes: &[u8],
         window_functions_bytes: &[u8],
+        mode: DocScanMode,
         prefilter: Option<&nodedb_types::SurrogateBitmap>,
     ) -> Response {
         debug!(
@@ -60,16 +62,7 @@ impl CoreLoop {
                 zerompk::from_msgpack(computed_columns_bytes).unwrap_or_default()
             };
 
-        // For an explicit LIMIT this preserves the over-fetch heuristic; for a
-        // no-LIMIT scan (`limit == usize::MAX`) it bounds the storage fetch to
-        // a row ceiling derived from the byte budget (+1 row to detect "more
-        // exist") so the data-plane Vec cannot grow to the whole collection.
         let scan_budget_bytes = self.query_tuning.max_scan_result_bytes;
-        let fetch_limit = crate::data::executor::handlers::scan_budget::fetch_limit_for(
-            limit,
-            offset,
-            scan_budget_bytes,
-        );
 
         let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
             Vec::new()
@@ -99,144 +92,31 @@ impl CoreLoop {
             }
         });
 
-        // Bitemporal collections keep every write on the versioned redb table
-        // (see `versioned_put_in_txn`). The current-state scan must therefore
-        // read the newest live version per doc_id from that same namespace —
-        // reading the plain DOCUMENTS table would return zero rows. The
-        // versioned store holds the document body in the SAME encoding the
-        // non-bitemporal path filters on (MessagePack for schemaless, Binary
-        // Tuple for strict), so the same push-down predicates apply unchanged.
-        let bitemporal = self.is_bitemporal(tid, collection);
-
-        // Single scan predicate, shared by the base scan and the transaction
-        // overlay merge so both admit rows on identical terms. Strict
-        // collections store Binary Tuples: decode to MessagePack via the schema
-        // before evaluating (`matches_binary` operates on MessagePack).
-        // Schemaless bodies are already MessagePack. An empty filter set matches
-        // every row.
-        // `strict_schema` is already resolved above (needed again later for
-        // sort/projection normalization) — reuse it here instead of paying
-        // the `doc_configs` lookup a second time per row via
-        // `strict_aware_filter_matches`.
-        let matches = |value: &[u8]| -> bool {
-            if filter_predicates.is_empty() {
-                return true;
-            }
-            crate::data::executor::core_loop::filter_match::matches_with_resolved_schema(
-                strict_schema.as_ref(),
-                &filter_predicates,
-                value,
-            )
-        };
-
-        // Scan strategy:
-        // 1. Try sparse engine first (with optimized push-down filters when present).
-        // 2. If sparse returns empty, fall back to scan_collection which routes
-        //    to the correct engine (KV → columnar → sparse). This makes
-        //    DocumentOp::Scan the universal scan for ALL collection types.
-        //
-        // Strict (Binary Tuple) collections need JSON-level filter evaluation
-        // because `matches_binary` operates on MessagePack, not Binary Tuples.
-        let scan_result = if filter_predicates.is_empty() {
-            if bitemporal {
-                self.sparse.versioned_scan_as_of(
-                    crate::engine::sparse::btree_versioned::VersionedScanParams {
-                        database_id: task.request.database_id.as_u64(),
-                        tenant: tid,
-                        coll: collection,
-                        sys_cutoff_ms: None,
-                        valid_at_ms: None,
-                        limit: fetch_limit,
-                    },
-                    &|_| true,
-                )
-            } else {
-                let sparse_result = self.sparse.scan_documents(
-                    task.request.database_id.as_u64(),
-                    tid,
-                    collection,
-                    fetch_limit,
-                );
-                match &sparse_result {
-                    Ok(docs) if docs.is_empty() => {
-                        let fallback = self.scan_collection(
-                            task.request.database_id.as_u64(),
-                            tid,
-                            collection,
-                            fetch_limit,
-                        );
-                        if let Ok(ref docs) = fallback
-                            && !docs.is_empty()
-                        {
-                            warn!(
-                                core = self.core_id,
-                                %collection,
-                                count = docs.len(),
-                                "document scan fallback to scan_collection"
-                            );
-                        }
-                        fallback
-                    }
-                    _ => sparse_result,
-                }
-            }
-        } else if strict_schema.is_some() {
-            if bitemporal {
-                self.sparse.versioned_scan_as_of(
-                    crate::engine::sparse::btree_versioned::VersionedScanParams {
-                        database_id: task.request.database_id.as_u64(),
-                        tenant: tid,
-                        coll: collection,
-                        sys_cutoff_ms: None,
-                        valid_at_ms: None,
-                        limit: fetch_limit,
-                    },
-                    &matches,
-                )
-            } else {
-                self.sparse.scan_documents_filtered(
-                    task.request.database_id.as_u64(),
-                    tid,
-                    collection,
-                    fetch_limit,
-                    &matches,
-                )
-            }
-        } else if bitemporal {
-            self.sparse.versioned_scan_as_of(
-                crate::engine::sparse::btree_versioned::VersionedScanParams {
-                    database_id: task.request.database_id.as_u64(),
-                    tenant: tid,
-                    coll: collection,
-                    sys_cutoff_ms: None,
-                    valid_at_ms: None,
-                    limit: fetch_limit,
-                },
-                &matches,
-            )
-        } else {
-            let sparse_result = self.sparse.scan_documents_filtered(
-                task.request.database_id.as_u64(),
-                tid,
+        // Fetch stage: the ONLY part that differs between a current-time read
+        // and a bitemporal `AS OF` / all-versions audit read. It returns the
+        // raw rows plus the schema the downstream should decode them with
+        // (`None` for temporal reads, whose bodies are already normalized to
+        // MessagePack with any synthetic `_ts_*` columns injected). Everything
+        // below runs identically for every mode, giving `AS OF` reads full
+        // ORDER BY / computed-column / window-function / DISTINCT parity.
+        let fetched = self.document_scan_fetch(
+            task,
+            tid,
+            DocFetchParams {
                 collection,
-                fetch_limit,
-                &matches,
-            );
-            match &sparse_result {
-                Ok(docs) if docs.is_empty() => self
-                    .scan_collection(
-                        task.request.database_id.as_u64(),
-                        tid,
-                        collection,
-                        fetch_limit,
-                    )
-                    .map(|docs| docs.into_iter().filter(|(_, data)| matches(data)).collect()),
-                _ => sparse_result,
-            }
-        };
+                mode: &mode,
+                limit,
+                offset,
+                filter_predicates: &filter_predicates,
+                strict_schema: strict_schema.as_ref(),
+            },
+        );
 
-        match scan_result {
-            Ok(mut filtered) => {
+        match fetched {
+            Ok(fetched) => {
+                let mut filtered = fetched.rows;
+                let effective_schema = fetched.effective_schema;
+
                 if let Some(ref m) = self.metrics {
                     m.record_document_read();
                 }
@@ -245,16 +125,27 @@ impl CoreLoop {
                 // staging overlay onto the base result before any budget /
                 // sort / projection / limit stage, so staged inserts count
                 // against the budget and flow through sort+limit unchanged.
-                // `execute_document_scan` only serves current-version reads
-                // (temporal scans route to the dedicated as-of handlers), so
-                // the merge is always safe here — staged bodies are
-                // current-version only.
-                if let Some(txn_id) = task.request.txn_id {
+                // Only current-version reads merge staged writes — temporal
+                // (`AS OF` / all-versions) reads never see the overlay, whose
+                // staged bodies are current-version only.
+                if mode.is_current()
+                    && let Some(txn_id) = task.request.txn_id
+                {
                     let coll_key = (
                         task.request.database_id,
                         crate::types::TenantId::new(tid),
                         collection.to_string(),
                     );
+                    let matches = |value: &[u8]| -> bool {
+                        if filter_predicates.is_empty() {
+                            return true;
+                        }
+                        crate::data::executor::core_loop::filter_match::matches_with_resolved_schema(
+                            effective_schema.as_ref(),
+                            &filter_predicates,
+                            value,
+                        )
+                    };
                     self.merge_overlay_into_scan(txn_id, &coll_key, &mut filtered, &matches);
                 }
 
@@ -285,7 +176,7 @@ impl CoreLoop {
                 // Strict collections may store binary tuples. Sort and projection
                 // operate on msgpack, so normalize binary tuples here.
                 let filtered = if !sort_keys.is_empty() || !projection.is_empty() {
-                    if let Some(ref schema) = strict_schema {
+                    if let Some(ref schema) = effective_schema {
                         filtered
                             .into_iter()
                             .map(|(id, bytes)| {
@@ -332,7 +223,7 @@ impl CoreLoop {
 
                 let stream_chunk_size = self.query_tuning.stream_chunk_size;
 
-                if let Some(ref schema) = strict_schema
+                if let Some(ref schema) = effective_schema
                     && window_specs.is_empty()
                 {
                     // SQL DISTINCT semantics require deduplication on the
@@ -366,7 +257,7 @@ impl CoreLoop {
                     let mut decoded_rows: Vec<(String, serde_json::Value)> = sorted
                         .into_iter()
                         .map(|(id, val)| {
-                            let doc = decode_scanned_document(&val, strict_schema.as_ref());
+                            let doc = decode_scanned_document(&val, effective_schema.as_ref());
                             (id, doc)
                         })
                         .collect();
