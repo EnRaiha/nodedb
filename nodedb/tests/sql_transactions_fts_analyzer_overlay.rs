@@ -3,7 +3,7 @@
 //! A collection's per-collection FTS analyzer (`CREATE SEARCH INDEX ...
 //! ANALYZER '<name>'`) must be honored for a document staged inside an
 //! open transaction, exactly as it is for an already-committed document
-//! (read-your-own-writes for FTS, analyzer-consistent variant — TW-6).
+//! (read-your-own-writes for FTS, analyzer-consistent variant).
 //!
 //! Analyzer + word used to make the difference observable: the collection
 //! binds the `'hindi'` analyzer (a Hindi stop-word list with no stemming
