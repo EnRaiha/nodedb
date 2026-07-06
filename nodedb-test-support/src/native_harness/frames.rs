@@ -99,18 +99,23 @@ pub async fn read_frame(stream: &mut TcpStream) -> Option<Vec<u8>> {
     Some(payload)
 }
 
-/// Send a `SHOW`/SQL statement over an established JSON-encoding session and
-/// decode the `NativeResponse`. Assumes the session's first frame already
-/// selected JSON (see `json_request_gets_json_response`) — callers that open
-/// a fresh connection must send one JSON frame before calling this.
-pub async fn send_sql(stream: &mut TcpStream, seq: u64, sql: &str) -> NativeResponse {
+/// Send any native-protocol request (opcode + `TextFields`) over an
+/// established JSON-encoding session and decode the `NativeResponse`.
+/// Assumes the session's first frame already selected JSON (see
+/// `json_request_gets_json_response`) — callers that open a fresh connection
+/// must send one JSON frame before calling this. Shared by [`send_sql`] and
+/// any test driving a direct-op opcode (`PointGet`, `RangeScan`,
+/// `VectorSearch`, `KvBatchPut`, ...) directly rather than through SQL text.
+pub async fn send_request(
+    stream: &mut TcpStream,
+    seq: u64,
+    op: OpCode,
+    fields: TextFields,
+) -> NativeResponse {
     let req = NativeRequest {
-        op: OpCode::Sql,
+        op,
         seq,
-        fields: RequestFields::Text(TextFields {
-            sql: Some(sql.into()),
-            ..Default::default()
-        }),
+        fields: RequestFields::Text(fields),
     };
     let json_bytes = sonic_rs::to_vec(&req).expect("json encode");
     write_frame(stream, &json_bytes).await;
@@ -120,4 +125,21 @@ pub async fn send_sql(stream: &mut TcpStream, seq: u64, sql: &str) -> NativeResp
         .expect("timeout waiting for response")
         .expect("response frame");
     sonic_rs::from_slice(&response_payload).expect("json decode NativeResponse")
+}
+
+/// Send a `SHOW`/SQL statement over an established JSON-encoding session and
+/// decode the `NativeResponse`. Assumes the session's first frame already
+/// selected JSON (see `json_request_gets_json_response`) — callers that open
+/// a fresh connection must send one JSON frame before calling this.
+pub async fn send_sql(stream: &mut TcpStream, seq: u64, sql: &str) -> NativeResponse {
+    send_request(
+        stream,
+        seq,
+        OpCode::Sql,
+        TextFields {
+            sql: Some(sql.into()),
+            ..Default::default()
+        },
+    )
+    .await
 }

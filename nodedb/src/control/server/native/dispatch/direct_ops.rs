@@ -12,7 +12,7 @@ use crate::control::planner::calvin::{
 };
 use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
 use crate::control::server::response_shape::types::describe_plan;
-use crate::types::{DatabaseId, Lsn, RequestId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use crate::control::server::wal_dispatch;
@@ -61,6 +61,15 @@ pub(crate) async fn handle_direct_op(
         return NativeResponse::error(seq, "42501", e.to_string());
     }
 
+    // Stamp the connection's active transaction id (as the SQL path's
+    // `route_in_tx_write` does for in-transaction reads — see
+    // `staging_gate.rs::route_in_tx_write`) so the Data Plane can resolve this
+    // transaction's staging overlay for read-your-own-writes on direct-op
+    // reads (PointGet / RangeScan / VectorSearch) and give direct-op writes
+    // (KvBatchPut) a real transaction identity. `tx_id` is `None` outside a
+    // transaction block, so autocommit behavior is unchanged.
+    let txn_id = ctx.sessions.tx_id(ctx.peer_addr);
+
     // Implicit graph-edge extraction (pgwire / native-SQL parity): a schemaless
     // document carrying `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task.
     // The common no-edge case leaves `tasks` at length 1 and runs the existing
@@ -73,7 +82,7 @@ pub(crate) async fn handle_direct_op(
         database_id: DatabaseId::DEFAULT,
         plan,
         post_set_op: PostSetOp::None,
-        txn_id: None,
+        txn_id,
     }];
     if let Err(e) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
         ctx.state,
@@ -94,7 +103,8 @@ pub(crate) async fn handle_direct_op(
         // single-plan dispatch. The local-path WAL append now lives inside
         // `dispatch_single_task` so it is shared with the single-shard edge loop.
         ctx.state.tenant_request_start(tenant_id);
-        let result = dispatch_single_task(ctx, seq, tenant_id, vshard_id, task.plan).await;
+        let result =
+            dispatch_single_task(ctx, seq, tenant_id, vshard_id, task.plan, task.txn_id).await;
         ctx.state.tenant_request_end(tenant_id);
         return result;
     }
@@ -132,7 +142,10 @@ pub(crate) async fn handle_direct_op(
             let mut error: Option<NativeResponse> = None;
             for task in tasks {
                 let task_vshard = task.vshard_id;
-                let resp = dispatch_single_task(ctx, seq, tenant_id, task_vshard, task.plan).await;
+                let task_txn_id = task.txn_id;
+                let resp =
+                    dispatch_single_task(ctx, seq, tenant_id, task_vshard, task.plan, task_txn_id)
+                        .await;
                 if resp.status == nodedb_types::protocol::ResponseStatus::Error {
                     error = Some(resp);
                     break;
@@ -194,9 +207,14 @@ pub(crate) async fn handle_graph_match(
         return NativeResponse::error(seq, "42501", e.to_string());
     }
 
+    // Same rationale as `handle_direct_op`: stamp the active transaction id
+    // (`None` outside a transaction block) so a MATCH issued inside a native
+    // transaction resolves this connection's staging overlay identically to
+    // every other direct-op read.
+    let txn_id = ctx.sessions.tx_id(ctx.peer_addr);
     let plan_for_response = plan.clone();
     ctx.state.tenant_request_start(tenant_id);
-    let raw = dispatch_single_task_raw(ctx, tenant_id, vshard_id, plan).await;
+    let raw = dispatch_single_task_raw(ctx, tenant_id, vshard_id, plan, txn_id).await;
     ctx.state.tenant_request_end(tenant_id);
 
     let resp = match raw {
@@ -235,9 +253,10 @@ async fn dispatch_single_task(
     tenant_id: TenantId,
     vshard_id: VShardId,
     plan: PhysicalPlan,
+    txn_id: Option<TxnId>,
 ) -> NativeResponse {
     let plan_for_response = plan.clone();
-    match dispatch_single_task_raw(ctx, tenant_id, vshard_id, plan).await {
+    match dispatch_single_task_raw(ctx, tenant_id, vshard_id, plan, txn_id).await {
         Ok(resp) => data_plane_response_to_native(ctx, seq, &plan_for_response, &resp),
         Err(e) => error_to_native(seq, &e),
     }
@@ -249,11 +268,17 @@ async fn dispatch_single_task(
 /// Factored out of [`dispatch_single_task`] so MATCH dispatch can unwrap the
 /// `{rows, frontier}` envelope before native conversion while every other
 /// direct op keeps its prior convert-in-place behaviour.
+///
+/// `txn_id` is the connection's active transaction id (`None` in autocommit),
+/// threaded through to the Data Plane exactly like the native SQL path's
+/// `dispatch_task_via_gateway` (see `sql_gateway.rs`) so direct-op reads can
+/// resolve this transaction's staging overlay for read-your-own-writes.
 async fn dispatch_single_task_raw(
     ctx: &DispatchCtx<'_>,
     tenant_id: TenantId,
     vshard_id: VShardId,
     plan: PhysicalPlan,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<Response> {
     match ctx.state.gateway.as_ref() {
         Some(gw) => {
@@ -285,13 +310,14 @@ async fn dispatch_single_task_raw(
                 DatabaseId::DEFAULT,
                 &plan,
             )?;
-            dispatch_utils::dispatch_to_data_plane(
+            dispatch_utils::dispatch_to_data_plane_with_txn(
                 ctx.state,
                 tenant_id,
                 DatabaseId::DEFAULT,
                 vshard_id,
                 plan,
                 TraceId::ZERO,
+                txn_id,
             )
             .await
         }

@@ -9,5 +9,5 @@
 mod frames;
 mod server;
 
-pub use frames::{do_handshake, read_frame, send_sql, write_frame};
+pub use frames::{do_handshake, read_frame, send_request, send_sql, write_frame};
 pub use server::NativeTestServer;
