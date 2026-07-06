@@ -265,6 +265,11 @@ pub fn spawn_core(
             // consults the merged set.
             if !wal_records.is_empty() {
                 core.replay_vector_wal(&wal_records, num_cores, &tombstones);
+                // Runs after `replay_vector_wal` so the `VectorParams` records
+                // emitted by `CREATE VECTOR INDEX` have registered per-collection
+                // index params before secondary vector indexes are rebuilt from
+                // document `Put` records.
+                core.replay_document_vector_wal(&wal_records, num_cores, &tombstones);
                 core.replay_kv_wal(&wal_records, num_cores, &tombstones);
                 core.replay_timeseries_wal(&wal_records, num_cores, &tombstones);
                 core.replay_array_wal(&wal_records, num_cores, &tombstones);

@@ -136,6 +136,10 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
                 }) = replay
                 {
                     core.replay_vector_wal(&records, 1, &tombstones);
+                    // After vector-params registration (see runtime.rs): rebuild
+                    // secondary vector indexes over document collections so their
+                    // nodes recover the row's real surrogate on restart.
+                    core.replay_document_vector_wal(&records, 1, &tombstones);
                     core.replay_kv_wal(&records, 1, &tombstones);
                     core.replay_timeseries_wal(&records, 1, &tombstones);
                     core.replay_array_wal(&records, 1, &tombstones);

@@ -326,6 +326,17 @@ pub async fn handle_alter_vector_index_set(
             ivf_cells,
             ivf_nprobe,
         });
+        // Persist the updated params to the WAL so a restart re-registers them
+        // (via `replay_vector_wal`) rather than reverting to the pre-ALTER
+        // configuration — the same durability the CREATE path now guarantees.
+        crate::control::server::wal_dispatch::wal_append_if_write(
+            &state.wal,
+            tenant_id,
+            vshard,
+            crate::types::DatabaseId::DEFAULT,
+            &set_plan,
+        )
+        .map_err(|e| ddl_err("XX000", format!("persist vector index params to WAL: {e}")))?;
         crate::control::server::dispatch_utils::dispatch_to_data_plane(
             state,
             tenant_id,

@@ -42,17 +42,28 @@ pub fn wal_append_if_write_with_creds(
             collection,
             document_id,
             value,
-            surrogate: _,
+            surrogate,
             pk_bytes: _,
         }) => {
+            // The row's global surrogate is appended as a trailing element so
+            // startup replay can rebuild any secondary vector index bound to
+            // this document with its real cross-engine identity (headless
+            // local ids otherwise leak into vector-search projections after a
+            // restart). Appending keeps the record an arity-cascade extension
+            // of the legacy `(collection, document_id, value, provenance)`
+            // shape, which older decoders still parse.
             let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
-            let entry =
-                zerompk::to_msgpack_vec(&(collection, document_id, value, prov)).map_err(|e| {
-                    crate::Error::Serialization {
-                        format: "msgpack".into(),
-                        detail: format!("wal point put: {e}"),
-                    }
-                })?;
+            let entry = zerompk::to_msgpack_vec(&(
+                collection,
+                document_id,
+                value,
+                prov,
+                surrogate.as_u32(),
+            ))
+            .map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal point put: {e}"),
+            })?;
             wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
         }
         PhysicalPlan::Document(DocumentOp::PointInsert {
@@ -60,16 +71,22 @@ pub fn wal_append_if_write_with_creds(
             document_id,
             value,
             if_absent: _,
-            surrogate: _,
+            surrogate,
         }) => {
+            // Trailing surrogate element (see `PointPut` above) — carries the
+            // row's global identity for restart-time vector-index rebuild.
             let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
-            let entry =
-                zerompk::to_msgpack_vec(&(collection, document_id, value, prov)).map_err(|e| {
-                    crate::Error::Serialization {
-                        format: "msgpack".into(),
-                        detail: format!("wal point insert: {e}"),
-                    }
-                })?;
+            let entry = zerompk::to_msgpack_vec(&(
+                collection,
+                document_id,
+                value,
+                prov,
+                surrogate.as_u32(),
+            ))
+            .map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal point insert: {e}"),
+            })?;
             wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
         }
         PhysicalPlan::Document(DocumentOp::PointDelete {

@@ -227,7 +227,35 @@ fn parse_put_record(
         });
     }
 
-    // Try document put with provenance (new arity): (collection, document_id, value, provenance)
+    // Try document put with surrogate (current arity):
+    // (collection, document_id, value, provenance, surrogate_u32). The trailing
+    // surrogate is consumed by the Data Plane's vector-index replay; the event
+    // stream keys on `document_id`, so it is ignored here.
+    if let Ok((collection, document_id, value, _prov, _surrogate)) =
+        zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>, u32)>(payload)
+    {
+        *sequence += 1;
+        let (system_time_ms, valid_time_ms) =
+            crate::event::bitemporal_extract::extract_stamps(Some(&value));
+        return Some(WriteEvent {
+            sequence: *sequence,
+            collection: Arc::from(collection.as_str()),
+            op: WriteOp::Insert,
+            row_id: RowId::new(document_id.as_str()),
+            lsn,
+            tenant_id,
+            vshard_id,
+            source: EventSource::User,
+            new_value: Some(Arc::from(value.as_slice())),
+            old_value: None,
+            system_time_ms,
+            valid_time_ms,
+            user_id: None,
+            statement_digest: None,
+        });
+    }
+
+    // Try document put with provenance (legacy arity): (collection, document_id, value, provenance)
     if let Ok((collection, document_id, value, _prov)) =
         zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>)>(payload)
     {

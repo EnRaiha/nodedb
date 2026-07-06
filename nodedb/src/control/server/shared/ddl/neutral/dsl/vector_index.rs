@@ -95,6 +95,22 @@ pub async fn create_vector_index(
         ivf_cells,
         ivf_nprobe,
     });
+
+    // Persist the index parameters to the WAL before dispatching to the Data
+    // Plane. Without this the params live only in Data Plane memory and are
+    // lost on restart: `replay_vector_wal` re-registers them from this record
+    // so that secondary vector indexes over document collections can be
+    // rebuilt (with their real per-row surrogates) from the journalled
+    // document writes on the next startup.
+    crate::control::server::wal_dispatch::wal_append_if_write(
+        &state.wal,
+        tenant_id,
+        vshard,
+        DatabaseId::DEFAULT,
+        &set_params_plan,
+    )
+    .map_err(|e| ddl_err("XX000", format!("persist vector index params to WAL: {e}")))?;
+
     let _ = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
