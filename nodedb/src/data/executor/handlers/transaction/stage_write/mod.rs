@@ -19,12 +19,14 @@ mod dispatch;
 mod stage_bulk_delete;
 mod stage_bulk_update;
 mod stage_columnar;
+mod stage_columnar_dml;
 mod stage_graph;
 mod stage_insert_select;
 mod stage_kv;
 mod stage_kv_atomic;
 mod stage_kv_transfer;
 mod stage_kv_ttl;
+mod stage_point_document;
 mod stage_spatial;
 mod stage_timeseries;
 mod stage_upsert;
@@ -32,6 +34,9 @@ mod stage_upsert;
 pub(in crate::data::executor) use stage_bulk_delete::StageBulkDeleteParams;
 pub(in crate::data::executor) use stage_bulk_update::StageBulkUpdateParams;
 pub(in crate::data::executor) use stage_columnar::StageColumnarInsertParams;
+pub(in crate::data::executor) use stage_columnar_dml::{
+    StageColumnarDeleteParams, StageColumnarUpdateParams,
+};
 pub(in crate::data::executor) use stage_insert_select::StageInsertSelectParams;
 pub(in crate::data::executor) use stage_kv::{hex_key, unhex_key};
 pub(in crate::data::executor) use stage_spatial::StageSpatialInsertParams;

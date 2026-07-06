@@ -91,7 +91,12 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
                     | KvOp::Persist { .. }
             )
         )
-        || matches!(plan, PhysicalPlan::Columnar(ColumnarOp::Insert { .. }))
+        || matches!(
+            plan,
+            PhysicalPlan::Columnar(
+                ColumnarOp::Insert { .. } | ColumnarOp::Update { .. } | ColumnarOp::Delete { .. }
+            )
+        )
         || matches!(plan, PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }))
         || matches!(
             plan,
@@ -200,6 +205,11 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
         PhysicalPlan::Document(DocumentOp::Upsert { .. }) => StagedTagKind::DocUpsert,
         PhysicalPlan::Kv(op) => staged_kv_tag_kind(op, payload),
         PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => StagedTagKind::Insert,
+        // Predicate `UPDATE ... WHERE` / `DELETE ... WHERE` on a columnar
+        // collection: same Update/Delete command tags the Document bulk
+        // predicate-DML arms above resolve to.
+        PhysicalPlan::Columnar(ColumnarOp::Update { .. }) => StagedTagKind::Update,
+        PhysicalPlan::Columnar(ColumnarOp::Delete { .. }) => StagedTagKind::Delete,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Spatial(SpatialOp::Insert { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Spatial(SpatialOp::Delete { .. }) => StagedTagKind::Delete,

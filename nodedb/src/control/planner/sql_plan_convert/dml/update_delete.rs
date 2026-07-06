@@ -279,6 +279,27 @@ pub(in super::super) fn convert_delete(
         }]);
     }
 
+    // Columnar and spatial engines have no document store; route to
+    // `ColumnarOp::Delete` regardless of whether the WHERE reduces to PK keys
+    // (mirrors the columnar/spatial UPDATE routing in `convert_update`). Without
+    // this a columnar/spatial DELETE falls through to `DocumentOp::BulkDelete`,
+    // which scans the empty document store and matches nothing.
+    if matches!(engine, EngineType::Columnar | EngineType::Spatial) {
+        let filter_bytes = serialize_filters(filters)?;
+        let effective_filter = pk_effective_filter(filter_bytes, target_keys)?;
+        return Ok(vec![PhysicalTask {
+            tenant_id,
+            vshard_id: vshard,
+            database_id: ctx.database_id,
+            plan: PhysicalPlan::Columnar(ColumnarOp::Delete {
+                collection: collection.into(),
+                filters: effective_filter,
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        }]);
+    }
+
     // EDGE-BEARING GATE: a PK-equality delete on a schemaless-document
     // collection that carries implicit edges must NOT lower to a static
     // `PointDelete` — that op bypasses the dependent-predicate (OLLP) path

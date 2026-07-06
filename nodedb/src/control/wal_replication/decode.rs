@@ -876,6 +876,29 @@ fn to_physical_plan(
                 })
             }
         }
+        ReplicatedWrite::ColumnarBulkDml {
+            collection,
+            filters,
+            is_update,
+            updates,
+        } => {
+            // Reconstruct the columnar predicate-DML plan. The apply re-scans
+            // local columnar state at this committed log position and mutates
+            // the predicate matches — deterministic across replicas by Raft
+            // log order (identical prior state ⇒ identical matching set).
+            if *is_update {
+                PhysicalPlan::Columnar(nodedb_physical::physical_plan::ColumnarOp::Update {
+                    collection: collection.clone(),
+                    filters: filters.clone(),
+                    updates: updates.clone(),
+                })
+            } else {
+                PhysicalPlan::Columnar(nodedb_physical::physical_plan::ColumnarOp::Delete {
+                    collection: collection.clone(),
+                    filters: filters.clone(),
+                })
+            }
+        }
         ReplicatedWrite::InsertSelect {
             target_collection,
             source_collection,

@@ -553,6 +553,30 @@ pub fn to_replicated_entry(
             is_update: true,
             updates: updates.clone(),
         },
+        // Columnar predicate DELETE / UPDATE replicates as a `ColumnarBulkDml`
+        // entry: each replica re-scans local columnar state at the committed
+        // log position and applies the predicate deterministically (Raft log
+        // order ⇒ identical prior state ⇒ identical matching set), exactly like
+        // the Document `BulkDml` sibling above.
+        PhysicalPlan::Columnar(ColumnarOp::Delete {
+            collection,
+            filters,
+        }) => ReplicatedWrite::ColumnarBulkDml {
+            collection: collection.clone(),
+            filters: filters.clone(),
+            is_update: false,
+            updates: Vec::new(),
+        },
+        PhysicalPlan::Columnar(ColumnarOp::Update {
+            collection,
+            filters,
+            updates,
+        }) => ReplicatedWrite::ColumnarBulkDml {
+            collection: collection.clone(),
+            filters: filters.clone(),
+            is_update: true,
+            updates: updates.clone(),
+        },
         // `INSERT ... SELECT ... WHERE <predicate>` replicates as a plain
         // `InsertSelect` entry: each replica re-scans the source at the
         // committed log position and copies the predicate matches, reusing each

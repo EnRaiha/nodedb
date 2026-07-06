@@ -75,6 +75,8 @@ pub(super) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Document(DocumentOp::EstimateCount { collection, .. })
         | PhysicalPlan::Columnar(ColumnarOp::Scan { collection, .. })
         | PhysicalPlan::Columnar(ColumnarOp::Insert { collection, .. })
+        | PhysicalPlan::Columnar(ColumnarOp::Update { collection, .. })
+        | PhysicalPlan::Columnar(ColumnarOp::Delete { collection, .. })
         | PhysicalPlan::Timeseries(TimeseriesOp::Scan { collection, .. })
         | PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. })
         | PhysicalPlan::Spatial(SpatialOp::Scan { collection, .. })

@@ -552,6 +552,27 @@ pub enum ReplicatedWrite {
         updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
     },
 
+    /// A single-shard columnar predicate write (`ColumnarOp::Delete` /
+    /// `ColumnarOp::Update`) to be replicated to the data group's Raft members
+    /// and re-executed on apply. The columnar sibling of [`Self::BulkDml`]:
+    /// a single shard is ONE Raft group, so re-evaluating the predicate at the
+    /// committed apply position re-derives the byte-identical matching set on
+    /// every replica (deterministic by Raft ordering). Columnar predicate DML
+    /// carries no OLLP path, so no predicted-surrogate machinery is involved.
+    ///
+    /// `filters` is the msgpack-encoded `Vec<ScanFilter>` predicate (empty = no
+    /// WHERE clause, match all). `updates` is empty for the delete and carries
+    /// the `(column_name, msgpack_value_bytes)` SET assignments for the update
+    /// (the same raw-bytes shape `ColumnarOp::Update` carries — distinct from
+    /// `BulkDml`'s `UpdateValue`); `is_update` disambiguates the two so apply
+    /// reconstructs the correct `ColumnarOp`.
+    ColumnarBulkDml {
+        collection: String,
+        filters: Vec<u8>,
+        is_update: bool,
+        updates: Vec<(String, Vec<u8>)>,
+    },
+
     /// A single-shard `INSERT INTO <target> SELECT ... FROM <source> WHERE
     /// <predicate>` to be replicated to the data group's Raft members and
     /// re-executed on apply. Like `BulkDml`, a single shard is ONE Raft group,
