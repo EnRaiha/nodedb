@@ -14,6 +14,7 @@ pub mod control;
 pub mod convert;
 pub mod document;
 pub mod facet;
+pub mod fts_analyzer;
 pub mod fts_sync;
 pub mod generated;
 pub mod graph;

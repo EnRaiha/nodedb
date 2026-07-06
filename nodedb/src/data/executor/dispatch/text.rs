@@ -134,6 +134,11 @@ impl CoreLoop {
                     score_alias: score_alias.as_deref(),
                 },
             ),
+
+            TextOp::SetAnalyzer {
+                collection,
+                analyzer_name,
+            } => self.execute_set_analyzer(task, tid, collection, analyzer_name),
         }
     }
 }

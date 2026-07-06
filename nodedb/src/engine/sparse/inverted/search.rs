@@ -61,7 +61,7 @@ impl InvertedIndex {
         // Load posting list for each term.
         let mut term_lists: Vec<Vec<Posting>> = Vec::with_capacity(terms.len());
         for term in terms {
-            let analyzed = nodedb_fts::analyze(term);
+            let analyzed = self.analyze_for_collection(database_id, tid, collection, term)?;
             let canonical = analyzed.into_iter().next().unwrap_or_else(|| term.clone());
             let postings: Vec<Posting> = postings_table
                 .get((database_id, t, collection, canonical.as_str()))

@@ -138,4 +138,20 @@ pub enum TextOp {
         /// SELECT-list alias for the fused RRF score column.
         score_alias: Option<String>,
     },
+
+    /// Bind a collection's per-collection FTS analyzer.
+    ///
+    /// Persists to backend metadata (`InvertedIndex::set_collection_analyzer`)
+    /// so `InvertedIndex::analyze_for_collection` resolves it for every
+    /// subsequent tokenization of the collection's text — forward indexing,
+    /// the in-transaction staged-write overlay, and query-time scoring alike.
+    /// Config-only, single-node, non-WAL-durable — the same dispatch shape
+    /// `VectorOp::SetParams` uses for `CREATE VECTOR INDEX`.
+    SetAnalyzer {
+        collection: String,
+        /// Analyzer name (e.g. "standard", "simple", "english", "cjk_bigram").
+        /// Unrecognized names fall back to the standard analyzer at resolve
+        /// time (see `nodedb_fts::index::analyzer_config::resolve_analyzer`).
+        analyzer_name: String,
+    },
 }

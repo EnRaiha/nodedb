@@ -250,7 +250,7 @@ pub(super) async fn try_string(
         return Some(dsl::create_fulltext_index(state, identity, &parts));
     }
     if upper.starts_with("CREATE SEARCH INDEX ") {
-        return Some(dsl::create_search_index(state, identity, sql));
+        return Some(dsl::create_search_index(state, identity, sql).await);
     }
     if upper.starts_with("CREATE SPARSE INDEX ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();

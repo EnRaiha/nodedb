@@ -68,6 +68,10 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Text(TextOp::FtsIndexDoc { .. })
         | PhysicalPlan::Text(TextOp::FtsDeleteDoc { .. }) => PlanKind::MultiRow,
 
+        // Analyzer-binding DDL config write — opaque execution result, same
+        // as `VectorOp::SetParams`.
+        PhysicalPlan::Text(TextOp::SetAnalyzer { .. }) => PlanKind::Execution,
+
         PhysicalPlan::Kv(KvOp::Get { .. }) | PhysicalPlan::Kv(KvOp::FieldGet { .. }) => {
             PlanKind::SingleDocument
         }

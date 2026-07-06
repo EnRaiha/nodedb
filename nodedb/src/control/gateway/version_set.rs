@@ -226,7 +226,8 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | HybridSearchTriple { collection, .. }
                 | PhraseSearch { collection, .. }
                 | FtsIndexDoc { collection, .. }
-                | FtsDeleteDoc { collection, .. } => out.push(collection.clone()),
+                | FtsDeleteDoc { collection, .. }
+                | SetAnalyzer { collection, .. } => out.push(collection.clone()),
             }
         }
 

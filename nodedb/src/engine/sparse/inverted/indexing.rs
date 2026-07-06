@@ -32,6 +32,40 @@ pub struct IndexDocScope<'a> {
 }
 
 impl InvertedIndex {
+    /// Tokenize `text` with the collection's configured analyzer (falls back
+    /// to the default analyzer when the collection has none bound).
+    ///
+    /// This is the single analyzer-resolution entry point for the whole
+    /// inverted-index module: forward indexing (`index_document`,
+    /// `index_document_in_txn`) and query-term canonicalization
+    /// (`phrase_search`) all call through here so a document is always
+    /// tokenized the same way it is later matched against, whether the write
+    /// is durable or still staged in an open transaction.
+    pub fn analyze_for_collection(
+        &self,
+        database_id: u64,
+        tid: TenantId,
+        collection: &str,
+        text: &str,
+    ) -> crate::Result<Vec<String>> {
+        self.inner
+            .analyze_for_collection(database_id, tid.as_u64(), collection, text)
+    }
+
+    /// Bind a collection's per-collection FTS analyzer, persisted to backend
+    /// metadata. `analyze_for_collection` resolves it from this point on for
+    /// every write and read of the collection's text.
+    pub fn set_collection_analyzer(
+        &self,
+        database_id: u64,
+        tid: TenantId,
+        collection: &str,
+        analyzer_name: &str,
+    ) -> crate::Result<()> {
+        self.inner
+            .set_collection_analyzer(database_id, tid.as_u64(), collection, analyzer_name)
+    }
+
     /// Index a document's text content.
     pub fn index_document(
         &self,
@@ -41,7 +75,7 @@ impl InvertedIndex {
         surrogate: Surrogate,
         text: &str,
     ) -> crate::Result<()> {
-        let tokens = nodedb_fts::analyze(text);
+        let tokens = self.analyze_for_collection(database_id, tid, collection, text)?;
         if tokens.is_empty() {
             return Ok(());
         }
@@ -71,7 +105,8 @@ impl InvertedIndex {
         scope: IndexDocScope<'_>,
         text: &str,
     ) -> crate::Result<()> {
-        let tokens = nodedb_fts::analyze(text);
+        let tokens =
+            self.analyze_for_collection(scope.database_id, scope.tid, scope.collection, text)?;
         if tokens.is_empty() {
             return Ok(());
         }

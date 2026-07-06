@@ -10,22 +10,21 @@
 //! therefore no staged FTS posting to read at query time. Instead, this
 //! merge makes the transaction's already-staged DOCUMENT BODIES (held in
 //! [`TxnOverlay`]) searchable by re-tokenizing and BM25-scoring them at
-//! query time with the exact same tokenizer the forward indexing path uses
-//! (`nodedb_fts::analyze` — see `IndexDocScope`/`index_document_in_txn`) and
-//! the SAME corpus stats (`df` / `total_docs` / `avg_doc_len`) the base
+//! query time with the exact same analyzer resolution the forward indexing
+//! path uses (`InvertedIndex::analyze_for_collection` — see
+//! `IndexDocScope`/`index_document_in_txn`) and the SAME corpus stats
+//! (`df` / `total_docs` / `avg_doc_len`) the base
 //! search read, via [`InvertedIndex::corpus_stats`] /
 //! [`InvertedIndex::term_df`], so a staged doc's score is directly
 //! comparable to base-search scores.
 //!
-//! **Known limitation (flagged, not silently approximated):** if a
-//! collection has a configured per-collection analyzer override
-//! (`FtsIndex::set_collection_analyzer`), the base INDEX WRITE path
-//! (`index_document_in_txn`) does not apply it either — it always
-//! tokenizes with the default `nodedb_fts::analyze`. This merge mirrors
-//! that existing write-path behavior for staged docs rather than
-//! introducing a second, inconsistent tokenization path. Fixing the
-//! pre-existing analyzer-override gap in the write path is out of scope
-//! for FTS read-your-own-writes.
+//! A collection's per-collection analyzer override
+//! (`InvertedIndex::analyze_for_collection`, backed by
+//! `FtsIndex::set_collection_analyzer`) is resolved for staged docs exactly
+//! the same way the forward indexing path (`index_document_in_txn`)
+//! resolves it, so a staged doc is tokenized identically whether it is
+//! still staged or already committed — no second, inconsistent tokenization
+//! path.
 
 use std::collections::HashMap;
 
@@ -84,7 +83,9 @@ impl CoreLoop {
             return;
         };
 
-        let Some((positive_terms, negative_terms)) = analyze_query_terms(query) else {
+        let Some((positive_terms, negative_terms)) =
+            self.analyze_query_terms(database_id.as_u64(), tid, collection, query)
+        else {
             // An invalid query already failed the base search with an
             // error before this merge could run — nothing to fold in.
             return;
@@ -155,8 +156,9 @@ impl CoreLoop {
     ///
     /// Positions come from the staged doc's own analyzed token indices — the
     /// forward indexer assigns posting positions the same way (`enumerate`
-    /// over `nodedb_fts::analyze` output), so no durable posting list is
-    /// needed to verify adjacency. Score mirrors the base phrase formula at
+    /// over `InvertedIndex::analyze_for_collection` output), so no durable
+    /// posting list is needed to verify adjacency. Score mirrors the base
+    /// phrase formula at
     /// rank 0 (`1 / (1 + earliest_start_pos)`), keeping staged matches
     /// order-comparable with base phrase hits.
     pub(in crate::data::executor) fn merge_fts_phrase_overlay_into_results(
@@ -178,15 +180,18 @@ impl CoreLoop {
             return;
         };
 
-        // Canonicalize each phrase term through the same analyzer the base
-        // phrase search uses (`analyze(term).next()`), so the contiguity
-        // check compares stemmed/normalized tokens on both sides.
+        // Canonicalize each phrase term through the collection's configured
+        // analyzer — the same resolution the base phrase search
+        // (`InvertedIndex::phrase_search`) uses — so the contiguity check
+        // compares stemmed/normalized tokens on both sides.
+        let db_u64 = database_id.as_u64();
         let phrase_terms: Vec<String> = terms
             .iter()
             .map(|t| {
-                nodedb_fts::analyze(t)
-                    .into_iter()
-                    .next()
+                self.inverted
+                    .analyze_for_collection(db_u64, tid, collection, t)
+                    .ok()
+                    .and_then(|tokens| tokens.into_iter().next())
                     .unwrap_or_else(|| t.clone())
             })
             .collect();
@@ -208,7 +213,8 @@ impl CoreLoop {
                     }
                 }
                 Staged::Put(body) => {
-                    let score = self.score_staged_phrase_doc(&config_key, body, &phrase_terms);
+                    let score =
+                        self.score_staged_phrase_doc(db_u64, &config_key, body, &phrase_terms);
                     match (score, seen.get(&surrogate).copied()) {
                         (Some(s), Some(idx)) => {
                             base_results[idx].1 = s;
@@ -252,7 +258,9 @@ impl CoreLoop {
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
             return;
         };
-        let Some((positive_terms, negative_terms)) = analyze_query_terms(query) else {
+        let Some((positive_terms, negative_terms)) =
+            self.analyze_query_terms(database_id.as_u64(), tid, collection, query)
+        else {
             return;
         };
 
@@ -343,6 +351,32 @@ impl CoreLoop {
             }
         }
     }
+
+    /// Parse `query` and analyze its positive/negative terms with the
+    /// collection's configured analyzer (`InvertedIndex::analyze_for_collection`
+    /// — the same resolution the forward-indexing path and the base search
+    /// use), once per merge call (never per staged document — every staged
+    /// doc in the merge loop is scored against this same pair of term
+    /// lists). Returns `None` when `query` fails to parse (the base search
+    /// already surfaced that error).
+    fn analyze_query_terms(
+        &self,
+        database_id: u64,
+        tid: TenantId,
+        collection: &str,
+        query: &str,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        let parsed = parse_query(query).ok()?;
+        let positive_terms = self
+            .inverted
+            .analyze_for_collection(database_id, tid, collection, &parsed.positive.join(" "))
+            .unwrap_or_default();
+        let negative_terms = self
+            .inverted
+            .analyze_for_collection(database_id, tid, collection, &parsed.negative.join(" "))
+            .unwrap_or_default();
+        Some((positive_terms, negative_terms))
+    }
 }
 
 /// Remove every staged tombstone's surrogate from `base_results` when there
@@ -362,18 +396,6 @@ fn remove_tombstoned(
         return;
     }
     base_results.retain(|(s, _, _)| !tombstoned.contains(&s.as_u32()));
-}
-
-/// Parse `query` and analyze its positive/negative terms with the same
-/// tokenizer the forward-indexing path uses, once per merge call (never
-/// per staged document — every staged doc in the merge loop is scored
-/// against this same pair of term lists). Returns `None` when `query`
-/// fails to parse (the base search already surfaced that error).
-fn analyze_query_terms(query: &str) -> Option<(Vec<String>, Vec<String>)> {
-    let parsed = parse_query(query).ok()?;
-    let positive_terms = nodedb_fts::analyze(&parsed.positive.join(" "));
-    let negative_terms = nodedb_fts::analyze(&parsed.negative.join(" "));
-    Some((positive_terms, negative_terms))
 }
 
 /// After a `Vec::remove(idx)` shifts every later element left by one, shift

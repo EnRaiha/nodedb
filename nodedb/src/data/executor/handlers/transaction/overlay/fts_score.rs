@@ -2,15 +2,17 @@
 
 //! Staged-document scoring internals shared by the FTS overlay merges in
 //! `fts_merge.rs`. Decodes a transaction's staged document body, re-tokenizes
-//! it with the SAME tokenizer the forward indexing path uses
-//! (`nodedb_fts::analyze`), and scores it against a query — either bag-of-words
-//! BM25 (using the base index's corpus stats so scores are comparable) or
+//! it with the collection's configured analyzer — the SAME analyzer
+//! resolution (`InvertedIndex::analyze_for_collection`) the forward indexing
+//! path uses — and scores it against a query — either bag-of-words BM25
+//! (using the base index's corpus stats so scores are comparable) or
 //! exact-adjacency phrase matching over the staged doc's own token positions.
 
 use std::collections::HashMap;
 
 use nodedb_fts::bm25::bm25_score;
 use nodedb_fts::posting::Bm25Params;
+use tracing::warn;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::fts_text::extract_fts_text;
@@ -69,7 +71,7 @@ impl CoreLoop {
         positive_terms: &[String],
         negative_terms: &[String],
     ) -> Option<f32> {
-        let doc_tokens = self.tokenize_staged_body(ctx.config_key, body)?;
+        let doc_tokens = self.tokenize_staged_body(ctx.database_id, ctx.config_key, body)?;
 
         if !negative_terms.is_empty() && negative_terms.iter().any(|t| doc_tokens.contains(t)) {
             return None;
@@ -116,6 +118,7 @@ impl CoreLoop {
     /// (base phrase formula at rank 0) on a match, else `None`.
     pub(in crate::data::executor) fn score_staged_phrase_doc(
         &self,
+        database_id: u64,
         config_key: &(TenantId, String),
         body: &[u8],
         phrase_terms: &[String],
@@ -123,17 +126,24 @@ impl CoreLoop {
         if phrase_terms.is_empty() {
             return None;
         }
-        let doc_tokens = self.tokenize_staged_body(config_key, body)?;
+        let doc_tokens = self.tokenize_staged_body(database_id, config_key, body)?;
         let start = earliest_contiguous_match(&doc_tokens, phrase_terms)?;
         Some(1.0 / (1.0 + start as f32))
     }
 
     /// Decode a staged body via the collection's storage mode and analyze it
-    /// with the forward-indexing tokenizer. Returns `None` for an
-    /// undecodable body or one whose extracted text is empty (which the
-    /// forward indexer also never indexes).
+    /// with the collection's configured analyzer — resolved through
+    /// [`InvertedIndex::analyze_for_collection`](crate::engine::sparse::inverted::InvertedIndex::analyze_for_collection),
+    /// the exact same lookup the forward indexing path
+    /// (`index_document_in_txn`) uses, so a staged doc is tokenized
+    /// identically to how it will be tokenized once committed. Returns
+    /// `None` for an undecodable body, one whose extracted text is empty
+    /// (which the forward indexer also never indexes), or one whose
+    /// analyzer resolution fails (logged, since that indicates a backend
+    /// metadata read error rather than an expected empty-text case).
     fn tokenize_staged_body(
         &self,
+        database_id: u64,
         config_key: &(TenantId, String),
         body: &[u8],
     ) -> Option<Vec<String>> {
@@ -142,7 +152,22 @@ impl CoreLoop {
         if text.is_empty() {
             return None;
         }
-        let tokens = nodedb_fts::analyze(&text);
+        let (tid, collection) = config_key;
+        let tokens =
+            match self
+                .inverted
+                .analyze_for_collection(database_id, *tid, collection, &text)
+            {
+                Ok(tokens) => tokens,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        %collection,
+                        "staged FTS scoring: analyzer resolution failed; skipping doc"
+                    );
+                    return None;
+                }
+            };
         if tokens.is_empty() {
             None
         } else {
