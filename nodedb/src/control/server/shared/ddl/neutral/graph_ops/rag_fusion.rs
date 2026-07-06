@@ -38,6 +38,17 @@ pub async fn rag_fusion(
     collection: String,
     params: FusionParams,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    // Gate on catalog `is_active` (see `support::ensure_collection_active`):
+    // a plain `DROP COLLECTION` only flips `is_active=false` without
+    // reclaiming edges/CSR, so this read must independently hide the target
+    // collection until UNDROP or a hard purge.
+    super::support::ensure_collection_active(
+        state,
+        database_id,
+        identity.tenant_id.as_u64(),
+        &collection,
+    )?;
+
     let query_vector = params
         .query_vector
         .ok_or_else(|| ddl_err("42601", "fusion query requires ARRAY[…] vector payload"))?;

@@ -78,22 +78,12 @@ pub async fn show_graph_stats(
     // through the same catalog path used by SHOW COLLECTIONS / DESCRIBE,
     // so the same not-found / inactive semantics apply.
     if let Some(ref name) = collection {
-        let catalog = match state.credentials.catalog() {
-            Some(c) => c,
-            None => return Err(ddl_err("XX000", "catalog not available")),
-        };
-        match catalog.get_collection(database_id, identity.tenant_id.as_u64(), name) {
-            Ok(Some(c)) if c.is_active => {}
-            Ok(Some(_)) => {
-                return Err(ddl_err(
-                    "42P01",
-                    format!("collection '{name}' is deactivated"),
-                ));
-            }
-            _ => {
-                return Err(ddl_err("42P01", format!("collection '{name}' not found")));
-            }
-        }
+        super::support::ensure_collection_active(
+            state,
+            database_id,
+            identity.tenant_id.as_u64(),
+            name,
+        )?;
     }
 
     let plan = PhysicalPlan::Graph(GraphOp::Stats {
@@ -109,6 +99,16 @@ pub async fn show_graph_stats(
         .map_err(|e| ddl_err("XX000", format!("graph stats decode failed: {e}")))?;
 
     let aggregated = aggregate_by_collection(merged);
+
+    // Tenant-wide (no collection name given): drop rows for collections that
+    // have been soft-deactivated (plain `DROP COLLECTION` without PURGE).
+    // Their edges/CSR/stats are still physically present until a hard purge,
+    // but they must not surface in the merged tenant-wide result.
+    let aggregated = if collection.is_none() {
+        filter_active_collections(state, database_id, identity.tenant_id.as_u64(), aggregated)
+    } else {
+        aggregated
+    };
 
     if verbose {
         Ok(encode_verbose_response(aggregated))
@@ -126,6 +126,33 @@ fn decode_merged_stats(payload: &[u8]) -> crate::Result<Vec<CollectionStats>> {
         format: "msgpack".into(),
         detail: e.to_string(),
     })
+}
+
+/// Filter out `CollectionStats` rows for collections that are not currently
+/// active in the catalog (soft-deleted via plain `DROP COLLECTION`). If the
+/// catalog is unavailable, or a given collection has no catalog entry at
+/// all (shouldn't normally happen for a row with live stats), the row is
+/// dropped conservatively rather than leaked into the tenant-wide view.
+fn filter_active_collections(
+    state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: u64,
+    rows: Vec<CollectionStats>,
+) -> Vec<CollectionStats> {
+    let Some(catalog) = state.credentials.catalog() else {
+        return Vec::new();
+    };
+    let all_collections = catalog
+        .load_collections_for_tenant(database_id, tenant_id)
+        .unwrap_or_default();
+    let active: std::collections::BTreeSet<&str> = all_collections
+        .iter()
+        .filter(|c| c.is_active)
+        .map(|c| c.name.as_str())
+        .collect();
+    rows.into_iter()
+        .filter(|r| active.contains(r.collection.as_str()))
+        .collect()
 }
 
 /// Aggregate per-core `CollectionStats` entries by `collection` name, merging
