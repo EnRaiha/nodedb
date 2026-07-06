@@ -10,6 +10,7 @@ use super::where_search::try_extract_where_search;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::parser::normalize::normalize_ident;
+use crate::planner::ast_helpers::strip_single_table_qualifiers;
 use crate::planner::lateral::plan::{
     is_lateral_derived, lateral_alias_from_factor, plan_lateral_join, subquery_from_factor,
 };
@@ -147,6 +148,25 @@ pub(super) fn plan_select(
         detail: "multi-table FROM without JOIN".into(),
     })?;
 
+    // For a single table the column qualifier (`t.` or its alias) is always
+    // redundant, so strip it from the projection, WHERE, and GROUP BY here —
+    // before it can become a literal `"t.col"` field-lookup string that
+    // silently matches zero rows / projects an empty value. A qualifier that
+    // matches neither the table name nor its alias becomes a typed error. This
+    // is scoped to the single-table branch only: the JOIN path (handled above
+    // by `try_plan_join`) deliberately keeps qualifiers for merged-document
+    // evaluation and is never reached here.
+    let valid_qualifiers: Vec<&str> = {
+        let ref_name = table.ref_name();
+        if ref_name == table.name {
+            vec![table.name.as_str()]
+        } else {
+            vec![table.name.as_str(), ref_name]
+        }
+    };
+    let normalized_select = strip_single_table_qualifiers(select, &valid_qualifiers)?;
+    let select = &normalized_select;
+
     // 4. Extract subqueries from WHERE and rewrite as semi/anti joins.
     let (subquery_joins, effective_where) = if let Some(expr) = &select.selection {
         let extraction =
@@ -159,6 +179,9 @@ pub(super) fn plan_select(
     // 5. Convert remaining WHERE filters. When a WHERE clause is present the
     // projection is converted here (needed for WHERE-search detection) and
     // cached so step 7 doesn't redo the same conversion.
+    // Qualifiers were already stripped from `select` (and thus from
+    // `effective_where`) by `strip_single_table_qualifiers` above, so the
+    // WHERE expr here carries only bare column names.
     let mut cached_projection = None;
     let filters = match &effective_where {
         Some(expr) => {
