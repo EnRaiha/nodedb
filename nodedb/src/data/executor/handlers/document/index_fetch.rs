@@ -13,17 +13,25 @@
 //! Non-bitemporal collections keep the byte-identical plain
 //! `range_scan` + `sparse.get` path.
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::filter_match::matches_with_resolved_schema;
 use crate::data::executor::task::ExecutionTask;
 
 /// Parameters for `execute_document_indexed_fetch`.
 ///
-/// `filters` / `projection` are carried for forward compatibility (the
-/// rewrite only fires for simple equality; richer cases fall back to a full
-/// scan) but are not yet applied by the handler.
+/// `filters` is the compound-predicate residual left over after the planner
+/// pulls the indexed equality out of the WHERE clause (e.g. the
+/// `other_col > 'y'` half of `indexed_col = 'x' AND other_col > 'y'`) — see
+/// `nodedb-sql`'s `try_document_index_lookup`. The handler applies it to every
+/// fetched body (committed and staged alike), so a row that satisfies the
+/// indexed term but fails the residual is excluded exactly as a base scan
+/// would exclude it; it is also handed to `merge_overlay_into_index_lookup` so
+/// a staged Put failing the residual is never added. `projection` is carried
+/// for forward compatibility and not yet applied by the handler.
 pub(in crate::data::executor) struct IndexedFetchParams<'a> {
     pub tid: u64,
     pub collection: &'a str,
@@ -81,6 +89,12 @@ impl CoreLoop {
                             value,
                             is_array,
                             case_insensitive,
+                            // `DocumentOp::IndexLookup` carries no residual
+                            // filters at all (it returns bare doc IDs, used by
+                            // bitmap-producer callers) — the empty slice makes
+                            // the merge's residual re-check a no-op.
+                            residual: &[],
+                            strict_schema: None,
                         },
                         &mut doc_ids,
                         &|body| self.decode_indexed_body(&config_key, body),
@@ -118,10 +132,11 @@ impl CoreLoop {
     /// superseded values); ordinary collections use the plain index and
     /// `sparse.get`.
     ///
-    /// Post-filters and projection are intentionally not applied here:
-    /// the planner only rewrites to this op when those are empty
-    /// (complex cases fall back to a full scan). Extending this handler
-    /// with filter/projection support is additive.
+    /// The compound-predicate residual (`filters`) IS applied to each fetched
+    /// body — committed or staged — so a row matching the indexed term but
+    /// failing the leftover conjuncts is excluded like a base scan would.
+    /// Projection is not yet applied here; the planner falls back to a full
+    /// scan for cases this handler doesn't cover (sort/distinct/window).
     pub(in crate::data::executor) fn execute_document_indexed_fetch(
         &mut self,
         task: &ExecutionTask,
@@ -132,7 +147,7 @@ impl CoreLoop {
             collection,
             path,
             value,
-            filters: _filters,
+            filters,
             projection: _projection,
             limit,
             offset,
@@ -189,6 +204,30 @@ impl CoreLoop {
             crate::types::TenantId::new(tid),
             collection.to_string(),
         );
+        // The residual: the WHERE conjuncts left over after the planner pulled
+        // out the indexed equality (e.g. the `other_col > 'y'` half of
+        // `indexed_col = 'x' AND other_col > 'y'`) — see `nodedb-sql`'s
+        // `try_document_index_lookup`. It is applied to EVERY fetched body
+        // below — committed or staged — so a row that satisfies the indexed
+        // term but not the residual is excluded exactly like a base scan would
+        // exclude it. It is also handed to the overlay merge so a staged Put
+        // failing the residual is never even added.
+        let residual: Vec<ScanFilter> = if filters.is_empty() {
+            Vec::new()
+        } else {
+            match zerompk::from_msgpack(filters) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(core = self.core_id, error = %e, "failed to parse indexed-fetch residual filters");
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("malformed indexed-fetch filters: {e}"),
+                        },
+                    );
+                }
+            }
+        };
         if let Some(txn_id) = task.request.txn_id {
             let (is_array, case_insensitive) = self.index_path_flags(&config_key, path);
             self.merge_overlay_into_index_lookup(
@@ -199,6 +238,8 @@ impl CoreLoop {
                     value,
                     is_array,
                     case_insensitive,
+                    residual: &residual,
+                    strict_schema: strict_schema.as_ref(),
                 },
                 &mut doc_ids,
                 &|body| self.decode_indexed_body(&config_key, body),
@@ -223,6 +264,16 @@ impl CoreLoop {
             });
             match fetched {
                 Ok(Some(bytes)) => {
+                    // A row matching the indexed term but failing the residual
+                    // (the leftover compound-predicate conjuncts) must be
+                    // excluded — checked on the raw stored body, exactly as a
+                    // base scan applies its filters, for committed and staged
+                    // bodies alike.
+                    if !residual.is_empty()
+                        && !matches_with_resolved_schema(strict_schema.as_ref(), &residual, &bytes)
+                    {
+                        continue;
+                    }
                     let payload = if let Some(ref schema) = strict_schema {
                         match super::super::super::strict_format::binary_tuple_to_msgpack(
                             &bytes, schema,

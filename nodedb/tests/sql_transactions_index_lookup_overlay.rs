@@ -157,12 +157,6 @@ async fn index_lookup_reflects_value_move(engine: &str, coll: &str) {
         "{engine}: staged update must add 'a' to the new value's lookup"
     );
 
-    // NOTE: a compound predicate that mixes the indexed term with a residual
-    // filter on another column (e.g. `region='eu' AND id='unrelated'`) is not
-    // asserted here — applying the residual filter to overlay-added rows is a
-    // separate concern from the index-lookup overlay merge and is handled where
-    // residual predicates are evaluated, not in this path.
-
     server.client.simple_query("ROLLBACK").await.unwrap();
     let after_us = select_ids(
         &server,
@@ -170,6 +164,112 @@ async fn index_lookup_reflects_value_move(engine: &str, coll: &str) {
     )
     .await;
     assert_eq!(after_us, vec!["a", "b"], "ROLLBACK: base index lookup only");
+}
+
+async fn setup_residual(server: &TestServer, coll: &str, engine: &str) {
+    server
+        .exec(&format!(
+            "CREATE COLLECTION {coll} \
+             (id STRING NOT NULL PRIMARY KEY, region STRING, score INT) WITH (engine='{engine}')"
+        ))
+        .await
+        .unwrap();
+    server
+        .exec(&format!("CREATE INDEX ON {coll}(region)"))
+        .await
+        .unwrap();
+    for (id, region, score) in [("a", "us", 100), ("b", "us", 5), ("unrelated", "eu", 100)] {
+        server
+            .exec(&format!(
+                "INSERT INTO {coll} (id, region, score) VALUES ('{id}', '{region}', {score})"
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+/// A compound-predicate index lookup (`WHERE region = 'us' AND score > 10`)
+/// resolves `region = 'us'` via the secondary index and applies `score > 10`
+/// as the residual. A staged row must honor the residual exactly like a
+/// committed row: matching the indexed term alone must not be enough to
+/// surface it in-transaction (regression for the overlay merge leaking
+/// residual-failing staged rows).
+async fn index_lookup_applies_residual_to_overlay(engine: &str, coll: &str) {
+    let server = TestServer::start().await;
+    setup_residual(&server, coll, engine).await;
+
+    server.exec("BEGIN").await.unwrap();
+
+    // Staged insert matching the indexed term but failing the residual
+    // (score = 1, not > 10) must NOT leak into the in-tx result.
+    server
+        .exec(&format!(
+            "INSERT INTO {coll} (id, region, score) VALUES ('fail', 'us', 1)"
+        ))
+        .await
+        .unwrap();
+
+    // Staged insert matching both the indexed term and the residual must
+    // still be visible (read-your-own-writes holds under a compound WHERE).
+    server
+        .exec(&format!(
+            "INSERT INTO {coll} (id, region, score) VALUES ('pass', 'us', 50)"
+        ))
+        .await
+        .unwrap();
+
+    let seen = select_ids(
+        &server,
+        &format!("SELECT id FROM {coll} WHERE region = 'us' AND score > 10"),
+    )
+    .await;
+    assert_eq!(
+        seen,
+        vec!["a", "pass"],
+        "{engine}: a staged row matching the indexed term but failing the residual must be \
+         excluded, while a staged row satisfying both must be included"
+    );
+
+    // A staged UPDATE that moves an already-matching row's residual column
+    // out of range (without touching the indexed column) must also drop it
+    // -- the supersede path must re-check the residual, not just the term.
+    server
+        .exec(&format!("UPDATE {coll} SET score = 1 WHERE id = 'a'"))
+        .await
+        .unwrap();
+
+    let after_update = select_ids(
+        &server,
+        &format!("SELECT id FROM {coll} WHERE region = 'us' AND score > 10"),
+    )
+    .await;
+    assert_eq!(
+        after_update,
+        vec!["pass"],
+        "{engine}: a staged update that moves a row's residual value out of range must exclude it"
+    );
+
+    server.client.simple_query("ROLLBACK").await.unwrap();
+    let after_rollback = select_ids(
+        &server,
+        &format!("SELECT id FROM {coll} WHERE region = 'us' AND score > 10"),
+    )
+    .await;
+    assert_eq!(
+        after_rollback,
+        vec!["a"],
+        "{engine}: ROLLBACK restores the base index lookup + residual result"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schemaless_index_lookup_applies_residual_to_overlay() {
+    index_lookup_applies_residual_to_overlay("document_schemaless", "il_res").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_index_lookup_applies_residual_to_overlay() {
+    index_lookup_applies_residual_to_overlay("document_strict", "il_res_st").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -227,8 +227,11 @@ pub enum DocumentOp {
     /// Emitted from `SqlPlan::DocumentIndexLookup` for SELECT queries where
     /// the WHERE clause has an equality predicate on an indexed field. The
     /// handler resolves doc IDs via `sparse.index_lookup`, fetches each
-    /// document, applies any remaining filters + projection, and emits
-    /// scan-compatible row output via `response_codec`.
+    /// document, and emits scan-compatible row output via `response_codec`.
+    /// `filters` (the compound-predicate residual left over after the
+    /// indexed equality) is applied to every fetched body — committed and a
+    /// transaction's staged overlay rows alike; `projection` is not yet
+    /// applied by the handler.
     ///
     /// Sort / distinct / window functions are handled by the planner
     /// falling back to a full scan — the planner only emits this variant

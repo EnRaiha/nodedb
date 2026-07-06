@@ -17,7 +17,11 @@
 //! storage is), so `merge_overlay_into_index_lookup` decodes each candidate's
 //! staged body and re-extracts the indexed field via the same
 //! `extract_index_values` the write path uses, rather than re-checking a
-//! generic predicate closure.
+//! generic predicate closure directly on the indexed term. It additionally
+//! re-checks any compound-predicate residual (the WHERE conjuncts beyond the
+//! indexed field) via the same schema-aware `ScanFilter` evaluator the base
+//! scan overlay merge uses, so a staged row can't satisfy the indexed term
+//! alone and skip the rest of the WHERE clause.
 //!
 //! Current-version only: temporal (`AS OF` / valid-at) scans never call this,
 //! because staged bodies represent the current version alone. Staged put bodies
@@ -28,8 +32,11 @@
 use std::collections::HashSet;
 
 use nodedb_types::Surrogate;
+use nodedb_types::columnar::StrictSchema;
 
+use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::filter_match::matches_with_resolved_schema;
 use crate::data::executor::handlers::transaction::overlay::{Staged, StagedTtl};
 use crate::engine::document::store::{extract_index_values, surrogate_to_doc_id};
 use crate::engine::kv::current_ms;
@@ -42,6 +49,19 @@ use crate::types::{DatabaseId, TenantId, TxnId};
 /// matches (`is_array`, `case_insensitive`) and the transaction to merge
 /// (`txn_id`), so the merge takes one parameter rather than a long positional
 /// list.
+///
+/// `residual` / `strict_schema` carry the compound-predicate leftover: when
+/// the query is `WHERE indexed_field = value AND other_field = other_value`,
+/// the planner resolves the indexed equality but ships the rest of the
+/// conjunction as post-filters on the `IndexedFetch` physical op (see
+/// `nodedb-sql`'s `try_document_index_lookup`). The base (committed) doc IDs
+/// carry no such re-check today for this path, but a staged Put must not
+/// bypass it: a row the overlay adds or keeps only because it matches the
+/// indexed term, while failing the residual, must be excluded exactly like a
+/// residual-failing row is excluded from a base scan
+/// ([`CoreLoop::merge_overlay_into_scan`]'s `matches` contract). Empty
+/// `residual` (no compound predicate, or the id-only `IndexLookup` op which
+/// carries no filters at all) makes the residual check a no-op.
 pub(in crate::data::executor) struct IndexOverlayMergeParams<'a> {
     pub txn_id: TxnId,
     pub coll_key: &'a (DatabaseId, TenantId, String),
@@ -49,6 +69,8 @@ pub(in crate::data::executor) struct IndexOverlayMergeParams<'a> {
     pub value: &'a str,
     pub is_array: bool,
     pub case_insensitive: bool,
+    pub residual: &'a [ScanFilter],
+    pub strict_schema: Option<&'a StrictSchema>,
 }
 
 impl CoreLoop {
@@ -233,6 +255,8 @@ impl CoreLoop {
             value,
             is_array,
             case_insensitive,
+            residual,
+            strict_schema,
         } = params;
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
             return;
@@ -254,6 +278,15 @@ impl CoreLoop {
                 .into_iter()
                 .any(|v| normalize(v) == target)
         };
+        // The compound-predicate leftover (e.g. the `other_col = 'y'` half of
+        // `indexed_col = 'x' AND other_col = 'y'`) — re-checked on the RAW
+        // stored body via the same schema-aware evaluator the base scan
+        // overlay merge uses, so a staged Put that satisfies the indexed term
+        // but not the residual is excluded exactly like it would be from a
+        // base scan result.
+        let residual_matches = |body: &[u8]| -> bool {
+            residual.is_empty() || matches_with_resolved_schema(strict_schema, residual, body)
+        };
 
         // Base doc IDs are hex surrogates; track their surrogates so additions
         // don't re-append a row the base index lookup already returned.
@@ -273,7 +306,7 @@ impl CoreLoop {
             };
             match overlay.get(coll_key, surrogate) {
                 Some(Staged::Tombstone) => false,
-                Some(Staged::Put(body)) => value_matches(body),
+                Some(Staged::Put(body)) => value_matches(body) && residual_matches(body),
                 None => true,
             }
         });
@@ -288,7 +321,7 @@ impl CoreLoop {
             }
             match staged {
                 Staged::Put(body) => {
-                    if value_matches(body) {
+                    if value_matches(body) && residual_matches(body) {
                         doc_ids.push(surrogate_to_doc_id(Surrogate::new(surrogate)));
                         seen.insert(surrogate);
                     }
