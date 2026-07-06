@@ -12,6 +12,7 @@ use nodedb_sql::ddl_ast::GraphProperties;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::planner::calvin::{build_static_tx_class, submit_calvin_routed};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::{DmlTxnCtx, TransactionState};
 use crate::control::server::surrogate_exchange::assign_surrogate_routed;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
@@ -184,16 +185,30 @@ pub async fn insert_edge(
     }])
 }
 
+/// A parsed edge identity: the endpoints and label a `GRAPH DELETE EDGE`
+/// statement addresses. Bundled so [`delete_edge`] stays within the argument
+/// budget without an `#[allow]`.
+pub struct EdgeRef {
+    pub collection: String,
+    pub src: String,
+    pub dst: String,
+    pub label: String,
+}
+
 /// `GRAPH DELETE EDGE IN '<collection>' FROM '<src>' TO '<dst>' TYPE '<label>'`
 pub async fn delete_edge(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    collection: String,
-    src: String,
-    dst: String,
-    label: String,
+    edge: EdgeRef,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    let EdgeRef {
+        collection,
+        src,
+        dst,
+        label,
+    } = edge;
     if collection.is_empty() {
         return Err(ddl_err(
             "42601",
@@ -255,8 +270,42 @@ pub async fn delete_edge(
     // rows on this node — nothing to dual-home and Calvin is not available.
     let calvin_available =
         state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
+    let single_home = vsrc == vdst || !calvin_available;
 
-    if vsrc == vdst || !calvin_available {
+    // Inside an explicit transaction block a single-home edge delete stages into
+    // the per-transaction `GraphTxnOverlay` through the neutral gate instead of
+    // applying durably now: an in-transaction `MATCH` / `GRAPH NEIGHBORS` then
+    // observes the edge as removed (read-your-own-writes), COMMIT replays the
+    // buffered `EdgeDelete` via the single-shard WAL + `TransactionBatch` path,
+    // and ROLLBACK discards the overlay. Autocommit is untouched.
+    if txn_ctx.sessions.transaction_state(txn_ctx.addr) == TransactionState::InBlock {
+        if !single_home {
+            // A cross-shard (dual-home) edge delete inside an explicit
+            // transaction needs the cross-shard-commit machinery to stage both
+            // homes atomically across the outer transaction boundary — out of
+            // scope for single-home staging. Reject with the same signal a
+            // cross-shard predicate write inside a transaction produces.
+            return Err(ddl_err(
+                "XX000",
+                crate::Error::CrossShardInExplicitTransaction.to_string(),
+            ));
+        }
+        super::edge_stage::stage_edge_write_in_txn(
+            state,
+            tenant_id,
+            database_id,
+            vsrc,
+            PhysicalPlan::Graph(edge_delete),
+            txn_ctx,
+        )
+        .await?;
+        return Ok(vec![DdlResult::Status {
+            command: "DELETE EDGE".to_string(),
+            rows_affected: None,
+        }]);
+    }
+
+    if single_home {
         // F1a fast path (unchanged): both endpoints share one home vShard (or we
         // are single-node), so a single-home write to `vsrc` tombstones both the
         // forward and reverse rows together.

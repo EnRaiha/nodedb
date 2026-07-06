@@ -5,8 +5,9 @@
 use nodedb_sql::ddl_ast::statement::{GraphStmt, NodedbStatement};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TxnId};
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::{algo, edge, rag_fusion, stats, traverse};
@@ -22,7 +23,7 @@ pub async fn dispatch_graph(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     stmt: NodedbStatement,
-    txn_id: Option<TxnId>,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     match stmt {
         NodedbStatement::Graph(GraphStmt::GraphInsertEdge {
@@ -49,9 +50,21 @@ pub async fn dispatch_graph(
             src,
             dst,
             label,
-        }) => {
-            Some(edge::delete_edge(state, identity, database_id, collection, src, dst, label).await)
-        }
+        }) => Some(
+            edge::delete_edge(
+                state,
+                identity,
+                database_id,
+                edge::EdgeRef {
+                    collection,
+                    src,
+                    dst,
+                    label,
+                },
+                txn_ctx,
+            )
+            .await,
+        ),
         NodedbStatement::Graph(GraphStmt::GraphSetLabels {
             node_id,
             labels,
@@ -78,18 +91,25 @@ pub async fn dispatch_graph(
             node,
             edge_label,
             direction,
-        }) => Some(
-            traverse::neighbors(
-                state,
-                identity,
-                database_id,
-                node,
-                edge_label,
-                direction,
-                txn_id,
+        }) => {
+            // Read-your-own-writes for single-hop GRAPH reads needs the
+            // session's active `TxnId` so the Data Plane merges this
+            // transaction's staged edge writes (`GraphTxnOverlay`). Idle
+            // sessions resolve to `None` (autocommit read).
+            let (txn_id, _) = txn_ctx.sessions.txn_identity(txn_ctx.addr);
+            Some(
+                traverse::neighbors(
+                    state,
+                    identity,
+                    database_id,
+                    node,
+                    edge_label,
+                    direction,
+                    txn_id,
+                )
+                .await,
             )
-            .await,
-        ),
+        }
         NodedbStatement::Graph(GraphStmt::GraphPath {
             src,
             dst,
