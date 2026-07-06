@@ -411,6 +411,9 @@ pub enum ReplicatedWrite {
         collection: String,
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         ttl_ms: u64,
+        /// Leader-assigned global surrogate per entry (binding key = entry
+        /// key raw bytes), same order and length as `entries`.
+        surrogates: Vec<u32>,
     },
     KvExpire {
         collection: String,

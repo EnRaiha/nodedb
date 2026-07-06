@@ -116,7 +116,18 @@ impl CoreLoop {
                 collection,
                 entries,
                 ttl_ms,
-            } => self.execute_kv_batch_put(task, did, tid, collection, entries, *ttl_ms),
+                surrogates,
+            } => self.execute_kv_batch_put(
+                task,
+                super::batch::KvBatchPutArgs {
+                    did,
+                    tid,
+                    collection,
+                    entries,
+                    ttl_ms: *ttl_ms,
+                    surrogates,
+                },
+            ),
             KvOp::RegisterIndex {
                 collection,
                 field,

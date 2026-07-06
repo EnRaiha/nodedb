@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+mod batch_put;
 pub mod engine;
 pub mod engine_atomic;
 pub mod engine_atomic_compute;
@@ -18,6 +19,7 @@ pub mod scan;
 pub mod slab;
 pub mod sorted_index;
 
+pub use batch_put::KvBatchPutParams;
 pub use engine::KvEngine;
 pub use engine_atomic::{AtomicError, AtomicKeyCtx, CasResult};
 pub use engine_atomic_compute as atomic_compute;

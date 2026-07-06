@@ -156,6 +156,12 @@ pub enum KvOp {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         /// Per-key TTL override in milliseconds. 0 = use collection default.
         ttl_ms: u64,
+        /// Stable cross-engine identity for each entry, same order and
+        /// length as `entries`, assigned by the CP-side `SurrogateAssigner`
+        /// from `(collection, key)` -- the same mechanism `Put`/`Insert`
+        /// use. `Surrogate::ZERO` only appears in test fixtures.
+        #[serde(default)]
+        surrogates: Vec<Surrogate>,
     },
 
     /// Register a secondary index on a value field (DDL).

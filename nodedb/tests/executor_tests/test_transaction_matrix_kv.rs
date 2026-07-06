@@ -206,6 +206,7 @@ fn rollback_matrix_kv_batch_put_then_doc_fail() {
                         (b"k_b".to_vec(), b"b_new".to_vec()),
                     ],
                     ttl_ms: 0,
+                    surrogates: vec![nodedb_types::Surrogate::ZERO; 2],
                 }),
                 doc_insert_conflict("docs"),
             ],

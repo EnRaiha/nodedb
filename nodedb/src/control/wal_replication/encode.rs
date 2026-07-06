@@ -310,10 +310,12 @@ pub fn to_replicated_entry(
             collection,
             entries,
             ttl_ms,
+            surrogates,
         }) => ReplicatedWrite::KvBatchPut {
             collection: collection.clone(),
             entries: entries.clone(),
             ttl_ms: *ttl_ms,
+            surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
         },
         PhysicalPlan::Kv(KvOp::Expire {
             collection,

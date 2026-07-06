@@ -354,6 +354,7 @@ mod tests {
             collection: "c".into(),
             entries: vec![(b"k".to_vec(), b"v".to_vec())],
             ttl_ms: 0,
+            surrogates: vec![nodedb_types::Surrogate::ZERO],
         })));
     }
 
@@ -403,6 +404,7 @@ mod tests {
             collection: "c".into(),
             entries: vec![(b"k".to_vec(), b"v".to_vec())],
             ttl_ms: 0,
+            surrogates: vec![nodedb_types::Surrogate::ZERO],
         };
         assert_eq!(staged_kv_tag_kind(&op, &payload), StagedTagKind::Insert);
     }

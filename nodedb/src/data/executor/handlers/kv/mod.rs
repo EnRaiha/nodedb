@@ -3,7 +3,7 @@
 //! KV engine operation handlers for the Data Plane executor.
 
 pub(in crate::data::executor) mod atomic;
-mod batch;
+pub(in crate::data::executor) mod batch;
 mod crud;
 mod dispatch;
 mod field;

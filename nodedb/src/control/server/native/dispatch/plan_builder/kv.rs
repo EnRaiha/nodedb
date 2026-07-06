@@ -80,6 +80,7 @@ pub(crate) fn build_batch_get(
 }
 
 pub(crate) fn build_batch_put(
+    ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -97,10 +98,21 @@ pub(crate) fn build_batch_put(
     }
     let ttl_ms = fields.ttl_ms.unwrap_or(0);
 
+    // Assign each entry's stable cross-engine surrogate the SAME way a
+    // single-key `Put` does (`assign_kv_surrogate` below): an existing key
+    // resolves to its already-bound surrogate, a new key mints a fresh one.
+    // Without this every batch-put row would land with `Surrogate::ZERO`,
+    // making it invisible to any surrogate-keyed cross-engine read/join.
+    let surrogates = entries
+        .iter()
+        .map(|(key, _value)| assign_kv_surrogate(ctx, collection, key))
+        .collect::<crate::Result<Vec<_>>>()?;
+
     Ok(PhysicalPlan::Kv(KvOp::BatchPut {
         collection: collection.to_string(),
         entries,
         ttl_ms,
+        surrogates,
     }))
 }
 

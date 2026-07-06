@@ -187,6 +187,7 @@ impl CoreLoop {
                 collection,
                 entries,
                 ttl_ms,
+                surrogates,
             } => {
                 let now_ms = current_ms();
                 let prior_entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = entries
@@ -196,7 +197,17 @@ impl CoreLoop {
                         (k.clone(), prior)
                     })
                     .collect();
-                let resp = self.execute_kv_batch_put(task, did, tid, collection, entries, *ttl_ms);
+                let resp = self.execute_kv_batch_put(
+                    task,
+                    crate::data::executor::handlers::kv::batch::KvBatchPutArgs {
+                        did,
+                        tid,
+                        collection,
+                        entries,
+                        ttl_ms: *ttl_ms,
+                        surrogates,
+                    },
+                );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv batch put failed".into(),

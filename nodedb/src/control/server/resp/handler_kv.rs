@@ -262,10 +262,24 @@ pub(super) async fn handle_mset(
         .map(|pair| (pair[0].clone(), pair[1].clone()))
         .collect();
 
+    // Assign each entry's stable cross-engine surrogate the same way SET
+    // (`handle_set`) does per key -- otherwise MSET rows would land with
+    // `Surrogate::ZERO` and be invisible to any surrogate-keyed cross-engine
+    // read/join.
+    let surrogates = match entries
+        .iter()
+        .map(|(key, _value)| resp_kv_surrogate(state, session, key))
+        .collect::<Result<Vec<_>, RespValue>>()
+    {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
     let plan = PhysicalPlan::Kv(KvOp::BatchPut {
         collection: session.collection.clone(),
         entries,
         ttl_ms: 0,
+        surrogates,
     });
 
     match dispatch_kv_write(state, session, plan).await {

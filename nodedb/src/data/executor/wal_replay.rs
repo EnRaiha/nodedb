@@ -121,14 +121,22 @@ impl CoreLoop {
                     if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
                         continue;
                     }
-                    self.kv_engine.batch_put(
-                        database_id,
-                        tenant_id,
-                        &collection,
-                        &entries,
-                        ttl_ms,
-                        now_ms,
-                    );
+                    // Same as the `kv_put` replay arm above: this local WAL
+                    // record does not carry the surrogate (it lives in the
+                    // separately-durable, redb-backed surrogate catalog, not
+                    // this per-core WAL), so replay passes `Surrogate::ZERO`
+                    // for every entry, matching single-`Put` replay exactly.
+                    let surrogates = vec![nodedb_types::Surrogate::ZERO; entries.len()];
+                    self.kv_engine
+                        .batch_put(crate::engine::kv::KvBatchPutParams {
+                            database_id,
+                            tenant_id,
+                            collection: &collection,
+                            entries: &entries,
+                            ttl_ms,
+                            now_ms,
+                            surrogates: &surrogates,
+                        });
                     puts += entries.len();
                     continue;
                 }

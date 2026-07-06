@@ -604,11 +604,26 @@ fn to_physical_plan(
             collection,
             entries,
             ttl_ms,
-        } => PhysicalPlan::Kv(KvOp::BatchPut {
-            collection: collection.clone(),
-            entries: entries.clone(),
-            ttl_ms: *ttl_ms,
-        }),
+            surrogates,
+        } => {
+            let resolved = entries
+                .iter()
+                .zip(surrogates.iter())
+                .map(|((key, _value), carried)| {
+                    let carried = nodedb_types::Surrogate::new(*carried);
+                    match assigner {
+                        Some(a) => a.bind(database_id, tenant_id, collection, key, carried),
+                        None => Ok(carried),
+                    }
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            PhysicalPlan::Kv(KvOp::BatchPut {
+                collection: collection.clone(),
+                entries: entries.clone(),
+                ttl_ms: *ttl_ms,
+                surrogates: resolved,
+            })
+        }
         ReplicatedWrite::KvExpire {
             collection,
             key,

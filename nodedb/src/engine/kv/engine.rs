@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use nodedb_types::Surrogate;
 
+use super::batch_put::KvBatchPutParams;
 use super::engine_helpers::{expiry_prefix, table_key};
 use super::expiry_wheel::ExpiryWheel;
 use super::hash_table::KvHashTable;
@@ -262,17 +263,26 @@ impl KvEngine {
     }
 
     /// BATCH PUT: insert/update multiple pairs. Returns count of new keys.
-    pub fn batch_put(
-        &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        entries: &[(Vec<u8>, Vec<u8>)],
-        ttl_ms: u64,
-        now_ms: u64,
-    ) -> usize {
+    ///
+    /// `surrogates` carries each entry's stable cross-engine identity,
+    /// same order and length as `entries` -- assigned by the CP-side
+    /// `SurrogateAssigner` from `(collection, key)`, same mechanism as a
+    /// single-key `put`. Pass `Surrogate::ZERO` per-entry only from internal
+    /// RMW callers that do not allocate one (existing entries preserve
+    /// their bound surrogate either way, per `put`'s semantics).
+    pub fn batch_put(&mut self, params: KvBatchPutParams<'_>) -> usize {
+        let KvBatchPutParams {
+            database_id,
+            tenant_id,
+            collection,
+            entries,
+            ttl_ms,
+            now_ms,
+            surrogates,
+        } = params;
         let mut new_count = 0;
-        for (key, value) in entries {
+        for (i, (key, value)) in entries.iter().enumerate() {
+            let surrogate = surrogates.get(i).copied().unwrap_or(Surrogate::ZERO);
             if self
                 .put(
                     database_id,
@@ -282,7 +292,7 @@ impl KvEngine {
                     value,
                     ttl_ms,
                     now_ms,
-                    Surrogate::ZERO,
+                    surrogate,
                 )
                 .is_none()
             {
@@ -582,7 +592,16 @@ mod tests {
         let n = now();
 
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..5u8).map(|i| (vec![i], vec![i * 10])).collect();
-        let new_count = e.batch_put(0, 1, "c", &entries, 0, n);
+        let surrogates = vec![Surrogate::ZERO; entries.len()];
+        let new_count = e.batch_put(KvBatchPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            entries: &entries,
+            ttl_ms: 0,
+            now_ms: n,
+            surrogates: &surrogates,
+        });
         assert_eq!(new_count, 5);
 
         let keys: Vec<Vec<u8>> = (0..7u8).map(|i| vec![i]).collect();
@@ -592,6 +611,56 @@ mod tests {
         assert_eq!(results[4], Some(vec![40]));
         assert!(results[5].is_none()); // Key 5 doesn't exist.
         assert!(results[6].is_none());
+    }
+
+    /// Regression: a native `KvBatchPut` used to call
+    /// `KvEngine::batch_put` with no per-entry surrogate, so every batch-put
+    /// row landed with `Surrogate::ZERO` -- invisible to any surrogate-keyed
+    /// cross-engine read/join, unlike a single-key `put` which always
+    /// carries a real, CP-assigned surrogate. This asserts `batch_put`
+    /// stores the REAL surrogate passed for each entry (observable via
+    /// `get_with_surrogate`, the same accessor the clone-delegated read path
+    /// uses), exactly mirroring what a loop of single-key `put` calls would
+    /// do. Fails pre-fix because pre-fix `batch_put` took no `surrogates`
+    /// parameter at all and hardcoded `Surrogate::ZERO` for every entry --
+    /// this test would not have compiled against that signature, and the
+    /// equivalent assertion against the old code (stubbing `Surrogate::ZERO`
+    /// in) observes `get_with_surrogate` returning `Surrogate::ZERO` instead
+    /// of the distinct real identity asserted here.
+    #[test]
+    fn batch_put_stores_real_per_entry_surrogates() {
+        let mut e = make_engine();
+        let n = now();
+
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..3u8).map(|i| (vec![i], vec![i * 10])).collect();
+        let surrogates: Vec<Surrogate> = (1..=3u32).map(Surrogate::new).collect();
+        let new_count = e.batch_put(KvBatchPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            entries: &entries,
+            ttl_ms: 0,
+            now_ms: n,
+            surrogates: &surrogates,
+        });
+        assert_eq!(new_count, 3);
+
+        for (i, expected) in surrogates.iter().enumerate() {
+            let key = &entries[i].0;
+            let (value, stored_surrogate) = e
+                .get_with_surrogate(0, 1, "c", key, n)
+                .unwrap_or_else(|| panic!("entry {i} must be present"));
+            assert_eq!(value, entries[i].1, "entry {i} value must round-trip");
+            assert_eq!(
+                stored_surrogate, *expected,
+                "entry {i} must carry its assigned surrogate, not Surrogate::ZERO"
+            );
+            assert_ne!(
+                stored_surrogate,
+                Surrogate::ZERO,
+                "entry {i} must not fall back to the unbound sentinel"
+            );
+        }
     }
 
     #[test]

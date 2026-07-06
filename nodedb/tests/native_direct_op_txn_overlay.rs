@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression test for TW-4 (shared root with TW-14): native direct-op
+//! Regression test: native direct-op
 //! dispatch (`handle_direct_op` in
 //! `control/server/native/dispatch/direct_ops.rs`) hardcoded `txn_id: None`
 //! on every dispatched `PhysicalTask`, so a native direct RANGE scan issued
@@ -230,7 +230,7 @@ async fn kv_batch_get(
     .await
 }
 
-/// Regression test for TW-16: a native `OpCode::KvBatchGet` fetched the
+/// Regression test: a native `OpCode::KvBatchGet` fetched the
 /// requested keys' values correctly on the Data Plane
 /// (`execute_kv_batch_get` in `data/executor/handlers/kv/batch.rs`), but the
 /// native-protocol response shaping dropped them -- `apply_kv_wrap`
@@ -350,7 +350,7 @@ async fn native_kv_batch_get_returns_fetched_values() {
     );
 }
 
-/// Regression test for TW-14: a native direct-op `KvBatchPut` issued inside
+/// Regression test: a native direct-op `KvBatchPut` issued inside
 /// an explicit transaction used to write straight through to durable storage
 /// (`execute_kv_batch_put` in `data/executor/handlers/kv/batch.rs`, called
 /// unconditionally from `handle_direct_op` via `dispatch_single_task`,
@@ -553,4 +553,115 @@ async fn native_kv_batch_put_in_txn_is_staged_and_rolled_back() {
             .any(|v| *v == Value::String("ck1".into())),
         "committed key 'ck1' must be visible after COMMIT: {after_commit_rows:?}"
     );
+}
+
+/// Regression test: a native `KvBatchPut` (`build_batch_put` in
+/// `control/server/native/dispatch/plan_builder/kv.rs`) never called the
+/// CP-side `SurrogateAssigner`, so `execute_kv_batch_put`
+/// (`data/executor/handlers/kv/batch.rs`) wrote every batch-put row through
+/// `KvEngine::batch_put` with `Surrogate::ZERO` -- the unbound sentinel --
+/// unlike a single-key `Put`/`Insert`/`PointPut`, which always plans a real
+/// surrogate via `assign_kv_surrogate`. A `Surrogate::ZERO` row is invisible
+/// to any cross-engine surrogate-keyed prefilter/join (real bitmaps never
+/// contain the reserved `0` element), a correctness gap versus single-key
+/// puts.
+///
+/// No client-facing read in this codebase currently surfaces or gates on a
+/// KV row's per-row surrogate: `KvOp::Scan`'s `surrogate_ceiling` treats
+/// `s == 0` as *always visible* by design (so it cannot distinguish
+/// zero from non-zero), and no native opcode exposes
+/// `KvEngine::get_with_surrogate` / `key_for_surrogate`. So this test
+/// cannot observe the surrogate value itself over the wire; the direct,
+/// fails-pre-fix-passes-post-fix observable for the surrogate value lives
+/// in `nodedb::engine::kv::engine::tests::batch_put_stores_real_per_entry_surrogates`
+/// (`src/engine/kv/engine.rs`), which asserts `KvEngine::batch_put` stores
+/// each entry's real assigned surrogate via `get_with_surrogate` (pre-fix,
+/// that call took no `surrogates` parameter and hardcoded
+/// `Surrogate::ZERO` for every entry).
+///
+/// What this test covers instead, end-to-end over the native wire: a
+/// `KvBatchPut` writes rows that are functionally indistinguishable from
+/// rows written by single-key `PointPut` calls on the same collection --
+/// both are fully visible via `KvScan` and `KvBatchGet` immediately
+/// afterward, i.e. the fix does not regress the batch path's observable
+/// read behavior while it starts assigning real surrogates underneath.
+#[tokio::test]
+async fn native_kv_batch_put_rows_visible_same_as_single_put() {
+    let server = NativeTestServer::start().await;
+    let (mut stream, _ack) = do_handshake(server.addr, &HelloFrame::current())
+        .await
+        .expect("handshake");
+
+    let create_resp = send_sql(
+        &mut stream,
+        1,
+        "CREATE COLLECTION native_kv_batch_parity (key TEXT PRIMARY KEY, val TEXT) \
+         WITH (engine='kv')",
+    )
+    .await;
+    assert_ne!(
+        create_resp.status,
+        ResponseStatus::Error,
+        "CREATE must succeed: {create_resp:?}"
+    );
+
+    // Single-key native PointPut, same code path (`assign_kv_surrogate`) a
+    // RESP `SET` or `INSERT` would take -- establishes the baseline "real
+    // surrogate" row shape batch-put rows must match functionally.
+    let single_put = send_request(
+        &mut stream,
+        2,
+        OpCode::PointPut,
+        TextFields {
+            collection: Some("native_kv_batch_parity".to_string()),
+            document_id: Some("single1".to_string()),
+            data: Some(b"single-value".to_vec()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_ne!(
+        single_put.status,
+        ResponseStatus::Error,
+        "single-key PointPut must succeed: {single_put:?}"
+    );
+
+    let put_resp = kv_batch_put(
+        &mut stream,
+        3,
+        "native_kv_batch_parity",
+        vec![
+            (b"batch1".to_vec(), b"batch-value-one".to_vec()),
+            (b"batch2".to_vec(), b"batch-value-two".to_vec()),
+        ],
+    )
+    .await;
+    assert_ne!(
+        put_resp.status,
+        ResponseStatus::Error,
+        "KvBatchPut must succeed: {put_resp:?}"
+    );
+
+    // KvScan must see all three rows (one single-put, two batch-put).
+    let scan = kv_scan(&mut stream, 4, "native_kv_batch_parity").await;
+    server.shutdown().await;
+    assert_ne!(
+        scan.status,
+        ResponseStatus::Error,
+        "KvScan must succeed: {scan:?}"
+    );
+    let rows = scan.rows.expect("rows present");
+    assert_eq!(
+        rows.len(),
+        3,
+        "KvScan must see the single-put row plus both batch-put rows: {rows:?}"
+    );
+    for expected_key in ["single1", "batch1", "batch2"] {
+        assert!(
+            rows.iter()
+                .flatten()
+                .any(|v| *v == Value::String(expected_key.into())),
+            "key '{expected_key}' must be visible via KvScan: {rows:?}"
+        );
+    }
 }

@@ -126,6 +126,7 @@ fn kv_protocol_command_sequence() {
                 (b"c".to_vec(), b"3".to_vec()),
             ],
             ttl_ms: 0,
+            surrogates: vec![nodedb_types::Surrogate::ZERO; 3],
         }),
     );
 

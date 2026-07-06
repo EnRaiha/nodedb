@@ -8,7 +8,22 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
+use crate::engine::kv::KvBatchPutParams;
 use crate::engine::kv::current_ms;
+
+/// Parameters for [`CoreLoop::execute_kv_batch_put`].
+///
+/// Bundles the plain data args so the method stays argument-count clean;
+/// `task` (response routing) is passed separately since it isn't part of
+/// the KV batch-put payload.
+pub(in crate::data::executor) struct KvBatchPutArgs<'a> {
+    pub did: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub entries: &'a [(Vec<u8>, Vec<u8>)],
+    pub ttl_ms: u64,
+    pub surrogates: &'a [nodedb_types::Surrogate],
+}
 
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_batch_get(
@@ -61,20 +76,30 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_batch_put(
         &mut self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        entries: &[(Vec<u8>, Vec<u8>)],
-        ttl_ms: u64,
+        args: KvBatchPutArgs<'_>,
     ) -> Response {
+        let KvBatchPutArgs {
+            did,
+            tid,
+            collection,
+            entries,
+            ttl_ms,
+            surrogates,
+        } = args;
         debug!(core = self.core_id, %collection, count = entries.len(), "kv batch put");
         let now_ms: u64 = self
             .epoch_system_ms
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
-        let new_count = self
-            .kv_engine
-            .batch_put(did, tid, collection, entries, ttl_ms, now_ms);
+        let new_count = self.kv_engine.batch_put(KvBatchPutParams {
+            database_id: did,
+            tenant_id: tid,
+            collection,
+            entries,
+            ttl_ms,
+            now_ms,
+            surrogates,
+        });
         match response_codec::encode_count("inserted", new_count) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(

@@ -125,6 +125,7 @@ fn kv_batch_put_and_get() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
     let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..5u8).map(|i| (vec![i], vec![i * 10])).collect();
+    let surrogates = vec![nodedb_types::Surrogate::ZERO; entries.len()];
 
     let payload = send_ok(
         &mut core,
@@ -134,6 +135,7 @@ fn kv_batch_put_and_get() {
             collection: "c".into(),
             entries,
             ttl_ms: 0,
+            surrogates,
         }),
     );
     let json = payload_value(&payload);

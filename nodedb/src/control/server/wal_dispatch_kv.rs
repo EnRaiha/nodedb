@@ -74,6 +74,7 @@ pub fn wal_append_kv_op(
             collection,
             entries,
             ttl_ms,
+            surrogates: _,
         } => {
             let entry = zerompk::to_msgpack_vec(&("kv_batch_put", collection, entries, ttl_ms))
                 .map_err(|e| crate::Error::Serialization {

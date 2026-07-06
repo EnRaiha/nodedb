@@ -21,6 +21,7 @@ fn batch_put_entries(ctx: &mut TestCtx, collection: &str, count: usize) {
             (key, value)
         })
         .collect();
+    let surrogates = vec![nodedb_types::Surrogate::ZERO; entries.len()];
     send_ok(
         &mut ctx.core,
         &mut ctx.tx,
@@ -29,6 +30,7 @@ fn batch_put_entries(ctx: &mut TestCtx, collection: &str, count: usize) {
             collection: collection.into(),
             entries,
             ttl_ms: 0,
+            surrogates,
         }),
     );
 }

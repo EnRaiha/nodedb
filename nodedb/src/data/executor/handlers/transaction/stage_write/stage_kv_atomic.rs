@@ -121,6 +121,11 @@ impl CoreLoop {
                 collection,
                 entries,
                 ttl_ms,
+                // The plan's per-entry cross-engine surrogates are applied by
+                // the durable COMMIT-time replay through `execute_kv_batch_put`;
+                // the staging overlay keys its own slots (see module doc) and
+                // ignores them here, same as `Incr`/`Cas`/`GetSet` above.
+                surrogates: _,
             } => self.stage_kv_batch_put(task, tid, txn_id, collection, entries, *ttl_ms),
             other => unreachable!(
                 "execute_stage_kv_atomic called on a non-atomic KvOp; \
