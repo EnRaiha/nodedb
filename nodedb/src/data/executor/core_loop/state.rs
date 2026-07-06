@@ -32,8 +32,7 @@ use super::priority_queues::PriorityQueues;
 /// - SPSC consumer for incoming requests from the Control Plane
 /// - SPSC producer for outgoing responses to the Control Plane
 /// - Per-core `SparseEngine` (redb) for point lookups and range scans
-/// - Per-tenant `TenantCrdtEngine` instances (lazy-initialized)
-/// - Task queue for pending execution
+/// - Per-tenant `TenantCrdtEngine` instances (lazy-initialized) + task queue
 ///
 /// This type is intentionally `!Send` — pinned to a single core.
 pub struct CoreLoop {
@@ -483,18 +482,19 @@ pub struct CoreLoop {
 
     /// Per-transaction staging overlay: not-yet-durable writes for each
     /// in-flight transaction on this core, keyed by `TxnId`. Populated by
-    /// `MetaOp::StageWrite` at statement time, released by
-    /// `MetaOp::DropTxnOverlay` on commit or rollback.
+    /// `MetaOp::StageWrite`, released by `MetaOp::DropTxnOverlay`.
     pub(in crate::data::executor) txn_overlays: HashMap<
         crate::types::TxnId,
         crate::data::executor::handlers::transaction::overlay::TxnOverlay,
     >,
-
     /// Parallel to `txn_overlays`, for GRAPH writes (edge identity is a
-    /// string tuple, not a surrogate -- see `GraphTxnOverlay`). Same
-    /// lifecycle, released by `MetaOp::DropTxnOverlay`.
+    /// string tuple, not a surrogate -- see `GraphTxnOverlay`). Same lifecycle.
     pub(in crate::data::executor) graph_txn_overlays: HashMap<
         crate::types::TxnId,
         crate::data::executor::handlers::transaction::overlay::GraphTxnOverlay,
     >,
+    /// Columnar engines THIS txn newly created while staging; `DropTxnOverlay`
+    /// drops still-empty entries (rollback) and leaves filled ones (commit).
+    pub(in crate::data::executor) txn_created_columnar_engines:
+        HashMap<crate::types::TxnId, std::collections::HashSet<(DatabaseId, TenantId, String)>>,
 }

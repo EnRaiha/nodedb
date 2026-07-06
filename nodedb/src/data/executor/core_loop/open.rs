@@ -177,6 +177,7 @@ impl CoreLoop {
             ollp_is_group_leader: true,
             txn_overlays: HashMap::new(),
             graph_txn_overlays: HashMap::new(),
+            txn_created_columnar_engines: HashMap::new(),
         })
     }
 }

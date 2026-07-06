@@ -109,6 +109,7 @@ impl CoreLoop {
         // same-transaction SELECT resolves the same schema instead of
         // hitting the scan's "missing engine -> empty result" branch. See
         // `ensure_columnar_engine_schema` doc comment.
+        let engine_preexisted = self.columnar_engines.contains_key(&engine_key);
         let schema = self.ensure_columnar_engine_schema(
             &engine_key,
             collection,
@@ -116,6 +117,18 @@ impl CoreLoop {
             &ndb_rows[0],
             schema_bytes,
         );
+        // Track engines THIS transaction newly auto-created (never engines
+        // that already existed before the txn started) so `MetaOp::DropTxnOverlay`
+        // can drop the still-empty ones on rollback without touching engines
+        // a prior/concurrent write populated. The staged rows themselves go
+        // to the overlay below, never the engine's memtable, so a purely
+        // staged-then-rolled-back engine is guaranteed empty at that point.
+        if !engine_preexisted {
+            self.txn_created_columnar_engines
+                .entry(txn_id)
+                .or_default()
+                .insert(engine_key.clone());
+        }
 
         let sys_now = if bitemporal {
             self.bitemporal_now_ms()

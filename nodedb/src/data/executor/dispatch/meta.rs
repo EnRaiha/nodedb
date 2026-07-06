@@ -233,9 +233,30 @@ impl CoreLoop {
             // this is safe even when no overlay was ever populated. The GRAPH
             // overlay is a parallel, independent structure (see
             // `GraphTxnOverlay`) and is dropped in lockstep.
+            //
+            // Columnar engines this transaction auto-created during staging
+            // (`stage_columnar_insert` -> `ensure_columnar_engine_schema`) are
+            // dropped here too, but ONLY if still empty. On ROLLBACK the
+            // staged rows never left the overlay, so the engine's memtable is
+            // still empty and gets dropped -- no phantom empty engine survives
+            // the rollback. On COMMIT, `TransactionBatch` has already replayed
+            // the insert through `execute_columnar_insert` (populating the
+            // memtable) before this dispatches, so the empty-check fails and
+            // the engine correctly stays registered with its committed rows.
             MetaOp::DropTxnOverlay { txn_id } => {
                 self.txn_overlays.remove(txn_id);
                 self.graph_txn_overlays.remove(txn_id);
+                if let Some(created) = self.txn_created_columnar_engines.remove(txn_id) {
+                    for engine_key in created {
+                        let still_empty = self
+                            .columnar_engines
+                            .get(&engine_key)
+                            .is_some_and(|engine| engine.memtable().is_empty());
+                        if still_empty {
+                            self.columnar_engines.remove(&engine_key);
+                        }
+                    }
+                }
                 self.response_ok(task)
             }
 
@@ -277,5 +298,259 @@ impl CoreLoop {
                 self.response_ok(task)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod txn_created_columnar_engine_tests {
+    //! `MetaOp::DropTxnOverlay` must reap a columnar engine that a transaction
+    //! auto-created purely via statement-time staging (its rows never left the
+    //! per-txn overlay for the engine's memtable) — but ONLY while that engine
+    //! is still empty. On ROLLBACK the memtable is empty, so the phantom engine
+    //! is dropped; on COMMIT the memtable has already been populated by the
+    //! `TransactionBatch` replay, so the engine (and its rows) survive.
+    //!
+    //! Observed directly on `CoreLoop::columnar_engines` membership — the field
+    //! the fix mutates — because a leaked empty engine is invisible to ordinary
+    //! SELECTs (`execute_columnar_scan` returns an empty result identically for
+    //! an absent key and a present-but-empty engine).
+
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    use nodedb_bridge::buffer::RingBuffer;
+    use nodedb_physical::physical_plan::MetaOp;
+    use nodedb_types::Surrogate;
+    use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
+    use nodedb_types::value::Value;
+
+    use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+    use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::handlers::transaction::stage_write::StageColumnarInsertParams;
+    use crate::data::executor::task::ExecutionTask;
+    use crate::types::{
+        DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, TxnId, VShardId,
+    };
+
+    const TID: u64 = 1;
+
+    fn make_core() -> (CoreLoop, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, _resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("CoreLoop::open");
+        (core, dir)
+    }
+
+    fn make_task() -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(TID),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Meta(MetaOp::Compact),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+        })
+    }
+
+    /// Deterministic 2-column schema (`id` Int64 PK, `v` Float64) so the
+    /// engine's column order is fixed regardless of row `HashMap` iteration.
+    fn schema_bytes() -> Vec<u8> {
+        let schema = ColumnarSchema::new(vec![
+            ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+            ColumnDef::nullable("v", ColumnType::Float64),
+        ])
+        .expect("valid schema");
+        zerompk::to_msgpack_vec(&schema).expect("encode schema")
+    }
+
+    /// One-row payload `[{"id": id, "v": val}]` in the staging wire shape
+    /// `stage_columnar_insert` decodes.
+    fn payload(id: i64, val: f64) -> Vec<u8> {
+        let mut obj = HashMap::new();
+        obj.insert("id".to_string(), Value::Integer(id));
+        obj.insert("v".to_string(), Value::Float(val));
+        nodedb_types::value_to_msgpack(&Value::Array(vec![Value::Object(obj)])).expect("encode row")
+    }
+
+    /// Drive the real staging path: stage one columnar INSERT into a NEW
+    /// collection under `txn_id`. Returns the engine key it auto-registers.
+    fn stage_new_collection(
+        core: &mut CoreLoop,
+        task: &ExecutionTask,
+        txn_id: TxnId,
+        collection: &str,
+    ) -> (DatabaseId, TenantId, String) {
+        let sb = schema_bytes();
+        let pl = payload(1, 1.0);
+        let surrogates = [Surrogate::new(1)];
+        let resp = core.stage_columnar_insert(StageColumnarInsertParams {
+            task,
+            tid: TID,
+            txn_id,
+            collection,
+            payload: &pl,
+            surrogates: &surrogates,
+            schema_bytes: &sb,
+        });
+        assert_eq!(
+            resp.status,
+            Status::Ok,
+            "staged columnar insert into a new collection must succeed: {:?}",
+            resp.error_code
+        );
+        (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            collection.to_string(),
+        )
+    }
+
+    #[test]
+    fn rollback_drops_the_empty_txn_created_columnar_engine() {
+        let (mut core, _dir) = make_core();
+        let task = make_task();
+        let txn_id = TxnId::new(42);
+
+        let key = stage_new_collection(&mut core, &task, txn_id, "rolled_back");
+
+        // Staging auto-created the engine and recorded it as txn-created; the
+        // staged row lives only in the overlay, so the memtable is empty.
+        assert!(
+            core.columnar_engines.contains_key(&key),
+            "staging must auto-register the columnar engine"
+        );
+        assert!(
+            core.txn_created_columnar_engines
+                .get(&txn_id)
+                .is_some_and(|s| s.contains(&key)),
+            "the newly-created engine must be tracked for this txn"
+        );
+        assert!(
+            core.columnar_engines[&key].memtable().is_empty(),
+            "staged rows go to the overlay, not the memtable — memtable stays empty"
+        );
+
+        // ROLLBACK path: DropTxnOverlay must reap the still-empty phantom engine.
+        let resp = core.dispatch_meta(&task, TID, &MetaOp::DropTxnOverlay { txn_id });
+        assert_eq!(resp.status, Status::Ok);
+
+        // The core assertion. Pre-fix, `columnar_engines` still contains `key`
+        // here (DropTxnOverlay only cleared the overlays) — so this FAILS on the
+        // pre-fix tree and passes only once the empty engine is dropped.
+        assert!(
+            !core.columnar_engines.contains_key(&key),
+            "a rolled-back txn must NOT leave a phantom empty columnar engine registered"
+        );
+        assert!(
+            !core.txn_created_columnar_engines.contains_key(&txn_id),
+            "per-txn created-engine tracking must be cleared on resolution"
+        );
+    }
+
+    #[test]
+    fn commit_keeps_the_populated_txn_created_columnar_engine() {
+        let (mut core, _dir) = make_core();
+        let task = make_task();
+        let txn_id = TxnId::new(7);
+
+        let key = stage_new_collection(&mut core, &task, txn_id, "committed");
+        assert!(core.columnar_engines.contains_key(&key));
+
+        // Mimic COMMIT: the `TransactionBatch` replay applies the buffered
+        // insert to the engine's memtable BEFORE DropTxnOverlay dispatches.
+        core.columnar_engines
+            .get_mut(&key)
+            .expect("engine present")
+            .insert(&[Value::Integer(1), Value::Float(1.0)])
+            .expect("apply committed row to memtable");
+        assert!(
+            !core.columnar_engines[&key].memtable().is_empty(),
+            "commit replay must populate the memtable"
+        );
+
+        let resp = core.dispatch_meta(&task, TID, &MetaOp::DropTxnOverlay { txn_id });
+        assert_eq!(resp.status, Status::Ok);
+
+        // Guards against an over-eager fix that drops every txn-created engine
+        // unconditionally: a populated engine must survive COMMIT.
+        assert!(
+            core.columnar_engines.contains_key(&key),
+            "a committed txn's populated columnar engine must stay registered"
+        );
+        assert!(
+            !core.txn_created_columnar_engines.contains_key(&txn_id),
+            "per-txn created-engine tracking must be cleared on commit too"
+        );
+    }
+
+    #[test]
+    fn drop_does_not_touch_a_preexisting_engine_staged_into() {
+        // An engine that already existed before the txn must never be tracked
+        // or dropped, even if a staged insert routes through it.
+        let (mut core, _dir) = make_core();
+        let task = make_task();
+        let txn_id = TxnId::new(9);
+        let collection = "preexisting";
+
+        // First txn creates + commits (memtable populated) — the engine is now
+        // pre-existing committed state.
+        let key = stage_new_collection(&mut core, &task, txn_id, collection);
+        core.columnar_engines
+            .get_mut(&key)
+            .expect("engine present")
+            .insert(&[Value::Integer(1), Value::Float(1.0)])
+            .expect("apply committed row");
+        let resp = core.dispatch_meta(&task, TID, &MetaOp::DropTxnOverlay { txn_id });
+        assert_eq!(resp.status, Status::Ok);
+        assert!(core.columnar_engines.contains_key(&key));
+
+        // Second txn stages into the SAME (now pre-existing) collection.
+        let txn2 = TxnId::new(10);
+        let sb = schema_bytes();
+        let pl = payload(2, 2.0);
+        let surrogates = [Surrogate::new(2)];
+        let resp = core.stage_columnar_insert(StageColumnarInsertParams {
+            task: &task,
+            tid: TID,
+            txn_id: txn2,
+            collection,
+            payload: &pl,
+            surrogates: &surrogates,
+            schema_bytes: &sb,
+        });
+        assert_eq!(resp.status, Status::Ok);
+        assert!(
+            !core
+                .txn_created_columnar_engines
+                .get(&txn2)
+                .is_some_and(|s| s.contains(&key)),
+            "a pre-existing engine must NOT be tracked as txn-created"
+        );
+
+        // Rolling back the second txn must leave the pre-existing engine alone.
+        let resp = core.dispatch_meta(&task, TID, &MetaOp::DropTxnOverlay { txn_id: txn2 });
+        assert_eq!(resp.status, Status::Ok);
+        assert!(
+            core.columnar_engines.contains_key(&key),
+            "rolling back a staged insert into a pre-existing engine must not drop it"
+        );
     }
 }
