@@ -37,11 +37,14 @@ pub async fn dispatch_graph(
                 state,
                 identity,
                 database_id,
-                collection,
-                src,
-                dst,
-                label,
+                edge::EdgeRef {
+                    collection,
+                    src,
+                    dst,
+                    label,
+                },
                 properties,
+                txn_ctx,
             )
             .await,
         ),

@@ -8,6 +8,7 @@
 pub(super) mod continuation;
 pub(super) mod core;
 pub(super) mod expansion;
+pub(super) mod overlay_expand;
 pub(super) mod predicates;
 pub(super) mod types;
 

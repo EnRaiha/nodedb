@@ -37,14 +37,24 @@ pub(super) async fn scatter_round_zero(
     query_bytes: &[u8],
     deadline_ms: u64,
 ) -> crate::Result<Vec<TaggedShardResult>> {
-    // Local cores: fan to all and unwrap each `{rows, frontier}` envelope.
+    // Local cores: fan to all and unwrap each `{rows, frontier}` envelope. The
+    // cluster MATCH path runs `cluster_mode = true`, under which the pattern
+    // engine's transaction-overlay merge is disabled (the durable path must emit
+    // the cross-shard frontier instead), so no `txn_id` is threaded here —
+    // cross-shard MATCH read-your-own-writes is a separate unit.
     let local_plan = PhysicalPlan::Graph(GraphOp::Match {
         query: query_bytes.to_vec(),
         frontier_bitmap: None,
         cluster_mode: true,
     });
-    let local_fut =
-        broadcast_match_to_all_cores(state, tenant_id, database_id, local_plan, TraceId::ZERO);
+    let local_fut = broadcast_match_to_all_cores(
+        state,
+        tenant_id,
+        database_id,
+        local_plan,
+        TraceId::ZERO,
+        None,
+    );
 
     // Remote owners: one batched dispatch per distinct non-local group leader.
     let remote_owners = distinct_remote_owners(state)?;

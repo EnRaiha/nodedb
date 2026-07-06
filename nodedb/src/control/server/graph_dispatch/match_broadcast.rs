@@ -40,7 +40,7 @@ use crate::data::executor::handlers::graph_match::{
     MATCH_ENVELOPE_FRONTIER_KEY, MATCH_ENVELOPE_RESUME_KEY, MATCH_ENVELOPE_ROWS_KEY,
 };
 use crate::engine::graph::pattern::executor::{UnresolvedExpansion, VarLenResume};
-use crate::types::{DatabaseId, TenantId, TraceId};
+use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 use nodedb_query::msgpack_scan::reader::{map_header, read_str_advance, skip_value};
 
 /// Result of a MATCH cross-core broadcast after envelope unwrapping.
@@ -195,6 +195,7 @@ pub async fn broadcast_match_to_all_cores(
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<MatchBroadcastOutcome> {
     // Shared broadcast call counter (parity with the generic gather path).
     crate::control::server::broadcast::broadcast_call_count_increment();
@@ -203,10 +204,12 @@ pub async fn broadcast_match_to_all_cores(
 
     // Eager dispatch: register a tracker receiver and dispatch to each core
     // BEFORE awaiting any response, matching gather_all_cores' true-parallelism
-    // prologue.
-    // MATCH pattern broadcast: not session-transaction-scoped, so `None`.
+    // prologue. `txn_id` (the caller's active session transaction, if any) is
+    // stamped on each core's request so the Data-Plane MATCH handler resolves
+    // the transaction's `GraphTxnOverlay` for read-your-own-writes; `None` is
+    // the autocommit path (committed-CSR-only), byte-identical to before.
     let receivers =
-        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, None, |_| {
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, txn_id, |_| {
             plan.clone()
         })?;
 

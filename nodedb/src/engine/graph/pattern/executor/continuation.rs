@@ -14,7 +14,7 @@ use super::expansion::{VarLenCaps, VarLenCursor, VarLenPattern, resume_variable_
 use super::predicates;
 use super::predicates::PropertyLookup;
 use super::types::{BindingRow, ContinuationSeed, ExecutionState, MatchOutcome, VarLenResume};
-use crate::engine::graph::csr::CsrIndex;
+use crate::engine::graph::csr::{CsrIndex, GraphOverlayDelta};
 use crate::engine::graph::edge_store::EdgeStore;
 
 /// Chain-execution core: expand a pattern chain's triples starting at
@@ -37,6 +37,7 @@ pub(super) fn run_chain_from(
     csr: &CsrIndex,
     state: &mut ExecutionState,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<Vec<BindingRow>, crate::Error> {
     let mut rows = initial_rows;
 
@@ -50,6 +51,7 @@ pub(super) fn run_chain_from(
                 row,
                 state,
                 frontier_bitmap,
+                overlay,
             )?);
         }
         rows = next_rows;
@@ -68,15 +70,14 @@ pub(super) fn run_chain_from(
 /// path (`execute_query`) and the cross-shard resume path
 /// ([`execute_continuation`]) funnel their expanded rows through here so the
 /// tail semantics are identical regardless of where expansion started.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_rows(
     query: &MatchQuery,
     mut rows: Vec<BindingRow>,
     csr: &CsrIndex,
     edge_store: &EdgeStore,
-    frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     varlen_caps: VarLenCaps,
     props: &PropertyLookup<'_>,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<Vec<BindingRow>, crate::Error> {
     for predicate in &query.where_predicates {
         rows = predicates::apply_predicate(
@@ -84,9 +85,9 @@ pub(super) fn finalize_rows(
             predicate,
             csr,
             edge_store,
-            frontier_bitmap,
             varlen_caps,
             props,
+            overlay,
         )?;
     }
 
@@ -169,6 +170,7 @@ pub fn execute_continuation<'a>(
     seed: ContinuationSeed,
     varlen_caps: VarLenCaps,
     props: &PropertyLookup<'_>,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<MatchOutcome, crate::Error> {
     // Mid-pattern resume is only unambiguous for a single clause holding a
     // single pattern chain. Reject anything else with a typed error rather
@@ -209,6 +211,7 @@ pub fn execute_continuation<'a>(
         csr,
         &mut state,
         frontier_bitmap,
+        overlay,
     )?;
 
     let rows = finalize_rows(
@@ -216,9 +219,9 @@ pub fn execute_continuation<'a>(
         rows,
         csr,
         edge_store,
-        frontier_bitmap,
         state.varlen_caps,
         props,
+        overlay,
     )?;
 
     Ok(MatchOutcome {
@@ -273,6 +276,7 @@ pub fn execute_varlen_resume<'a>(
     resume: VarLenResume,
     varlen_caps: VarLenCaps,
     props: &PropertyLookup<'_>,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<MatchOutcome, crate::Error> {
     // Same single-chain restriction as `execute_continuation`: mid-pattern
     // resume is only unambiguous for a single MATCH clause with one chain.
@@ -377,6 +381,7 @@ pub fn execute_varlen_resume<'a>(
         csr,
         &mut state,
         frontier_bitmap,
+        overlay,
     )?;
 
     let rows = finalize_rows(
@@ -384,9 +389,9 @@ pub fn execute_varlen_resume<'a>(
         rows,
         csr,
         edge_store,
-        frontier_bitmap,
         state.varlen_caps,
         props,
+        overlay,
     )?;
 
     Ok(MatchOutcome {
@@ -466,6 +471,7 @@ mod tests {
             None,
             VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows
@@ -520,6 +526,7 @@ mod tests {
                 resume,
                 VarLenCaps::default(),
                 &props,
+                None,
             )
             .unwrap();
             for row in &outcome.rows {
@@ -570,6 +577,7 @@ mod tests {
             },
             VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap();
 
@@ -613,6 +621,7 @@ mod tests {
             },
             VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap();
 
@@ -643,6 +652,7 @@ mod tests {
             None,
             VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;

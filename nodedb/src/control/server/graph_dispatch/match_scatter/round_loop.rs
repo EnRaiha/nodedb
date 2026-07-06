@@ -59,12 +59,18 @@ fn push_dispatch_fut<'f>(
     match remote_coords {
         None => {
             futs.push(Box::pin(async move {
+                // Cross-shard MATCH continuation: the resumed pattern runs on
+                // whichever owner shard emitted the frontier, not necessarily
+                // the node holding the transaction's staged overlay, so no
+                // txn_id is threaded here (committed-CSR-only). Cross-shard
+                // read-your-own-writes for MATCH remains a separate unit.
                 let outcome = broadcast_match_to_all_cores(
                     state,
                     tenant_id,
                     database_id,
                     plan,
                     TraceId::ZERO,
+                    None,
                 )
                 .await?;
                 Ok::<_, crate::Error>(vec![TaggedShardResult {

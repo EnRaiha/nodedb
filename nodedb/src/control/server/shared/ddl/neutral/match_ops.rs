@@ -15,7 +15,7 @@ use crate::control::server::graph_dispatch;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
-use crate::types::{DatabaseId, TraceId};
+use crate::types::{DatabaseId, TraceId, TxnId};
 use nodedb_physical::physical_plan::GraphOp;
 
 use super::super::result::{DdlError, DdlResult};
@@ -39,6 +39,7 @@ pub async fn match_query(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
+    txn_id: Option<TxnId>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     // Parse the MATCH query.
     let query = crate::engine::graph::pattern::compiler::parse(sql).map_err(|e| DdlError {
@@ -129,6 +130,7 @@ pub async fn match_query(
             database_id,
             plan,
             TraceId::ZERO,
+            txn_id,
         )
         .await
         {
@@ -158,6 +160,12 @@ pub async fn match_query(
     // continuation round loop across shard boundaries. `scatter_match` returns
     // the deduped rows in the same bare-array shape and a `partial` flag set on
     // truncation / round exhaustion.
+    // Cluster mode runs `cluster_mode = true`, under which the pattern engine's
+    // transaction-overlay merge is disabled (see `match_scatter::round_zero`), so
+    // `txn_id` is not threaded into the cluster scatter — a MATCH inside a
+    // transaction reads committed CSR across shards. Cross-shard MATCH
+    // read-your-own-writes is a separate unit; the single-node path above carries
+    // `txn_id` for the overlay merge.
     let deadline_ms = crate::control::gateway::dispatcher::default_deadline_ms(state);
     match graph_dispatch::scatter_match(state, tenant_id, database_id, query_bytes, deadline_ms)
         .await

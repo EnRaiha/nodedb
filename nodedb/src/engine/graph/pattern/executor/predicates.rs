@@ -6,7 +6,7 @@ use super::super::ast::*;
 use super::core::execute_clause;
 use super::expansion::VarLenCaps;
 use super::types::{BindingRow, ExecutionState};
-use crate::engine::graph::csr::CsrIndex;
+use crate::engine::graph::csr::{CsrIndex, GraphOverlayDelta};
 use crate::engine::graph::edge_store::EdgeStore;
 use crate::engine::sparse::btree::SparseEngine;
 
@@ -47,9 +47,9 @@ pub(super) fn apply_predicate(
     predicate: &WherePredicate,
     csr: &CsrIndex,
     _edge_store: &EdgeStore,
-    _frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     varlen_caps: VarLenCaps,
     props: &PropertyLookup<'_>,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<Vec<BindingRow>, crate::Error> {
     match predicate {
         WherePredicate::Equals {
@@ -172,6 +172,7 @@ pub(super) fn apply_predicate(
                     std::slice::from_ref(row),
                     &mut sub_state,
                     None,
+                    overlay,
                 )?;
                 if sub_state.truncated() {
                     // Sub-pattern hit a cap — treat the outer match as

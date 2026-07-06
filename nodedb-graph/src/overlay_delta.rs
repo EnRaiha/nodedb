@@ -94,6 +94,21 @@ impl GraphOverlayDelta {
         })
     }
 
+    /// Every node name that appears as an endpoint of a staged edge (as a
+    /// source in `out_edges` or a destination in `in_edges`).
+    ///
+    /// A node created purely by an in-transaction edge write has no durable CSR
+    /// id, so a pattern engine that enumerates free-ranging MATCH anchors from
+    /// the CSR alone would never admit it. This lets such staged-only nodes be
+    /// offered as candidate anchors. Names may repeat (a node that is both a
+    /// staged source and a staged destination); callers dedup as needed.
+    pub fn staged_endpoint_names(&self) -> impl Iterator<Item = &str> {
+        self.out_edges
+            .keys()
+            .chain(self.in_edges.keys())
+            .map(String::as_str)
+    }
+
     /// True when `src -[label]-> dst` has been staged-deleted.
     pub fn is_tombstoned(&self, src: &str, label: &str, dst: &str) -> bool {
         self.tombstones

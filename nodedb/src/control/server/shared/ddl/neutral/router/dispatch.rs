@@ -155,7 +155,13 @@ pub async fn try_dispatch(
     // pgwire `dsl` router's MatchQuery branch). It must precede the general graph
     // dispatch below, which does not own `MatchQuery`.
     if let NodedbStatement::Graph(GraphStmt::MatchQuery { .. }) = &stmt {
-        return Some(match_ops::match_query(state, identity, database_id, sql).await);
+        // Read-your-own-writes: a MATCH inside an explicit transaction must
+        // observe the session's staged edge writes/deletes, so resolve the
+        // active `TxnId` (idle sessions → `None`, an autocommit read) and hand
+        // it to the MATCH handler for the Data-Plane overlay merge — mirroring
+        // the single-hop `GRAPH NEIGHBORS` path.
+        let (txn_id, _) = txn_ctx.sessions.txn_identity(txn_ctx.addr);
+        return Some(match_ops::match_query(state, identity, database_id, sql, txn_id).await);
     }
 
     // Graph-overlay statements (GRAPH INSERT/DELETE EDGE, GRAPH LABEL/UNLABEL,

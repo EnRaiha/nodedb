@@ -54,17 +54,24 @@ fn validate_edge_label(label: &str) -> Result<(), DdlError> {
 }
 
 /// `GRAPH INSERT EDGE IN '<collection>' FROM '<src>' TO '<dst>' TYPE '<label>' [PROPERTIES '<json>' | { ... }]`
-#[allow(clippy::too_many_arguments)]
+///
+/// The edge identity (`collection`/`src`/`dst`/`label`) is bundled in [`EdgeRef`]
+/// so this stays within the argument budget without an `#[allow]`, matching
+/// [`delete_edge`].
 pub async fn insert_edge(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    collection: String,
-    src: String,
-    dst: String,
-    label: String,
+    edge: EdgeRef,
     properties: GraphProperties,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    let EdgeRef {
+        collection,
+        src,
+        dst,
+        label,
+    } = edge;
     if collection.is_empty() {
         return Err(ddl_err(
             "42601",
@@ -141,8 +148,44 @@ pub async fn insert_edge(
     // through Calvin.
     let calvin_available =
         state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
+    let single_home = vsrc == vdst || !calvin_available;
 
-    if vsrc == vdst || !calvin_available {
+    // Inside an explicit transaction block a single-home edge insert stages into
+    // the per-transaction `GraphTxnOverlay` through the neutral gate instead of
+    // applying durably now: an in-transaction `MATCH` / `GRAPH NEIGHBORS` then
+    // observes the edge as present (read-your-own-writes), COMMIT replays the
+    // buffered `EdgePut` via the single-shard WAL + `TransactionBatch` path, and
+    // ROLLBACK discards the overlay. This is the write-side complement to the
+    // `delete_edge` staging above; both reuse `stage_edge_write_in_txn`.
+    // Autocommit is untouched.
+    if txn_ctx.sessions.transaction_state(txn_ctx.addr) == TransactionState::InBlock {
+        if !single_home {
+            // A cross-shard (dual-home) edge insert inside an explicit
+            // transaction needs the cross-shard-commit machinery to stage both
+            // homes atomically across the outer transaction boundary — out of
+            // scope for single-home staging. Reject with the same signal a
+            // cross-shard predicate write inside a transaction produces.
+            return Err(ddl_err(
+                "XX000",
+                crate::Error::CrossShardInExplicitTransaction.to_string(),
+            ));
+        }
+        super::edge_stage::stage_edge_write_in_txn(
+            state,
+            tenant_id,
+            database_id,
+            vsrc,
+            PhysicalPlan::Graph(edge_put),
+            txn_ctx,
+        )
+        .await?;
+        return Ok(vec![DdlResult::Status {
+            command: "INSERT EDGE".to_string(),
+            rows_affected: None,
+        }]);
+    }
+
+    if single_home {
         // F1a fast path (unchanged): both endpoints share one home vShard (or we
         // are single-node), so a single-home Raft write to `vsrc` covers both
         // forward and reverse traversal — EDGES + REVERSE_EDGES land together.
@@ -185,9 +228,10 @@ pub async fn insert_edge(
     }])
 }
 
-/// A parsed edge identity: the endpoints and label a `GRAPH DELETE EDGE`
-/// statement addresses. Bundled so [`delete_edge`] stays within the argument
-/// budget without an `#[allow]`.
+/// A parsed edge identity: the collection, endpoints, and label a
+/// `GRAPH INSERT EDGE` / `GRAPH DELETE EDGE` statement addresses. Bundled so
+/// [`insert_edge`] and [`delete_edge`] each stay within the argument budget
+/// without an `#[allow]`.
 pub struct EdgeRef {
     pub collection: String,
     pub src: String,

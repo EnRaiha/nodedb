@@ -8,12 +8,14 @@ use std::collections::HashMap;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::graph::graph_txn_merge;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::pattern::ast::MatchQuery;
 use crate::engine::graph::pattern::executor::{
     BindingRow, ContinuationSeed, PropertyLookup, UnresolvedExpansion, VarLenResume,
     rows_to_msgpack,
 };
+use crate::types::TenantId;
 
 /// Map key carrying the binding-rows msgpack array in the MATCH envelope.
 pub(crate) const MATCH_ENVELOPE_ROWS_KEY: &str = "rows";
@@ -163,6 +165,29 @@ impl CoreLoop {
         }
     }
 
+    /// Build the transaction's staged-edge overlay for a MATCH read, when the
+    /// task carries a `txn_id` with a live `GraphTxnOverlay`. Mirrors the delta
+    /// construction in `execute_graph_hop` so MATCH observes the same staged
+    /// edge writes/deletes for read-your-own-writes. `None` (the autocommit
+    /// path, no overlay) yields committed-CSR-only execution — byte-identical
+    /// to prior behaviour.
+    fn match_graph_overlay(
+        &self,
+        task: &ExecutionTask,
+        tid: u64,
+    ) -> Option<crate::engine::graph::csr::GraphOverlayDelta> {
+        task.request
+            .txn_id
+            .and_then(|txn_id| self.graph_txn_overlays.get(&txn_id))
+            .map(|ov| {
+                graph_txn_merge::build_graph_overlay_delta(
+                    ov,
+                    task.request.database_id,
+                    TenantId::new(tid),
+                )
+            })
+    }
+
     pub(in crate::data::executor) fn execute_graph_match(
         &self,
         task: &ExecutionTask,
@@ -225,6 +250,7 @@ impl CoreLoop {
             tenant_id: tid,
             collection: query.collection.as_deref(),
         };
+        let overlay = self.match_graph_overlay(task, tid);
         match crate::engine::graph::pattern::executor::execute(
             &query,
             partition,
@@ -233,6 +259,7 @@ impl CoreLoop {
             is_remote_node,
             varlen_caps,
             &props,
+            overlay.as_ref(),
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
@@ -329,6 +356,11 @@ impl CoreLoop {
             tenant_id: tid,
             collection: query.collection.as_deref(),
         };
+        // A continuation only ever runs cross-shard (`is_remote_node` is always
+        // `Some` here), where the pattern engine's overlay merge is disabled and
+        // the transaction's staged overlay is not reachable anyway — so no
+        // overlay is built. Cross-shard MATCH read-your-own-writes is a separate
+        // unit.
         match crate::engine::graph::pattern::executor::execute_continuation(
             &query,
             partition,
@@ -341,6 +373,7 @@ impl CoreLoop {
             },
             varlen_caps,
             &props,
+            None,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
@@ -420,6 +453,10 @@ impl CoreLoop {
             tenant_id: tid,
             collection: query.collection.as_deref(),
         };
+        // A variable-length resume only ever runs cross-shard (`is_remote_node`
+        // is always `Some` here); the pattern engine's overlay merge is disabled
+        // in that mode and the staged overlay is not reachable, so no overlay is
+        // built. Cross-shard MATCH read-your-own-writes is a separate unit.
         match crate::engine::graph::pattern::executor::execute_varlen_resume(
             &query,
             partition,
@@ -429,6 +466,7 @@ impl CoreLoop {
             resume,
             varlen_caps,
             &props,
+            None,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),

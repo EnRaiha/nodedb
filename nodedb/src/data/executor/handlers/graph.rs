@@ -29,7 +29,7 @@ use crate::types::TenantId;
 #[path = "graph_traversal.rs"]
 mod graph_traversal;
 #[path = "graph_txn_merge.rs"]
-mod graph_txn_merge;
+pub(in crate::data::executor) mod graph_txn_merge;
 
 use graph_txn_merge::merge_graph_txn_overlay_neighbors;
 

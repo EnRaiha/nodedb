@@ -67,9 +67,20 @@ pub async fn execute_plan_all_local_cores(
                 use crate::control::server::graph_dispatch::match_broadcast::broadcast_match_to_all_cores;
                 use crate::data::executor::handlers::graph_match::encode_match_envelope_raw;
 
-                let outcome =
-                    broadcast_match_to_all_cores(state, tenant_id, database_id, plan, trace_id)
-                        .await?;
+                // Cross-node MATCH execution: this node received the plan from a
+                // remote coordinator, so the transaction's staged overlay (which
+                // lives on the origin node) is not reachable here — run
+                // committed-CSR-only. Cross-node read-your-own-writes for MATCH
+                // is a separate unit.
+                let outcome = broadcast_match_to_all_cores(
+                    state,
+                    tenant_id,
+                    database_id,
+                    plan,
+                    trace_id,
+                    None,
+                )
+                .await?;
 
                 // Carry the truncation resume cursor(s) onto the cross-node
                 // wire inside the envelope bytes so a remote shard's truncation

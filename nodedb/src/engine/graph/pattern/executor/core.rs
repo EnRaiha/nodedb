@@ -9,7 +9,7 @@ use super::continuation;
 use super::expansion;
 use super::predicates::PropertyLookup;
 use super::types::{BindingRow, ExecutionState, MatchOutcome, UnresolvedExpansion, VarLenResume};
-use crate::engine::graph::csr::CsrIndex;
+use crate::engine::graph::csr::{CsrIndex, GraphOverlayDelta};
 use crate::engine::graph::edge_store::{Direction, EdgeStore};
 
 /// Execute a MATCH query on a CSR index and edge store.
@@ -32,6 +32,12 @@ use crate::engine::graph::edge_store::{Direction, EdgeStore};
 /// shard's own pass covers all its local nodes.
 /// Pass `None` (the production default on a fully-local CSR) to guarantee
 /// an always-empty frontier, preserving byte-identical single-node behaviour.
+///
+/// `overlay`: when `Some(delta)` and the delta is non-empty, the query runs
+/// inside a transaction and each fixed-hop triple observes the transaction's
+/// own staged edge writes/deletes (read-your-own-writes) via the name-keyed
+/// merge in [`super::overlay_expand`]. `None` (or an empty delta) is the
+/// autocommit path and is byte-identical to committed-CSR-only execution.
 #[allow(clippy::too_many_arguments)]
 pub fn execute<'a>(
     query: &MatchQuery,
@@ -41,8 +47,13 @@ pub fn execute<'a>(
     is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
     varlen_caps: expansion::VarLenCaps,
     props: &PropertyLookup<'_>,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<MatchOutcome, crate::Error> {
-    // Optimize query before execution (reorder triples by selectivity).
+    // Optimize query before execution (reorder triples by selectivity). The
+    // optimizer only REORDERS triples within a chain (it never drops one), and
+    // a staged-only edge label has zero CSR edges so it scores as most
+    // selective and simply sorts first — every triple is still visited, so a
+    // staged edge/node cannot be pruned out of the plan.
     let mut optimized = query.clone();
     super::super::optimizer::optimize(&mut optimized, csr);
     execute_query(
@@ -53,6 +64,7 @@ pub fn execute<'a>(
         is_remote_node,
         varlen_caps,
         props,
+        overlay,
     )
 }
 
@@ -66,6 +78,7 @@ fn execute_query<'a>(
     is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
     varlen_caps: expansion::VarLenCaps,
     props: &PropertyLookup<'_>,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<MatchOutcome, crate::Error> {
     let mut rows: Vec<BindingRow> = vec![HashMap::new()];
     let mut state = ExecutionState::new(is_remote_node, varlen_caps);
@@ -77,7 +90,7 @@ fn execute_query<'a>(
         expansion::resolve_collection_filter(query.collection.as_deref(), csr);
 
     for clause in &query.clauses {
-        let clause_rows = execute_clause(clause, csr, &rows, &mut state, frontier_bitmap)?;
+        let clause_rows = execute_clause(clause, csr, &rows, &mut state, frontier_bitmap, overlay)?;
         if clause.optional {
             rows = left_join_rows(&rows, &clause_rows, clause);
         } else {
@@ -90,9 +103,9 @@ fn execute_query<'a>(
         rows,
         csr,
         edge_store,
-        frontier_bitmap,
         state.varlen_caps,
         props,
+        overlay,
     )?;
 
     Ok(MatchOutcome {
@@ -134,13 +147,21 @@ pub(super) fn execute_clause(
     input_rows: &[BindingRow],
     state: &mut ExecutionState,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<Vec<BindingRow>, crate::Error> {
     let mut result_rows = input_rows.to_vec();
 
     for chain in &clause.patterns {
         let mut next_rows = Vec::new();
         for row in &result_rows {
-            next_rows.extend(execute_chain(chain, csr, row, state, frontier_bitmap)?);
+            next_rows.extend(execute_chain(
+                chain,
+                csr,
+                row,
+                state,
+                frontier_bitmap,
+                overlay,
+            )?);
         }
         result_rows = next_rows;
     }
@@ -158,6 +179,7 @@ fn execute_chain(
     input_row: &BindingRow,
     state: &mut ExecutionState,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<Vec<BindingRow>, crate::Error> {
     continuation::run_chain_from(
         chain,
@@ -166,6 +188,7 @@ fn execute_chain(
         csr,
         state,
         frontier_bitmap,
+        overlay,
     )
 }
 
@@ -180,7 +203,38 @@ pub(super) fn execute_triple(
     input_row: &BindingRow,
     state: &mut ExecutionState,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<Vec<BindingRow>, crate::Error> {
+    // Read-your-own-writes: inside a transaction with staged graph edges, a
+    // fixed-hop triple is expanded against a name-keyed merge of durable CSR
+    // adjacency and the staged overlay, so staged edges are visible, staged
+    // tombstones are hidden, and staged-only intermediate nodes (which have no
+    // durable CSR id) participate. Variable-length edges keep the durable BFS
+    // path (its visited set keys on dense CSR ids); autocommit / empty-overlay
+    // runs are unaffected and fall through to the durable path below.
+    //
+    // The overlay merge runs single-node only (`is_remote_node.is_none()`): in
+    // cluster mode the durable path emits the cross-shard unresolved frontier
+    // for a bound zero-local-degree source, which this name-keyed path does not
+    // produce. Taking it in cluster mode would drop committed cross-shard
+    // continuations, so a transaction's staged overlay is only merged on the
+    // single-node path. Cross-shard MATCH read-your-own-writes is a separate
+    // unit.
+    if let Some(ov) = overlay
+        && !ov.is_empty()
+        && !triple.edge.is_variable_length()
+        && state.is_remote_node.is_none()
+    {
+        return Ok(super::overlay_expand::expand_triple_overlay(
+            triple,
+            csr,
+            input_row,
+            state,
+            frontier_bitmap,
+            ov,
+        ));
+    }
+
     let direction = triple.edge.direction.to_csr_direction();
     let label_filter = triple.edge.edge_type.as_deref();
     let src_nodes = resolve_binding(&triple.src, csr, input_row, frontier_bitmap);
@@ -501,6 +555,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -526,6 +581,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -549,6 +605,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -573,6 +630,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -595,6 +653,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -617,6 +676,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -649,6 +709,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -666,6 +727,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -683,6 +745,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -703,6 +766,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -721,6 +785,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -770,6 +835,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -850,6 +916,7 @@ pub(super) mod tests {
             Some(is_remote),
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap();
 
@@ -917,6 +984,7 @@ pub(super) mod tests {
             Some(is_remote),
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap();
 
@@ -949,6 +1017,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap();
 
@@ -986,6 +1055,7 @@ pub(super) mod tests {
             Some(is_remote),
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap();
 
@@ -1068,6 +1138,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -1103,6 +1174,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -1140,6 +1212,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -1182,6 +1255,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         );
         // `MatchOutcome` (the Ok type) is not `Debug`, so match on the Result
         // directly rather than `unwrap_err()`.
@@ -1265,6 +1339,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -1301,6 +1376,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -1336,6 +1412,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
@@ -1379,6 +1456,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         );
         assert!(
             matches!(result, Err(crate::Error::BadRequest { .. })),
@@ -1413,6 +1491,7 @@ pub(super) mod tests {
             None,
             expansion::VarLenCaps::default(),
             &props,
+            None,
         )
         .unwrap()
         .rows;
