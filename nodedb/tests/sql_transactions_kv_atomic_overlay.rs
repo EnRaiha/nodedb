@@ -239,16 +239,15 @@ async fn getset_in_tx_returns_staged_old_value() {
     server.exec("COMMIT").await.unwrap();
 }
 
-// `BatchPut` has no SQL surface (`KV_BATCH_PUT` does not exist) and its only
-// current caller, the native protocol's `KvBatchPut` direct-op path
-// (`native/dispatch/direct_ops.rs`), dispatches straight to the Data Plane
-// with `txn_id: None` — it never calls `route_in_tx_write` at all, for any
-// direct op (`PointGet`, `VectorSearch`, `BatchPut`, etc. alike), so it
-// cannot exercise the staging overlay end-to-end today regardless of this
-// unit's changes. `KvOp::BatchPut`'s `is_stageable_write` / `staged_tag_kind`
-// classification and its Data Plane staging handler
-// (`stage_kv_atomic::stage_kv_batch_put`) are still implemented so that a
-// future transactional `BatchPut` surface (or a fix to `direct_ops.rs`
-// routing every direct op through the staging gate, out of scope here) picks
-// up correct RYOW behavior with no further Data Plane changes; see the
-// `staging_predicates` unit tests for coverage of the classification itself.
+// `BatchPut` has no SQL surface (`KV_BATCH_PUT` does not exist); its only
+// caller is the native protocol's `KvBatchPut` direct-op path
+// (`native/dispatch/direct_ops.rs`), which now routes every direct op
+// through the same `route_in_tx_write`/`stage_write` staging gate the
+// SQL-planned dispatch loops use (`dispatch_single_task` in
+// `direct_ops.rs`), so `KvOp::BatchPut`'s `is_stageable_write` /
+// `staged_tag_kind` classification and its Data Plane staging handler
+// (`stage_kv_atomic::stage_kv_batch_put`) are exercised end-to-end. See
+// `nodedb/tests/native_direct_op_txn_overlay.rs` for the native-protocol
+// coverage (staged BatchPut visible read-your-own-writes, discarded on
+// ROLLBACK, persisted on COMMIT) and `staging_predicates`'s unit tests for
+// coverage of the classification itself.

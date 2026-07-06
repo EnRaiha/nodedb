@@ -12,6 +12,10 @@ use crate::control::planner::calvin::{
 };
 use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
 use crate::control::server::response_shape::types::describe_plan;
+use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+use crate::control::server::shared::session::staging_gate::{
+    InTxnRoute, StagingGateError, route_in_tx_write,
+};
 use crate::types::{DatabaseId, Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -247,6 +251,18 @@ pub(crate) async fn handle_graph_match(
 /// This is the exact single-plan dispatch the direct-op handler used before
 /// implicit-edge extraction; it is factored out so the no-edge fast path and
 /// the single-shard edge loop share one code path.
+///
+/// Routes through the same protocol-neutral in-transaction staging gate
+/// (`route_in_tx_write`) the SQL-planned dispatch loops (`sql_loop.rs`,
+/// pgwire's `execute_dml_hooks.rs`) already use. Outside a transaction block
+/// this is a no-op passthrough (`InTxnRoute::Read` with the task unchanged),
+/// so autocommit direct ops (including `KvBatchPut`) dispatch exactly as
+/// before. Inside a transaction block, a stageable write (e.g. `KvBatchPut`)
+/// is applied to the per-transaction overlay at statement time instead of
+/// hitting durable storage directly -- fixing the atomicity gap where a
+/// native direct-op write inside `BEGIN...COMMIT` used to commit immediately
+/// and survive `ROLLBACK`. A non-stageable write is buffered for COMMIT-time
+/// replay, matching the SQL path's deferral for the same plan shapes.
 async fn dispatch_single_task(
     ctx: &DispatchCtx<'_>,
     seq: u64,
@@ -255,8 +271,64 @@ async fn dispatch_single_task(
     plan: PhysicalPlan,
     txn_id: Option<TxnId>,
 ) -> NativeResponse {
-    let plan_for_response = plan.clone();
-    match dispatch_single_task_raw(ctx, tenant_id, vshard_id, plan, txn_id).await {
+    let task = PhysicalTask {
+        tenant_id,
+        vshard_id,
+        database_id: DatabaseId::DEFAULT,
+        plan,
+        post_set_op: PostSetOp::None,
+        txn_id,
+    };
+
+    // Cloned before `route_in_tx_write` consumes `task`, so a staged write
+    // whose outcome carries a real affected-count/computed-value payload
+    // (e.g. `KvBatchPut`'s `{"inserted": n}`) can be shaped into the
+    // response the same way the non-staged branch below shapes it.
+    let plan_for_staged_response = task.plan.clone();
+
+    let task = match route_in_tx_write(ctx.sessions, ctx.peer_addr, task, |stage_task| {
+        dispatch_single_task_raw(
+            ctx,
+            stage_task.tenant_id,
+            stage_task.vshard_id,
+            stage_task.plan,
+            stage_task.txn_id,
+        )
+    })
+    .await
+    {
+        Ok(InTxnRoute::Read(routed_task)) => *routed_task,
+        Ok(InTxnRoute::Buffered) => {
+            let mut r = NativeResponse::ok(seq);
+            r.rows_affected = Some(1);
+            return r;
+        }
+        Ok(InTxnRoute::Staged(outcome)) => {
+            let synthetic = Response {
+                request_id: RequestId::new(0),
+                status: Status::Ok,
+                attempt: 0,
+                partial: false,
+                payload: Payload::from_vec(outcome.payload),
+                watermark_lsn: Lsn::new(0),
+                error_code: None,
+            };
+            return data_plane_response_to_native(ctx, seq, &plan_for_staged_response, &synthetic);
+        }
+        Err(StagingGateError::Dispatch(e)) => return error_to_native(seq, &e),
+        Err(StagingGateError::Rejected { code }) => {
+            let (_, sqlstate, message) = match code {
+                Some(code) => error_code_to_sqlstate(&code),
+                None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
+            };
+            return NativeResponse::error(seq, sqlstate, message);
+        }
+    };
+
+    let plan_for_response = task.plan.clone();
+    match dispatch_single_task_raw(ctx, task.tenant_id, task.vshard_id, task.plan, task.txn_id)
+        .await
+    {
         Ok(resp) => data_plane_response_to_native(ctx, seq, &plan_for_response, &resp),
         Err(e) => error_to_native(seq, &e),
     }
