@@ -95,9 +95,10 @@ impl CoreLoop {
                 let weight = crate::engine::graph::csr::extract_weight_from_properties(properties);
                 let partition = self.csr_partition_mut(database_id, tid);
                 let csr_result = if weight != 1.0 {
-                    partition.add_edge_weighted(src_id, label, dst_id, weight)
+                    partition
+                        .add_edge_weighted_in_collection(src_id, label, dst_id, collection, weight)
                 } else {
-                    partition.add_edge(src_id, label, dst_id)
+                    partition.add_edge_in_collection(src_id, label, dst_id, collection)
                 };
                 match csr_result {
                     Ok(()) => {
@@ -170,7 +171,12 @@ impl CoreLoop {
             ) {
                 Ok(()) => {
                     let partition = self.csr_partition_mut(database_id, tid);
-                    if let Err(e) = partition.add_edge(&edge.src_id, &edge.label, &edge.dst_id) {
+                    if let Err(e) = partition.add_edge_in_collection(
+                        &edge.src_id,
+                        &edge.label,
+                        &edge.dst_id,
+                        &edge.collection,
+                    ) {
                         return self.response_error(
                             task,
                             ErrorCode::Internal {
@@ -226,7 +232,12 @@ impl CoreLoop {
                 ord,
             );
             let partition = self.csr_partition_mut(database_id, tid);
-            partition.remove_edge(&edge.src_id, &edge.label, &edge.dst_id);
+            partition.remove_edge_in_collection(
+                &edge.src_id,
+                &edge.label,
+                &edge.dst_id,
+                &edge.collection,
+            );
         }
         if !edges.is_empty() {
             self.checkpoint_coordinator
@@ -261,7 +272,7 @@ impl CoreLoop {
         ) {
             Ok(_) => {
                 let partition = self.csr_partition_mut(database_id, tid);
-                partition.remove_edge(src_id, label, dst_id);
+                partition.remove_edge_in_collection(src_id, label, dst_id, collection);
                 self.checkpoint_coordinator.mark_dirty("sparse", 1);
                 self.response_ok(task)
             }

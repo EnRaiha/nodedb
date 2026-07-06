@@ -17,7 +17,12 @@ use crate::GraphError;
 /// Magic header for rkyv-serialized CSR snapshots (6 bytes).
 const RKYV_MAGIC: &[u8; 6] = b"RKCS2\0";
 /// Current format version for rkyv-serialized CSR snapshots.
-pub const CSR_FORMAT_VERSION: u8 = 1;
+///
+/// Bumped to `2` when per-edge collection tags were added (parallel
+/// `out_collections` / `in_collections` arrays + collection interning). A v1
+/// snapshot has no collection axis and is rejected; the CSR is instead rebuilt
+/// from the collection-scoped durable edge store.
+pub const CSR_FORMAT_VERSION: u8 = 2;
 
 /// Errors during CSR checkpoint operations.
 #[derive(Debug, thiserror::Error)]
@@ -34,15 +39,24 @@ pub enum CsrCheckpointError {
 struct CsrSnapshotRkyv {
     nodes: Vec<String>,
     labels: Vec<String>,
+    collections: Vec<String>,
     out_offsets: Vec<u32>,
     out_targets: Vec<u32>,
     out_labels: Vec<u32>,
+    out_collections: Vec<u32>,
     in_offsets: Vec<u32>,
     in_targets: Vec<u32>,
     in_labels: Vec<u32>,
+    in_collections: Vec<u32>,
     buffer_out: Vec<Vec<(u32, u32)>>,
     buffer_in: Vec<Vec<(u32, u32)>>,
-    deleted: Vec<(u32, u32, u32)>,
+    buffer_out_collections: Vec<Vec<u32>>,
+    buffer_in_collections: Vec<Vec<u32>>,
+    /// Deleted-edge identities `(src, label, dst, collection)`. Collection is
+    /// part of the key so per-collection copies of a shared triple tombstone
+    /// independently. The v2 snapshot already carries the collection axis, so
+    /// widening this key needs no new format version.
+    deleted: Vec<(u32, u32, u32, u32)>,
     has_weights: bool,
     out_weights: Option<Vec<f64>>,
     in_weights: Option<Vec<f64>>,
@@ -61,14 +75,19 @@ impl CsrIndex {
         let snapshot = CsrSnapshotRkyv {
             nodes: self.id_to_node.clone(),
             labels: self.id_to_label.clone(),
+            collections: self.id_to_collection.clone(),
             out_offsets: self.out_offsets.clone(),
             out_targets: self.out_targets.to_vec(),
             out_labels: self.out_labels.to_vec(),
+            out_collections: self.out_collections.clone(),
             in_offsets: self.in_offsets.clone(),
             in_targets: self.in_targets.to_vec(),
             in_labels: self.in_labels.to_vec(),
+            in_collections: self.in_collections.clone(),
             buffer_out: self.buffer_out.clone(),
             buffer_in: self.buffer_in.clone(),
+            buffer_out_collections: self.buffer_out_collections.clone(),
+            buffer_in_collections: self.buffer_in_collections.clone(),
             deleted: self.deleted_edges.iter().copied().collect(),
             has_weights: self.has_weights,
             out_weights: self.out_weights.as_ref().map(|w| w.to_vec()),
@@ -206,24 +225,46 @@ impl CsrIndex {
         } else {
             vec![Vec::new(); node_count]
         };
+        let collection_to_id: HashMap<String, u32> = snap
+            .collections
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), i as u32))
+            .collect();
+        let buffer_out_collections = if snap.buffer_out_collections.len() == node_count {
+            snap.buffer_out_collections
+        } else {
+            vec![Vec::new(); node_count]
+        };
+        let buffer_in_collections = if snap.buffer_in_collections.len() == node_count {
+            snap.buffer_in_collections
+        } else {
+            vec![Vec::new(); node_count]
+        };
 
         Some(Self {
             node_to_id,
             id_to_node: snap.nodes,
             label_to_id,
             id_to_label: snap.labels,
+            collection_to_id,
+            id_to_collection: snap.collections,
             out_offsets: snap.out_offsets,
             out_targets,
             out_labels,
+            out_collections: snap.out_collections,
             out_weights,
             in_offsets: snap.in_offsets,
             in_targets,
             in_labels,
+            in_collections: snap.in_collections,
             in_weights,
             buffer_out: snap.buffer_out,
             buffer_in: snap.buffer_in,
             buffer_out_weights,
             buffer_in_weights,
+            buffer_out_collections,
+            buffer_in_collections,
             deleted_edges: snap.deleted.into_iter().collect(),
             has_weights: snap.has_weights,
             node_label_bits: vec![0; node_count],
@@ -271,24 +312,46 @@ impl CsrIndex {
         } else {
             vec![Vec::new(); node_count]
         };
+        let collection_to_id: HashMap<String, u32> = snap
+            .collections
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), i as u32))
+            .collect();
+        let buffer_out_collections = if snap.buffer_out_collections.len() == node_count {
+            snap.buffer_out_collections
+        } else {
+            vec![Vec::new(); node_count]
+        };
+        let buffer_in_collections = if snap.buffer_in_collections.len() == node_count {
+            snap.buffer_in_collections
+        } else {
+            vec![Vec::new(); node_count]
+        };
 
         Self {
             node_to_id,
             id_to_node: snap.nodes,
             label_to_id,
             id_to_label: snap.labels,
+            collection_to_id,
+            id_to_collection: snap.collections,
             out_offsets: snap.out_offsets,
             out_targets: snap.out_targets.into(),
             out_labels: snap.out_labels.into(),
+            out_collections: snap.out_collections,
             out_weights: snap.out_weights.map(Into::into),
             in_offsets: snap.in_offsets,
             in_targets: snap.in_targets.into(),
             in_labels: snap.in_labels.into(),
+            in_collections: snap.in_collections,
             in_weights: snap.in_weights.map(Into::into),
             buffer_out: snap.buffer_out,
             buffer_in: snap.buffer_in,
             buffer_out_weights,
             buffer_in_weights,
+            buffer_out_collections,
+            buffer_in_collections,
             deleted_edges: snap.deleted.into_iter().collect(),
             has_weights: snap.has_weights,
             node_label_bits: vec![0; node_count],

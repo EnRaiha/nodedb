@@ -197,6 +197,8 @@ pub fn execute_continuation<'a>(
     }
 
     let mut state = ExecutionState::new(is_remote_node, varlen_caps);
+    state.collection_filter =
+        super::expansion::resolve_collection_filter(query.collection.as_deref(), csr);
 
     // Resume the chain from the originating shard's stopping point. The seed
     // row already carries the bindings for triples [0, seed.triple_idx).
@@ -307,6 +309,8 @@ pub fn execute_varlen_resume<'a>(
     }
 
     let mut state = ExecutionState::new(is_remote_node, varlen_caps);
+    state.collection_filter =
+        super::expansion::resolve_collection_filter(query.collection.as_deref(), csr);
 
     // Rebuild the pattern shape for the truncated triple verbatim (no
     // re-optimization). `want_path` matches the from-scratch branch in
@@ -318,6 +322,7 @@ pub fn execute_varlen_resume<'a>(
         min_hops: triple.edge.min_hops,
         max_hops: triple.edge.max_hops,
         want_path,
+        collection_filter: state.collection_filter,
     };
 
     // Continue the BFS from the carried cursor. A fresh cap hit here records a
@@ -478,6 +483,7 @@ mod tests {
             min_hops: 1,
             max_hops: 6,
             want_path: false,
+            collection_filter: super::super::expansion::CollectionFilter::Unscoped,
         };
         let caps = VarLenCaps {
             max_results: 2,

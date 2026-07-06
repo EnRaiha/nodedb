@@ -69,6 +69,12 @@ fn execute_query<'a>(
 ) -> Result<MatchOutcome, crate::Error> {
     let mut rows: Vec<BindingRow> = vec![HashMap::new()];
     let mut state = ExecutionState::new(is_remote_node, varlen_caps);
+    // Resolve the `IN '<collection>'` scoping once against this partition's
+    // collection interning; every edge expansion in this execution is filtered
+    // by it so a collection-scoped MATCH never traverses another collection's
+    // edges (they share one CSR partition).
+    state.collection_filter =
+        expansion::resolve_collection_filter(query.collection.as_deref(), csr);
 
     for clause in &query.clauses {
         let clause_rows = execute_clause(clause, csr, &rows, &mut state, frontier_bitmap)?;
@@ -196,6 +202,7 @@ pub(super) fn execute_triple(
             min_hops: triple.edge.min_hops,
             max_hops: triple.edge.max_hops,
             want_path,
+            collection_filter: state.collection_filter,
         };
         for &src_id in &src_nodes {
             let expansion =
@@ -291,7 +298,13 @@ pub(super) fn execute_triple(
                 continue;
             }
 
-            let neighbors = expansion::collect_neighbors(csr, src_id, label_filter, direction);
+            let neighbors = expansion::collect_neighbors(
+                csr,
+                src_id,
+                label_filter,
+                direction,
+                state.collection_filter,
+            );
             for (lid, dst_id) in neighbors {
                 if !binding_compatible(&triple.dst, csr, input_row, dst_id) {
                     continue;

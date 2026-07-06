@@ -158,6 +158,11 @@ pub(super) fn apply_predicate(
             // local state and inspect it.
             for row in rows {
                 let mut sub_state = ExecutionState::new(None, varlen_caps);
+                // Scope the sub-pattern's edge traversal to the same collection
+                // as the outer query (`IN '<collection>'`) so NOT EXISTS never
+                // consults another collection's edges.
+                sub_state.collection_filter =
+                    super::expansion::resolve_collection_filter(props.collection, csr);
                 // NOT EXISTS sub-patterns check structural connectivity
                 // against already-bound variables — no anchor enumeration
                 // occurs, so the frontier bitmap does not apply here.

@@ -105,6 +105,43 @@ pub(super) struct VarLenPattern<'a> {
     /// `true` iff the edge variable is bound in the query (e.g. `[e*1..k]`).
     /// When `false` all `format!`/`String` path work in the hot loop is skipped.
     pub want_path: bool,
+    /// Collection scoping for edge traversal (resolved from the query's
+    /// `IN '<collection>'` clause). See [`CollectionFilter`].
+    pub collection_filter: CollectionFilter,
+}
+
+/// Collection scoping applied to graph edge traversal.
+///
+/// A CSR partition holds every collection's edges under one shared node space;
+/// this selects which edges a collection-scoped read (`MATCH ... IN '<c>'`) may
+/// traverse, so a query in collection A never sees collection B's edges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum CollectionFilter {
+    /// No `IN '<collection>'` clause — traverse edges of every collection
+    /// (tenant-wide graph). This preserves the collection-less behavior.
+    #[default]
+    Unscoped,
+    /// Traverse only edges tagged with this collection id.
+    Only(u32),
+    /// An `IN '<collection>'` clause naming a collection that has no edges in
+    /// this partition — match nothing (never falls back to unscoped, which
+    /// would re-introduce the cross-collection leak).
+    Empty,
+}
+
+/// Resolve a query's `IN '<collection>'` clause to a [`CollectionFilter`]
+/// against the partition's collection interning.
+pub(super) fn resolve_collection_filter(
+    collection: Option<&str>,
+    csr: &CsrIndex,
+) -> CollectionFilter {
+    match collection {
+        None => CollectionFilter::Unscoped,
+        Some(c) => match csr.collection_id(c) {
+            Some(id) => CollectionFilter::Only(id),
+            None => CollectionFilter::Empty,
+        },
+    }
 }
 
 /// Return `csr.node_name_raw(node).to_string()` when `want_path`, else `""`.
@@ -257,7 +294,13 @@ fn run_bfs(
         let mut next_frontier: Vec<(u32, String)> = Vec::new();
 
         for (node, path) in &frontier {
-            let neighbors = collect_neighbors(csr, *node, pattern.label_filter, pattern.direction);
+            let neighbors = collect_neighbors(
+                csr,
+                *node,
+                pattern.label_filter,
+                pattern.direction,
+                pattern.collection_filter,
+            );
             for (_, dst) in neighbors {
                 if !visited.insert(dst) {
                     continue;
@@ -318,32 +361,47 @@ pub(super) fn collect_neighbors(
     node: u32,
     label_filter: Option<&str>,
     direction: Direction,
+    collection_filter: CollectionFilter,
 ) -> Vec<(u32, u32)> {
     let mut neighbors = Vec::new();
-    match direction {
-        Direction::Out => {
-            for (lid, dst) in csr.iter_out_edges_raw(node) {
-                if label_filter.is_none() || csr_label_matches(csr, lid, label_filter) {
-                    neighbors.push((lid, dst));
+    // A collection clause naming an unknown collection matches nothing —
+    // never fall through to the unscoped iterators.
+    if collection_filter == CollectionFilter::Empty {
+        return neighbors;
+    }
+    let keep = |lid: u32| label_filter.is_none() || csr_label_matches(csr, lid, label_filter);
+    if matches!(direction, Direction::Out | Direction::Both) {
+        match collection_filter {
+            CollectionFilter::Only(cid) => {
+                for (lid, dst) in csr.iter_out_edges_raw_in(node, cid) {
+                    if keep(lid) {
+                        neighbors.push((lid, dst));
+                    }
+                }
+            }
+            _ => {
+                for (lid, dst) in csr.iter_out_edges_raw(node) {
+                    if keep(lid) {
+                        neighbors.push((lid, dst));
+                    }
                 }
             }
         }
-        Direction::In => {
-            for (lid, src) in csr.iter_in_edges_raw(node) {
-                if label_filter.is_none() || csr_label_matches(csr, lid, label_filter) {
-                    neighbors.push((lid, src));
+    }
+    if matches!(direction, Direction::In | Direction::Both) {
+        match collection_filter {
+            CollectionFilter::Only(cid) => {
+                for (lid, src) in csr.iter_in_edges_raw_in(node, cid) {
+                    if keep(lid) {
+                        neighbors.push((lid, src));
+                    }
                 }
             }
-        }
-        Direction::Both => {
-            for (lid, dst) in csr.iter_out_edges_raw(node) {
-                if label_filter.is_none() || csr_label_matches(csr, lid, label_filter) {
-                    neighbors.push((lid, dst));
-                }
-            }
-            for (lid, src) in csr.iter_in_edges_raw(node) {
-                if label_filter.is_none() || csr_label_matches(csr, lid, label_filter) {
-                    neighbors.push((lid, src));
+            _ => {
+                for (lid, src) in csr.iter_in_edges_raw(node) {
+                    if keep(lid) {
+                        neighbors.push((lid, src));
+                    }
                 }
             }
         }
@@ -399,6 +457,7 @@ mod tests {
                 min_hops: 1,
                 max_hops: 8,
                 want_path: false,
+                collection_filter: CollectionFilter::Unscoped,
             },
             VarLenCaps::default(),
         );
@@ -446,6 +505,7 @@ mod tests {
                 min_hops: 0,
                 max_hops: 2,
                 want_path: false,
+                collection_filter: CollectionFilter::Unscoped,
             },
             VarLenCaps::default(),
         );
@@ -480,6 +540,7 @@ mod tests {
                 min_hops: 2,
                 max_hops: 2,
                 want_path: false,
+                collection_filter: CollectionFilter::Unscoped,
             },
             VarLenCaps::default(),
         );
@@ -522,6 +583,7 @@ mod tests {
                 min_hops: 1,
                 max_hops: 5,
                 want_path: false,
+                collection_filter: CollectionFilter::Unscoped,
             },
             VarLenCaps::default(),
         );
@@ -568,6 +630,7 @@ mod tests {
             min_hops: 1,
             max_hops: 6,
             want_path: false,
+            collection_filter: CollectionFilter::Unscoped,
         };
         let uncapped = expand_variable_length(&csr, src, &pat, VarLenCaps::default());
         assert!(uncapped.cursor.is_none(), "uncapped pass must not truncate");
@@ -615,6 +678,7 @@ mod tests {
                 min_hops: 1,
                 max_hops: 3,
                 want_path: false,
+                collection_filter: CollectionFilter::Unscoped,
             },
             VarLenCaps::default(),
         );
@@ -650,6 +714,7 @@ mod tests {
             min_hops: 1,
             max_hops: 2,
             want_path: false,
+            collection_filter: CollectionFilter::Unscoped,
         };
         let first = expand_variable_length(&csr, src, &pat, caps);
         let cursor = first.cursor.clone().expect("cap=1 must truncate");
@@ -698,6 +763,7 @@ mod tests {
             min_hops: 1,
             max_hops: 6,
             want_path: true,
+            collection_filter: CollectionFilter::Unscoped,
         };
 
         // Ground truth: a single uncapped want_path pass.
@@ -753,6 +819,7 @@ mod tests {
             min_hops: 1,
             max_hops: 6,
             want_path: false,
+            collection_filter: CollectionFilter::Unscoped,
         };
         let cursor = VarLenCursor {
             frontier: vec![
@@ -793,6 +860,7 @@ mod tests {
             min_hops: 1,
             max_hops: 6,
             want_path: false,
+            collection_filter: CollectionFilter::Unscoped,
         };
         let cursor = VarLenCursor {
             frontier: vec![("n1".to_string(), "n0->n1".to_string())],

@@ -91,6 +91,7 @@ impl CoreLoop {
             direction,
             expansion_depth,
             max_visited,
+            collection,
         );
 
         let (vector_k, graph_k) = rrf_k;
@@ -244,6 +245,7 @@ impl CoreLoop {
         direction: Direction,
         max_depth: usize,
         max_visited: usize,
+        collection: &str,
     ) -> (Vec<String>, HashMap<String, usize>, bool) {
         let budget_node_limit =
             self.query_tuning.bfs_memory_budget_bytes / self.query_tuning.bfs_bytes_per_node;
@@ -274,7 +276,9 @@ impl CoreLoop {
             }
 
             let neighbors = match self.csr_partition(database_id, tid) {
-                Some(part) => part.neighbors(&node, label_filter, direction),
+                Some(part) => {
+                    part.neighbors_in_collection(&node, label_filter, direction, collection)
+                }
                 None => Vec::new(),
             };
             for (_, neighbor) in &neighbors {

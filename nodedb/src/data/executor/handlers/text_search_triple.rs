@@ -140,6 +140,7 @@ impl CoreLoop {
             Direction::Out,
             graph_depth,
             self.query_tuning.bfs_memory_budget_bytes / self.query_tuning.bfs_bytes_per_node,
+            collection,
         );
 
         // 4. Build ranked lists.

@@ -34,6 +34,8 @@ impl CsrIndex {
                 self.buffer_in.push(Vec::new());
                 self.buffer_out_weights.push(Vec::new());
                 self.buffer_in_weights.push(Vec::new());
+                self.buffer_out_collections.push(Vec::new());
+                self.buffer_in_collections.push(Vec::new());
                 self.node_label_bits.push(0);
                 // Surrogate is populated later by the EdgePut handler; start
                 // with the ZERO sentinel so unset nodes are never in a bitmap.
@@ -66,6 +68,39 @@ impl CsrIndex {
                 Ok(id)
             }
         }
+    }
+
+    /// Get or create a dense id for a collection name.
+    ///
+    /// Unlike labels/nodes there is no hard cap: the number of distinct
+    /// collections in a partition is bounded by DDL and far below any `u32`
+    /// concern. `""` (the unscoped sentinel) interns like any other name.
+    pub(crate) fn ensure_collection(&mut self, collection: &str) -> u32 {
+        match self.collection_to_id.entry(collection.to_string()) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let id = self.id_to_collection.len() as u32;
+                e.insert(id);
+                self.id_to_collection.push(collection.to_string());
+                id
+            }
+        }
+    }
+
+    /// Look up the dense collection id for a collection name, if interned.
+    ///
+    /// Returns `None` when no edge in this partition was inserted under
+    /// `collection` — the collection-scoped read paths (MATCH `IN '<c>'`,
+    /// RAG) treat that as "no edges in this collection" (empty result).
+    pub fn collection_id(&self, collection: &str) -> Option<u32> {
+        self.collection_to_id.get(collection).copied()
+    }
+
+    /// Collection name for a dense collection id.
+    pub fn collection_name(&self, collection_id: u32) -> Option<&str> {
+        self.id_to_collection
+            .get(collection_id as usize)
+            .map(String::as_str)
     }
 
     // ── Surrogate methods ──

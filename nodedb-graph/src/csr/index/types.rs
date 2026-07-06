@@ -36,6 +36,18 @@ pub struct CsrIndex {
     pub(crate) label_to_id: HashMap<String, u32>,
     pub(crate) id_to_label: Vec<String>,
 
+    // ── Collection interning ──
+    //
+    // Every edge carries the id of the collection it was inserted under.
+    // Nodes (and their label bitsets / surrogates) are shared across
+    // collections within a `(database, tenant)` partition — only edges are
+    // collection-scoped — so the collection axis lives on edges, not on the
+    // partition key. `""` (the empty string) is the reserved "unscoped"
+    // collection used by throwaway CSRs built for algorithms / tests via the
+    // collection-less `add_edge` / `add_edge_weighted` entry points.
+    pub(crate) collection_to_id: HashMap<String, u32>,
+    pub(crate) id_to_collection: Vec<String>,
+
     // ── Dense CSR (read-only between compactions) ──
     //
     // Offsets are `Vec<u32>` (mutable — extended on node creation).
@@ -48,12 +60,20 @@ pub struct CsrIndex {
     pub(crate) out_offsets: Vec<u32>,
     pub(crate) out_targets: DenseArray<u32>,
     pub(crate) out_labels: DenseArray<u32>,
+    /// Parallel outbound edge collection-id array. Same length/order as
+    /// `out_targets` / `out_labels`: `out_collections[i]` is the collection id
+    /// of the edge whose target/label live at index `i`. Plain `Vec` (not a
+    /// zero-copy `DenseArray`) because it is small relative to targets and is
+    /// only read on the collection-scoped MATCH / RAG paths.
+    pub(crate) out_collections: Vec<u32>,
     /// Parallel edge weight array. `None` if graph has no weighted edges.
     pub(crate) out_weights: Option<DenseArray<f64>>,
 
     pub(crate) in_offsets: Vec<u32>,
     pub(crate) in_targets: DenseArray<u32>,
     pub(crate) in_labels: DenseArray<u32>,
+    /// Parallel inbound edge collection-id array (see `out_collections`).
+    pub(crate) in_collections: Vec<u32>,
     /// Parallel inbound edge weight array. `None` if graph has no weighted edges.
     pub(crate) in_weights: Option<DenseArray<f64>>,
 
@@ -66,9 +86,20 @@ pub struct CsrIndex {
     pub(crate) buffer_out_weights: Vec<Vec<f64>>,
     /// Per-node inbound weight buffer (parallel to `buffer_in`).
     pub(crate) buffer_in_weights: Vec<Vec<f64>>,
+    /// Per-node outbound collection-id buffer (parallel to `buffer_out`):
+    /// `buffer_out_collections[node][k]` is the collection id of the edge
+    /// `buffer_out[node][k]`. Always maintained (unlike weights, which are
+    /// gated on `has_weights`).
+    pub(crate) buffer_out_collections: Vec<Vec<u32>>,
+    /// Per-node inbound collection-id buffer (parallel to `buffer_in`).
+    pub(crate) buffer_in_collections: Vec<Vec<u32>>,
 
-    /// Edges deleted since last compaction: `(src, label, dst)`.
-    pub(crate) deleted_edges: HashSet<(u32, u32, u32)>,
+    /// Edges deleted since last compaction, keyed by full edge identity
+    /// `(src, label, dst, collection)`. The collection is part of the key so
+    /// the SAME `(src, label, dst)` triple inserted under two collections
+    /// forms two DISTINCT edges: deleting collection A's copy leaves
+    /// collection B's copy live.
+    pub(crate) deleted_edges: HashSet<(u32, u32, u32, u32)>,
 
     /// Whether any edge has a non-default weight. When false, weight arrays
     /// are `None` and weight buffers are empty — zero overhead for unweighted graphs.
@@ -134,18 +165,24 @@ impl CsrIndex {
             id_to_node: Vec::new(),
             label_to_id: HashMap::new(),
             id_to_label: Vec::new(),
+            collection_to_id: HashMap::new(),
+            id_to_collection: Vec::new(),
             out_offsets: vec![0],
             out_targets: DenseArray::default(),
             out_labels: DenseArray::default(),
+            out_collections: Vec::new(),
             out_weights: None,
             in_offsets: vec![0],
             in_targets: DenseArray::default(),
             in_labels: DenseArray::default(),
+            in_collections: Vec::new(),
             in_weights: None,
             buffer_out: Vec::new(),
             buffer_in: Vec::new(),
             buffer_out_weights: Vec::new(),
             buffer_in_weights: Vec::new(),
+            buffer_out_collections: Vec::new(),
+            buffer_in_collections: Vec::new(),
             deleted_edges: HashSet::new(),
             has_weights: false,
             node_label_bits: Vec::new(),

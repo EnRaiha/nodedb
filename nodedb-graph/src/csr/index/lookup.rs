@@ -21,6 +21,7 @@ pub(crate) struct DenseAdjacency {
     pub(crate) offsets: Vec<u32>,
     pub(crate) targets: Vec<u32>,
     pub(crate) labels: Vec<u32>,
+    pub(crate) collections: Vec<u32>,
 }
 
 impl CsrIndex {
@@ -188,25 +189,29 @@ impl CsrIndex {
     /// reservation for the three output arrays exceeds the `Graph` engine budget.
     pub(crate) fn build_dense(
         edges: &[Vec<(u32, u32)>],
+        collections: &[Vec<u32>],
         governor: Option<&Arc<MemoryGovernor>>,
     ) -> Result<DenseAdjacency, GraphError> {
         let n = edges.len();
         let total: usize = edges.iter().map(|e| e.len()).sum();
-        // Reserve budget for offsets (n+1 u32s), targets (total u32s), labels (total u32s).
-        let reserve_bytes = (n + 1 + 2 * total) * size_of::<u32>();
+        // Reserve budget for offsets (n+1 u32s), targets/labels/collections (total u32s each).
+        let reserve_bytes = (n + 1 + 3 * total) * size_of::<u32>();
         let _budget_guard = governor
             .map(|g| g.reserve(EngineId::Graph, reserve_bytes))
             .transpose()?;
         let mut offsets = Vec::with_capacity(n + 1);
         let mut targets = Vec::with_capacity(total);
         let mut labels = Vec::with_capacity(total);
+        let mut out_collections = Vec::with_capacity(total);
 
         let mut offset = 0u32;
-        for node_edges in edges {
+        for (node, node_edges) in edges.iter().enumerate() {
             offsets.push(offset);
-            for &(lid, target) in node_edges {
+            let node_colls = collections.get(node);
+            for (k, &(lid, target)) in node_edges.iter().enumerate() {
                 targets.push(target);
                 labels.push(lid);
+                out_collections.push(node_colls.and_then(|c| c.get(k)).copied().unwrap_or(0));
             }
             offset += node_edges.len() as u32;
         }
@@ -216,21 +221,26 @@ impl CsrIndex {
             offsets,
             targets,
             labels,
+            collections: out_collections,
         })
     }
 
-    /// Check if a specific edge exists in the dense CSR.
-    pub(crate) fn dense_has_edge(&self, src: u32, label: u32, dst: u32) -> bool {
-        for (lid, target) in self.dense_out_edges(src) {
-            if lid == label && target == dst {
+    /// Check if a specific `(src, label, dst, collection)` edge exists in the
+    /// dense CSR. Edge identity is collection-aware: the same triple under two
+    /// collections is two distinct edges, so dedup / re-insert must key on the
+    /// collection too.
+    pub(crate) fn dense_has_edge(&self, src: u32, label: u32, dst: u32, collection: u32) -> bool {
+        for (lid, target, coll) in self.dense_out_edges(src) {
+            if lid == label && target == dst && coll == collection {
                 return true;
             }
         }
         false
     }
 
-    /// Iterate dense outbound edges for a node (raw u32, no tag check).
-    pub(crate) fn dense_out_edges(&self, node: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+    /// Iterate dense outbound edges for a node as `(label, dst, collection)`
+    /// (raw u32, no tag check, no deletion filter).
+    pub(crate) fn dense_out_edges(&self, node: u32) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
         let idx = node as usize;
         if idx + 1 >= self.out_offsets.len() {
             return Vec::new().into_iter();
@@ -238,13 +248,20 @@ impl CsrIndex {
         let start = self.out_offsets[idx] as usize;
         let end = self.out_offsets[idx + 1] as usize;
         (start..end)
-            .map(move |i| (self.out_labels[i], self.out_targets[i]))
+            .map(move |i| {
+                (
+                    self.out_labels[i],
+                    self.out_targets[i],
+                    self.out_collections.get(i).copied().unwrap_or(0),
+                )
+            })
             .collect::<Vec<_>>()
             .into_iter()
     }
 
-    /// Iterate dense inbound edges for a node (raw u32, no tag check).
-    pub(crate) fn dense_in_edges(&self, node: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+    /// Iterate dense inbound edges for a node as `(label, src, collection)`
+    /// (raw u32, no tag check, no deletion filter).
+    pub(crate) fn dense_in_edges(&self, node: u32) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
         let idx = node as usize;
         if idx + 1 >= self.in_offsets.len() {
             return Vec::new().into_iter();
@@ -252,27 +269,83 @@ impl CsrIndex {
         let start = self.in_offsets[idx] as usize;
         let end = self.in_offsets[idx + 1] as usize;
         (start..end)
-            .map(move |i| (self.in_labels[i], self.in_targets[i]))
+            .map(move |i| {
+                (
+                    self.in_labels[i],
+                    self.in_targets[i],
+                    self.in_collections.get(i).copied().unwrap_or(0),
+                )
+            })
             .collect::<Vec<_>>()
             .into_iter()
     }
 
-    /// Raw u32 iteration over outbound edges (dense + buffer - deleted).
+    /// Raw u32 iteration over outbound edges (dense + buffer - deleted),
+    /// yielding `(label, dst)`. The deletion filter is collection-aware: only
+    /// the `(node, label, dst, collection)` copy that was deleted is hidden.
     /// Crate-internal: used by label-dispatching helpers and algorithms
     /// that already hold a validated partition borrow.
     pub(crate) fn dense_iter_out(&self, node: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
         let dense = self
             .dense_out_edges(node)
-            .filter(move |&(lid, dst)| !self.deleted_edges.contains(&(node, lid, dst)));
+            .filter(move |&(lid, dst, coll)| !self.deleted_edges.contains(&(node, lid, dst, coll)))
+            .map(|(lid, dst, _coll)| (lid, dst));
         dense.chain(self.buffer_out_iter(node))
     }
 
-    /// Raw u32 iteration over inbound edges (dense + buffer - deleted).
+    /// Raw u32 iteration over inbound edges (dense + buffer - deleted),
+    /// yielding `(label, src)`. Collection-aware deletion filter.
     pub(crate) fn dense_iter_in(&self, node: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
         let dense = self
             .dense_in_edges(node)
-            .filter(move |&(lid, src)| !self.deleted_edges.contains(&(src, lid, node)));
+            .filter(move |&(lid, src, coll)| !self.deleted_edges.contains(&(src, lid, node, coll)))
+            .map(|(lid, src, _coll)| (lid, src));
         dense.chain(self.buffer_in_iter(node))
+    }
+
+    /// Collection-tagged iteration over live outbound edges (dense + buffer -
+    /// deleted), yielding `(label, dst, collection)`. Used by node-edge removal
+    /// so each edge is tombstoned under its own collection identity.
+    pub(crate) fn dense_iter_out_coll(&self, node: u32) -> Vec<(u32, u32, u32)> {
+        let mut out: Vec<(u32, u32, u32)> = self
+            .dense_out_edges(node)
+            .filter(|&(lid, dst, coll)| !self.deleted_edges.contains(&(node, lid, dst, coll)))
+            .collect();
+        let idx = node as usize;
+        if idx < self.buffer_out.len() {
+            for (k, &(lid, dst)) in self.buffer_out[idx].iter().enumerate() {
+                let coll = self
+                    .buffer_out_collections
+                    .get(idx)
+                    .and_then(|c| c.get(k))
+                    .copied()
+                    .unwrap_or(0);
+                out.push((lid, dst, coll));
+            }
+        }
+        out
+    }
+
+    /// Collection-tagged iteration over live inbound edges (see
+    /// [`Self::dense_iter_out_coll`]), yielding `(label, src, collection)`.
+    pub(crate) fn dense_iter_in_coll(&self, node: u32) -> Vec<(u32, u32, u32)> {
+        let mut out: Vec<(u32, u32, u32)> = self
+            .dense_in_edges(node)
+            .filter(|&(lid, src, coll)| !self.deleted_edges.contains(&(src, lid, node, coll)))
+            .collect();
+        let idx = node as usize;
+        if idx < self.buffer_in.len() {
+            for (k, &(lid, src)) in self.buffer_in[idx].iter().enumerate() {
+                let coll = self
+                    .buffer_in_collections
+                    .get(idx)
+                    .and_then(|c| c.get(k))
+                    .copied()
+                    .unwrap_or(0);
+                out.push((lid, src, coll));
+            }
+        }
+        out
     }
 
     /// Buffer-only iteration over outbound edges for a node.

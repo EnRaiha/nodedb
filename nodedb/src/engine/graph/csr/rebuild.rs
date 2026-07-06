@@ -28,7 +28,7 @@ pub fn rebuild_sharded_from_store_as_of(
 
     // First pass: materialize every (database, tenant, node) so isolated
     // endpoints get stable node ids before edge insertion.
-    // EdgeRecord is now (DatabaseId, TenantId, collection, src, label, dst, props).
+    // EdgeRecord is (DatabaseId, TenantId, collection, src, label, dst, props).
     for (db, tid, _collection, src, _label, dst, _props) in &all_edges {
         let partition = sharded.get_or_create(*db, *tid);
         partition
@@ -43,16 +43,18 @@ pub fn rebuild_sharded_from_store_as_of(
             })?;
     }
 
-    // Second pass: insert edges into their tenant's partition.
-    // The CSR is collection-agnostic in memory — all collections'
-    // edges live in the same per-tenant partition.
-    for (db, tid, _collection, src, label, dst, props) in &all_edges {
+    // Second pass: insert edges into their tenant's partition, tagged with
+    // the collection they belong to. All collections' edges live in the same
+    // per-tenant partition (nodes are shared), but each edge carries its
+    // collection id so collection-scoped MATCH / RAG reads never cross
+    // collection boundaries.
+    for (db, tid, collection, src, label, dst, props) in &all_edges {
         let partition = sharded.get_or_create(*db, *tid);
         let weight = extract_weight_from_properties(props);
         let res = if weight != 1.0 {
-            partition.add_edge_weighted(src, label, dst, weight)
+            partition.add_edge_weighted_in_collection(src, label, dst, collection, weight)
         } else {
-            partition.add_edge(src, label, dst)
+            partition.add_edge_in_collection(src, label, dst, collection)
         };
         res.map_err(|e| crate::Error::Internal {
             detail: format!("CSR rebuild: {e}"),

@@ -95,6 +95,7 @@ impl CoreLoop {
             direction,
             expansion_depth,
             max_visited,
+            collection,
         );
 
         let (vector_k, text_k, graph_k) = rrf_k;

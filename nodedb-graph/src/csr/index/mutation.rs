@@ -13,7 +13,37 @@ impl CsrIndex {
     /// client; silently ignoring it reproduces the silent-wrap bug the
     /// `u32` widening was meant to fix.
     pub fn add_edge(&mut self, src: &str, label: &str, dst: &str) -> Result<(), crate::GraphError> {
-        self.add_edge_internal(src, label, dst, 1.0, false)
+        self.add_edge_internal(src, label, dst, "", 1.0, false)
+    }
+
+    /// Add an unweighted edge scoped to `collection`.
+    ///
+    /// The collection tag is what lets a collection-scoped MATCH / RAG read
+    /// (`... IN '<collection>'`) see only its own edges even though every
+    /// collection's edges share one per-`(database, tenant)` CSR partition
+    /// (nodes, node-labels and surrogates are shared across collections; only
+    /// edges carry the collection axis).
+    pub fn add_edge_in_collection(
+        &mut self,
+        src: &str,
+        label: &str,
+        dst: &str,
+        collection: &str,
+    ) -> Result<(), crate::GraphError> {
+        self.add_edge_internal(src, label, dst, collection, 1.0, false)
+    }
+
+    /// Add a weighted edge scoped to `collection`. See
+    /// [`Self::add_edge_in_collection`] and [`Self::add_edge_weighted`].
+    pub fn add_edge_weighted_in_collection(
+        &mut self,
+        src: &str,
+        label: &str,
+        dst: &str,
+        collection: &str,
+        weight: f64,
+    ) -> Result<(), crate::GraphError> {
+        self.add_edge_internal(src, label, dst, collection, weight, weight != 1.0)
     }
 
     /// Incrementally add a weighted edge (goes into mutable buffer).
@@ -28,7 +58,7 @@ impl CsrIndex {
         dst: &str,
         weight: f64,
     ) -> Result<(), crate::GraphError> {
-        self.add_edge_internal(src, label, dst, weight, weight != 1.0)
+        self.add_edge_internal(src, label, dst, "", weight, weight != 1.0)
     }
 
     fn add_edge_internal(
@@ -36,20 +66,29 @@ impl CsrIndex {
         src: &str,
         label: &str,
         dst: &str,
+        collection: &str,
         weight: f64,
         force_weights: bool,
     ) -> Result<(), crate::GraphError> {
         let src_id = self.ensure_node(src)?;
         let dst_id = self.ensure_node(dst)?;
         let label_id = self.ensure_label(label)?;
+        let collection_id = self.ensure_collection(collection);
 
-        // Check for duplicates in buffer.
+        // Check for duplicates in buffer. Edge identity is collection-aware:
+        // the same `(label, dst)` under a DIFFERENT collection is a distinct
+        // edge and must NOT be deduplicated away.
         let out = &self.buffer_out[src_id as usize];
-        if out.iter().any(|&(l, d)| l == label_id && d == dst_id) {
+        let out_colls = &self.buffer_out_collections[src_id as usize];
+        if out
+            .iter()
+            .zip(out_colls.iter())
+            .any(|(&(l, d), &c)| l == label_id && d == dst_id && c == collection_id)
+        {
             return Ok(());
         }
-        // Check for duplicates in dense CSR.
-        if self.dense_has_edge(src_id, label_id, dst_id) {
+        // Check for duplicates in dense CSR (collection-aware).
+        if self.dense_has_edge(src_id, label_id, dst_id, collection_id) {
             return Ok(());
         }
 
@@ -60,19 +99,42 @@ impl CsrIndex {
 
         self.buffer_out[src_id as usize].push((label_id, dst_id));
         self.buffer_in[dst_id as usize].push((label_id, src_id));
+        self.buffer_out_collections[src_id as usize].push(collection_id);
+        self.buffer_in_collections[dst_id as usize].push(collection_id);
 
         if self.has_weights {
             self.buffer_out_weights[src_id as usize].push(weight);
             self.buffer_in_weights[dst_id as usize].push(weight);
         }
 
-        // If it was previously deleted, un-delete.
-        self.deleted_edges.remove(&(src_id, label_id, dst_id));
+        // If this exact `(src, label, dst, collection)` copy was previously
+        // deleted, un-delete it.
+        self.deleted_edges
+            .remove(&(src_id, label_id, dst_id, collection_id));
         Ok(())
     }
 
-    /// Incrementally remove an edge.
+    /// Incrementally remove an edge under the unscoped (`""`) collection.
+    ///
+    /// Kept for callers that operate on a single-collection CSR (NodeDB-Lite
+    /// keys one `CsrIndex` per collection) or add edges via the collection-less
+    /// [`Self::add_edge`]. Origin's collection-scoped delete path uses
+    /// [`Self::remove_edge_in_collection`].
     pub fn remove_edge(&mut self, src: &str, label: &str, dst: &str) {
+        self.remove_edge_in_collection(src, label, dst, "");
+    }
+
+    /// Incrementally remove the `(src, label, dst, collection)` edge.
+    ///
+    /// Only the copy tagged with `collection` is removed — an identical triple
+    /// under a different collection is left intact.
+    pub fn remove_edge_in_collection(
+        &mut self,
+        src: &str,
+        label: &str,
+        dst: &str,
+        collection: &str,
+    ) {
         let (Some(&src_id), Some(&dst_id)) = (self.node_to_id.get(src), self.node_to_id.get(dst))
         else {
             return;
@@ -80,32 +142,42 @@ impl CsrIndex {
         let Some(&label_id) = self.label_to_id.get(label) else {
             return;
         };
+        let Some(&collection_id) = self.collection_to_id.get(collection) else {
+            return;
+        };
 
-        // Remove from buffer if present (keep weight buffers in sync).
+        // Remove from buffer if present (keep parallel buffers in sync).
         let out_buf = &self.buffer_out[src_id as usize];
+        let out_colls = &self.buffer_out_collections[src_id as usize];
         if let Some(pos) = out_buf
             .iter()
-            .position(|&(l, d)| l == label_id && d == dst_id)
+            .zip(out_colls.iter())
+            .position(|(&(l, d), &c)| l == label_id && d == dst_id && c == collection_id)
         {
             self.buffer_out[src_id as usize].swap_remove(pos);
+            self.buffer_out_collections[src_id as usize].swap_remove(pos);
             if self.has_weights {
                 self.buffer_out_weights[src_id as usize].swap_remove(pos);
             }
         }
         let in_buf = &self.buffer_in[dst_id as usize];
+        let in_colls = &self.buffer_in_collections[dst_id as usize];
         if let Some(pos) = in_buf
             .iter()
-            .position(|&(l, s)| l == label_id && s == src_id)
+            .zip(in_colls.iter())
+            .position(|(&(l, s), &c)| l == label_id && s == src_id && c == collection_id)
         {
             self.buffer_in[dst_id as usize].swap_remove(pos);
+            self.buffer_in_collections[dst_id as usize].swap_remove(pos);
             if self.has_weights {
                 self.buffer_in_weights[dst_id as usize].swap_remove(pos);
             }
         }
 
         // Mark as deleted in dense CSR.
-        if self.dense_has_edge(src_id, label_id, dst_id) {
-            self.deleted_edges.insert((src_id, label_id, dst_id));
+        if self.dense_has_edge(src_id, label_id, dst_id, collection_id) {
+            self.deleted_edges
+                .insert((src_id, label_id, dst_id, collection_id));
         }
     }
 
@@ -116,44 +188,57 @@ impl CsrIndex {
         };
         let mut removed = 0;
 
-        // Collect outgoing edges then remove reverse references.
-        let out_edges: Vec<(u32, u32)> = self.dense_iter_out(node_id).collect();
-        for (label_id, dst_id) in &out_edges {
+        // Collect outgoing edges (collection-tagged) then remove reverse
+        // references. Every collection's copy of an edge is removed — node
+        // deletion cascades across all collections.
+        let out_edges = self.dense_iter_out_coll(node_id);
+        for (label_id, dst_id, coll_id) in &out_edges {
             let in_buf = &self.buffer_in[*dst_id as usize];
+            let in_colls = &self.buffer_in_collections[*dst_id as usize];
             if let Some(pos) = in_buf
                 .iter()
-                .position(|&(l, s)| l == *label_id && s == node_id)
+                .zip(in_colls.iter())
+                .position(|(&(l, s), &c)| l == *label_id && s == node_id && c == *coll_id)
             {
                 self.buffer_in[*dst_id as usize].swap_remove(pos);
+                self.buffer_in_collections[*dst_id as usize].swap_remove(pos);
                 if self.has_weights {
                     self.buffer_in_weights[*dst_id as usize].swap_remove(pos);
                 }
             }
-            self.deleted_edges.insert((node_id, *label_id, *dst_id));
+            self.deleted_edges
+                .insert((node_id, *label_id, *dst_id, *coll_id));
             removed += 1;
         }
         self.buffer_out[node_id as usize].clear();
+        self.buffer_out_collections[node_id as usize].clear();
         if self.has_weights {
             self.buffer_out_weights[node_id as usize].clear();
         }
 
-        // Collect incoming edges then remove reverse references.
-        let in_edges: Vec<(u32, u32)> = self.dense_iter_in(node_id).collect();
-        for (label_id, src_id) in &in_edges {
+        // Collect incoming edges (collection-tagged) then remove reverse
+        // references.
+        let in_edges = self.dense_iter_in_coll(node_id);
+        for (label_id, src_id, coll_id) in &in_edges {
             let out_buf = &self.buffer_out[*src_id as usize];
+            let out_colls = &self.buffer_out_collections[*src_id as usize];
             if let Some(pos) = out_buf
                 .iter()
-                .position(|&(l, d)| l == *label_id && d == node_id)
+                .zip(out_colls.iter())
+                .position(|(&(l, d), &c)| l == *label_id && d == node_id && c == *coll_id)
             {
                 self.buffer_out[*src_id as usize].swap_remove(pos);
+                self.buffer_out_collections[*src_id as usize].swap_remove(pos);
                 if self.has_weights {
                     self.buffer_out_weights[*src_id as usize].swap_remove(pos);
                 }
             }
-            self.deleted_edges.insert((*src_id, *label_id, node_id));
+            self.deleted_edges
+                .insert((*src_id, *label_id, node_id, *coll_id));
             removed += 1;
         }
         self.buffer_in[node_id as usize].clear();
+        self.buffer_in_collections[node_id as usize].clear();
         if self.has_weights {
             self.buffer_in_weights[node_id as usize].clear();
         }

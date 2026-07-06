@@ -175,6 +175,11 @@ pub(super) struct ExecutionState<'a> {
     /// to `100_000` when no tuning override is set), so truncation is a real
     /// operational knob rather than a compile-time constant.
     pub varlen_caps: super::expansion::VarLenCaps,
+    /// Collection scoping for edge traversal, resolved once from the query's
+    /// `IN '<collection>'` clause against the CSR's collection interning.
+    /// Defaults to [`CollectionFilter::Unscoped`] (tenant-wide) until the
+    /// executor entry point resolves it.
+    pub collection_filter: super::expansion::CollectionFilter,
 }
 
 impl<'a> ExecutionState<'a> {
@@ -187,6 +192,7 @@ impl<'a> ExecutionState<'a> {
             frontier: Vec::new(),
             is_remote_node,
             varlen_caps,
+            collection_filter: super::expansion::CollectionFilter::Unscoped,
         }
     }
 

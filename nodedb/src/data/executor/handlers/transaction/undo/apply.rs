@@ -159,8 +159,12 @@ impl CoreLoop {
                             );
                             (entry_index, detail)
                         })?;
-                    self.csr_partition_mut(did, tid)
-                        .remove_edge(&src_id, &label, &dst_id);
+                    self.csr_partition_mut(did, tid).remove_edge_in_collection(
+                        &src_id,
+                        &label,
+                        &dst_id,
+                        &collection,
+                    );
                 }
                 Ok(())
             }
@@ -197,9 +201,15 @@ impl CoreLoop {
                     crate::engine::graph::csr::extract_weight_from_properties(&old_properties);
                 let partition = self.csr_partition_mut(did, tid);
                 let csr_res = if weight != 1.0 {
-                    partition.add_edge_weighted(&src_id, &label, &dst_id, weight)
+                    partition.add_edge_weighted_in_collection(
+                        &src_id,
+                        &label,
+                        &dst_id,
+                        &collection,
+                        weight,
+                    )
                 } else {
-                    partition.add_edge(&src_id, &label, &dst_id)
+                    partition.add_edge_in_collection(&src_id, &label, &dst_id, &collection)
                 };
                 csr_res.map_err(|e| {
                     let detail = format!("CSR re-insert {src_id}-[{label}]->{dst_id}: {e}");

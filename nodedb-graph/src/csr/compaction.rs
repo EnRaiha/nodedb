@@ -20,6 +20,9 @@ impl CsrIndex {
         let n = self.id_to_node.len();
         let mut new_out_edges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
         let mut new_in_edges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
+        // Collection ids parallel to `new_out_edges` / `new_in_edges`.
+        let mut new_out_collections: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut new_in_collections: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut new_out_weights: Vec<Vec<f64>> = if self.has_weights {
             vec![Vec::new(); n]
         } else {
@@ -43,8 +46,10 @@ impl CsrIndex {
                 for i in start..end {
                     let lid = self.out_labels[i];
                     let dst = self.out_targets[i];
-                    if !self.deleted_edges.contains(&(node_id, lid, dst)) {
+                    let coll = self.out_collections.get(i).copied().unwrap_or(0);
+                    if !self.deleted_edges.contains(&(node_id, lid, dst, coll)) {
                         new_out_edges[node].push((lid, dst));
+                        new_out_collections[node].push(coll);
                         if self.has_weights {
                             let w = self
                                 .out_weights
@@ -63,8 +68,10 @@ impl CsrIndex {
                 for i in start..end {
                     let lid = self.in_labels[i];
                     let src = self.in_targets[i];
-                    if !self.deleted_edges.contains(&(src, lid, node_id)) {
+                    let coll = self.in_collections.get(i).copied().unwrap_or(0);
+                    if !self.deleted_edges.contains(&(src, lid, node_id, coll)) {
                         new_in_edges[node].push((lid, src));
+                        new_in_collections[node].push(coll);
                         if self.has_weights {
                             let w = self
                                 .in_weights
@@ -77,14 +84,22 @@ impl CsrIndex {
             }
         }
 
-        // Merge buffer edges.
+        // Merge buffer edges. Dedup is collection-aware: an identical
+        // `(label, dst)` under a different collection is a distinct edge and
+        // must survive alongside the existing one.
         for node in 0..n {
             for (buf_idx, &(lid, dst)) in self.buffer_out[node].iter().enumerate() {
+                let coll = self.buffer_out_collections[node]
+                    .get(buf_idx)
+                    .copied()
+                    .unwrap_or(0);
                 if !new_out_edges[node]
                     .iter()
-                    .any(|&(l, d)| l == lid && d == dst)
+                    .zip(new_out_collections[node].iter())
+                    .any(|(&(l, d), &c)| l == lid && d == dst && c == coll)
                 {
                     new_out_edges[node].push((lid, dst));
+                    new_out_collections[node].push(coll);
                     if self.has_weights {
                         let w = self.buffer_out_weights[node]
                             .get(buf_idx)
@@ -95,11 +110,17 @@ impl CsrIndex {
                 }
             }
             for (buf_idx, &(lid, src)) in self.buffer_in[node].iter().enumerate() {
+                let coll = self.buffer_in_collections[node]
+                    .get(buf_idx)
+                    .copied()
+                    .unwrap_or(0);
                 if !new_in_edges[node]
                     .iter()
-                    .any(|&(l, s)| l == lid && s == src)
+                    .zip(new_in_collections[node].iter())
+                    .any(|(&(l, s), &c)| l == lid && s == src && c == coll)
                 {
                     new_in_edges[node].push((lid, src));
+                    new_in_collections[node].push(coll);
                     if self.has_weights {
                         let w = self.buffer_in_weights[node]
                             .get(buf_idx)
@@ -113,15 +134,17 @@ impl CsrIndex {
 
         // Build new dense arrays.
         let governor = self.governor.as_ref();
-        let out = Self::build_dense(&new_out_edges, governor)?;
-        let in_ = Self::build_dense(&new_in_edges, governor)?;
+        let out = Self::build_dense(&new_out_edges, &new_out_collections, governor)?;
+        let in_ = Self::build_dense(&new_in_edges, &new_in_collections, governor)?;
 
         self.out_offsets = out.offsets;
         self.out_targets = out.targets.into();
         self.out_labels = out.labels.into();
+        self.out_collections = out.collections;
         self.in_offsets = in_.offsets;
         self.in_targets = in_.targets.into();
         self.in_labels = in_.labels.into();
+        self.in_collections = in_.collections;
 
         // Build weight arrays (flatten per-node vecs into contiguous array).
         if self.has_weights {
@@ -146,6 +169,12 @@ impl CsrIndex {
             buf.clear();
         }
         for buf in &mut self.buffer_in {
+            buf.clear();
+        }
+        for buf in &mut self.buffer_out_collections {
+            buf.clear();
+        }
+        for buf in &mut self.buffer_in_collections {
             buf.clear();
         }
         if self.has_weights {

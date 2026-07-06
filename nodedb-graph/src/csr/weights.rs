@@ -78,9 +78,12 @@ impl CsrIndex {
             let start = self.out_offsets[idx] as usize;
             let end = self.out_offsets[idx + 1] as usize;
             for i in start..end {
+                let coll = self.out_collections.get(i).copied().unwrap_or(0);
                 if self.out_labels[i] == label_id
                     && self.out_targets[i] == dst_id
-                    && !self.deleted_edges.contains(&(src_id, label_id, dst_id))
+                    && !self
+                        .deleted_edges
+                        .contains(&(src_id, label_id, dst_id, coll))
                 {
                     return Some(self.out_edge_weight(i));
                 }
@@ -132,11 +135,16 @@ impl CsrIndex {
         };
 
         let dense = (dense_start..dense_end)
-            .map(move |i| {
-                let w = self.out_edge_weight(i);
-                (self.out_labels[i], self.out_targets[i], w)
+            .filter_map(move |i| {
+                let lid = self.out_labels[i];
+                let dst = self.out_targets[i];
+                let coll = self.out_collections.get(i).copied().unwrap_or(0);
+                if self.deleted_edges.contains(&(node, lid, dst, coll)) {
+                    None
+                } else {
+                    Some((lid, dst, self.out_edge_weight(i)))
+                }
             })
-            .filter(move |&(lid, dst, _)| !self.deleted_edges.contains(&(node, lid, dst)))
             .collect::<Vec<_>>();
 
         // Buffer edges with weights.
