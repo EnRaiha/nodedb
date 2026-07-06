@@ -64,6 +64,12 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::RejectedAuthz { .. } => {
             ("ERROR", sqlstate::INSUFFICIENT_PRIVILEGE, err.to_string())
         }
+        // A rate-limit rejection is transient/retryable, distinct from a
+        // credential or privilege failure. TOO_MANY_CONNECTIONS (53300) is the
+        // canonical retryable code clients recognise.
+        crate::Error::RateExceeded { .. } => {
+            ("ERROR", sqlstate::TOO_MANY_CONNECTIONS, err.to_string())
+        }
         crate::Error::MemoryExhausted { .. } => ("ERROR", sqlstate::OUT_OF_MEMORY, err.to_string()),
         crate::Error::Backpressure { .. } => ("ERROR", sqlstate::OUT_OF_MEMORY, err.to_string()),
         crate::Error::FanOutExceeded { .. } => {

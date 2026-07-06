@@ -110,13 +110,15 @@ pub async fn authenticate(
             let rl_outcome = state.rate_limiter.check_login(&peer_ip_str, username);
             if !matches!(rl_outcome, LoginRateLimitOutcome::Allowed) {
                 let emitter = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
-                let detail = match rl_outcome {
-                    LoginRateLimitOutcome::IpExceeded => {
-                        format!("login rate limited (ip={peer_ip_str}): {username}")
-                    }
-                    LoginRateLimitOutcome::UserExceeded => {
-                        format!("login rate limited (user): {username}")
-                    }
+                let (detail, retry_after_secs) = match rl_outcome {
+                    LoginRateLimitOutcome::IpExceeded { retry_after_secs } => (
+                        format!("login rate limited (ip={peer_ip_str}): {username}"),
+                        retry_after_secs,
+                    ),
+                    LoginRateLimitOutcome::UserExceeded { retry_after_secs } => (
+                        format!("login rate limited (user): {username}"),
+                        retry_after_secs,
+                    ),
                     LoginRateLimitOutcome::Allowed => unreachable!(),
                 };
                 emitter.emit(
@@ -126,13 +128,21 @@ pub async fn authenticate(
                     AuditEmitContext::new(None, "", username),
                 );
                 state.auth_metrics.record_auth_failure("password");
-                // Constant-time floor: sleep until auth_start + AUTH_FLOOR
-                // so timing cannot distinguish a rate-limit rejection from a
-                // real Argon2 credential check.
-                enforce_auth_floor(auth_start).await;
-                return Err(crate::Error::RejectedAuthz {
-                    tenant_id: TenantId::new(0),
-                    resource: "authentication failed".into(),
+                // A rate-limit rejection is a TRANSIENT admission failure, not a
+                // credential signal, so it is surfaced as a distinct retryable
+                // error (`RateExceeded`) and logged distinctly (LoginRateLimited
+                // above) — never collapsed into the generic "authentication
+                // failed" that a wrong password / lockout / unknown user return.
+                // The constant-time floor is deliberately NOT applied: unlike
+                // the credential arms it reveals nothing about whether the
+                // account exists or the password was right, so an early return
+                // leaks no oracle while avoiding wasted latency. The genuine
+                // credential arms below keep their `AUTH_FLOOR` and remain
+                // indistinguishable from one another.
+                return Err(crate::Error::RateExceeded {
+                    gate: "login".into(),
+                    detail: "too many login attempts; retry shortly".into(),
+                    retry_after_ms: retry_after_secs.saturating_mul(1000),
                 });
             }
 
@@ -164,6 +174,13 @@ pub async fn authenticate(
                         state
                             .credentials
                             .record_login_failure(username, peer_ip, &emitter);
+                        // Drive the per-IP / per-user brute-force window from the
+                        // same place as the lockout counter: only genuine
+                        // credential failures close it, so correct-credential
+                        // bursts never trip the pre-verify admission check.
+                        state
+                            .rate_limiter
+                            .record_login_failure(&peer_ip_str, username);
                     }
                     state.audit_record(
                         AuditEvent::AuthFailure,

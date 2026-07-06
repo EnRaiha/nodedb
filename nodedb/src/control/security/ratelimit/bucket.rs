@@ -73,9 +73,17 @@ impl TokenBucket {
             return; // Don't refill more often than every 10ms.
         }
 
-        // Calculate tokens to add.
-        let added = (self.refill_rate * elapsed_ms as f64 / 1000.0) as u64 * 1000;
-        if added == 0 {
+        // Tokens to add, in milli-token units. `refill_rate` is tokens/sec and
+        // `elapsed_ms` is milliseconds, so `refill_rate * elapsed_ms` is already
+        // expressed in milli-tokens (rate * elapsed_ms/1000 tokens * 1000). This
+        // avoids the previous `(rate * elapsed/1000) as u64 * 1000` form, which
+        // truncated to whole tokens BEFORE re-scaling and silently discarded up
+        // to one full token of accrued credit per refill. Under sustained login
+        // pressure that drift compounded, pinning the effective refill rate
+        // below the configured rate and keeping busy buckets permanently
+        // near-empty — the "worsens with uptime" symptom.
+        let added_millis = (self.refill_rate * elapsed_ms as f64) as u64;
+        if added_millis == 0 {
             return;
         }
 
@@ -91,7 +99,7 @@ impl TokenBucket {
         let cap_millis = self.capacity * 1000;
         loop {
             let current = self.tokens_millis.load(Ordering::Relaxed);
-            let new_val = (current + added).min(cap_millis);
+            let new_val = (current + added_millis).min(cap_millis);
             if self
                 .tokens_millis
                 .compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed)

@@ -633,6 +633,17 @@ impl NativeSession {
                 self.identity = Some(identity);
                 resp
             }
+            // A transient login rate-limit is distinct from a credential
+            // failure: it maps to TOO_MANY_CONNECTIONS (53300), which clients
+            // recognise as retryable, and carries a distinct message. Every
+            // other auth error (wrong password, lockout, unknown user) stays
+            // collapsed into the generic invalid-password 28P01 so none can be
+            // distinguished from the others.
+            Err(e @ crate::Error::RateExceeded { .. }) => NativeResponse::error(
+                seq,
+                nodedb_types::error::sqlstate::TOO_MANY_CONNECTIONS,
+                format!("{e}"),
+            ),
             Err(e) => NativeResponse::error(seq, "28P01", format!("{e}")),
         }
     }

@@ -59,14 +59,26 @@ pub struct QuotaCheckParams {
     pub database_id: DatabaseId,
 }
 
-/// Result of a pre-authentication login rate-limit check.
+/// Result of a pre-authentication login admission check.
+///
+/// A non-`Allowed` outcome is a *transient* rejection (retry after
+/// `retry_after_secs`) — NOT a credential signal. Callers must surface it as a
+/// distinct retryable error, never collapse it into an invalid-password error.
+#[derive(Debug)]
 pub enum LoginRateLimitOutcome {
-    /// Both the IP and user buckets have tokens remaining — proceed with auth.
+    /// Admission granted — proceed with credential verification.
     Allowed,
-    /// The per-IP bucket was exhausted.
-    IpExceeded,
-    /// The per-username bucket was exhausted.
-    UserExceeded,
+    /// The per-IP admission ceiling (brute-force failure window or Argon2 DoS
+    /// ceiling) is exhausted for this source address.
+    IpExceeded {
+        /// Seconds until the caller should retry.
+        retry_after_secs: u64,
+    },
+    /// The per-username brute-force failure window is exhausted.
+    UserExceeded {
+        /// Seconds until the caller should retry.
+        retry_after_secs: u64,
+    },
 }
 
 /// Hierarchical rate limiter.
@@ -76,10 +88,9 @@ pub struct RateLimiter {
     buckets: RwLock<HashMap<String, TokenBucket>>,
     /// Total rejection counter for Prometheus metrics.
     rejections_total: std::sync::atomic::AtomicU64,
-    /// Maximum login attempts per IP per minute (0 = disabled).
-    login_ip_cap: std::sync::atomic::AtomicU64,
-    /// Maximum login attempts per username per minute (0 = disabled).
-    login_user_cap: std::sync::atomic::AtomicU64,
+    /// Pre-authentication login admission control (brute-force windows +
+    /// Argon2 DoS ceiling). Owns its own bucket map — see `LoginLimiter`.
+    login: super::login::LoginLimiter,
 }
 
 impl RateLimiter {
@@ -88,79 +99,34 @@ impl RateLimiter {
             config,
             buckets: RwLock::new(HashMap::new()),
             rejections_total: std::sync::atomic::AtomicU64::new(0),
-            login_ip_cap: std::sync::atomic::AtomicU64::new(30),
-            login_user_cap: std::sync::atomic::AtomicU64::new(10),
+            login: super::login::LoginLimiter::new(),
         }
     }
 
-    /// Update the per-IP and per-username login attempt capacities.
-    ///
-    /// Takes effect for new token buckets created after this call.
-    /// Existing in-flight buckets retain their original capacity.
+    /// Update the per-IP and per-username login brute-force failure capacities.
     /// Called once at startup from server configuration.
     pub fn set_login_capacities(&self, ip_cap: u64, user_cap: u64) {
-        self.login_ip_cap
-            .store(ip_cap, std::sync::atomic::Ordering::Relaxed);
-        self.login_user_cap
-            .store(user_cap, std::sync::atomic::Ordering::Relaxed);
+        self.login.set_capacities(ip_cap, user_cap);
     }
 
-    /// Check the two pre-authentication login rate-limit buckets.
-    ///
-    /// Both `login_ip:{addr}` and `login_user:{username}` are consulted.
-    /// Each failed attempt ALWAYS consumes a token from the IP bucket
-    /// (the username may be unknown or wrong, but the IP is always real).
-    /// The user bucket is only consumed when a username is provided.
-    ///
-    /// Capacities come from the values set via [`set_login_capacities`].
-    /// Each bucket refills at `capacity / 60` tokens per second — one full
-    /// window per minute.
-    ///
-    /// Returns [`LoginRateLimitOutcome::Allowed`] when both buckets have tokens.
+    /// Pre-authentication admission check. Delegates to `LoginLimiter::check`;
+    /// never consumes the brute-force budget for a legitimate attempt.
     pub fn check_login(&self, peer_addr: &str, username: &str) -> LoginRateLimitOutcome {
-        let ip_cap = self.login_ip_cap.load(std::sync::atomic::Ordering::Relaxed);
-        let user_cap = self
-            .login_user_cap
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        // 0-cap means the bucket type is disabled.
-        if ip_cap > 0 {
-            let ip_key = format!("login_ip:{peer_addr}");
-            let ip_rate = (ip_cap as f64) / 60.0;
-            if !self.check_login_bucket(&ip_key, ip_cap, ip_rate) {
-                return LoginRateLimitOutcome::IpExceeded;
-            }
-        }
-
-        if user_cap > 0 && !username.is_empty() {
-            let user_key = format!("login_user:{username}");
-            let user_rate = (user_cap as f64) / 60.0;
-            if !self.check_login_bucket(&user_key, user_cap, user_rate) {
-                return LoginRateLimitOutcome::UserExceeded;
-            }
-        }
-
-        LoginRateLimitOutcome::Allowed
+        self.login.check(peer_addr, username)
     }
 
-    /// Check a login-specific bucket with an explicit refill rate.
-    ///
-    /// Creates the bucket with the given capacity and rate if it does not exist.
-    /// Returns `true` (allowed) or `false` (rate-limited).
-    fn check_login_bucket(&self, key: &str, capacity: u64, rate_per_sec: f64) -> bool {
-        // Fast path: read-only check.
-        {
-            let buckets = self.buckets.read().unwrap_or_else(|p| p.into_inner());
-            if let Some(bucket) = buckets.get(key) {
-                return bucket.try_acquire(1);
-            }
-        }
-        // Slow path: create bucket.
-        let mut buckets = self.buckets.write().unwrap_or_else(|p| p.into_inner());
-        let bucket = buckets
-            .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new(capacity, rate_per_sec));
-        bucket.try_acquire(1)
+    /// Record a genuine credential FAILURE for brute-force accounting. Must be
+    /// called only from the same site that drives the credential lockout
+    /// counter — never on success or on a policy rejection.
+    pub fn record_login_failure(&self, peer_addr: &str, username: &str) {
+        self.login.record_failure(peer_addr, username);
+    }
+
+    /// Non-consuming check of whether login admission would currently reject
+    /// `(peer_addr, username)` — used to avoid double-counting a SASL failure
+    /// that was actually an admission rejection.
+    pub fn is_login_rate_limited(&self, peer_addr: &str, username: &str) -> bool {
+        self.login.is_rate_limited(peer_addr, username)
     }
 
     /// Check rate limit for a request.
@@ -369,9 +335,10 @@ impl RateLimiter {
         self.config.enabled
     }
 
-    /// Number of active buckets (for metrics).
+    /// Number of active buckets (for metrics) — the per-identity QPS buckets
+    /// plus the login admission buckets.
     pub fn active_buckets(&self) -> usize {
-        self.buckets.read().unwrap_or_else(|p| p.into_inner()).len()
+        self.buckets.read().unwrap_or_else(|p| p.into_inner()).len() + self.login.active_buckets()
     }
 
     /// Get the config for inspection.
@@ -388,17 +355,10 @@ impl Default for RateLimiter {
 
 impl std::fmt::Debug for RateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (login_ip_cap, login_user_cap) = self.login.capacities();
         f.debug_struct("RateLimiter")
-            .field(
-                "login_ip_cap",
-                &self.login_ip_cap.load(std::sync::atomic::Ordering::Relaxed),
-            )
-            .field(
-                "login_user_cap",
-                &self
-                    .login_user_cap
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            )
+            .field("login_ip_cap", &login_ip_cap)
+            .field("login_user_cap", &login_user_cap)
             .finish_non_exhaustive()
     }
 }
@@ -509,92 +469,94 @@ mod tests {
     }
 
     #[test]
-    fn login_rate_limit_ip() {
-        let limiter = login_limiter(30, 10);
-
-        // 30 attempts from one IP — all allowed.
-        for i in 0..30 {
-            let outcome = limiter.check_login("10.0.0.1", &format!("user_{i}"));
+    fn correct_credential_burst_is_never_rate_limited() {
+        // The core regression: a burst of correct-credential reconnects from a
+        // single IP (a pool warming up) must ALL be admitted. `check_login`
+        // never consumes the brute-force budget, and the generous DoS ceiling
+        // (max(ip_cap*4, 120) = 120 here) easily covers the burst.
+        let limiter = login_limiter(5, 5);
+        for i in 0..50 {
+            let outcome = limiter.check_login("10.0.0.1", "pool_user");
             assert!(
                 matches!(outcome, LoginRateLimitOutcome::Allowed),
-                "attempt {i} should be allowed"
+                "correct-credential attempt {i} must be admitted"
             );
         }
-        // 31st attempt — IP bucket exhausted.
-        let outcome = limiter.check_login("10.0.0.1", "user_overflow");
-        assert!(
-            matches!(outcome, LoginRateLimitOutcome::IpExceeded),
-            "31st attempt from same IP must be rate-limited"
-        );
-
-        // Different IP is unaffected.
-        let outcome = limiter.check_login("10.0.0.2", "user_other");
-        assert!(
-            matches!(outcome, LoginRateLimitOutcome::Allowed),
-            "different IP must still be allowed"
-        );
     }
 
     #[test]
-    fn login_rate_limit_user() {
-        let limiter = login_limiter(30, 10);
+    fn brute_force_failures_close_the_ip_window() {
+        let limiter = login_limiter(5, 100);
 
-        // 10 attempts for the same username from different IPs — all allowed.
-        for i in 0..10 {
-            let outcome = limiter.check_login(&format!("10.0.0.{i}"), "victim");
-            assert!(
-                matches!(outcome, LoginRateLimitOutcome::Allowed),
-                "attempt {i} should be allowed"
-            );
+        // Five FAILED attempts from one IP drain the per-IP failure bucket.
+        for _ in 0..5 {
+            assert!(matches!(
+                limiter.check_login("10.0.0.9", "victim"),
+                LoginRateLimitOutcome::Allowed
+            ));
+            limiter.record_login_failure("10.0.0.9", "victim");
         }
-        // 11th attempt — user bucket exhausted.
-        let outcome = limiter.check_login("10.0.0.200", "victim");
-        assert!(
-            matches!(outcome, LoginRateLimitOutcome::UserExceeded),
-            "11th attempt for same user must be rate-limited"
-        );
 
-        // Different username is unaffected.
-        let outcome = limiter.check_login("10.0.0.200", "other_user");
+        // The next attempt is denied — the brute-force window is closed.
         assert!(
-            matches!(outcome, LoginRateLimitOutcome::Allowed),
-            "different username must still be allowed"
+            matches!(
+                limiter.check_login("10.0.0.9", "victim"),
+                LoginRateLimitOutcome::IpExceeded { .. }
+            ),
+            "IP must be rate-limited after exhausting failure budget"
         );
+        assert!(limiter.is_login_rate_limited("10.0.0.9", "victim"));
+
+        // A different IP is unaffected.
+        assert!(matches!(
+            limiter.check_login("10.0.0.10", "victim2"),
+            LoginRateLimitOutcome::Allowed
+        ));
     }
 
     #[test]
-    fn login_rate_limit_window() {
-        // Use a small capacity (2) so the window reset is observable
-        // without sleeping 60 seconds.  The bucket refills at 2/60 tokens/s.
-        // We exhaust it, then verify the bucket is a real TokenBucket that
-        // will refill given elapsed time — confirm via `available()`.
+    fn brute_force_failures_close_the_user_window() {
+        let limiter = login_limiter(1000, 5);
+
+        // Five FAILED attempts for one username from different IPs drain the
+        // per-user failure bucket.
+        for i in 0..5 {
+            let ip = format!("10.0.1.{i}");
+            assert!(matches!(
+                limiter.check_login(&ip, "victim"),
+                LoginRateLimitOutcome::Allowed
+            ));
+            limiter.record_login_failure(&ip, "victim");
+        }
+
+        // A further attempt for that user from a fresh IP is denied.
+        assert!(
+            matches!(
+                limiter.check_login("10.0.1.200", "victim"),
+                LoginRateLimitOutcome::UserExceeded { .. }
+            ),
+            "user must be rate-limited after exhausting per-user failure budget"
+        );
+
+        // A different username is unaffected.
+        assert!(matches!(
+            limiter.check_login("10.0.1.200", "other_user"),
+            LoginRateLimitOutcome::Allowed
+        ));
+    }
+
+    #[test]
+    fn retry_after_is_populated_on_rejection() {
         let limiter = login_limiter(2, 100);
-
-        assert!(matches!(
-            limiter.check_login("192.0.2.1", "u"),
-            LoginRateLimitOutcome::Allowed
-        ));
-        assert!(matches!(
-            limiter.check_login("192.0.2.1", "u"),
-            LoginRateLimitOutcome::Allowed
-        ));
-        // Third attempt — exhausted.
-        assert!(matches!(
-            limiter.check_login("192.0.2.1", "u"),
-            LoginRateLimitOutcome::IpExceeded
-        ));
-
-        // After the bucket is exhausted the `available()` is 0.
-        {
-            let buckets = limiter.buckets.read().unwrap_or_else(|p| p.into_inner());
-            let bucket = buckets
-                .get("login_ip:192.0.2.1")
-                .expect("bucket must exist");
-            assert_eq!(
-                bucket.available(),
-                0,
-                "bucket must be empty after exhaustion"
-            );
+        for _ in 0..2 {
+            let _ = limiter.check_login("192.0.2.1", "u");
+            limiter.record_login_failure("192.0.2.1", "u");
+        }
+        match limiter.check_login("192.0.2.1", "u") {
+            LoginRateLimitOutcome::IpExceeded { retry_after_secs } => {
+                assert!(retry_after_secs > 0, "retry hint must be non-zero");
+            }
+            other => panic!("expected IpExceeded, got a different outcome: {other:?}"),
         }
     }
 

@@ -70,13 +70,15 @@ impl AuthSource for NodeDbAuthSource {
                 ArcAuditEmitter, AuditEmitContext, AuditEmitter,
             };
             let emitter = ArcAuditEmitter(std::sync::Arc::clone(&self.state.audit));
-            let detail = match rl_outcome {
-                LoginRateLimitOutcome::IpExceeded => {
-                    format!("login rate limited (ip={peer_ip_str}): {username}")
-                }
-                LoginRateLimitOutcome::UserExceeded => {
-                    format!("login rate limited (user): {username}")
-                }
+            let (detail, retry_after_secs) = match rl_outcome {
+                LoginRateLimitOutcome::IpExceeded { retry_after_secs } => (
+                    format!("login rate limited (ip={peer_ip_str}): {username}"),
+                    retry_after_secs,
+                ),
+                LoginRateLimitOutcome::UserExceeded { retry_after_secs } => (
+                    format!("login rate limited (user): {username}"),
+                    retry_after_secs,
+                ),
                 LoginRateLimitOutcome::Allowed => unreachable!(),
             };
             emitter.emit(
@@ -86,14 +88,21 @@ impl AuthSource for NodeDbAuthSource {
                 AuditEmitContext::new(None, "", username),
             );
             self.state.auth_metrics.record_auth_failure("scram");
-            // Constant-time floor before returning the generic invalid-password
-            // error so timing cannot distinguish rate-limit from wrong password.
-            let deadline = auth_start + AUTH_FLOOR;
-            let now = std::time::Instant::now();
-            if deadline > now {
-                tokio::time::sleep(deadline - now).await;
-            }
-            return Err(PgWireError::InvalidPassword(username.to_owned()));
+            // A rate-limit rejection is a TRANSIENT admission failure, not a
+            // credential signal. It is surfaced as a distinct, retryable
+            // TOO_MANY_CONNECTIONS (53300) error and logged distinctly
+            // (LoginRateLimited above) — never collapsed into the invalid-
+            // password error that wrong-password / lockout / unknown-user
+            // return. The constant-time AUTH_FLOOR is deliberately skipped here:
+            // this arm reveals nothing about account existence or password
+            // correctness, so an early return leaks no timing oracle while the
+            // genuine credential arms below keep their floor and stay mutually
+            // indistinguishable.
+            let msg = format!("too many login attempts; retry after {retry_after_secs}s");
+            return Err(super::types::error_map::sqlstate_error(
+                nodedb_types::error::sqlstate::TOO_MANY_CONNECTIONS,
+                &msg,
+            ));
         }
 
         // Check lockout before returning credentials.
@@ -405,11 +414,24 @@ impl StartupHandler for AuthStartup {
                         // credential lookup (expired / must-change password,
                         // inactive or service account) or an internal error
                         // must not count — the password may well be correct.
-                        let counts = matches!(
-                            state.credentials.get_scram_credentials(&username),
-                            ScramLookup::Found(_)
-                                | ScramLookup::Rejected(AuthRejection::BadCredential)
-                        );
+                        let scram_ip_str = source
+                            .parse::<std::net::SocketAddr>()
+                            .map(|s| s.ip().to_string())
+                            .unwrap_or_else(|_| source.clone());
+                        // A SASL failure that was actually caused by the
+                        // pre-verify admission gate (rate-limit / DoS ceiling)
+                        // must NOT move the brute-force or lockout counters —
+                        // the client proof was never even checked. Only a
+                        // genuine wrong-proof / unknown-user failure counts.
+                        let rate_limited = state
+                            .rate_limiter
+                            .is_login_rate_limited(&scram_ip_str, &username);
+                        let counts = !rate_limited
+                            && matches!(
+                                state.credentials.get_scram_credentials(&username),
+                                ScramLookup::Found(_)
+                                    | ScramLookup::Rejected(AuthRejection::BadCredential)
+                            );
                         if counts {
                             let emitter = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
                             let scram_ip =
@@ -417,6 +439,12 @@ impl StartupHandler for AuthStartup {
                             state
                                 .credentials
                                 .record_login_failure(&username, scram_ip, &emitter);
+                            // Drive the per-IP / per-user brute-force window from
+                            // the same genuine-failure site as the lockout
+                            // counter.
+                            state
+                                .rate_limiter
+                                .record_login_failure(&scram_ip_str, &username);
                         }
                         state.audit_record(
                             AuditEvent::AuthFailure,

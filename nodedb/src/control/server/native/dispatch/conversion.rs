@@ -14,6 +14,10 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
     let (code, message) = match e {
         crate::Error::BadRequest { detail } => ("42601", detail.clone()),
         crate::Error::RejectedAuthz { resource, .. } => ("42501", resource.clone()),
+        crate::Error::RateExceeded { .. } => (
+            nodedb_types::error::sqlstate::TOO_MANY_CONNECTIONS,
+            format!("{e}"),
+        ),
         crate::Error::DeadlineExceeded { .. } => ("57014", "query cancelled due to timeout".into()),
         crate::Error::CollectionNotFound { collection, .. } => {
             ("42P01", format!("collection '{collection}' not found"))
