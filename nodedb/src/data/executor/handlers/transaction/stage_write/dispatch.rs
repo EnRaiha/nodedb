@@ -3,13 +3,15 @@
 //! `StageWrite` dispatch: route a point-write plan to the matching staging
 //! path, compute its real affected-row count, and record it in the overlay.
 
-use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, GraphOp, SpatialOp, UpdateValue};
+use nodedb_physical::physical_plan::{
+    ColumnarOp, DocumentOp, GraphOp, SpatialOp, TimeseriesOp, UpdateValue,
+};
 
 use super::constraint::OverlayPk;
 use super::context::StageCtx;
 use super::{
     StageBulkDeleteParams, StageBulkUpdateParams, StageColumnarInsertParams,
-    StageInsertSelectParams, StageSpatialInsertParams,
+    StageInsertSelectParams, StageSpatialInsertParams, StageTimeseriesInsertParams,
 };
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -119,8 +121,25 @@ impl CoreLoop {
                 | GraphOp::Stats { .. },
             ) => return self.stage_not_point_write(task),
             PhysicalPlan::Vector(_) => return self.stage_not_point_write(task),
+            PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+                collection,
+                payload,
+                surrogates,
+                ..
+            }) => {
+                return self.stage_timeseries_insert(StageTimeseriesInsertParams {
+                    task,
+                    tid,
+                    txn_id,
+                    collection,
+                    payload,
+                    surrogates,
+                });
+            }
+            PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. }) => {
+                return self.stage_not_point_write(task);
+            }
             PhysicalPlan::Text(_)
-            | PhysicalPlan::Timeseries(_)
             | PhysicalPlan::Crdt(_)
             | PhysicalPlan::Query(_)
             | PhysicalPlan::Meta(_)

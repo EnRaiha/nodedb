@@ -173,6 +173,15 @@ impl CoreLoop {
                 &needed_columns,
             )
         } else {
+            // In-transaction read-your-own-writes is confined to the RAW scan
+            // branch and to current-version reads: audit-log (`all_versions`)
+            // and `AS OF SYSTEM TIME` reads are committed-only, so the overlay
+            // merge is pre-gated out here rather than in the raw handler.
+            let overlay_txn = if all_versions || system_as_of_ms.is_some() {
+                None
+            } else {
+                task.request.txn_id
+            };
             self.execute_ts_raw_scan(raw_scan::RawScanParams {
                 task,
                 tid,
@@ -183,6 +192,7 @@ impl CoreLoop {
                 has_filters,
                 computed_columns,
                 all_versions,
+                txn_id: overlay_txn,
             })
         }
     }

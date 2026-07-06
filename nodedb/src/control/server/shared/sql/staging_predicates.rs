@@ -8,7 +8,9 @@
 //! later units). No pgwire types are imported here.
 
 use crate::bridge::envelope::PhysicalPlan;
-use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, GraphOp, KvOp, SpatialOp};
+use nodedb_physical::physical_plan::{
+    ColumnarOp, DocumentOp, GraphOp, KvOp, SpatialOp, TimeseriesOp,
+};
 
 /// Allow-list of the plans the in-transaction path stages at statement time:
 /// point writes, predicate `BulkUpdate` / `BulkDelete` (bulk predicate DML,
@@ -90,6 +92,7 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
             )
         )
         || matches!(plan, PhysicalPlan::Columnar(ColumnarOp::Insert { .. }))
+        || matches!(plan, PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }))
         || matches!(
             plan,
             PhysicalPlan::Spatial(SpatialOp::Insert { .. } | SpatialOp::Delete { .. })
@@ -197,6 +200,7 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
         PhysicalPlan::Document(DocumentOp::Upsert { .. }) => StagedTagKind::DocUpsert,
         PhysicalPlan::Kv(op) => staged_kv_tag_kind(op, payload),
         PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => StagedTagKind::Insert,
+        PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Spatial(SpatialOp::Insert { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Spatial(SpatialOp::Delete { .. }) => StagedTagKind::Delete,
         // GraphOp::EdgePut / EdgePutBatch add a new edge tuple -- Insert,

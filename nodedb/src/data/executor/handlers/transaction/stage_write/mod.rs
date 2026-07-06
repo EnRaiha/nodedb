@@ -26,6 +26,7 @@ mod stage_kv_atomic;
 mod stage_kv_transfer;
 mod stage_kv_ttl;
 mod stage_spatial;
+mod stage_timeseries;
 mod stage_upsert;
 
 pub(in crate::data::executor) use stage_bulk_delete::StageBulkDeleteParams;
@@ -34,3 +35,4 @@ pub(in crate::data::executor) use stage_columnar::StageColumnarInsertParams;
 pub(in crate::data::executor) use stage_insert_select::StageInsertSelectParams;
 pub(in crate::data::executor) use stage_kv::{hex_key, unhex_key};
 pub(in crate::data::executor) use stage_spatial::StageSpatialInsertParams;
+pub(in crate::data::executor) use stage_timeseries::StageTimeseriesInsertParams;

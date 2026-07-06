@@ -23,6 +23,13 @@ pub(in crate::data::executor) struct RawScanParams<'a> {
     /// `AS OF SYSTEM TIME NULL`: emit every `_ts_system` version ordered
     /// ascending by system time (audit-log semantics).
     pub all_versions: bool,
+    /// In-transaction read-your-own-writes: when `Some`, fold this
+    /// transaction's staged `TimeseriesOp::Ingest` rows into the result.
+    /// Pre-gated by the caller — `None` for autocommit reads and for
+    /// audit-log / `AS OF SYSTEM TIME` reads (committed-only). The
+    /// aggregate branch never reaches this handler, so continuous
+    /// aggregates stay committed-only.
+    pub txn_id: Option<crate::types::TxnId>,
 }
 
 impl CoreLoop {
@@ -41,6 +48,7 @@ impl CoreLoop {
             has_filters,
             computed_columns: computed_columns_bytes,
             all_versions,
+            txn_id,
         } = params;
 
         // A no-LIMIT SQL `SELECT * FROM <timeseries>` arrives as
@@ -164,6 +172,27 @@ impl CoreLoop {
                     results.truncate(limit);
                 }
             }
+        }
+
+        // 3. In-transaction read-your-own-writes: fold this transaction's
+        // staged `TimeseriesOp::Ingest` rows into the base result. Gated on
+        // `txn_id` (autocommit reads never carry one) and already excluded by
+        // the caller for audit-log / temporal reads. The aggregate / bucket
+        // branch runs in `execute_ts_aggregate`, never here, so continuous
+        // aggregates and bucketed queries remain committed-only.
+        if let Some(txn_id) = txn_id {
+            let coll_key = (task.request.database_id, tid, collection.to_string());
+            self.merge_overlay_into_timeseries_scan(
+                crate::data::executor::handlers::transaction::overlay::TimeseriesOverlayMergeParams {
+                    txn_id,
+                    coll_key: &coll_key,
+                    time_range,
+                    filter_predicates,
+                    has_filters,
+                    limit,
+                },
+                &mut results,
+            );
         }
 
         // Apply computed columns (e.g. time_bucket) if present.

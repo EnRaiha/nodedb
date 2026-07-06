@@ -13,7 +13,7 @@ use super::super::aggregate::{
 };
 use super::super::filter::serialize_filters;
 use super::super::scan_params::TimeseriesScanParams;
-use super::super::value::{row_to_msgpack, sql_value_to_string, write_msgpack_array_header};
+use super::super::value::{row_to_msgpack, write_msgpack_array_header};
 use super::helpers::valid_at_from_scope;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -102,25 +102,18 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(
     for row in rows {
         let row_bytes = row_to_msgpack(row)?;
         payload.extend_from_slice(&row_bytes);
-        // Timeseries PK is the (timestamp, tag-set) tuple, which is not
-        // canonically named. Use the same (id|document_id|key) heuristic
-        // as the columnar/document path; rows with no PK column receive
-        // `Surrogate::ZERO` (downstream re-derivation owned by the
-        // engine integration once the row's natural identity is known).
-        let pk = row
-            .iter()
-            .find(|(k, _)| k == "id" || k == "document_id" || k == "key")
-            .map(|(_, v)| sql_value_to_string(v))
-            .unwrap_or_default();
-        if pk.is_empty() {
-            surrogates.push(nodedb_types::Surrogate::ZERO);
-        } else {
-            let s = match ctx.surrogate_assigner.as_ref() {
-                Some(a) => a.assign(ctx.database_id, ctx.tenant_id, collection, pk.as_bytes())?,
-                None => nodedb_types::Surrogate::ZERO,
-            };
-            surrogates.push(s);
-        }
+        // A timeseries row's natural identity is its (timestamp, tag-set)
+        // tuple, which is not a cross-engine surrogate and carries no PK
+        // column. Mint a FRESH unique surrogate per row (mirroring the
+        // columnar auto-`_rowid` path in `dml/insert.rs`) so every row
+        // occupies its own transaction-overlay slot for statement-time
+        // read-your-own-writes staging. Content-addressing an empty PK would
+        // collapse every row onto `Surrogate::ZERO` and merge distinct rows.
+        let s = match ctx.surrogate_assigner.as_ref() {
+            Some(a) => a.assign_fresh(ctx.database_id, ctx.tenant_id, collection)?,
+            None => nodedb_types::Surrogate::ZERO,
+        };
+        surrogates.push(s);
     }
     Ok(vec![PhysicalTask {
         tenant_id,
