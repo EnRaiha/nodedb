@@ -30,7 +30,7 @@ impl CoreLoop {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn finalize_groups(
         &self,
-        groups: HashMap<String, GroupState>,
+        mut groups: HashMap<String, GroupState>,
         mut sub_groups: HashMap<String, HashMap<String, GroupState>>,
         group_by: &[String],
         aggregates: &[AggregateSpec],
@@ -41,6 +41,26 @@ impl CoreLoop {
         sort_keys: &[(String, bool)],
     ) -> crate::Result<Vec<u8>> {
         let need_sub = !sub_group_by.is_empty() && !sub_aggregates.is_empty();
+
+        // A scalar aggregate (no GROUP BY) over zero input rows must still
+        // emit exactly one row (COUNT -> 0, SUM/AVG/MIN/MAX -> NULL) — SQL
+        // semantics for aggregates without a GROUP BY clause. A `GROUP BY`
+        // aggregate over zero rows correctly stays at zero groups/rows, so
+        // this only fires when there is no GROUP BY at all.
+        //
+        // This is the single seed site shared by both the local aggregate
+        // path (`aggregate_over_docs`) and the distributed-shuffle
+        // coordinator (`execute_shuffle_aggregate`, which merges every
+        // shard's partial state by group key before calling here). Seeding
+        // here — after the merge, not per-shard — guarantees exactly one
+        // final row: if any shard actually matched rows, `groups` already
+        // holds the real merged state and this branch never fires; only a
+        // fully empty merge (every shard matched nothing) synthesizes the
+        // one identity row.
+        if group_by.is_empty() && groups.is_empty() {
+            groups.insert("__all__".to_string(), GroupState::new(aggregates));
+        }
+
         let mut results: Vec<serde_json::Value> = Vec::new();
 
         for (group_key, state) in groups {

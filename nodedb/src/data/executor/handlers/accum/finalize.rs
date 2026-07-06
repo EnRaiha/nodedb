@@ -12,12 +12,15 @@ impl AggAccum {
         match self {
             AggAccum::Count { n } => Value::Integer(n as i64),
             AggAccum::SumAvg { sum, n, .. } => {
-                if agg.function == "avg" {
-                    if n == 0 {
-                        Value::Null
-                    } else {
-                        Value::Float(sum / n as f64)
-                    }
+                // Zero contributing values → NULL for both SUM and AVG. SUM has
+                // no natural zero identity in SQL: `SUM` over an empty input is
+                // NULL, not 0.0. `n` counts the values actually fed, so `n == 0`
+                // is the exact zero-contribution signal (a real SUM that happens
+                // to total 0.0 still has `n > 0` and returns `0.0`).
+                if n == 0 {
+                    Value::Null
+                } else if agg.function == "avg" {
+                    Value::Float(sum / n as f64)
                 } else {
                     Value::Float(sum)
                 }
@@ -35,12 +38,14 @@ impl AggAccum {
                     comp = (t - sum) - y;
                     sum = t;
                 }
-                if agg.function == "avg_distinct" {
-                    if n == 0 {
-                        Value::Null
-                    } else {
-                        Value::Float(sum / n as f64)
-                    }
+                // Zero distinct values → NULL for both SUM(DISTINCT) and
+                // AVG(DISTINCT): same no-zero-identity rule as plain SUM. `n`
+                // is the distinct-value count (`seen.len()`), so `n == 0` is the
+                // zero-contribution signal.
+                if n == 0 {
+                    Value::Null
+                } else if agg.function == "avg_distinct" {
+                    Value::Float(sum / n as f64)
                 } else {
                     Value::Float(sum)
                 }
