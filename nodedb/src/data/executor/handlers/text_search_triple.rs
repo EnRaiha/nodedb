@@ -147,33 +147,56 @@ impl CoreLoop {
         use crate::query::fusion::{RankedResult, reciprocal_rank_fusion_weighted};
         let _ = edge_label_owned; // consumed above
 
-        let vector_ranked: Vec<RankedResult> = vector_results
-            .iter()
-            .enumerate()
-            .map(|(rank, r)| {
-                let document_id = vector_collection
-                    .and_then(|c| c.get_surrogate(r.id))
-                    .map(crate::engine::document::store::surrogate_to_doc_id)
-                    .unwrap_or_else(|| format!("__local_{}", r.id));
-                RankedResult {
-                    document_id,
-                    rank,
-                    score: r.distance,
-                    source: "vector",
-                }
-            })
-            .collect();
+        // Inside a transaction, read-your-own-writes: the vector and text legs
+        // must also observe this transaction's staged document writes, folded
+        // in via the shared overlay splice (reusing the single-source
+        // vector/FTS overlay merges). The graph leg's RYOW is a separate
+        // concern and is not folded in here. Outside a transaction the
+        // committed-only construction below runs unchanged.
+        let (vector_ranked, text_ranked): (Vec<RankedResult>, Vec<RankedResult>) =
+            if let Some(txn_id) = task.request.txn_id {
+                self.hybrid_ranked_with_overlay(
+                    super::hybrid_overlay::HybridOverlayParams {
+                        txn_id,
+                        database_id: task.request.database_id,
+                        tid: tenant_id,
+                        collection,
+                        query_vector,
+                        query_text,
+                        fetch_k,
+                        filter_bitmap,
+                    },
+                    &vector_results,
+                    vector_collection,
+                    &text_results,
+                )
+            } else {
+                let vector_ranked: Vec<RankedResult> = vector_results
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, r)| RankedResult {
+                        document_id: super::vector_search::vector_leg_doc_id(
+                            vector_collection,
+                            r.id,
+                        ),
+                        rank,
+                        score: r.distance,
+                        source: "vector",
+                    })
+                    .collect();
 
-        let text_ranked: Vec<RankedResult> = text_results
-            .iter()
-            .enumerate()
-            .map(|(rank, r)| RankedResult {
-                document_id: crate::engine::document::store::surrogate_to_doc_id(r.doc_id),
-                rank,
-                score: r.score,
-                source: "text",
-            })
-            .collect();
+                let text_ranked: Vec<RankedResult> = text_results
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, r)| RankedResult {
+                        document_id: crate::engine::document::store::surrogate_to_doc_id(r.doc_id),
+                        rank,
+                        score: r.score,
+                        source: "text",
+                    })
+                    .collect();
+                (vector_ranked, text_ranked)
+            };
 
         let graph_ranked = graph_nodes_to_ranked_results(&graph_expanded, &hop_distances);
 
