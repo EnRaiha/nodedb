@@ -90,6 +90,19 @@ pub struct AggregateExpr {
     pub grouping_col_index: Option<usize>,
 }
 
+/// Records SELECT-list interleaving of GROUP BY keys and aggregate
+/// expressions so the output-schema builder emits columns in the user's
+/// SELECT order instead of a hardcoded group-keys-first order.
+/// `GroupKey(i)` indexes `Aggregate::group_by[i]`; `Aggregate(j)` indexes
+/// `Aggregate::aggregates[j]`. Empty = no projection was in scope when the
+/// plan was built (engine-rules base plan); output_schema falls back to
+/// group-keys-first, matching pre-fix behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggOutputSlot {
+    GroupKey(usize),
+    Aggregate(usize),
+}
+
 /// Window function specification.
 #[derive(Debug, Clone)]
 pub struct WindowSpec {

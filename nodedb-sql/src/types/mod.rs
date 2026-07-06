@@ -17,7 +17,8 @@ pub use plan::{
     MergePlanClause, SqlPlan, VectorAnnOptions, VectorPrimaryRow, VectorQuantization,
 };
 pub use query::{
-    AggregateExpr, EngineType, JoinType, Projection, SortKey, SpatialPredicate, WindowSpec,
+    AggOutputSlot, AggregateExpr, EngineType, JoinType, Projection, SortKey, SpatialPredicate,
+    WindowSpec,
 };
 
 // ── SQL value / expression / operator types ──

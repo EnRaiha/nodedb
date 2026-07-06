@@ -45,6 +45,16 @@ pub fn plan_aggregate(
         aggregates.extend(grouping_aggs);
     }
 
+    // Records the SELECT-list interleaving of GROUP BY keys and aggregates so
+    // output columns follow the user's SELECT order. Computed after the full
+    // aggregate list (including any GROUPING pseudo-aggregates) is assembled so
+    // grouping slots index correctly.
+    let output_order = super::aggregate_order::compute_output_order(
+        &select.projection,
+        &group_by_exprs,
+        functions,
+    )?;
+
     // Extract timeseries-specific params (bucket interval, group columns) if applicable.
     let (bucket_interval_ms, group_columns) =
         extract_timeseries_params(&select.group_by, &select.projection, functions)?;
@@ -71,11 +81,13 @@ pub fn plan_aggregate(
     // `label`, not `k`).
     let group_by_aliases = group_by_output_aliases(&select.projection, &group_by_exprs);
     if let SqlPlan::Aggregate {
-        group_by_aliases: slot,
+        group_by_aliases: alias_slot,
+        output_order: order_slot,
         ..
     } = &mut base_plan
     {
-        *slot = group_by_aliases.clone();
+        *alias_slot = group_by_aliases.clone();
+        *order_slot = output_order.clone();
     }
 
     // Wrap the plan to attach grouping sets if present.
@@ -84,6 +96,7 @@ pub fn plan_aggregate(
             base_plan,
             group_by_exprs,
             group_by_aliases,
+            output_order,
             aggregates,
             having,
             sets,
@@ -112,7 +125,7 @@ pub fn group_by_output_aliases(
 }
 
 /// The bare column name of a GROUP BY key, when the key is a column reference.
-fn key_column_name(key: &SqlExpr) -> Option<&str> {
+pub(super) fn key_column_name(key: &SqlExpr) -> Option<&str> {
     match key {
         SqlExpr::Column { name, .. } => Some(name.as_str()),
         _ => None,
@@ -135,7 +148,7 @@ fn projection_alias_for_column(projection: &[ast::SelectItem], col: &str) -> Opt
 
 /// The bare column name referenced by an `ast::Expr`, when it is a simple or
 /// compound identifier; `None` for any other expression shape.
-fn expr_column_name(expr: &ast::Expr) -> Option<String> {
+pub(super) fn expr_column_name(expr: &ast::Expr) -> Option<String> {
     match expr {
         ast::Expr::Identifier(ident) => Some(normalize_ident(ident)),
         ast::Expr::CompoundIdentifier(parts) => parts.last().map(normalize_ident),
@@ -149,6 +162,7 @@ fn attach_grouping_sets(
     base_plan: SqlPlan,
     group_by: Vec<SqlExpr>,
     group_by_aliases: Vec<Option<String>>,
+    output_order: Vec<AggOutputSlot>,
     aggregates: Vec<AggregateExpr>,
     having: Vec<Filter>,
     grouping_sets: Vec<Vec<usize>>,
@@ -164,6 +178,7 @@ fn attach_grouping_sets(
             input,
             group_by,
             group_by_aliases,
+            output_order,
             aggregates,
             having,
             limit,
@@ -177,6 +192,7 @@ fn attach_grouping_sets(
                 input: Box::new(other),
                 group_by,
                 group_by_aliases,
+                output_order,
                 aggregates,
                 having,
                 limit: 10000,
@@ -392,7 +408,7 @@ fn collect_grouping_from_expr(
 }
 
 /// Extract the positional expression arguments from a function call.
-fn function_args_exprs(f: &ast::Function) -> Vec<&ast::Expr> {
+pub(super) fn function_args_exprs(f: &ast::Function) -> Vec<&ast::Expr> {
     match &f.args {
         ast::FunctionArguments::List(list) => list
             .args
@@ -407,7 +423,7 @@ fn function_args_exprs(f: &ast::Function) -> Vec<&ast::Expr> {
 }
 
 /// Return the simple lowercase name of a function (unqualified part only).
-fn normalize_function_name(f: &ast::Function) -> String {
+pub(super) fn normalize_function_name(f: &ast::Function) -> String {
     f.name
         .0
         .last()

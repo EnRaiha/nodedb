@@ -133,6 +133,11 @@ pub fn plan_join_from_select(
         let group_by = super::super::aggregate::convert_group_by(&select.group_by)?;
         let group_by_aliases =
             super::super::aggregate::group_by_output_aliases(&select.projection, &group_by);
+        let output_order = super::super::aggregate_order::compute_output_order(
+            &select.projection,
+            &group_by,
+            functions,
+        )?;
         let having = match &select.having {
             Some(expr) => super::super::select::convert_where_to_filters(expr)?,
             None => Vec::new(),
@@ -141,6 +146,7 @@ pub fn plan_join_from_select(
             input: Box::new(current_plan),
             group_by,
             group_by_aliases,
+            output_order,
             aggregates,
             having,
             limit: 10000,

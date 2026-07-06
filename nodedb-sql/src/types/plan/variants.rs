@@ -10,7 +10,8 @@ pub use nodedb_types::vector_distance::DistanceMetric;
 
 use crate::types::filter::Filter;
 use crate::types::query::{
-    AggregateExpr, EngineType, JoinType, Projection, SortKey, SpatialPredicate, WindowSpec,
+    AggOutputSlot, AggregateExpr, EngineType, JoinType, Projection, SortKey, SpatialPredicate,
+    WindowSpec,
 };
 
 use super::merge_types::MergePlanClause;
@@ -233,6 +234,10 @@ pub enum SqlPlan {
         /// Empty when the plan was built without a projection in scope
         /// (treated the same as all-`None`).
         group_by_aliases: Vec<Option<String>>,
+        /// SELECT-list interleaving of `group_by` keys and `aggregates`, in
+        /// output order. Empty when built without a projection in scope (see
+        /// `AggOutputSlot`) — output_schema falls back to group-keys-first.
+        output_order: Vec<AggOutputSlot>,
         aggregates: Vec<AggregateExpr>,
         having: Vec<Filter>,
         limit: usize,

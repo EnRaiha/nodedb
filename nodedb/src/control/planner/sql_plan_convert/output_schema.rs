@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use nodedb_sql::catalog::SqlCatalog;
 use nodedb_sql::types::SqlPlan;
-use nodedb_sql::types::query::Projection;
+use nodedb_sql::types::query::{AggOutputSlot, Projection};
 use nodedb_sql::types_expr::SqlExpr;
 
 use crate::control::server::response_shape::schema::{
@@ -298,32 +298,53 @@ pub fn build_output_schema<C: SqlCatalog>(
         SqlPlan::Aggregate {
             group_by,
             group_by_aliases,
+            output_order,
             aggregates,
             ..
         } => {
-            let mut columns = Vec::with_capacity(group_by.len() + aggregates.len());
-            for (index, key) in group_by.iter().enumerate() {
-                // `group_by_aliases` is parallel to `group_by` when populated,
-                // but may be empty when the plan was built without a projection
-                // in scope — treat a missing/`None` entry as "no alias".
-                let alias = group_by_aliases.get(index).and_then(|a| a.as_deref());
-                columns.push(group_by_key_column(key, index, alias));
-            }
-            for agg in aggregates {
-                // `AggregateExpr::alias` is always populated by the planner:
-                // either the user's explicit alias, or (for unnamed
-                // projections) the lowercased unparsed expression text —
-                // e.g. `count(*)` — matching this module's own
-                // lowercasing of non-column expressions. So the alias is
-                // already the canonical name; no separate derivation needed.
-                // All aggregate result values ship as TEXT (the pgwire SELECT
-                // encoder is text-format only; typed OIDs are deferred to a
-                // dedicated value-encoding unit).
-                columns.push(OutputColumn {
+            // Derives the `OutputColumn` for one GROUP BY key: `group_by_aliases`
+            // is parallel to `group_by` when populated, but may be empty when the
+            // plan was built without a projection in scope — treat a
+            // missing/`None` entry as "no alias".
+            let key_column = |index: usize| {
+                group_by.get(index).map(|key| {
+                    let alias = group_by_aliases.get(index).and_then(|a| a.as_deref());
+                    group_by_key_column(key, index, alias)
+                })
+            };
+            // Derives the `OutputColumn` for one aggregate. `AggregateExpr::alias`
+            // is always populated by the planner: either the user's explicit
+            // alias, or (for unnamed projections) the lowercased unparsed
+            // expression text — e.g. `count(*)` — matching this module's own
+            // lowercasing of non-column expressions. So the alias is already the
+            // canonical name; no separate derivation needed. All aggregate result
+            // values ship as TEXT (the pgwire SELECT encoder is text-format only;
+            // typed OIDs are deferred to a dedicated value-encoding unit).
+            let agg_column = |index: usize| {
+                aggregates.get(index).map(|agg| OutputColumn {
                     display_name: agg.alias.clone(),
                     lookup_key: agg.alias.clone(),
                     ty: DdlColType::Text,
-                });
+                })
+            };
+            let mut columns = Vec::with_capacity(group_by.len() + aggregates.len());
+            if output_order.is_empty() {
+                // Built without a projection in scope: fall back to
+                // group-keys-first, then aggregates.
+                for index in 0..group_by.len() {
+                    columns.extend(key_column(index));
+                }
+                for index in 0..aggregates.len() {
+                    columns.extend(agg_column(index));
+                }
+            } else {
+                // Emit columns in the recorded SELECT-list order.
+                for slot in output_order {
+                    match slot {
+                        AggOutputSlot::GroupKey(index) => columns.extend(key_column(*index)),
+                        AggOutputSlot::Aggregate(index) => columns.extend(agg_column(*index)),
+                    }
+                }
             }
             OutputSchema {
                 columns,
@@ -526,6 +547,8 @@ mod tests {
             // SELECT-list alias, while the value lookup key stays the raw
             // grouped column name.
             group_by_aliases: vec![Some("state".to_string())],
+            // Empty output_order exercises the group-keys-first fallback.
+            output_order: Vec::new(),
             aggregates: vec![
                 AggregateExpr {
                     function: "sum".to_string(),
