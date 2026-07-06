@@ -283,6 +283,28 @@ impl OriginArrayInbound {
                     format!("schema import error: {e}"),
                 )));
             }
+            // Single-node has no Raft applier to register the array_catalog
+            // entry, so this direct-import path must do it itself — mirrors
+            // `raft_apply::apply_array_schema`'s post-import registration.
+            // Without this, the array is importable but never openable by
+            // the Data Plane and never visible to `SHOW COLLECTIONS`.
+            //
+            // Unlike the Raft-apply path, this path's `Result` is still live
+            // and reaches the sync sender, so a registration failure is
+            // propagated rather than swallowed: reporting `SchemaImported`
+            // while the array stays unregistered would be a silent
+            // catalog-visibility inconsistency.
+            if let Err(e) =
+                super::catalog_register::register_array_catalog_entry(&self.shared, &msg.array)
+            {
+                warn!(array = %msg.array, error = %e, "array_inbound: catalog registration failed");
+                return Err(Some(build_reject(
+                    &msg.array,
+                    remote_hlc,
+                    ArrayRejectReason::EngineRejected,
+                    format!("catalog registration error: {e}"),
+                )));
+            }
             return Ok(InboundOutcome::SchemaImported);
         }
 

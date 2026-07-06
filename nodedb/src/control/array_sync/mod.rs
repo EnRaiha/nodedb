@@ -2,6 +2,7 @@
 
 pub mod ack_registry;
 pub mod apply;
+pub(crate) mod catalog_register;
 pub mod catchup;
 pub mod gc_task;
 pub mod inbound;

@@ -345,10 +345,6 @@ pub(crate) fn apply_array_schema(
         applied_key,
     } = pos;
     use nodedb_array::sync::hlc::Hlc;
-    use nodedb_array::types::ArrayId;
-    use nodedb_types::TenantId as NdTenantId;
-
-    use crate::control::array_catalog::entry::ArrayCatalogEntry;
 
     let ArraySchemaPayload {
         array,
@@ -381,47 +377,21 @@ pub(crate) fn apply_array_schema(
     }
 
     // Decode the ArraySchema from the just-imported Loro document and register
-    // it in the array catalog so the Data Plane can open the array on this node.
-    match state.array_sync_schemas.to_array_schema(array) {
-        Some(schema) => match zerompk::to_msgpack_vec(&schema) {
-            Ok(schema_msgpack) => {
-                let array_id = ArrayId::new(NdTenantId::new(0), array);
-                let entry = ArrayCatalogEntry {
-                    array_id,
-                    name: array.to_string(),
-                    schema_msgpack,
-                    schema_hash: 0,
-                    created_at_ms: 0,
-                    prefix_bits: 8,
-                    audit_retain_ms: None,
-                    minimum_audit_retain_ms: None,
-                };
-                let mut cat = state
-                    .array_catalog
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner());
-                if cat.lookup_by_name(array).is_none()
-                    && let Err(e) = cat.register(entry)
-                {
-                    warn!(
-                        group_id, index = log_index, array = %array, error = %e,
-                        "apply_array_schema: catalog register failed (non-fatal)"
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    group_id, index = log_index, array = %array, error = %e,
-                    "apply_array_schema: schema_msgpack encode failed (non-fatal)"
-                );
-            }
-        },
-        None => {
-            warn!(
-                group_id, index = log_index, array = %array,
-                "apply_array_schema: to_array_schema returned None after import (non-fatal)"
-            );
-        }
+    // it in the array catalog so the Data Plane can open the array on this
+    // node. Shared with the single-node direct-import path in `inbound.rs`
+    // via `catalog_register::register_array_catalog_entry` so both codepaths
+    // converge on the same catalog-visibility guarantee.
+    //
+    // Warn-and-continue: the schema snapshot import above already committed
+    // durably and this apply loop has no fail-back path (the caller only
+    // gates Raft log compaction on our `bool`, not correctness of catalog
+    // state). A missing entry here is caught by the next `ensure_array_open`
+    // lookup failure or by drift detection, not by re-running Raft apply.
+    if let Err(e) = super::catalog_register::register_array_catalog_entry(state, array) {
+        warn!(
+            group_id, index = log_index, array = %array, error = %e,
+            "apply_array_schema: register_array_catalog_entry failed (non-fatal)"
+        );
     }
 
     tracker.complete(group_id, log_index, applied_key, Ok(vec![]));

@@ -191,7 +191,23 @@ pub fn show_collections(
         Vec::new()
     };
 
-    let mut rows = Vec::with_capacity(collections.len());
+    // Array (`CREATE ARRAY`) collections live in the dedicated
+    // `array_catalog`, not in `StoredCollection` — `CollectionType` has no
+    // Array variant (Array uses its own DDL family and schema model, never
+    // `WITH (engine='array')`). Without this merge, arrays are silently
+    // absent from `SHOW COLLECTIONS`, unlike every other engine. Merge in
+    // the array_catalog entries visible to this identity so introspection
+    // is uniform across all eight engines.
+    let array_entries: Vec<crate::control::array_catalog::entry::ArrayCatalogEntry> = state
+        .array_catalog
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .all_entries()
+        .into_iter()
+        .filter(|e| identity.is_superuser || e.array_id.tenant_id == tenant_id)
+        .collect();
+
+    let mut rows = Vec::with_capacity(collections.len() + array_entries.len());
 
     for coll in &collections {
         let mut row = Map::new();
@@ -204,6 +220,21 @@ pub fn show_collections(
         row.insert(
             "partition_strategy".to_string(),
             JsonValue::String(coll.partition_strategy.as_str().to_string()),
+        );
+        rows.push(row);
+    }
+
+    for entry in &array_entries {
+        let mut row = Map::new();
+        row.insert("name".to_string(), JsonValue::String(entry.name.clone()));
+        row.insert("owner".to_string(), JsonValue::String(String::new()));
+        row.insert(
+            "created_at".to_string(),
+            JsonValue::String(entry.created_at_ms.to_string()),
+        );
+        row.insert(
+            "partition_strategy".to_string(),
+            JsonValue::String("array".to_string()),
         );
         rows.push(row);
     }
