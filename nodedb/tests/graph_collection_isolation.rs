@@ -205,7 +205,7 @@ fn scoped_removal_of_shared_triple_leaves_other_collection_intact() {
 #[test]
 fn distinct_partitions_do_not_share_edges() {
     let mut tenant_a = CsrIndex::new();
-    let mut tenant_b = CsrIndex::new();
+    let tenant_b = CsrIndex::new();
     tenant_a
         .add_edge_in_collection("alice", "KNOWS", "bob", COLL_A)
         .unwrap();
