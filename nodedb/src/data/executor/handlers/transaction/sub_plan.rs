@@ -219,14 +219,16 @@ impl CoreLoop {
 
                 let resp = self.execute_edge_put(
                     &dummy_task,
-                    tid,
-                    collection,
-                    src_id,
-                    label,
-                    dst_id,
-                    properties,
-                    *src_surrogate,
-                    *dst_surrogate,
+                    crate::data::executor::handlers::graph::EdgePutParams {
+                        tid,
+                        collection,
+                        src_id,
+                        label,
+                        dst_id,
+                        properties,
+                        src_surrogate: *src_surrogate,
+                        dst_surrogate: *dst_surrogate,
+                    },
                 );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {

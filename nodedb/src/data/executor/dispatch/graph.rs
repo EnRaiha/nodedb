@@ -53,14 +53,16 @@ impl CoreLoop {
                 dst_surrogate,
             } => self.execute_edge_put(
                 task,
-                tid,
-                collection,
-                src_id,
-                label,
-                dst_id,
-                properties,
-                *src_surrogate,
-                *dst_surrogate,
+                crate::data::executor::handlers::graph::EdgePutParams {
+                    tid,
+                    collection,
+                    src_id,
+                    label,
+                    dst_id,
+                    properties,
+                    src_surrogate: *src_surrogate,
+                    dst_surrogate: *dst_surrogate,
+                },
             ),
 
             GraphOp::EdgePutBatch { edges } => self.execute_edge_put_batch(task, tid, edges),
@@ -85,12 +87,14 @@ impl CoreLoop {
                 frontier_bitmap,
             } => self.execute_graph_hop(
                 task,
-                tid,
-                start_nodes,
-                edge_label,
-                *direction,
-                *depth,
-                frontier_bitmap.as_ref(),
+                crate::data::executor::handlers::graph::GraphHopParams {
+                    tid,
+                    start_nodes,
+                    edge_label,
+                    direction: *direction,
+                    depth: *depth,
+                    frontier_bitmap: frontier_bitmap.as_ref(),
+                },
             ),
 
             GraphOp::Neighbors {
@@ -125,12 +129,14 @@ impl CoreLoop {
                 frontier_bitmap,
             } => self.execute_graph_path(
                 task,
-                tid,
-                src,
-                dst,
-                edge_label,
-                *max_depth,
-                frontier_bitmap.as_ref(),
+                crate::data::executor::handlers::graph::graph_traversal::GraphPathParams {
+                    tid,
+                    src,
+                    dst,
+                    edge_label,
+                    max_depth: *max_depth,
+                    frontier_bitmap: frontier_bitmap.as_ref(),
+                },
             ),
 
             GraphOp::Subgraph {
@@ -161,34 +167,38 @@ impl CoreLoop {
                 {
                     self.execute_graph_rag_fusion_triple(
                         task,
-                        tid,
-                        collection,
-                        query_vector,
-                        *vector_top_k,
-                        edge_label,
-                        *direction,
-                        *expansion_depth,
-                        *final_top_k,
-                        *triple_k,
-                        vector_field.as_str(),
-                        options.max_visited,
-                        bm25_q,
-                        bm25_f,
+                        crate::data::executor::handlers::graph_rag_triple::GraphRagFusionTripleParams {
+                            tenant_id: tid,
+                            collection,
+                            query_vector,
+                            vector_top_k: *vector_top_k,
+                            edge_label,
+                            direction: *direction,
+                            expansion_depth: *expansion_depth,
+                            final_top_k: *final_top_k,
+                            rrf_k: *triple_k,
+                            vector_field: vector_field.as_str(),
+                            max_visited: options.max_visited,
+                            bm25_query: bm25_q,
+                            bm25_field: bm25_f,
+                        },
                     )
                 } else {
                     self.execute_graph_rag_fusion(
                         task,
-                        tid,
-                        collection,
-                        query_vector,
-                        *vector_top_k,
-                        edge_label,
-                        *direction,
-                        *expansion_depth,
-                        *final_top_k,
-                        *rrf_k,
-                        vector_field.as_str(),
-                        options.max_visited,
+                        crate::data::executor::handlers::graph_rag::GraphRagFusionParams {
+                            tenant_id: tid,
+                            collection,
+                            query_vector,
+                            vector_top_k: *vector_top_k,
+                            edge_label,
+                            direction: *direction,
+                            expansion_depth: *expansion_depth,
+                            final_top_k: *final_top_k,
+                            rrf_k: *rrf_k,
+                            vector_field: vector_field.as_str(),
+                            max_visited: options.max_visited,
+                        },
                     )
                 }
             }
@@ -213,12 +223,14 @@ impl CoreLoop {
                 source_binding,
             } => self.execute_graph_match_continuation(
                 task,
-                tid,
-                query,
-                *resume_triple_idx,
-                partial_row,
-                source_node,
-                source_binding,
+                crate::data::executor::handlers::graph_match::GraphMatchContinuationParams {
+                    tid,
+                    query_bytes: query,
+                    resume_triple_idx: *resume_triple_idx,
+                    partial_row_bytes: partial_row,
+                    source_node,
+                    source_binding,
+                },
             ),
 
             GraphOp::MatchVarLenResume { query, resume } => {

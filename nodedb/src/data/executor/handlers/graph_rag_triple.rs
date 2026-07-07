@@ -17,32 +17,51 @@ use tracing::debug;
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::graph_rag::{
-    RagResponseParams, graph_nodes_to_ranked_results,
+    BfsWithDistancesParams, RagResponseParams, graph_nodes_to_ranked_results,
 };
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::edge_store::Direction;
 use crate::query::fusion::{RankedResult, reciprocal_rank_fusion_weighted};
 use crate::types::TenantId;
 
+/// Bundled arguments for [`CoreLoop::execute_graph_rag_fusion_triple`].
+pub(in crate::data::executor) struct GraphRagFusionTripleParams<'a> {
+    pub tenant_id: u64,
+    pub collection: &'a str,
+    pub query_vector: &'a [f32],
+    pub vector_top_k: usize,
+    pub edge_label: &'a Option<String>,
+    pub direction: Direction,
+    pub expansion_depth: usize,
+    pub final_top_k: usize,
+    pub rrf_k: (f64, f64, f64),
+    pub vector_field: &'a str,
+    pub max_visited: usize,
+    pub bm25_query: &'a str,
+    pub bm25_field: &'a str,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_graph_rag_fusion_triple(
         &self,
         task: &ExecutionTask,
-        tenant_id: u64,
-        collection: &str,
-        query_vector: &[f32],
-        vector_top_k: usize,
-        edge_label: &Option<String>,
-        direction: Direction,
-        expansion_depth: usize,
-        final_top_k: usize,
-        rrf_k: (f64, f64, f64),
-        vector_field: &str,
-        max_visited: usize,
-        bm25_query: &str,
-        _bm25_field: &str,
+        params: GraphRagFusionTripleParams<'_>,
     ) -> Response {
+        let GraphRagFusionTripleParams {
+            tenant_id,
+            collection,
+            query_vector,
+            vector_top_k,
+            edge_label,
+            direction,
+            expansion_depth,
+            final_top_k,
+            rrf_k,
+            vector_field,
+            max_visited,
+            bm25_query,
+            bm25_field: _bm25_field,
+        } = params;
         debug!(
             core = self.core_id,
             %collection,
@@ -87,16 +106,17 @@ impl CoreLoop {
 
         // Graph BFS from vector-nearest nodes.
         let start_ids: Vec<&str> = vector_scores.keys().map(String::as_str).collect();
-        let (expanded_nodes, hop_distances, bfs_truncated) = self.bfs_with_distances(
-            task.request.database_id.as_u64(),
-            tenant_id,
-            &start_ids,
-            edge_label.as_deref(),
-            direction,
-            expansion_depth,
-            max_visited,
-            collection,
-        );
+        let (expanded_nodes, hop_distances, bfs_truncated) =
+            self.bfs_with_distances(BfsWithDistancesParams {
+                database_id: task.request.database_id.as_u64(),
+                tid: tenant_id,
+                start_nodes: &start_ids,
+                label_filter: edge_label.as_deref(),
+                direction,
+                max_depth: expansion_depth,
+                max_visited,
+                collection,
+            });
 
         let (vector_k, text_k, graph_k) = rrf_k;
 

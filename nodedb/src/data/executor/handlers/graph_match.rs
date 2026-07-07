@@ -110,6 +110,16 @@ pub(crate) fn encode_match_envelope_raw(
     Ok(buf)
 }
 
+/// Bundled arguments for [`CoreLoop::execute_graph_match_continuation`].
+pub(in crate::data::executor) struct GraphMatchContinuationParams<'a> {
+    pub tid: u64,
+    pub query_bytes: &'a [u8],
+    pub resume_triple_idx: usize,
+    pub partial_row_bytes: &'a [u8],
+    pub source_node: &'a str,
+    pub source_binding: &'a str,
+}
+
 impl CoreLoop {
     /// Encode a `MatchOutcome` into the DP→CP MATCH envelope and build the
     /// appropriate response (`partial` if the outcome was truncated, normal
@@ -287,17 +297,19 @@ impl CoreLoop {
     /// `MatchContinuation` — the predicate is unconditionally `true` here.
     /// The response already envelopes `{rows, frontier}` via
     /// `match_outcome_response`.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_graph_match_continuation(
         &self,
         task: &ExecutionTask,
-        tid: u64,
-        query_bytes: &[u8],
-        resume_triple_idx: usize,
-        partial_row_bytes: &[u8],
-        source_node: &str,
-        source_binding: &str,
+        params: GraphMatchContinuationParams<'_>,
     ) -> Response {
+        let GraphMatchContinuationParams {
+            tid,
+            query_bytes,
+            resume_triple_idx,
+            partial_row_bytes,
+            source_node,
+            source_binding,
+        } = params;
         debug!(
             core = self.core_id,
             tid, "graph match continuation execution"

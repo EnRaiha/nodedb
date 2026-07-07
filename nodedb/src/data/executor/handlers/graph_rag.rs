@@ -44,23 +44,52 @@ pub(in crate::data::executor) struct RagResponseParams<'a> {
     pub op_name: &'a str,
 }
 
+/// Bundled arguments for [`CoreLoop::execute_graph_rag_fusion`].
+pub(in crate::data::executor) struct GraphRagFusionParams<'a> {
+    pub tenant_id: u64,
+    pub collection: &'a str,
+    pub query_vector: &'a [f32],
+    pub vector_top_k: usize,
+    pub edge_label: &'a Option<String>,
+    pub direction: Direction,
+    pub expansion_depth: usize,
+    pub final_top_k: usize,
+    pub rrf_k: (f64, f64),
+    pub vector_field: &'a str,
+    pub max_visited: usize,
+}
+
+/// Bundled arguments for [`CoreLoop::bfs_with_distances`].
+pub(in crate::data::executor) struct BfsWithDistancesParams<'a> {
+    pub database_id: u64,
+    pub tid: u64,
+    pub start_nodes: &'a [&'a str],
+    pub label_filter: Option<&'a str>,
+    pub direction: Direction,
+    pub max_depth: usize,
+    pub max_visited: usize,
+    pub collection: &'a str,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_graph_rag_fusion(
         &self,
         task: &ExecutionTask,
-        tenant_id: u64,
-        collection: &str,
-        query_vector: &[f32],
-        vector_top_k: usize,
-        edge_label: &Option<String>,
-        direction: Direction,
-        expansion_depth: usize,
-        final_top_k: usize,
-        rrf_k: (f64, f64),
-        vector_field: &str,
-        max_visited: usize,
+        params: GraphRagFusionParams<'_>,
     ) -> Response {
+        let GraphRagFusionParams {
+            tenant_id,
+            collection,
+            query_vector,
+            vector_top_k,
+            edge_label,
+            direction,
+            expansion_depth,
+            final_top_k,
+            rrf_k,
+            vector_field,
+            max_visited,
+        } = params;
         debug!(
             core = self.core_id,
             %collection,
@@ -83,16 +112,17 @@ impl CoreLoop {
         };
 
         let start_ids: Vec<&str> = vector_scores.keys().map(String::as_str).collect();
-        let (expanded_nodes, hop_distances, bfs_truncated) = self.bfs_with_distances(
-            task.request.database_id.as_u64(),
-            tenant_id,
-            &start_ids,
-            edge_label.as_deref(),
-            direction,
-            expansion_depth,
-            max_visited,
-            collection,
-        );
+        let (expanded_nodes, hop_distances, bfs_truncated) =
+            self.bfs_with_distances(BfsWithDistancesParams {
+                database_id: task.request.database_id.as_u64(),
+                tid: tenant_id,
+                start_nodes: &start_ids,
+                label_filter: edge_label.as_deref(),
+                direction,
+                max_depth: expansion_depth,
+                max_visited,
+                collection,
+            });
 
         let (vector_k, graph_k) = rrf_k;
 
@@ -235,18 +265,20 @@ impl CoreLoop {
     }
 
     /// BFS traversal that also tracks hop distances from start nodes.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn bfs_with_distances(
         &self,
-        database_id: u64,
-        tid: u64,
-        start_nodes: &[&str],
-        label_filter: Option<&str>,
-        direction: Direction,
-        max_depth: usize,
-        max_visited: usize,
-        collection: &str,
+        params: BfsWithDistancesParams<'_>,
     ) -> (Vec<String>, HashMap<String, usize>, bool) {
+        let BfsWithDistancesParams {
+            database_id,
+            tid,
+            start_nodes,
+            label_filter,
+            direction,
+            max_depth,
+            max_visited,
+            collection,
+        } = params;
         let budget_node_limit =
             self.query_tuning.bfs_memory_budget_bytes / self.query_tuning.bfs_bytes_per_node;
         let effective_limit = max_visited.min(budget_node_limit);

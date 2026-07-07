@@ -17,7 +17,9 @@ use nodedb_fts::posting::QueryMode;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::graph_rag::graph_nodes_to_ranked_results;
+use crate::data::executor::handlers::graph_rag::{
+    BfsWithDistancesParams, graph_nodes_to_ranked_results,
+};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::edge_store::Direction;
 
@@ -132,16 +134,18 @@ impl CoreLoop {
 
         // 3. Graph BFS from seed node.
         let edge_label_owned = graph_edge_label.map(str::to_string);
-        let (graph_expanded, hop_distances, _bfs_truncated) = self.bfs_with_distances(
-            task.request.database_id.as_u64(),
-            tid,
-            &[graph_seed_id],
-            graph_edge_label,
-            Direction::Out,
-            graph_depth,
-            self.query_tuning.bfs_memory_budget_bytes / self.query_tuning.bfs_bytes_per_node,
-            collection,
-        );
+        let (graph_expanded, hop_distances, _bfs_truncated) =
+            self.bfs_with_distances(BfsWithDistancesParams {
+                database_id: task.request.database_id.as_u64(),
+                tid,
+                start_nodes: &[graph_seed_id],
+                label_filter: graph_edge_label,
+                direction: Direction::Out,
+                max_depth: graph_depth,
+                max_visited: self.query_tuning.bfs_memory_budget_bytes
+                    / self.query_tuning.bfs_bytes_per_node,
+                collection,
+            });
 
         // 4. Build ranked lists.
         use crate::query::fusion::{RankedResult, reciprocal_rank_fusion_weighted};

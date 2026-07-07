@@ -9,18 +9,30 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// Bundled arguments for [`CoreLoop::execute_graph_path`].
+pub(in crate::data::executor) struct GraphPathParams<'a> {
+    pub tid: u64,
+    pub src: &'a str,
+    pub dst: &'a str,
+    pub edge_label: &'a Option<String>,
+    pub max_depth: usize,
+    pub frontier_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_graph_path(
         &self,
         task: &ExecutionTask,
-        tid: u64,
-        src: &str,
-        dst: &str,
-        edge_label: &Option<String>,
-        max_depth: usize,
-        frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
+        params: GraphPathParams<'_>,
     ) -> Response {
+        let GraphPathParams {
+            tid,
+            src,
+            dst,
+            edge_label,
+            max_depth,
+            frontier_bitmap,
+        } = params;
         let max_depth =
             max_depth.min(crate::engine::graph::traversal_options::MAX_GRAPH_TRAVERSAL_DEPTH);
         debug!(core = self.core_id, tid, %src, %dst, ?edge_label, max_depth, "graph path");
