@@ -4,16 +4,20 @@
 //!
 //! Periodically dispatches `PhysicalPlan::Checkpoint` to all Data Plane cores,
 //! collects their checkpoint LSNs, and truncates the WAL up to the global
-//! minimum LSN.
+//! minimum LSN — but only when every core has reported.
 //!
 //! ## How it works
 //!
 //! 1. The manager sends a `Checkpoint` request to every core via the Dispatcher.
 //! 2. Each core flushes its engine state (vectors, CRDTs) and responds with
 //!    its watermark LSN.
-//! 3. The manager collects all responses. The global checkpoint LSN is the
-//!    **minimum** across all cores — ensuring no core has unflushed state
-//!    above the truncation point.
+//! 3. The manager collects all responses. If any core failed to dispatch,
+//!    missed its response deadline, or otherwise did not report a fresh
+//!    flush LSN, the whole cycle is deferred — no marker, no truncation,
+//!    no tombstone GC — and retried next cycle. Only when every core has
+//!    reported does the global checkpoint LSN become the **minimum**
+//!    across all cores, ensuring no core has unflushed state above the
+//!    truncation point.
 //! 4. A `RecordType::Checkpoint` WAL record is written at the global LSN.
 //! 5. `WalManager::truncate_before()` deletes old WAL segments.
 //!
@@ -56,6 +60,22 @@ impl Default for CheckpointManagerConfig {
             core_timeout: Duration::from_secs(30),
         }
     }
+}
+
+/// Decide the WAL truncation LSN for a checkpoint cycle.
+///
+/// Returns `None` (defer truncation) unless EVERY core reported a fresh
+/// flush LSN. A core that failed to dispatch or missed its response
+/// deadline may still hold acknowledged-but-unflushed records below the
+/// reporting cores' minimum LSN; truncating there would delete them and
+/// lose the writes on restart. Also returns `None` when the minimum is 0
+/// (no writes yet, nothing to truncate).
+fn checkpoint_truncation_lsn(reported_lsns: &[u64], num_cores: usize) -> Option<u64> {
+    if reported_lsns.len() != num_cores {
+        return None;
+    }
+    let min = *reported_lsns.iter().min()?;
+    if min == 0 { None } else { Some(min) }
 }
 
 /// Run one checkpoint cycle: dispatch checkpoint to all cores, collect LSNs,
@@ -165,25 +185,28 @@ pub async fn run_checkpoint_cycle(
         }
     }
 
-    if !failed_cores.is_empty() {
-        warn!(
-            failed = ?failed_cores,
-            succeeded = checkpoint_lsns.len(),
-            "some cores failed checkpoint — using partial results"
-        );
-    }
-
-    if checkpoint_lsns.is_empty() {
-        warn!("no cores completed checkpoint — skipping WAL truncation");
-        return None;
-    }
-
-    // 3. Global checkpoint LSN = minimum across all responding cores.
-    let &global_lsn = checkpoint_lsns.iter().min()?;
-    if global_lsn == 0 {
-        debug!("global checkpoint LSN is 0 (no writes yet) — skipping");
-        return None;
-    }
+    // Truncation is only safe when every core reported a fresh flush LSN.
+    // A core that failed to dispatch or missed its deadline may hold
+    // acknowledged-but-unflushed records below the reporting cores'
+    // minimum; truncating would delete them and lose the writes on
+    // restart. Defer the entire checkpoint (no marker, no truncation) and
+    // retry next cycle.
+    let global_lsn = match checkpoint_truncation_lsn(&checkpoint_lsns, num_cores) {
+        Some(lsn) => lsn,
+        None => {
+            if checkpoint_lsns.len() != num_cores {
+                warn!(
+                    responded = checkpoint_lsns.len(),
+                    expected = num_cores,
+                    failed = ?failed_cores,
+                    "checkpoint deferred: not all cores reported a flush LSN — skipping WAL truncation this cycle"
+                );
+            } else {
+                debug!("global checkpoint LSN is 0 (no writes yet) — skipping");
+            }
+            return None;
+        }
+    };
 
     let checkpoint_lsn = Lsn::new(global_lsn);
 
@@ -386,5 +409,42 @@ async fn archive_wal_segments_before_truncation(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_cores_reported_distinct_lsns_returns_min() {
+        assert_eq!(checkpoint_truncation_lsn(&[10, 5, 8], 3), Some(5));
+    }
+
+    #[test]
+    fn one_core_missing_defers_even_though_responders_have_a_min() {
+        // Old (buggy) behavior would have truncated at 5, deleting the
+        // missing core's unflushed records. Correct behavior defers.
+        assert_eq!(checkpoint_truncation_lsn(&[5, 10], 3), None);
+    }
+
+    #[test]
+    fn dispatch_gap_only_one_core_responded_defers() {
+        assert_eq!(checkpoint_truncation_lsn(&[7], 2), None);
+    }
+
+    #[test]
+    fn all_reported_but_min_is_zero_defers() {
+        assert_eq!(checkpoint_truncation_lsn(&[0, 5], 2), None);
+    }
+
+    #[test]
+    fn single_core_reported_returns_its_lsn() {
+        assert_eq!(checkpoint_truncation_lsn(&[42], 1), Some(42));
+    }
+
+    #[test]
+    fn degenerate_empty_input_does_not_panic() {
+        assert_eq!(checkpoint_truncation_lsn(&[], 0), None);
     }
 }
