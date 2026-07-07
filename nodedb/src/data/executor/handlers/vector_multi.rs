@@ -12,23 +12,49 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// Parameters for [`CoreLoop::execute_multi_vector_insert`].
+pub(in crate::data::executor) struct MultiVectorInsertParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub field_name: &'a str,
+    pub document_surrogate: Surrogate,
+    pub vectors_flat: &'a [f32],
+    pub count: usize,
+    pub dim: usize,
+}
+
+/// Parameters for [`CoreLoop::execute_multi_vector_score_search`].
+pub(in crate::data::executor) struct MultiVectorScoreSearchParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub field_name: &'a str,
+    pub query_vector: &'a [f32],
+    pub top_k: usize,
+    pub ef_search: usize,
+    pub mode_str: &'a str,
+}
+
 impl CoreLoop {
     /// Insert multiple vectors for a single document into the HNSW index.
     ///
     /// All vectors share the same `document_surrogate` in `surrogate_map`
     /// and are tracked in `multi_doc_map` for bulk deletion.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_multi_vector_insert(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        field_name: &str,
-        document_surrogate: Surrogate,
-        vectors_flat: &[f32],
-        count: usize,
-        dim: usize,
+        params: MultiVectorInsertParams<'_>,
     ) -> Response {
+        let MultiVectorInsertParams {
+            task,
+            tid,
+            collection,
+            field_name,
+            document_surrogate,
+            vectors_flat,
+            count,
+            dim,
+        } = params;
         debug!(
             core = self.core_id,
             %collection, %field_name, doc_surrogate = document_surrogate.as_u32(), count, dim,
@@ -168,18 +194,20 @@ impl CoreLoop {
     /// 3. For each document, collect all its candidate distances
     /// 4. Aggregate per-document using the specified mode (MaxSim/AvgSim/SumSim)
     /// 5. Sort by aggregated score, dedup, return top-K documents
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_multi_vector_score_search(
         &self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        field_name: &str,
-        query_vector: &[f32],
-        top_k: usize,
-        ef_search: usize,
-        mode_str: &str,
+        params: MultiVectorScoreSearchParams<'_>,
     ) -> Response {
+        let MultiVectorScoreSearchParams {
+            task,
+            tid,
+            collection,
+            field_name,
+            query_vector,
+            top_k,
+            ef_search,
+            mode_str,
+        } = params;
         debug!(
             core = self.core_id,
             %collection, %field_name, top_k, %mode_str,

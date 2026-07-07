@@ -157,13 +157,15 @@ impl CoreLoop {
                 m0,
                 ef_construction,
             } => self.execute_vector_rebuild(
-                task,
-                tid,
-                collection,
-                field_name,
-                *m,
-                *m0,
-                *ef_construction,
+                super::super::handlers::vector_lifecycle::VectorRebuildParams {
+                    task,
+                    tid,
+                    collection,
+                    field_name,
+                    m: *m,
+                    m0: *m0,
+                    ef_construction: *ef_construction,
+                },
             ),
 
             VectorOp::SparseInsert {
@@ -196,14 +198,16 @@ impl CoreLoop {
                 count,
                 dim,
             } => self.execute_multi_vector_insert(
-                task,
-                tid,
-                collection,
-                field_name,
-                *document_surrogate,
-                vectors,
-                *count,
-                *dim,
+                super::super::handlers::vector_multi::MultiVectorInsertParams {
+                    task,
+                    tid,
+                    collection,
+                    field_name,
+                    document_surrogate: *document_surrogate,
+                    vectors_flat: vectors,
+                    count: *count,
+                    dim: *dim,
+                },
             ),
 
             VectorOp::MultiVectorDelete {
@@ -226,14 +230,16 @@ impl CoreLoop {
                 ef_search,
                 mode,
             } => self.execute_multi_vector_score_search(
-                task,
-                tid,
-                collection,
-                field_name,
-                query_vector,
-                *top_k,
-                *ef_search,
-                mode,
+                super::super::handlers::vector_multi::MultiVectorScoreSearchParams {
+                    task,
+                    tid,
+                    collection,
+                    field_name,
+                    query_vector,
+                    top_k: *top_k,
+                    ef_search: *ef_search,
+                    mode_str: mode,
+                },
             ),
 
             VectorOp::DirectUpsert {
@@ -246,16 +252,18 @@ impl CoreLoop {
                 storage_dtype,
                 payload_indexes,
             } => self.execute_vector_direct_upsert(
-                task,
-                tid,
-                collection,
-                field,
-                *surrogate,
-                vector,
-                payload,
-                *quantization,
-                *storage_dtype,
-                payload_indexes,
+                super::super::handlers::vector_upsert::VectorDirectUpsertParams {
+                    task,
+                    tid,
+                    collection,
+                    field,
+                    surrogate: *surrogate,
+                    vector,
+                    payload,
+                    quantization: *quantization,
+                    storage_dtype: *storage_dtype,
+                    payload_indexes,
+                },
             ),
 
             VectorOp::DeleteBySurrogate {

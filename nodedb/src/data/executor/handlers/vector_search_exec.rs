@@ -14,6 +14,19 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// Parameters for [`CoreLoop::search_ivf`].
+struct SearchIvfParams<'a> {
+    task: &'a ExecutionTask,
+    tid: u64,
+    collection: &'a str,
+    index_key: &'a (nodedb_types::DatabaseId, crate::types::TenantId, String),
+    ivf: &'a crate::engine::vector::ivf::IvfPqIndex,
+    query_vector: &'a [f32],
+    top_k: usize,
+    filter_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
+    rls_filters: &'a [u8],
+}
+
 impl CoreLoop {
     /// Fetch the document body via the sparse engine (keyed by
     /// surrogate-hex) and attach it to the hit. Used both by the RLS path
@@ -110,17 +123,17 @@ impl CoreLoop {
 
         // Check for IVF-PQ index first.
         if let Some(ivf) = self.ivf_indexes.get(&index_key) {
-            return self.search_ivf(
+            return self.search_ivf(SearchIvfParams {
                 task,
                 tid,
                 collection,
-                &index_key,
+                index_key: &index_key,
                 ivf,
                 query_vector,
                 top_k,
                 filter_bitmap,
                 rls_filters,
-            );
+            });
         }
 
         // Default: HNSW collection.
@@ -341,19 +354,18 @@ impl CoreLoop {
     }
 
     /// Search an IVF-PQ index with optional bitmap post-filtering.
-    #[allow(clippy::too_many_arguments)]
-    fn search_ivf(
-        &self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        index_key: &(nodedb_types::DatabaseId, crate::types::TenantId, String),
-        ivf: &crate::engine::vector::ivf::IvfPqIndex,
-        query_vector: &[f32],
-        top_k: usize,
-        filter_bitmap: Option<&nodedb_types::SurrogateBitmap>,
-        rls_filters: &[u8],
-    ) -> Response {
+    fn search_ivf(&self, params: SearchIvfParams<'_>) -> Response {
+        let SearchIvfParams {
+            task,
+            tid,
+            collection,
+            index_key,
+            ivf,
+            query_vector,
+            top_k,
+            filter_bitmap,
+            rls_filters,
+        } = params;
         if ivf.is_empty() {
             return self.response_with_payload(task, b"[]".to_vec());
         }

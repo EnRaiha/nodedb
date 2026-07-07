@@ -11,6 +11,17 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// Parameters for [`CoreLoop::execute_vector_rebuild`].
+pub(in crate::data::executor) struct VectorRebuildParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub field_name: &'a str,
+    pub m: usize,
+    pub m0: usize,
+    pub ef_construction: usize,
+}
+
 impl CoreLoop {
     /// Return live `VectorIndexStats` for a collection/field.
     ///
@@ -177,18 +188,21 @@ impl CoreLoop {
     /// Updates the params so future builds use them. Then re-seals and
     /// re-builds all sealed segments with the new params by extracting their
     /// vectors, creating new HNSW indexes, and swapping atomically.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_vector_rebuild(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        field_name: &str,
-        m: usize,
-        m0: usize,
-        ef_construction: usize,
+        params: VectorRebuildParams<'_>,
     ) -> Response {
         use crate::engine::vector::hnsw::{HnswIndex, HnswParams};
+
+        let VectorRebuildParams {
+            task,
+            tid,
+            collection,
+            field_name,
+            m,
+            m0,
+            ef_construction,
+        } = params;
 
         let database_id = task.request.database_id.as_u64();
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);

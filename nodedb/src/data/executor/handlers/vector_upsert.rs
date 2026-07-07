@@ -38,22 +38,38 @@ pub(in crate::data::executor) fn decode_payload_lowercased(
     })
 }
 
+/// Parameters for [`CoreLoop::execute_vector_direct_upsert`].
+pub(in crate::data::executor) struct VectorDirectUpsertParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub field: &'a str,
+    pub surrogate: Surrogate,
+    pub vector: &'a [f32],
+    pub payload: &'a [u8],
+    pub quantization: nodedb_types::VectorQuantization,
+    pub storage_dtype: nodedb_types::VectorStorageDtype,
+    pub payload_indexes: &'a [(String, nodedb_types::PayloadIndexKind)],
+}
+
 impl CoreLoop {
     /// Handle `VectorOp::DirectUpsert`.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_vector_direct_upsert(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        field: &str,
-        surrogate: Surrogate,
-        vector: &[f32],
-        payload: &[u8],
-        quantization: nodedb_types::VectorQuantization,
-        storage_dtype: nodedb_types::VectorStorageDtype,
-        payload_indexes: &[(String, nodedb_types::PayloadIndexKind)],
+        params: VectorDirectUpsertParams<'_>,
     ) -> Response {
+        let VectorDirectUpsertParams {
+            task,
+            tid,
+            collection,
+            field,
+            surrogate,
+            vector,
+            payload,
+            quantization,
+            storage_dtype,
+            payload_indexes,
+        } = params;
         debug!(
             core = self.core_id,
             %collection,

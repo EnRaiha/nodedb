@@ -18,6 +18,38 @@ use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::SpatialPredicate;
 use nodedb_types::{Surrogate, SurrogateBitmap, Value};
 
+/// Parameters for [`CoreLoop::execute_spatial_scan`].
+pub(in crate::data::executor) struct SpatialScanParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub field: &'a str,
+    pub predicate: &'a SpatialPredicate,
+    pub query_geometry: &'a nodedb_types::geometry::Geometry,
+    pub distance_meters: f64,
+    pub attribute_filters: &'a [u8],
+    pub limit: usize,
+    pub projection: &'a [String],
+    pub rls_filters: &'a [u8],
+    pub prefilter: Option<&'a SurrogateBitmap>,
+}
+
+/// Parameters for [`CoreLoop::spatial_full_scan`].
+struct SpatialFullScanParams<'a> {
+    task: &'a ExecutionTask,
+    tid: u64,
+    collection: &'a str,
+    field: &'a str,
+    predicate: &'a SpatialPredicate,
+    query_geom: &'a nodedb_types::geometry::Geometry,
+    distance_meters: f64,
+    limit: usize,
+    projection: &'a [String],
+    attr_filters: &'a [ScanFilter],
+    rls_filters: &'a [ScanFilter],
+    prefilter: Option<&'a SurrogateBitmap>,
+}
+
 impl CoreLoop {
     /// Execute a spatial scan using the R-tree index.
     ///
@@ -25,22 +57,24 @@ impl CoreLoop {
     /// 2. R-tree range search for bbox candidates
     /// 3. Exact predicate refinement (extract geometry, apply ST_*)
     /// 4. Return matching documents up to limit
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_spatial_scan(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        field: &str,
-        predicate: &SpatialPredicate,
-        query_geometry: &nodedb_types::geometry::Geometry,
-        distance_meters: f64,
-        attribute_filters: &[u8],
-        limit: usize,
-        projection: &[String],
-        rls_filters: &[u8],
-        prefilter: Option<&SurrogateBitmap>,
+        params: SpatialScanParams<'_>,
     ) -> Response {
+        let SpatialScanParams {
+            task,
+            tid,
+            collection,
+            field,
+            predicate,
+            query_geometry,
+            distance_meters,
+            attribute_filters,
+            limit,
+            projection,
+            rls_filters,
+            prefilter,
+        } = params;
         debug!(
             core = self.core_id,
             %collection,
@@ -86,7 +120,7 @@ impl CoreLoop {
 
         // No R-tree: full scan with predicate post-filter.
         if !has_index {
-            return self.spatial_full_scan(
+            return self.spatial_full_scan(SpatialFullScanParams {
                 task,
                 tid,
                 collection,
@@ -96,10 +130,10 @@ impl CoreLoop {
                 distance_meters,
                 limit,
                 projection,
-                &attr_filters,
-                &row_level_filters,
+                attr_filters: &attr_filters,
+                rls_filters: &row_level_filters,
                 prefilter,
-            );
+            });
         }
 
         let coll_key = (db_id, tid_id, collection.to_string());
@@ -224,22 +258,21 @@ impl CoreLoop {
     }
 
     /// Full scan when no R-tree exists for the field.
-    #[allow(clippy::too_many_arguments)]
-    fn spatial_full_scan(
-        &self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        field: &str,
-        predicate: &SpatialPredicate,
-        query_geom: &nodedb_types::geometry::Geometry,
-        distance_meters: f64,
-        limit: usize,
-        projection: &[String],
-        attr_filters: &[ScanFilter],
-        rls_filters: &[ScanFilter],
-        prefilter: Option<&SurrogateBitmap>,
-    ) -> Response {
+    fn spatial_full_scan(&self, params: SpatialFullScanParams<'_>) -> Response {
+        let SpatialFullScanParams {
+            task,
+            tid,
+            collection,
+            field,
+            predicate,
+            query_geom,
+            distance_meters,
+            limit,
+            projection,
+            attr_filters,
+            rls_filters,
+            prefilter,
+        } = params;
         debug!(core = self.core_id, %collection, "spatial full scan (no R-tree index yet)");
 
         let scan_limit = limit * 10;
@@ -419,6 +452,7 @@ fn expand_bbox(bbox: &nodedb_types::BoundingBox, meters: f64) -> nodedb_types::B
 
 #[cfg(test)]
 mod tests {
+    use super::SpatialScanParams;
     use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
     use crate::data::executor::task::ExecutionTask;
     use crate::engine::spatial::RTreeEntry;
@@ -579,20 +613,20 @@ mod tests {
         let task = make_task(dummy_spatial_plan());
         let empty_bitmap = SurrogateBitmap::new();
 
-        let resp = core.execute_spatial_scan(
-            &task,
+        let resp = core.execute_spatial_scan(SpatialScanParams {
+            task: &task,
             tid,
             collection,
             field,
-            &nodedb_physical::physical_plan::SpatialPredicate::DWithin,
-            &origin_point(),
-            1_000_000.0,
-            &[],
-            100,
-            &[],
-            &[],
-            Some(&empty_bitmap),
-        );
+            predicate: &nodedb_physical::physical_plan::SpatialPredicate::DWithin,
+            query_geometry: &origin_point(),
+            distance_meters: 1_000_000.0,
+            attribute_filters: &[],
+            limit: 100,
+            projection: &[],
+            rls_filters: &[],
+            prefilter: Some(&empty_bitmap),
+        });
         assert_eq!(resp.status, Status::Ok);
         let decoded: Vec<nodedb_types::Value> =
             zerompk::from_msgpack(resp.payload.as_bytes()).unwrap_or_default();

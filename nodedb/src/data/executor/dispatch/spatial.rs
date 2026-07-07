@@ -58,20 +58,20 @@ impl CoreLoop {
                 projection,
                 rls_filters,
                 prefilter,
-            } => self.execute_spatial_scan(
+            } => self.execute_spatial_scan(super::super::handlers::spatial::SpatialScanParams {
                 task,
                 tid,
                 collection,
                 field,
                 predicate,
                 query_geometry,
-                *distance_meters,
+                distance_meters: *distance_meters,
                 attribute_filters,
-                *limit,
+                limit: *limit,
                 projection,
                 rls_filters,
-                prefilter.as_ref(),
-            ),
+                prefilter: prefilter.as_ref(),
+            }),
         }
     }
 }
