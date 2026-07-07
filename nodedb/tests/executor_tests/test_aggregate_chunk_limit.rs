@@ -11,7 +11,7 @@
 
 use crate::helpers::{make_ctx, payload_value, send_ok};
 use nodedb_physical::physical_plan::{
-    AggregateSpec, ColumnarInsertIntent, ColumnarOp, PhysicalPlan, QueryOp,
+    AggregateSpec, ColumnarInsertIntent, ColumnarOp, GroupKeySpec, PhysicalPlan, QueryOp,
 };
 use nodedb_types::config::tuning::QueryTuning;
 
@@ -83,7 +83,7 @@ fn limit_honoured_when_groups_span_multiple_aggregate_chunks() {
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "chunk_limit_col".into(),
             input: None,
-            group_by: vec!["g".into()],
+            group_by: vec![GroupKeySpec::column("g")],
             aggregates: vec![AggregateSpec {
                 function: "count".into(),
                 alias: "count(*)".into(),
@@ -145,7 +145,7 @@ fn no_limit_returns_all_groups_with_small_chunk_size() {
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "chunk_nolimit_col".into(),
             input: None,
-            group_by: vec!["g".into()],
+            group_by: vec![GroupKeySpec::column("g")],
             aggregates: vec![AggregateSpec {
                 function: "count".into(),
                 alias: "count(*)".into(),

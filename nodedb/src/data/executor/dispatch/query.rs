@@ -3,7 +3,7 @@
 //! Dispatch for QueryOp variants (aggregates, joins, recursive scans, facets).
 
 use crate::bridge::envelope::Response;
-use nodedb_physical::physical_plan::QueryOp;
+use nodedb_physical::physical_plan::{GroupKeySpec, QueryOp};
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::join::{
@@ -227,21 +227,29 @@ impl CoreLoop {
                 group_by,
                 aggregates,
                 filters,
-            } => self.execute_aggregate(
-                task,
-                tid,
-                collection,
-                None,
-                group_by,
-                aggregates,
-                filters,
-                &[],
-                usize::MAX,
-                &[],
-                &[],
-                &[],
-                &[],
-            ),
+            } => {
+                // This variant still carries plain column-name keys; lift them
+                // to bare-column specs for the shared executor entry point.
+                let group_specs: Vec<GroupKeySpec> = group_by
+                    .iter()
+                    .map(|s| GroupKeySpec::column(s.as_str()))
+                    .collect();
+                self.execute_aggregate(
+                    task,
+                    tid,
+                    collection,
+                    None,
+                    &group_specs,
+                    aggregates,
+                    filters,
+                    &[],
+                    usize::MAX,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+            }
 
             QueryOp::PartialAggregateState {
                 collection,
@@ -266,9 +274,23 @@ impl CoreLoop {
                 having,
                 limit,
                 sort_keys,
-            } => self.execute_shuffle_aggregate(
-                task, state_path, group_by, aggregates, having, *limit, sort_keys,
-            ),
+            } => {
+                // This variant still carries plain column-name keys; lift them
+                // to bare-column specs for the consumer's merge + finalize.
+                let group_specs: Vec<GroupKeySpec> = group_by
+                    .iter()
+                    .map(|s| GroupKeySpec::column(s.as_str()))
+                    .collect();
+                self.execute_shuffle_aggregate(
+                    task,
+                    state_path,
+                    &group_specs,
+                    aggregates,
+                    having,
+                    *limit,
+                    sort_keys,
+                )
+            }
 
             QueryOp::LateralTopK {
                 outer_plan,

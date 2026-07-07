@@ -38,7 +38,7 @@ pub use graph::{
 };
 pub use kv::KvOp;
 pub use meta::MetaOp;
-pub use query::{AggregateSpec, JoinProjection, QueryOp};
+pub use query::{AggregateSpec, GroupKeySpec, JoinProjection, QueryOp};
 pub use routing::plan_contains_cluster_partitioned_leaf;
 pub use spatial::{SpatialOp, SpatialPredicate};
 pub use text::TextOp;

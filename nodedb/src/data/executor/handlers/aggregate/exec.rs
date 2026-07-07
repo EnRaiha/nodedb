@@ -12,7 +12,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::AggregateSpec;
+use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 use nodedb_query::agg_key::canonical_agg_key;
 use nodedb_query::msgpack_scan;
 
@@ -24,7 +24,7 @@ impl CoreLoop {
         tid: u64,
         collection: &str,
         input: Option<&nodedb_physical::physical_plan::PhysicalPlan>,
-        group_by: &[String],
+        group_by: &[GroupKeySpec],
         aggregates: &[AggregateSpec],
         filters: &[u8],
         having: &[u8],
@@ -70,12 +70,19 @@ impl CoreLoop {
 
         // ROLLUP / CUBE / GROUPING SETS path: union results from each set.
         if !grouping_sets.is_empty() {
+            // Physical column names for the group-key fields, used by the
+            // paths that key on raw column names (grouping-set expansion,
+            // native columnar aggregation). For a bare column this is the
+            // same string the spec emits under, so those paths behave
+            // identically.
+            let group_fields: Vec<String> =
+                group_by.iter().filter_map(|s| s.field.clone()).collect();
             return super::super::grouping_sets_exec::execute_grouping_sets(
                 self,
                 task,
                 tid,
                 collection,
-                group_by,
+                &group_fields,
                 aggregates,
                 filters,
                 having,
@@ -107,8 +114,9 @@ impl CoreLoop {
             && aggregates.len() == 1
             && aggregates[0].expr.is_none()
             && aggregates[0].function == "count"
+            && let Some(field) = group_by[0].field.as_deref()
         {
-            let field = &group_by[0];
+            let out_name = group_by[0].output_name.as_str();
             if let Ok(groups) = self.sparse.scan_index_groups(
                 task.request.database_id.as_u64(),
                 tid,
@@ -125,7 +133,7 @@ impl CoreLoop {
                 msgpack_scan::write_array_header(&mut payload_buf, row_count);
                 for (value, count) in groups.into_iter().take(limit) {
                     msgpack_scan::write_map_header(&mut payload_buf, 2);
-                    msgpack_scan::write_kv_str(&mut payload_buf, field, &value);
+                    msgpack_scan::write_kv_str(&mut payload_buf, out_name, &value);
                     msgpack_scan::write_kv_i64(&mut payload_buf, &count_key, count as i64);
                 }
                 return match Ok::<Vec<u8>, crate::Error>(payload_buf) {
@@ -168,6 +176,13 @@ impl CoreLoop {
                 }
             };
 
+            // Physical column names for the group-key fields, used by the
+            // paths that key on raw column names (grouping-set expansion,
+            // native columnar aggregation). For a bare column this is the
+            // same string the spec emits under, so those paths behave
+            // identically.
+            let group_fields: Vec<String> =
+                group_by.iter().filter_map(|s| s.field.clone()).collect();
             let legacy_aggs = legacy_aggregate_pairs(aggregates);
             let columnar_spill_dir = self
                 .data_dir
@@ -178,7 +193,7 @@ impl CoreLoop {
                 super::super::columnar_agg::try_columnar_aggregate(
                     &super::super::columnar_agg::ColumnarAggParams {
                         mt,
-                        group_by,
+                        group_by: &group_fields,
                         aggregates: &pairs,
                         filters: &filter_predicates,
                         limit,

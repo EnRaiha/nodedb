@@ -112,3 +112,40 @@ pub struct ComputedColumn {
     pub alias: String,
     pub expr: SqlExpr,
 }
+
+/// A GROUP BY key specification for aggregate physical execution.
+///
+/// A bare-column key extracts its value from the document field named by
+/// `field` and emits it in the aggregate output row under `output_name`. For a
+/// plain column these are the same string. `expr` carries a computed-key
+/// expression to evaluate per row; it is always `None` for bare-column keys.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct GroupKeySpec {
+    /// Output column name for this group key (alias, else the raw column name).
+    pub output_name: String,
+    /// Bare-column extraction key. `Some` for a plain `Column` group key.
+    pub field: Option<String>,
+    /// Computed-key expression, evaluated per row. `None` for bare-column keys.
+    pub expr: Option<SqlExpr>,
+}
+
+impl GroupKeySpec {
+    /// Build a bare-column group key: extract from `name` and emit under the
+    /// same column name, with no computed expression.
+    pub fn column(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            output_name: name.clone(),
+            field: Some(name),
+            expr: None,
+        }
+    }
+}

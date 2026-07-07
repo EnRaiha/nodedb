@@ -7,7 +7,7 @@ use super::super::cache_key::aggregate_cache_key;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::AggregateSpec;
+use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 
 impl CoreLoop {
     /// Streaming aggregation over an already-materialized set of `(doc_id,
@@ -38,7 +38,7 @@ impl CoreLoop {
         collection: &str,
         cache_tid: Option<u64>,
         docs: Vec<(String, Vec<u8>)>,
-        group_by: &[String],
+        group_by: &[GroupKeySpec],
         aggregates: &[AggregateSpec],
         filters: &[u8],
         having: &[u8],

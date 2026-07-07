@@ -2,12 +2,29 @@
 
 //! Aggregate result-cache key derivation.
 
-use nodedb_physical::physical_plan::AggregateSpec;
+use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
+
+/// Serialize group-key specs into a deterministic, distinct cache-key fragment.
+/// Each spec contributes `output_name=field` (empty field for a computed key),
+/// so distinct group-key shapes never collide.
+fn group_specs_key(group_by: &[GroupKeySpec]) -> String {
+    group_by
+        .iter()
+        .map(|spec| {
+            format!(
+                "{}={}",
+                spec.output_name,
+                spec.field.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 pub(super) fn aggregate_cache_key(
     tid: u64,
     collection: &str,
-    group_by: &[String],
+    group_by: &[GroupKeySpec],
     aggregates: &[AggregateSpec],
     sub_group_by: &[String],
     sub_aggregates: &[AggregateSpec],
@@ -15,7 +32,7 @@ pub(super) fn aggregate_cache_key(
     use std::fmt::Write;
     let mut rest = format!(
         "{collection}\0{}\0{}",
-        group_by.join(","),
+        group_specs_key(group_by),
         aggregates
             .iter()
             .map(|agg| {

@@ -34,7 +34,7 @@ use std::net::SocketAddr;
 use nodedb_cluster::rpc_codec::{RaftRpc, ShuffleAggregateConsumeResponse, ShuffleProduceResponse};
 use nodedb_cluster::{PartNodeEntry, ShuffleAggregateConsumeRequest, ShuffleProduceRequest};
 use nodedb_physical::physical_plan::wire as plan_wire;
-use nodedb_physical::physical_plan::{AggregateSpec, PhysicalPlan, QueryOp};
+use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec, PhysicalPlan, QueryOp};
 use nodedb_types::Value;
 
 const NUM_PARTS: u32 = 2;
@@ -115,7 +115,7 @@ fn producer_plan(rows: &[&Row]) -> Vec<u8> {
     let plan = PhysicalPlan::Query(QueryOp::PartialAggregateState {
         collection: String::new(),
         input: Some(Box::new(scan)),
-        group_by: vec!["k".into()],
+        group_by: vec![GroupKeySpec::column("k")],
         aggregates: agg_specs(),
         filters: Vec::new(),
     });

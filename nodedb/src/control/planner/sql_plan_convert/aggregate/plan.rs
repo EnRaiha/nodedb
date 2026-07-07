@@ -15,7 +15,7 @@ use super::super::filter::serialize_filters;
 use super::super::value::extract_time_range;
 use super::spec::{
     agg_expr_to_pair, agg_expr_to_spec, extract_collection_name, extract_scan_alias,
-    group_by_to_strings, inline_join_side, join_side_collection,
+    group_by_to_specs, group_by_to_strings, inline_join_side, join_side_collection,
 };
 use nodedb_sql::types::AggregateExpr;
 
@@ -168,7 +168,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
                 ),
             });
         }
-        let group_strs = group_by_to_strings(group_by);
+        let group_specs = group_by_to_specs(group_by);
         let agg_specs: Vec<AggregateSpec> = aggregates.iter().map(agg_expr_to_spec).collect();
         let provider_scan = PhysicalPlan::Query(QueryOp::ProviderScan {
             provider: Some(raw_collection.clone()),
@@ -191,7 +191,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
             plan: PhysicalPlan::Query(QueryOp::Aggregate {
                 collection: raw_collection,
                 input: Some(Box::new(provider_scan)),
-                group_by: group_strs,
+                group_by: group_specs,
                 aggregates: agg_specs,
                 // Filters live on the ProviderScan input; the aggregate node
                 // applies none of its own over the already-filtered rows.
@@ -288,10 +288,13 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
     } else {
         Vec::new()
     };
+    // The Data-Plane aggregate carries group-key specs; the shuffle exchange
+    // keys and the cost model above still key on the plain column-name strings.
+    let group_specs = group_by_to_specs(group_by);
     let aggregate = PhysicalPlan::Query(QueryOp::Aggregate {
         collection,
         input: None,
-        group_by: group_strs,
+        group_by: group_specs,
         aggregates: agg_specs,
         filters: filter_bytes,
         having: having_bytes,

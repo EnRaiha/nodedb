@@ -22,7 +22,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::accum::GroupState;
 use crate::data::executor::handlers::join::FrameStreamReader;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::AggregateSpec;
+use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 use nodedb_query::msgpack_scan;
 
 /// Merge every partial-state frame in `state_path` into a consolidated
@@ -40,7 +40,7 @@ use nodedb_query::msgpack_scan;
 /// truncation contract.
 pub(in crate::data::executor) fn merge_state_frames(
     state_path: &Path,
-    group_by: &[String],
+    group_by: &[GroupKeySpec],
     // Accepted for an explicit spec-count contract at the call site and API
     // symmetry with `accumulate_groups`; the decoded states already carry one
     // accumulator per spec, so the merge needs no per-spec dispatch.
@@ -91,7 +91,7 @@ impl CoreLoop {
         &mut self,
         task: &ExecutionTask,
         state_path: &str,
-        group_by: &[String],
+        group_by: &[GroupKeySpec],
         aggregates: &[AggregateSpec],
         having: &[u8],
         limit: usize,
@@ -139,7 +139,7 @@ mod tests {
 
     use super::merge_state_frames;
     use crate::data::executor::handlers::accum::GroupState;
-    use nodedb_physical::physical_plan::AggregateSpec;
+    use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
     use nodedb_types::Value;
 
     fn make_spec(func: &str, field: &str) -> AggregateSpec {
@@ -170,7 +170,7 @@ mod tests {
     fn write_partial_state_frames(
         path: &std::path::Path,
         specs: &[AggregateSpec],
-        group_by: &[String],
+        group_by: &[GroupKeySpec],
         docs: &[Vec<u8>],
     ) {
         let mut groups: HashMap<String, GroupState> = HashMap::new();
@@ -188,9 +188,17 @@ mod tests {
             // as the production producer) and re-emit them as flat row fields.
             let parts: Vec<serde_json::Value> = sonic_rs::from_str(&key).expect("key json");
             let mut row: HashMap<String, Value> = HashMap::new();
-            for (i, field) in group_by.iter().enumerate() {
-                let jv = parts.get(i).cloned().unwrap_or(serde_json::Value::Null);
-                row.insert(field.clone(), Value::from(jv));
+            let mut part_idx = 0usize;
+            for spec in group_by {
+                if spec.field.is_none() {
+                    continue;
+                }
+                let jv = parts
+                    .get(part_idx)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                row.insert(spec.output_name.clone(), Value::from(jv));
+                part_idx += 1;
             }
             let state_bytes = sonic_rs::to_vec(&state).expect("state json");
             row.insert(
@@ -211,7 +219,7 @@ mod tests {
     /// `GroupState` per key and finalize.
     fn reference_finalized(
         specs: &[AggregateSpec],
-        group_by: &[String],
+        group_by: &[GroupKeySpec],
         docs: &[Vec<u8>],
     ) -> HashMap<String, Vec<Value>> {
         let mut map: HashMap<String, GroupState> = HashMap::new();
@@ -242,7 +250,7 @@ mod tests {
             make_spec("stddev_pop", "v"),
             make_spec("count_distinct", "v"),
         ];
-        let group_by = vec!["g".to_string()];
+        let group_by = vec![GroupKeySpec::column("g")];
 
         // Producer A and B both touch groups "x" and "y" (overlap) and B also
         // adds a group "z" only it sees. A null `v` exercises count(*) vs

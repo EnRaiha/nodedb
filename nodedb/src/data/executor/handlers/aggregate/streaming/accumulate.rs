@@ -15,7 +15,7 @@ use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::accum::GroupState;
 use crate::data::executor::handlers::spill::groupby::GroupBySpiller;
-use nodedb_physical::physical_plan::AggregateSpec;
+use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 use nodedb_query::msgpack_scan;
 
 /// Outer per-group accumulators plus the sub-group accumulators (keyed
@@ -43,7 +43,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn accumulate_groups(
         &mut self,
         docs: &[(String, Vec<u8>)],
-        group_by: &[String],
+        group_by: &[GroupKeySpec],
         aggregates: &[AggregateSpec],
         filters: &[u8],
         sub_group_by: &[String],
@@ -63,6 +63,16 @@ impl CoreLoop {
 
         let use_field_index = filter_predicates.len() + group_by.len() >= 2;
         let need_sub = !sub_group_by.is_empty() && !sub_aggregates.is_empty();
+        // Sub-group keys are still plain column names; lift them to bare-column
+        // specs so the sub-key uses the identical `build_group_key` encoding.
+        let sub_specs: Vec<GroupKeySpec> = if need_sub {
+            sub_group_by
+                .iter()
+                .map(|s| GroupKeySpec::column(s.as_str()))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Spill-to-disk GROUP BY accumulator.
         //
@@ -112,7 +122,7 @@ impl CoreLoop {
                 }
 
                 if need_sub {
-                    let sub_key = msgpack_scan::build_group_key(value, sub_group_by);
+                    let sub_key = msgpack_scan::build_group_key(value, &sub_specs);
                     // Composite key: outer + U+001F + sub.
                     let composite = format!("{outer_key}\x1F{sub_key}");
                     if let Err(e) = spiller.feed(composite, sub_aggregates, value) {

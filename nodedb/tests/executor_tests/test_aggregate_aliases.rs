@@ -2,7 +2,9 @@
 
 use crate::helpers::{make_ctx, payload_value, send_ok};
 use nodedb::bridge::scan_filter::{FilterOp, ScanFilter};
-use nodedb_physical::physical_plan::{AggregateSpec, DocumentOp, PhysicalPlan, QueryOp};
+use nodedb_physical::physical_plan::{
+    AggregateSpec, DocumentOp, GroupKeySpec, PhysicalPlan, QueryOp,
+};
 
 #[test]
 fn aggregate_output_uses_user_alias_but_having_reads_canonical_key() {
@@ -54,7 +56,7 @@ fn aggregate_output_uses_user_alias_but_having_reads_canonical_key() {
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "users".into(),
             input: None,
-            group_by: vec!["department".into()],
+            group_by: vec![GroupKeySpec::column("department")],
             aggregates: vec![
                 AggregateSpec {
                     function: "count".into(),

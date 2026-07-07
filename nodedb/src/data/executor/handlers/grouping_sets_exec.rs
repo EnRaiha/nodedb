@@ -19,7 +19,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::AggregateSpec;
+use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 use nodedb_query::msgpack_scan;
 
 /// Hidden column name carrying the grouping bitmask for `GROUPING()` support.
@@ -115,6 +115,13 @@ pub(super) fn execute_grouping_sets(
         // Grouping bitmask: bit i set means group_by[i] IS present in this set.
         let grouping_id: u64 = set.iter().fold(0u64, |acc, &i| acc | (1u64 << i));
 
+        // Bare-column specs for the active keys, so this set's group key uses
+        // the identical `build_group_key` encoding as the single-set path.
+        let active_specs: Vec<GroupKeySpec> = active_keys
+            .iter()
+            .map(|s| GroupKeySpec::column(s.as_str()))
+            .collect();
+
         // Aggregate over the documents using only active keys and real aggregates.
         let mut groups: HashMap<String, GroupState> = HashMap::new();
 
@@ -135,8 +142,7 @@ pub(super) fn execute_grouping_sets(
                 }
             }
 
-            let active_key_strs: Vec<String> = active_keys.iter().map(|s| (*s).clone()).collect();
-            let group_key = msgpack_scan::build_group_key(raw, &active_key_strs);
+            let group_key = msgpack_scan::build_group_key(raw, &active_specs);
             groups
                 .entry(group_key)
                 .or_insert_with(|| GroupState::new(&real_agg_slice))

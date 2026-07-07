@@ -4,7 +4,7 @@ use crate::helpers::{make_ctx, payload_value, send_ok, send_raw};
 use nodedb::bridge::envelope::{ErrorCode, Status};
 use nodedb::bridge::scan_filter::{FilterOp, ScanFilter};
 use nodedb_physical::physical_plan::{
-    AggregateSpec, ColumnarInsertIntent, ColumnarOp, PhysicalPlan, QueryOp,
+    AggregateSpec, ColumnarInsertIntent, ColumnarOp, GroupKeySpec, PhysicalPlan, QueryOp,
 };
 
 #[test]
@@ -119,7 +119,7 @@ fn columnar_having_uses_canonical_key_but_output_keeps_user_alias() {
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "weather".into(),
             input: None,
-            group_by: vec!["city".into()],
+            group_by: vec![GroupKeySpec::column("city")],
             aggregates: vec![AggregateSpec {
                 function: "count".into(),
                 alias: "count(*)".into(),
@@ -241,7 +241,7 @@ fn aggregate_group_by_does_not_require_full_materialization() {
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "grouped".into(),
             input: None,
-            group_by: vec!["g".into()],
+            group_by: vec![GroupKeySpec::column("g")],
             aggregates: vec![
                 AggregateSpec {
                     function: "count".into(),

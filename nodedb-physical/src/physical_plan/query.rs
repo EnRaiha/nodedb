@@ -2,6 +2,8 @@
 
 //! Query operations (joins, aggregates) dispatched to the Data Plane.
 
+pub use nodedb_query::expr::GroupKeySpec;
+
 /// Aggregate specification for Data Plane aggregate execution.
 #[derive(
     Debug,
@@ -104,7 +106,7 @@ pub enum QueryOp {
         /// read it; the executor simply prefers `input` when present.
         #[serde(default)]
         input: Option<Box<crate::physical_plan::PhysicalPlan>>,
-        group_by: Vec<String>,
+        group_by: Vec<GroupKeySpec>,
         aggregates: Vec<AggregateSpec>,
         filters: Vec<u8>,
         /// HAVING predicates applied post-aggregation.
@@ -160,7 +162,7 @@ pub enum QueryOp {
         /// `collection`. `collection` stays populated either way.
         #[serde(default)]
         input: Option<Box<crate::physical_plan::PhysicalPlan>>,
-        group_by: Vec<String>,
+        group_by: Vec<GroupKeySpec>,
         aggregates: Vec<AggregateSpec>,
         filters: Vec<u8>,
     },

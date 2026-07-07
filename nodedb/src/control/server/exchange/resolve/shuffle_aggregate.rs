@@ -109,14 +109,18 @@ pub async fn resolve_shuffle_aggregate(
             detail: "shuffle aggregate requires a non-empty GROUP BY key list".into(),
         });
     }
+    // Plain column-name view of the group-key specs, used for the Exchange-key
+    // agreement check and the wire requests (which repartition / re-key on the
+    // physical column names, not the full specs).
+    let group_by_fields: Vec<String> = group_by.iter().filter_map(|s| s.field.clone()).collect();
     // `keys` carried by the Exchange mode must agree with the wrapped aggregate's
     // grouping columns (identical by construction at emit). A mismatch is a
     // planner bug, not a runtime condition — surface it loudly.
-    if keys != group_by {
+    if keys != group_by_fields {
         return Err(crate::Error::Internal {
             detail: format!(
                 "shuffle aggregate: Exchange keys {keys:?} do not match wrapped \
-                 Aggregate group_by {group_by:?}"
+                 Aggregate group_by {group_by_fields:?}"
             ),
         });
     }
@@ -230,7 +234,7 @@ pub async fn resolve_shuffle_aggregate(
             side: 0,
             num_parts: num_parts_u32,
             producer_count,
-            keys: group_by.clone(),
+            keys: group_by_fields.clone(),
             part_node_map: part_node_map.clone(),
             plan_bytes: plan_bytes.clone(),
             tenant_id: tenant_id.as_u64(),
@@ -272,7 +276,7 @@ pub async fn resolve_shuffle_aggregate(
         let req = ShuffleAggregateConsumeRequest {
             shuffle_id,
             part: entry.part,
-            group_by: group_by.clone(),
+            group_by: group_by_fields.clone(),
             aggregates_bytes: aggregates_bytes.clone(),
             having: having.clone(),
             // No per-part cap — the global cap is applied at the coordinator (step 8).

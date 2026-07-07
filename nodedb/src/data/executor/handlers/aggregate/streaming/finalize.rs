@@ -14,7 +14,7 @@ use super::super::rows::{apply_user_aliases_to_rows, sort_aggregated_rows};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::accum::GroupState;
-use nodedb_physical::physical_plan::AggregateSpec;
+use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 
 impl CoreLoop {
     /// Finalize consolidated per-group states into an encoded response payload.
@@ -32,7 +32,7 @@ impl CoreLoop {
         &self,
         mut groups: HashMap<String, GroupState>,
         mut sub_groups: HashMap<String, HashMap<String, GroupState>>,
-        group_by: &[String],
+        group_by: &[GroupKeySpec],
         aggregates: &[AggregateSpec],
         having: &[u8],
         limit: usize,
@@ -69,9 +69,19 @@ impl CoreLoop {
             if !group_by.is_empty()
                 && let Ok(parts) = sonic_rs::from_str::<Vec<serde_json::Value>>(&group_key)
             {
-                for (i, field) in group_by.iter().enumerate() {
-                    let val = parts.get(i).cloned().unwrap_or(serde_json::Value::Null);
-                    row.insert(field.clone(), val);
+                // One positional slot per key that contributed to the key bytes
+                // (i.e. has a `field`); emit each under its `output_name`.
+                let mut part_idx = 0usize;
+                for spec in group_by {
+                    if spec.field.is_none() {
+                        continue;
+                    }
+                    let val = parts
+                        .get(part_idx)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    row.insert(spec.output_name.clone(), val);
+                    part_idx += 1;
                 }
             }
 

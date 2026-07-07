@@ -3,7 +3,9 @@
 //! Integration tests for array operators and array aggregate functions.
 
 use nodedb::bridge::scan_filter::ScanFilter;
-use nodedb_physical::physical_plan::{AggregateSpec, DocumentOp, PhysicalPlan, QueryOp};
+use nodedb_physical::physical_plan::{
+    AggregateSpec, DocumentOp, GroupKeySpec, PhysicalPlan, QueryOp,
+};
 
 use crate::helpers::*;
 
@@ -205,7 +207,7 @@ fn array_agg_aggregate() {
         PhysicalPlan::Query(QueryOp::Aggregate {
             collection: "products".into(),
             input: None,
-            group_by: vec!["brand".into()],
+            group_by: vec![GroupKeySpec::column("brand")],
             aggregates: vec![AggregateSpec {
                 function: "array_agg".into(),
                 alias: "array_agg_color".into(),

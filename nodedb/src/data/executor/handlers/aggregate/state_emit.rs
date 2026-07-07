@@ -22,7 +22,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::accum::GroupState;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::AggregateSpec;
+use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 use nodedb_types::Value;
 
 /// The field name carrying a group's serialized partial `GroupState` in a
@@ -41,7 +41,7 @@ impl CoreLoop {
         tid: u64,
         collection: &str,
         input: Option<&nodedb_physical::physical_plan::PhysicalPlan>,
-        group_by: &[String],
+        group_by: &[GroupKeySpec],
         aggregates: &[AggregateSpec],
         filters: &[u8],
     ) -> Response {
@@ -121,7 +121,7 @@ impl CoreLoop {
     /// reconstructs a byte-identical key.
     fn partial_state_rows(
         groups: std::collections::HashMap<String, GroupState>,
-        group_by: &[String],
+        group_by: &[GroupKeySpec],
     ) -> crate::Result<Vec<Value>> {
         let mut rows: Vec<Value> = Vec::with_capacity(groups.len());
         for (group_key, state) in groups {
@@ -133,9 +133,19 @@ impl CoreLoop {
                     sonic_rs::from_str(&group_key).map_err(|e| crate::Error::Codec {
                         detail: format!("partial-state group key decode: {e}"),
                     })?;
-                for (i, field) in group_by.iter().enumerate() {
-                    let jv = parts.get(i).cloned().unwrap_or(serde_json::Value::Null);
-                    map.insert(field.clone(), Value::from(jv));
+                // One positional slot per key that contributed to the key bytes
+                // (i.e. has a `field`); re-emit each under its `output_name`.
+                let mut part_idx = 0usize;
+                for spec in group_by {
+                    if spec.field.is_none() {
+                        continue;
+                    }
+                    let jv = parts
+                        .get(part_idx)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    map.insert(spec.output_name.clone(), Value::from(jv));
+                    part_idx += 1;
                 }
             }
 
