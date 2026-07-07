@@ -165,6 +165,35 @@ pub fn propose_catalog_entry_with_timeout(
         )?;
     }
 
+    // Freeze the descriptor_version / constraint_version /
+    // modification_hlc HERE, at propose time, so the value is computed
+    // exactly once from this node's local catalog (`prior + 1`) and
+    // then replicated verbatim inside the entry. Every node applies the
+    // frozen value without re-deriving it, which makes replay-from-log
+    // on restart and re-delivery during learner catch-up idempotent —
+    // the divergence that a per-node apply-time stamp produced is gone.
+    //
+    // Gated on the same rolling-upgrade flag the apply path used to
+    // gate on: only stamp once every node can activate descriptor
+    // versioning; otherwise leave the entry's sentinel version `0`
+    // (downstream resolvers treat `0` as `1`). Older nodes in a
+    // mixed-version cluster lack the stamp logic, so a stamped value
+    // would not be reproduced symmetrically there.
+    let stamped_owned;
+    let entry: &CatalogEntry = if shared
+        .cluster_version_view()
+        .can_activate_feature(crate::control::rolling_upgrade::DESCRIPTOR_VERSIONING_VERSION)
+    {
+        stamped_owned = catalog_entry::descriptor_stamp::stamp(
+            entry.clone(),
+            &shared.hlc_clock,
+            shared.credentials.catalog(),
+        );
+        &stamped_owned
+    } else {
+        entry
+    };
+
     let payload = catalog_entry::encode(entry)?;
 
     // DDL transaction buffer: if a transactional DDL session is

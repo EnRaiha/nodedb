@@ -217,6 +217,55 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
     }
 }
 
+/// Validate a carried collection descriptor version (frozen at
+/// propose time and replicated verbatim) against this node's local
+/// prior, before the applier persists it. Enforces that a replayed or
+/// re-delivered entry is idempotent and that a real anomaly halts the
+/// apply watermark loudly instead of diverging silently.
+///
+/// - carried `0`: compat mode / unstamped (unit tests) — skipped.
+/// - carried `== prior`: idempotent re-apply / replay of an
+///   already-applied entry — allowed (the write is the same value).
+/// - carried `== prior + 1`: normal new version — allowed.
+/// - carried `< prior` (regression) or `> prior + 1` (gap): a real
+///   anomaly / corruption — returns a loud typed error.
+///
+/// Only the collection `Put*` variants carry a version derived from a
+/// per-descriptor `prior + 1` counter and are validated here; every
+/// other variant is a no-op. Determinism for all stamped variants is
+/// already guaranteed by verbatim application — this check is the
+/// additional guard against a corrupt or reordered collection entry.
+pub fn validate(entry: &CatalogEntry, catalog: &SystemCatalog) -> Result<(), crate::Error> {
+    let (descriptor, carried, prior) = match entry {
+        CatalogEntry::PutCollection(stored) | CatalogEntry::PutCollectionIfAbsent(stored) => {
+            let prior = catalog
+                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten()
+                .map(|c| c.descriptor_version)
+                .unwrap_or(0);
+            (stored.name.clone(), stored.descriptor_version, prior)
+        }
+        _ => return Ok(()),
+    };
+
+    // Sentinel `0` is the pre-stamping / compat-mode marker; downstream
+    // resolvers treat it as `1`. Nothing to validate.
+    if carried == 0 {
+        return Ok(());
+    }
+
+    if carried == prior || carried == prior.saturating_add(1) {
+        return Ok(());
+    }
+
+    Err(crate::Error::DescriptorVersionAnomaly {
+        descriptor,
+        carried,
+        prior,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +331,89 @@ mod tests {
         };
         let stamped = stamp(entry, &clock, catalog);
         assert!(matches!(stamped, CatalogEntry::DeactivateCollection { .. }));
+    }
+
+    fn collection_with_version(name: &str, version: u64) -> CatalogEntry {
+        let mut stored = StoredCollection::new(1, name, "tester");
+        stored.descriptor_version = version;
+        CatalogEntry::PutCollection(Box::new(stored))
+    }
+
+    fn seed_prior(catalog: &SystemCatalog, name: &str, version: u64) {
+        let mut stored = StoredCollection::new(1, name, "tester");
+        stored.descriptor_version = version;
+        catalog
+            .put_collection(DatabaseId::DEFAULT, &stored)
+            .expect("put_collection");
+    }
+
+    #[test]
+    fn validate_allows_create() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        // No prior record (prior = 0), carried = 1 → prior + 1.
+        assert!(validate(&collection_with_version("orders", 1), catalog).is_ok());
+    }
+
+    #[test]
+    fn validate_allows_idempotent_replay() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        seed_prior(catalog, "orders", 3);
+        // Re-delivery / full-log replay: carried == prior.
+        assert!(validate(&collection_with_version("orders", 3), catalog).is_ok());
+    }
+
+    #[test]
+    fn validate_allows_next_version() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        seed_prior(catalog, "orders", 3);
+        assert!(validate(&collection_with_version("orders", 4), catalog).is_ok());
+    }
+
+    #[test]
+    fn validate_skips_sentinel_zero() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        seed_prior(catalog, "orders", 3);
+        // Compat mode / unstamped entry: version 0 is never validated.
+        assert!(validate(&collection_with_version("orders", 0), catalog).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_gap() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        seed_prior(catalog, "orders", 1);
+        // carried = 3 skips version 2 → gap anomaly.
+        let err = validate(&collection_with_version("orders", 3), catalog)
+            .expect_err("gap must be rejected");
+        assert!(matches!(
+            err,
+            crate::Error::DescriptorVersionAnomaly {
+                carried: 3,
+                prior: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_regression() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        seed_prior(catalog, "orders", 5);
+        // carried = 2 < prior = 5 → regression anomaly.
+        let err = validate(&collection_with_version("orders", 2), catalog)
+            .expect_err("regression must be rejected");
+        assert!(matches!(
+            err,
+            crate::Error::DescriptorVersionAnomaly {
+                carried: 2,
+                prior: 5,
+                ..
+            }
+        ));
     }
 }

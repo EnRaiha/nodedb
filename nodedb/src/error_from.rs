@@ -210,6 +210,7 @@ impl From<Error> for NodeDbError {
             Error::Bridge { detail } => NodeDbError::bridge(detail),
             Error::VersionCompat { detail } => NodeDbError::cluster(detail),
             Error::Internal { detail } => NodeDbError::internal(detail),
+            err @ Error::DescriptorVersionAnomaly { .. } => NodeDbError::internal(err.to_string()),
             Error::Promql(e) => NodeDbError::bad_request(e.to_string()),
             Error::DependentObjectsExist {
                 tenant_id: _,

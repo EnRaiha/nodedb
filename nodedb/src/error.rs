@@ -243,6 +243,16 @@ pub enum Error {
     #[error("internal error: {detail}")]
     Internal { detail: String },
 
+    #[error(
+        "descriptor version anomaly for '{descriptor}': replicated version {carried} \
+         is inconsistent with local prior {prior} (expected {prior} or prior+1)"
+    )]
+    DescriptorVersionAnomaly {
+        descriptor: String,
+        carried: u64,
+        prior: u64,
+    },
+
     /// A deterministic typed error code returned by the Data Plane across the
     /// SPSC bridge. Preserves the [`crate::bridge::envelope::ErrorCode`] instead
     /// of flattening it to an opaque string, so Control-Plane callers (e.g. the

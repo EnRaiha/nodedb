@@ -461,7 +461,7 @@ impl MetadataCommitApplier {
             ),
             _ => return Ok(()),
         };
-        let catalog_entry = match catalog_entry::decode(payload) {
+        let stamped = match catalog_entry::decode(payload) {
             Ok(e) => e,
             Err(e) => {
                 // Deterministic poison: a corrupt payload will not decode on
@@ -473,35 +473,21 @@ impl MetadataCommitApplier {
             }
         };
 
-        // Stamp `descriptor_version` + `modification_hlc` for every
-        // `Put*` variant that carries them. Gated on the rolling
-        // upgrade flag — in mixed-version clusters the older nodes
-        // do not have the stamp logic, so we leave the entry's
-        // sentinel `0` / `Hlc::ZERO` in place and let resolvers
-        // treat it as "unknown, always re-fetch". Only the proposing
-        // node's apply path observes the gate; followers run the
-        // same applier and will reach the same conclusion because
-        // every node observes the same live topology (same
-        // `wire_version` on every NodeInfo, replicated via the
-        // gossip path).
-        let stamped = if let Some(weak) = self.shared.get()
-            && let Some(shared) = weak.upgrade()
-        {
-            let compat = !shared.cluster_version_view().can_activate_feature(
-                crate::control::rolling_upgrade::DESCRIPTOR_VERSIONING_VERSION,
-            );
-            if compat {
-                catalog_entry
-            } else {
-                catalog_entry::descriptor_stamp::stamp(catalog_entry, &shared.hlc_clock, catalog)
-            }
-        } else {
-            // Unit tests construct the applier without a SharedState.
-            // They don't care about descriptor versioning — leave
-            // the entry unstamped so existing assertions on
-            // `descriptor_version == 0` still hold.
-            catalog_entry
-        };
+        // Descriptor versions (and the constraint_version /
+        // modification_hlc that travel with them) are frozen at PROPOSE
+        // time and replicated verbatim (see `metadata_proposer`). The
+        // applier persists exactly what the entry carries and never
+        // re-derives from local state, so full-log replay on restart and
+        // re-delivery during learner catch-up write the same frozen
+        // value — idempotent by construction, with no per-node drift.
+        //
+        // Before persisting, validate the carried version against this
+        // node's local prior so a genuine regression or gap surfaces as a
+        // loud typed error (halting the apply watermark for this entry and
+        // forcing Raft re-delivery) rather than silently writing a
+        // divergent value. A version of `0` (compat mode / unit tests) is
+        // skipped by the validator.
+        catalog_entry::descriptor_stamp::validate(&stamped, catalog)?;
 
         debug!(kind = stamped.kind(), "catalog_entry: applying to redb");
         catalog_entry::apply::apply_to(&stamped, catalog);
