@@ -23,6 +23,7 @@ use nodedb_cluster::rpc_codec::{ExecuteRequest, ExecuteResponse, TypedClusterErr
 
 use crate::control::server::exchange::execute_plan_all_local_cores;
 use crate::control::state::SharedState;
+use crate::control::trace_export::EmitSpanParams;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::wire as plan_wire;
 
@@ -52,15 +53,15 @@ impl PlanExecutor for LocalPlanExecutor {
         // Emit one OTLP executor span per leaseholder so the gateway's
         // upstream span joins the N leaseholder spans into a single
         // distributed trace via the shared `trace_id`.
-        exporter.emit(
-            "executor.execute_plan",
+        exporter.emit(EmitSpanParams {
+            span_name: "executor.execute_plan",
             trace_id,
             start,
-            SystemTime::now(),
+            end: SystemTime::now(),
             tenant_id,
-            0,
-            resp.success,
-        );
+            vshard_id: 0,
+            status_ok: resp.success,
+        });
         resp
     }
 
@@ -78,15 +79,15 @@ impl PlanExecutor for LocalPlanExecutor {
             .execute_plan_streaming_inner(req, sink)
             .instrument(span)
             .await;
-        exporter.emit(
-            "executor.execute_plan_streaming",
+        exporter.emit(EmitSpanParams {
+            span_name: "executor.execute_plan_streaming",
             trace_id,
             start,
-            SystemTime::now(),
+            end: SystemTime::now(),
             tenant_id,
-            0,
-            outcome.is_none(),
-        );
+            vshard_id: 0,
+            status_ok: outcome.is_none(),
+        });
         outcome
     }
 }

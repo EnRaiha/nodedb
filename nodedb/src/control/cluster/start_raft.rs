@@ -22,7 +22,9 @@ use crate::control::cluster::handle::ClusterHandle;
 use crate::control::cluster::metadata_applier::MetadataCommitApplier;
 use crate::control::cluster::snapshot_hook::RaftSnapshotQuarantineHook;
 use crate::control::cluster::spsc_applier::SpscCommitApplier;
-use crate::control::cluster::start_raft_helpers::{build_vshard_handler, spawn_vshard_schedulers};
+use crate::control::cluster::start_raft_helpers::{
+    SpawnVshardSchedulersParams, build_vshard_handler, spawn_vshard_schedulers,
+};
 use crate::control::distributed_applier::{
     ProposeTracker, create_distributed_applier, run_apply_loop,
 };
@@ -325,14 +327,14 @@ pub fn start_raft(
     let sequencer_metrics = Arc::clone(&sequencer_service.metrics);
 
     let scheduler_config = SchedulerConfig::default();
-    spawn_vshard_schedulers(
+    spawn_vshard_schedulers(SpawnVshardSchedulersParams {
         handle,
-        &shared,
-        raft_loop_handle.clone(),
-        &sequencer_state_machine,
-        &calvin_read_result_senders,
-        &scheduler_config,
-    )?;
+        shared: &shared,
+        raft_loop_handle: raft_loop_handle.clone(),
+        sequencer_state_machine: &sequencer_state_machine,
+        calvin_read_result_senders: &calvin_read_result_senders,
+        scheduler_config: &scheduler_config,
+    })?;
 
     let running = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(nodedb_cluster::start_cluster_subsystems(

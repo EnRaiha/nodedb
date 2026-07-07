@@ -10,7 +10,9 @@ use nodedb_cluster::wire::VShardEnvelope;
 
 use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
 use crate::control::cluster::calvin::scheduler::read_last_applied_epoch;
-use crate::control::cluster::calvin::{ReadResultEvent, Scheduler, SchedulerConfig};
+use crate::control::cluster::calvin::{
+    ReadResultEvent, Scheduler, SchedulerConfig, SchedulerParams,
+};
 use crate::control::cluster::handle::ClusterHandle;
 use crate::control::state::SharedState;
 
@@ -91,6 +93,17 @@ fn hosted_vshards(routing: &RwLock<nodedb_cluster::RoutingTable>, node_id: u64) 
     vshards
 }
 
+/// Parameters for [`reconcile_vshard_schedulers`].
+struct ReconcileSchedulersParams<'a> {
+    node_id: u64,
+    routing: &'a Arc<RwLock<nodedb_cluster::RoutingTable>>,
+    shared: &'a Arc<SharedState>,
+    raft_loop_handle: &'a Arc<Mutex<nodedb_cluster::multi_raft::MultiRaft>>,
+    sequencer_state_machine: &'a Arc<Mutex<SequencerStateMachine>>,
+    calvin_read_result_senders: &'a ReadResultSenders,
+    scheduler_config: &'a SchedulerConfig,
+}
+
 /// Idempotently ensure a Calvin `Scheduler` is running for every vShard this
 /// node currently hosts.
 ///
@@ -103,16 +116,17 @@ fn hosted_vshards(routing: &RwLock<nodedb_cluster::RoutingTable>, node_id: u64) 
 /// left this node. vShard removal happens via migration / decommission, which
 /// own their own teardown path; wiring scheduler removal into that lifecycle is
 /// tracked as a separate follow-up.
-#[allow(clippy::too_many_arguments)]
-fn reconcile_vshard_schedulers(
-    node_id: u64,
-    routing: &Arc<RwLock<nodedb_cluster::RoutingTable>>,
-    shared: &Arc<SharedState>,
-    raft_loop_handle: &Arc<Mutex<nodedb_cluster::multi_raft::MultiRaft>>,
-    sequencer_state_machine: &Arc<Mutex<SequencerStateMachine>>,
-    calvin_read_result_senders: &ReadResultSenders,
-    scheduler_config: &SchedulerConfig,
-) -> crate::Result<usize> {
+fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::Result<usize> {
+    let ReconcileSchedulersParams {
+        node_id,
+        routing,
+        shared,
+        raft_loop_handle,
+        sequencer_state_machine,
+        calvin_read_result_senders,
+        scheduler_config,
+    } = params;
+
     let mut spawned = 0usize;
     for vshard_id in hosted_vshards(routing, node_id) {
         // Already-served vShards keep their running scheduler untouched.
@@ -139,17 +153,17 @@ fn reconcile_vshard_schedulers(
             .unwrap_or_else(|p| p.into_inner())
             .insert(vshard_id, read_result_tx);
 
-        let scheduler = Scheduler::new(
+        let scheduler = Scheduler::new(SchedulerParams {
             vshard_id,
-            sequenced_rx,
-            Arc::clone(shared),
-            raft_loop_handle.clone(),
+            receiver: sequenced_rx,
+            shared: Arc::clone(shared),
+            multi_raft: raft_loop_handle.clone(),
             last_applied_epoch,
-            last_applied_epoch,
-            scheduler_config.clone(),
-            SchedulerMetrics::new(),
+            rebuild_target_epoch: last_applied_epoch,
+            config: scheduler_config.clone(),
+            metrics: SchedulerMetrics::new(),
             read_result_rx,
-        );
+        });
         let shutdown = shared.shutdown.subscribe();
         tokio::spawn(async move {
             scheduler.run(shutdown).await;
@@ -157,6 +171,16 @@ fn reconcile_vshard_schedulers(
         spawned += 1;
     }
     Ok(spawned)
+}
+
+/// Parameters for [`spawn_vshard_schedulers`].
+pub(super) struct SpawnVshardSchedulersParams<'a> {
+    pub(super) handle: &'a ClusterHandle,
+    pub(super) shared: &'a Arc<SharedState>,
+    pub(super) raft_loop_handle: Arc<Mutex<nodedb_cluster::multi_raft::MultiRaft>>,
+    pub(super) sequencer_state_machine: &'a Arc<Mutex<SequencerStateMachine>>,
+    pub(super) calvin_read_result_senders: &'a ReadResultSenders,
+    pub(super) scheduler_config: &'a SchedulerConfig,
 }
 
 /// Spawn Calvin `Scheduler` tasks for this node's vShards and keep the set in
@@ -174,28 +198,31 @@ fn reconcile_vshard_schedulers(
 /// (covers the bootstrap node, which already sees its membership) and then
 /// spawns a background task that re-reconciles on a short interval until
 /// shutdown. Reconcile is idempotent and add-only.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_vshard_schedulers(
-    handle: &ClusterHandle,
-    shared: &Arc<SharedState>,
-    raft_loop_handle: Arc<Mutex<nodedb_cluster::multi_raft::MultiRaft>>,
-    sequencer_state_machine: &Arc<Mutex<SequencerStateMachine>>,
-    calvin_read_result_senders: &ReadResultSenders,
-    scheduler_config: &SchedulerConfig,
+    params: SpawnVshardSchedulersParams<'_>,
 ) -> crate::Result<()> {
+    let SpawnVshardSchedulersParams {
+        handle,
+        shared,
+        raft_loop_handle,
+        sequencer_state_machine,
+        calvin_read_result_senders,
+        scheduler_config,
+    } = params;
+
     let node_id = handle.node_id;
     let routing = Arc::clone(&handle.routing);
 
     // Initial reconcile: schedulers for vShards this node already knows it hosts.
-    reconcile_vshard_schedulers(
+    reconcile_vshard_schedulers(ReconcileSchedulersParams {
         node_id,
-        &routing,
+        routing: &routing,
         shared,
-        &raft_loop_handle,
+        raft_loop_handle: &raft_loop_handle,
         sequencer_state_machine,
         calvin_read_result_senders,
         scheduler_config,
-    )?;
+    })?;
 
     // Background reconcile: pick up vShards whose membership lands after startup
     // (joiner admission) or shifts later (rebalancing). The routing table has no
@@ -215,15 +242,15 @@ pub(super) fn spawn_vshard_schedulers(
                 biased;
                 _ = shutdown.wait_cancelled() => break,
                 _ = tick.tick() => {
-                    if let Err(e) = reconcile_vshard_schedulers(
+                    if let Err(e) = reconcile_vshard_schedulers(ReconcileSchedulersParams {
                         node_id,
-                        &routing,
-                        &shared_task,
-                        &raft_loop_handle,
-                        &sm_task,
-                        &rr_task,
-                        &cfg_task,
-                    ) {
+                        routing: &routing,
+                        shared: &shared_task,
+                        raft_loop_handle: &raft_loop_handle,
+                        sequencer_state_machine: &sm_task,
+                        calvin_read_result_senders: &rr_task,
+                        scheduler_config: &cfg_task,
+                    }) {
                         tracing::warn!(node_id, error = %e, "calvin scheduler reconcile pass failed");
                     }
                 }

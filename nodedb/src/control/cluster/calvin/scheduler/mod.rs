@@ -6,7 +6,7 @@ pub mod metrics;
 pub mod recovery;
 
 pub use driver::{
-    CalvinReadResultProposal, ReadResultEvent, Scheduler, SchedulerConfig,
+    CalvinReadResultProposal, ReadResultEvent, Scheduler, SchedulerConfig, SchedulerParams,
     propose_calvin_read_result,
 };
 pub use lock_manager::{AcquireOutcome, LockKey, LockManager, TxnId};

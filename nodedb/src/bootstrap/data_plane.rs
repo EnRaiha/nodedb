@@ -12,7 +12,7 @@ use crate::bridge::quiesce::CollectionQuiesce;
 use crate::control::array_catalog::ArrayCatalog;
 use crate::control::metrics::SystemMetrics;
 use crate::data::eventfd::EventFdNotifier;
-use crate::data::runtime::{CoreCompactionConfig, spawn_core};
+use crate::data::runtime::{CoreCompactionConfig, SpawnCoreParams, spawn_core};
 use crate::event::EventProducer;
 use crate::storage::quarantine::QuarantineRegistry;
 
@@ -91,24 +91,24 @@ pub fn spawn_data_plane_cores(
     for (core_id, (data_side, event_producer)) in
         data_sides.into_iter().zip(event_producers).enumerate()
     {
-        let (handle, notifier) = spawn_core(
+        let (handle, notifier) = spawn_core(SpawnCoreParams {
             core_id,
-            data_side.request_rx,
-            data_side.response_tx,
-            &config.server.data_dir,
-            Arc::clone(&wal_records),
-            replay_tombstones.clone(),
+            request_rx: data_side.request_rx,
+            response_tx: data_side.response_tx,
+            data_dir: &config.server.data_dir,
+            wal_records: Arc::clone(&wal_records),
+            tombstones: replay_tombstones.clone(),
             num_cores,
-            compaction_cfg.clone(),
-            Some(Arc::clone(&system_metrics)),
-            Some(event_producer),
-            Arc::clone(&governor),
-            Some(Arc::clone(&quiesce)),
-            Arc::clone(&hlc),
-            Arc::clone(&array_catalog),
-            Arc::clone(&quarantine_registry),
-            Arc::clone(&maintenance_budget),
-        )?;
+            compaction_config: compaction_cfg.clone(),
+            system_metrics: Some(Arc::clone(&system_metrics)),
+            event_producer: Some(event_producer),
+            governor: Arc::clone(&governor),
+            quiesce: Some(Arc::clone(&quiesce)),
+            hlc: Arc::clone(&hlc),
+            array_catalog: Arc::clone(&array_catalog),
+            quarantine_registry: Arc::clone(&quarantine_registry),
+            maintenance_budget: Arc::clone(&maintenance_budget),
+        })?;
         core_handles.push(handle);
         notifiers.push((core_id, notifier));
     }

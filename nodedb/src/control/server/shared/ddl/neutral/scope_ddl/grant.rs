@@ -6,6 +6,7 @@
 use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::scope::grant::ScopeGrantParams;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
@@ -46,15 +47,15 @@ pub fn grant_scope(
 
     state
         .scope_grants
-        .grant(
+        .grant(ScopeGrantParams {
             scope_name,
-            &grantee_type,
+            grantee_type: &grantee_type,
             grantee_id,
-            &identity.username,
+            granted_by: &identity.username,
             expires_at,
             grace_period_secs,
-            &on_expire_action,
-        )
+            on_expire_action: &on_expire_action,
+        })
         .map_err(|e| err("XX000", e.to_string()))?;
 
     state.audit_record(

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use super::grant::{ScopeGrantStore, ScopeStatus};
+use super::grant::{ScopeGrantParams, ScopeGrantStore, ScopeStatus};
 
 /// Spawn the periodic scope expiry check task.
 ///
@@ -142,15 +142,15 @@ fn execute_on_expire(store: &ScopeGrantStore, grant: &super::grant::ScopeGrant) 
 
     if let Some(downgrade_scope) = action.strip_prefix("grant:") {
         // Automatic downgrade: grant a replacement scope.
-        match store.grant(
-            downgrade_scope,
-            &grant.grantee_type,
-            &grant.grantee_id,
-            "system:expiry",
-            0, // Permanent (no expiry on the downgrade).
-            0,
-            "",
-        ) {
+        match store.grant(ScopeGrantParams {
+            scope_name: downgrade_scope,
+            grantee_type: &grant.grantee_type,
+            grantee_id: &grant.grantee_id,
+            granted_by: "system:expiry",
+            expires_at: 0, // Permanent (no expiry on the downgrade).
+            grace_period_secs: 0,
+            on_expire_action: "",
+        }) {
             Ok(_) => {
                 info!(
                     old_scope = %grant.scope_name,
@@ -191,7 +191,15 @@ mod tests {
         let store = ScopeGrantStore::new();
         let past = now_secs() - 100;
         store
-            .grant("pro:all", "org", "acme", "admin", past, 0, "revoke_all")
+            .grant(ScopeGrantParams {
+                scope_name: "pro:all",
+                grantee_type: "org",
+                grantee_id: "acme",
+                granted_by: "admin",
+                expires_at: past,
+                grace_period_secs: 0,
+                on_expire_action: "revoke_all",
+            })
             .unwrap();
 
         // Grant exists but is expired.
@@ -209,15 +217,15 @@ mod tests {
         let store = ScopeGrantStore::new();
         let past = now_secs() - 100;
         store
-            .grant(
-                "pro:all",
-                "org",
-                "acme",
-                "admin",
-                past,
-                0,
-                "grant:free:basic",
-            )
+            .grant(ScopeGrantParams {
+                scope_name: "pro:all",
+                grantee_type: "org",
+                grantee_id: "acme",
+                granted_by: "admin",
+                expires_at: past,
+                grace_period_secs: 0,
+                on_expire_action: "grant:free:basic",
+            })
             .unwrap();
 
         process_expired_grants(&store);
@@ -233,7 +241,15 @@ mod tests {
         // Expired 10s ago but grace is 60s.
         let past = now_secs() - 10;
         store
-            .grant("pro:all", "org", "acme", "admin", past, 60, "revoke_all")
+            .grant(ScopeGrantParams {
+                scope_name: "pro:all",
+                grantee_type: "org",
+                grantee_id: "acme",
+                granted_by: "admin",
+                expires_at: past,
+                grace_period_secs: 60,
+                on_expire_action: "revoke_all",
+            })
             .unwrap();
 
         // In grace period — still effective.

@@ -26,6 +26,7 @@ use tracing::{Instrument, debug, info_span};
 
 use crate::Error;
 use crate::control::state::SharedState;
+use crate::control::trace_export::EmitSpanParams;
 use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 
@@ -105,15 +106,15 @@ impl Gateway {
         // enabled collector correlates this with the executor spans
         // emitted by every leaseholder we dispatched to — they all
         // share the same `trace_id`.
-        self.shared.trace_exporter.emit(
-            "gateway.execute",
-            ctx.trace_id,
+        self.shared.trace_exporter.emit(EmitSpanParams {
+            span_name: "gateway.execute",
+            trace_id: ctx.trace_id,
             start,
-            SystemTime::now(),
-            ctx.tenant_id.as_u64(),
-            0,
-            result.is_ok(),
-        );
+            end: SystemTime::now(),
+            tenant_id: ctx.tenant_id.as_u64(),
+            vshard_id: 0,
+            status_ok: result.is_ok(),
+        });
 
         // Advance per-tenant observed write-HLC high-water on any
         // successful cluster dispatch (local or remote). Used by

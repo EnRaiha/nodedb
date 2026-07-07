@@ -39,4 +39,4 @@ pub mod scheduler;
 mod tests;
 
 pub use propose::{CalvinReadResultProposal, propose_calvin_read_result};
-pub use scheduler::Scheduler;
+pub use scheduler::{Scheduler, SchedulerParams};

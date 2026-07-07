@@ -89,20 +89,34 @@ pub struct Scheduler {
         mpsc::Sender<CompletionItem>,
 }
 
+/// Parameters for [`Scheduler::new`].
+pub struct SchedulerParams {
+    pub vshard_id: u32,
+    pub receiver: mpsc::Receiver<SequencedTxn>,
+    pub shared: Arc<SharedState>,
+    pub multi_raft: Arc<Mutex<MultiRaft>>,
+    pub last_applied_epoch: u64,
+    pub rebuild_target_epoch: u64,
+    pub config: SchedulerConfig,
+    pub metrics: Arc<SchedulerMetrics>,
+    pub read_result_rx: mpsc::Receiver<ReadResultEvent>,
+}
+
 impl Scheduler {
     /// Construct a scheduler.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        vshard_id: u32,
-        receiver: mpsc::Receiver<SequencedTxn>,
-        shared: Arc<SharedState>,
-        multi_raft: Arc<Mutex<MultiRaft>>,
-        last_applied_epoch: u64,
-        rebuild_target_epoch: u64,
-        config: SchedulerConfig,
-        metrics: Arc<SchedulerMetrics>,
-        read_result_rx: mpsc::Receiver<ReadResultEvent>,
-    ) -> Self {
+    pub fn new(params: SchedulerParams) -> Self {
+        let SchedulerParams {
+            vshard_id,
+            receiver,
+            shared,
+            multi_raft,
+            last_applied_epoch,
+            rebuild_target_epoch,
+            config,
+            metrics,
+            read_result_rx,
+        } = params;
+
         // Capacity: at most one completion per inflight txn. Use the incoming
         // channel capacity as a proxy for the max concurrent pending count.
         let completion_cap = config.channel_capacity;

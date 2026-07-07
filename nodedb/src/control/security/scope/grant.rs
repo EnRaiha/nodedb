@@ -107,6 +107,20 @@ pub struct ScopeGrantStore {
     catalog: Option<SystemCatalog>,
 }
 
+/// Parameters for [`ScopeGrantStore::grant`].
+pub struct ScopeGrantParams<'a> {
+    pub scope_name: &'a str,
+    pub grantee_type: &'a str,
+    pub grantee_id: &'a str,
+    pub granted_by: &'a str,
+    /// 0 means permanent (no expiry).
+    pub expires_at: u64,
+    /// Seconds after expiry before hard cutoff.
+    pub grace_period_secs: u64,
+    /// "revoke_all", "grant:<scope>", or "" (just expire).
+    pub on_expire_action: &'a str,
+}
+
 impl ScopeGrantStore {
     pub fn new() -> Self {
         Self {
@@ -132,21 +146,17 @@ impl ScopeGrantStore {
     }
 
     /// Grant a scope to a user, role, org, or team.
-    ///
-    /// `expires_at` = 0 means permanent (no expiry).
-    /// `grace_period_secs` = seconds after expiry before hard cutoff.
-    /// `on_expire_action` = "revoke_all", "grant:<scope>", or "" (just expire).
-    #[allow(clippy::too_many_arguments)]
-    pub fn grant(
-        &self,
-        scope_name: &str,
-        grantee_type: &str,
-        grantee_id: &str,
-        granted_by: &str,
-        expires_at: u64,
-        grace_period_secs: u64,
-        on_expire_action: &str,
-    ) -> crate::Result<()> {
+    pub fn grant(&self, params: ScopeGrantParams<'_>) -> crate::Result<()> {
+        let ScopeGrantParams {
+            scope_name,
+            grantee_type,
+            grantee_id,
+            granted_by,
+            expires_at,
+            grace_period_secs,
+            on_expire_action,
+        } = params;
+
         let record = ScopeGrant {
             scope_name: scope_name.into(),
             grantee_type: grantee_type.into(),
@@ -322,7 +332,15 @@ mod tests {
     fn grant_and_check() {
         let store = ScopeGrantStore::new();
         store
-            .grant("profile:read", "user", "u1", "admin", 0, 0, "")
+            .grant(ScopeGrantParams {
+                scope_name: "profile:read",
+                grantee_type: "user",
+                grantee_id: "u1",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
             .unwrap();
 
         assert!(store.has_scope("u1", &[], "profile:read"));
@@ -334,7 +352,15 @@ mod tests {
     fn org_scope_inheritance() {
         let store = ScopeGrantStore::new();
         store
-            .grant("pro:all", "org", "acme", "admin", 0, 0, "")
+            .grant(ScopeGrantParams {
+                scope_name: "pro:all",
+                grantee_type: "org",
+                grantee_id: "acme",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
             .unwrap();
 
         // User u1 is member of acme → inherits pro:all.
@@ -347,13 +373,37 @@ mod tests {
     fn effective_scopes_union() {
         let store = ScopeGrantStore::new();
         store
-            .grant("scope_a", "user", "u1", "admin", 0, 0, "")
+            .grant(ScopeGrantParams {
+                scope_name: "scope_a",
+                grantee_type: "user",
+                grantee_id: "u1",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
             .unwrap();
         store
-            .grant("scope_b", "org", "acme", "admin", 0, 0, "")
+            .grant(ScopeGrantParams {
+                scope_name: "scope_b",
+                grantee_type: "org",
+                grantee_id: "acme",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
             .unwrap();
         store
-            .grant("scope_c", "org", "beta", "admin", 0, 0, "")
+            .grant(ScopeGrantParams {
+                scope_name: "scope_c",
+                grantee_type: "org",
+                grantee_id: "beta",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
             .unwrap();
 
         let effective = store.effective_scopes("u1", &["acme".into()]);
@@ -365,7 +415,17 @@ mod tests {
     #[test]
     fn revoke_removes_grant() {
         let store = ScopeGrantStore::new();
-        store.grant("s1", "user", "u1", "admin", 0, 0, "").unwrap();
+        store
+            .grant(ScopeGrantParams {
+                scope_name: "s1",
+                grantee_type: "user",
+                grantee_id: "u1",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
+            .unwrap();
         assert!(store.has_scope("u1", &[], "s1"));
 
         store.revoke("s1", "user", "u1").unwrap();

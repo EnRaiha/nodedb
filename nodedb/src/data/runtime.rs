@@ -29,6 +29,7 @@ use tracing::{error, info, warn};
 
 use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
 use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
+use crate::data::core_health::{CoreHealthWatchdog, MAX_CONSECUTIVE_PANICS, PANIC_WINDOW_SECS};
 use crate::data::eventfd::{EventFd, EventFdNotifier};
 use crate::data::executor::core_loop::CoreLoop;
 
@@ -40,107 +41,6 @@ use nodedb_bridge::buffer::{Consumer, Producer};
 /// (e.g., deferred retry polling, metrics flush).
 const IDLE_POLL_TIMEOUT_MS: i32 = 100;
 
-/// Maximum consecutive panics before the core enters degraded mode.
-///
-/// Degraded mode drains and rejects all incoming requests with
-/// `ErrorCode::CoreDegraded` instead of executing them. This prevents
-/// a poison-pill request from hot-looping through catch_unwind.
-const MAX_CONSECUTIVE_PANICS: u32 = 3;
-
-/// Window in which consecutive panics are counted. If more than
-/// `MAX_CONSECUTIVE_PANICS` occur within this window, the core degrades.
-/// Panics separated by more than this duration reset the counter.
-const PANIC_WINDOW_SECS: u64 = 60;
-
-/// How long a degraded core stays in degraded mode before attempting
-/// recovery. After this cool-down, the core resets its panic counter
-/// and resumes accepting requests. If the poison-pill request is still
-/// in the queue, it will panic again and re-enter degraded mode — but
-/// by then the offending request has been drained and rejected.
-const DEGRADED_COOLDOWN_SECS: u64 = 30;
-
-/// Tracks core health across panics for the watchdog.
-struct CoreHealthWatchdog {
-    /// Number of panics in the current window.
-    consecutive_panics: u32,
-    /// Timestamp of the first panic in the current window.
-    window_start: Option<Instant>,
-    /// Whether this core has been marked degraded.
-    degraded: bool,
-    /// When the core entered degraded mode (for cool-down recovery).
-    degraded_at: Option<Instant>,
-}
-
-impl CoreHealthWatchdog {
-    fn new() -> Self {
-        Self {
-            consecutive_panics: 0,
-            window_start: None,
-            degraded: false,
-            degraded_at: None,
-        }
-    }
-
-    /// Record a panic. Returns `true` if the core should enter degraded mode.
-    fn record_panic(&mut self) -> bool {
-        let now = Instant::now();
-
-        // Reset window if the previous panic was outside the window.
-        if let Some(start) = self.window_start {
-            if now.duration_since(start).as_secs() > PANIC_WINDOW_SECS {
-                self.consecutive_panics = 0;
-                self.window_start = Some(now);
-            }
-        } else {
-            self.window_start = Some(now);
-        }
-
-        self.consecutive_panics += 1;
-
-        if self.consecutive_panics >= MAX_CONSECUTIVE_PANICS {
-            self.degraded = true;
-            self.degraded_at = Some(Instant::now());
-        }
-
-        self.degraded
-    }
-
-    /// Record a successful tick (no panic). Resets the consecutive counter.
-    fn record_success(&mut self) {
-        if self.consecutive_panics > 0 {
-            self.consecutive_panics = 0;
-            self.window_start = None;
-        }
-    }
-
-    /// Check if the core is degraded. If the cool-down period has elapsed,
-    /// auto-recover: reset panic counters and exit degraded mode.
-    fn is_degraded(&mut self) -> bool {
-        if self.degraded
-            && let Some(degraded_at) = self.degraded_at
-            && degraded_at.elapsed().as_secs() >= DEGRADED_COOLDOWN_SECS
-        {
-            info!(
-                cooldown_secs = DEGRADED_COOLDOWN_SECS,
-                "core recovered from degraded mode after cool-down"
-            );
-            self.degraded = false;
-            self.degraded_at = None;
-            self.consecutive_panics = 0;
-            self.window_start = None;
-            return false;
-        }
-        self.degraded
-    }
-}
-
-/// Spawn a Data Plane core on a dedicated OS thread with TPC isolation.
-///
-/// Returns the `JoinHandle` and the `EventFdNotifier` that the Control Plane
-/// uses to wake this core after pushing a request into the SPSC queue.
-///
-/// If `wal_records` is non-empty, the core replays vector WAL records
-/// during startup (before entering the event loop) to rebuild HNSW indexes.
 /// Compaction configuration passed to each Data Plane core.
 #[derive(Debug, Clone)]
 pub struct CoreCompactionConfig {
@@ -165,25 +65,55 @@ impl Default for CoreCompactionConfig {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Parameters for [`spawn_core`].
+pub struct SpawnCoreParams<'a> {
+    pub core_id: usize,
+    pub request_rx: Consumer<BridgeRequest>,
+    pub response_tx: Producer<BridgeResponse>,
+    pub data_dir: &'a Path,
+    pub wal_records: Arc<[nodedb_wal::WalRecord]>,
+    pub tombstones: nodedb_wal::TombstoneSet,
+    pub num_cores: usize,
+    pub compaction_config: CoreCompactionConfig,
+    pub system_metrics: Option<Arc<crate::control::metrics::SystemMetrics>>,
+    pub event_producer: Option<crate::event::bus::EventProducer>,
+    pub governor: Arc<nodedb_mem::MemoryGovernor>,
+    pub quiesce: Option<Arc<crate::bridge::quiesce::CollectionQuiesce>>,
+    pub hlc: Arc<nodedb_types::OrdinalClock>,
+    pub array_catalog: crate::control::array_catalog::ArrayCatalogHandle,
+    pub quarantine_registry: Arc<crate::storage::quarantine::QuarantineRegistry>,
+    pub maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
+}
+
+/// Spawn a Data Plane core on a dedicated OS thread with TPC isolation.
+///
+/// Returns the `JoinHandle` and the `EventFdNotifier` that the Control Plane
+/// uses to wake this core after pushing a request into the SPSC queue.
+///
+/// If `wal_records` is non-empty, the core replays vector WAL records
+/// during startup (before entering the event loop) to rebuild HNSW indexes.
 pub fn spawn_core(
-    core_id: usize,
-    request_rx: Consumer<BridgeRequest>,
-    response_tx: Producer<BridgeResponse>,
-    data_dir: &Path,
-    wal_records: Arc<[nodedb_wal::WalRecord]>,
-    tombstones: nodedb_wal::TombstoneSet,
-    num_cores: usize,
-    compaction_config: CoreCompactionConfig,
-    system_metrics: Option<Arc<crate::control::metrics::SystemMetrics>>,
-    event_producer: Option<crate::event::bus::EventProducer>,
-    governor: Arc<nodedb_mem::MemoryGovernor>,
-    quiesce: Option<Arc<crate::bridge::quiesce::CollectionQuiesce>>,
-    hlc: Arc<nodedb_types::OrdinalClock>,
-    array_catalog: crate::control::array_catalog::ArrayCatalogHandle,
-    quarantine_registry: Arc<crate::storage::quarantine::QuarantineRegistry>,
-    maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
+    params: SpawnCoreParams<'_>,
 ) -> std::io::Result<(JoinHandle<()>, EventFdNotifier)> {
+    let SpawnCoreParams {
+        core_id,
+        request_rx,
+        response_tx,
+        data_dir,
+        wal_records,
+        tombstones,
+        num_cores,
+        compaction_config,
+        system_metrics,
+        event_producer,
+        governor,
+        quiesce,
+        hlc,
+        array_catalog,
+        quarantine_registry,
+        maintenance_budget,
+    } = params;
+
     let data_dir = data_dir.to_path_buf();
 
     // Create eventfd and extract notifier before moving EventFd to core thread.

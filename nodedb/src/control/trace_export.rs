@@ -54,6 +54,18 @@ pub enum TraceExporterError {
     ClientBuild(#[from] reqwest::Error),
 }
 
+/// Parameters for [`TraceExporter::emit`].
+#[derive(Debug, Clone, Copy)]
+pub struct EmitSpanParams {
+    pub span_name: &'static str,
+    pub trace_id: nodedb_types::TraceId,
+    pub start: SystemTime,
+    pub end: SystemTime,
+    pub tenant_id: u64,
+    pub vshard_id: u32,
+    pub status_ok: bool,
+}
+
 impl TraceExporter {
     /// Construct an exporter that pushes to `endpoint`
     /// (e.g. `http://collector:4318`). Fails if the underlying
@@ -100,18 +112,17 @@ impl TraceExporter {
     /// `trace_id` must be the id carried on `ExecuteRequest` so the
     /// gateway span and every executor span join up into one OTLP
     /// trace.
-    ///
-    #[allow(clippy::too_many_arguments)]
-    pub fn emit(
-        self: &Arc<Self>,
-        span_name: &'static str,
-        trace_id: nodedb_types::TraceId,
-        start: SystemTime,
-        end: SystemTime,
-        tenant_id: u64,
-        vshard_id: u32,
-        status_ok: bool,
-    ) {
+    pub fn emit(self: &Arc<Self>, params: EmitSpanParams) {
+        let EmitSpanParams {
+            span_name,
+            trace_id,
+            start,
+            end,
+            tenant_id,
+            vshard_id,
+            status_ok,
+        } = params;
+
         if !self.is_enabled() {
             return;
         }
@@ -160,7 +171,15 @@ mod tests {
         let now = SystemTime::now();
         // emit on disabled exporter must not panic — the internal
         // spawn path is guarded behind the is_enabled check.
-        exp.emit("noop", nodedb_types::TraceId::ZERO, now, now, 0, 0, true);
+        exp.emit(EmitSpanParams {
+            span_name: "noop",
+            trace_id: nodedb_types::TraceId::ZERO,
+            start: now,
+            end: now,
+            tenant_id: 0,
+            vshard_id: 0,
+            status_ok: true,
+        });
     }
 
     #[test]
