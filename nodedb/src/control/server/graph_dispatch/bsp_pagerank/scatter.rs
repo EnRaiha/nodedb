@@ -17,7 +17,7 @@ use futures::future::join_all;
 use crate::bridge::envelope::{Payload, PhysicalPlan};
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::server::graph_dispatch::cluster_resolve::{
-    dispatch_superstep_to_node, gateway_shared,
+    DispatchSuperstepParams, dispatch_superstep_to_node, gateway_shared,
 };
 use crate::types::{DatabaseId, TenantId};
 use nodedb_graph::{AlgoParams, GraphAlgorithm};
@@ -56,21 +56,35 @@ pub(super) struct ShardResult {
     pub(super) result: BspSuperstepResult,
 }
 
+/// Parameters for [`scatter_superstep`].
+pub(super) struct ScatterSuperstepParams<'a> {
+    pub(super) tenant_id: TenantId,
+    pub(super) database_id: DatabaseId,
+    pub(super) algorithm: GraphAlgorithm,
+    pub(super) params: &'a AlgoParams,
+    pub(super) superstep: u32,
+    pub(super) global_n: usize,
+    pub(super) dispatches: Vec<ShardDispatch>,
+    pub(super) deadline_ms: u64,
+}
+
 /// Dispatch one `BspSuperstep` to every owner node concurrently and decode each
 /// node's [`BspSuperstepResult`]. `global_n == 0` is the count-only phase
 /// (handler short-circuits after counting owned nodes).
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn scatter_superstep(
     state: &crate::control::state::SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    algorithm: GraphAlgorithm,
-    params: &AlgoParams,
-    superstep: u32,
-    global_n: usize,
-    dispatches: Vec<ShardDispatch>,
-    deadline_ms: u64,
+    args: ScatterSuperstepParams<'_>,
 ) -> crate::Result<Vec<ShardResult>> {
+    let ScatterSuperstepParams {
+        tenant_id,
+        database_id,
+        algorithm,
+        params,
+        superstep,
+        global_n,
+        dispatches,
+        deadline_ms,
+    } = args;
     let shared_arc = gateway_shared(state)?;
     let version_set = GatewayVersionSet::from_pairs(Vec::new());
 
@@ -96,14 +110,16 @@ pub(super) async fn scatter_superstep(
         Box::pin(async move {
             let payload = dispatch_superstep_to_node(
                 shared_arc,
-                tenant_id,
-                database_id,
-                deadline_ms,
-                node_id,
-                is_local,
-                route_vshard,
-                plan,
-                &version_set,
+                DispatchSuperstepParams {
+                    tenant_id,
+                    database_id,
+                    deadline_ms,
+                    node_id,
+                    is_local,
+                    route_vshard,
+                    plan,
+                    version_set: &version_set,
+                },
             )
             .await?;
             let result = decode_single_result_from_payload(node_id, payload)?;

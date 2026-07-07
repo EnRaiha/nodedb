@@ -100,13 +100,15 @@ pub async fn traverse(
     // `cross_core_bfs_with_options` directly.
     match crate::control::server::graph_dispatch::cross_core_traverse_subgraph(
         state,
-        tenant_id,
-        database_id,
-        start,
-        edge_label,
-        dir,
-        depth,
-        &GraphTraversalOptions::default(),
+        crate::control::server::graph_dispatch::CrossCoreTraverseSubgraphParams {
+            tenant_id,
+            database_id,
+            start,
+            edge_label,
+            direction: dir,
+            max_depth: depth,
+            options: &GraphTraversalOptions::default(),
+        },
     )
     .await
     {

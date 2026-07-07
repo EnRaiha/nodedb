@@ -49,6 +49,18 @@ pub(super) fn resolve_for_vshard(state: &SharedState, vshard_id: u32) -> RouteDe
     )
 }
 
+/// Parameters for [`dispatch_superstep_to_node`].
+pub(in crate::control::server::graph_dispatch) struct DispatchSuperstepParams<'a> {
+    pub(in crate::control::server::graph_dispatch) tenant_id: TenantId,
+    pub(in crate::control::server::graph_dispatch) database_id: DatabaseId,
+    pub(in crate::control::server::graph_dispatch) deadline_ms: u64,
+    pub(in crate::control::server::graph_dispatch) node_id: u64,
+    pub(in crate::control::server::graph_dispatch) is_local: bool,
+    pub(in crate::control::server::graph_dispatch) route_vshard: u32,
+    pub(in crate::control::server::graph_dispatch) plan: PhysicalPlan,
+    pub(in crate::control::server::graph_dispatch) version_set: &'a GatewayVersionSet,
+}
+
 /// Dispatch a single already-built graph-superstep `plan` to one owner node and
 /// return its node-level payload. The LOCAL node fans the plan across all its
 /// Data-Plane cores via `execute_plan_all_local_cores` (per-core results merged
@@ -56,18 +68,20 @@ pub(super) fn resolve_for_vshard(state: &SharedState, vshard_id: u32) -> RouteDe
 /// `dispatch_route`. An empty payload denotes a zero-vertex shard — the caller's
 /// decoder maps it to its result type's `::default()`. Shared by the PageRank and
 /// WCC per-node scatter paths.
-#[allow(clippy::too_many_arguments)]
 pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_node(
     shared_arc: &Arc<SharedState>,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    deadline_ms: u64,
-    node_id: u64,
-    is_local: bool,
-    route_vshard: u32,
-    plan: PhysicalPlan,
-    version_set: &GatewayVersionSet,
+    args: DispatchSuperstepParams<'_>,
 ) -> crate::Result<Payload> {
+    let DispatchSuperstepParams {
+        tenant_id,
+        database_id,
+        deadline_ms,
+        node_id,
+        is_local,
+        route_vshard,
+        plan,
+        version_set,
+    } = args;
     if is_local {
         // Local node: fan across ALL local cores and merge. The per-core
         // owned-node sets are disjoint, so the merged result is correct without

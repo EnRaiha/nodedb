@@ -18,7 +18,7 @@ use crate::bridge::envelope::{Payload, PhysicalPlan};
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::server::graph_dispatch::bsp_pagerank::enumerate::ShardTarget;
 use crate::control::server::graph_dispatch::cluster_resolve::{
-    dispatch_superstep_to_node, gateway_shared,
+    DispatchSuperstepParams, dispatch_superstep_to_node, gateway_shared,
 };
 use crate::types::{DatabaseId, TenantId};
 use nodedb_graph::AlgoParams;
@@ -60,14 +60,16 @@ pub(super) async fn scatter_wcc_round(
         Box::pin(async move {
             let payload = dispatch_superstep_to_node(
                 &shared_arc,
-                tenant_id,
-                database_id,
-                deadline_ms,
-                node_id,
-                is_local,
-                route_vshard,
-                plan,
-                &version_set,
+                DispatchSuperstepParams {
+                    tenant_id,
+                    database_id,
+                    deadline_ms,
+                    node_id,
+                    is_local,
+                    route_vshard,
+                    plan,
+                    version_set: &version_set,
+                },
             )
             .await?;
             let result = decode_wcc_from_payload(node_id, payload)?;

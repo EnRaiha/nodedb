@@ -15,7 +15,7 @@ pub mod receiver;
 
 pub use aggregator_hook::RegistryShuffleAggregator;
 pub use consumer_hook::RegistryShuffleConsumer;
-pub use fanout::ShuffleFanoutSink;
+pub use fanout::{ShuffleFanoutSink, ShuffleFanoutSinkParams};
 pub use inbox::{ShuffleInbox, ShuffleKey, ShuffleReceiverRegistry};
 pub use producer::send_shuffle_push;
 pub use producer_hook::RegistryShuffleProducer;

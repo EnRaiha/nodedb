@@ -80,6 +80,17 @@ pub struct ShuffleFanoutSink {
     parts: HashMap<u32, PartState>,
 }
 
+/// Parameters for [`ShuffleFanoutSink::new`].
+pub struct ShuffleFanoutSinkParams<'a> {
+    pub self_node_id: u64,
+    pub shuffle_id: u64,
+    pub side: u8,
+    pub num_parts: u32,
+    pub producer_count: u32,
+    pub keys: Vec<String>,
+    pub part_node_map: &'a [(u32, u64)],
+}
+
 impl ShuffleFanoutSink {
     /// Build a sink for one `(shuffle_id, side)` produce.
     ///
@@ -87,18 +98,20 @@ impl ShuffleFanoutSink {
     /// `self_node_id` are wired for loopback; all others open a QUIC push stream
     /// lazily on first use. Every part in `0..num_parts` is materialized up front
     /// so `finish` can `End` it even if it received zero rows.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         transport: Arc<NexarTransport>,
         registry: Arc<ShuffleReceiverRegistry>,
-        self_node_id: u64,
-        shuffle_id: u64,
-        side: u8,
-        num_parts: u32,
-        producer_count: u32,
-        keys: Vec<String>,
-        part_node_map: &[(u32, u64)],
+        params: ShuffleFanoutSinkParams<'_>,
     ) -> Self {
+        let ShuffleFanoutSinkParams {
+            self_node_id,
+            shuffle_id,
+            side,
+            num_parts,
+            producer_count,
+            keys,
+            part_node_map,
+        } = params;
         let owner: HashMap<u32, u64> = part_node_map.iter().copied().collect();
         let mut parts = HashMap::with_capacity(num_parts as usize);
         for part in 0..num_parts {

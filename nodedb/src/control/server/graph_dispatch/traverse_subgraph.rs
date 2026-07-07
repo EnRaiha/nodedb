@@ -57,6 +57,17 @@ struct WireSubGraph<'a> {
     edges: Vec<WireEdge<'a>>,
 }
 
+/// Parameters for [`cross_core_traverse_subgraph`].
+pub struct CrossCoreTraverseSubgraphParams<'a> {
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub start: String,
+    pub edge_label: Option<String>,
+    pub direction: Direction,
+    pub max_depth: usize,
+    pub options: &'a GraphTraversalOptions,
+}
+
 /// BFS that returns a `{nodes,edges}` JSON subgraph for `GRAPH TRAVERSE`.
 ///
 /// Each hop expands every frontier node at the node that owns
@@ -66,17 +77,19 @@ struct WireSubGraph<'a> {
 ///   * each `(src, label, dst)` edge the hop crossed where `src` is in the
 ///     current frontier — fully attributed for BOTH the local-shard and
 ///     remote-shard portions of the frontier.
-#[allow(clippy::too_many_arguments)]
 pub async fn cross_core_traverse_subgraph(
     shared: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    start: String,
-    edge_label: Option<String>,
-    direction: Direction,
-    max_depth: usize,
-    options: &GraphTraversalOptions,
+    params: CrossCoreTraverseSubgraphParams<'_>,
 ) -> crate::Result<Response> {
+    let CrossCoreTraverseSubgraphParams {
+        tenant_id,
+        database_id,
+        start,
+        edge_label,
+        direction,
+        max_depth,
+        options,
+    } = params;
     // Per-node depth: the start node is at depth 0; subsequent nodes
     // are tagged with the hop index that first surfaced them.
     let mut depth_of: HashMap<String, u8> = HashMap::new();

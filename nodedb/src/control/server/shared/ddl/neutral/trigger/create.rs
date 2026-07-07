@@ -18,25 +18,45 @@ use crate::control::state::SharedState;
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
 
+/// Parsed `CREATE TRIGGER` request — fields extracted by the nodedb-sql parser.
+#[derive(Clone, Copy)]
+pub struct CreateTriggerRequest<'a> {
+    pub or_replace: bool,
+    pub execution_mode: &'a str,
+    pub name: &'a str,
+    pub timing: &'a str,
+    pub events_insert: bool,
+    pub events_update: bool,
+    pub events_delete: bool,
+    pub collection: &'a str,
+    pub granularity: &'a str,
+    pub when_condition: Option<&'a str>,
+    pub priority: i32,
+    pub security: &'a str,
+    pub body_sql: &'a str,
+}
+
 /// Handle `CREATE [OR REPLACE] TRIGGER ...` from typed AST fields.
-#[allow(clippy::too_many_arguments)]
 pub fn create_trigger(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    or_replace: bool,
-    execution_mode: &str,
-    name: &str,
-    timing: &str,
-    events_insert: bool,
-    events_update: bool,
-    events_delete: bool,
-    collection: &str,
-    granularity: &str,
-    when_condition: Option<&str>,
-    priority: i32,
-    security: &str,
-    body_sql: &str,
+    req: CreateTriggerRequest<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    let CreateTriggerRequest {
+        or_replace,
+        execution_mode,
+        name,
+        timing,
+        events_insert,
+        events_update,
+        events_delete,
+        collection,
+        granularity,
+        when_condition,
+        priority,
+        security,
+        body_sql,
+    } = req;
     require_tenant_admin(identity, "create triggers")?;
 
     let tenant_id = identity.tenant_id.as_u64();

@@ -87,6 +87,17 @@ pub async fn dispatch_route(
     }
 }
 
+/// Parameters for [`dispatch_route_stream`].
+pub struct DispatchRouteStreamParams<'a> {
+    pub route: TaskRoute,
+    pub shared: &'a Arc<SharedState>,
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub trace_id: TraceId,
+    pub deadline_ms: u64,
+    pub version_set: &'a GatewayVersionSet,
+}
+
 /// Streaming sibling of [`dispatch_route`]: dispatch a single route and return
 /// a [`ResultStream`] of row batches.
 ///
@@ -96,16 +107,18 @@ pub async fn dispatch_route(
 /// - `Remote` → [`dispatch_remote_stream`] (eager first frame + retry split).
 /// - `Broadcast` → unreachable (router splits broadcasts before dispatch).
 /// - `LeaderUnknown` → `NotLeader` so the gateway retry loop re-resolves.
-#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_route_stream(
-    route: TaskRoute,
-    shared: &Arc<SharedState>,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    trace_id: TraceId,
-    deadline_ms: u64,
-    version_set: &GatewayVersionSet,
+    args: DispatchRouteStreamParams<'_>,
 ) -> Result<ResultStream, Error> {
+    let DispatchRouteStreamParams {
+        route,
+        shared,
+        tenant_id,
+        database_id,
+        trace_id,
+        deadline_ms,
+        version_set,
+    } = args;
     match route.decision {
         // Cluster gateway route dispatch: no session-transaction context
         // crosses this boundary yet, so `None`. TRACKED: cross-node

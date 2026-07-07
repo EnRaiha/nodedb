@@ -29,7 +29,7 @@ pub mod match_scatter;
 pub mod shortest_path;
 pub mod traverse_subgraph;
 
-pub use bfs::cross_core_bfs_with_options;
+pub use bfs::{CrossCoreBfsParams, cross_core_bfs_with_options};
 pub use bsp_pagerank::run_bsp_pagerank;
 pub use bsp_wcc::run_bsp_wcc;
 pub use match_broadcast::{
@@ -37,4 +37,4 @@ pub use match_broadcast::{
 };
 pub use match_scatter::{MatchScatterOutcome, scatter_match};
 pub use shortest_path::cross_core_shortest_path;
-pub use traverse_subgraph::cross_core_traverse_subgraph;
+pub use traverse_subgraph::{CrossCoreTraverseSubgraphParams, cross_core_traverse_subgraph};

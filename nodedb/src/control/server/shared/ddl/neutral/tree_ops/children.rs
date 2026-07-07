@@ -44,13 +44,15 @@ pub async fn tree_children(
     let dir = crate::engine::graph::edge_store::Direction::Out;
     let bfs_result = crate::control::server::graph_dispatch::cross_core_bfs_with_options(
         state,
-        tenant_id,
-        database_id,
-        vec![root_id],
-        Some(graph_index),
-        dir,
-        max_depth,
-        &GraphTraversalOptions::default(),
+        crate::control::server::graph_dispatch::CrossCoreBfsParams {
+            tenant_id,
+            database_id,
+            start_nodes: vec![root_id],
+            edge_label: Some(graph_index),
+            direction: dir,
+            max_depth,
+            options: &GraphTraversalOptions::default(),
+        },
     )
     .await
     .map_err(|e| ddl_err("XX000", format!("BFS failed: {e}")))?;

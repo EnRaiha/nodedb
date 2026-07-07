@@ -21,21 +21,34 @@ use crate::types::{DatabaseId, TenantId};
 use super::helpers::{encode_path, ok_response};
 use super::hop::{NeighborHopParams, execute_neighbor_hop};
 
+/// Parameters for [`cross_core_bfs_with_options`].
+pub struct CrossCoreBfsParams<'a> {
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub start_nodes: Vec<String>,
+    pub edge_label: Option<String>,
+    pub direction: crate::engine::graph::edge_store::Direction,
+    pub max_depth: usize,
+    pub options: &'a GraphTraversalOptions,
+}
+
 /// Cross-core BFS with explicit traversal options (fan-out limits, partial mode).
 ///
 /// This is the cluster-aware entry point. Callers pass
 /// `&GraphTraversalOptions::default()` for standard traversal.
-#[allow(clippy::too_many_arguments)]
 pub async fn cross_core_bfs_with_options(
     shared: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    start_nodes: Vec<String>,
-    edge_label: Option<String>,
-    direction: crate::engine::graph::edge_store::Direction,
-    max_depth: usize,
-    options: &GraphTraversalOptions,
+    params: CrossCoreBfsParams<'_>,
 ) -> crate::Result<Response> {
+    let CrossCoreBfsParams {
+        tenant_id,
+        database_id,
+        start_nodes,
+        edge_label,
+        direction,
+        max_depth,
+        options,
+    } = params;
     let mut visited: HashSet<String> = HashSet::new();
     let mut all_discovered: Vec<String> = Vec::new();
     let mut frontier: Vec<String> = start_nodes;

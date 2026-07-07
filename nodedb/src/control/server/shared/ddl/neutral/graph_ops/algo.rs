@@ -21,24 +21,43 @@ use super::support::ddl_err;
 const MAX_ITERATIONS_CAP: usize = 1_000;
 const MAX_SAMPLE_CAP: usize = 1_000_000;
 
-#[allow(clippy::too_many_arguments)]
+/// `GRAPH ALGO` request fields, bundled from the parsed `GraphStmt::GraphAlgo`
+/// statement.
+pub struct AlgoRequest<'a> {
+    pub algorithm_name: &'a str,
+    pub collection: String,
+    pub edge_label: Option<String>,
+    pub damping: Option<f64>,
+    pub tolerance: Option<f64>,
+    pub resolution: Option<f64>,
+    pub max_iterations: Option<usize>,
+    pub sample_size: Option<usize>,
+    pub source_node: Option<String>,
+    pub direction: Option<String>,
+    pub mode: Option<String>,
+    pub personalization: Option<String>,
+}
+
 pub async fn algo(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    algorithm_name: &str,
-    collection: String,
-    edge_label: Option<String>,
-    damping: Option<f64>,
-    tolerance: Option<f64>,
-    resolution: Option<f64>,
-    max_iterations: Option<usize>,
-    sample_size: Option<usize>,
-    source_node: Option<String>,
-    direction: Option<String>,
-    mode: Option<String>,
-    personalization: Option<String>,
+    request: AlgoRequest<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    let AlgoRequest {
+        algorithm_name,
+        collection,
+        edge_label,
+        damping,
+        tolerance,
+        resolution,
+        max_iterations,
+        sample_size,
+        source_node,
+        direction,
+        mode,
+        personalization,
+    } = request;
     let algorithm = resolve_algorithm(algorithm_name)?;
 
     let max_iterations = clamp_opt(max_iterations, "ITERATIONS", MAX_ITERATIONS_CAP)?;

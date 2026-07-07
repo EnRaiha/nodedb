@@ -36,7 +36,7 @@ use nodedb_cluster::{ShuffleProduceRequest, TypedClusterError};
 
 use nodedb_cluster::PlanExecutor;
 
-use super::fanout::ShuffleFanoutSink;
+use super::fanout::{ShuffleFanoutSink, ShuffleFanoutSinkParams};
 use crate::control::LocalPlanExecutor;
 use crate::control::state::SharedState;
 
@@ -78,13 +78,15 @@ impl RegistryShuffleProducer {
         let mut sink = ShuffleFanoutSink::new(
             transport,
             Arc::clone(&self.state.shuffle_registry),
-            self.state.node_id,
-            req.shuffle_id,
-            req.side,
-            req.num_parts,
-            req.producer_count,
-            req.keys.clone(),
-            &part_node_map,
+            ShuffleFanoutSinkParams {
+                self_node_id: self.state.node_id,
+                shuffle_id: req.shuffle_id,
+                side: req.side,
+                num_parts: req.num_parts,
+                producer_count: req.producer_count,
+                keys: req.keys.clone(),
+                part_node_map: &part_node_map,
+            },
         );
 
         // Mirror `ExecuteRequest`'s fields from the produce request so the local

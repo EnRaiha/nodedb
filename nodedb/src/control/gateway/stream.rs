@@ -14,7 +14,7 @@ use crate::control::server::result_stream::ResultStream;
 use nodedb_physical::physical_plan::PhysicalPlan;
 
 use super::core::{Gateway, QueryContext};
-use super::dispatcher::{default_deadline_ms, dispatch_route_stream};
+use super::dispatcher::{DispatchRouteStreamParams, default_deadline_ms, dispatch_route_stream};
 use super::retry::retry_not_leader;
 use super::route::TaskRoute;
 use super::router::resolve_decision;
@@ -104,15 +104,15 @@ impl Gateway {
                         decision,
                         vshard_id: vshard_id_u32,
                     };
-                    dispatch_route_stream(
+                    dispatch_route_stream(DispatchRouteStreamParams {
                         route,
-                        &shared,
+                        shared: &shared,
                         tenant_id,
                         database_id,
                         trace_id,
                         deadline_ms,
-                        &version_set,
-                    )
+                        version_set: &version_set,
+                    })
                     .await
                 }
             })

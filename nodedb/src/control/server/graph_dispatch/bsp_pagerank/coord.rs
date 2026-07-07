@@ -49,7 +49,7 @@ use crate::engine::graph::algo::result::AlgoResultBatch;
 use crate::types::{DatabaseId, TenantId};
 
 use super::enumerate::enumerate_shards;
-use super::scatter::{ShardDispatch, scatter_superstep};
+use super::scatter::{ScatterSuperstepParams, ShardDispatch, scatter_superstep};
 
 /// Default max supersteps when the query carries no explicit `ITERATIONS`.
 /// Mirrors the single-node PageRank default iteration budget.
@@ -135,14 +135,16 @@ pub async fn run_bsp_pagerank(
         .collect();
     let counts = scatter_superstep(
         state,
-        tenant_id,
-        database_id,
-        algorithm,
-        &params,
-        0,
-        0, // count-only sentinel
-        count_dispatches,
-        deadline_ms,
+        ScatterSuperstepParams {
+            tenant_id,
+            database_id,
+            algorithm,
+            params: &params,
+            superstep: 0,
+            global_n: 0, // count-only sentinel
+            dispatches: count_dispatches,
+            deadline_ms,
+        },
     )
     .await?;
 
@@ -233,14 +235,16 @@ pub async fn run_bsp_pagerank(
 
         let results = scatter_superstep(
             state,
-            tenant_id,
-            database_id,
-            algorithm,
-            &params,
-            superstep,
-            global_n,
-            dispatches,
-            deadline_ms,
+            ScatterSuperstepParams {
+                tenant_id,
+                database_id,
+                algorithm,
+                params: &params,
+                superstep,
+                global_n,
+                dispatches,
+                deadline_ms,
+            },
         )
         .await?;
 
