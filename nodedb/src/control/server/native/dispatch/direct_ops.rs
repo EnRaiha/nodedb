@@ -16,7 +16,7 @@ use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::staging_gate::{
     InTxnRoute, StagingGateError, route_in_tx_write,
 };
-use crate::types::{DatabaseId, Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
+use crate::types::{Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use crate::control::server::wal_dispatch;
@@ -83,7 +83,7 @@ pub(crate) async fn handle_direct_op(
     let mut tasks = vec![PhysicalTask {
         tenant_id,
         vshard_id,
-        database_id: DatabaseId::DEFAULT,
+        database_id: ctx.database_id(),
         plan,
         post_set_op: PostSetOp::None,
         txn_id,
@@ -92,7 +92,7 @@ pub(crate) async fn handle_direct_op(
         ctx.state,
         &mut tasks,
         tenant_id,
-        DatabaseId::DEFAULT,
+        ctx.database_id(),
         TraceId::ZERO,
     )
     .await
@@ -274,7 +274,7 @@ async fn dispatch_single_task(
     let task = PhysicalTask {
         tenant_id,
         vshard_id,
-        database_id: DatabaseId::DEFAULT,
+        database_id: ctx.database_id(),
         plan,
         post_set_op: PostSetOp::None,
         txn_id,
@@ -357,7 +357,7 @@ async fn dispatch_single_task_raw(
             let gw_ctx = GatewayQueryContext {
                 tenant_id,
                 trace_id: TraceId::generate(),
-                database_id: DatabaseId::DEFAULT,
+                database_id: ctx.database_id(),
             };
             match gw.execute(&gw_ctx, plan).await {
                 Ok(payloads) => Ok(gateway_payloads_to_response(payloads)),
@@ -379,13 +379,13 @@ async fn dispatch_single_task_raw(
                 &ctx.state.wal,
                 tenant_id,
                 vshard_id,
-                DatabaseId::DEFAULT,
+                ctx.database_id(),
                 &plan,
             )?;
             dispatch_utils::dispatch_to_data_plane_with_txn(
                 ctx.state,
                 tenant_id,
-                DatabaseId::DEFAULT,
+                ctx.database_id(),
                 vshard_id,
                 plan,
                 TraceId::ZERO,

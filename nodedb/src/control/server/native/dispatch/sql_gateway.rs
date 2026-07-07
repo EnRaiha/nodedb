@@ -38,7 +38,7 @@ pub(super) async fn dispatch_task_via_gateway(
             let gw_ctx = GatewayQueryContext {
                 tenant_id,
                 trace_id: TraceId::generate(),
-                database_id: nodedb_types::id::DatabaseId::DEFAULT,
+                database_id,
             };
             gw.execute(&gw_ctx, plan)
                 .await
