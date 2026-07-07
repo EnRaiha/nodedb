@@ -11,7 +11,7 @@
 //! via `gateway.execute(ctx, plan)` which ships pre-planned `PhysicalPlan` bytes
 //! over QUIC via `ExecuteRequest`, rather than raw SQL text.
 
-use pgwire::api::results::{Response, Tag};
+use pgwire::api::results::{FieldFormat, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::gateway::GatewayErrorMap;
@@ -89,6 +89,7 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         database_id: nodedb_types::id::DatabaseId,
         projection: Option<&OutputSchema>,
+        result_formats: &[FieldFormat],
     ) -> PgWireResult<Vec<Response>> {
         let gateway = self.state.gateway.as_ref().ok_or_else(|| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -121,7 +122,8 @@ impl NodeDbPgHandler {
                 for payload in &payloads {
                     match compose::shape_payload_no_plan(payload, PlanKind::MultiRow, projection) {
                         ShapeOutcome::Rows(shaped) => {
-                            let (response, notice) = shape_encode::shaped_query_response(shaped);
+                            let (response, notice) =
+                                shape_encode::shaped_query_response(shaped, result_formats);
                             // The gateway has no `addr` to route a NOTICE to; the
                             // MultiRow shape never carries one, so assert loudly
                             // rather than silently swallowing.

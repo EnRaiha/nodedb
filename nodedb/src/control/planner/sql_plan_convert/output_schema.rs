@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Derives the planner-authoritative [`OutputSchema`] from a compiled
-//! `SqlPlan` list, for later threading into response shaping.
+//! `SqlPlan` list, threaded into response shaping so the pgwire encoder can
+//! advertise correct RowDescription type OIDs.
 //!
-//! Purely additive: nothing in this module is consumed by any existing
-//! call site yet. The single call site that invokes [`build_output_schema`]
-//! today discards the result.
+//! Bare columns carry their real catalog type; computed SELECT expressions,
+//! GROUP BY keys, and aggregate results are typed conservatively via
+//! [`output_schema_types`](super::output_schema_types). A wrong non-TEXT OID
+//! makes clients fail to parse the text value, so every uncertain case falls
+//! back to `DdlColType::Text`, the safe default.
 
 use std::collections::HashMap;
 
@@ -14,6 +17,8 @@ use nodedb_sql::types::SqlPlan;
 use nodedb_sql::types::query::{AggOutputSlot, Projection};
 use nodedb_sql::types_expr::SqlExpr;
 
+use super::lateral::collection_name_from_plan;
+use super::output_schema_types::{infer_aggregate_type, infer_computed_expr_type};
 use crate::control::server::response_shape::schema::{
     OutputColumn, OutputSchema, sql_data_type_to_ddl_col_type,
 };
@@ -69,7 +74,7 @@ fn projection_to_column(
             Some(OutputColumn {
                 display_name: alias.clone(),
                 lookup_key,
-                ty: DdlColType::Text,
+                ty: infer_computed_expr_type(expr, types),
             })
         }
         Projection::Star | Projection::QualifiedStar(_) => None,
@@ -104,17 +109,21 @@ fn column_types_for<C: SqlCatalog>(
 /// the aggregate executor emits the value under), so `project_row` still finds
 /// the value.
 ///
-/// The output type is `DdlColType::Text`: the pgwire SELECT encoder is
-/// text-format only, so advertising a non-TEXT type OID without matching typed
-/// value encoding would break the extended-query protocol. (Typed aggregate /
-/// group-key reporting is deferred to a dedicated pgwire value-encoding unit.)
+/// The output type is the grouped column's catalog type when the key is a bare
+/// column (resolved from `types`, default `Text`); a computed-expression key is
+/// typed conservatively via [`infer_computed_expr_type`], defaulting to `Text`.
 ///
 /// A non-`Column` GROUP BY key (a computed expression) derives its `lookup_key`
 /// from the shared index-based `computed_group_key_name` rule — the exact name
 /// the aggregate spec emits the evaluated value under, so the two can never
 /// diverge. Its `display_name` is the SELECT-list alias when present
 /// (`UPPER(label) AS u` shows column `u`), else the same placeholder.
-fn group_by_key_column(expr: &SqlExpr, index: usize, alias: Option<&str>) -> OutputColumn {
+fn group_by_key_column(
+    expr: &SqlExpr,
+    index: usize,
+    alias: Option<&str>,
+    types: &HashMap<String, DdlColType>,
+) -> OutputColumn {
     match expr {
         SqlExpr::Column { table, name } => {
             let lookup_key = match table {
@@ -122,10 +131,11 @@ fn group_by_key_column(expr: &SqlExpr, index: usize, alias: Option<&str>) -> Out
                 None => name.clone(),
             };
             let display_name = alias.map(str::to_string).unwrap_or_else(|| name.clone());
+            let ty = types.get(name).copied().unwrap_or(DdlColType::Text);
             OutputColumn {
                 display_name,
                 lookup_key,
-                ty: DdlColType::Text,
+                ty,
             }
         }
         _ => {
@@ -140,7 +150,7 @@ fn group_by_key_column(expr: &SqlExpr, index: usize, alias: Option<&str>) -> Out
             OutputColumn {
                 display_name,
                 lookup_key,
-                ty: DdlColType::Text,
+                ty: infer_computed_expr_type(expr, types),
             }
         }
     }
@@ -302,12 +312,21 @@ pub fn build_output_schema<C: SqlCatalog>(
             is_star: false,
         },
         SqlPlan::Aggregate {
+            input,
             group_by,
             group_by_aliases,
             output_order,
             aggregates,
             ..
         } => {
+            // Catalog types of the aggregate's underlying columns, resolved from
+            // the input plan's single source collection when it has one (Scan /
+            // point-get style). GROUP BY bare keys and MIN/MAX/SUM/AVG argument
+            // columns are typed against this; anything unresolvable stays Text.
+            let types = match collection_name_from_plan(input) {
+                Some(collection) => column_types_for(catalog, database_id, &collection),
+                None => HashMap::new(),
+            };
             // Derives the `OutputColumn` for one GROUP BY key: `group_by_aliases`
             // is parallel to `group_by` when populated, but may be empty when the
             // plan was built without a projection in scope — treat a
@@ -315,7 +334,7 @@ pub fn build_output_schema<C: SqlCatalog>(
             let key_column = |index: usize| {
                 group_by.get(index).map(|key| {
                     let alias = group_by_aliases.get(index).and_then(|a| a.as_deref());
-                    group_by_key_column(key, index, alias)
+                    group_by_key_column(key, index, alias, &types)
                 })
             };
             // Derives the `OutputColumn` for one aggregate. `AggregateExpr::alias`
@@ -323,14 +342,14 @@ pub fn build_output_schema<C: SqlCatalog>(
             // alias, or (for unnamed projections) the lowercased unparsed
             // expression text — e.g. `count(*)` — matching this module's own
             // lowercasing of non-column expressions. So the alias is already the
-            // canonical name; no separate derivation needed. All aggregate result
-            // values ship as TEXT (the pgwire SELECT encoder is text-format only;
-            // typed OIDs are deferred to a dedicated value-encoding unit).
+            // canonical name; no separate derivation needed. The result type is
+            // inferred conservatively (COUNT -> Int8, MIN/MAX preserve the input
+            // column type, SUM/AVG of a float -> Float8, else Text).
             let agg_column = |index: usize| {
                 aggregates.get(index).map(|agg| OutputColumn {
                     display_name: agg.alias.clone(),
                     lookup_key: agg.alias.clone(),
-                    ty: DdlColType::Text,
+                    ty: infer_aggregate_type(agg, &types),
                 })
             };
             let mut columns = Vec::with_capacity(group_by.len() + aggregates.len());
@@ -588,12 +607,13 @@ mod tests {
         assert_eq!(schema.columns[0].lookup_key, "status");
         assert_eq!(schema.columns[1].display_name, "total");
         assert_eq!(schema.columns[1].lookup_key, "total");
-        // Aggregate result columns ship as TEXT (pgwire SELECT encoder is
-        // text-format only; typed OIDs deferred to a value-encoding unit).
+        // sum(x) stays TEXT here because this test has no catalog, so the
+        // argument's numeric type is unresolvable and falls back to TEXT.
         assert_eq!(schema.columns[1].ty, DdlColType::Text);
         assert_eq!(schema.columns[2].display_name, "count(*)");
         assert_eq!(schema.columns[2].lookup_key, "count(*)");
-        assert_eq!(schema.columns[2].ty, DdlColType::Text);
+        // count(*) is always Postgres bigint (Int8), independent of catalog.
+        assert_eq!(schema.columns[2].ty, DdlColType::Int8);
         assert!(!schema.is_star);
     }
 
@@ -719,5 +739,170 @@ mod tests {
         }];
         let schema = build_output_schema(&plans, &NoCatalog, nodedb_types::DatabaseId::DEFAULT);
         assert_id_and_dist_schema(&schema);
+    }
+
+    /// Catalog stub exposing a single `metrics` collection with a text
+    /// `region`, integer `n`, and float `amount` column — used to exercise
+    /// catalog-backed type resolution for GROUP BY keys, aggregate arguments,
+    /// and bare-column computed projections.
+    struct TypedCatalog;
+
+    impl SqlCatalog for TypedCatalog {
+        fn get_collection(
+            &self,
+            _database_id: nodedb_types::DatabaseId,
+            name: &str,
+        ) -> Result<Option<nodedb_sql::types::CollectionInfo>, nodedb_sql::catalog::SqlCatalogError>
+        {
+            use nodedb_sql::types::collection::ColumnInfo;
+            use nodedb_sql::types::query::EngineType;
+            use nodedb_sql::types_expr::SqlDataType;
+
+            if name != "metrics" {
+                return Ok(None);
+            }
+            let col = |n: &str, t: SqlDataType| ColumnInfo {
+                name: n.to_string(),
+                data_type: t,
+                nullable: true,
+                is_primary_key: false,
+                default: None,
+                raw_type: None,
+            };
+            Ok(Some(nodedb_sql::types::CollectionInfo {
+                name: "metrics".to_string(),
+                engine: EngineType::DocumentStrict,
+                columns: vec![
+                    col("region", SqlDataType::String),
+                    col("n", SqlDataType::Int64),
+                    col("amount", SqlDataType::Float64),
+                ],
+                primary_key: None,
+                has_auto_tier: false,
+                indexes: Vec::new(),
+                bitemporal: false,
+                primary: nodedb_types::PrimaryEngine::Document,
+                vector_primary: None,
+                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+            }))
+        }
+    }
+
+    fn agg_expr(
+        function: &str,
+        args: Vec<SqlExpr>,
+        alias: &str,
+    ) -> nodedb_sql::types::query::AggregateExpr {
+        nodedb_sql::types::query::AggregateExpr {
+            function: function.to_string(),
+            args,
+            alias: alias.to_string(),
+            distinct: false,
+            grouping_col_index: None,
+        }
+    }
+
+    fn metrics_column(name: &str) -> SqlExpr {
+        SqlExpr::Column {
+            table: None,
+            name: name.to_string(),
+        }
+    }
+
+    /// GROUP BY a bare text column plus MIN/SUM/COUNT aggregates resolve to
+    /// their real catalog-derived types, while SUM over an integer column and
+    /// a computed GROUP BY key stay Text.
+    #[test]
+    fn aggregate_types_resolve_against_catalog() {
+        let plans = vec![SqlPlan::Aggregate {
+            input: Box::new(scan_plan("metrics", vec![])),
+            group_by: vec![metrics_column("region")],
+            group_by_aliases: vec![None],
+            output_order: Vec::new(),
+            aggregates: vec![
+                agg_expr("count", vec![SqlExpr::Wildcard], "count(*)"),
+                agg_expr("min", vec![metrics_column("n")], "min_n"),
+                agg_expr("sum", vec![metrics_column("amount")], "sum_amount"),
+                agg_expr("sum", vec![metrics_column("n")], "sum_n"),
+            ],
+            having: Vec::new(),
+            limit: 0,
+            grouping_sets: None,
+            sort_keys: Vec::new(),
+        }];
+        let schema = build_output_schema(&plans, &TypedCatalog, nodedb_types::DatabaseId::DEFAULT);
+        // group-keys-first fallback (empty output_order): region, then aggs.
+        assert_eq!(schema.columns.len(), 5);
+        // GROUP BY text column -> the text column's catalog type.
+        assert_eq!(schema.columns[0].display_name, "region");
+        assert_eq!(schema.columns[0].ty, DdlColType::Text);
+        // COUNT(*) -> Int8 (Postgres bigint).
+        assert_eq!(schema.columns[1].display_name, "count(*)");
+        assert_eq!(schema.columns[1].ty, DdlColType::Int8);
+        // MIN(int_col) preserves the integer input type.
+        assert_eq!(schema.columns[2].display_name, "min_n");
+        assert_eq!(schema.columns[2].ty, DdlColType::Int8);
+        // SUM(float_col) -> Float8.
+        assert_eq!(schema.columns[3].display_name, "sum_amount");
+        assert_eq!(schema.columns[3].ty, DdlColType::Float8);
+        // SUM(int_col) stays Text (numeric promotion, no regression).
+        assert_eq!(schema.columns[4].display_name, "sum_n");
+        assert_eq!(schema.columns[4].ty, DdlColType::Text);
+    }
+
+    /// A computed GROUP BY key (`UPPER(region)`) is not a bare column, so it
+    /// defaults to Text.
+    #[test]
+    fn computed_group_by_key_is_text() {
+        let upper = SqlExpr::Function {
+            name: "upper".to_string(),
+            args: vec![metrics_column("region")],
+            distinct: false,
+        };
+        let plans = vec![SqlPlan::Aggregate {
+            input: Box::new(scan_plan("metrics", vec![])),
+            group_by: vec![upper],
+            group_by_aliases: vec![Some("u".to_string())],
+            output_order: Vec::new(),
+            aggregates: Vec::new(),
+            having: Vec::new(),
+            limit: 0,
+            grouping_sets: None,
+            sort_keys: Vec::new(),
+        }];
+        let schema = build_output_schema(&plans, &TypedCatalog, nodedb_types::DatabaseId::DEFAULT);
+        assert_eq!(schema.columns.len(), 1);
+        assert_eq!(schema.columns[0].display_name, "u");
+        assert_eq!(schema.columns[0].ty, DdlColType::Text);
+    }
+
+    /// A computed SELECT expression that is really a bare column reference
+    /// carries that column's catalog type; a boolean comparison is `Bool`.
+    #[test]
+    fn computed_projection_types_resolve_against_catalog() {
+        let projection = vec![
+            Projection::Computed {
+                expr: metrics_column("n"),
+                alias: "aliased_n".to_string(),
+            },
+            Projection::Computed {
+                expr: SqlExpr::BinaryOp {
+                    left: Box::new(metrics_column("n")),
+                    op: nodedb_sql::types_expr::BinaryOp::Gt,
+                    right: Box::new(SqlExpr::Literal(nodedb_sql::types_expr::SqlValue::Int(0))),
+                },
+                alias: "positive".to_string(),
+            },
+        ];
+        let plans = vec![scan_plan("metrics", projection)];
+        let schema = build_output_schema(&plans, &TypedCatalog, nodedb_types::DatabaseId::DEFAULT);
+        assert_eq!(schema.columns.len(), 2);
+        // Bare-column-passthrough computed expr -> the column's catalog type.
+        assert_eq!(schema.columns[0].display_name, "aliased_n");
+        assert_eq!(schema.columns[0].lookup_key, "n");
+        assert_eq!(schema.columns[0].ty, DdlColType::Int8);
+        // Boolean comparison expression -> Bool.
+        assert_eq!(schema.columns[1].display_name, "positive");
+        assert_eq!(schema.columns[1].ty, DdlColType::Bool);
     }
 }

@@ -226,9 +226,12 @@ impl NodeDbPgHandler {
                     };
                     match shape_payload_no_plan(resp.payload.as_ref(), plan_kind, None) {
                         ShapeOutcome::Rows(shaped) => {
+                            // Clone write-path DML result (PointUpdate/PointDelete):
+                            // no client-requested result formats, so text.
                             let (response, notice) =
                                 crate::control::server::pgwire::handler::shape_encode::shaped_query_response(
                                     shaped,
+                                    &[],
                                 );
                             if let Some(n) = notice {
                                 self.sessions.push_notice(addr, n);

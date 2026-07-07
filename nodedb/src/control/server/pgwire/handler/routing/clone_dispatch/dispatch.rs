@@ -10,7 +10,7 @@
 //! Non-cloned databases and fully `Materialized` clones return `None` —
 //! zero overhead for the common path.
 
-use pgwire::api::results::Response;
+use pgwire::api::results::{FieldFormat, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::clone::resolver::{
@@ -43,6 +43,7 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
         projection: Option<&OutputSchema>,
+        result_formats: &[FieldFormat],
     ) -> PgWireResult<Option<Vec<Response>>> {
         // Compute query LSN and wall-ms for the resolver.
         //
@@ -94,7 +95,8 @@ impl NodeDbPgHandler {
                     nodedb_types::json_to_msgpack(&serde_json::json!([])).unwrap_or_default();
                 match compose::shape_payload_no_plan(&empty, PlanKind::MultiRow, projection) {
                     ShapeOutcome::Rows(shaped) => {
-                        let (response, notice) = shape_encode::shaped_query_response(shaped);
+                        let (response, notice) =
+                            shape_encode::shaped_query_response(shaped, result_formats);
                         if let Some(n) = notice {
                             self.sessions.push_notice(addr, n);
                         }
@@ -283,7 +285,8 @@ impl NodeDbPgHandler {
                         projection,
                     ) {
                         ShapeOutcome::Rows(shaped) => {
-                            let (response, notice) = shape_encode::shaped_query_response(shaped);
+                            let (response, notice) =
+                                shape_encode::shaped_query_response(shaped, result_formats);
                             if let Some(n) = notice {
                                 self.sessions.push_notice(addr, n);
                             }

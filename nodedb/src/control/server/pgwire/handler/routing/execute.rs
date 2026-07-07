@@ -3,7 +3,7 @@
 //! Plan-and-dispatch entry points for SQL queries on the simple-query and
 //! extended-query (prepared-statement) paths.
 
-use pgwire::api::results::{Response, Tag};
+use pgwire::api::results::{FieldFormat, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::planner::calvin::{
@@ -21,6 +21,15 @@ use super::super::shape_encode;
 use super::planning::consistency_for_tasks;
 use super::set_ops;
 use crate::control::server::response_shape::schema::OutputSchema;
+
+/// Result-shaping inputs for the prepared/extended execution path: the
+/// Describe-supplied output schema (when present) and the client's per-column
+/// result formats (empty = all text).
+#[derive(Clone, Copy)]
+pub(in crate::control::server::pgwire::handler) struct ResultShaping<'a> {
+    pub projection: Option<&'a OutputSchema>,
+    pub formats: &'a [FieldFormat],
+}
 
 impl NodeDbPgHandler {
     /// Plan and dispatch SQL after quota and DDL checks have passed.
@@ -46,8 +55,20 @@ impl NodeDbPgHandler {
         // `execute_planned_sql_inner` and used to shape/project every SELECT-read
         // producer's response via the neutral shaping core, so there is no
         // post-hoc reproject seam here.
-        self.execute_planned_sql_inner(identity, sql, tenant_id, addr, &[], None)
-            .await
+        // Simple query has no Bind message, so no client-requested result
+        // formats: everything renders in text.
+        self.execute_planned_sql_inner(
+            identity,
+            sql,
+            tenant_id,
+            addr,
+            &[],
+            ResultShaping {
+                projection: None,
+                formats: &[],
+            },
+        )
+        .await
     }
 
     /// Execute planned SQL with bound parameters (prepared statement path).
@@ -58,9 +79,9 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
         params: &[nodedb_sql::ParamValue],
-        projection: Option<&OutputSchema>,
+        shaping: ResultShaping<'_>,
     ) -> PgWireResult<Vec<Response>> {
-        self.execute_planned_sql_inner(identity, sql, tenant_id, addr, params, projection)
+        self.execute_planned_sql_inner(identity, sql, tenant_id, addr, params, shaping)
             .await
     }
 
@@ -71,7 +92,7 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         addr: &std::net::SocketAddr,
         params: &[nodedb_sql::ParamValue],
-        projection: Option<&OutputSchema>,
+        shaping: ResultShaping<'_>,
     ) -> PgWireResult<Vec<Response>> {
         let (mut tasks, output_schema, _plan_lease_scope) = self
             .plan_statement_to_tasks(identity, sql, tenant_id, addr, params)
@@ -84,7 +105,7 @@ impl NodeDbPgHandler {
         // An externally-supplied prepared-statement schema (from the Describe
         // phase) wins; otherwise use the planner's fresh output schema for this
         // statement.
-        let effective_schema = projection.or(Some(&output_schema));
+        let effective_schema = shaping.projection.or(Some(&output_schema));
 
         // Implicit graph-edge extraction: a schemaless document carrying
         // `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task, homed and
@@ -116,7 +137,13 @@ impl NodeDbPgHandler {
         // Returns Some(responses) when clone dispatch is fully handled.
         // Returns None when this is not a cloned collection (fast path).
         if let Some(clone_responses) = self
-            .maybe_dispatch_clone_reads(tasks.clone(), tenant_id, addr, effective_schema)
+            .maybe_dispatch_clone_reads(
+                tasks.clone(),
+                tenant_id,
+                addr,
+                effective_schema,
+                shaping.formats,
+            )
             .await?
         {
             return Ok(clone_responses);
@@ -173,7 +200,13 @@ impl NodeDbPgHandler {
                 .get_current_database(addr)
                 .unwrap_or(crate::types::DatabaseId::DEFAULT);
             return self
-                .dispatch_tasks_via_gateway(tasks, tenant_id, database_id, effective_schema)
+                .dispatch_tasks_via_gateway(
+                    tasks,
+                    tenant_id,
+                    database_id,
+                    effective_schema,
+                    shaping.formats,
+                )
                 .await;
         }
 
@@ -209,8 +242,15 @@ impl NodeDbPgHandler {
             }
         }
 
-        self.dispatch_task_loop(tasks, tenant_id, identity, addr, effective_schema)
-            .await
+        self.dispatch_task_loop(
+            tasks,
+            tenant_id,
+            identity,
+            addr,
+            effective_schema,
+            shaping.formats,
+        )
+        .await
     }
 
     /// Execute the per-task dispatch loop for non-Calvin queries.
@@ -221,6 +261,7 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         addr: &std::net::SocketAddr,
         projection: Option<&OutputSchema>,
+        result_formats: &[FieldFormat],
     ) -> PgWireResult<Vec<Response>> {
         let needs_set_op = tasks.iter().any(|t| t.post_set_op != PostSetOp::None);
         let mut dedup_payloads: Vec<Vec<u8>> = Vec::new();
@@ -249,61 +290,10 @@ impl NodeDbPgHandler {
             if let nodedb_physical::physical_plan::PhysicalPlan::ClusterArray(ref cluster_op) =
                 task.plan
             {
-                use crate::control::cluster::ClusterArrayExecutor;
-                use crate::control::server::pgwire::handler::plan::PlanKind;
-                use std::sync::Arc;
-
-                let transport = self.state.cluster_transport.as_ref().ok_or_else(|| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "XX000".to_owned(),
-                        "cluster transport not available for ClusterArray dispatch".to_owned(),
-                    )))
-                })?;
-                let routing = self.state.cluster_routing.as_ref().ok_or_else(|| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "XX000".to_owned(),
-                        "cluster routing not available for ClusterArray dispatch".to_owned(),
-                    )))
-                })?;
-                let executor = ClusterArrayExecutor::new(
-                    Arc::clone(transport),
-                    Arc::clone(routing),
-                    self.state.node_id,
-                    Arc::clone(&self.state),
-                );
-                let payload_bytes = executor.execute(cluster_op).await.map_err(|e| {
-                    let (severity, code, message) = error_to_sqlstate(&e);
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        severity.to_owned(),
-                        code.to_owned(),
-                        message,
-                    )))
-                })?;
-                let cluster_plan_kind = match cluster_op {
-                    nodedb_physical::physical_plan::ClusterArrayOp::Slice { .. } => {
-                        PlanKind::ArraySlice
-                    }
-                    _ => PlanKind::MultiRow,
-                };
-                match compose::shape_payload_no_plan(&payload_bytes, cluster_plan_kind, projection)
-                {
-                    ShapeOutcome::Rows(shaped) => {
-                        let (response, notice) = shape_encode::shaped_query_response(shaped);
-                        if let Some(n) = notice {
-                            self.sessions.push_notice(addr, n);
-                        }
-                        responses.push(response);
-                    }
-                    ShapeOutcome::Passthrough => {
-                        let shaped = payload_to_response(&payload_bytes, cluster_plan_kind);
-                        if let Some(notice) = shaped.notice {
-                            self.sessions.push_notice(addr, notice);
-                        }
-                        responses.push(shaped.response);
-                    }
-                }
+                let response = self
+                    .dispatch_cluster_array_task(cluster_op, projection, result_formats, addr)
+                    .await?;
+                responses.push(response);
                 continue;
             }
 
@@ -337,7 +327,14 @@ impl NodeDbPgHandler {
                 == crate::control::server::shared::session::TransactionState::InBlock;
             if !in_transaction
                 && let Some(stream_response) = self
-                    .maybe_stream_select(&task, plan_kind, resp_post_set_op, addr, projection)
+                    .maybe_stream_select(
+                        &task,
+                        plan_kind,
+                        resp_post_set_op,
+                        addr,
+                        projection,
+                        result_formats,
+                    )
                     .await?
             {
                 responses.push(stream_response);
@@ -451,7 +448,8 @@ impl NodeDbPgHandler {
                 .map_err(|e| sqlstate_error("XX000", e.message()))?
                 {
                     ShapeOutcome::Rows(shaped) => {
-                        let (response, notice) = shape_encode::shaped_query_response(shaped);
+                        let (response, notice) =
+                            shape_encode::shaped_query_response(shaped, result_formats);
                         if let Some(n) = notice {
                             self.sessions.push_notice(addr, n);
                         }
@@ -471,7 +469,7 @@ impl NodeDbPgHandler {
         // Set operations: merge sub-query payloads.
         if needs_set_op && !dedup_payloads.is_empty() {
             let (response, notice) =
-                set_ops::apply_set_ops(&dedup_payloads, dedup_set_op, projection);
+                set_ops::apply_set_ops(&dedup_payloads, dedup_set_op, projection, result_formats);
             if let Some(n) = notice {
                 self.sessions.push_notice(addr, n);
             }

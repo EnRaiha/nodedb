@@ -4,7 +4,7 @@
 //!
 //! Operates on raw msgpack payloads — no decode/re-encode round-trip.
 
-use pgwire::api::results::Response;
+use pgwire::api::results::{FieldFormat, Response};
 
 use nodedb_physical::physical_task::PostSetOp;
 
@@ -20,6 +20,7 @@ pub(super) fn apply_set_ops(
     dedup_payloads: &[Vec<u8>],
     dedup_set_op: PostSetOp,
     projection: Option<&OutputSchema>,
+    result_formats: &[FieldFormat],
 ) -> (Response, Option<String>) {
     let merged = match dedup_set_op {
         PostSetOp::Intersect | PostSetOp::IntersectAll => {
@@ -31,7 +32,7 @@ pub(super) fn apply_set_ops(
         _ => dedup_union_payloads(dedup_payloads),
     };
     match compose::shape_payload_no_plan(&merged, PlanKind::MultiRow, projection) {
-        ShapeOutcome::Rows(shaped) => shape_encode::shaped_query_response(shaped),
+        ShapeOutcome::Rows(shaped) => shape_encode::shaped_query_response(shaped, result_formats),
         ShapeOutcome::Passthrough => {
             let shaped = payload_to_response(&merged, PlanKind::MultiRow);
             (shaped.response, shaped.notice)

@@ -71,6 +71,14 @@ impl NodeDbPgHandler {
             return Ok(DescribePortalResponse::no_data());
         }
 
-        Ok(DescribePortalResponse::new(stmt.result_fields.clone()))
+        // The portal is bound, so the client's requested result-column formats
+        // are known. Stamp the resolved (feature-downgraded) formats onto the
+        // RowDescription so Describe advertises exactly what Execute encodes.
+        let formats = super::result_format::resolve_result_formats(
+            &stmt.result_fields,
+            &target.result_column_format,
+        );
+        let fields = super::result_format::stamp_formats(&stmt.result_fields, &formats);
+        Ok(DescribePortalResponse::new(fields))
     }
 }

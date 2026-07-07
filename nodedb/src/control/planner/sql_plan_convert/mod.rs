@@ -11,6 +11,7 @@ pub mod filter;
 pub mod group_key_name;
 pub mod lateral;
 pub mod output_schema;
+pub mod output_schema_types;
 pub mod scan;
 pub mod scan_params;
 pub mod set_ops;

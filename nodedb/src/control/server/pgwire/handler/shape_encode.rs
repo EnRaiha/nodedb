@@ -11,14 +11,13 @@
 //! per-column `DdlColType` the shaper threaded through `ShapedRows`:
 //! `Float8`/`Float4` go through pgwire's native float encoder (so `0.0` stays
 //! `"0.0"`, not `"0"`), `Timestamp`/`Timestamptz` epoch-microsecond cells
-//! render as ISO-8601 text, `Bytea` renders as `\x<hex>`, and everything else
-//! (`Text`, integers, `Bool`) falls back to `json_value_to_text` — notably
-//! `Bool` as `t`/`f`, not `true`/`false`.
+//! render as ISO-8601 text, and everything else (`Text`, integers, `Bool`)
+//! falls back to `json_value_to_text` — notably `Bool` as `t`/`f`, not
+//! `true`/`false`.
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
-use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response};
+use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
 use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
@@ -27,7 +26,7 @@ use nodedb_types::NdbDateTime;
 use crate::control::server::response_shape::project::json_value_to_text;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 
-use super::super::ddl_encode::col_type_to_field;
+use super::super::ddl_encode::col_type_to_field_with_format;
 
 /// Encode one flat row object into a pgwire `DataRow`, using `columns` (in
 /// order) to look up cells in `row` and `column_types` (parallel to `columns`)
@@ -40,16 +39,18 @@ pub(in crate::control::server::pgwire) fn encode_shaped_row(
     schema: &Arc<Vec<FieldInfo>>,
     columns: &[String],
     column_types: &[DdlColType],
+    formats: &[FieldFormat],
     row: &serde_json::Map<String, serde_json::Value>,
 ) -> PgWireResult<DataRow> {
     let mut encoder = DataRowEncoder::new(schema.clone());
     for (idx, name) in columns.iter().enumerate() {
         let ct = column_types.get(idx).copied().unwrap_or(DdlColType::Text);
+        let format = formats.get(idx).copied().unwrap_or(FieldFormat::Text);
         match row.get(name) {
             None | Some(serde_json::Value::Null) => {
                 encoder.encode_field(&None::<&str>)?;
             }
-            Some(v) => encode_typed_cell(&mut encoder, ct, v)?,
+            Some(v) => encode_typed_cell(&mut encoder, ct, format, v)?,
         }
     }
     Ok(encoder.take_row())
@@ -60,16 +61,47 @@ pub(in crate::control::server::pgwire) fn encode_shaped_row(
 /// `Float8`/`Float4` numeric cells go through pgwire's native float encoder
 /// (ryu + `extra_float_digits`) so their text bytes match PostgreSQL exactly;
 /// `Timestamp`/`Timestamptz` epoch-microsecond numbers render as ISO-8601
-/// text; `Bytea` base64 cells render as PostgreSQL's `\x<hex>` form. Any cell
-/// whose JSON shape doesn't match the typed arm (e.g. an already-formatted
-/// timestamp string) falls back to `json_value_to_text`, as does every other
-/// type — `Text`, integers, and `Bool` (`t`/`f`).
+/// text. Any cell whose JSON shape doesn't match the typed arm (e.g. an
+/// already-formatted timestamp string) falls back to `json_value_to_text`, as
+/// does every other type — `Text`, integers, and `Bool` (`t`/`f`).
 fn encode_typed_cell(
     encoder: &mut DataRowEncoder,
     ct: DdlColType,
+    format: FieldFormat,
     v: &serde_json::Value,
 ) -> PgWireResult<()> {
     use serde_json::Value;
+
+    // Binary result format: the column's `FieldInfo` is Binary, so
+    // `encode_field` emits the value's binary wire form. Extract the correctly
+    // typed scalar from the JSON cell. A type/shape mismatch cannot fall back
+    // to the text arms here — the RowDescription already advertises this
+    // column's binary type, so a text value under it would be misread by the
+    // client; encode SQL NULL for the (well-typed data should never hit this)
+    // mismatch instead. Only the feature-supported scalar types reach a Binary
+    // format (the resolver downgrades the rest to Text upstream); any other
+    // `ct` under Binary falls through to the text arms below.
+    if format == FieldFormat::Binary {
+        match ct {
+            DdlColType::Int8 => return encoder.encode_field(&v.as_i64()),
+            DdlColType::Int4 => return encoder.encode_field(&v.as_i64().map(|n| n as i32)),
+            DdlColType::Int2 => return encoder.encode_field(&v.as_i64().map(|n| n as i16)),
+            DdlColType::Float8 => return encoder.encode_field(&v.as_f64()),
+            DdlColType::Float4 => return encoder.encode_field(&v.as_f64().map(|f| f as f32)),
+            DdlColType::Bool => return encoder.encode_field(&v.as_bool()),
+            DdlColType::Text | DdlColType::Varchar => {
+                // TEXT/VARCHAR binary wire bytes are identical to text bytes,
+                // so render any JSON scalar (numbers, bools, strings) to its
+                // text form exactly as the text arm does, then emit as binary.
+                return encoder.encode_field(&json_value_to_text(v));
+            }
+            // Feature-blocked / non-scalar types are downgraded to Text by the
+            // format resolver and never reach here as Binary; if one somehow
+            // does, fall through to the text arms below.
+            _ => {}
+        }
+    }
+
     match ct {
         DdlColType::Float8 => match v {
             Value::Number(n) => match n.as_f64() {
@@ -94,27 +126,8 @@ fn encode_typed_cell(
             },
             _ => encoder.encode_field(&json_value_to_text(v)),
         },
-        DdlColType::Bytea => match v {
-            Value::String(s) => encoder.encode_field(&bytea_hex_text(s)),
-            _ => encoder.encode_field(&json_value_to_text(v)),
-        },
         _ => encoder.encode_field(&json_value_to_text(v)),
     }
-}
-
-/// Render a base64-encoded byte string as PostgreSQL's `bytea` hex text output
-/// (`\x` followed by lowercase hex). The shaper transcodes msgpack `bin`
-/// payloads to base64 JSON strings; a value that fails to base64-decode is
-/// hexed from its raw UTF-8 bytes rather than erroring.
-fn bytea_hex_text(base64_str: &str) -> String {
-    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_str)
-        .unwrap_or_else(|_| base64_str.as_bytes().to_vec());
-    let mut out = String::with_capacity(2 + bytes.len() * 2);
-    out.push_str("\\x");
-    for b in &bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 /// Build a `Response::Query` from a protocol-neutral [`ShapedRows`], plus its
@@ -126,6 +139,7 @@ fn bytea_hex_text(base64_str: &str) -> String {
 /// `sessions.push_notice`.
 pub(in crate::control::server::pgwire) fn shaped_query_response(
     shaped: ShapedRows,
+    formats: &[FieldFormat],
 ) -> (Response, Option<String>) {
     let ShapedRows {
         columns,
@@ -139,14 +153,15 @@ pub(in crate::control::server::pgwire) fn shaped_query_response(
         .enumerate()
         .map(|(i, name)| {
             let ct = column_types.get(i).copied().unwrap_or(DdlColType::Text);
-            col_type_to_field(name, ct)
+            let format = formats.get(i).copied().unwrap_or(FieldFormat::Text);
+            col_type_to_field_with_format(name, ct, format)
         })
         .collect();
     let schema = Arc::new(fields);
 
     let encoded_rows: Vec<PgWireResult<DataRow>> = rows
         .iter()
-        .map(|row| encode_shaped_row(&schema, &columns, &column_types, row))
+        .map(|row| encode_shaped_row(&schema, &columns, &column_types, formats, row))
         .collect();
 
     let response = Response::Query(QueryResponse::new(
@@ -163,7 +178,7 @@ mod tests {
     use serde_json::json;
 
     use super::shaped_query_response;
-    use crate::control::server::response_shape::types::ShapedRows;
+    use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 
     /// Drain a `QueryResponse` stream into a `Vec` of `DataRow`s.
     async fn drain(mut qr: QueryResponse) -> Vec<pgwire::messages::data::DataRow> {
@@ -238,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn string_cell_renders_verbatim() {
         let shaped = make_shaped(&["a"], vec![obj(&[("a", json!("hello"))])]);
-        let (response, notice) = shaped_query_response(shaped);
+        let (response, notice) = shaped_query_response(shaped, &[]);
         assert!(notice.is_none());
         let Response::Query(qr) = response else {
             panic!("expected Query response");
@@ -253,7 +268,7 @@ mod tests {
             &["a"],
             vec![obj(&[("a", json!(true))]), obj(&[("a", json!(false))])],
         );
-        let (response, _notice) = shaped_query_response(shaped);
+        let (response, _notice) = shaped_query_response(shaped, &[]);
         let Response::Query(qr) = response else {
             panic!("expected Query response");
         };
@@ -268,7 +283,7 @@ mod tests {
             &["a"],
             vec![obj(&[("a", json!(42))]), obj(&[("a", json!(0.0))])],
         );
-        let (response, _notice) = shaped_query_response(shaped);
+        let (response, _notice) = shaped_query_response(shaped, &[]);
         let Response::Query(qr) = response else {
             panic!("expected Query response");
         };
@@ -280,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn null_and_missing_column_both_encode_as_sql_null() {
         let shaped = make_shaped(&["a", "b"], vec![obj(&[("a", serde_json::Value::Null)])]);
-        let (response, _notice) = shaped_query_response(shaped);
+        let (response, _notice) = shaped_query_response(shaped, &[]);
         let Response::Query(qr) = response else {
             panic!("expected Query response");
         };
@@ -297,7 +312,7 @@ mod tests {
             &["b", "a"],
             vec![obj(&[("a", json!("first")), ("b", json!("second"))])],
         );
-        let (response, _notice) = shaped_query_response(shaped);
+        let (response, _notice) = shaped_query_response(shaped, &[]);
         let Response::Query(qr) = response else {
             panic!("expected Query response");
         };
@@ -313,13 +328,7 @@ mod tests {
     async fn typed_columns_report_correct_oid_and_text() {
         use pgwire::api::Type;
 
-        use crate::control::server::response_shape::types::DdlColType;
-
-        // A base64 string is how the shaper transcodes a `bytea` msgpack `bin`.
-        let raw = [0xDE_u8, 0xAD];
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw);
-
-        let columns: Vec<String> = ["i", "f", "b", "ts", "by"]
+        let columns: Vec<String> = ["i", "f", "b", "ts"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -328,7 +337,6 @@ mod tests {
             DdlColType::Float8,
             DdlColType::Bool,
             DdlColType::Timestamp,
-            DdlColType::Bytea,
         ];
         let row = obj(&[
             ("i", json!(42)),
@@ -338,7 +346,6 @@ mod tests {
             ("b", json!(true)),
             // Epoch microseconds → ISO-8601 text (0 == Unix epoch).
             ("ts", json!(0)),
-            ("by", json!(b64)),
         ]);
         let shaped = ShapedRows {
             columns,
@@ -347,7 +354,7 @@ mod tests {
             notice: None,
         };
 
-        let (response, _notice) = shaped_query_response(shaped);
+        let (response, _notice) = shaped_query_response(shaped, &[]);
         let Response::Query(qr) = response else {
             panic!("expected Query response");
         };
@@ -357,7 +364,6 @@ mod tests {
         assert_eq!(schema[1].datatype(), &Type::FLOAT8);
         assert_eq!(schema[2].datatype(), &Type::BOOL);
         assert_eq!(schema[3].datatype(), &Type::TIMESTAMP);
-        assert_eq!(schema[4].datatype(), &Type::BYTEA);
 
         let rows = drain(qr).await;
         assert_eq!(field_text(&rows[0], 0).as_deref(), Some("42"));
@@ -367,14 +373,128 @@ mod tests {
             field_text(&rows[0], 3).as_deref(),
             Some("1970-01-01T00:00:00.000000Z")
         );
-        assert_eq!(field_text(&rows[0], 4).as_deref(), Some("\\xdead"));
     }
 
     #[tokio::test]
     async fn notice_is_preserved_not_dropped() {
         let mut shaped = make_shaped(&["a"], vec![obj(&[("a", json!("x"))])]);
         shaped.notice = Some("heads up".to_owned());
-        let (_response, notice) = shaped_query_response(shaped);
+        let (_response, notice) = shaped_query_response(shaped, &[]);
         assert_eq!(notice.as_deref(), Some("heads up"));
+    }
+
+    /// Read the raw bytes of field `idx` from a `DataRow` (or `None` for SQL
+    /// NULL), without assuming UTF-8 — used to inspect binary-format cells.
+    fn field_bytes(row: &pgwire::messages::data::DataRow, idx: usize) -> Option<Vec<u8>> {
+        let data = &row.data;
+        let mut offset = 0usize;
+        for field_i in 0..=idx {
+            if offset + 4 > data.len() {
+                return None;
+            }
+            let len = i32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+            if len < 0 {
+                if field_i == idx {
+                    return None;
+                }
+                continue;
+            }
+            let len = len as usize;
+            if offset + len > data.len() {
+                return None;
+            }
+            if field_i == idx {
+                return Some(data[offset..offset + len].to_vec());
+            }
+            offset += len;
+        }
+        None
+    }
+
+    fn shaped_typed(
+        columns: &[&str],
+        column_types: Vec<DdlColType>,
+        row: serde_json::Map<String, serde_json::Value>,
+    ) -> ShapedRows {
+        ShapedRows {
+            columns: columns.iter().map(|s| s.to_string()).collect(),
+            column_types,
+            rows: vec![row],
+            notice: None,
+        }
+    }
+
+    /// A binary-format request for the supported scalar types encodes each
+    /// cell in its PostgreSQL binary wire form (big-endian), and the
+    /// RowDescription advertises `FieldFormat::Binary`.
+    #[tokio::test]
+    async fn binary_format_encodes_scalar_wire_bytes() {
+        use pgwire::api::results::FieldFormat;
+
+        let shaped = shaped_typed(
+            &["i", "f", "b", "t"],
+            vec![
+                DdlColType::Int8,
+                DdlColType::Float8,
+                DdlColType::Bool,
+                DdlColType::Text,
+            ],
+            obj(&[
+                ("i", json!(42)),
+                ("f", json!(1.5)),
+                ("b", json!(true)),
+                ("t", json!("hello")),
+            ]),
+        );
+        let formats = vec![FieldFormat::Binary; 4];
+        let (response, _notice) = shaped_query_response(shaped, &formats);
+        let Response::Query(qr) = response else {
+            panic!("expected Query response");
+        };
+        // RowDescription advertises Binary for every column.
+        for f in qr.row_schema.iter() {
+            assert_eq!(f.format(), FieldFormat::Binary);
+        }
+        let rows = drain(qr).await;
+        // int8 -> 8-byte big-endian.
+        assert_eq!(field_bytes(&rows[0], 0), Some(42i64.to_be_bytes().to_vec()));
+        // float8 -> IEEE-754 big-endian bits.
+        assert_eq!(
+            field_bytes(&rows[0], 1),
+            Some(1.5f64.to_be_bytes().to_vec())
+        );
+        // bool -> single byte 0x01.
+        assert_eq!(field_bytes(&rows[0], 2), Some(vec![1u8]));
+        // text -> raw UTF-8 bytes (binary text is identical bytes).
+        assert_eq!(field_bytes(&rows[0], 3), Some(b"hello".to_vec()));
+    }
+
+    /// A per-column format vector: only the columns whose format is Binary are
+    /// binary-encoded; the rest stay text. Mirrors an `Individual` Bind.
+    #[tokio::test]
+    async fn mixed_formats_are_per_column() {
+        use pgwire::api::results::FieldFormat;
+
+        let shaped = shaped_typed(
+            &["i", "j"],
+            vec![DdlColType::Int8, DdlColType::Int8],
+            obj(&[("i", json!(7)), ("j", json!(9))]),
+        );
+        let formats = vec![FieldFormat::Binary, FieldFormat::Text];
+        let (response, _notice) = shaped_query_response(shaped, &formats);
+        let Response::Query(qr) = response else {
+            panic!("expected Query response");
+        };
+        let rows = drain(qr).await;
+        // Column 0 binary: 8 raw bytes.
+        assert_eq!(field_bytes(&rows[0], 0), Some(7i64.to_be_bytes().to_vec()));
+        // Column 1 text: ASCII "9".
+        assert_eq!(field_text(&rows[0], 1).as_deref(), Some("9"));
     }
 }

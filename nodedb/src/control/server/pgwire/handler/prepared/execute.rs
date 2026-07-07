@@ -17,9 +17,10 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
 use crate::control::server::response_shape::schema::{OutputColumn, OutputSchema};
-use crate::control::server::response_shape::types::DdlColType;
 
 use super::super::core::NodeDbPgHandler;
+use super::super::routing::execute::ResultShaping;
+use super::result_format::{pg_type_to_ddl_col_type, resolve_result_formats};
 use super::statement::ParsedStatement;
 
 impl NodeDbPgHandler {
@@ -104,6 +105,12 @@ impl NodeDbPgHandler {
         // DML RETURNING rows are shaped as multi-column `RowsPayload` by the
         // `ReturningRows` producer (which ignores projection), so they stay
         // correct without any guard.
+        // Resolve the client's requested per-column result formats (from the
+        // Bind message), downgrading any column whose binary encoding is
+        // feature-blocked back to text. Parallel to `stmt.result_fields`.
+        let result_formats =
+            resolve_result_formats(&stmt.result_fields, &portal.result_column_format);
+
         let projection: Option<OutputSchema> = if stmt.result_fields.is_empty() {
             None
         } else {
@@ -114,7 +121,11 @@ impl NodeDbPgHandler {
                     .map(|f| OutputColumn {
                         display_name: f.name().into(),
                         lookup_key: f.name().into(),
-                        ty: DdlColType::Text,
+                        // Carry each column's real catalog type (from the
+                        // Describe-phase field) so the encoder can render the
+                        // matching PostgreSQL text form and, for binary
+                        // columns, extract the correctly-typed scalar.
+                        ty: pg_type_to_ddl_col_type(f.datatype()),
                     })
                     .collect(),
                 is_star: false,
@@ -129,7 +140,10 @@ impl NodeDbPgHandler {
                 tenant_id,
                 &addr,
                 &params,
-                projection.as_ref(),
+                ResultShaping {
+                    projection: projection.as_ref(),
+                    formats: &result_formats,
+                },
             )
             .await?;
         Ok(results.pop().unwrap_or(Response::EmptyQuery))

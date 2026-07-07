@@ -161,3 +161,19 @@ pub(in crate::control::server::pgwire) fn col_type_to_field(
         DdlColType::Float8Array => float8_array_field(name),
     }
 }
+
+/// Like [`col_type_to_field`] but with an explicit wire `format`.
+///
+/// Reuses the `DdlColType` -> type-OID mapping and swaps the format, so a
+/// column can advertise (and be encoded in) binary when the client requested
+/// it. The `DataRowEncoder` reads this format from the schema to pick binary
+/// vs text encoding, so both the RowDescription and the `DataRow` bytes stay
+/// in agreement.
+pub(in crate::control::server::pgwire) fn col_type_to_field_with_format(
+    name: &str,
+    ct: DdlColType,
+    format: pgwire::api::results::FieldFormat,
+) -> FieldInfo {
+    let base = col_type_to_field(name, ct);
+    FieldInfo::new(name.to_owned(), None, None, base.datatype().clone(), format)
+}

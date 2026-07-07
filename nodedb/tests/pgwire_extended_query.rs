@@ -221,8 +221,9 @@ async fn extended_query_count_aggregate_returns_count_column() {
         "COUNT(*) result must not expose scan-level columns, got {col_names:?}"
     );
 
-    let n_text: String = rows[0].get::<_, String>(0);
-    assert_eq!(n_text, "2");
+    // COUNT(*) is Postgres bigint (int8), so the client decodes it as i64.
+    let n: i64 = rows[0].get::<_, i64>(0);
+    assert_eq!(n, 2);
 }
 
 /// Key-value lookup by parameterised key must return column-shaped rows.
@@ -512,4 +513,87 @@ async fn extended_query_pg_type_with_parameter() {
         assert!(!row.is_empty());
         let _name: &str = row.get("typname");
     }
+}
+
+/// Typed columns fetched over the extended protocol decode correctly in
+/// binary result format. `tokio-postgres` requests binary for every result
+/// column and binary-decodes each value, so a successful typed `get` proves
+/// the server encoded the column in its PostgreSQL binary wire form.
+#[tokio::test]
+async fn extended_query_binary_typed_columns_decode() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION m (id STRING PRIMARY KEY, n INT, amt DOUBLE, flag BOOL, \
+             name STRING) WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    server
+        .exec(
+            "INSERT INTO m (id, n, amt, flag, name) \
+             VALUES ('a', 42, 2.5, true, 'hello')",
+        )
+        .await
+        .unwrap();
+
+    let rows = server
+        .client
+        .query("SELECT n, amt, flag, name FROM m WHERE id = $1", &[&"a"])
+        .await
+        .expect("prepared typed query should succeed");
+    assert_eq!(rows.len(), 1);
+
+    // int8 -> i64, float8 -> f64, bool -> bool, text -> String.
+    let n: i64 = rows[0].get("n");
+    let amt: f64 = rows[0].get("amt");
+    let flag: bool = rows[0].get("flag");
+    let name: &str = rows[0].get("name");
+    assert_eq!(n, 42);
+    assert!((amt - 2.5).abs() < 1e-9, "amt decoded as {amt}");
+    assert!(flag);
+    assert_eq!(name, "hello");
+}
+
+/// A `TIMESTAMP` column is feature-blocked for binary encoding, so it stays
+/// text even when the client requests binary. The extended query still
+/// succeeds and its binary-capable sibling column decodes; the same timestamp
+/// is retrievable as text over the simple-query path.
+#[tokio::test]
+async fn extended_query_timestamp_text_fallback_with_binary_sibling() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION ev (id STRING PRIMARY KEY, n INT, ts TIMESTAMP) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO ev (id, n, ts) VALUES ('a', 7, '2024-01-01 00:00:00')")
+        .await
+        .unwrap();
+
+    // Extended path: the query carrying a timestamp column must succeed, and
+    // the int8 sibling decodes from binary.
+    let rows = server
+        .client
+        .query("SELECT n, ts FROM ev WHERE id = $1", &[&"a"])
+        .await
+        .expect("query with a timestamp column should succeed");
+    assert_eq!(rows.len(), 1);
+    let n: i64 = rows[0].get("n");
+    assert_eq!(n, 7);
+
+    // Simple-query path returns every column as text, including the timestamp.
+    let text_rows = server
+        .query_text("SELECT ts FROM ev WHERE id = 'a'")
+        .await
+        .expect("simple-query text select should succeed");
+    assert_eq!(text_rows.len(), 1);
+    assert!(
+        !text_rows[0].is_empty(),
+        "timestamp must be present as text on the simple-query path, got {:?}",
+        text_rows[0]
+    );
 }

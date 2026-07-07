@@ -8,7 +8,7 @@
 //! cores and builds a lazy `QueryResponse` that pulls row batches as they
 //! arrive, instead of materializing and merging the whole result first.
 
-use pgwire::api::results::Response;
+use pgwire::api::results::{FieldFormat, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
@@ -43,6 +43,7 @@ impl NodeDbPgHandler {
         post_set_op: PostSetOp,
         addr: &std::net::SocketAddr,
         projection: Option<&OutputSchema>,
+        result_formats: &[FieldFormat],
     ) -> PgWireResult<Option<Response>> {
         if post_set_op != PostSetOp::None
             || !matches!(plan_kind, PlanKind::MultiRow)
@@ -109,7 +110,7 @@ impl NodeDbPgHandler {
         //   - anything else   -> raw single-column envelope passthrough
         let response = match projection {
             Some(s) if !s.is_star && !s.columns.is_empty() => {
-                stream_response::streaming_shaped_response(stream, limit, s.clone())
+                stream_response::streaming_shaped_response(stream, limit, s.clone(), result_formats)
             }
             Some(s) if s.is_star => stream_response::streaming_star_response(stream, limit).await,
             _ => stream_response::streaming_multirow_response(stream, limit),

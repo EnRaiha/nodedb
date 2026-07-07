@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response};
+use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::server::response_shape::compose::shape_decoded_rows;
@@ -18,7 +18,7 @@ use crate::control::server::response_shape::types::DdlColType;
 use crate::control::server::result_stream::ResultStream;
 use crate::data::executor::response_codec::decode_payload_to_json;
 
-use super::super::ddl_encode::col_type_to_field;
+use super::super::ddl_encode::col_type_to_field_with_format;
 use super::super::types::{error_to_sqlstate, text_field};
 use super::shape_encode::{encode_shaped_row, shaped_query_response};
 
@@ -98,6 +98,7 @@ pub(crate) fn streaming_shaped_response(
     stream: ResultStream,
     limit: usize,
     schema_out: OutputSchema,
+    formats: &[FieldFormat],
 ) -> Response {
     use futures::StreamExt;
 
@@ -109,12 +110,21 @@ pub(crate) fn streaming_shaped_response(
     // Advertise each projected column's real catalog type so the streaming
     // path's RowDescription OIDs match the non-streaming `shaped_query_response`
     // (and the extended-query Describe path); `column_types` also drives the
-    // per-cell text rendering in `encode_shaped_row`.
+    // per-cell text rendering in `encode_shaped_row`. Per-column `formats`
+    // carry the client's (feature-downgraded) result-format request so binary
+    // columns advertise and encode in binary.
     let column_types: Vec<DdlColType> = schema_out.columns.iter().map(|c| c.ty).collect();
+    let row_formats: Vec<FieldFormat> = schema_out
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, _)| formats.get(i).copied().unwrap_or(FieldFormat::Text))
+        .collect();
     let fields: Vec<FieldInfo> = schema_out
         .columns
         .iter()
-        .map(|c| col_type_to_field(&c.display_name, c.ty))
+        .enumerate()
+        .map(|(i, c)| col_type_to_field_with_format(&c.display_name, c.ty, row_formats[i]))
         .collect();
     let schema = Arc::new(fields);
     let row_schema = schema.clone();
@@ -149,7 +159,8 @@ pub(crate) fn streaming_shaped_response(
                 if emitted >= limit {
                     break;
                 }
-                let encoded = encode_shaped_row(&row_schema, &display_columns, &column_types, row)?;
+                let encoded =
+                    encode_shaped_row(&row_schema, &display_columns, &column_types, &row_formats, row)?;
                 emitted += 1;
                 yield encoded;
             }
@@ -233,6 +244,8 @@ pub(crate) async fn streaming_star_response(stream: ResultStream, limit: usize) 
     }
 
     let shaped = shape_decoded_rows(&serde_json::Value::Array(values), None);
-    let (response, _notice) = shaped_query_response(shaped);
+    // `SELECT *` derives its columns from the rows and has no client-requested
+    // per-column formats, so it always renders text.
+    let (response, _notice) = shaped_query_response(shaped, &[]);
     response
 }
