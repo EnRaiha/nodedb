@@ -70,10 +70,12 @@ impl CoreLoop {
                 && let Ok(parts) = sonic_rs::from_str::<Vec<serde_json::Value>>(&group_key)
             {
                 // One positional slot per key that contributed to the key bytes
-                // (i.e. has a `field`); emit each under its `output_name`.
+                // (a bare `field` or a computed `expr`); emit each under its
+                // `output_name` — for a computed key this is the evaluated
+                // value that `build_group_key` folded into the key.
                 let mut part_idx = 0usize;
                 for spec in group_by {
-                    if spec.field.is_none() {
+                    if spec.field.is_none() && spec.expr.is_none() {
                         continue;
                     }
                     let val = parts

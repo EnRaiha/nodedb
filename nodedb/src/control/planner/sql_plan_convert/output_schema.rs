@@ -109,9 +109,11 @@ fn column_types_for<C: SqlCatalog>(
 /// value encoding would break the extended-query protocol. (Typed aggregate /
 /// group-key reporting is deferred to a dedicated pgwire value-encoding unit.)
 ///
-/// A non-`Column` GROUP BY key (a computed expression) uses the alias when
-/// present, else a stable `group_{index}` placeholder (also used as the lookup
-/// key).
+/// A non-`Column` GROUP BY key (a computed expression) derives its `lookup_key`
+/// from the shared index-based `computed_group_key_name` rule — the exact name
+/// the aggregate spec emits the evaluated value under, so the two can never
+/// diverge. Its `display_name` is the SELECT-list alias when present
+/// (`UPPER(label) AS u` shows column `u`), else the same placeholder.
 fn group_by_key_column(expr: &SqlExpr, index: usize, alias: Option<&str>) -> OutputColumn {
     match expr {
         SqlExpr::Column { table, name } => {
@@ -127,13 +129,17 @@ fn group_by_key_column(expr: &SqlExpr, index: usize, alias: Option<&str>) -> Out
             }
         }
         _ => {
-            let placeholder = format!("group_{index}");
+            // The executor emits the evaluated value under the shared
+            // index-based name (see `group_by_to_specs`), so `lookup_key` MUST
+            // equal it. `display_name` is the SELECT-list alias when present
+            // (`UPPER(label) AS u` shows column `u`), else the same placeholder.
+            let lookup_key = super::group_key_name::computed_group_key_name(index);
             let display_name = alias
                 .map(str::to_string)
-                .unwrap_or_else(|| placeholder.clone());
+                .unwrap_or_else(|| lookup_key.clone());
             OutputColumn {
                 display_name,
-                lookup_key: placeholder,
+                lookup_key,
                 ty: DdlColType::Text,
             }
         }

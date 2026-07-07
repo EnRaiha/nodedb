@@ -107,8 +107,12 @@ impl CoreLoop {
             }
         }
 
-        // Fast path: index-backed COUNT/GROUP BY.
+        // Fast path: index-backed COUNT/GROUP BY. A computed group key
+        // (`field: None`) has no physical column to scan an index on, so this
+        // path is skipped for it and aggregation falls through to the streaming
+        // (expression-evaluating) path below.
         if group_by.len() == 1
+            && group_by.iter().all(|s| s.field.is_some())
             && filters.is_empty()
             && having.is_empty()
             && aggregates.len() == 1
@@ -160,10 +164,15 @@ impl CoreLoop {
             .get(&mt_key)
             .filter(|mt| !mt.is_empty());
 
-        // Fast path: native columnar aggregation.
-        if let Some(mt) =
-            columnar_mt.filter(|_| sub_group_by.is_empty() && sub_aggregates.is_empty())
-        {
+        // Fast path: native columnar aggregation. This path keys on physical
+        // column names and has no expression-evaluation capability, so a
+        // computed group key (`field: None`) diverts it to the streaming path
+        // below rather than silently mis-grouping on the dropped key.
+        if let Some(mt) = columnar_mt.filter(|_| {
+            sub_group_by.is_empty()
+                && sub_aggregates.is_empty()
+                && group_by.iter().all(|s| s.field.is_some())
+        }) {
             let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
                 Vec::new()
             } else {

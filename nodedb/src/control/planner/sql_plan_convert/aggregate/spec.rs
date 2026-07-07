@@ -219,14 +219,25 @@ pub(super) fn group_by_to_strings(exprs: &[SqlExpr]) -> Vec<String> {
 
 /// Lower GROUP BY expressions to Data-Plane group-key specs.
 ///
-/// Only bare `Column` keys are emitted; a computed-expression key is dropped
-/// (matching the current aggregate behavior). A bare column extracts from, and
-/// is emitted under, its own column name, so its output stays byte-identical to
-/// the string-keyed form. Built from `group_by_to_strings` so the two never
-/// diverge on which keys are dropped.
+/// A bare `Column` key extracts from, and is emitted under, its own column
+/// name, so its output stays byte-identical to the string-keyed form. A
+/// computed-expression key carries the bridge-evaluated expression (`field:
+/// None, expr: Some(..)`) and is emitted under the shared index-based
+/// [`group_key_output_name`] name (`group_{index}`) — a purely internal
+/// executor↔shaper handshake, matching the response shaper's `lookup_key`. The
+/// SELECT alias never enters here; it reaches only the shaper's `display_name`.
 pub(super) fn group_by_to_specs(exprs: &[SqlExpr]) -> Vec<GroupKeySpec> {
-    group_by_to_strings(exprs)
-        .into_iter()
-        .map(GroupKeySpec::column)
+    use super::super::group_key_name::group_key_output_name;
+    exprs
+        .iter()
+        .enumerate()
+        .map(|(index, e)| match e {
+            SqlExpr::Column { name, .. } => GroupKeySpec::column(name.clone()),
+            _ => GroupKeySpec {
+                output_name: group_key_output_name(e, index),
+                field: None,
+                expr: Some(sql_expr_to_bridge_expr(e)),
+            },
+        })
         .collect()
 }

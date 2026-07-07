@@ -134,10 +134,12 @@ impl CoreLoop {
                         detail: format!("partial-state group key decode: {e}"),
                     })?;
                 // One positional slot per key that contributed to the key bytes
-                // (i.e. has a `field`); re-emit each under its `output_name`.
+                // (a bare `field` or a computed `expr`); re-emit each under its
+                // `output_name` so the consume side can rebuild a byte-identical
+                // key from these flat row fields.
                 let mut part_idx = 0usize;
                 for spec in group_by {
-                    if spec.field.is_none() {
+                    if spec.field.is_none() && spec.expr.is_none() {
                         continue;
                     }
                     let jv = parts

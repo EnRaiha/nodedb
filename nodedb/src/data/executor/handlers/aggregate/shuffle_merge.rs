@@ -25,13 +25,29 @@ use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 use nodedb_query::msgpack_scan;
 
+/// The producer emits each group-key value as a flat row field named by its
+/// `output_name` (see `state_emit::partial_state_rows`). Re-deriving the merge
+/// key from those rows therefore keys every spec — bare column OR computed — on
+/// its `output_name` as a plain field. For a bare column `output_name == field`,
+/// so this is identical to keying on the original spec; for a computed key it
+/// reads the already-evaluated value the producer folded in, yielding a
+/// byte-identical key without needing the original document columns (which the
+/// flat row no longer carries).
+fn row_key_specs(group_by: &[GroupKeySpec]) -> Vec<GroupKeySpec> {
+    group_by
+        .iter()
+        .map(|s| GroupKeySpec::column(s.output_name.clone()))
+        .collect()
+}
+
 /// Merge every partial-state frame in `state_path` into a consolidated
 /// `HashMap<group_key, GroupState>`.
 ///
 /// For each frame row:
-/// - the group key is rebuilt via `msgpack_scan::build_group_key(row,
-///   group_by)` — byte-identical to the producer's accumulate-side key, so
-///   matching groups from different producers collide on the same map entry;
+/// - the group key is rebuilt via `msgpack_scan::build_group_key` over
+///   [`row_key_specs`] (each key read from its flat `output_name` field) —
+///   byte-identical to the producer's accumulate-side key, so matching groups
+///   from different producers collide on the same map entry;
 /// - the `__agg_state` field bytes are decoded into a partial `GroupState` and
 ///   `merge_from`'d into the entry (or inserted as the first state).
 ///
@@ -48,10 +64,11 @@ pub(in crate::data::executor) fn merge_state_frames(
 ) -> crate::Result<HashMap<String, GroupState>> {
     let mut merged: HashMap<String, GroupState> = HashMap::new();
     let mut reader = FrameStreamReader::open(state_path)?;
+    let row_keys = row_key_specs(group_by);
 
     while let Some(row) = reader.next_row()? {
-        // Byte-identical group key reconstruction.
-        let key = msgpack_scan::build_group_key(&row, group_by);
+        // Byte-identical group key reconstruction from the flat row fields.
+        let key = msgpack_scan::build_group_key(&row, &row_keys);
 
         // Extract the `__agg_state` binary field.
         let (val_start, _val_end) = msgpack_scan::extract_field(&row, 0, AGG_STATE_FIELD)

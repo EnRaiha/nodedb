@@ -13,6 +13,7 @@ use crate::planner::aggregate::{
     expr_column_name, extract_aggregates_from_projection, function_args_exprs, key_column_name,
     normalize_function_name,
 };
+use crate::resolver::expr::convert_expr;
 use crate::types::query::AggOutputSlot;
 use crate::types_expr::SqlExpr;
 
@@ -49,6 +50,24 @@ pub fn compute_output_order(
         {
             order.push(AggOutputSlot::GroupKey(index));
             continue;
+        }
+        // Computed expression that structurally matches a GROUP BY key
+        // (e.g. `UPPER(label)` selected AND grouped). It is neither a bare
+        // column nor an aggregate, so it must be classified before the
+        // grouping / aggregate checks below. `SqlExpr` has no `PartialEq`
+        // (it can carry a subquery plan), so compare the canonical `Debug`
+        // rendering — both the projection expr and the GROUP BY key pass
+        // through the same `convert_expr`, so equal expressions render
+        // identically.
+        if let Ok(converted) = convert_expr(expr) {
+            let rendered = format!("{converted:?}");
+            if let Some(index) = group_by
+                .iter()
+                .position(|key| format!("{key:?}") == rendered)
+            {
+                order.push(AggOutputSlot::GroupKey(index));
+                continue;
+            }
         }
         // `GROUPING(col)` pseudo-aggregates: not in the function registry, so
         // `contains_aggregate` misses them, and the planner appends them after

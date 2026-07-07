@@ -5,7 +5,7 @@
 //! Builds a deterministic string key from field values extracted directly
 //! from msgpack bytes, avoiding full document decode.
 
-use crate::expr::GroupKeySpec;
+use crate::expr::{GroupKeySpec, SqlExpr};
 use crate::msgpack_scan::field::extract_field;
 use crate::msgpack_scan::index::FieldIndex;
 use crate::msgpack_scan::reader::{read_f64, read_i64, read_null, read_str};
@@ -16,9 +16,13 @@ use crate::msgpack_scan::reader::{read_f64, read_i64, read_null, read_str};
 /// This is compatible with the legacy `sonic_rs::to_string(&key_parts)` format,
 /// so the result-construction code can parse it back with `sonic_rs::from_str`.
 ///
-/// Each key contributes one positional slot, extracted from the document field
-/// named by its `field`. A key with no `field` (a computed expression, not yet
-/// evaluated here) contributes no slot at all.
+/// Each key contributes one positional slot: a bare-column key (`field: Some`)
+/// contributes the value extracted from that document field; a computed key
+/// (`field: None, expr: Some`) contributes the value of the expression
+/// evaluated against the whole document. Evaluation is deterministic on the
+/// document bytes, so the same spec on the same bytes yields a byte-identical
+/// slot on producer and consumer. A spec with neither `field` nor `expr`
+/// contributes no slot.
 pub fn build_group_key(doc: &[u8], group_keys: &[GroupKeySpec]) -> String {
     if group_keys.is_empty() {
         return "__all__".to_string();
@@ -28,14 +32,19 @@ pub fn build_group_key(doc: &[u8], group_keys: &[GroupKeySpec]) -> String {
     key_buf.push('[');
     let mut written = 0usize;
     for spec in group_keys {
-        let Some(field) = spec.field.as_deref() else {
-            continue;
-        };
-        if written > 0 {
-            key_buf.push(',');
+        if let Some(field) = spec.field.as_deref() {
+            if written > 0 {
+                key_buf.push(',');
+            }
+            append_field_value(&mut key_buf, doc, field);
+            written += 1;
+        } else if let Some(expr) = spec.expr.as_ref() {
+            if written > 0 {
+                key_buf.push(',');
+            }
+            append_computed_value(&mut key_buf, doc, expr);
+            written += 1;
         }
-        append_field_value(&mut key_buf, doc, field);
-        written += 1;
     }
     key_buf.push(']');
     key_buf
@@ -55,27 +64,30 @@ pub fn build_group_key_indexed(
     key_buf.push('[');
     let mut written = 0usize;
     for spec in group_keys {
-        let Some(field) = spec.field.as_deref() else {
-            continue;
-        };
-        if written > 0 {
-            key_buf.push(',');
+        if let Some(field) = spec.field.as_deref() {
+            if written > 0 {
+                key_buf.push(',');
+            }
+            let range = idx.get(field);
+            append_field_value_range(&mut key_buf, doc, range);
+            written += 1;
+        } else if let Some(expr) = spec.expr.as_ref() {
+            // A computed key evaluates against the whole document, not a single
+            // indexed field, so the field index cannot short-circuit it.
+            if written > 0 {
+                key_buf.push(',');
+            }
+            append_computed_value(&mut key_buf, doc, expr);
+            written += 1;
         }
-        let range = idx.get(field);
-        append_field_value_range(&mut key_buf, doc, range);
-        written += 1;
     }
     key_buf.push(']');
     key_buf
 }
 
-/// Append a single field's value to the key buffer as a JSON literal.
-fn append_field_value(buf: &mut String, doc: &[u8], field: &str) {
-    let Some((start, end)) = extract_field(doc, 0, field) else {
-        buf.push_str("null");
-        return;
-    };
-
+/// Append the msgpack value at `doc[start..end]` to the key buffer as a JSON
+/// literal (string quoted, numbers/null verbatim, complex values hex-encoded).
+fn append_value_at(buf: &mut String, doc: &[u8], start: usize, end: usize) {
     if read_null(doc, start) {
         buf.push_str("null");
     } else if let Some(s) = read_str(doc, start) {
@@ -98,31 +110,36 @@ fn append_field_value(buf: &mut String, doc: &[u8], field: &str) {
     }
 }
 
+/// Append a single field's value to the key buffer as a JSON literal.
+fn append_field_value(buf: &mut String, doc: &[u8], field: &str) {
+    match extract_field(doc, 0, field) {
+        Some((start, end)) => append_value_at(buf, doc, start, end),
+        None => buf.push_str("null"),
+    }
+}
+
 /// Append a field value from a pre-resolved range.
 fn append_field_value_range(buf: &mut String, doc: &[u8], range: Option<(usize, usize)>) {
-    let Some((start, end)) = range else {
+    match range {
+        Some((start, end)) => append_value_at(buf, doc, start, end),
+        None => buf.push_str("null"),
+    }
+}
+
+/// Append a computed key's value: evaluate `expr` against the whole document
+/// and encode the result the same way a field value is encoded, so a computed
+/// slot is byte-identical wherever the same expression meets the same document.
+/// A document that cannot be decoded, or a value that cannot be re-encoded,
+/// contributes `null` — mirroring the missing-field handling above.
+fn append_computed_value(buf: &mut String, doc: &[u8], expr: &SqlExpr) {
+    let Ok(doc_val) = nodedb_types::json_msgpack::value_from_msgpack(doc) else {
         buf.push_str("null");
         return;
     };
-
-    if read_null(doc, start) {
-        buf.push_str("null");
-    } else if let Some(s) = read_str(doc, start) {
-        buf.push('"');
-        buf.push_str(s);
-        buf.push('"');
-    } else if let Some(n) = read_i64(doc, start) {
-        use std::fmt::Write;
-        let _ = write!(buf, "{n}");
-    } else if let Some(n) = read_f64(doc, start) {
-        use std::fmt::Write;
-        let _ = write!(buf, "{n}");
-    } else {
-        let bytes = &doc[start..end];
-        for b in bytes {
-            use std::fmt::Write;
-            let _ = write!(buf, "{b:02x}");
-        }
+    let val = expr.eval(&doc_val);
+    match nodedb_types::json_msgpack::value_to_msgpack(&val) {
+        Ok(vb) => append_value_at(buf, &vb, 0, vb.len()),
+        Err(_) => buf.push_str("null"),
     }
 }
 
@@ -186,5 +203,50 @@ mod tests {
         let doc = encode(&json!({"temp": 36.6}));
         let key = build_group_key(&doc, &keys(&["temp"]));
         assert_eq!(key, "[36.6]");
+    }
+
+    /// A computed group key evaluates its expression and folds the result into
+    /// the key slot; `alpha` and `ALPHA` collapse under `UPPER(label)`.
+    fn upper_label_spec() -> GroupKeySpec {
+        GroupKeySpec {
+            output_name: "u".to_string(),
+            field: None,
+            expr: Some(SqlExpr::Function {
+                name: "upper".to_string(),
+                args: vec![SqlExpr::Column("label".to_string())],
+            }),
+        }
+    }
+
+    #[test]
+    fn computed_key_folds_expression_value() {
+        let lower = encode(&json!({"label": "alpha", "score": 7}));
+        let upper = encode(&json!({"label": "ALPHA", "score": 3}));
+        assert_eq!(
+            build_group_key(&lower, &[upper_label_spec()]),
+            r#"["ALPHA"]"#
+        );
+        assert_eq!(
+            build_group_key(&upper, &[upper_label_spec()]),
+            r#"["ALPHA"]"#
+        );
+    }
+
+    #[test]
+    fn computed_key_indexed_matches_unindexed() {
+        let doc = encode(&json!({"label": "beta", "score": 5}));
+        let specs = [upper_label_spec()];
+        let idx = FieldIndex::build(&doc, 0).unwrap_or_else(FieldIndex::empty);
+        assert_eq!(
+            build_group_key(&doc, &specs),
+            build_group_key_indexed(&doc, &specs, &idx),
+        );
+    }
+
+    #[test]
+    fn mixed_column_and_computed_keys() {
+        let doc = encode(&json!({"region": "us", "label": "west"}));
+        let specs = [GroupKeySpec::column("region"), upper_label_spec()];
+        assert_eq!(build_group_key(&doc, &specs), r#"["us","WEST"]"#);
     }
 }
