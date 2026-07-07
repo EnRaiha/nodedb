@@ -47,14 +47,7 @@ pub fn drop_schedule(
 
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     // Pre-check existence: `IF EXISTS` + missing is a no-op that
     // doesn't touch raft. Check via the in-memory registry since

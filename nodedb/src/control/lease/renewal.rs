@@ -224,7 +224,6 @@ impl LeaseRenewalLoop {
 fn lookup_current_version(shared: &SharedState, id: &DescriptorId) -> Option<u64> {
     use nodedb_cluster::DescriptorKind;
     let catalog = shared.credentials.catalog();
-    let catalog = catalog.as_ref()?;
     match id.kind {
         DescriptorKind::Collection => catalog
             .get_collection(DatabaseId::DEFAULT, id.tenant_id, &id.name)

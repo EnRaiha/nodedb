@@ -28,8 +28,11 @@ pub fn create_timeseries(
     let name = parts[2].to_lowercase();
     let tenant_id = identity.tenant_id;
 
-    if let Some(catalog) = state.credentials.catalog()
-        && let Ok(Some(_)) = catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name)
+    if let Ok(Some(_)) =
+        state
+            .credentials
+            .catalog()
+            .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name)
     {
         return Err(ddl_err(
             "42P07",
@@ -95,7 +98,8 @@ pub fn create_timeseries(
         declared_primary_key: None,
     };
 
-    if let Some(catalog) = state.credentials.catalog() {
+    {
+        let catalog = state.credentials.catalog();
         catalog
             .put_collection(database_id, &coll)
             .map_err(|e| ddl_err("XX000", e.to_string()))?;

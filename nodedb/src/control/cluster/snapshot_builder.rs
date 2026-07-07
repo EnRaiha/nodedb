@@ -266,20 +266,19 @@ impl nodedb_cluster::SnapshotBuilder for DataPlaneSnapshotBuilder {
         // its `tenant_id`; the distinct set is the tenants to snapshot. When no
         // catalog is configured there is nothing durable to enumerate, so ship
         // an empty (well-formed) snapshot.
-        let tenants: Vec<u64> = match self.shared.credentials.catalog() {
-            Some(catalog) => {
-                let collections = catalog
-                    .load_all_collections(DatabaseId::DEFAULT)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let mut set: HashSet<u64> = HashSet::new();
-                for coll in collections.iter().filter(|c| c.is_active) {
-                    set.insert(coll.tenant_id);
-                }
-                let mut v: Vec<u64> = set.into_iter().collect();
-                v.sort_unstable();
-                v
+        let tenants: Vec<u64> = {
+            let catalog = self.shared.credentials.catalog();
+
+            let collections = catalog
+                .load_all_collections(DatabaseId::DEFAULT)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let mut set: HashSet<u64> = HashSet::new();
+            for coll in collections.iter().filter(|c| c.is_active) {
+                set.insert(coll.tenant_id);
             }
-            None => Vec::new(),
+            let mut v: Vec<u64> = set.into_iter().collect();
+            v.sort_unstable();
+            v
         };
 
         let mut merged = TenantDataSnapshot::default();
@@ -295,7 +294,8 @@ impl nodedb_cluster::SnapshotBuilder for DataPlaneSnapshotBuilder {
         // follower has documents but cannot resolve PK point-lookups. The
         // catalog is Control-Plane state (the Data-Plane snapshot handler can't
         // see it), so it is captured here and rebound on the apply side.
-        if let Some(catalog) = self.shared.credentials.catalog() {
+        {
+            let catalog = self.shared.credentials.catalog();
             Self::capture_surrogates(catalog, &tenants, &group_vshards, &mut merged)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }

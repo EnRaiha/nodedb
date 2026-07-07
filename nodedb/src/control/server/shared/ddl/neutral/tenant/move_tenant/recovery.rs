@@ -174,10 +174,7 @@ pub async fn resume_or_compensate(
 ///
 /// Called once during server startup before accepting connections.
 pub async fn recover_all(state: &SharedState) {
-    let catalog = match state.credentials.catalog().as_ref() {
-        Some(c) => c,
-        None => return,
-    };
+    let catalog = state.credentials.catalog();
 
     let entries = match journal::scan_all_journal_entries(catalog) {
         Ok(e) => e,

@@ -82,14 +82,7 @@ pub fn create_consumer_group(
         created_at: now,
     };
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     catalog.put_consumer_group(&def).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),

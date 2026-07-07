@@ -64,9 +64,7 @@ pub async fn create_checkpoint(
     };
 
     // Check for duplicate and persist.
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "catalog unavailable".to_string()));
-    };
+    let catalog = state.credentials.catalog();
     if catalog
         .get_checkpoint(tenant_id.as_u64(), &collection, &doc_id, &checkpoint_name)
         .map_err(|e| err("XX000", e.to_string()))?
@@ -107,9 +105,7 @@ pub fn drop_checkpoint(
     let (checkpoint_name, collection, doc_id) = parse_checkpoint_sql(sql, "DROP CHECKPOINT")?;
     let tenant_id = identity.tenant_id;
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "catalog unavailable".to_string()));
-    };
+    let catalog = state.credentials.catalog();
     let existed = catalog
         .delete_checkpoint(tenant_id.as_u64(), &collection, &doc_id, &checkpoint_name)
         .map_err(|e| err("XX000", e.to_string()))?;

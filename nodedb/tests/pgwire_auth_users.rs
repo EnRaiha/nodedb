@@ -178,7 +178,7 @@ fn dropped_username_is_free_for_service_account() {
     // The CREATE-time uniqueness check for service accounts shares
     // the user uniqueness store. A name freed by DROP USER must be
     // available to a new service account.
-    let store = CredentialStore::new();
+    let store = CredentialStore::new().expect("build credential store");
     store
         .create_user("demo2", "oldpass", TenantId::new(2), vec![Role::ReadWrite])
         .unwrap();

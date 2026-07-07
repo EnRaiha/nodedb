@@ -84,11 +84,7 @@ pub fn alter_retention_policy(
     }
 
     // Persist updated policy.
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
+    let catalog = state.credentials.catalog();
 
     catalog
         .put_retention_policy(&def)

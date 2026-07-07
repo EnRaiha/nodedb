@@ -36,7 +36,7 @@ use super::super::record::UserRecord;
 pub struct CredentialStore {
     pub(in crate::control::security::credential) users: RwLock<HashMap<String, UserRecord>>,
     pub(in crate::control::security::credential) next_user_id: RwLock<u64>,
-    pub(in crate::control::security::credential) catalog: Option<SystemCatalog>,
+    pub(in crate::control::security::credential) catalog: SystemCatalog,
     /// Failed login tracking (in-memory only — clears on restart).
     pub(in crate::control::security::credential) login_attempts:
         RwLock<HashMap<String, LoginAttemptTracker>>,
@@ -63,12 +63,6 @@ pub struct CredentialStore {
         std::sync::OnceLock<Arc<crate::control::security::buses::UserChangeBus>>,
 }
 
-impl Default for CredentialStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub(in crate::control::security::credential) fn read_lock<T>(
     lock: &RwLock<T>,
 ) -> crate::Result<std::sync::RwLockReadGuard<'_, T>> {
@@ -92,12 +86,13 @@ pub(in crate::control::security::credential) fn write_lock<T>(
 }
 
 impl CredentialStore {
-    /// Create an in-memory-only credential store (for tests).
-    pub fn new() -> Self {
-        Self {
+    /// Create an in-memory-only credential store backed by an in-memory
+    /// system catalog (for tests and in-process fixtures).
+    pub fn new() -> crate::Result<Self> {
+        Ok(Self {
             users: RwLock::new(HashMap::new()),
             next_user_id: RwLock::new(1),
-            catalog: None,
+            catalog: SystemCatalog::open_in_memory()?,
             login_attempts: RwLock::new(HashMap::new()),
             max_failed_logins: 0,
             lockout_duration: std::time::Duration::from_secs(300),
@@ -107,7 +102,7 @@ impl CredentialStore {
             versions: RwLock::new(HashMap::new()),
             si_bus: std::sync::OnceLock::new(),
             uc_bus: std::sync::OnceLock::new(),
-        }
+        })
     }
 
     /// Open a persistent credential store backed by redb.
@@ -134,7 +129,7 @@ impl CredentialStore {
         Ok(Self {
             users: RwLock::new(users),
             next_user_id: RwLock::new(next_id),
-            catalog: Some(catalog),
+            catalog,
             login_attempts: RwLock::new(HashMap::new()),
             max_failed_logins: 0,
             lockout_duration: std::time::Duration::from_secs(300),
@@ -154,9 +149,7 @@ impl CredentialStore {
         record: &mut UserRecord,
     ) -> crate::Result<()> {
         record.updated_at = now_secs();
-        if let Some(ref catalog) = self.catalog {
-            catalog.put_user(&record.to_stored())?;
-        }
+        self.catalog.put_user(&record.to_stored())?;
         Ok(())
     }
 
@@ -165,9 +158,7 @@ impl CredentialStore {
         &self,
         id: u64,
     ) -> crate::Result<()> {
-        if let Some(ref catalog) = self.catalog {
-            catalog.save_next_user_id(id)?;
-        }
+        self.catalog.save_next_user_id(id)?;
         Ok(())
     }
 
@@ -317,9 +308,7 @@ impl CredentialStore {
         let user_id = record.user_id;
 
         // 1. Delete from the persistent catalog.
-        if let Some(ref catalog) = self.catalog {
-            catalog.delete_user(&record.username)?;
-        }
+        self.catalog.delete_user(&record.username)?;
 
         // 2. UserChanged.
         if let Some(bus) = self.uc_bus.get() {

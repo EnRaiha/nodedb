@@ -41,10 +41,7 @@ pub fn grant_database(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "GRANT ON DATABASE")?;
 
-    let catalog = state.credentials.catalog().as_ref().ok_or(DdlError {
-        sqlstate: "XX000".to_string(),
-        message: "system catalog unavailable".to_string(),
-    })?;
+    let catalog = state.credentials.catalog();
 
     let db_id = catalog
         .get_database_id_by_name(db_name)
@@ -116,10 +113,7 @@ pub fn revoke_database(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "REVOKE ON DATABASE")?;
 
-    let catalog = state.credentials.catalog().as_ref().ok_or(DdlError {
-        sqlstate: "XX000".to_string(),
-        message: "system catalog unavailable".to_string(),
-    })?;
+    let catalog = state.credentials.catalog();
 
     let db_id = catalog
         .get_database_id_by_name(db_name)

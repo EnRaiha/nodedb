@@ -18,9 +18,7 @@ pub(super) fn collection_exists(
     name: &str,
     database_id: DatabaseId,
 ) -> bool {
-    let Some(catalog) = state.credentials.catalog() else {
-        return false;
-    };
+    let catalog = state.credentials.catalog();
     let tid = identity.tenant_id.as_u64();
     matches!(catalog.get_collection(database_id, tid, name), Ok(Some(_)))
 }

@@ -106,10 +106,7 @@ fn effective_retention_for_tenant(
 /// Single sweep pass. Public for testability — callers can drive the
 /// sweeper synchronously in tests without waiting on the interval.
 pub fn sweep_once(shared: &SharedState, retention: Duration) -> crate::Result<()> {
-    let Some(catalog) = shared.credentials.catalog() else {
-        // No persistent catalog — nothing to sweep.
-        return Ok(());
-    };
+    let catalog = shared.credentials.catalog();
 
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)

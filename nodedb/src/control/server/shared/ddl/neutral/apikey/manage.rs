@@ -59,7 +59,7 @@ pub fn revoke_api_key(
         let catalog = state.credentials.catalog();
         state
             .api_keys
-            .revoke_key(key_id, catalog.as_ref())
+            .revoke_key(key_id, Some(catalog))
             .map_err(|e| err("XX000", e.to_string()))?
     } else {
         // Cluster mode: trust the committed log index — the
@@ -157,8 +157,9 @@ pub fn list_api_keys(
                     state
                         .credentials
                         .catalog()
-                        .as_ref()
-                        .and_then(|cat| cat.get_database_name_by_id(db_id).ok().flatten())
+                        .get_database_name_by_id(db_id)
+                        .ok()
+                        .flatten()
                         .unwrap_or_else(|| format!("<id:{}>", db_id.as_u64()))
                 })
                 .collect();

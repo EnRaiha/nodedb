@@ -32,12 +32,7 @@ pub fn handle_use_database(
     addr: &SocketAddr,
     name: &str,
 ) -> PgWireResult<Vec<Response>> {
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => {
-            return Err(sqlstate_error("XX000", "system catalog unavailable"));
-        }
-    };
+    let catalog = state.credentials.catalog();
 
     // Verify the named database exists.
     let db_id = catalog

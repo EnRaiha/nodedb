@@ -27,12 +27,13 @@ pub fn handle_compact(
     let tenant_id = identity.tenant_id;
 
     // Verify collection exists.
-    if let Some(catalog) = state.credentials.catalog()
-        && catalog
-            .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
-            .ok()
-            .flatten()
-            .is_none()
+    if state
+        .credentials
+        .catalog()
+        .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
+        .ok()
+        .flatten()
+        .is_none()
     {
         return Err(ddl_err(
             "42P01",

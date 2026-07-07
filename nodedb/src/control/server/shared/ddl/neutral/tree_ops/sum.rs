@@ -98,15 +98,15 @@ pub async fn tree_sum(
     // Without it, we fall back to scanning all tenant collections (O(N×C)).
     let collections_to_search: Vec<String> = if let Some(ref coll) = explicit_collection {
         vec![coll.clone()]
-    } else if let Some(catalog) = state.credentials.catalog() {
-        catalog
+    } else {
+        state
+            .credentials
+            .catalog()
             .load_collections_for_tenant(database_id, tenant_id.as_u64())
             .unwrap_or_default()
             .iter()
             .map(|c| c.name.clone())
             .collect()
-    } else {
-        Vec::new()
     };
 
     for node_id in &all_ids {

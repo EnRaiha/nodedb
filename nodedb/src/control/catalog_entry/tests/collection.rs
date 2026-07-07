@@ -44,7 +44,7 @@ fn roundtrip_deactivate_collection() {
 #[test]
 fn apply_put_collection_writes_redb() {
     let (credentials, _tmp) = open_catalog();
-    let catalog = credentials.catalog().as_ref().expect("catalog present");
+    let catalog = credentials.catalog();
 
     let stored = StoredCollection::new(1, "widgets", "carol");
     apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog);
@@ -61,7 +61,7 @@ fn apply_put_collection_writes_redb() {
 #[test]
 fn apply_deactivate_collection_preserves_record() {
     let (credentials, _tmp) = open_catalog();
-    let catalog = credentials.catalog().as_ref().expect("catalog present");
+    let catalog = credentials.catalog();
 
     // Set up through `apply_to` so the owner row is written
     // alongside the primary row — deactivate would otherwise
@@ -88,7 +88,7 @@ fn apply_deactivate_collection_preserves_record() {
 #[test]
 fn apply_deactivate_missing_is_noop() {
     let (credentials, _tmp) = open_catalog();
-    let catalog = credentials.catalog().as_ref().expect("catalog present");
+    let catalog = credentials.catalog();
     apply_to(
         &CatalogEntry::DeactivateCollection {
             tenant_id: 1,

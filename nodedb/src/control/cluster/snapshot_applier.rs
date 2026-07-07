@@ -101,9 +101,8 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
         let mut clear_vshards: Vec<u32> = group_vshards.iter().copied().collect();
         clear_vshards.sort_unstable();
         let mut collections_to_clear: Vec<(u64, String)> = Vec::new();
-        if !group_vshards.is_empty()
-            && let Some(catalog) = self.shared.credentials.catalog()
-        {
+        if !group_vshards.is_empty() {
+            let catalog = self.shared.credentials.catalog();
             let collections = catalog
                 .load_all_collections(DatabaseId::DEFAULT)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -151,9 +150,8 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
                 detail: format!("snapshot apply: decode group {group_id} snapshot: {e}"),
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
-        if !snap.surrogate_pk.is_empty()
-            && let Some(catalog) = self.shared.credentials.catalog()
-        {
+        if !snap.surrogate_pk.is_empty() {
+            let catalog = self.shared.credentials.catalog();
             for e in &snap.surrogate_pk {
                 catalog
                     .put_surrogate(

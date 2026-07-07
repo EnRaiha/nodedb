@@ -42,9 +42,7 @@ pub(super) fn add_materialized_sum(
         value_expr: expr,
     };
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, target_collection)

@@ -42,11 +42,7 @@ pub async fn handle_move_tenant(
     from_db: &str,
     to_db: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
+    let catalog = state.credentials.catalog();
 
     // Resolve source database id first so the privilege gate can carry it
     // in the audit record. The gate runs BEFORE tenant / target lookup so an

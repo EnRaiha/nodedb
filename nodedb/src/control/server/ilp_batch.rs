@@ -210,8 +210,8 @@ async fn flush_ilp_batch_inner(
                     })
                     .collect();
 
+                let catalog = state.credentials.catalog();
                 if !fields.is_empty()
-                    && let Some(catalog) = state.credentials.catalog().as_ref()
                     && let Ok(Some(mut coll)) =
                         catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
                     && coll.fields != fields

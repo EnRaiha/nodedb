@@ -120,7 +120,8 @@ impl LocalPlanExecutor {
 
         // ── 2. Descriptor version validation ──────────────────────────────────
         let catalog_ref = self.state.credentials.catalog();
-        if let Some(catalog) = catalog_ref.as_ref() {
+        {
+            let catalog = catalog_ref;
             for entry in &req.descriptor_versions {
                 match catalog.get_collection(database_id, req.tenant_id, &entry.collection) {
                     Ok(Some(stored)) => {
@@ -191,8 +192,7 @@ impl LocalPlanExecutor {
         ) = &mut plan
             && *surrogate == nodedb_types::Surrogate::ZERO
             && !pk_bytes.is_empty()
-            && let Some(catalog) = catalog_ref.as_ref()
-            && let Ok(Some(resolved)) = catalog.get_surrogate_for_pk(
+            && let Ok(Some(resolved)) = catalog_ref.get_surrogate_for_pk(
                 database_id,
                 crate::types::TenantId::new(req.tenant_id),
                 collection,

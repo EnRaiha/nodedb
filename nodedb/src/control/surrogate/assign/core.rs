@@ -146,10 +146,7 @@ impl SurrogateAssigner {
         collection: &str,
         pk_bytes: &[u8],
     ) -> crate::Result<Surrogate> {
-        let catalog = match self.credential_store.catalog().as_ref() {
-            Some(c) => c,
-            None => return Ok(Surrogate::ZERO),
-        };
+        let catalog = self.credential_store.catalog();
 
         // Fast-path: existing binding. Done under a read lock — most
         // production calls land here once the per-collection working
@@ -242,10 +239,7 @@ impl SurrogateAssigner {
         tenant_id: TenantId,
         collection: &str,
     ) -> crate::Result<Surrogate> {
-        let catalog = match self.credential_store.catalog().as_ref() {
-            Some(c) => c,
-            None => return Ok(Surrogate::ZERO),
-        };
+        let catalog = self.credential_store.catalog();
 
         // Allocate + self-bind + maybe-flush under the registry write lock,
         // with the same empty-batch refill fallback as the `assign` slow path.
@@ -343,10 +337,7 @@ impl SurrogateAssigner {
         collection: &str,
         pk_bytes: &[u8],
     ) -> crate::Result<Option<Surrogate>> {
-        let catalog = match self.credential_store.catalog().as_ref() {
-            Some(c) => c,
-            None => return Ok(Some(Surrogate::ZERO)),
-        };
+        let catalog = self.credential_store.catalog();
         catalog.get_surrogate_for_pk(database_id, tenant_id, collection, pk_bytes)
     }
 
@@ -391,10 +382,7 @@ impl SurrogateAssigner {
         pk_bytes: &[u8],
         surrogate: Surrogate,
     ) -> crate::Result<Surrogate> {
-        let catalog = match self.credential_store.catalog().as_ref() {
-            Some(c) => c,
-            None => return Ok(surrogate),
-        };
+        let catalog = self.credential_store.catalog();
 
         // First-wins pre-check under a read lock: if any binding is already
         // installed (replay, retry, or a competing coordinator's carried
@@ -463,10 +451,7 @@ impl SurrogateAssigner {
         tenant_id: TenantId,
         collection: &str,
     ) -> crate::Result<Surrogate> {
-        let catalog = match self.credential_store.catalog().as_ref() {
-            Some(c) => c,
-            None => return Ok(Surrogate::ZERO),
-        };
+        let catalog = self.credential_store.catalog();
 
         loop {
             let registry = self.registry_write()?;
@@ -591,7 +576,7 @@ mod tests {
         let s = a
             .assign(DatabaseId::DEFAULT, T0, "users", b"alice")
             .unwrap();
-        let cat = a.credential_store.catalog().as_ref().unwrap();
+        let cat = a.credential_store.catalog();
         assert_eq!(
             cat.get_pk_for_surrogate(DatabaseId::DEFAULT, T0, "users", s)
                 .unwrap(),
@@ -613,7 +598,7 @@ mod tests {
         // Either threshold (1024 ops or 200 ms elapsed) may fire
         // first; assert only that the catalog persisted *some*
         // checkpoint inside the (0, n] band.
-        let cat = a.credential_store.catalog().as_ref().unwrap();
+        let cat = a.credential_store.catalog();
         let persisted = cat.get_surrogate_hwm().unwrap();
         assert!(persisted > 0 && persisted <= n as u32);
     }

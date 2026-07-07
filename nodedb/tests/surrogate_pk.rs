@@ -61,7 +61,7 @@ fn assign_is_idempotent_for_same_pk() {
         .unwrap();
     assert_eq!(s1, s2);
     assert_eq!(s2, s3);
-    let cat = creds.catalog().as_ref().unwrap();
+    let cat = creds.catalog();
     assert_eq!(
         cat.get_surrogate_for_pk(
             nodedb_types::DatabaseId::DEFAULT,
@@ -149,7 +149,7 @@ fn drop_collection_wipes_surrogate_map() {
             b"o1",
         )
         .unwrap();
-    let cat = creds.catalog().as_ref().unwrap();
+    let cat = creds.catalog();
     assert_eq!(
         cat.scan_surrogates_for_collection(
             nodedb_types::DatabaseId::DEFAULT,
@@ -259,7 +259,7 @@ fn flush_emits_wal_record_at_threshold() {
         bind_calls as usize, n,
         "expected one SurrogateBind per fresh allocation"
     );
-    let cat = creds.catalog().as_ref().unwrap();
+    let cat = creds.catalog();
     let persisted = cat.get_surrogate_hwm().unwrap();
     assert!(
         persisted > 0 && persisted <= n as u32,
@@ -287,7 +287,7 @@ fn assigns_persist_across_reopen() {
     }
     // Reopen — the binding row must survive.
     let creds = CredentialStore::open(&path).unwrap();
-    let cat = creds.catalog().as_ref().unwrap();
+    let cat = creds.catalog();
     assert_eq!(
         cat.get_surrogate_for_pk(
             nodedb_types::DatabaseId::DEFAULT,

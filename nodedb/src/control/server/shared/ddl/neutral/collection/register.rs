@@ -49,9 +49,7 @@ pub async fn dispatch_register_if_needed(
     let name = parts.get(2).map(|s| s.to_lowercase()).unwrap_or_default();
     let tenant_id = identity.tenant_id;
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Ok(());
-    };
+    let catalog = state.credentials.catalog();
     let Ok(Some(coll)) = catalog.get_collection(database_id, tenant_id.as_u64(), &name) else {
         return Ok(());
     };
@@ -79,9 +77,7 @@ pub async fn dispatch_register_by_name(
     database_id: DatabaseId,
 ) -> crate::Result<()> {
     let tenant_id = identity.tenant_id;
-    let Some(catalog) = state.credentials.catalog() else {
-        return Ok(());
-    };
+    let catalog = state.credentials.catalog();
     let Ok(Some(coll)) = catalog.get_collection(database_id, tenant_id.as_u64(), name) else {
         return Ok(());
     };
@@ -173,9 +169,7 @@ async fn dispatch_register_from_stored_inner(
         coll.database_id,
         &coll.name,
     );
-    let Some(catalog) = state.credentials.catalog() else {
-        return Ok(());
-    };
+    let catalog = state.credentials.catalog();
 
     // Determine storage mode from collection type — exhaustive
     // match ensures new CollectionType variants get a compile

@@ -54,7 +54,8 @@ pub fn audit_log(
     // `_system.audit_log` between flush ticks. Dedupe by `seq`.
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-    if let Some(catalog) = state.credentials.catalog() {
+    {
+        let catalog = state.credentials.catalog();
         let entries = catalog
             .load_audit_entries_ranged(1, u64::MAX, 0, u64::MAX, MATERIALIZE_LIMIT)
             .map_err(|e| crate::Error::Storage {

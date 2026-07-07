@@ -216,10 +216,6 @@ pub fn alter_user(
             }
             // Resolve the database name to an ID via the system catalog.
             let catalog = state.credentials.catalog();
-            let catalog = catalog.as_ref().ok_or_else(|| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: "system catalog unavailable".to_string(),
-            })?;
             let db_id = catalog
                 .get_database_id_by_name(db_name)
                 .map_err(|e| DdlError {
@@ -267,7 +263,8 @@ fn propose_and_install(
             message: format!("metadata propose: {e}"),
         })?;
     if log_index == 0 {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog.put_user(&stored).map_err(|e| DdlError {
                 sqlstate: "XX000".to_string(),
                 message: format!("catalog write: {e}"),

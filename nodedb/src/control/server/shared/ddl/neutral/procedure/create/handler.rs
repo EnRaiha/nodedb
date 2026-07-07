@@ -30,14 +30,7 @@ pub fn create_procedure(
     let parsed = parse_create_procedure(sql)?;
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     if !parsed.or_replace
         && let Ok(Some(_)) = catalog.get_procedure(tenant_id, &parsed.name)

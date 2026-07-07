@@ -67,9 +67,9 @@ pub async fn insert_document(
     // Auto-generate sequence values for fields with sequence_name where the
     // INSERT didn't provide an explicit value.
     let mut fields = fields;
-    if let Some(catalog) = state.credentials.catalog()
-        && let Ok(Some(coll_def)) =
-            catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
+    let catalog = state.credentials.catalog();
+    if let Ok(Some(coll_def)) =
+        catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
     {
         for field_def in &coll_def.field_defs {
             if let Some(ref seq_name) = field_def.sequence_name
@@ -104,9 +104,9 @@ pub async fn insert_document(
     }
 
     // Enforce type guards and CHECK constraints (after BEFORE trigger + sequence injection).
-    if let Some(catalog) = state.credentials.catalog()
-        && let Ok(Some(coll_def)) =
-            catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
+    let catalog = state.credentials.catalog();
+    if let Ok(Some(coll_def)) =
+        catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
     {
         // Inject DEFAULT/VALUE + validate type guards (combined).
         if !coll_def.type_guards.is_empty()
@@ -143,9 +143,9 @@ pub async fn insert_document(
     // Collections with user-defined enum types store them physically as TEXT;
     // label validation must happen here in the Control Plane since the Data
     // Plane sees only TEXT.
-    if let Some(catalog) = state.credentials.catalog()
-        && let Ok(Some(coll_def)) =
-            catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
+    let catalog = state.credentials.catalog();
+    if let Ok(Some(coll_def)) =
+        catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
     {
         for (field_name, type_name) in &coll_def.fields {
             if let Some(value) = fields.get(field_name.as_str()) {
@@ -181,11 +181,11 @@ pub async fn insert_document(
     }
 
     // Track field names in catalog for schemaless collections.
+    let catalog = state.credentials.catalog();
     if parsed
         .collection_type
         .as_ref()
         .is_none_or(|ct| ct.is_schemaless())
-        && let Some(catalog) = state.credentials.catalog()
         && let Ok(Some(mut coll)) =
             catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
     {
@@ -223,7 +223,8 @@ pub async fn insert_document(
     for (field_name, vector) in extract_vector_fields(&fields) {
         let dim = vector.len();
 
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             let col = if field_name.is_empty() {
                 "embedding"
             } else {

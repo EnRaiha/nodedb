@@ -88,9 +88,7 @@ pub(super) fn apply_metadata_sections(
         SECTION_ORIGIN_CATALOG_ROWS, SECTION_ORIGIN_SOURCE_TOMBSTONES, SourceTombstoneEntry,
         StoredCollectionBlob,
     };
-    let Some(catalog) = state.credentials.catalog() else {
-        return Ok(());
-    };
+    let catalog = state.credentials.catalog();
 
     for section in &env.sections {
         match section.origin_node_id {

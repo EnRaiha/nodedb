@@ -42,7 +42,7 @@ fn make_gated_state() -> (
     let wal_path = dir.path().join("gate_test.wal");
     let wal = Arc::new(nodedb::wal::WalManager::open_for_testing(&wal_path).unwrap());
     let (dispatcher, data_sides) = Dispatcher::new(1, 64);
-    let mut shared = SharedState::new(dispatcher, wal);
+    let mut shared = SharedState::new(dispatcher, wal).unwrap();
 
     // Replace the pre-fired placeholder with a real sequencer.
     let (seq, gate) = StartupSequencer::new();

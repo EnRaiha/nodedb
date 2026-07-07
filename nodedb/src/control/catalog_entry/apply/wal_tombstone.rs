@@ -34,7 +34,7 @@ mod tests {
     #[test]
     fn record_wal_tombstone_entry_applies_and_is_monotone() {
         let (store, _tmp) = make_catalog();
-        let catalog = store.catalog().as_ref().expect("catalog");
+        let catalog = store.catalog();
 
         // Apply via the top-level apply_to path (entry → apply_to_inner → wal_tombstone::record).
         let entry = CatalogEntry::RecordWalTombstone {

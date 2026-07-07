@@ -51,14 +51,7 @@ pub fn alter_function(
     let new_owner = parts[5].trim_end_matches(';').to_string();
 
     let tenant_id = identity.tenant_id.as_u64();
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     let mut func = catalog
         .get_function(tenant_id, &name)
@@ -102,14 +95,7 @@ fn alter_function_limits(
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     let mut func = catalog
         .get_function(tenant_id, name)

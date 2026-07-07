@@ -56,12 +56,8 @@ pub async fn show_continuous_aggregates(
     let stored_aggs: Vec<StoredContinuousAggregate> = state
         .credentials
         .catalog()
-        .as_ref()
-        .and_then(|catalog| {
-            catalog
-                .list_continuous_aggregates(database_id.as_u64(), tenant_id.as_u64())
-                .ok()
-        })
+        .list_continuous_aggregates(database_id.as_u64(), tenant_id.as_u64())
+        .ok()
         .unwrap_or_default();
 
     // Best-effort runtime stats from the local manager.

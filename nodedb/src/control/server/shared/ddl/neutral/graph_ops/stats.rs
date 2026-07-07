@@ -139,9 +139,7 @@ fn filter_active_collections(
     tenant_id: u64,
     rows: Vec<CollectionStats>,
 ) -> Vec<CollectionStats> {
-    let Some(catalog) = state.credentials.catalog() else {
-        return Vec::new();
-    };
+    let catalog = state.credentials.catalog();
     let all_collections = catalog
         .load_collections_for_tenant(database_id, tenant_id)
         .unwrap_or_default();

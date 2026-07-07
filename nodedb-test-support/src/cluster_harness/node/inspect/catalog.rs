@@ -10,9 +10,7 @@ impl TestClusterNode {
     /// `MetadataCommitApplier` on every node via
     /// `CatalogEntry::apply_to`).
     pub fn cached_collection_count(&self) -> usize {
-        let Some(catalog) = self.shared.credentials.catalog() else {
-            return 0;
-        };
+        let catalog = self.shared.credentials.catalog();
         // `load_collections_for_tenant` filters out `is_active = false`
         // records, so a deactivated collection drops out of the count.
         catalog
@@ -62,8 +60,9 @@ impl TestClusterNode {
         self.shared
             .credentials
             .catalog()
-            .as_ref()
-            .and_then(|c| c.get_function(tenant_id, name).ok().flatten())
+            .get_function(tenant_id, name)
+            .ok()
+            .flatten()
             .is_some()
     }
 
@@ -72,8 +71,9 @@ impl TestClusterNode {
         self.shared
             .credentials
             .catalog()
-            .as_ref()
-            .and_then(|c| c.get_procedure(tenant_id, name).ok().flatten())
+            .get_procedure(tenant_id, name)
+            .ok()
+            .flatten()
             .is_some()
     }
 
@@ -122,9 +122,7 @@ impl TestClusterNode {
     /// Check whether a tenant identity exists in this node's local
     /// `SystemCatalog` redb (written by the `PutTenant` applier).
     pub fn has_tenant(&self, tenant_id: u64) -> bool {
-        let Some(catalog) = self.shared.credentials.catalog() else {
-            return false;
-        };
+        let catalog = self.shared.credentials.catalog();
         match catalog.load_all_tenants() {
             Ok(list) => list.iter().any(|t| t.tenant_id == tenant_id),
             Err(_) => false,
@@ -137,8 +135,9 @@ impl TestClusterNode {
         self.shared
             .credentials
             .catalog()
-            .as_ref()
-            .and_then(|c| c.get_rls_policy(tenant_id, collection, name).ok().flatten())
+            .get_rls_policy(tenant_id, collection, name)
+            .ok()
+            .flatten()
             .is_some()
     }
 
@@ -148,8 +147,9 @@ impl TestClusterNode {
         self.shared
             .credentials
             .catalog()
-            .as_ref()
-            .and_then(|c| c.get_materialized_view(tenant_id, name).ok().flatten())
+            .get_materialized_view(tenant_id, name)
+            .ok()
+            .flatten()
             .is_some()
     }
 
@@ -191,12 +191,9 @@ impl TestClusterNode {
         self.shared
             .credentials
             .catalog()
-            .as_ref()
-            .and_then(|c| {
-                c.get_collection(nodedb_types::DatabaseId::DEFAULT, tenant_id, name)
-                    .ok()
-                    .flatten()
-            })
+            .get_collection(nodedb_types::DatabaseId::DEFAULT, tenant_id, name)
+            .ok()
+            .flatten()
             .map(|coll| (coll.descriptor_version, coll.modification_hlc))
     }
 
@@ -209,8 +206,9 @@ impl TestClusterNode {
         self.shared
             .credentials
             .catalog()
-            .as_ref()
-            .and_then(|c| c.get_function(tenant_id, name).ok().flatten())
+            .get_function(tenant_id, name)
+            .ok()
+            .flatten()
             .map(|f| (f.descriptor_version, f.modification_hlc))
     }
 
@@ -223,8 +221,9 @@ impl TestClusterNode {
         self.shared
             .credentials
             .catalog()
-            .as_ref()
-            .and_then(|c| c.get_procedure(tenant_id, name).ok().flatten())
+            .get_procedure(tenant_id, name)
+            .ok()
+            .flatten()
             .map(|p| (p.descriptor_version, p.modification_hlc))
     }
 }

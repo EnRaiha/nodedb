@@ -121,15 +121,12 @@ pub(crate) async fn apply_delta_and_finalize(
     let constraint_version_required = shared
         .credentials
         .catalog()
-        .as_ref()
-        .and_then(|c| {
-            c.get_collection(
-                crate::types::DatabaseId::DEFAULT,
-                tenant_id.as_u64(),
-                &delta_msg.collection,
-            )
-            .ok()
-        })
+        .get_collection(
+            crate::types::DatabaseId::DEFAULT,
+            tenant_id.as_u64(),
+            &delta_msg.collection,
+        )
+        .ok()
         .flatten()
         .map(|col| col.constraint_version)
         .unwrap_or(0);

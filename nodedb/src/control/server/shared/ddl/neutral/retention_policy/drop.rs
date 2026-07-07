@@ -56,11 +56,7 @@ pub async fn drop_retention_policy(
         .ok_or_else(|| err("42704", format!("retention policy '{name}' does not exist")))?;
 
     // Delete from catalog.
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
+    let catalog = state.credentials.catalog();
 
     catalog
         .delete_retention_policy(database_id.as_u64(), tenant_id, &name)

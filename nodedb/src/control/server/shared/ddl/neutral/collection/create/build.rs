@@ -88,9 +88,8 @@ pub async fn build_and_persist(
     let tenant_id = identity.tenant_id;
 
     // Check if the object already exists.
-    if let Some(catalog) = state.credentials.catalog()
-        && let Ok(Some(existing)) = catalog.get_collection(database_id, tenant_id.as_u64(), name)
-    {
+    let catalog = state.credentials.catalog();
+    if let Ok(Some(existing)) = catalog.get_collection(database_id, tenant_id.as_u64(), name) {
         if existing.is_active {
             return Err(err(
                 "42P07",

@@ -35,11 +35,7 @@ pub async fn handle_analyze(
 
     let specific_columns = parse_column_list(sql);
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| ddl_err("XX000", "catalog not available"))?;
+    let catalog = state.credentials.catalog();
 
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &collection)

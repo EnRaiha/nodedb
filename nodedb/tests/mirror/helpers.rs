@@ -111,12 +111,7 @@ pub fn inject_mirror_descriptor(
     status: MirrorStatus,
     last_applied_lsn: u64,
 ) {
-    let catalog = server
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("catalog unavailable");
+    let catalog = server.shared.credentials.catalog();
     let db_id = server.shared.database_registry.alloc_one();
     let descriptor = make_mirror_descriptor(db_id.as_u64(), name, status, last_applied_lsn);
     // put_database writes both the forward (DATABASES) and reverse
@@ -129,12 +124,7 @@ pub fn inject_mirror_descriptor(
 /// Write a `MirrorLagRecord` for `db_name` in `server`'s catalog with
 /// `last_apply_ms` set to `now_ms - lag_offset_ms`.
 pub fn inject_lag_record(server: &TestServer, db_name: &str, lag_offset_ms: u64, lsn: u64) {
-    let catalog = server
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("catalog unavailable");
+    let catalog = server.shared.credentials.catalog();
 
     let db_id = catalog
         .get_database_id_by_name(db_name)

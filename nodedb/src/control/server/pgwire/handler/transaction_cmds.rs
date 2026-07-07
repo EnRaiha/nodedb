@@ -391,7 +391,8 @@ impl NodeDbPgHandler {
                 .gap_free_manager()
                 .commit(handle);
             // Log to _system.sequence_log.
-            if let Some(catalog) = self.state.credentials.catalog() {
+            {
+                let catalog = self.state.credentials.catalog();
                 crate::control::sequence::log::log_reservation(
                     catalog,
                     &crate::control::sequence::log::committed(
@@ -473,7 +474,8 @@ impl NodeDbPgHandler {
                     h.rollback_one();
                 }
             });
-            if let Some(catalog) = self.state.credentials.catalog() {
+            {
+                let catalog = self.state.credentials.catalog();
                 crate::control::sequence::log::log_reservation(
                     catalog,
                     &crate::control::sequence::log::rolled_back(

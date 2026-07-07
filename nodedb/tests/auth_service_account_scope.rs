@@ -74,9 +74,11 @@ async fn alter_service_account_set_databases_requires_superuser() {
 #[tokio::test]
 async fn create_service_account_for_tenant_in_database_requires_superuser() {
     let state = make_state();
-    if let Some(cat) = state.credentials.catalog().as_ref() {
-        cat.bootstrap_default_database().unwrap();
-    }
+    state
+        .credentials
+        .catalog()
+        .bootstrap_default_database()
+        .unwrap();
 
     // Non-superuser TenantAdmin attempting cross-tenant create.
     let viewer = readonly_user();

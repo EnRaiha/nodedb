@@ -77,13 +77,7 @@ async fn snapshot_round_trip_builder_to_applier() {
     // The pgwire connection resolves to a concrete tenant; rather than hard-code
     // it, read it from the source catalog so the surrogate assertions use the
     // exact tenant the builder captured.
-    let source_catalog = source
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("source catalog present")
-        .clone();
+    let source_catalog = source.shared.credentials.catalog().clone();
     let tenant_id = source_catalog
         .load_all_collections(DatabaseId::DEFAULT)
         .expect("load source collections")
@@ -161,13 +155,7 @@ async fn snapshot_round_trip_builder_to_applier() {
     // (c) Direct catalog check: the target's surrogate for pk0 equals the
     //     source's — the identity map travelled with the data group and was
     //     rebound on apply.
-    let target_catalog = target
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("target catalog present")
-        .clone();
+    let target_catalog = target.shared.credentials.catalog().clone();
     let target_surrogate = target_catalog
         .get_surrogate_for_pk(DatabaseId::DEFAULT, tid, COLL, pks[0].as_bytes())
         .expect("target get_surrogate_for_pk")

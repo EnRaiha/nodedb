@@ -8,9 +8,7 @@
 //! shared `resolve_tenant_ref` helper, mirroring the already-shipped
 //! `CREATE TENANT <name>` / `SHOW TENANT <name>` paths.
 
-use crate::common::pgwire_auth_helpers::{
-    ddl_err, ddl_ok, make_state, make_state_with_catalog, superuser,
-};
+use crate::common::pgwire_auth_helpers::{ddl_err, ddl_ok, make_state_with_catalog, superuser};
 
 // ─── DROP TENANT by name ─────────────────────────────────────────────────────
 
@@ -285,7 +283,7 @@ async fn purge_tenant_unknown_numeric_id_errors() {
     );
 }
 
-// ─── System tenant + catalog-unavailable guards ──────────────────────────────
+// ─── System tenant guards ────────────────────────────────────────────────────
 
 /// `DROP TENANT 0` — the system tenant is protected with `42501` regardless of
 /// the resolver refactor.
@@ -311,20 +309,5 @@ async fn purge_system_tenant_numeric_errors() {
     assert!(
         err.contains("42501") && err.contains("system tenant"),
         "expected 42501 system-tenant guard, got: {err}"
-    );
-}
-
-/// `DROP TENANT <name>` with no catalog wired up → `42601`, directing the
-/// caller to use a numeric id. Exercises the catalog-unavailable branch of
-/// `resolve_tenant_ref` that the catalog-backed fixtures cannot reach.
-#[tokio::test]
-async fn drop_tenant_by_name_without_catalog_errors() {
-    let state = make_state();
-    let su = superuser();
-
-    let err = ddl_err(&state, &su, "DROP TENANT some_tenant_name").await;
-    assert!(
-        err.contains("42601") && err.contains("catalog"),
-        "expected 42601 catalog-unavailable error, got: {err}"
     );
 }

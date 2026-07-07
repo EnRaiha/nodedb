@@ -35,9 +35,7 @@ pub async fn verify_balance(
     let column = clean_arg(args[1]);
 
     // Find the materialized sum definition.
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
         .map_err(|e| err("XX000", &e.to_string()))?

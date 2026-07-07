@@ -29,14 +29,7 @@ pub async fn call_procedure(
     let (name, args) = parse_call(sql)?;
     let tenant_id = identity.tenant_id;
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     let proc = catalog
         .get_procedure(tenant_id.as_u64(), &name)

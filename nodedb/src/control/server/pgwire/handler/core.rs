@@ -322,8 +322,9 @@ impl SimpleQueryHandler for NodeDbPgHandler {
             .state
             .credentials
             .catalog()
-            .as_ref()
-            .and_then(|cat| cat.get_database(current_db).ok().flatten())
+            .get_database(current_db)
+            .ok()
+            .flatten()
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "default".to_string());
         tracing::debug!(

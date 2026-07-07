@@ -51,11 +51,7 @@ pub fn alter_alert(
         _ => return Err(err("42601", "expected ENABLE or DISABLE".to_string())),
     }
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
+    let catalog = state.credentials.catalog();
 
     catalog
         .put_alert_rule(&def)

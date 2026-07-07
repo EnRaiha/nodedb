@@ -84,9 +84,7 @@ pub(super) fn resolve_checkpoint_vv(
     }
 
     // Otherwise, look up checkpoint name in catalog.
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "catalog unavailable".to_string()));
-    };
+    let catalog = state.credentials.catalog();
     let record = catalog
         .get_checkpoint(tenant_id, collection, doc_id, checkpoint_or_vv)
         .map_err(|e| err("XX000", e.to_string()))?

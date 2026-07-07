@@ -27,7 +27,6 @@ pub(super) fn current_descriptor_version(
         return None;
     }
     let catalog = state.credentials.catalog();
-    let catalog = catalog.as_ref()?;
     match id.kind {
         nodedb_cluster::DescriptorKind::Collection => catalog
             .get_collection(database_id, tenant_id, &id.name)

@@ -46,7 +46,8 @@ pub fn propose_owner(
     let log_index = propose_catalog_entry(state, &entry)
         .map_err(|e| owner_err("XX000", format!("metadata propose: {e}")))?;
     if log_index == 0 {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog
                 .put_owner(&stored)
                 .map_err(|e| owner_err("XX000", format!("catalog write: {e}")))?;
@@ -72,7 +73,8 @@ pub fn propose_delete_owner(
     let log_index = propose_catalog_entry(state, &entry)
         .map_err(|e| owner_err("XX000", format!("metadata propose: {e}")))?;
     if log_index == 0 {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog
                 .delete_owner(object_type, tenant_id.as_u64(), object_name)
                 .map_err(|e| owner_err("XX000", format!("catalog write: {e}")))?;

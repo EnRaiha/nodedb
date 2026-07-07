@@ -75,10 +75,7 @@ async fn update_source_only_row_creates_copyup_in_target() {
     );
 
     // Verify copy-up catalog entry exists using the shared state.
-    let catalog_arc = server.shared.credentials.catalog();
-    let catalog = catalog_arc
-        .as_ref()
-        .expect("catalog must be available in test");
+    let catalog = server.shared.credentials.catalog();
 
     // The target_collection_key uses db_qualified format.
     // We look for any copyup entry for 'products' in the clone DB.

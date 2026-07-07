@@ -43,9 +43,6 @@ pub fn clone_database(
     params: CloneDatabaseParams<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let catalog = state.credentials.catalog();
-    let catalog = catalog
-        .as_ref()
-        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     // ── Resolve source database ───────────────────────────────────────────────
     let source_db_id = catalog
@@ -279,10 +276,6 @@ fn is_mirror_database(descriptor: &DatabaseDescriptor) -> bool {
 /// `>= MAX_CLONE_DEPTH` guard fires.
 fn clone_chain_depth(state: &SharedState, start_db_id: DatabaseId) -> crate::Result<u32> {
     let catalog = state.credentials.catalog();
-    let catalog = catalog.as_ref().ok_or(crate::Error::Storage {
-        engine: "catalog".into(),
-        detail: "system catalog unavailable for depth check".into(),
-    })?;
 
     let mut current = start_db_id;
     let mut depth: u32 = 0;

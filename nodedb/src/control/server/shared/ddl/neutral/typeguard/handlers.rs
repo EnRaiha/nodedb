@@ -72,9 +72,7 @@ pub fn create_typeguard(
         ));
     }
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let tenant_id = identity.tenant_id.as_u64();
     let mut coll = catalog
@@ -129,9 +127,7 @@ pub fn alter_typeguard_add(
 
     let guard = parse_single_field(after_add)?;
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let tenant_id = identity.tenant_id.as_u64();
     let mut coll = catalog
@@ -187,9 +183,7 @@ pub fn alter_typeguard_drop(
         return Err(err("42601", "ALTER TYPEGUARD DROP requires a field name"));
     }
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let tenant_id = identity.tenant_id.as_u64();
     let mut coll = catalog
@@ -248,9 +242,7 @@ pub fn drop_typeguard(
 
     let coll_name = extract_collection_name(sql)?;
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let tenant_id = identity.tenant_id.as_u64();
     let mut coll = catalog
@@ -288,9 +280,7 @@ pub fn show_typeguard(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let coll_name = extract_collection_name(sql)?;
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let tenant_id = identity.tenant_id.as_u64();
     let coll = catalog
@@ -337,9 +327,7 @@ pub fn show_typeguards(
     identity: &AuthenticatedIdentity,
     _sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let tenant_id = identity.tenant_id.as_u64();
     let collections = catalog

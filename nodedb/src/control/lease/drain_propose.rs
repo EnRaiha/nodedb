@@ -306,7 +306,6 @@ pub fn descriptor_id_and_prior_version(
     shared: &SharedState,
 ) -> Option<(DescriptorId, u64)> {
     let catalog = shared.credentials.catalog();
-    let catalog = catalog.as_ref()?;
     match entry {
         CatalogEntry::PutCollection(stored) => {
             let prior = catalog

@@ -72,9 +72,7 @@ pub async fn create_graph_index(
 
     let (parent_col, id_col) = parse_edge_columns(sql)?;
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(ddl_err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
     if catalog
         .get_collection(database_id, tenant_id.as_u64(), &collection)
         .map_err(|e| ddl_err("XX000", e.to_string()))?

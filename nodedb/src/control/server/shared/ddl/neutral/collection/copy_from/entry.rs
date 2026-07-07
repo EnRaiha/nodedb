@@ -147,10 +147,7 @@ fn check_engine_support(
     collection: &str,
 ) -> Result<(), DdlError> {
     let tenant_id = identity.tenant_id;
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => return Ok(()), // No catalog means schemaless fallback — allow.
-    };
+    let catalog = state.credentials.catalog();
     let stored = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), collection) {
         Ok(Some(c)) => c,
         Ok(None) => return Ok(()), // Collection doesn't exist yet — will fail at INSERT.

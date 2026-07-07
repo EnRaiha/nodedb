@@ -62,9 +62,6 @@ fn resolve_database_id(
     };
 
     let catalog = state.shared.credentials.catalog();
-    let catalog = catalog
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("system catalog unavailable".to_string()))?;
 
     match catalog.get_database_id_by_name(&db_name) {
         Ok(Some(id)) => Ok(id),

@@ -51,7 +51,7 @@ fn state_with_lockout() -> (Arc<SharedState>, tempfile::TempDir) {
     let credentials = Arc::new(store);
 
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    let state = SharedState::new_with_credentials(dispatcher, wal, credentials);
+    let state = SharedState::new_with_credentials(dispatcher, wal, credentials).unwrap();
     // Generous login rate-limit so the per-user bucket never trips before
     // the lockout counter is exercised — the lockout counter, not the
     // rate limiter, is the subject under test.

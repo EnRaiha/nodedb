@@ -196,12 +196,12 @@ pub fn plan_needs_implicit_edge_recon(
     };
     let coll = collection_name_from_plan(&dep_task.plan);
     let db = dep_task.database_id;
-    let edge_bearing = match state.credentials.catalog().as_ref() {
-        Some(catalog) => catalog
+    let edge_bearing = {
+        let catalog = state.credentials.catalog();
+        catalog
             .get_collection(db, tenant_id.as_u64(), &coll)?
             .map(|c| c.has_implicit_edges)
-            .unwrap_or(false),
-        None => false,
+            .unwrap_or(false)
     };
     if edge_bearing {
         Ok(Some((coll, db)))

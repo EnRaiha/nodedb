@@ -134,11 +134,10 @@ impl TestServer {
         // Ensure the built-in `default` database (id 0) is present in the
         // catalog so `USE DATABASE default` and `\c default` work in tests.
         // Idempotent: no-op if the descriptor is already there.
-        if let Some(cat) = credentials.catalog() {
-            let _ = cat.bootstrap_default_database();
-        }
+        let _ = credentials.catalog().bootstrap_default_database();
         let mut shared =
-            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials);
+            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)
+                .expect("build shared state");
         // Inject a fixed test KEK so backup tests produce encrypted envelopes.
         // Deterministic 32-byte key — same value every test run.
         if let Some(s) = Arc::get_mut(&mut shared) {

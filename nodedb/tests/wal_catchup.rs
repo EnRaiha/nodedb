@@ -45,7 +45,7 @@ impl TestStack {
         let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
 
         let (dispatcher, data_sides) = Dispatcher::new(1, 64);
-        let shared = SharedState::new(dispatcher, Arc::clone(&wal));
+        let shared = SharedState::new(dispatcher, Arc::clone(&wal)).unwrap();
 
         let data_side = data_sides.into_iter().next().unwrap();
         let core_dir = dir.path().join("data");

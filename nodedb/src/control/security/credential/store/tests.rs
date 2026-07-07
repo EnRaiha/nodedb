@@ -9,7 +9,7 @@ use crate::types::TenantId;
 
 #[test]
 fn in_memory_create_and_verify() {
-    let store = CredentialStore::new();
+    let store = CredentialStore::new().unwrap();
     store.bootstrap_superuser("nodedb", "secret").unwrap();
     assert!(store.verify_password("nodedb", "secret"));
     assert!(!store.verify_password("nodedb", "wrong"));
@@ -218,7 +218,7 @@ fn backward_compat_stored_user_defaults() {
 /// `must_change_password` must be cleared regardless of prior state.
 #[test]
 fn update_password_clears_must_change_and_sets_changed_at() {
-    let store = CredentialStore::new();
+    let store = CredentialStore::new().unwrap();
     store
         .create_user("eve", "old", TenantId::new(1), vec![Role::ReadWrite])
         .unwrap();
@@ -250,7 +250,7 @@ fn update_password_clears_must_change_and_sets_changed_at() {
 /// when the password is expired (past expiry and no grace period).
 #[test]
 fn scram_blocks_expired_account_no_grace() {
-    let store = CredentialStore::new();
+    let store = CredentialStore::new().unwrap();
     store
         .create_user("frank", "pass", TenantId::new(1), vec![Role::ReadWrite])
         .unwrap();
@@ -275,7 +275,7 @@ fn scram_blocks_expired_account_no_grace() {
 /// when within the grace period.
 #[test]
 fn scram_allows_expired_account_within_grace_with_warning() {
-    let mut store = CredentialStore::new();
+    let mut store = CredentialStore::new().unwrap();
     store.password_expiry_grace_days = 30; // 30-day grace period
     store
         .create_user(
@@ -313,7 +313,7 @@ fn scram_allows_expired_account_within_grace_with_warning() {
 /// `get_scram_credentials` blocks when `must_change_password` is set and grace = 0.
 #[test]
 fn scram_blocks_must_change_password_no_grace() {
-    let store = CredentialStore::new();
+    let store = CredentialStore::new().unwrap();
     store
         .create_user("hank", "pass", TenantId::new(1), vec![Role::ReadWrite])
         .unwrap();
@@ -334,7 +334,7 @@ fn scram_blocks_must_change_password_no_grace() {
 /// past the grace period even though the supplied password is correct.
 #[test]
 fn verify_password_blocks_expired_account() {
-    let store = CredentialStore::new();
+    let store = CredentialStore::new().unwrap();
     store
         .create_user(
             "ivan",
@@ -363,7 +363,7 @@ fn verify_password_blocks_expired_account() {
 /// A wrong password is a `BadCredential` regardless of account policy state.
 #[test]
 fn verify_password_wrong_password_is_a_credential_failure() {
-    let store = CredentialStore::new();
+    let store = CredentialStore::new().unwrap();
     store
         .create_user(
             "karl",
@@ -390,7 +390,7 @@ fn verify_password_wrong_password_is_a_credential_failure() {
 /// `verify_password_with_status` emits a warning when within grace period.
 #[test]
 fn verify_password_grace_period_emits_warning() {
-    let mut store = CredentialStore::new();
+    let mut store = CredentialStore::new().unwrap();
     store.password_expiry_grace_days = 7;
     store
         .create_user("judy", "pass", TenantId::new(1), vec![Role::ReadWrite])

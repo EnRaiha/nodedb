@@ -20,7 +20,7 @@ async fn pgwire_connect_and_query() {
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
 
     let (dispatcher, data_sides) = Dispatcher::new(1, 64);
-    let shared = SharedState::new(dispatcher, wal);
+    let shared = SharedState::new(dispatcher, wal).unwrap();
 
     // Start a Data Plane core in a background thread.
     let data_side = data_sides.into_iter().next().unwrap();

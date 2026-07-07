@@ -101,8 +101,9 @@ pub fn create_tenant(
     // `IF NOT EXISTS`: if a tenant with this name already exists, the
     // statement is a no-op success — do not allocate a second id.
     if if_not_exists
-        && let Some(catalog) = state.credentials.catalog()
-        && catalog
+        && state
+            .credentials
+            .catalog()
             .find_tenant_by_name(name)
             .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
             .is_some()
@@ -117,20 +118,14 @@ pub fn create_tenant(
     // when wired up; the in-memory mirror covers the no-catalog path.
     let tenant_id = match opts.explicit_id {
         Some(id) => TenantId::new(id),
-        None => match state.credentials.catalog().as_ref() {
-            Some(catalog) => TenantId::new(
+        None => {
+            let catalog = state.credentials.catalog();
+            TenantId::new(
                 catalog
                     .allocate_tenant_id()
                     .map_err(|e| ddl_err("XX000", format!("tenant id alloc: {e}")))?,
-            ),
-            None => {
-                let mut tenants = match state.tenants.lock() {
-                    Ok(t) => t,
-                    Err(p) => p.into_inner(),
-                };
-                TenantId::new(tenants.allocate_tenant_id())
-            }
-        },
+            )
+        }
     };
 
     let now = std::time::SystemTime::now()
@@ -150,7 +145,8 @@ pub fn create_tenant(
     if log_index == 0 {
         // Single-node fallback: write redb + seed in-memory quota
         // ourselves since post_apply only runs on the raft path.
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog
                 .put_tenant(&stored)
                 .map_err(|e| ddl_err("XX000", format!("catalog write: {e}")))?;

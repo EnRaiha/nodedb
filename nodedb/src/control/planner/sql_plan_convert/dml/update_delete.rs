@@ -390,9 +390,7 @@ fn document_collection_is_edge_bearing(
     let Some(credentials) = ctx.credentials.as_ref() else {
         return Ok(false);
     };
-    let Some(catalog) = credentials.catalog().as_ref() else {
-        return Ok(false);
-    };
+    let catalog = credentials.catalog();
     Ok(catalog
         .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), collection)?
         .map(|c| c.has_implicit_edges)
@@ -538,10 +536,7 @@ mod tests {
         let store =
             CredentialStore::open(&dir.path().join("system.redb")).expect("open credential store");
         {
-            let catalog = store
-                .catalog()
-                .as_ref()
-                .expect("persistent store has a catalog");
+            let catalog = store.catalog();
             let mut edges = StoredCollection::new(0, "edges", "owner");
             edges.has_implicit_edges = true;
             catalog

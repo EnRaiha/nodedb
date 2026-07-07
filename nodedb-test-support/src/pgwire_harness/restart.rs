@@ -164,7 +164,8 @@ impl TestServer {
             vec![nodedb::control::security::identity::Role::Superuser],
         );
         let mut shared =
-            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials);
+            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)
+                .expect("build shared state");
         if let Some(s) = Arc::get_mut(&mut shared) {
             s.backup_kek = Some(Arc::new([0x42u8; 32]));
             s.governor = init_test_memory_governor();
@@ -172,13 +173,12 @@ impl TestServer {
         let shared = shared;
         nodedb::bootstrap::credentials::replay_surrogate_wal(&shared, &wal_records);
         // Restore in-memory synonym registry from the persisted catalog.
-        if let Some(catalog) = shared.credentials.catalog()
-            && let Err(e) = shared.synonym_registry.reload_from_catalog(catalog)
-        {
+        let catalog = shared.credentials.catalog();
+        if let Err(e) = shared.synonym_registry.reload_from_catalog(catalog) {
             eprintln!("pgwire_harness: failed to reload synonym groups: {e}");
         }
-        if let Some(catalog) = shared.credentials.catalog()
-            && let Ok(entries) = catalog.load_all_arrays()
+        let catalog = shared.credentials.catalog();
+        if let Ok(entries) = catalog.load_all_arrays()
             && let Ok(mut guard) = shared.array_catalog.write()
         {
             for entry in entries {

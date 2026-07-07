@@ -48,11 +48,7 @@ pub async fn verify_bearer_token(
     let iss = &claims.iss;
 
     // 2. Look up provider by `iss`.
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| jwt_error_to_crate_error(JwtError::InvalidIssuer))?;
+    let catalog = state.credentials.catalog();
     let provider = catalog
         .list_oidc_providers()
         .map_err(|_| jwt_error_to_crate_error(JwtError::InvalidIssuer))?

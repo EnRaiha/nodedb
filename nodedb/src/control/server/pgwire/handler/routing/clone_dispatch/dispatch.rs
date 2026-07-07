@@ -145,40 +145,34 @@ impl NodeDbPgHandler {
                 }
 
                 // Load tombstones for source row filtering.
-                let tombstoned = {
-                    let catalog_arc = self.state.credentials.catalog();
-                    match catalog_arc.as_ref() {
-                        Some(catalog) => catalog
-                            .list_clone_tombstones(&target_collection_key)
-                            .map_err(|e| {
-                                let (severity, code, message) = error_to_sqlstate(&e);
-                                PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    severity.to_owned(),
-                                    code.to_owned(),
-                                    message,
-                                )))
-                            })?,
-                        None => std::collections::HashSet::new(),
-                    }
-                };
+                let tombstoned = self
+                    .state
+                    .credentials
+                    .catalog()
+                    .list_clone_tombstones(&target_collection_key)
+                    .map_err(|e| {
+                        let (severity, code, message) = error_to_sqlstate(&e);
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            severity.to_owned(),
+                            code.to_owned(),
+                            message,
+                        )))
+                    })?;
 
                 // Load KV tombstones for KV-engine key-based filtering.
-                let kv_tombstoned = {
-                    let catalog_arc = self.state.credentials.catalog();
-                    match catalog_arc.as_ref() {
-                        Some(catalog) => catalog
-                            .list_kv_clone_tombstones(&target_collection_key)
-                            .map_err(|e| {
-                            let (severity, code, message) = error_to_sqlstate(&e);
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                severity.to_owned(),
-                                code.to_owned(),
-                                message,
-                            )))
-                        })?,
-                        None => std::collections::HashSet::new(),
-                    }
-                };
+                let kv_tombstoned = self
+                    .state
+                    .credentials
+                    .catalog()
+                    .list_kv_clone_tombstones(&target_collection_key)
+                    .map_err(|e| {
+                        let (severity, code, message) = error_to_sqlstate(&e);
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            severity.to_owned(),
+                            code.to_owned(),
+                            message,
+                        )))
+                    })?;
 
                 // Dispatch source tasks, filter tombstoned rows, merge into target responses.
                 //

@@ -83,10 +83,7 @@ impl NodeDbPgHandler {
             _ => return Ok(CloneWriteOutcome::Passthrough),
         };
 
-        let catalog_arc = self.state.credentials.catalog();
-        let Some(catalog) = catalog_arc.as_ref() else {
-            return Ok(CloneWriteOutcome::Passthrough);
-        };
+        let catalog = self.state.credentials.catalog();
 
         let db_id = task.database_id;
         let coll_name = strip_db_prefix(db_id, collection_qualified);
@@ -190,10 +187,7 @@ impl NodeDbPgHandler {
                 let db_id = task.database_id;
                 let coll_name = strip_db_prefix(db_id, collection_qualified);
 
-                let catalog_arc = self.state.credentials.catalog();
-                let Some(catalog) = catalog_arc.as_ref() else {
-                    return Ok(CloneWriteOutcome::Passthrough);
-                };
+                let catalog = self.state.credentials.catalog();
 
                 let desc = catalog
                     .get_collection(db_id, tenant_id.as_u64(), coll_name)
@@ -276,10 +270,7 @@ impl NodeDbPgHandler {
         let db_id = task.database_id;
         let coll_name = strip_db_prefix(db_id, collection_qualified);
 
-        let catalog_arc = self.state.credentials.catalog();
-        let Some(catalog) = catalog_arc.as_ref() else {
-            return Ok(CloneWriteOutcome::Passthrough);
-        };
+        let catalog = self.state.credentials.catalog();
 
         let desc = catalog
             .get_collection(db_id, tenant_id.as_u64(), coll_name)

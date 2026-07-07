@@ -31,9 +31,7 @@ pub fn show_constraints(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let coll_name = extract_collection_after_on(sql)?;
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let tenant_id = identity.tenant_id.as_u64();
     let coll = catalog

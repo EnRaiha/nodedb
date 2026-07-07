@@ -394,11 +394,13 @@ impl Session {
                     None
                 } else {
                     // Validate the database name against the catalog.
-                    let resolved = if let Some(cat) = self.state.credentials.catalog().as_ref() {
-                        cat.get_database_id_by_name(db_name).ok().flatten()
-                    } else {
-                        None
-                    };
+                    let resolved = self
+                        .state
+                        .credentials
+                        .catalog()
+                        .get_database_id_by_name(db_name)
+                        .ok()
+                        .flatten();
                     match resolved {
                         Some(db_id) => Some(db_id),
                         None => {
@@ -804,7 +806,7 @@ mod tests {
         let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
 
         let (dispatcher, data_sides) = Dispatcher::new(1, 64);
-        let shared = SharedState::new(dispatcher, wal);
+        let shared = SharedState::new(dispatcher, wal).unwrap();
 
         // Start a Data Plane core in a background thread.
         let data_side = data_sides.into_iter().next().unwrap();

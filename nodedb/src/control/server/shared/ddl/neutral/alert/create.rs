@@ -73,12 +73,13 @@ pub fn create_alert(
     let tenant_id = identity.tenant_id.as_u64();
 
     // Validate collection exists.
-    if let Some(catalog) = state.credentials.catalog()
-        && catalog
-            .get_collection(database_id, tenant_id, collection)
-            .ok()
-            .flatten()
-            .is_none()
+    if state
+        .credentials
+        .catalog()
+        .get_collection(database_id, tenant_id, collection)
+        .ok()
+        .flatten()
+        .is_none()
     {
         return Err(err(
             "42P01",
@@ -130,11 +131,7 @@ pub fn create_alert(
     };
 
     // Persist to catalog.
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
+    let catalog = state.credentials.catalog();
 
     catalog
         .put_alert_rule(&def)

@@ -54,9 +54,7 @@ pub fn add_state_constraint(
         transitions,
     };
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
@@ -120,9 +118,7 @@ pub fn add_transition_check(
         predicate: parsed,
     };
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
@@ -197,9 +193,7 @@ pub fn add_check_constraint(
         has_subquery,
     };
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
@@ -258,9 +252,7 @@ pub fn drop_constraint(
         .ok_or_else(|| err("42601", "DROP CONSTRAINT requires ON <collection>"))?
         .to_lowercase();
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)

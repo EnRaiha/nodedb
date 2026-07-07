@@ -184,7 +184,7 @@ mod tests {
             WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test wal"),
         );
         let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-        let shared = SharedState::new(dispatcher, wal);
+        let shared = SharedState::new(dispatcher, wal).unwrap();
 
         // A deliberately non-zero, non-default tenant so a placeholder-0
         // regression is unmistakable.

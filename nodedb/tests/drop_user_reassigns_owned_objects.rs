@@ -63,13 +63,7 @@ fn owner_of(catalog: &SystemCatalog, object_type: &str, name: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drop_user_reassigns_every_owner_bearing_kind_and_sweeps_grants() {
     let server = TestServer::start().await;
-    let catalog = server
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("catalog-backed credential store")
-        .clone();
+    let catalog = server.shared.credentials.catalog().clone();
 
     // The reassignment target `{tenant}_admin` must resolve to a real
     // StoredUser, else its owner rows would themselves dangle.

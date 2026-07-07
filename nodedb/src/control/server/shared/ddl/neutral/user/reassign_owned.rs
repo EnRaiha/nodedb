@@ -103,12 +103,7 @@ pub(super) fn reassign_owned_and_sweep_grants(
     user_tenant: TenantId,
     admin_name: &str,
 ) -> Result<(), DdlError> {
-    let Some(catalog) = state.credentials.catalog().as_ref() else {
-        // No persistent catalog (pure in-memory node): owner and grant
-        // state is not backed by redb, so it cannot outlive the user
-        // row on disk and there is nothing to rewrite for boot safety.
-        return Ok(());
-    };
+    let catalog = state.credentials.catalog();
 
     let owned = catalog
         .owners_for_user(username, user_tenant.as_u64())

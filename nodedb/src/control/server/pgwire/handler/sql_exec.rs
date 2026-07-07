@@ -331,9 +331,8 @@ impl NodeDbPgHandler {
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
         // Increment per-database QPS counter and per-database metrics registry.
-        if let Some(catalog) = self.state.credentials.catalog().as_ref()
-            && let Ok(Some(desc)) = catalog.get_database(database_id)
-        {
+        let catalog = self.state.credentials.catalog();
+        if let Ok(Some(desc)) = catalog.get_database(database_id) {
             if let Some(ref m) = self.state.system_metrics {
                 m.record_database_query(&desc.name);
             }

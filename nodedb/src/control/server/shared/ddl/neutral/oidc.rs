@@ -85,10 +85,7 @@ pub fn create_oidc_provider(
         });
     }
 
-    let catalog = state.credentials.catalog().as_ref().ok_or(DdlError {
-        sqlstate: "XX000".to_string(),
-        message: "system catalog not available".to_string(),
-    })?;
+    let catalog = state.credentials.catalog();
 
     // Check for duplicate by provider name.
     match catalog.get_oidc_provider(name) {
@@ -178,10 +175,7 @@ pub fn alter_oidc_provider_claim_mapping(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_superuser(state, identity, "alter OIDC providers")?;
 
-    let catalog = state.credentials.catalog().as_ref().ok_or(DdlError {
-        sqlstate: "XX000".to_string(),
-        message: "system catalog not available".to_string(),
-    })?;
+    let catalog = state.credentials.catalog();
 
     let mut provider = catalog
         .get_oidc_provider(name)
@@ -241,10 +235,7 @@ pub fn drop_oidc_provider(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_superuser(state, identity, "drop OIDC providers")?;
 
-    let catalog = state.credentials.catalog().as_ref().ok_or(DdlError {
-        sqlstate: "XX000".to_string(),
-        message: "system catalog not available".to_string(),
-    })?;
+    let catalog = state.credentials.catalog();
 
     if catalog
         .get_oidc_provider(name)
@@ -294,10 +285,7 @@ pub fn show_oidc_providers(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_superuser(state, identity, "show OIDC providers")?;
 
-    let catalog = state.credentials.catalog().as_ref().ok_or(DdlError {
-        sqlstate: "XX000".to_string(),
-        message: "system catalog not available".to_string(),
-    })?;
+    let catalog = state.credentials.catalog();
 
     let providers = catalog.list_oidc_providers().map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),

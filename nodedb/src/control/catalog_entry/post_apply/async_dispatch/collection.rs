@@ -63,9 +63,8 @@ pub(crate) async fn reclaim_collection_storage(
     purge_lsn: u64,
 ) -> crate::Result<()> {
     // 1. Persist to redb (every node has its own catalog).
-    if let Some(catalog) = shared.credentials.catalog()
-        && let Err(e) = catalog.record_wal_tombstone(tenant_id, name, purge_lsn)
-    {
+    let catalog = shared.credentials.catalog();
+    if let Err(e) = catalog.record_wal_tombstone(tenant_id, name, purge_lsn) {
         warn!(
             collection = %name,
             tenant = tenant_id,
@@ -98,9 +97,8 @@ pub(crate) async fn reclaim_collection_storage(
     // backed up or transiently offline, and `_system.l2_cleanup_queue`
     // surfaces the backlog for operators. Idempotent: re-enqueuing
     // the same `(tenant, name)` replaces the prior entry.
-    if shared.cold_storage.is_some()
-        && let Some(catalog) = shared.credentials.catalog()
-    {
+    if shared.cold_storage.is_some() {
+        let catalog = shared.credentials.catalog();
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -169,9 +167,8 @@ pub(crate) async fn reclaim_collection_storage(
     } else {
         // A prior failed attempt may have left a durable entry; a
         // succeeding purge clears it so the worker stops retrying.
-        if let Some(catalog) = shared.credentials.catalog()
-            && let Err(rm) = catalog.remove_pending_reclaim(tenant_id, name)
-        {
+        let catalog = shared.credentials.catalog();
+        if let Err(rm) = catalog.remove_pending_reclaim(tenant_id, name) {
             warn!(
                 collection = %name,
                 tenant = tenant_id,
@@ -202,21 +199,7 @@ fn record_pending_reclaim(
     purge_lsn: u64,
     last_error: &str,
 ) {
-    let Some(catalog) = shared.credentials.catalog() else {
-        // No durable catalog (single-node in-memory-only mode). The
-        // purge failure still surfaces as the propagated Err; there is
-        // no durable table to record it in.
-        warn!(
-            collection = %name,
-            tenant = tenant_id,
-            purge_lsn,
-            error = %last_error,
-            "engine purge failed and no durable catalog is configured to \
-             record a pending-reclaim entry — purge will be retried only if \
-             the DROP is re-proposed"
-        );
-        return;
-    };
+    let catalog = shared.credentials.catalog();
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)

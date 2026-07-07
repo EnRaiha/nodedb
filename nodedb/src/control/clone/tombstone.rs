@@ -48,11 +48,7 @@ pub fn perform_kv_clone_tombstone(params: KvTombstoneParams<'_>) -> crate::Resul
         kv_key,
     } = params;
 
-    let catalog_arc = state.credentials.catalog();
-    let catalog = catalog_arc.as_ref().ok_or(crate::Error::Storage {
-        engine: "clone_kv_tombstone".into(),
-        detail: "catalog unavailable".into(),
-    })?;
+    let catalog = state.credentials.catalog();
 
     let target_coll_qualified = db_qualified(target_db_id, target_collection);
 
@@ -76,11 +72,7 @@ pub fn perform_clone_tombstone(params: TombstoneParams<'_>) -> crate::Result<()>
         source_surrogate,
     } = params;
 
-    let catalog_arc = state.credentials.catalog();
-    let catalog = catalog_arc.as_ref().ok_or(crate::Error::Storage {
-        engine: "clone_tombstone".into(),
-        detail: "catalog unavailable".into(),
-    })?;
+    let catalog = state.credentials.catalog();
 
     let target_coll_qualified = db_qualified(target_db_id, target_collection);
 

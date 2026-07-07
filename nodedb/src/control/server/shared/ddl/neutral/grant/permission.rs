@@ -68,7 +68,8 @@ fn propose_grant(
         message: format!("metadata propose: {e}"),
     })?;
     if log_index == 0 {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog.put_permission(&stored).map_err(|e| DdlError {
                 sqlstate: "XX000".to_string(),
                 message: format!("catalog write: {e}"),
@@ -96,7 +97,8 @@ fn propose_revoke(
         message: format!("metadata propose: {e}"),
     })?;
     if log_index == 0 {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog
                 .delete_permission(target, grantee, &perm_str)
                 .map_err(|e| DdlError {
@@ -119,10 +121,7 @@ fn resolve_tenant_id(state: &SharedState, name: &str) -> Result<TenantId, DdlErr
     if let Ok(id) = name.parse::<u64>() {
         return Ok(TenantId::new(id));
     }
-    let catalog = state.credentials.catalog().as_ref().ok_or(DdlError {
-        sqlstate: "XX000".to_string(),
-        message: "tenant catalog unavailable — cannot resolve tenant name".to_string(),
-    })?;
+    let catalog = state.credentials.catalog();
     let tenants = catalog.load_all_tenants().map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("tenant lookup: {e}"),

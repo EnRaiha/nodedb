@@ -51,15 +51,7 @@ pub fn describe_collection(
     let name = name_lower.as_str();
     let tenant_id = identity.tenant_id;
 
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => {
-            return Err(DdlError {
-                sqlstate: "XX000".to_string(),
-                message: "catalog not available".to_string(),
-            });
-        }
-    };
+    let catalog = state.credentials.catalog();
 
     let coll = match catalog.get_collection(database_id, tenant_id.as_u64(), name) {
         Ok(Some(c)) if c.is_active => c,
@@ -174,7 +166,8 @@ pub fn show_collections(
         DdlColType::Text,
     ];
 
-    let collections = if let Some(catalog) = state.credentials.catalog() {
+    let collections = {
+        let catalog = state.credentials.catalog();
         if identity.is_superuser {
             catalog
                 .load_all_collections(database_id)
@@ -187,8 +180,6 @@ pub fn show_collections(
                 .load_collections_for_tenant(database_id, tenant_id.as_u64())
                 .unwrap_or_default()
         }
-    } else {
-        Vec::new()
     };
 
     // Array (`CREATE ARRAY`) collections live in the dedicated

@@ -119,7 +119,8 @@ pub(in super::super) fn convert_create_array(
                 detail: format!("array catalog register: {e}"),
             })?;
     }
-    if let Some(catalog) = credentials.catalog().as_ref() {
+    {
+        let catalog = credentials.catalog();
         crate::control::array_catalog::persist::persist(catalog, &entry).map_err(|e| {
             crate::Error::PlanError {
                 detail: format!("array catalog persist: {e}"),
@@ -199,7 +200,8 @@ pub(in super::super) fn convert_drop_array(
             detail: format!("DROP ARRAY {name}: not found"),
         });
     }
-    if let Some(catalog) = credentials.catalog().as_ref() {
+    {
+        let catalog = credentials.catalog();
         if let Err(e) = crate::control::array_catalog::persist::remove(catalog, name) {
             return Err(crate::Error::PlanError {
                 detail: format!("array catalog remove: {e}"),

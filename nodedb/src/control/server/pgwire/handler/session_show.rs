@@ -52,8 +52,8 @@ impl NodeDbPgHandler {
                 .state
                 .credentials
                 .catalog()
-                .as_ref()
-                .and_then(|c| c.load_all_tenants().ok())
+                .load_all_tenants()
+                .ok()
                 .and_then(|tenants| {
                     tenants
                         .into_iter()

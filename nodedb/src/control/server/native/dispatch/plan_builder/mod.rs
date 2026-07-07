@@ -126,7 +126,7 @@ pub(super) fn collection_type(
     ctx: &DispatchCtx<'_>,
     collection: &str,
 ) -> Option<nodedb_types::CollectionType> {
-    let catalog = ctx.state.credentials.catalog().as_ref()?;
+    let catalog = ctx.state.credentials.catalog();
     let coll = catalog
         .get_collection(
             DatabaseId::DEFAULT,

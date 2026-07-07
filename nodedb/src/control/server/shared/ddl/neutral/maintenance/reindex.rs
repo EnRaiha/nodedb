@@ -37,12 +37,13 @@ pub async fn handle_reindex(
     let tenant_id = identity.tenant_id;
 
     // Verify the collection exists.
-    if let Some(catalog) = state.credentials.catalog()
-        && catalog
-            .get_collection(database_id, tenant_id.as_u64(), &collection)
-            .ok()
-            .flatten()
-            .is_none()
+    if state
+        .credentials
+        .catalog()
+        .get_collection(database_id, tenant_id.as_u64(), &collection)
+        .ok()
+        .flatten()
+        .is_none()
     {
         return Err(ddl_err(
             "42P01",

@@ -33,7 +33,7 @@ fn make_gated_state() -> (
     let wal_path = dir.path().join("gate_resp_test.wal");
     let wal = Arc::new(nodedb::wal::WalManager::open_for_testing(&wal_path).unwrap());
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    let mut shared = SharedState::new(dispatcher, wal);
+    let mut shared = SharedState::new(dispatcher, wal).unwrap();
 
     let (seq, gate) = StartupSequencer::new();
     let gw_gate = seq.register_gate(StartupPhase::GatewayEnable, "gateway-enable-resp-test");

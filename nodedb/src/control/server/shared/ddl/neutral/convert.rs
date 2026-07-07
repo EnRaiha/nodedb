@@ -46,9 +46,7 @@ pub async fn convert_collection(
     let tenant_id = identity.tenant_id;
 
     // Validate collection exists.
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "catalog unavailable"));
-    };
+    let catalog = state.credentials.catalog();
 
     let mut coll = catalog
         .get_collection(database_id, tenant_id.as_u64(), &collection)

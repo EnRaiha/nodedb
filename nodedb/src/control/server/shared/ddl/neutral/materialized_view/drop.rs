@@ -68,7 +68,8 @@ pub fn drop_materialized_view(
         .get_def(tenant_id.as_u64(), &name)
         .is_some()
     {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog
                 .delete_streaming_mv(tenant_id.as_u64(), &name)
                 .map_err(|e| err("XX000", e.to_string()))?;
@@ -83,14 +84,13 @@ pub fn drop_materialized_view(
 
     // Pre-check existence so `IF EXISTS` + missing is a no-op
     // that never touches raft.
-    let exists_before = if let Some(catalog) = state.credentials.catalog() {
-        matches!(
-            catalog.get_materialized_view(tenant_id.as_u64(), &name),
-            Ok(Some(_))
-        )
-    } else {
-        false
-    };
+    let exists_before = matches!(
+        state
+            .credentials
+            .catalog()
+            .get_materialized_view(tenant_id.as_u64(), &name),
+        Ok(Some(_))
+    );
     if !exists_before && !if_exists {
         return Err(err(
             "42P01",
@@ -110,9 +110,8 @@ pub fn drop_materialized_view(
     };
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0
-        && let Some(catalog) = state.credentials.catalog()
-    {
+    if log_index == 0 {
+        let catalog = state.credentials.catalog();
         catalog
             .delete_materialized_view(tenant_id.as_u64(), &name)
             .map_err(|e| err("XX000", e.to_string()))?;
@@ -122,12 +121,11 @@ pub fn drop_materialized_view(
     // The target lives as a normal collection to support INSERT...SELECT refresh
     // and SELECT reads; leaving it behind would leak storage and shadow any
     // later CREATE COLLECTION with the same name.
-    if let Some(catalog) = state.credentials.catalog()
-        && matches!(
-            catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name),
-            Ok(Some(_))
-        )
-    {
+    let catalog = state.credentials.catalog();
+    if matches!(
+        catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name),
+        Ok(Some(_))
+    ) {
         let coll_entry = crate::control::catalog_entry::CatalogEntry::DeactivateCollection {
             tenant_id: tenant_id.as_u64(),
             name: name.clone(),

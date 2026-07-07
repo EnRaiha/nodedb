@@ -32,10 +32,7 @@ pub async fn mark_collection_edge_bearing(
     tenant_id: TenantId,
     collection: &str,
 ) -> crate::Result<()> {
-    let Some(catalog) = state.credentials.catalog() else {
-        // No catalog wired (e.g. minimal/test harness) — nothing to record.
-        return Ok(());
-    };
+    let catalog = state.credentials.catalog();
     let Some(mut coll) = catalog.get_collection(database_id, tenant_id.as_u64(), collection)?
     else {
         // Collection row absent — don't fail the write over flag bookkeeping.

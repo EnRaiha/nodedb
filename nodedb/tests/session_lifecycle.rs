@@ -71,7 +71,6 @@ async fn alter_database_set_idle_timeout_persists_to_catalog() {
 
     // Read back via catalog.
     let cat = state.credentials.catalog();
-    let cat = cat.as_ref().expect("catalog must be present");
     let desc = cat
         .get_database(DatabaseId::DEFAULT)
         .unwrap()

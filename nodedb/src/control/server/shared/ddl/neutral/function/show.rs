@@ -39,9 +39,8 @@ pub fn show_functions(
     let mut rows: Vec<Map<String, JsonValue>> = Vec::new();
 
     // User-defined functions from catalog.
-    if let Some(catalog) = state.credentials.catalog().as_ref()
-        && let Ok(functions) = catalog.load_functions_for_tenant(tenant_id)
-    {
+    let catalog = state.credentials.catalog();
+    if let Ok(functions) = catalog.load_functions_for_tenant(tenant_id) {
         for func in &functions {
             let params_str = func
                 .parameters

@@ -24,8 +24,6 @@ async fn setup_foo_db(state: &nodedb::control::state::SharedState) -> DatabaseId
     state
         .credentials
         .catalog()
-        .as_ref()
-        .expect("catalog must be present")
         .get_database_id_by_name("foo")
         .unwrap()
         .expect("foo db must exist after CREATE DATABASE")
@@ -331,8 +329,6 @@ async fn move_tenant_cluster_admin_denied() {
     let foo_id = state
         .credentials
         .catalog()
-        .as_ref()
-        .expect("catalog must be present")
         .get_database_id_by_name("foo")
         .unwrap()
         .expect("foo must still exist");

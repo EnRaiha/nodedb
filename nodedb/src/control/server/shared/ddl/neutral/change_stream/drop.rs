@@ -52,14 +52,7 @@ pub fn drop_change_stream(
 
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     // Pre-check existence via the catalog (no separate get_change_stream
     // method — use `load_all_change_streams` + filter, the set is

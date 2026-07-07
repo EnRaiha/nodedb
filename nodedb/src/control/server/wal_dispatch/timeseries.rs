@@ -24,8 +24,10 @@ pub fn wal_append_timeseries(
     let database_id = DatabaseId::DEFAULT;
     // WAL bypass check.
     if let Some(creds) = credentials
-        && let Some(catalog) = creds.catalog()
-        && let Ok(Some(coll)) = catalog.get_collection(database_id, tenant_id.as_u64(), collection)
+        && let Ok(Some(coll)) =
+            creds
+                .catalog()
+                .get_collection(database_id, tenant_id.as_u64(), collection)
         && let Some(config) = coll.get_timeseries_config()
         && config.get("wal").and_then(|v| v.as_str()) == Some("false")
     {

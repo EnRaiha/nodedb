@@ -48,11 +48,7 @@ pub async fn drop_synonym_group(
     }
 
     // Remove from catalog.
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
+    let catalog = state.credentials.catalog();
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteSynonymGroup {
         tenant_id: tenant_id_u64,

@@ -114,7 +114,8 @@ pub fn check_rate_limit(
     let plan_tier = auth_ctx.metadata.get("plan").map(|s| s.as_str());
 
     // Resolve tenant and database QPS caps from the quota catalog if available.
-    let quota_params = state.credentials.catalog().as_ref().and_then(|catalog| {
+    let quota_params = {
+        let catalog = state.credentials.catalog();
         let tenant_max_qps = catalog
             .get_tenant_quota(database_id, identity.tenant_id)
             .ok()
@@ -149,7 +150,7 @@ pub fn check_rate_limit(
         } else {
             None
         }
-    });
+    };
 
     let result = state.rate_limiter.check(
         &identity.user_id.to_string(),

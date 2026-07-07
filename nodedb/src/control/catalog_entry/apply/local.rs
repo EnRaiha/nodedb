@@ -39,8 +39,6 @@ pub fn apply_locally_if_needed(state: &SharedState, entry: &CatalogEntry, log_in
     if log_index != 0 {
         return;
     }
-    let Some(catalog) = state.credentials.catalog() else {
-        return;
-    };
+    let catalog = state.credentials.catalog();
     apply_to(entry, catalog);
 }

@@ -39,14 +39,7 @@ pub fn drop_consumer_group(
     let stream_name = parts[5].to_lowercase();
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     let existed = catalog
         .delete_consumer_group(tenant_id, &stream_name, &group_name)

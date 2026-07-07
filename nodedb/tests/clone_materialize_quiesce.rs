@@ -50,12 +50,7 @@ async fn freeze_blocks_writes_and_allows_reads() {
 
     // Resolve the DatabaseId for quiesce_src.
     let db_id: DatabaseId = {
-        let catalog = server
-            .shared
-            .credentials
-            .catalog()
-            .as_ref()
-            .expect("catalog must be present in test harness");
+        let catalog = server.shared.credentials.catalog();
         let databases = catalog.list_databases().expect("list_databases");
         databases
             .into_iter()

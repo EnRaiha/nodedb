@@ -35,9 +35,8 @@ pub fn show_procedures(
     ];
 
     let mut rows: Vec<Map<String, JsonValue>> = Vec::new();
-    if let Some(catalog) = state.credentials.catalog().as_ref()
-        && let Ok(procs) = catalog.load_procedures_for_tenant(tenant_id)
-    {
+    let catalog = state.credentials.catalog();
+    if let Ok(procs) = catalog.load_procedures_for_tenant(tenant_id) {
         for p in &procs {
             let params_str = p
                 .parameters

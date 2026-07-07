@@ -32,7 +32,6 @@ async fn create_tenant_without_id_allocates_distinct_ids() {
     ddl_ok(&state, &su, "CREATE TENANT beta").await;
 
     let catalog = state.credentials.catalog();
-    let catalog = catalog.as_ref().expect("catalog must be wired");
     let a = catalog
         .find_tenant_by_name("alpha")
         .unwrap()
@@ -59,8 +58,6 @@ async fn dropped_tenant_id_is_not_reused() {
     ddl_ok(&state, &su, "CREATE TENANT gamma").await;
     let catalog = state.credentials.catalog();
     let dropped_id = catalog
-        .as_ref()
-        .unwrap()
         .find_tenant_by_name("gamma")
         .unwrap()
         .expect("gamma must exist")
@@ -72,8 +69,6 @@ async fn dropped_tenant_id_is_not_reused() {
     let reused = state
         .credentials
         .catalog()
-        .as_ref()
-        .unwrap()
         .find_tenant_by_name("delta")
         .unwrap()
         .expect("delta must exist")

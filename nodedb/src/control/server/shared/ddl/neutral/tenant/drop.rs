@@ -99,7 +99,8 @@ pub fn drop_tenant(
     let log_index = propose_catalog_entry(state, &entry)
         .map_err(|e| ddl_err("XX000", format!("metadata propose: {e}")))?;
     if log_index == 0 {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog
                 .delete_tenant(tid)
                 .map_err(|e| ddl_err("XX000", format!("catalog write: {e}")))?;
@@ -144,8 +145,8 @@ fn reconcile_tenant_users(
     let Some(tenant_name) = state
         .credentials
         .catalog()
-        .as_ref()
-        .and_then(|cat| cat.load_all_tenants().ok())
+        .load_all_tenants()
+        .ok()
         .and_then(|all| {
             all.into_iter()
                 .find(|t| t.tenant_id == tenant_id.as_u64())

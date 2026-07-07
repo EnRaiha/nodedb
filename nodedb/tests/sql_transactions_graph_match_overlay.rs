@@ -72,10 +72,10 @@ async fn match_sources(server: &TestServer, label: &str) -> Vec<String> {
         .expect("MATCH should succeed");
     let mut out = Vec::new();
     for msg in msgs {
-        if let SimpleQueryMessage::Row(row) = msg {
-            if let Some(x) = row.get(0) {
-                out.push(x.to_string());
-            }
+        if let SimpleQueryMessage::Row(row) = msg
+            && let Some(x) = row.get(0)
+        {
+            out.push(x.to_string());
         }
     }
     out

@@ -109,16 +109,9 @@ pub(super) fn parse_with_databases(
     let catalog = state.credentials.catalog();
     let mut ids = Vec::with_capacity(raw_names.len());
     for name in raw_names {
-        // catalog: Option<Arc<SystemCatalog>>
-        // map produces: Option<Result<Option<DatabaseId>>>
-        // transpose: Result<Option<Option<DatabaseId>>>
-        // ? + flatten: Option<DatabaseId>
         let resolved: Option<DatabaseId> = catalog
-            .as_ref()
-            .map(|cat| cat.get_database_id_by_name(name))
-            .transpose()
-            .map_err(|e| err("XX000", e.to_string()))?
-            .flatten();
+            .get_database_id_by_name(name)
+            .map_err(|e| err("XX000", e.to_string()))?;
         match resolved {
             Some(id) => ids.push(id),
             None => {
@@ -147,10 +140,7 @@ pub(super) fn build_owner_database_set_for_user(
     let db_ids = state
         .credentials
         .catalog()
-        .as_ref()
-        .map(|cat| cat.list_user_grant_databases(user.user_id))
-        .transpose()
-        .map_err(|e| err("XX000", e.to_string()))?
-        .unwrap_or_else(|| vec![DatabaseId::DEFAULT]);
+        .list_user_grant_databases(user.user_id)
+        .map_err(|e| err("XX000", e.to_string()))?;
     Ok(DatabaseSet::Some(SmallVec::from_iter(db_ids)))
 }

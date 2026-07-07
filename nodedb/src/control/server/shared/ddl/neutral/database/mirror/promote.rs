@@ -31,9 +31,6 @@ pub fn promote_database(
     name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let catalog = state.credentials.catalog();
-    let catalog = catalog
-        .as_ref()
-        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     let db_id = catalog
         .get_database_id_by_name(name)

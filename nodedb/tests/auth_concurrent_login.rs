@@ -38,7 +38,7 @@ fn state_with_login_caps(ip_cap: u64, user_cap: u64) -> (Arc<SharedState>, tempf
     let credentials = Arc::new(store);
 
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    let state = SharedState::new_with_credentials(dispatcher, wal, credentials);
+    let state = SharedState::new_with_credentials(dispatcher, wal, credentials).unwrap();
     state.rate_limiter.set_login_capacities(ip_cap, user_cap);
     (state, dir)
 }

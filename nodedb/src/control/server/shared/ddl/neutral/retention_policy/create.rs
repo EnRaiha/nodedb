@@ -66,7 +66,8 @@ pub async fn create_retention_policy(
     let tenant_id = identity.tenant_id.as_u64();
 
     // Validate collection exists and is timeseries.
-    if let Some(catalog) = state.credentials.catalog() {
+    {
+        let catalog = state.credentials.catalog();
         match catalog.get_collection(database_id, tenant_id, &parsed.collection) {
             Ok(Some(coll)) if coll.collection_type.is_timeseries() => {}
             Ok(Some(_)) => {
@@ -130,11 +131,7 @@ pub async fn create_retention_policy(
     };
 
     // Persist to catalog.
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
+    let catalog = state.credentials.catalog();
 
     catalog
         .put_retention_policy(&def)

@@ -16,9 +16,7 @@ pub async fn dropped_collections(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
 ) -> crate::Result<Vec<Vec<u8>>> {
-    let Some(catalog) = state.credentials.catalog() else {
-        return Ok(Vec::new());
-    };
+    let catalog = state.credentials.catalog();
 
     let dropped = catalog
         .load_dropped_collections(DatabaseId::DEFAULT)

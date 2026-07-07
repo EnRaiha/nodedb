@@ -77,9 +77,7 @@ pub async fn balance_as_of(
         .unwrap_or(rust_decimal::Decimal::ZERO);
 
     // Find materialized sum definitions to know the source collection and value_expr.
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
         .map_err(|e| err("XX000", &e.to_string()))?

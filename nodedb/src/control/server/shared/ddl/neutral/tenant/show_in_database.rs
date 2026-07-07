@@ -168,10 +168,7 @@ fn resolve_tenant_quota(
     name: &str,
     database: &str,
 ) -> Result<(nodedb_types::DatabaseId, TenantId, QuotaRecord), DdlError> {
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => return Err(ddl_err("XX000", "system catalog unavailable")),
-    };
+    let catalog = state.credentials.catalog();
 
     let db_id = catalog
         .get_database_id_by_name(database)

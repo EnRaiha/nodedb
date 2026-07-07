@@ -51,29 +51,28 @@ pub async fn verify_and_repair(shared: &SharedState) -> crate::Result<VerifyRepo
     // returns `None` because the `SystemCatalog` is
     // in-memory only. Nothing to verify against — skip both
     // the registry verifier AND the integrity walker.
-    let (registry_outcome, integrity, integrity_healed) = match shared.credentials.catalog() {
-        Some(catalog) => {
-            let reg = verify_registries(shared, catalog)?;
-            let raw = verify_redb_integrity(catalog);
-            // Self-heal the orphan-row class: reconstruct every
-            // missing `StoredOwner` from the primary row's in-band
-            // `owner` field. Anything still in `remaining` is a real
-            // integrity bug (primary row gone, catalog write failed,
-            // or a future divergence kind we don't know how to
-            // repair) and must still fail the startup gate.
-            let (remaining, healed) = heal_orphan_rows(catalog, raw);
-            if healed > 0 {
-                tracing::info!(
-                    healed,
-                    remaining = remaining.len(),
-                    "catalog sanity check: integrity self-heal pass repaired \
+    let (registry_outcome, integrity, integrity_healed) = {
+        let catalog = shared.credentials.catalog();
+
+        let reg = verify_registries(shared, catalog)?;
+        let raw = verify_redb_integrity(catalog);
+        // Self-heal the orphan-row class: reconstruct every
+        // missing `StoredOwner` from the primary row's in-band
+        // `owner` field. Anything still in `remaining` is a real
+        // integrity bug (primary row gone, catalog write failed,
+        // or a future divergence kind we don't know how to
+        // repair) and must still fail the startup gate.
+        let (remaining, healed) = heal_orphan_rows(catalog, raw);
+        if healed > 0 {
+            tracing::info!(
+                healed,
+                remaining = remaining.len(),
+                "catalog sanity check: integrity self-heal pass repaired \
                      orphan rows by reconstructing StoredOwner entries from \
                      primary rows' in-band owner fields"
-                );
-            }
-            (Some(reg), remaining, healed)
+            );
         }
-        None => (None, Vec::new(), 0),
+        (Some(reg), remaining, healed)
     };
 
     // ── 3. Assemble report ─────────────────────────────

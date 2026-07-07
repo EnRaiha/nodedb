@@ -33,24 +33,23 @@ impl SharedState {
         dispatcher: Dispatcher,
         wal: Arc<WalManager>,
         credentials: Arc<CredentialStore>,
-    ) -> Arc<Self> {
+    ) -> crate::Result<Arc<Self>> {
         let wal_for_assigner = Arc::clone(&wal);
-        let mut state = Self::new_inner(dispatcher, wal);
+        let mut state = Self::new_inner(dispatcher, wal)?;
         if let Some(s) = Arc::get_mut(&mut state) {
             // Rebuild the surrogate assigner against the supplied
             // credential store. `new_inner` constructs the assigner
-            // from a fresh in-memory `CredentialStore` whose
-            // `catalog()` is `None`, which causes every `assign()`
-            // call to short-circuit to `Surrogate::ZERO` — collapsing
-            // every row in every test to the same substrate key.
+            // from a fresh in-memory `CredentialStore` with its own
+            // in-memory catalog; the supplied store carries the durable
+            // catalog whose surrogate watermark this fixture must resume.
             let registry = Arc::clone(&s.surrogate_registry);
             // Seed the registry's high-watermark AND applied-reserve cursor
             // from the catalog so restarts in a re-opened test fixture pick up
             // where the previous session left off — and so cluster-mode
             // metadata-log replay skips already-applied reservations rather
             // than double-counting `G`.
-            if let Some(catalog) = credentials.catalog()
-                && let Ok(hwm) = catalog.get_surrogate_hwm()
+            let catalog = credentials.catalog();
+            if let Ok(hwm) = catalog.get_surrogate_hwm()
                 && let Ok(reserve_index) = catalog.get_surrogate_reserve_index()
                 && let Ok(mut reg) = registry.write()
             {
@@ -69,15 +68,15 @@ impl SharedState {
             ));
             s.credentials = credentials;
         }
-        state
+        Ok(state)
     }
 
     /// Create shared state with in-memory credential store (for tests).
-    pub fn new(dispatcher: Dispatcher, wal: Arc<WalManager>) -> Arc<Self> {
+    pub fn new(dispatcher: Dispatcher, wal: Arc<WalManager>) -> crate::Result<Arc<Self>> {
         Self::new_inner(dispatcher, wal)
     }
 
-    fn new_inner(dispatcher: Dispatcher, wal: Arc<WalManager>) -> Arc<Self> {
+    fn new_inner(dispatcher: Dispatcher, wal: Arc<WalManager>) -> crate::Result<Arc<Self>> {
         let shutdown = Arc::new(crate::control::shutdown::ShutdownWatch::new());
         let loop_registry = Arc::new(crate::control::shutdown::LoopRegistry::new());
         // Test helpers get a pre-fired gate so listeners start accepting
@@ -85,7 +84,7 @@ impl SharedState {
         // StartupSequencer after calling `SharedState::open`.
         let startup_gate = crate::control::startup::StartupGate::pre_fired();
         let test_id = Self::unique_test_id();
-        let test_credentials = Arc::new(CredentialStore::new());
+        let test_credentials = Arc::new(CredentialStore::new()?);
         let test_surrogate_registry: crate::control::surrogate::SurrogateRegistryHandle = Arc::new(
             std::sync::RwLock::new(crate::control::surrogate::SurrogateRegistry::new()),
         );
@@ -388,7 +387,7 @@ impl SharedState {
             startup: Arc::clone(&startup_gate),
         });
         Self::wire_session_handle_audit(&state);
-        state
+        Ok(state)
     }
 
     /// Point the session-handle store's audit hook at this state's

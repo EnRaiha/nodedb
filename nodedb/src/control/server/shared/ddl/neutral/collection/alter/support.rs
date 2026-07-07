@@ -48,3 +48,36 @@ pub(super) fn propose_and_apply(
     apply_locally_if_needed(state, entry, log_index);
     Ok(log_index)
 }
+
+/// Async variant of [`propose_and_apply`] for online DDL that runs
+/// concurrently with ingest.
+///
+/// The local catalog apply (`log_index == 0` path) performs a redb write
+/// transaction whose `commit()` issues an `fsync`; that fsync can take tens
+/// of milliseconds. Running it inline on the Tokio worker would monopolise
+/// the worker for the duration of the flush, stalling every concurrent
+/// `INSERT` task scheduled on it — an online `ALTER` must never block the
+/// write path. Moving the blocking commit onto a `spawn_blocking` thread
+/// keeps the worker free to service writes while the catalog is made durable.
+///
+/// Proposal ordering is unchanged: the durable apply still completes before
+/// this call returns, so the cross-core schema-register barrier that follows
+/// observes the applied schema.
+pub(super) async fn propose_and_apply_async(
+    state: &SharedState,
+    entry: CatalogEntry,
+) -> Result<u64, DdlError> {
+    let log_index = propose_catalog_entry(state, &entry)
+        .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
+    if log_index == 0 {
+        // Clone only the cheap `Arc<Database>` handle (not `SharedState`) so
+        // the blocking closure owns exactly what the apply needs.
+        let catalog = state.credentials.catalog().clone();
+        tokio::task::spawn_blocking(move || {
+            crate::control::catalog_entry::apply::apply_to(&entry, &catalog)
+        })
+        .await
+        .map_err(|e| err("XX000", format!("catalog apply join: {e}")))?;
+    }
+    Ok(log_index)
+}

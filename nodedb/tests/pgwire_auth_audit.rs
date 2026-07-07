@@ -101,7 +101,7 @@ async fn audit_flush_persists_to_catalog() {
 
     state.flush_audit_log();
 
-    let catalog = state.credentials.catalog().as_ref().unwrap();
+    let catalog = state.credentials.catalog();
     let count = catalog.audit_entry_count().unwrap();
     assert_eq!(count, 2, "expected 2 persisted audit entries");
 
@@ -162,7 +162,7 @@ async fn audit_sequence_survives_restart() {
         state.audit_record(AuditEvent::AdminAction, None, "src", "event3");
         state.flush_audit_log();
 
-        let catalog = state.credentials.catalog().as_ref().unwrap();
+        let catalog = state.credentials.catalog();
         let count = catalog.audit_entry_count().unwrap();
         assert_eq!(
             count, 3,
@@ -214,7 +214,7 @@ async fn alter_set_audit_dml_persists() {
     .await;
 
     // Read back from catalog and verify the mode was persisted.
-    let catalog = state.credentials.catalog().as_ref().unwrap();
+    let catalog = state.credentials.catalog();
     let db_id = catalog
         .get_database_id_by_name("dml_audit_db")
         .unwrap()
@@ -256,7 +256,7 @@ async fn show_audit_in_database_filters() {
     ddl_ok(&state, &su, "CREATE DATABASE filter_db_a").await;
     ddl_ok(&state, &su, "CREATE DATABASE filter_db_b").await;
 
-    let catalog = state.credentials.catalog().as_ref().unwrap();
+    let catalog = state.credentials.catalog();
     let db_id_a = catalog
         .get_database_id_by_name("filter_db_a")
         .unwrap()

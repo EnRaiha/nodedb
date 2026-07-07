@@ -88,13 +88,7 @@ pub async fn run(
     // Single-node path (proposed == 0): Raft is absent; apply directly.
     // Clustered path: the entry was applied after quorum commit.
     if proposed == 0 {
-        let catalog_arc = state.credentials.catalog();
-        let catalog = catalog_arc.as_ref().ok_or_else(|| {
-            NodeDbError::move_tenant_cutover_failed(
-                tenant_id.as_u64().to_string(),
-                "system catalog unavailable for direct apply".to_string(),
-            )
-        })?;
+        let catalog = state.credentials.catalog();
         apply_to(&entry, catalog);
     }
 

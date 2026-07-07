@@ -67,9 +67,9 @@ pub async fn upsert_document(
     };
 
     // Enforce type guards and CHECK constraints (after BEFORE trigger).
-    if let Some(catalog) = state.credentials.catalog()
-        && let Ok(Some(coll_def)) =
-            catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
+    let catalog = state.credentials.catalog();
+    if let Ok(Some(coll_def)) =
+        catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
     {
         // Inject DEFAULT/VALUE + validate type guards (combined).
         if !coll_def.type_guards.is_empty()
@@ -103,9 +103,9 @@ pub async fn upsert_document(
     }
 
     // Validate enum-typed columns against the custom type registry.
-    if let Some(catalog) = state.credentials.catalog()
-        && let Ok(Some(coll_def)) =
-            catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
+    let catalog = state.credentials.catalog();
+    if let Ok(Some(coll_def)) =
+        catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
     {
         for (field_name, type_name) in &coll_def.fields {
             if let Some(value) = fields.get(field_name.as_str()) {

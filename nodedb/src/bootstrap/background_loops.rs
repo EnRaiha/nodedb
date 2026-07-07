@@ -32,10 +32,7 @@ pub struct EventPlaneComponents {
 /// processes each restart decision; this function only reads the catalog
 /// and logs.
 pub fn log_mirror_restart_decisions(shared: &Arc<crate::control::state::SharedState>) {
-    let catalog = match shared.credentials.catalog() {
-        Some(c) => c,
-        None => return,
-    };
+    let catalog = shared.credentials.catalog();
     match crate::control::mirror::enumerate_resumable_mirrors(catalog) {
         Ok(decisions) => {
             for d in &decisions {
@@ -106,10 +103,7 @@ pub fn spawn_background_loops(
                     if shutdown.is_cancelled() {
                         break;
                     }
-                    let catalog = match shared_mirror.credentials.catalog() {
-                        Some(c) => c,
-                        None => continue,
-                    };
+                    let catalog = shared_mirror.credentials.catalog();
                     let databases = match catalog.list_databases() {
                         Ok(d) => d,
                         Err(e) => {
@@ -288,9 +282,7 @@ pub fn spawn_background_loops(
                     }
                     let state_for_sweep = Arc::clone(&shared_sweep);
                     let result = tokio::task::spawn_blocking(move || {
-                        let Some(catalog) = state_for_sweep.credentials.catalog() else {
-                            return;
-                        };
+                        let catalog = state_for_sweep.credentials.catalog();
                         let cancel = std::sync::atomic::AtomicBool::new(false);
                         if let Err(e) =
                             crate::control::maintenance::clone_materializer::run_scheduled_sweep(

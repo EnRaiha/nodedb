@@ -93,7 +93,7 @@ fn nodedb_exits_nonzero_on_catalog_integrity_violation() {
     {
         let creds =
             CredentialStore::open(&data_dir.join("system.redb")).expect("open credential store");
-        let catalog = creds.catalog().as_ref().expect("catalog backed store");
+        let catalog = creds.catalog();
         catalog
             .put_rls_policy(&StoredRlsPolicy {
                 tenant_id: 1,

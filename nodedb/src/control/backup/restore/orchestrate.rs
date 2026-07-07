@@ -423,9 +423,7 @@ fn rebind_surrogates(
     if binds.is_empty() {
         return Ok(());
     }
-    let Some(catalog) = state.credentials.catalog() else {
-        return Ok(());
-    };
+    let catalog = state.credentials.catalog();
     let database_id = crate::types::DatabaseId::DEFAULT;
     for e in &binds {
         catalog.put_surrogate(
@@ -445,9 +443,7 @@ fn warn_on_tombstoned_restores(
     merged: &TenantDataSnapshot,
     snapshot_watermark: u64,
 ) {
-    let Some(catalog) = state.credentials.catalog() else {
-        return;
-    };
+    let catalog = state.credentials.catalog();
     let Ok(tombstones) = catalog.load_wal_tombstones() else {
         return;
     };

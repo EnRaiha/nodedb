@@ -74,7 +74,7 @@ pub(super) fn cost_model_picks_shuffle(
 /// the maximum to be robust against partially-written stat rows.
 fn estimated_collection_bytes(ctx: &ConvertContext, collection: &str) -> Option<usize> {
     let credentials = ctx.credentials.as_ref()?;
-    let catalog = credentials.catalog().as_ref()?;
+    let catalog = credentials.catalog();
     let stats = catalog
         .load_column_stats(ctx.tenant_id.as_u64(), collection)
         .ok()?;

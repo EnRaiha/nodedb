@@ -21,9 +21,7 @@ use super::super::auth_support::{require_tenant_admin, status};
 /// router. Mirrors the pgwire `exists::trigger_exists` helper: `false` when the
 /// catalog is unavailable or the read errors.
 pub fn trigger_exists(state: &SharedState, identity: &AuthenticatedIdentity, name: &str) -> bool {
-    let Some(catalog) = state.credentials.catalog() else {
-        return false;
-    };
+    let catalog = state.credentials.catalog();
     let tid = identity.tenant_id.as_u64();
     matches!(catalog.get_trigger(tid, name), Ok(Some(_)))
 }
@@ -39,14 +37,7 @@ pub fn drop_trigger(
     let (name, if_exists) = parse_drop_trigger(parts)?;
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     // Check existence before proposing (so `IF EXISTS` + missing
     // trigger returns a clean success without touching raft).
@@ -137,14 +128,7 @@ pub fn alter_trigger(
     };
 
     let tenant_id = identity.tenant_id.as_u64();
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     let mut trigger = catalog
         .get_trigger(tenant_id, name)
@@ -192,14 +176,7 @@ fn alter_trigger_owner(
         .to_string();
 
     let tenant_id = identity.tenant_id.as_u64();
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     let mut trigger = catalog
         .get_trigger(tenant_id, name)

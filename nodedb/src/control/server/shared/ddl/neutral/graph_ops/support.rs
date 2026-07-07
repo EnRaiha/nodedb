@@ -35,10 +35,7 @@ pub(crate) fn ensure_collection_active(
     tenant_id: u64,
     name: &str,
 ) -> Result<(), DdlError> {
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => return Err(ddl_err("XX000", "catalog not available")),
-    };
+    let catalog = state.credentials.catalog();
     match catalog.get_collection(database_id, tenant_id, name) {
         Ok(Some(c)) if c.is_active => Ok(()),
         Ok(Some(_)) => Err(ddl_err(

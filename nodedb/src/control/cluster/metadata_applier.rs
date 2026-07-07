@@ -197,9 +197,8 @@ impl MetadataCommitApplier {
                     // next restart will re-derive the HWM from the log
                     // (the log is the source of truth), which is correct —
                     // just slightly slower. Tolerate and continue.
-                    if let Some(catalog) = self.credentials.catalog()
-                        && let Err(e) = catalog.put_surrogate_hwm(*hwm)
-                    {
+                    let catalog = self.credentials.catalog();
+                    if let Err(e) = catalog.put_surrogate_hwm(*hwm) {
                         warn!(
                             hwm,
                             error = %e,
@@ -318,9 +317,8 @@ impl MetadataCommitApplier {
                     // correct, just slightly slower. The hwm and cursor are
                     // written together in one redb txn, so a crash can never
                     // leave them inconsistent.
-                    if let Some(catalog) = self.credentials.catalog()
-                        && let Err(e) = catalog.put_surrogate_reserve_state(end - 1, raft_index)
-                    {
+                    let catalog = self.credentials.catalog();
+                    if let Err(e) = catalog.put_surrogate_reserve_state(end - 1, raft_index) {
                         warn!(
                             node_id,
                             request_id,
@@ -445,9 +443,7 @@ impl MetadataCommitApplier {
             _ => {}
         }
 
-        let Some(catalog) = self.credentials.catalog() else {
-            return Ok(());
-        };
+        let catalog = self.credentials.catalog();
         let (payload, audit) = match entry {
             MetadataEntry::CatalogDdl { payload } => (payload, None),
             MetadataEntry::CatalogDdlAudited {
@@ -655,8 +651,6 @@ mod tests {
 
         let loaded = credentials
             .catalog()
-            .as_ref()
-            .unwrap()
             .get_collection(DatabaseId::DEFAULT, 7, "orders")
             .unwrap()
             .expect("present");
@@ -682,8 +676,6 @@ mod tests {
 
         let loaded = credentials
             .catalog()
-            .as_ref()
-            .unwrap()
             .get_collection(DatabaseId::DEFAULT, 7, "archived")
             .unwrap()
             .expect("preserved");

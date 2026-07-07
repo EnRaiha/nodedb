@@ -239,7 +239,7 @@ impl TestClusterNode {
             )?,
         );
         let mut shared =
-            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials);
+            SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)?;
 
         // Initialise the cluster using the pre-bound transport.
         let handle = nodedb::control::cluster::init_cluster_with_transport(
@@ -265,17 +265,15 @@ impl TestClusterNode {
             // already-open catalog (mirrors production `SharedState::open`).
             // Required for sync handshake fencing to replicate via the
             // metadata Raft group on cluster nodes.
-            if let Some(catalog) = state.credentials.catalog() {
-                match nodedb::control::sync_producer::registry::SyncProducerRegistry::open(
-                    Arc::new(catalog.clone()),
-                ) {
-                    Ok(reg) => state.producer_registry = Some(Arc::new(reg)),
-                    Err(e) => {
-                        return Err(format!(
-                            "SyncProducerRegistry::open failed in test harness: {e}"
-                        )
-                        .into());
-                    }
+            let catalog = state.credentials.catalog().clone();
+            match nodedb::control::sync_producer::registry::SyncProducerRegistry::open(Arc::new(
+                catalog,
+            )) {
+                Ok(reg) => state.producer_registry = Some(Arc::new(reg)),
+                Err(e) => {
+                    return Err(
+                        format!("SyncProducerRegistry::open failed in test harness: {e}").into(),
+                    );
                 }
             }
         } else {

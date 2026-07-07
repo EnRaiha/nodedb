@@ -35,9 +35,7 @@ pub(super) fn load_strict_collection(
     name: &str,
     operation: &str,
 ) -> Result<(StoredCollection, nodedb_types::columnar::StrictSchema), DdlError> {
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, name)

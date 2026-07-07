@@ -53,7 +53,8 @@ pub async fn refresh_materialized_view(
     let name = parts[3].to_lowercase();
     let tenant_id = identity.tenant_id;
 
-    let view = if let Some(catalog) = state.credentials.catalog() {
+    let view = {
+        let catalog = state.credentials.catalog();
         match catalog.get_materialized_view(tenant_id.as_u64(), &name) {
             Ok(Some(v)) => v,
             Ok(None) => {
@@ -64,8 +65,6 @@ pub async fn refresh_materialized_view(
             }
             Err(e) => return Err(err("XX000", e.to_string())),
         }
-    } else {
-        return Err(err("XX000", "catalog unavailable".to_string()));
     };
 
     // 1) Run the stored SELECT and collect every row.

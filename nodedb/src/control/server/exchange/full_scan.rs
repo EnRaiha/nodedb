@@ -47,10 +47,7 @@ pub fn full_scan_plan_for_collection(
     tenant_id: TenantId,
     collection: &str,
 ) -> crate::Result<Option<PhysicalPlan>> {
-    let catalog_ref = state.credentials.catalog();
-    let Some(catalog) = catalog_ref.as_ref() else {
-        return Ok(None);
-    };
+    let catalog = state.credentials.catalog();
     let stored = match catalog.get_collection(database_id, tenant_id.as_u64(), collection)? {
         Some(s) => s,
         None => return Ok(None),

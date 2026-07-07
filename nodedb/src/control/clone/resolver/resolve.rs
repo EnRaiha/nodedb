@@ -65,10 +65,7 @@ pub fn resolve_read(
     let db_id = first_task.database_id;
 
     // Retrieve catalog for lookup.
-    let catalog_arc = state.credentials.catalog();
-    let Some(catalog) = catalog_arc.as_ref() else {
-        return Ok(None);
-    };
+    let catalog = state.credentials.catalog();
 
     // Extract the collection name from the first read-type task.
     let Some(raw_coll) = super::rewrite::extract_collection_from_plan(&first_task.plan) else {

@@ -44,12 +44,7 @@ pub fn undrop_collection(
     let name = name_lower.as_str();
     let tenant_id = identity.tenant_id;
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "UNDROP COLLECTION requires a persistent system catalog".to_string(),
-        });
-    };
+    let catalog = state.credentials.catalog();
 
     // Look up the soft-deleted record. Three distinct failures:
     //   - row absent: retention already expired or never existed.

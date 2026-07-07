@@ -45,13 +45,11 @@ pub fn show_materialized_views(
         "query".to_string(),
     ];
 
-    let views = if let Some(catalog) = state.credentials.catalog() {
-        catalog
-            .list_materialized_views(tenant_id.as_u64())
-            .map_err(|e| err("XX000", format!("catalog read failed: {e}")))?
-    } else {
-        Vec::new()
-    };
+    let views = state
+        .credentials
+        .catalog()
+        .list_materialized_views(tenant_id.as_u64())
+        .map_err(|e| err("XX000", format!("catalog read failed: {e}")))?;
 
     let mut rows = Vec::new();
     for view in &views {

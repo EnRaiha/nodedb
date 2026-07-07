@@ -199,10 +199,7 @@ impl SqlCatalog for OriginCatalog {
         // from the nodedb-sql planner. This enforces per-database namespace
         // isolation at plan time: a query in `db_alpha` cannot resolve a
         // collection that lives in `db_beta`.
-        let catalog_ref = self.credentials.catalog();
-        let Some(catalog) = catalog_ref.as_ref() else {
-            return Ok(None);
-        };
+        let catalog = self.credentials.catalog();
         let Some(stored) = catalog
             .get_collection(self.database_id, self.tenant_id, name)
             .ok()

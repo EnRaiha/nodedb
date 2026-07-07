@@ -37,16 +37,7 @@ pub async fn upload_wasm(
     let name = name.to_lowercase();
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = match state.shared.credentials.catalog() {
-        Some(c) => c,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "system catalog not available".to_string(),
-            )
-                .into_response();
-        }
-    };
+    let catalog = state.shared.credentials.catalog();
 
     // Verify the function exists and is a WASM function.
     let mut func = match catalog.get_function(tenant_id, &name) {

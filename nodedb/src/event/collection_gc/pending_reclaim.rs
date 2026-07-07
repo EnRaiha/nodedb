@@ -56,9 +56,7 @@ async fn run_loop(shared: Arc<SharedState>) {
 /// One worker pass: re-run the engine purge for every queued entry.
 /// Public for the boot-time drain and for testing.
 pub async fn drain_once(shared: &SharedState) {
-    let Some(catalog) = shared.credentials.catalog() else {
-        return;
-    };
+    let catalog = shared.credentials.catalog();
 
     let queue = match catalog.load_pending_reclaim_queue() {
         Ok(q) => q,

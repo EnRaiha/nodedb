@@ -29,9 +29,7 @@ pub fn load_collections(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
 ) -> Vec<StoredCollection> {
-    let Some(catalog) = state.credentials.catalog() else {
-        return Vec::new();
-    };
+    let catalog = state.credentials.catalog();
     if identity.is_superuser {
         catalog
             .load_all_collections(DatabaseId::DEFAULT)

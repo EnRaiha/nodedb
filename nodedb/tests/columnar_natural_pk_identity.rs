@@ -67,12 +67,7 @@ async fn columnar_natural_pk_rows_get_distinct_surrogates() {
     // distinct, non-zero cross-engine surrogate. The surrogate assigner writes
     // the binding synchronously during plan conversion, so it is durable by
     // the time the INSERT returns.
-    let catalog = server
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("harness wires a redb-backed catalog");
+    let catalog = server.shared.credentials.catalog();
     let bindings = catalog
         .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), "parts")
         .expect("scan persisted surrogate bindings for parts");

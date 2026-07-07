@@ -36,9 +36,6 @@ pub fn mirror_database(
     require_superuser(state, identity, None, "MIRROR DATABASE")?;
 
     let catalog = state.credentials.catalog();
-    let catalog = catalog
-        .as_ref()
-        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     // Reject if the local name already exists.
     match catalog.get_database_id_by_name(local_name) {

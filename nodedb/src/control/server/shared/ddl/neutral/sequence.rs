@@ -218,7 +218,8 @@ fn alter_restart(
                 sqlstate: "22023".to_string(),
                 message: e.to_string(),
             })?;
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             state.sequence_registry.persist_all(catalog);
         }
     }
@@ -294,7 +295,8 @@ pub fn drop_sequence(
         })?;
     if log_index == 0 {
         // Single-node / no-cluster fallback.
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             let _ = catalog.delete_sequence(tenant_id, name);
         }
         let _ = state.sequence_registry.remove(tenant_id, name);

@@ -92,14 +92,11 @@ pub fn drop_collection(
     // landed yet, so CASCADE itself is still rejected — but now with
     // the enumerated dependent list in hand, so the rejection is
     // specific instead of a generic "not yet supported".
-    let dependents: Vec<crate::control::cascade::Dependent> = if let Some(catalog) =
-        state.credentials.catalog().as_ref()
-    {
+    let dependents: Vec<crate::control::cascade::Dependent> = {
+        let catalog = state.credentials.catalog();
         let mut visited = std::collections::HashSet::new();
         crate::control::cascade::collect_dependents(catalog, tenant_id.as_u64(), name, &mut visited)
             .map_err(|e| err("XX000", e.to_string()))?
-    } else {
-        Vec::new()
     };
 
     // Implicit SERIAL/BIGSERIAL sequences (`{collection}_{field}_seq`)
@@ -184,7 +181,8 @@ pub fn drop_collection(
     // propose — re-running a drop that's already a no-op should not
     // spawn extra raft rounds or audit noise. The `if_exists` case
     // joins them on the absent-name branch.
-    if let Some(catalog) = state.credentials.catalog().as_ref() {
+    {
+        let catalog = state.credentials.catalog();
         match catalog.get_collection(database_id, tenant_id.as_u64(), name) {
             Ok(Some(coll)) if coll.is_active => {}
             Ok(Some(_)) if purge => {}
@@ -242,9 +240,8 @@ pub fn drop_collection(
     };
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", e.to_string()))?;
-    if log_index == 0
-        && let Some(catalog) = state.credentials.catalog().as_ref()
-    {
+    if log_index == 0 {
+        let catalog = state.credentials.catalog();
         // Single-node / no-cluster fallback: apply the catalog mutation
         // directly, matching what the applier would have done on a
         // clustered deployment.
@@ -263,9 +260,8 @@ pub fn drop_collection(
     }
 
     // Cascade: drop implicit sequences (SERIAL/BIGSERIAL fields create {coll}_{field}_seq).
-    if let Some(catalog) = state.credentials.catalog().as_ref()
-        && let Ok(seqs) = catalog.load_sequences_for_tenant(tenant_id.as_u64())
-    {
+    let catalog = state.credentials.catalog();
+    if let Ok(seqs) = catalog.load_sequences_for_tenant(tenant_id.as_u64()) {
         let prefix = format!("{name}_");
         let suffix = "_seq";
         for seq in &seqs {

@@ -38,7 +38,7 @@ fn build_test_state() -> Arc<SharedState> {
 
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).expect("wal"));
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    SharedState::new(dispatcher, wal)
+    SharedState::new(dispatcher, wal).unwrap()
 }
 
 fn superuser_identity() -> AuthenticatedIdentity {

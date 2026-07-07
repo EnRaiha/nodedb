@@ -95,9 +95,7 @@ pub async fn reconcile_once(
     if !shared.is_metadata_leader() {
         return 0;
     }
-    let Some(catalog) = shared.credentials.catalog().clone() else {
-        return 0;
-    };
+    let catalog = shared.credentials.catalog().clone();
     // Read every owned database's collections off the reactor.
     let loaded = match tokio::task::spawn_blocking(move || load_collections(&catalog)).await {
         Ok(Ok(rows)) => rows,

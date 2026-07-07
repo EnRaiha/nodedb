@@ -37,9 +37,7 @@ use crate::control::state::SharedState;
 /// which carries no descriptor row in `_system.databases`) is shared with
 /// the constraint-reconcile loop via [`load_collections`].
 pub async fn rehydrate_schema_registry(shared: &Arc<SharedState>) -> anyhow::Result<()> {
-    let Some(catalog) = shared.credentials.catalog() else {
-        return Ok(());
-    };
+    let catalog = shared.credentials.catalog();
 
     let all = load_collections(catalog)
         .map_err(|e| anyhow::anyhow!("schema rehydration: failed to load collections: {e}"))?;

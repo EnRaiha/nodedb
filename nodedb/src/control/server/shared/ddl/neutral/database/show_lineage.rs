@@ -38,11 +38,7 @@ pub fn show_database_lineage(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "show database lineage")?;
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
+    let catalog = state.credentials.catalog();
 
     let start_id = catalog
         .get_database_id_by_name(name)

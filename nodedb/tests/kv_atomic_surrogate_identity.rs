@@ -52,12 +52,7 @@ async fn kv_incr_on_fresh_key_persists_a_real_surrogate() {
     // `Surrogate::ZERO` and never called the assigner, so NO binding exists and
     // this scan is empty. With the fix, the assigner allocates + persists one
     // binding synchronously during plan conversion.
-    let catalog = server
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("harness wires a redb-backed catalog");
+    let catalog = server.shared.credentials.catalog();
     let bindings = catalog
         .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), "c")
         .expect("scan persisted surrogate bindings for c");

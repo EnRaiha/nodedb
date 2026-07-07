@@ -57,10 +57,7 @@ pub fn spawn_event_trigger_processor(shared: Arc<SharedState>) {
 
 /// Process a single change event against all matching EventDefinitions.
 async fn process_event(shared: &SharedState, event: &ChangeEvent) {
-    let catalog = match shared.credentials.catalog() {
-        Some(c) => c,
-        None => return,
-    };
+    let catalog = shared.credentials.catalog();
 
     let coll = match catalog.get_collection(
         DatabaseId::DEFAULT,

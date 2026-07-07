@@ -83,7 +83,7 @@ fn estimated_group_cardinality(
     group_by: &[String],
 ) -> Option<usize> {
     let credentials = ctx.credentials.as_ref()?;
-    let catalog = credentials.catalog().as_ref()?;
+    let catalog = credentials.catalog();
     let stats = catalog
         .load_column_stats(ctx.tenant_id.as_u64(), collection)
         .ok()?;

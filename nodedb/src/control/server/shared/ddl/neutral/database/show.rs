@@ -26,12 +26,7 @@ pub fn show_databases(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "show databases")?;
 
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => {
-            return Err(ddl_err("XX000", "system catalog unavailable"));
-        }
-    };
+    let catalog = state.credentials.catalog();
 
     let databases = catalog
         .list_databases()

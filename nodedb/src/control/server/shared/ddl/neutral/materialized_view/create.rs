@@ -52,7 +52,8 @@ pub async fn create_materialized_view(
     }
 
     // Validate source collection exists.
-    if let Some(catalog) = state.credentials.catalog() {
+    {
+        let catalog = state.credentials.catalog();
         match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &source) {
             Ok(Some(_)) => {}
             _ => {
@@ -100,12 +101,12 @@ pub async fn create_materialized_view(
     // Create the view's target collection so REFRESH can insert into it
     // and clients can SELECT from it like any other collection. Skipped
     // when a collection of the same name already exists (idempotent).
-    let target_exists = match state.credentials.catalog() {
-        Some(catalog) => matches!(
+    let target_exists = {
+        let catalog = state.credentials.catalog();
+        matches!(
             catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name),
             Ok(Some(c)) if c.is_active
-        ),
-        None => false,
+        )
     };
     if !target_exists {
         let target = StoredCollection {
@@ -230,11 +231,7 @@ async fn create_streaming_mv(
         created_at: now,
     };
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
+    let catalog = state.credentials.catalog();
     catalog
         .put_streaming_mv(&def)
         .map_err(|e| err("XX000", format!("catalog write: {e}")))?;

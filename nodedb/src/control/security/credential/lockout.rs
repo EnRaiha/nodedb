@@ -74,10 +74,7 @@ impl CredentialStore {
     /// Must be called after `set_lockout_policy_with_grace` because GC uses the
     /// configured `lockout_duration` to determine the cutoff.
     pub fn rebuild_lockout_cache(&self) -> crate::Result<()> {
-        let catalog = match self.catalog.as_ref() {
-            Some(c) => c,
-            None => return Ok(()),
-        };
+        let catalog = &self.catalog;
 
         let records = catalog.load_all_lockout_records()?;
         let now_epoch_ms = now_ms();
@@ -223,9 +220,7 @@ impl CredentialStore {
         drop(attempts);
 
         // Write through to redb (best-effort; log on failure, do not abort).
-        if let Some(ref catalog) = self.catalog
-            && let Err(e) = catalog.put_lockout_record(username, &stored)
-        {
+        if let Err(e) = self.catalog.put_lockout_record(username, &stored) {
             tracing::warn!(
                 username,
                 error = %e,
@@ -270,9 +265,7 @@ impl CredentialStore {
         drop(attempts);
 
         // Remove from redb on success (best-effort).
-        if let Some(ref catalog) = self.catalog
-            && let Err(e) = catalog.delete_lockout_record(username)
-        {
+        if let Err(e) = self.catalog.delete_lockout_record(username) {
             tracing::warn!(
                 username,
                 error = %e,
@@ -291,7 +284,7 @@ mod tests {
 
     #[test]
     fn lockout_after_threshold() {
-        let mut store = CredentialStore::new();
+        let mut store = CredentialStore::new().unwrap();
         store.set_lockout_policy(3, 300, 0);
 
         store.record_login_failure("alice", None, NOOP);
@@ -304,7 +297,7 @@ mod tests {
 
     #[test]
     fn login_success_resets_counter() {
-        let mut store = CredentialStore::new();
+        let mut store = CredentialStore::new().unwrap();
         store.set_lockout_policy(3, 300, 0);
 
         store.record_login_failure("bob", None, NOOP);
@@ -316,7 +309,7 @@ mod tests {
 
     #[test]
     fn lockout_disabled_when_zero() {
-        let store = CredentialStore::new();
+        let store = CredentialStore::new().unwrap();
         // max_failed_logins = 0 means disabled
         for _ in 0..100 {
             store.record_login_failure("charlie", None, NOOP);
@@ -328,7 +321,7 @@ mod tests {
     fn lockout_trigger_emits_audit_row() {
         use crate::control::security::audit::emitter::test_helpers::CapturingEmitter;
 
-        let mut store = CredentialStore::new();
+        let mut store = CredentialStore::new().unwrap();
         store.set_lockout_policy(2, 300, 0);
 
         let emitter = CapturingEmitter::new();
@@ -349,7 +342,7 @@ mod tests {
         use crate::control::security::audit::emitter::test_helpers::CapturingEmitter;
 
         // max_failed_logins = 0 → lockout disabled, never emits.
-        let store = CredentialStore::new();
+        let store = CredentialStore::new().unwrap();
         let emitter = CapturingEmitter::new();
         for _ in 0..10 {
             store.record_login_failure("frank", None, &emitter);

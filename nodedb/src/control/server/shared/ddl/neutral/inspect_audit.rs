@@ -74,13 +74,7 @@ pub fn show_audit_log(
         100
     };
 
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => {
-            // No persistent catalog — show in-memory entries only.
-            return show_audit_log_memory(state, limit);
-        }
-    };
+    let catalog = state.credentials.catalog();
 
     let entries = catalog
         .load_recent_audit_entries(limit)
@@ -108,64 +102,6 @@ pub fn show_audit_log(
         row.insert(
             "database_id".to_string(),
             JsonValue::String((entry.database_id.unwrap_or(0) as i64).to_string()),
-        );
-        row.insert(
-            "source".to_string(),
-            JsonValue::String(entry.source.clone()),
-        );
-        row.insert(
-            "detail".to_string(),
-            JsonValue::String(entry.detail.clone()),
-        );
-        rows.push(row);
-    }
-
-    Ok(vec![DdlResult::Rows(ShapedRows {
-        columns,
-        column_types,
-        rows,
-        notice: None,
-    })])
-}
-
-/// Show in-memory audit entries (when no persistent catalog).
-fn show_audit_log_memory(state: &SharedState, limit: usize) -> Result<Vec<DdlResult>, DdlError> {
-    let log = match state.audit.lock() {
-        Ok(l) => l,
-        Err(p) => p.into_inner(),
-    };
-
-    let (columns, column_types) = audit_columns();
-    let all = log.all();
-    let skip = if all.len() > limit {
-        all.len() - limit
-    } else {
-        0
-    };
-
-    let mut rows = Vec::new();
-
-    for entry in all.iter().skip(skip).rev() {
-        let mut row = Map::new();
-        row.insert(
-            "seq".to_string(),
-            JsonValue::String((entry.seq as i64).to_string()),
-        );
-        row.insert(
-            "timestamp_us".to_string(),
-            JsonValue::String((entry.timestamp_us as i64).to_string()),
-        );
-        row.insert(
-            "event".to_string(),
-            JsonValue::String(format!("{:?}", entry.event)),
-        );
-        row.insert(
-            "tenant_id".to_string(),
-            JsonValue::String((entry.tenant_id.map_or(0i64, |t| t.as_u64() as i64)).to_string()),
-        );
-        row.insert(
-            "database_id".to_string(),
-            JsonValue::String((entry.database_id.map_or(0i64, |d| d.as_u64() as i64)).to_string()),
         );
         row.insert(
             "source".to_string(),
@@ -302,9 +238,6 @@ pub fn show_audit_in_database(
     }
 
     let catalog = state.credentials.catalog();
-    let catalog = catalog
-        .as_ref()
-        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     let db_id = catalog
         .get_database_id_by_name(db_name)

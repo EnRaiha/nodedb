@@ -49,14 +49,7 @@ pub fn create_change_stream(
 
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     if let Ok(Some(_)) = catalog.get_change_stream(tenant_id, name) {
         return Err(DdlError {

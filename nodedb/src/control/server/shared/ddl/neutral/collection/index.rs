@@ -57,7 +57,8 @@ async fn commit_collection_mutation(
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", e.to_string()))?;
     if log_index == 0 {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog
                 .put_collection(database_id, coll)
                 .map_err(|e| err("XX000", e.to_string()))?;
@@ -123,12 +124,7 @@ pub async fn create_index(
     let tenant_id = identity.tenant_id;
 
     // Verify collection exists, capture it, and check CREATE permission.
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err(
-            "XX000",
-            "catalog unavailable: CREATE INDEX requires persisted collections",
-        ));
-    };
+    let catalog = state.credentials.catalog();
     let mut coll = match catalog.get_collection(database_id, tenant_id.as_u64(), collection) {
         Ok(Some(c)) if c.is_active => c,
         _ => {
@@ -332,12 +328,7 @@ pub async fn drop_index(
 
     // Locate the owning collection via catalog scan. Every index lives on
     // exactly one collection; scanning is cheap relative to Raft commit.
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err(
-            "XX000",
-            "catalog unavailable: DROP INDEX requires persisted collections",
-        ));
-    };
+    let catalog = state.credentials.catalog();
     let collections = catalog
         .load_collections_for_tenant(database_id, tenant_id.as_u64())
         .map_err(|e| err("XX000", e.to_string()))?;

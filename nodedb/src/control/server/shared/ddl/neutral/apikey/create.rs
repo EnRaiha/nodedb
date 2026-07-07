@@ -91,8 +91,9 @@ pub fn create_api_key(
                     let db_name = state
                         .credentials
                         .catalog()
-                        .as_ref()
-                        .and_then(|cat| cat.get_database_name_by_id(db_id).ok().flatten())
+                        .get_database_name_by_id(db_id)
+                        .ok()
+                        .flatten()
                         .unwrap_or_else(|| format!("<id:{}>", db_id.as_u64()));
                     return Err(err(
                         "42501",
@@ -126,9 +127,8 @@ pub fn create_api_key(
     let entry = crate::control::catalog_entry::CatalogEntry::PutApiKey(Box::new(stored.clone()));
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| err("XX000", format!("metadata propose: {e}")))?;
-    if log_index == 0
-        && let Some(catalog) = state.credentials.catalog()
-    {
+    if log_index == 0 {
+        let catalog = state.credentials.catalog();
         catalog
             .put_api_key(&stored)
             .map_err(|e| err("XX000", format!("catalog write: {e}")))?;

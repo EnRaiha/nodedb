@@ -38,7 +38,7 @@ impl NativeTestServer {
         let (dispatcher, data_sides) = Dispatcher::new(1, 64);
         let (event_producers, event_consumers) = create_event_bus(1);
 
-        let shared = SharedState::new(dispatcher, Arc::clone(&wal));
+        let shared = SharedState::new(dispatcher, Arc::clone(&wal)).unwrap();
 
         let data_side = data_sides.into_iter().next().unwrap();
         let core_dir = dir.path().to_path_buf();

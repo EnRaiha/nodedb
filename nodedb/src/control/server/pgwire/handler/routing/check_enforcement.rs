@@ -52,9 +52,7 @@ impl NodeDbPgHandler {
         };
 
         // Look up collection and its CHECK constraints.
-        let Some(catalog) = self.state.credentials.catalog() else {
-            return Ok(());
-        };
+        let catalog = self.state.credentials.catalog();
         let coll = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &coll_name)
         {
             Ok(Some(c)) => c,
@@ -115,9 +113,7 @@ impl NodeDbPgHandler {
             return Ok(());
         };
 
-        let Some(catalog) = self.state.credentials.catalog() else {
-            return Ok(());
-        };
+        let catalog = self.state.credentials.catalog();
         let coll = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &coll_name)
         {
             Ok(Some(c)) => c,

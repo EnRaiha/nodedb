@@ -182,7 +182,8 @@ pub fn create_rls_policy(
         message: format!("metadata propose: {e}"),
     })?;
     if log_index == 0 {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog.put_rls_policy(&stored).map_err(|e| DdlError {
                 sqlstate: "XX000".to_string(),
                 message: format!("catalog write: {e}"),
@@ -256,7 +257,8 @@ pub fn drop_rls_policy(
         message: format!("metadata propose: {e}"),
     })?;
     if log_index == 0 {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog
                 .delete_rls_policy(tenant_id, collection, name)
                 .map_err(|e| DdlError {

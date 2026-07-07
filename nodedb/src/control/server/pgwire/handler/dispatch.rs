@@ -75,8 +75,8 @@ impl NodeDbPgHandler {
         //     Eventual      → serve locally unconditionally
         // The catalog lookup is skipped for the default database (id=0) to keep the
         // hot path allocation-free in the single-database case.
+        let catalog = self.state.credentials.catalog();
         if task.database_id.as_u64() != 0
-            && let Some(catalog) = self.state.credentials.catalog()
             && let Ok(Some(descriptor)) = catalog.get_database(task.database_id)
             && let Some(origin) = descriptor.mirror_origin.as_ref()
             && !matches!(origin.status, nodedb_types::MirrorStatus::Promoted)

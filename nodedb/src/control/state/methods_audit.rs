@@ -153,7 +153,8 @@ impl SharedState {
             return;
         }
 
-        if let Some(catalog) = self.credentials.catalog() {
+        {
+            let catalog = self.credentials.catalog();
             let stored: Vec<crate::control::security::catalog::StoredAuditEntry> = entries
                 .iter()
                 .map(|e| crate::control::security::catalog::StoredAuditEntry {

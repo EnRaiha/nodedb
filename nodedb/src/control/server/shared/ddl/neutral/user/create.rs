@@ -28,14 +28,7 @@ fn resolve_tenant_selector(
     match selector {
         TenantSelector::Id(id) => Ok(TenantId::new(*id)),
         TenantSelector::Name(name) => {
-            let catalog = state
-                .credentials
-                .catalog()
-                .as_ref()
-                .ok_or_else(|| DdlError {
-                    sqlstate: "42704".to_string(),
-                    message: format!("tenant '{name}' not found"),
-                })?;
+            let catalog = state.credentials.catalog();
             let stored = catalog
                 .find_tenant_by_name(name)
                 .map_err(|e| DdlError {
@@ -124,7 +117,8 @@ pub fn create_user(
         // on the cache update. Test fixtures (and any future
         // fully-in-memory deployment) can run without a redb
         // catalog and still get correct read-after-write.
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog.put_user(&stored).map_err(|e| DdlError {
                 sqlstate: "XX000".to_string(),
                 message: format!("catalog write: {e}"),

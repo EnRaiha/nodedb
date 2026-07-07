@@ -176,11 +176,7 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
     // compensate by removing the just-written mapping; this guarantees we
     // never end up with an orphaned row in target (row present, no mapping)
     // which would later cause duplicate surrogates on retry.
-    let catalog_arc = state.credentials.catalog();
-    let catalog = catalog_arc.as_ref().ok_or(crate::Error::Storage {
-        engine: "clone_copyup".into(),
-        detail: "catalog unavailable".into(),
-    })?;
+    let catalog = state.credentials.catalog();
 
     let source_coll_qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
         origin.source_database,

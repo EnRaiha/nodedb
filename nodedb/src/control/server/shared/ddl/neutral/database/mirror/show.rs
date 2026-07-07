@@ -31,9 +31,6 @@ pub fn show_database_mirror_status(
     require_tenant_admin(identity, "show database mirror status")?;
 
     let catalog = state.credentials.catalog();
-    let catalog = catalog
-        .as_ref()
-        .ok_or_else(|| ddl_err("XX000", "system catalog unavailable"))?;
 
     let all_databases = catalog
         .list_databases()

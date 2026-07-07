@@ -83,7 +83,7 @@ pub(super) fn resolve_surrogate_pk(
     collection: &str,
     surrogate: Surrogate,
 ) -> Option<String> {
-    let catalog = state.credentials.catalog().as_ref()?;
+    let catalog = state.credentials.catalog();
     let pk_bytes = catalog
         .get_pk_for_surrogate(database_id, tenant_id, collection, surrogate)
         .ok()??;

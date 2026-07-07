@@ -31,17 +31,39 @@ impl SystemCatalog {
 
         let db = Database::create(path).map_err(|e| catalog_err("open", e))?;
 
-        // Bootstrap every `_system.*` table from the canonical registry —
-        // but only if at least one is actually missing. Probing read-only
-        // first keeps `open` byte-idempotent on an already-bootstrapped
-        // catalog: a write transaction + commit stamps a fresh meta/commit
-        // page on redb every time, so an unconditional bootstrap rewrites
-        // `system.redb` on every boot (changing its size/md5) even when
-        // nothing changed — and a boot that then fails its integrity check
-        // would have mutated persistent catalog state on its way out.
-        // Opening a table in a write transaction creates it if absent; the
-        // registry is the single source of truth, so a table cannot be
-        // read in production code without being bootstrapped here.
+        if Self::ensure_bootstrapped(&db)? {
+            info!(path = %path.display(), "system catalog opened (bootstrapped)");
+        } else {
+            info!(path = %path.display(), "system catalog opened");
+        }
+
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Open a non-persistent system catalog backed by an in-memory redb
+    /// database. Used by in-process credential stores that need a real,
+    /// fully-bootstrapped catalog without touching the filesystem.
+    pub fn open_in_memory() -> crate::Result<Self> {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(|e| catalog_err("open in-memory", e))?;
+        Self::ensure_bootstrapped(&db)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Bootstrap every `_system.*` table from the canonical registry —
+    /// but only if at least one is actually missing. Probing read-only
+    /// first keeps `open` byte-idempotent on an already-bootstrapped
+    /// catalog: a write transaction + commit stamps a fresh meta/commit
+    /// page on redb every time, so an unconditional bootstrap rewrites
+    /// `system.redb` on every boot (changing its size/md5) even when
+    /// nothing changed — and a boot that then fails its integrity check
+    /// would have mutated persistent catalog state on its way out.
+    /// Opening a table in a write transaction creates it if absent; the
+    /// registry is the single source of truth, so a table cannot be
+    /// read in production code without being bootstrapped here. Returns
+    /// `true` when a bootstrap write actually ran.
+    fn ensure_bootstrapped(db: &Database) -> crate::Result<bool> {
         let needs_bootstrap = match db.begin_read() {
             Ok(read_txn) => super::bootstrap_tables::BOOTSTRAP_TABLES
                 .iter()
@@ -52,21 +74,15 @@ impl SystemCatalog {
         };
         if needs_bootstrap {
             let write_txn = db.begin_write().map_err(|e| catalog_err("init txn", e))?;
-            {
-                for table in super::bootstrap_tables::BOOTSTRAP_TABLES {
-                    (table.create)(&write_txn)
-                        .map_err(|e| catalog_err(&format!("init {} table", table.label), e))?;
-                }
+            for table in super::bootstrap_tables::BOOTSTRAP_TABLES {
+                (table.create)(&write_txn)
+                    .map_err(|e| catalog_err(&format!("init {} table", table.label), e))?;
             }
             write_txn
                 .commit()
                 .map_err(|e| catalog_err("init commit", e))?;
-            info!(path = %path.display(), "system catalog opened (bootstrapped)");
-        } else {
-            info!(path = %path.display(), "system catalog opened");
         }
-
-        Ok(Self { db: Arc::new(db) })
+        Ok(needs_bootstrap)
     }
 
     /// Execute a write transaction on the WASM_MODULES table.

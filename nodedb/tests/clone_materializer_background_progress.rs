@@ -59,23 +59,14 @@ async fn background_sweep_materializes_clone_without_ddl() {
     let shared = server.shared.clone();
     tokio::task::spawn_blocking(move || {
         let cancel = AtomicBool::new(false);
-        let catalog = shared
-            .credentials
-            .catalog()
-            .as_ref()
-            .expect("system catalog");
+        let catalog = shared.credentials.catalog();
         run_scheduled_sweep(&shared, catalog, &cancel)
     })
     .await
     .expect("spawn_blocking join")
     .expect("run_scheduled_sweep must succeed");
 
-    let catalog = server
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("system catalog");
+    let catalog = server.shared.credentials.catalog();
     let db_id = catalog
         .get_database_id_by_name("bg_sweep_clone")
         .expect("catalog lookup")

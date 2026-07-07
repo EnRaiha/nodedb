@@ -50,14 +50,7 @@ pub fn drop_procedure(
     let name = parts[idx].to_lowercase().trim_end_matches(';').to_string();
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     // Pre-check existence so `IF EXISTS` on a missing procedure is
     // a clean no-op that never touches raft.

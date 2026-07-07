@@ -25,12 +25,7 @@ pub fn backup_database(
     identity: &AuthenticatedIdentity,
     name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => {
-            return Err(ddl_err("XX000", "system catalog unavailable"));
-        }
-    };
+    let catalog = state.credentials.catalog();
     let db_id = match catalog.get_database_id_by_name(name) {
         Ok(Some(id)) => id,
         Ok(None) => {
@@ -59,8 +54,9 @@ pub fn restore_database(
     let db_id_opt = state
         .credentials
         .catalog()
-        .as_ref()
-        .and_then(|c| c.get_database_id_by_name(name).ok().flatten());
+        .get_database_id_by_name(name)
+        .ok()
+        .flatten();
     require_superuser(
         state,
         identity,

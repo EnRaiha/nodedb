@@ -69,9 +69,7 @@ pub async fn drain_once(shared: &SharedState) {
     let Some(cold) = shared.cold_storage.as_ref() else {
         return;
     };
-    let Some(catalog) = shared.credentials.catalog() else {
-        return;
-    };
+    let catalog = shared.credentials.catalog();
 
     let queue = match catalog.load_l2_cleanup_queue() {
         Ok(q) => q,

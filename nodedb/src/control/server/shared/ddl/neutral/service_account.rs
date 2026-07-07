@@ -323,14 +323,11 @@ pub fn alter_service_account_set_databases(
     let mut db_ids = Vec::with_capacity(raw_names.len());
     for db_name in raw_names {
         let resolved: Option<nodedb_types::id::DatabaseId> = catalog
-            .as_ref()
-            .map(|cat| cat.get_database_id_by_name(db_name))
-            .transpose()
+            .get_database_id_by_name(db_name)
             .map_err(|e| DdlError {
                 sqlstate: "XX000".to_string(),
                 message: e.to_string(),
-            })?
-            .flatten();
+            })?;
         match resolved {
             Some(id) => db_ids.push(id),
             None => {
@@ -366,19 +363,12 @@ fn resolve_database(
     name: &str,
 ) -> Result<nodedb_types::id::DatabaseId, DdlError> {
     let catalog = state.credentials.catalog();
-    // catalog: Option<Arc<SystemCatalog>>
-    // map: Option<Result<Option<DatabaseId>>>
-    // transpose: Result<Option<Option<DatabaseId>>>
-    // ? + flatten: Option<DatabaseId>
     let resolved: Option<nodedb_types::id::DatabaseId> = catalog
-        .as_ref()
-        .map(|cat| cat.get_database_id_by_name(name))
-        .transpose()
+        .get_database_id_by_name(name)
         .map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: e.to_string(),
-        })?
-        .flatten();
+        })?;
     resolved.ok_or_else(|| DdlError {
         sqlstate: "42704".to_string(),
         message: format!("database '{name}' not found"),

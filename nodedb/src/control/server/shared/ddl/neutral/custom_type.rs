@@ -158,11 +158,7 @@ pub fn drop_type(
         ));
     }
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available"))?;
+    let catalog = state.credentials.catalog();
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteCustomType {
         tenant_id,
@@ -260,11 +256,7 @@ pub fn show_types(
 
 /// Persist the entry to catalog and register in the in-memory registry.
 fn persist_and_register(state: &SharedState, stored: StoredCustomType) -> Result<(), DdlError> {
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available"))?;
+    let catalog = state.credentials.catalog();
 
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutCustomType(Box::new(stored.clone()));
@@ -289,10 +281,7 @@ fn find_referencing_collections(
     tenant_id: u64,
     type_name: &str,
 ) -> Vec<String> {
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => return Vec::new(),
-    };
+    let catalog = state.credentials.catalog();
     let collections = match catalog.load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id) {
         Ok(c) => c,
         Err(_) => return Vec::new(),

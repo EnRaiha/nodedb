@@ -47,7 +47,7 @@ async fn start_http(auth_mode: AuthMode) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("auth.wal")).unwrap());
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    let shared = SharedState::new(dispatcher, wal);
+    let shared = SharedState::new(dispatcher, wal).unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_addr = listener.local_addr().unwrap();

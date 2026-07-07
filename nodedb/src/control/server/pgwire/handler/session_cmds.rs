@@ -430,10 +430,7 @@ impl NodeDbPgHandler {
         let resolved = if let Ok(id) = value.parse::<u64>() {
             crate::types::TenantId::new(id)
         } else {
-            let catalog =
-                self.state.credentials.catalog().as_ref().ok_or_else(|| {
-                    sqlstate_error("42704", &format!("tenant '{value}' not found"))
-                })?;
+            let catalog = self.state.credentials.catalog();
             let stored = catalog
                 .find_tenant_by_name(value)
                 .map_err(|e| sqlstate_error("XX000", &format!("catalog read: {e}")))?

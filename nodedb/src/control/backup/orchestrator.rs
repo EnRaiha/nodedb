@@ -96,7 +96,8 @@ pub async fn backup_tenant(state: &Arc<SharedState>, tenant_id: u64) -> Result<B
     // window loses its soft-deleted row (UNDROP can't work after
     // restore), and a restore whose source has already purged a
     // collection can resurrect rows that were properly reaped.
-    if let Some(catalog) = state.credentials.catalog() {
+    {
+        let catalog = state.credentials.catalog();
         if let Ok(all) = catalog.load_all_collections(DatabaseId::DEFAULT) {
             let mut blobs: Vec<nodedb_types::backup_envelope::StoredCollectionBlob> = Vec::new();
             for coll in all.iter().filter(|c| c.tenant_id == tenant_id) {

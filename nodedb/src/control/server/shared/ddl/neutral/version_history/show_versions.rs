@@ -26,9 +26,7 @@ pub fn show_versions(
     let (collection, doc_id, limit) = parse_show_versions(sql)?;
     let tenant_id = identity.tenant_id;
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "catalog unavailable".to_string()));
-    };
+    let catalog = state.credentials.catalog();
 
     let records = catalog
         .list_checkpoints(

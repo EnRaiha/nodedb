@@ -22,9 +22,7 @@ use nodedb_physical::physical_plan::MetaOp;
 /// aggregate becomes silently inactive after restart and the runtime
 /// bucket-aggregation pipeline forgets the definitions.
 pub async fn register_persisted_continuous_aggregates(state: &SharedState) {
-    let Some(catalog) = state.credentials.catalog() else {
-        return;
-    };
+    let catalog = state.credentials.catalog();
     let stored = match catalog.load_all_continuous_aggregates() {
         Ok(s) => s,
         Err(e) => {

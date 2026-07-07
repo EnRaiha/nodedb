@@ -26,7 +26,8 @@ pub fn alter_timeseries(
     let name = parts[2].to_lowercase();
     let tenant_id = identity.tenant_id;
 
-    if let Some(catalog) = state.credentials.catalog() {
+    {
+        let catalog = state.credentials.catalog();
         let mut coll = catalog
             .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name)
             .map_err(|e| ddl_err("XX000", e.to_string()))?
@@ -62,8 +63,6 @@ pub fn alter_timeseries(
         catalog
             .put_collection(DatabaseId::DEFAULT, &coll)
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
-    } else {
-        return Err(ddl_err("XX000", "catalog unavailable"));
     }
 
     tracing::info!(collection = name, "timeseries config updated");

@@ -52,12 +52,12 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             // best-effort fallback if the redb write silently failed.
             // Owner record install is sync; Data Plane register is
             // the async part, handled by `spawn_post_apply_async_side_effects`.
-            let canonical = shared.credentials.catalog().as_ref().and_then(|catalog| {
-                catalog
-                    .get_collection(stored.database_id, stored.tenant_id, &stored.name)
-                    .ok()
-                    .flatten()
-            });
+            let canonical = shared
+                .credentials
+                .catalog()
+                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
             match canonical {
                 Some(canonical) => collection::put_owner_sync(&canonical, Arc::clone(shared)),
                 None => collection::put_owner_sync(stored, Arc::clone(shared)),

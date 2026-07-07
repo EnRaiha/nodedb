@@ -37,11 +37,8 @@ pub(in crate::control::server::sync) fn build_collection_schema_frame(
     let stored = shared
         .credentials
         .catalog()
-        .as_ref()
-        .and_then(|c| {
-            c.get_collection(crate::types::DatabaseId::DEFAULT, tenant_id, collection)
-                .ok()
-        })
+        .get_collection(crate::types::DatabaseId::DEFAULT, tenant_id, collection)
+        .ok()
         .flatten();
 
     let Some(stored) = stored else {

@@ -479,8 +479,8 @@ fn is_timeseries_cdc_enabled(
     tenant_id: TenantId,
     collection: &str,
 ) -> bool {
-    if let Some(catalog) = shared.credentials.catalog()
-        && let Ok(Some(coll)) = catalog.get_collection(database_id, tenant_id.as_u64(), collection)
+    let catalog = shared.credentials.catalog();
+    if let Ok(Some(coll)) = catalog.get_collection(database_id, tenant_id.as_u64(), collection)
         && coll.collection_type.is_timeseries()
     {
         if let Some(config) = coll.get_timeseries_config()

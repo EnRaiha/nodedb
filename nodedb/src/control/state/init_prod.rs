@@ -38,29 +38,25 @@ impl SharedState {
         // Bring the surrogate PK catalog up to the current key layout before
         // any allocation path reads it: v1 (bare) → v2 (database-scoped) →
         // v3 (database + tenant scoped). Both steps are idempotent and ordered.
-        if let Some(catalog) = credentials.catalog() {
-            catalog.migrate_surrogate_pk()?;
-            catalog.migrate_surrogate_pk_v3()?;
-        }
+        credentials.catalog().migrate_surrogate_pk()?;
+        credentials.catalog().migrate_surrogate_pk_v3()?;
 
         // Share the credential store's already-open catalog (one redb file
         // handle). Opening a second `SystemCatalog` on the same path is rejected
         // by redb, which would silently disable durable fencing.
         let producer_registry = {
             use crate::control::sync_producer::registry::SyncProducerRegistry;
-            match credentials.catalog() {
-                Some(catalog) => match SyncProducerRegistry::open(Arc::new(catalog.clone())) {
-                    Ok(reg) => Some(Arc::new(reg)),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "SharedState::open: SyncProducerRegistry::open failed; \
-                             sync handshake will use in-memory fork detection only"
-                        );
-                        None
-                    }
-                },
-                None => None,
+            let catalog = credentials.catalog();
+            match SyncProducerRegistry::open(Arc::new(catalog.clone())) {
+                Ok(reg) => Some(Arc::new(reg)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "SharedState::open: SyncProducerRegistry::open failed; \
+                         sync handshake will use in-memory fork detection only"
+                    );
+                    None
+                }
             }
         };
 
@@ -91,7 +87,8 @@ impl SharedState {
         let sequence_registry = Arc::new(crate::control::sequence::SequenceRegistry::new());
         let rls_store = RlsPolicyStore::new();
         let mut audit_start_seq = 1u64;
-        if let Some(catalog) = credentials.catalog() {
+        {
+            let catalog = credentials.catalog();
             api_keys.load_from(catalog)?;
             roles.load_from(catalog)?;
             permissions.load_from(catalog)?;
@@ -152,11 +149,7 @@ impl SharedState {
         // it seeds from the persisted hwm so post-restart allocations cannot
         // collide with pre-restart ones.
         let database_registry = {
-            let hwm = if let Some(catalog) = credentials.catalog() {
-                catalog.get_database_hwm().unwrap_or(0)
-            } else {
-                0
-            };
+            let hwm = credentials.catalog().get_database_hwm().unwrap_or(0);
             crate::control::database::DatabaseRegistry::from_persisted_hwm(hwm)
         };
 
@@ -165,18 +158,17 @@ impl SharedState {
         // it seeds `next = persisted_hwm + 1` so post-restart
         // allocations cannot collide with pre-restart ones.
         let surrogate_registry_handle: crate::control::surrogate::SurrogateRegistryHandle = {
-            let initial = if let Some(catalog) = credentials.catalog() {
+            let initial = {
                 // Seed BOTH the global watermark `G` and the applied-reserve
                 // cursor so cluster-mode metadata-log replay skips every
                 // `SurrogateReserve` already folded into `G` (no restart
                 // double-count). Single-node history has cursor 0, so the
                 // single-node path (which never proposes `SurrogateReserve`)
                 // is unaffected.
+                let catalog = credentials.catalog();
                 let hwm = catalog.get_surrogate_hwm()?;
                 let reserve_index = catalog.get_surrogate_reserve_index()?;
                 crate::control::surrogate::SurrogateRegistry::from_persisted(hwm, reserve_index)
-            } else {
-                crate::control::surrogate::SurrogateRegistry::new()
             };
             Arc::new(std::sync::RwLock::new(initial))
         };
@@ -198,9 +190,8 @@ impl SharedState {
         // (avoids blocking_write() which panics inside async runtimes).
         let mut permission_cache =
             crate::control::security::permission_tree::PermissionCache::new();
-        if let Some(catalog) = credentials.catalog()
-            && let Ok(collections) = catalog.load_all_collections(DatabaseId::DEFAULT)
-        {
+        let catalog = credentials.catalog();
+        if let Ok(collections) = catalog.load_all_collections(DatabaseId::DEFAULT) {
             for coll in &collections {
                 if let Some(ref def_json) = coll.permission_tree_def
                     && let Ok(def) = sonic_rs::from_str::<
@@ -516,7 +507,8 @@ impl SharedState {
         // Populate per-database DML audit cache and collection→database reverse
         // map from the catalog so the Event Plane consumer has accurate data
         // from the first write after startup.
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             if let Err(e) = state.audit_dml_cache.load_from_catalog(catalog) {
                 tracing::warn!(error = %e, "boot: failed to populate audit_dml_cache from catalog");
             }

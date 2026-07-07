@@ -45,12 +45,7 @@ async fn kv_field_set_on_fresh_key_persists_a_real_surrogate() {
         .await
         .expect("kv field-set on fresh key");
 
-    let catalog = server
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("harness wires a redb-backed catalog");
+    let catalog = server.shared.credentials.catalog();
     let bindings = catalog
         .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), "cf")
         .expect("scan persisted surrogate bindings for cf");
@@ -92,12 +87,7 @@ async fn kv_transfer_persists_two_distinct_surrogates() {
         .await
         .expect("transfer debit -> credit");
 
-    let catalog = server
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("harness wires a redb-backed catalog");
+    let catalog = server.shared.credentials.catalog();
     let bindings = catalog
         .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), "ct")
         .expect("scan persisted surrogate bindings for ct");

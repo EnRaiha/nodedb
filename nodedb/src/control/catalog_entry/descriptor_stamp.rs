@@ -235,7 +235,7 @@ mod tests {
     fn stamp_on_create_assigns_version_one() {
         let (store, _tmp) = make_catalog();
         let clock = HlcClock::new();
-        let catalog = store.catalog().as_ref().expect("catalog");
+        let catalog = store.catalog();
         let stored = StoredCollection::new(1, "orders", "tester");
         let entry = CatalogEntry::PutCollection(Box::new(stored));
 
@@ -251,7 +251,7 @@ mod tests {
     fn stamp_monotonic_across_updates() {
         let (store, _tmp) = make_catalog();
         let clock = HlcClock::new();
-        let catalog = store.catalog().as_ref().expect("catalog");
+        let catalog = store.catalog();
 
         let mut prior_hlc = nodedb_types::Hlc::ZERO;
         for expected in 1u64..=5 {
@@ -275,7 +275,7 @@ mod tests {
     fn stamp_ignores_deletes() {
         let (store, _tmp) = make_catalog();
         let clock = HlcClock::new();
-        let catalog = store.catalog().as_ref().expect("catalog");
+        let catalog = store.catalog();
         let entry = CatalogEntry::DeactivateCollection {
             tenant_id: 1,
             name: "orders".into(),

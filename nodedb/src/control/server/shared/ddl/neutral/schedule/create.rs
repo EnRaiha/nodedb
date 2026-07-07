@@ -108,13 +108,6 @@ pub fn create_schedule(
         created_at: now,
     };
 
-    if state.credentials.catalog().is_none() {
-        return Err(DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        });
-    }
-
     let entry = crate::control::catalog_entry::CatalogEntry::PutSchedule(Box::new(def.clone()));
     let log_index = super::super::super::catalog::propose_and_apply(state, &entry)?;
     if log_index == 0 {

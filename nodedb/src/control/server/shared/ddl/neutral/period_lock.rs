@@ -95,9 +95,7 @@ pub fn add_period_lock(
     };
 
     // Load the collection, update, and re-persist.
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &name)
@@ -138,9 +136,7 @@ pub fn drop_period_lock(
         .ok_or_else(|| err("42601", "missing collection name"))?
         .to_lowercase();
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
 
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, &name)

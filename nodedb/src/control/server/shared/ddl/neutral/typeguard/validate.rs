@@ -35,11 +35,7 @@ pub async fn validate_typeguard(
     let coll_name = super::parse::extract_collection_name(sql)?;
     let tenant_id = identity.tenant_id;
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| super::parse::err("08000", "catalog not available"))?;
+    let catalog = state.credentials.catalog();
 
     let coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &coll_name)

@@ -26,7 +26,6 @@ async fn create_oidc_provider_persists_in_catalog() {
     .await;
 
     let cat = state.credentials.catalog();
-    let cat = cat.as_ref().expect("catalog must be present");
     let stored = cat
         .get_oidc_provider("okta")
         .expect("catalog read must succeed")
@@ -70,7 +69,6 @@ async fn drop_oidc_provider_removes_record() {
     ddl_ok(&state, &su, "DROP OIDC PROVIDER auth0").await;
 
     let cat = state.credentials.catalog();
-    let cat = cat.as_ref().expect("catalog must be present");
     let stored = cat
         .get_oidc_provider("auth0")
         .expect("catalog read must succeed");

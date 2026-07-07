@@ -15,9 +15,7 @@ pub fn l2_cleanup_queue(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
 ) -> crate::Result<Vec<Vec<u8>>> {
-    let Some(catalog) = state.credentials.catalog() else {
-        return Ok(Vec::new());
-    };
+    let catalog = state.credentials.catalog();
     let queue = catalog
         .load_l2_cleanup_queue()
         .map_err(|e| crate::Error::Storage {

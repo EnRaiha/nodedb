@@ -142,9 +142,8 @@ where
     };
 
     let mut names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
-    if let Some(catalog) = state.credentials.catalog()
-        && let Ok(all) = catalog.load_all_tenants()
-    {
+    let catalog = state.credentials.catalog();
+    if let Ok(all) = catalog.load_all_tenants() {
         for t in all {
             names.insert(t.tenant_id, t.name);
         }

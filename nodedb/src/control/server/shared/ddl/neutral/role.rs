@@ -67,9 +67,8 @@ pub fn create_role(
             sqlstate: "XX000".to_string(),
             message: format!("metadata propose: {e}"),
         })?;
-    if log_index == 0
-        && let Some(catalog) = state.credentials.catalog()
-    {
+    if log_index == 0 {
+        let catalog = state.credentials.catalog();
         catalog.put_role(&stored).map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: format!("catalog write: {e}"),
@@ -132,7 +131,7 @@ pub fn drop_role(
         let catalog = state.credentials.catalog();
         state
             .roles
-            .drop_role(name, catalog.as_ref())
+            .drop_role(name, Some(catalog))
             .map_err(|e| DdlError {
                 sqlstate: "42704".to_string(),
                 message: e.to_string(),
@@ -278,9 +277,8 @@ pub fn set_role_parent(
             sqlstate: "XX000".to_string(),
             message: format!("metadata propose: {e}"),
         })?;
-    if log_index == 0
-        && let Some(catalog) = state.credentials.catalog()
-    {
+    if log_index == 0 {
+        let catalog = state.credentials.catalog();
         catalog.put_role(&stored).map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: format!("catalog write: {e}"),

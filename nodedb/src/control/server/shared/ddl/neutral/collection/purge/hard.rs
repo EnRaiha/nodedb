@@ -56,7 +56,8 @@ pub(crate) async fn hard_purge_collection(
     //    owner row, surrogate map) — the synchronous half of the
     //    `PurgeCollection` applier. Propagate failure: if the old row
     //    survives, the new collection must NOT register over it.
-    if let Some(catalog) = state.credentials.catalog() {
+    {
+        let catalog = state.credentials.catalog();
         crate::control::catalog_entry::apply::collection::purge(tenant_id, name, catalog)?;
     }
 

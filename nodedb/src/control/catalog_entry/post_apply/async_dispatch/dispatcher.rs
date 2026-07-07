@@ -59,12 +59,12 @@ pub fn spawn_post_apply_async_side_effects(
             // read-back is always Some; a None here would mean the redb
             // write silently failed, so warn and skip rather than register
             // a divergent config.
-            let canonical = shared.credentials.catalog().as_ref().and_then(|catalog| {
-                catalog
-                    .get_collection(stored.database_id, stored.tenant_id, &stored.name)
-                    .ok()
-                    .flatten()
-            });
+            let canonical = shared
+                .credentials
+                .catalog()
+                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
             match canonical {
                 Some(canonical) => {
                     // SYNCHRONOUS: Register must complete before the

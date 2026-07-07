@@ -43,7 +43,8 @@ pub(super) async fn alter_table_add_column(
         ));
     }
 
-    let updated = if let Some(catalog) = state.credentials.catalog() {
+    let updated = {
+        let catalog = state.credentials.catalog();
         match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), table_name) {
             Ok(Some(coll)) if coll.is_active => {
                 if coll.collection_type.is_strict()
@@ -69,7 +70,10 @@ pub(super) async fn alter_table_add_column(
                     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(
                         Box::new(updated.clone()),
                     );
-                    super::support::propose_and_apply(state, &entry)?;
+                    // Offload the durable catalog commit (redb `fsync`) off the
+                    // Tokio worker so this online ALTER never stalls concurrent
+                    // INSERTs on the same runtime.
+                    super::support::propose_and_apply_async(state, entry).await?;
                     Some(updated)
                 } else {
                     None
@@ -82,8 +86,6 @@ pub(super) async fn alter_table_add_column(
                 ));
             }
         }
-    } else {
-        None
     };
 
     if let Some(ref coll) = updated {

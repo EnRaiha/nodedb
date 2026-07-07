@@ -66,11 +66,7 @@ pub fn drop_alert(
         return Err(err("42704", format!("alert '{name}' does not exist")));
     }
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
+    let catalog = state.credentials.catalog();
 
     catalog
         .delete_alert_rule(database_id.as_u64(), tenant_id, &name)

@@ -35,9 +35,7 @@ pub async fn compact_history(
     let tenant_id = identity.tenant_id;
 
     // Resolve checkpoint to version vector + timestamp.
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "catalog unavailable".to_string()));
-    };
+    let catalog = state.credentials.catalog();
     let record = catalog
         .get_checkpoint(tenant_id.as_u64(), &collection, &doc_id, &checkpoint_name)
         .map_err(|e| err("XX000", e.to_string()))?

@@ -38,12 +38,10 @@ impl NativeTestServer {
         let (dispatcher, data_sides) = Dispatcher::new(1, 64);
         let (event_producers, event_consumers) = create_event_bus(1);
 
-        // Use catalog-backed credential store (mirrors pgwire_harness::start —
-        // without a real catalog, `credentials.catalog()` returns `None` for
-        // the server's whole lifetime, which makes DDL apply
-        // (`apply_locally_if_needed`) and planner reads
-        // (`OriginCatalog::get_collection`) silently no-op, so every
-        // collection created over the native protocol is invisible).
+        // Use catalog-backed credential store (mirrors pgwire_harness::start)
+        // so DDL apply (`apply_locally_if_needed`) and planner reads
+        // (`OriginCatalog::get_collection`) resolve against a real catalog and
+        // collections created over the native protocol are visible.
         let catalog_path = dir.path().join("system.redb");
         let credential_store =
             nodedb::control::security::credential::store::CredentialStore::open(&catalog_path)
@@ -59,10 +57,9 @@ impl NativeTestServer {
         );
         // Ensure the built-in `default` database (id 0) is present in the
         // catalog so the default connection database works in tests.
-        if let Some(cat) = credentials.catalog() {
-            let _ = cat.bootstrap_default_database();
-        }
-        let shared = SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials);
+        let _ = credentials.catalog().bootstrap_default_database();
+        let shared = SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)
+            .expect("build shared state");
 
         let data_side = data_sides.into_iter().next().expect("data side");
         let core_dir = dir.path().to_path_buf();

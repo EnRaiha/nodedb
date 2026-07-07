@@ -300,11 +300,13 @@ fn bind_startup_database<C: pgwire::api::ClientInfo>(
 
     handler.sessions.ensure_session(*addr);
 
-    let db_id = if let Some(cat) = handler.state.credentials.catalog().as_ref() {
-        cat.get_database_id_by_name(&db_name).ok().flatten()
-    } else {
-        None
-    };
+    let db_id = handler
+        .state
+        .credentials
+        .catalog()
+        .get_database_id_by_name(&db_name)
+        .ok()
+        .flatten();
 
     if let Some(id) = db_id {
         handler.sessions.set_current_database(addr, id);

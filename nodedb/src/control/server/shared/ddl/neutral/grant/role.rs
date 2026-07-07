@@ -56,7 +56,8 @@ fn propose_user_with_roles(
         message: format!("metadata propose: {e}"),
     })?;
     if log_index == 0 {
-        if let Some(catalog) = state.credentials.catalog() {
+        {
+            let catalog = state.credentials.catalog();
             catalog.put_user(&stored).map_err(|e| DdlError {
                 sqlstate: "XX000".to_string(),
                 message: format!("catalog write: {e}"),

@@ -103,10 +103,7 @@ fn check_collection_exists(
     identity: &AuthenticatedIdentity,
     collection: &str,
 ) -> Result<(), DdlError> {
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => return Ok(()), // No catalog: schemaless fallback; proceed.
-    };
+    let catalog = state.credentials.catalog();
     match catalog.get_collection(DatabaseId::DEFAULT, identity.tenant_id.as_u64(), collection) {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(ddl_err(

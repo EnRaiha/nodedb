@@ -15,7 +15,8 @@ use nodedb_wal::WalRecord;
 /// Exits the process if replay fails — a partially-recovered surrogate
 /// registry is not safe to continue with.
 pub fn replay_surrogate_wal(shared: &Arc<SharedState>, wal_records: &Arc<[WalRecord]>) {
-    if let Some(catalog) = shared.credentials.catalog() {
+    {
+        let catalog = shared.credentials.catalog();
         match crate::wal::replay::replay_surrogate_records(
             wal_records,
             catalog,

@@ -65,12 +65,13 @@ pub fn handle_set_vector_metadata(
         .to_lowercase();
 
     // Verify collection exists.
-    if let Some(catalog) = state.credentials.catalog()
-        && catalog
-            .get_collection(database_id, tenant_id, &collection)
-            .ok()
-            .flatten()
-            .is_none()
+    if state
+        .credentials
+        .catalog()
+        .get_collection(database_id, tenant_id, &collection)
+        .ok()
+        .flatten()
+        .is_none()
     {
         return Err(err(
             "42P01",
@@ -149,11 +150,7 @@ pub fn handle_set_vector_metadata(
         },
     };
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available"))?;
+    let catalog = state.credentials.catalog();
 
     catalog
         .put_vector_model(&entry)
@@ -181,11 +178,7 @@ pub fn handle_show_vector_models(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available"))?;
+    let catalog = state.credentials.catalog();
 
     let entries = catalog
         .list_vector_models(tenant_id)
@@ -246,11 +239,7 @@ pub fn handle_vector_metadata_query(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available"))?;
+    let catalog = state.credentials.catalog();
 
     let entry = catalog
         .get_vector_model(tenant_id, collection, column)

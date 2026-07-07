@@ -145,9 +145,7 @@ async fn asof_audit_null_honours_order_by() {
     // Audit path still returns all versions AND now respects ORDER BY on a real
     // user column.
     let audit = srv
-        .query_rows(&format!(
-            "SELECT n FROM bta AS OF SYSTEM TIME NULL ORDER BY n"
-        ))
+        .query_rows("SELECT n FROM bta AS OF SYSTEM TIME NULL ORDER BY n")
         .await
         .expect("audit scan with order by");
     let flat: Vec<&str> = audit.iter().map(|r| r[0].as_str()).collect();
@@ -159,9 +157,7 @@ async fn asof_audit_null_honours_order_by() {
 
     // And the synthetic `_ts_system` column is projectable + sortable.
     let by_ts = srv
-        .query_rows(&format!(
-            "SELECT n FROM bta AS OF SYSTEM TIME NULL ORDER BY _ts_system, n"
-        ))
+        .query_rows("SELECT n FROM bta AS OF SYSTEM TIME NULL ORDER BY _ts_system, n")
         .await
         .expect("audit scan ordered by _ts_system");
     assert_eq!(

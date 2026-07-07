@@ -29,8 +29,7 @@ use nodedb_types::id::DatabaseId;
 async fn database_ddl_audit_smoke() {
     let state = make_state_with_catalog();
     let su = superuser();
-    let cat = state.credentials.catalog();
-    let cat_handle = cat.as_ref().expect("catalog");
+    let cat_handle = state.credentials.catalog();
 
     // CREATE DATABASE → DatabaseCreated, db_id = new id.
     ddl_ok(&state, &su, "CREATE DATABASE smoke_a").await;
@@ -100,8 +99,7 @@ async fn clone_database_requires_superuser_audit() {
     let state = make_state_with_catalog();
     let su = superuser();
     ddl_ok(&state, &su, "CREATE DATABASE clone_src").await;
-    let cat = state.credentials.catalog();
-    let cat_handle = cat.as_ref().expect("catalog");
+    let cat_handle = state.credentials.catalog();
     let src_id = cat_handle
         .get_database_id_by_name("clone_src")
         .unwrap()

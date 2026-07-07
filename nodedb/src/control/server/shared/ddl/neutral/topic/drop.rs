@@ -34,14 +34,7 @@ pub fn drop_topic(
     let name = parts[2].to_lowercase();
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     let existed = catalog
         .delete_ep_topic(tenant_id, &name)

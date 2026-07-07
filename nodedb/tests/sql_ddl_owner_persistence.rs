@@ -67,12 +67,7 @@ fn owner_row_for(
 /// `CredentialStore` the handler writes through, so any orphan the
 /// handler leaves is visible here.
 fn catalog_of(server: &TestServer) -> &SystemCatalog {
-    server
-        .shared
-        .credentials
-        .catalog()
-        .as_ref()
-        .expect("TestServer should expose a catalog-backed credential store")
+    server.shared.credentials.catalog()
 }
 
 /// Common post-condition for every test in this file: after a CREATE,
@@ -110,7 +105,7 @@ fn assert_owner_persisted(catalog: &SystemCatalog, object_type: &str, object_nam
     );
 }
 
-// ── 1. CREATE COLLECTION — the issue #101 repro ──────────────────────────────
+// ── 1. CREATE COLLECTION — the owner-persistence repro ───────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_collection_via_pgwire_persists_owner_row() {
@@ -258,11 +253,11 @@ async fn create_collection_with_serial_field_persists_sequence_owner_row() {
     assert_owner_persisted(catalog, "sequence", "serial_owner_id_seq");
 }
 
-// ── 10. Restart roundtrip — the issue #101 wedge ─────────────────────────────
+// ── 10. Restart roundtrip — the boot-integrity wedge ─────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgwire_create_collection_then_reopen_has_zero_integrity_violations() {
-    // Mirrors the deterministic repro from issue #101:
+    // Mirrors the deterministic owner-persistence repro:
     //   1. Boot fresh server.
     //   2. `CREATE COLLECTION orphan_repro TYPE document` via pgwire.
     //   3. Graceful shutdown.
@@ -288,7 +283,7 @@ async fn pgwire_create_collection_then_reopen_has_zero_integrity_violations() {
         violations.is_empty(),
         "verify_redb_integrity on a freshly-reopened catalog must be \
          empty after a single CREATE COLLECTION + restart — the original \
-         bug (issue #101) is that this returns `OrphanRow(collection)` \
+         bug is that this returns `OrphanRow(collection)` \
          and the StartupSequencer transitions to Failed at \
          CatalogSanityCheck. Got: {violations:?}"
     );

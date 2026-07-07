@@ -79,9 +79,7 @@ pub async fn set_permission_tree(
     let tenant_id = identity.tenant_id;
 
     // Verify collection exists.
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "catalog unavailable"));
-    };
+    let catalog = state.credentials.catalog();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
         .map_err(|e| err("XX000", e.to_string()))?
@@ -140,9 +138,7 @@ pub async fn drop_permission_tree(
 
     let tenant_id = identity.tenant_id;
 
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "catalog unavailable"));
-    };
+    let catalog = state.credentials.catalog();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
         .map_err(|e| err("XX000", e.to_string()))?

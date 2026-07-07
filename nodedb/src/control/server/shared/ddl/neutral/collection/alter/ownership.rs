@@ -64,10 +64,7 @@ pub(super) fn alter_collection_owner(
     // through subsequent ALTER COLLECTION calls is to also mutate
     // the parent record. A separate `PutOwner` would be silently
     // overwritten the next time anyone re-proposed the collection.
-    let catalog_ref = state.credentials.catalog();
-    let catalog = catalog_ref
-        .as_ref()
-        .ok_or_else(|| err("XX000", "catalog unavailable for ALTER COLLECTION OWNER"))?;
+    let catalog = state.credentials.catalog();
     let mut stored = match catalog.get_collection(
         DatabaseId::DEFAULT,
         identity.tenant_id.as_u64(),

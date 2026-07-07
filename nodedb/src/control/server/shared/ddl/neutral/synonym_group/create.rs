@@ -64,11 +64,7 @@ pub async fn create_synonym_group(
     };
 
     // Persist to catalog.
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| err("XX000", "system catalog not available".to_string()))?;
+    let catalog = state.credentials.catalog();
 
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutSynonymGroup(Box::new(stored.clone()));

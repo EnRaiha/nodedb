@@ -104,7 +104,8 @@ pub(super) fn convert_alter_array(
     }
 
     // 5. Persist to system catalog.
-    if let Some(catalog) = credentials.catalog().as_ref() {
+    {
+        let catalog = credentials.catalog();
         crate::control::array_catalog::persist::persist(catalog, &updated).map_err(|e| {
             crate::Error::PlanError {
                 detail: format!("ALTER ARRAY {name}: catalog persist: {e}"),

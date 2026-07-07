@@ -109,7 +109,8 @@ pub async fn create_continuous_aggregate(
 
     // Validate source collection exists and is timeseries.
     let tenant_id = identity.tenant_id;
-    if let Some(catalog) = state.credentials.catalog() {
+    {
+        let catalog = state.credentials.catalog();
         match catalog.get_collection(database_id, tenant_id.as_u64(), &def.source) {
             Ok(Some(coll)) if coll.collection_type.is_timeseries() => {}
             Ok(Some(_)) => {
@@ -171,12 +172,12 @@ pub async fn create_continuous_aggregate(
     // materialized-view targets; refresh-path writes (when wired) will
     // upsert rolled-up documents into it. Idempotent when a collection
     // of the same name already exists.
-    let target_exists = match state.credentials.catalog() {
-        Some(catalog) => matches!(
+    let target_exists = {
+        let catalog = state.credentials.catalog();
+        matches!(
             catalog.get_collection(database_id, tenant_id.as_u64(), &def.name),
             Ok(Some(c)) if c.is_active
-        ),
-        None => false,
+        )
     };
     if !target_exists {
         let target = StoredCollection {

@@ -67,8 +67,8 @@ fn build_owner_database_set(state: &SharedState, user: &UserRecord) -> DatabaseS
     let db_ids = state
         .credentials
         .catalog()
-        .as_ref()
-        .and_then(|cat| cat.list_user_grant_databases(user.user_id).ok())
+        .list_user_grant_databases(user.user_id)
+        .ok()
         .unwrap_or_else(|| vec![DatabaseId::DEFAULT]);
     DatabaseSet::Some(SmallVec::from_iter(db_ids))
 }

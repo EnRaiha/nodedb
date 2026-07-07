@@ -63,7 +63,6 @@ pub(super) fn text_rows(
 ///
 /// Errors:
 /// - `42601` — empty token (after quote stripping).
-/// - `42601` — non-numeric token but catalog is unavailable.
 /// - `XX000` — catalog read failure.
 ///
 /// Used by `DROP TENANT`, `ALTER TENANT SET QUOTA`, and `PURGE TENANT` to
@@ -85,35 +84,23 @@ pub(super) fn resolve_tenant_ref(
             "TENANT reference must be a numeric id or a tenant name",
         ));
     }
-    let catalog = state.credentials.catalog().as_ref().ok_or_else(|| {
-        ddl_err(
-            "42601",
-            "cannot resolve tenant by name: catalog unavailable; use numeric id",
-        )
-    })?;
+    let catalog = state.credentials.catalog();
     Ok(catalog
         .find_tenant_by_name(name)
         .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
         .map(|stored| TenantId::new(stored.tenant_id)))
 }
 
-/// Whether `tenant_id` currently exists, consulting the redb catalog when one
-/// is wired up and falling back to the in-memory quota table otherwise.
+/// Whether `tenant_id` currently exists, consulting the redb catalog.
 ///
 /// Shared by `DROP`, `ALTER`, and `PURGE TENANT` so existence is enforced the
 /// same way for numeric ids and resolved names — see [`resolve_tenant_ref`].
 pub(super) fn tenant_exists(state: &SharedState, tenant_id: TenantId) -> Result<bool, DdlError> {
-    if let Some(catalog) = state.credentials.catalog() {
-        let present = catalog
-            .load_all_tenants()
-            .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
-            .iter()
-            .any(|t| t.tenant_id == tenant_id.as_u64());
-        return Ok(present);
-    }
-    let tenants = match state.tenants.lock() {
-        Ok(t) => t,
-        Err(p) => p.into_inner(),
-    };
-    Ok(tenants.has_quota(tenant_id))
+    let catalog = state.credentials.catalog();
+    let present = catalog
+        .load_all_tenants()
+        .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
+        .iter()
+        .any(|t| t.tenant_id == tenant_id.as_u64());
+    Ok(present)
 }

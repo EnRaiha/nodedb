@@ -41,14 +41,7 @@ pub fn create_trigger(
 
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state
-        .credentials
-        .catalog()
-        .as_ref()
-        .ok_or_else(|| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: "system catalog not available".to_string(),
-        })?;
+    let catalog = state.credentials.catalog();
 
     // Check for existing trigger.
     if !or_replace && let Ok(Some(_)) = catalog.get_trigger(tenant_id, name) {

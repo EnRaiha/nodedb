@@ -26,9 +26,7 @@ pub(super) fn alter_collection_set_retention(
     value: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, name)
         .map_err(|e| err("XX000", e.to_string()))?
@@ -50,9 +48,7 @@ pub(super) fn alter_collection_set_legal_hold(
     tag: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, name)
         .map_err(|e| err("XX000", e.to_string()))?
@@ -96,9 +92,7 @@ pub(super) fn alter_collection_set_append_only(
     name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, name)
         .map_err(|e| err("XX000", e.to_string()))?
@@ -122,9 +116,7 @@ pub(super) fn alter_collection_set_last_value_cache(
     enabled: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let Some(catalog) = state.credentials.catalog() else {
-        return Err(err("XX000", "no catalog available"));
-    };
+    let catalog = state.credentials.catalog();
     let mut coll = catalog
         .get_collection(DatabaseId::DEFAULT, tenant_id, name)
         .map_err(|e| err("XX000", e.to_string()))?

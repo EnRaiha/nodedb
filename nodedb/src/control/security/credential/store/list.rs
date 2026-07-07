@@ -68,7 +68,7 @@ impl CredentialStore {
 
     /// Access the underlying system catalog (for API key persistence
     /// and other subsystems that piggyback on the same redb).
-    pub fn catalog(&self) -> &Option<SystemCatalog> {
+    pub fn catalog(&self) -> &SystemCatalog {
         &self.catalog
     }
 }

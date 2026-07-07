@@ -42,7 +42,7 @@ fn roundtrip_delete_sequence() {
 #[test]
 fn apply_put_then_delete_sequence() {
     let (credentials, _tmp) = open_catalog();
-    let catalog = credentials.catalog().as_ref().expect("catalog present");
+    let catalog = credentials.catalog();
 
     let seq = StoredSequence::new(1, "orders_id_seq".into(), "alice".into());
     apply_to(&CatalogEntry::PutSequence(Box::new(seq)), catalog);

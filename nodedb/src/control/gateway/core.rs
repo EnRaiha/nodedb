@@ -341,8 +341,7 @@ impl Gateway {
             .as_ref()
             .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
         let routing = routing_guard.as_deref();
-        let catalog_ref = self.shared.credentials.catalog();
-        let catalog = catalog_ref.as_ref();
+        let catalog = Some(self.shared.credentials.catalog());
         let database_id = ctx.database_id;
         let tenant_id = ctx.tenant_id.as_u64();
         let strategy_fn = |name: &str| {
@@ -379,8 +378,7 @@ impl Gateway {
         tenant_id: u64,
         database_id: DatabaseId,
     ) -> GatewayVersionSet {
-        let catalog_ref = self.shared.credentials.catalog();
-        let catalog = catalog_ref.as_ref();
+        let catalog = Some(self.shared.credentials.catalog());
 
         GatewayVersionSet::from_plan(plan, |name| {
             catalog
@@ -403,8 +401,7 @@ impl Gateway {
         tenant_id: u64,
         database_id: DatabaseId,
     ) -> GatewayVersionSet {
-        let catalog_ref = self.shared.credentials.catalog();
-        let catalog = catalog_ref.as_ref();
+        let catalog = Some(self.shared.credentials.catalog());
 
         let pairs: Vec<(String, u64)> = stored_vs
             .iter()

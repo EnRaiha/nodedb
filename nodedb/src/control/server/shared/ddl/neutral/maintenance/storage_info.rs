@@ -34,12 +34,13 @@ pub fn handle_show_storage(
     let tenant_id = identity.tenant_id.as_u64();
 
     // Verify collection exists.
-    if let Some(catalog) = state.credentials.catalog()
-        && catalog
-            .get_collection(DatabaseId::DEFAULT, tenant_id, &collection)
-            .ok()
-            .flatten()
-            .is_none()
+    if state
+        .credentials
+        .catalog()
+        .get_collection(DatabaseId::DEFAULT, tenant_id, &collection)
+        .ok()
+        .flatten()
+        .is_none()
     {
         return Err(ddl_err(
             "42P01",
@@ -51,8 +52,8 @@ pub fn handle_show_storage(
     let stats = state
         .credentials
         .catalog()
-        .as_ref()
-        .and_then(|c| c.load_column_stats(tenant_id, &collection).ok())
+        .load_column_stats(tenant_id, &collection)
+        .ok()
         .unwrap_or_default();
 
     let columns = vec![

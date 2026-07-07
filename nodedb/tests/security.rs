@@ -208,7 +208,7 @@ async fn commit_user_mutation_publishes_both_buses() {
     let wal_path = dir.path().join("test.wal");
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
     let (dispatcher, _) = Dispatcher::new(1, 64);
-    let state = SharedState::new(dispatcher, wal);
+    let state = SharedState::new(dispatcher, wal).unwrap();
 
     // Subscribe to both buses before any mutations.
     let mut uc_rx = state.credentials.subscribe_user_changes();
@@ -250,7 +250,7 @@ async fn commit_user_mutation_no_invalidation_publishes_user_changed_only() {
     let wal_path = dir.path().join("test.wal");
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
     let (dispatcher, _) = Dispatcher::new(1, 64);
-    let state = SharedState::new(dispatcher, wal);
+    let state = SharedState::new(dispatcher, wal).unwrap();
 
     let mut uc_rx = state.credentials.subscribe_user_changes();
     let mut si_rx = state.credentials.subscribe_session_invalidation();

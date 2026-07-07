@@ -303,7 +303,7 @@ pub fn spawn_checkpoint_task(
                             num_cores,
                             config.core_timeout,
                             shared.cold_storage.clone(),
-                            shared.credentials.catalog().as_ref(),
+                            Some(shared.credentials.catalog()),
                         ).await;
                         info!("checkpoint manager stopped");
                         return;
@@ -318,7 +318,7 @@ pub fn spawn_checkpoint_task(
                 num_cores,
                 config.core_timeout,
                 shared.cold_storage.clone(),
-                shared.credentials.catalog().as_ref(),
+                Some(shared.credentials.catalog()),
             )
             .await;
         }

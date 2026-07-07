@@ -33,10 +33,7 @@ pub fn handle_alter_tenant_quota(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "alter tenant quota")?;
 
-    let catalog = match state.credentials.catalog() {
-        Some(c) => c,
-        None => return Err(ddl_err("XX000", "system catalog unavailable")),
-    };
+    let catalog = state.credentials.catalog();
 
     // Resolve database name → id.
     let db_id = catalog

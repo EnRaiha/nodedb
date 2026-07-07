@@ -51,8 +51,9 @@ fn make_shared() -> (tempfile::TempDir, Arc<SharedState>, Arc<CredentialStore>) 
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
     let credentials = Arc::new(CredentialStore::open(&catalog_path).unwrap());
-    put_admin_user(credentials.catalog().as_ref().unwrap());
-    let shared = SharedState::new_with_credentials(dispatcher, wal, Arc::clone(&credentials));
+    put_admin_user(credentials.catalog());
+    let shared =
+        SharedState::new_with_credentials(dispatcher, wal, Arc::clone(&credentials)).unwrap();
     (dir, shared, credentials)
 }
 
@@ -93,12 +94,12 @@ async fn run_repair(shared: &SharedState) -> nodedb::control::cluster::VerifyRep
         .expect("verify_and_repair should return Ok even on dirty catalog")
 }
 
-// ── 1. Collection — the issue #101 single-DDL wedge ──────────────────────────
+// ── 1. Collection — the single-DDL orphan wedge ──────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verify_and_repair_recovers_orphan_collection() {
     let (_dir, shared, credentials) = make_shared();
-    let catalog = credentials.catalog().as_ref().unwrap();
+    let catalog = credentials.catalog();
     catalog
         .put_collection(
             nodedb_types::DatabaseId::DEFAULT,
@@ -109,7 +110,7 @@ async fn verify_and_repair_recovers_orphan_collection() {
     let report = run_repair(&shared).await;
     assert!(
         report.is_acceptable(),
-        "issue #101: a single CREATE COLLECTION that left only the primary \
+        "a single CREATE COLLECTION that left only the primary \
          row in redb must not brick the next restart. \
          VerifyReport: {report}"
     );
@@ -121,7 +122,7 @@ async fn verify_and_repair_recovers_orphan_collection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verify_and_repair_recovers_orphan_function() {
     let (_dir, shared, credentials) = make_shared();
-    let catalog = credentials.catalog().as_ref().unwrap();
+    let catalog = credentials.catalog();
     catalog.put_function(&make_function("orphan_fn")).unwrap();
 
     let report = run_repair(&shared).await;
@@ -138,7 +139,7 @@ async fn verify_and_repair_recovers_orphan_function() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verify_and_repair_recovers_orphan_procedure() {
     let (_dir, shared, credentials) = make_shared();
-    let catalog = credentials.catalog().as_ref().unwrap();
+    let catalog = credentials.catalog();
     catalog
         .put_procedure(&make_procedure("orphan_proc"))
         .unwrap();
@@ -157,7 +158,7 @@ async fn verify_and_repair_recovers_orphan_procedure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verify_and_repair_recovers_orphan_trigger() {
     let (_dir, shared, credentials) = make_shared();
-    let catalog = credentials.catalog().as_ref().unwrap();
+    let catalog = credentials.catalog();
     // Plant the parent collection via the *correct* apply path so the
     // dangling-reference check (Check 4: trigger.collection →
     // collection) does not also fire. This test is about the trigger
@@ -184,7 +185,7 @@ async fn verify_and_repair_recovers_orphan_trigger() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verify_and_repair_recovers_orphan_materialized_view() {
     let (_dir, shared, credentials) = make_shared();
-    let catalog = credentials.catalog().as_ref().unwrap();
+    let catalog = credentials.catalog();
     // Source collection must exist & be owned, so Check 6 (mv.source
     // → collection) doesn't fire.
     apply_to(
@@ -209,7 +210,7 @@ async fn verify_and_repair_recovers_orphan_materialized_view() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verify_and_repair_recovers_orphan_sequence() {
     let (_dir, shared, credentials) = make_shared();
-    let catalog = credentials.catalog().as_ref().unwrap();
+    let catalog = credentials.catalog();
     catalog.put_sequence(&make_sequence("orphan_seq")).unwrap();
 
     let report = run_repair(&shared).await;
@@ -226,7 +227,7 @@ async fn verify_and_repair_recovers_orphan_sequence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verify_and_repair_recovers_orphan_schedule() {
     let (_dir, shared, credentials) = make_shared();
-    let catalog = credentials.catalog().as_ref().unwrap();
+    let catalog = credentials.catalog();
     catalog.put_schedule(&make_schedule("orphan_sch")).unwrap();
 
     let report = run_repair(&shared).await;
@@ -243,7 +244,7 @@ async fn verify_and_repair_recovers_orphan_schedule() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verify_and_repair_recovers_orphan_change_stream() {
     let (_dir, shared, credentials) = make_shared();
-    let catalog = credentials.catalog().as_ref().unwrap();
+    let catalog = credentials.catalog();
     catalog
         .put_change_stream(&make_stream("orphan_cs"))
         .unwrap();

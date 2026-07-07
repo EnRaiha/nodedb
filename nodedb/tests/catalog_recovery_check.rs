@@ -31,7 +31,8 @@ fn make_shared(data_dir: &std::path::Path) -> (Arc<SharedState>, Arc<CredentialS
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
     let credentials = Arc::new(CredentialStore::open(&catalog_path).unwrap());
-    let shared = SharedState::new_with_credentials(dispatcher, wal, Arc::clone(&credentials));
+    let shared =
+        SharedState::new_with_credentials(dispatcher, wal, Arc::clone(&credentials)).unwrap();
     (shared, credentials)
 }
 
@@ -179,7 +180,7 @@ fn make_blacklist_entry(key: &str, kind: &str) -> StoredBlacklistEntry {
 async fn happy_path_clean_catalog_passes_all_verifiers() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     let result = verify_registries(&shared, catalog).unwrap();
     assert!(
@@ -196,7 +197,7 @@ async fn happy_path_clean_catalog_passes_all_verifiers() {
 async fn rls_policy_orphan_refuses_startup() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     let stored = nodedb::control::security::catalog::rls::StoredRlsPolicy {
         tenant_id: 1,
@@ -226,7 +227,7 @@ async fn rls_policy_orphan_refuses_startup() {
 async fn blacklist_ghost_refuses_startup() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     catalog
         .put_blacklist_entry(&make_blacklist_entry("user:evil_user", "user"))
@@ -242,7 +243,7 @@ async fn blacklist_ghost_refuses_startup() {
 async fn schedule_orphan_refuses_startup() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     catalog
         .put_schedule(&make_schedule_def(1, "nightly_cleanup"))
@@ -258,7 +259,7 @@ async fn schedule_orphan_refuses_startup() {
 async fn alert_orphan_refuses_startup() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     catalog
         .put_alert_rule(&make_alert_def(1, "high_temp_alert", "sensors"))
@@ -274,7 +275,7 @@ async fn alert_orphan_refuses_startup() {
 async fn mv_orphan_refuses_startup() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     catalog
         .put_streaming_mv(&make_mv_def(1, "orders_summary", "orders_stream"))
@@ -293,7 +294,7 @@ async fn mv_orphan_refuses_startup() {
 async fn change_stream_orphan_refuses_startup() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     catalog
         .put_change_stream(&make_stream_def(1, "orders_cdc"))
@@ -312,7 +313,7 @@ async fn change_stream_orphan_refuses_startup() {
 async fn consumer_group_orphan_refuses_startup() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     catalog
         .put_consumer_group(&make_consumer_group(1, "orders_cdc", "analytics_group"))
@@ -331,7 +332,7 @@ async fn consumer_group_orphan_refuses_startup() {
 async fn retention_policy_orphan_refuses_startup() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     catalog
         .put_retention_policy(&make_retention_policy(1, "keep_90d", "metrics"))
@@ -357,7 +358,7 @@ async fn credential_ghost_refuses_startup() {
     // Phase 1: Write a user to redb via a catalog-backed credential store.
     {
         let writer = CredentialStore::open(&catalog_path).unwrap();
-        let cat = writer.catalog().as_ref().unwrap();
+        let cat = writer.catalog();
         let stored_user = nodedb::control::security::catalog::auth_types::StoredUser {
             user_id: 999,
             username: "ghost_user".to_string(),
@@ -391,11 +392,11 @@ async fn credential_ghost_refuses_startup() {
 
     // Catalog-bearing store — for catalog access only.
     let catalog_store = Arc::new(CredentialStore::open(&catalog_path).unwrap());
-    let catalog = catalog_store.catalog().as_ref().unwrap();
+    let catalog = catalog_store.catalog();
 
     // Memory-only store — no users loaded.
-    let empty_creds = Arc::new(CredentialStore::new());
-    let shared = SharedState::new_with_credentials(dispatcher, wal, empty_creds);
+    let empty_creds = Arc::new(CredentialStore::new().expect("build credential store"));
+    let shared = SharedState::new_with_credentials(dispatcher, wal, empty_creds).unwrap();
 
     let result = verify_registries(&shared, catalog).unwrap();
     let c = result.counts.get("credentials").expect("credentials entry");
@@ -407,7 +408,7 @@ async fn credential_ghost_refuses_startup() {
 async fn rls_policy_value_mismatch_detected() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     let stored = nodedb::control::security::catalog::rls::StoredRlsPolicy {
         tenant_id: 1,
@@ -438,7 +439,7 @@ async fn rls_policy_value_mismatch_detected() {
 async fn triggers_verifier_still_fires() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     let trigger = StoredTrigger {
         tenant_id: 1,
@@ -475,7 +476,7 @@ async fn triggers_verifier_still_fires() {
 async fn api_keys_verifier_still_fires() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     let key = StoredApiKey {
         key_id: "test_key_id".to_string(),
@@ -502,7 +503,7 @@ async fn api_keys_verifier_still_fires() {
 async fn repair_cycle_succeeds_for_schedules() {
     let dir = tempfile::tempdir().unwrap();
     let (shared, creds) = make_shared(dir.path());
-    let catalog = creds.catalog().as_ref().unwrap();
+    let catalog = creds.catalog();
 
     catalog
         .put_schedule(&make_schedule_def(1, "hourly_job"))

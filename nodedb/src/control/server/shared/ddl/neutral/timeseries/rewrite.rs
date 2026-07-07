@@ -32,7 +32,8 @@ pub fn rewrite_partitions(
     let tenant_id = identity.tenant_id;
 
     // Verify collection exists and is timeseries.
-    if let Some(catalog) = state.credentials.catalog() {
+    {
+        let catalog = state.credentials.catalog();
         match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name) {
             Ok(Some(coll)) if coll.collection_type.is_timeseries() => {}
             Ok(Some(_)) => {

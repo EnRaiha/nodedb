@@ -44,11 +44,11 @@ fn make_test_state() -> (Arc<SharedState>, Arc<PlanCache>) {
 
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).expect("wal"));
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    let shared = SharedState::new(dispatcher, wal);
+    let shared = SharedState::new(dispatcher, wal).unwrap();
 
     // Wire a real Gateway + PlanCacheInvalidator (mirrors main.rs).
     //
-    // We use Arc::get_mut — valid here because SharedState::new() returns a
+    // We use Arc::get_mut — valid here because SharedState::new returns a
     // fresh Arc with refcount=1 and we have not cloned it yet. The clone for
     // Gateway::new is made before the get_mut call; that makes the refcount 2,
     // so we need the raw-pointer write path instead.
@@ -346,7 +346,7 @@ async fn no_gateway_invalidator_is_safe_noop() {
     let wal_path = std::path::PathBuf::from("/tmp/matchstick_no_gw.wal");
     let wal = Arc::new(WalManager::open_for_testing(&wal_path).expect("wal"));
     let (dispatcher, _) = Dispatcher::new(1, 64);
-    let shared = SharedState::new(dispatcher, wal);
+    let shared = SharedState::new(dispatcher, wal).unwrap();
     // gateway_invalidator is None by default.
 
     let entry = CatalogEntry::PutCollection(Box::new(StoredCollection::new(1, "x", "alice")));
