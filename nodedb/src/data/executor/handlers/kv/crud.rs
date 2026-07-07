@@ -26,18 +26,41 @@ pub(in crate::data::executor) struct KvInsertOnConflictUpdateParams<'a> {
     pub surrogate: Surrogate,
 }
 
+/// Parameters for a KV point `GET`.
+pub(in crate::data::executor) struct KvGetParams<'a> {
+    pub did: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub key: &'a [u8],
+    pub rls_filters: &'a [u8],
+    pub surrogate_ceiling: Option<u32>,
+}
+
+/// Parameters for a KV point write (`PUT` / `INSERT` / `INSERT ... IF ABSENT`).
+pub(in crate::data::executor) struct KvWriteParams<'a> {
+    pub did: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub ttl_ms: u64,
+    pub surrogate: Surrogate,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_get(
         &self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
-        rls_filters: &[u8],
-        surrogate_ceiling: Option<u32>,
+        params: KvGetParams<'_>,
     ) -> Response {
+        let KvGetParams {
+            did,
+            tid,
+            collection,
+            key,
+            rls_filters,
+            surrogate_ceiling,
+        } = params;
         debug!(core = self.core_id, %collection, "kv get");
 
         // Read-your-own-writes: an in-transaction get consults this
@@ -122,18 +145,20 @@ impl CoreLoop {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_put(
         &mut self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
-        value: &[u8],
-        ttl_ms: u64,
-        surrogate: Surrogate,
+        params: KvWriteParams<'_>,
     ) -> Response {
+        let KvWriteParams {
+            did,
+            tid,
+            collection,
+            key,
+            value,
+            ttl_ms,
+            surrogate,
+        } = params;
         debug!(core = self.core_id, %collection, "kv put");
 
         // Memory budget check: reject new PUTs when over budget.
@@ -186,18 +211,20 @@ impl CoreLoop {
     /// are pinned to one Data Plane core (vshard routing), and the core
     /// loop runs ops serially — no other writer can slip between the
     /// probe and the put on the same key.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_insert(
         &mut self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
-        value: &[u8],
-        ttl_ms: u64,
-        surrogate: Surrogate,
+        params: KvWriteParams<'_>,
     ) -> Response {
+        let KvWriteParams {
+            did,
+            tid,
+            collection,
+            key,
+            value,
+            ttl_ms,
+            surrogate,
+        } = params;
         debug!(core = self.core_id, %collection, "kv insert");
 
         if self.kv_engine.is_over_budget() {
@@ -258,18 +285,20 @@ impl CoreLoop {
 
     /// SQL `INSERT ... ON CONFLICT DO NOTHING` semantics: write if absent,
     /// silent no-op on duplicate. No error on conflict.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_insert_if_absent(
         &mut self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
-        value: &[u8],
-        ttl_ms: u64,
-        surrogate: Surrogate,
+        params: KvWriteParams<'_>,
     ) -> Response {
+        let KvWriteParams {
+            did,
+            tid,
+            collection,
+            key,
+            value,
+            ttl_ms,
+            surrogate,
+        } = params;
         debug!(core = self.core_id, %collection, "kv insert-if-absent");
 
         if self.kv_engine.is_over_budget() {
@@ -323,7 +352,6 @@ impl CoreLoop {
     /// decode the stored value, apply the updates (with `EXCLUDED`
     /// resolving to the would-be-inserted row), and write the merged
     /// result back.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_insert_on_conflict_update(
         &mut self,
         task: &ExecutionTask,

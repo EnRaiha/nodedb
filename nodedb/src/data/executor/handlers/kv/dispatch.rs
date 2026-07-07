@@ -24,12 +24,14 @@ impl CoreLoop {
                 surrogate_ceiling,
             } => self.execute_kv_get(
                 task,
-                did,
-                tid,
-                collection,
-                key,
-                rls_filters,
-                *surrogate_ceiling,
+                super::crud::KvGetParams {
+                    did,
+                    tid,
+                    collection,
+                    key,
+                    rls_filters,
+                    surrogate_ceiling: *surrogate_ceiling,
+                },
             ),
             KvOp::Put {
                 collection,
@@ -37,16 +39,36 @@ impl CoreLoop {
                 value,
                 ttl_ms,
                 surrogate,
-            } => self.execute_kv_put(task, did, tid, collection, key, value, *ttl_ms, *surrogate),
+            } => self.execute_kv_put(
+                task,
+                super::crud::KvWriteParams {
+                    did,
+                    tid,
+                    collection,
+                    key,
+                    value,
+                    ttl_ms: *ttl_ms,
+                    surrogate: *surrogate,
+                },
+            ),
             KvOp::Insert {
                 collection,
                 key,
                 value,
                 ttl_ms,
                 surrogate,
-            } => {
-                self.execute_kv_insert(task, did, tid, collection, key, value, *ttl_ms, *surrogate)
-            }
+            } => self.execute_kv_insert(
+                task,
+                super::crud::KvWriteParams {
+                    did,
+                    tid,
+                    collection,
+                    key,
+                    value,
+                    ttl_ms: *ttl_ms,
+                    surrogate: *surrogate,
+                },
+            ),
             KvOp::InsertIfAbsent {
                 collection,
                 key,
@@ -54,7 +76,16 @@ impl CoreLoop {
                 ttl_ms,
                 surrogate,
             } => self.execute_kv_insert_if_absent(
-                task, did, tid, collection, key, value, *ttl_ms, *surrogate,
+                task,
+                super::crud::KvWriteParams {
+                    did,
+                    tid,
+                    collection,
+                    key,
+                    value,
+                    ttl_ms: *ttl_ms,
+                    surrogate: *surrogate,
+                },
             ),
             KvOp::InsertOnConflictUpdate {
                 collection,
@@ -135,12 +166,14 @@ impl CoreLoop {
                 backfill,
             } => self.execute_kv_register_index(
                 task,
-                did,
-                tid,
-                collection,
-                field,
-                *field_position,
-                *backfill,
+                super::index::KvRegisterIndexParams {
+                    did,
+                    tid,
+                    collection,
+                    field,
+                    field_position: *field_position,
+                    backfill: *backfill,
+                },
             ),
             KvOp::DropIndex { collection, field } => {
                 self.execute_kv_drop_index(task, did, tid, collection, field)
@@ -278,11 +311,13 @@ impl CoreLoop {
                 score_max,
             } => self.execute_kv_sorted_index_range(
                 task,
-                did,
-                tid,
-                index_name,
-                score_min.as_deref(),
-                score_max.as_deref(),
+                super::sorted::KvSortedIndexRangeParams {
+                    did,
+                    tid,
+                    index_name,
+                    score_min: score_min.as_deref(),
+                    score_max: score_max.as_deref(),
+                },
             ),
             KvOp::SortedIndexCount { index_name } => {
                 self.execute_kv_sorted_index_count(task, did, tid, index_name)

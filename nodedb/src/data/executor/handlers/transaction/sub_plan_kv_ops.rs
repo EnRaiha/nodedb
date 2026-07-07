@@ -69,8 +69,18 @@ impl CoreLoop {
             } => {
                 let now_ms = current_ms();
                 let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
-                let resp = self
-                    .execute_kv_put(task, did, tid, collection, key, value, *ttl_ms, *surrogate);
+                let resp = self.execute_kv_put(
+                    task,
+                    crate::data::executor::handlers::kv::crud::KvWriteParams {
+                        did,
+                        tid,
+                        collection,
+                        key,
+                        value,
+                        ttl_ms: *ttl_ms,
+                        surrogate: *surrogate,
+                    },
+                );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv put failed".into(),
@@ -91,8 +101,18 @@ impl CoreLoop {
                 ttl_ms,
                 surrogate,
             } => {
-                let resp = self
-                    .execute_kv_insert(task, did, tid, collection, key, value, *ttl_ms, *surrogate);
+                let resp = self.execute_kv_insert(
+                    task,
+                    crate::data::executor::handlers::kv::crud::KvWriteParams {
+                        did,
+                        tid,
+                        collection,
+                        key,
+                        value,
+                        ttl_ms: *ttl_ms,
+                        surrogate: *surrogate,
+                    },
+                );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
                         detail: "kv insert failed".into(),
@@ -120,7 +140,16 @@ impl CoreLoop {
                     .get(did, tid, collection, key, now_ms)
                     .is_none();
                 let resp = self.execute_kv_insert_if_absent(
-                    task, did, tid, collection, key, value, *ttl_ms, *surrogate,
+                    task,
+                    crate::data::executor::handlers::kv::crud::KvWriteParams {
+                        did,
+                        tid,
+                        collection,
+                        key,
+                        value,
+                        ttl_ms: *ttl_ms,
+                        surrogate: *surrogate,
+                    },
                 );
                 if resp.status == Status::Error {
                     return Err(resp.error_code.unwrap_or(ErrorCode::Internal {

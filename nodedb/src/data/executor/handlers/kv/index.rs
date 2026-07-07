@@ -10,18 +10,30 @@ use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::current_ms;
 
+/// Parameters for registering a KV secondary index.
+pub(in crate::data::executor) struct KvRegisterIndexParams<'a> {
+    pub did: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub field: &'a str,
+    pub field_position: usize,
+    pub backfill: bool,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_register_index(
         &mut self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        field: &str,
-        field_position: usize,
-        backfill: bool,
+        params: KvRegisterIndexParams<'_>,
     ) -> Response {
+        let KvRegisterIndexParams {
+            did,
+            tid,
+            collection,
+            field,
+            field_position,
+            backfill,
+        } = params;
         debug!(core = self.core_id, %collection, %field, "kv register index");
         let now_ms = current_ms();
         let backfilled = self

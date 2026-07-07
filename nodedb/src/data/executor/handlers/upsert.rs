@@ -14,6 +14,16 @@ use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_types::Surrogate;
 
+/// Parameters for `execute_upsert`.
+pub(in crate::data::executor) struct UpsertParams<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub surrogate: Surrogate,
+    pub value: &'a [u8],
+    pub on_conflict_updates: &'a [(String, nodedb_physical::physical_plan::UpdateValue)],
+}
+
 impl CoreLoop {
     /// Upsert: insert if absent, merge fields if present.
     ///
@@ -23,17 +33,19 @@ impl CoreLoop {
     ///
     /// `value` is msgpack-encoded (zerompk). Strict collections decode binary
     /// tuples for existing docs, merge, and re-encode via `apply_point_put`.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_upsert(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        document_id: &str,
-        surrogate: Surrogate,
-        value: &[u8],
-        on_conflict_updates: &[(String, nodedb_physical::physical_plan::UpdateValue)],
+        params: UpsertParams<'_>,
     ) -> Response {
+        let UpsertParams {
+            tid,
+            collection,
+            document_id,
+            surrogate,
+            value,
+            on_conflict_updates,
+        } = params;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
         debug!(

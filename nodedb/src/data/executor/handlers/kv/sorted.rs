@@ -27,6 +27,15 @@ pub(in crate::data::executor) struct KvRegisterSortedIndexParams<'a> {
     pub window_end_ms: u64,
 }
 
+/// Parameters for `execute_kv_sorted_index_range`.
+pub(in crate::data::executor) struct KvSortedIndexRangeParams<'a> {
+    pub did: u64,
+    pub tid: u64,
+    pub index_name: &'a str,
+    pub score_min: Option<&'a [u8]>,
+    pub score_max: Option<&'a [u8]>,
+}
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_register_sorted_index(
         &mut self,
@@ -190,16 +199,18 @@ impl CoreLoop {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_kv_sorted_index_range(
         &self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        index_name: &str,
-        score_min: Option<&[u8]>,
-        score_max: Option<&[u8]>,
+        params: KvSortedIndexRangeParams<'_>,
     ) -> Response {
+        let KvSortedIndexRangeParams {
+            did,
+            tid,
+            index_name,
+            score_min,
+            score_max,
+        } = params;
         debug!(core = self.core_id, %index_name, "kv sorted index range");
         let now_ms = current_ms();
 

@@ -129,12 +129,14 @@ impl CoreLoop {
                 returning,
             } => self.execute_point_update(
                 task,
-                tid,
-                collection,
-                document_id,
-                *surrogate,
-                updates,
-                returning.as_ref(),
+                crate::data::executor::handlers::point::update::PointUpdateParams {
+                    tid,
+                    collection,
+                    document_id,
+                    surrogate: *surrogate,
+                    updates,
+                    returning: returning.as_ref(),
+                },
             ),
 
             DocumentOp::Scan {
@@ -277,12 +279,14 @@ impl CoreLoop {
                 surrogate,
             } => self.execute_upsert(
                 task,
-                tid,
-                collection,
-                document_id,
-                *surrogate,
-                value,
-                on_conflict_updates,
+                crate::data::executor::handlers::upsert::UpsertParams {
+                    tid,
+                    collection,
+                    document_id,
+                    surrogate: *surrogate,
+                    value,
+                    on_conflict_updates,
+                },
             ),
 
             DocumentOp::Truncate { collection, .. } => self.execute_truncate(task, tid, collection),

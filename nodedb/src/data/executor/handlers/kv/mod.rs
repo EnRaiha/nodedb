@@ -4,7 +4,7 @@
 
 pub(in crate::data::executor) mod atomic;
 pub(in crate::data::executor) mod batch;
-mod crud;
+pub(in crate::data::executor) mod crud;
 mod dispatch;
 mod field;
 mod index;

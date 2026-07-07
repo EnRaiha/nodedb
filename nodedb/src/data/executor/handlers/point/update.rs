@@ -18,18 +18,30 @@ use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
 use nodedb_types::Surrogate;
 
+/// Parameters for `execute_point_update`.
+pub(in crate::data::executor) struct PointUpdateParams<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub surrogate: Surrogate,
+    pub updates: &'a [(String, UpdateValue)],
+    pub returning: Option<&'a ReturningSpec>,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_point_update(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        document_id: &str,
-        surrogate: Surrogate,
-        updates: &[(String, UpdateValue)],
-        returning: Option<&ReturningSpec>,
+        params: PointUpdateParams<'_>,
     ) -> Response {
+        let PointUpdateParams {
+            tid,
+            collection,
+            document_id,
+            surrogate,
+            updates,
+            returning,
+        } = params;
         let row_key = surrogate_to_doc_id(surrogate);
         let row_key = row_key.as_str();
         debug!(
