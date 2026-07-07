@@ -137,7 +137,6 @@ pub(super) fn plan_select(
             false, // comma-LATERAL is INNER (no LEFT semantics)
             projection,
             catalog,
-            functions,
             temporal,
         )
         .map(Ok)?;

@@ -58,7 +58,6 @@ pub fn plan_join_from_select(
                 left_join,
                 projection,
                 catalog,
-                functions,
                 temporal,
             )?));
         }

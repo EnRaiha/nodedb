@@ -8,7 +8,6 @@ use sqlparser::ast;
 use super::correlation::analyse_lateral_where;
 use crate::coerce::expr_as_usize_literal;
 use crate::error::{Result, SqlError};
-use crate::functions::registry::FunctionRegistry;
 use crate::parser::normalize::normalize_ident;
 use crate::resolver::expr::convert_expr;
 use crate::temporal::TemporalScope;
@@ -38,7 +37,6 @@ pub fn plan_lateral_join(
     left_join: bool,
     outer_projection: Vec<Projection>,
     catalog: &dyn SqlCatalog,
-    functions: &FunctionRegistry,
     temporal: TemporalScope,
 ) -> Result<SqlPlan> {
     let select = match subquery.body.as_ref() {
@@ -76,8 +74,13 @@ pub fn plan_lateral_join(
         )
     } else if has_equi && analysis.non_equi.is_empty() {
         // Equi-correlated, no LIMIT: rewrite as a regular hash join.
-        let inner_plan =
-            crate::planner::select::plan_query(subquery, catalog, functions, temporal)?;
+        //
+        // The equi correlations become the join keys. The inner side is a bare
+        // scan of the inner collection carrying only the residual (equi-stripped)
+        // WHERE; the outer alias never leaks into inner name resolution. The join
+        // executor scans the inner collection by name, so the join key columns
+        // are available on the merged rows.
+        let inner_plan = build_inner_scan(select, analysis.remaining, catalog, temporal)?;
         let equi_on: Vec<(String, String)> = analysis
             .equi_keys
             .into_iter()
@@ -100,14 +103,17 @@ pub fn plan_lateral_join(
     } else {
         // General correlation — LateralLoop.
         //
-        // Non-equi correlated predicates (e.g. `e.log_time > u.created_at`)
-        // are encoded verbatim in `inner_plan`'s filter list as `GtColumn`
-        // operators; the Data Plane executor binds the outer value at runtime
-        // via `bind_outer_values`. We do NOT duplicate them in
-        // `correlation_predicates` (which the executor applies as `Eq`),
-        // because that would add a contradictory equality filter.
-        let inner_plan =
-            crate::planner::select::plan_query(subquery, catalog, functions, temporal)?;
+        // The inner side is a bare scan of the inner collection carrying the
+        // residual WHERE (`analysis.remaining`): non-correlated predicates plus
+        // any non-equi correlated predicates (e.g. `e.log_time > u.created_at`).
+        // The latter lower to `*Column` scan filters (`GtColumn`, ...) whose
+        // outer operand is bound per outer row by the Data Plane executor via
+        // `bind_outer_values`. Equi correlations are applied separately through
+        // `correlation_predicates`, so they are excluded from `remaining` and
+        // not duplicated here. The subquery is not routed through `plan_query`
+        // because its WHERE references the outer alias, which is not resolvable
+        // in the inner FROM scope.
+        let inner_plan = build_inner_scan(select, analysis.remaining, catalog, temporal)?;
         let correlation_predicates: Vec<(String, String)> = analysis
             .equi_keys
             .iter()
@@ -123,6 +129,53 @@ pub fn plan_lateral_join(
             outer_row_cap: LATERAL_LOOP_CAP,
             left_join,
         })
+    }
+}
+
+/// Build the inner `SqlPlan::Scan` for a LATERAL join.
+///
+/// The scan carries the residual WHERE as filters. Correlated non-equi
+/// predicates survive as column-vs-column comparisons and lower to
+/// runtime-bound `*Column` filters downstream; the executor binds the outer
+/// operand per outer row.
+fn build_inner_scan(
+    select: &sqlparser::ast::Select,
+    residual_where: Option<ast::Expr>,
+    catalog: &dyn SqlCatalog,
+    temporal: TemporalScope,
+) -> Result<SqlPlan> {
+    let inner_collection = extract_inner_collection(select)?;
+    let inner_alias = extract_inner_alias(select);
+    let inner_info = catalog
+        .get_collection(nodedb_types::DatabaseId::DEFAULT, &inner_collection)?
+        .ok_or_else(|| SqlError::UnknownTable {
+            name: inner_collection.clone(),
+        })?;
+    let filters = match &residual_where {
+        Some(expr) => crate::planner::select::convert_where_to_filters(expr)?,
+        None => Vec::new(),
+    };
+    Ok(SqlPlan::Scan {
+        collection: inner_collection,
+        alias: inner_alias,
+        engine: inner_info.engine,
+        filters,
+        projection: Vec::new(),
+        sort_keys: Vec::new(),
+        limit: None,
+        offset: 0,
+        distinct: false,
+        window_functions: Vec::new(),
+        temporal,
+    })
+}
+
+/// Extract the alias of the single-table inner SELECT, if present.
+fn extract_inner_alias(select: &sqlparser::ast::Select) -> Option<String> {
+    let from = select.from.first()?;
+    match &from.relation {
+        ast::TableFactor::Table { alias, .. } => alias.as_ref().map(|a| normalize_ident(&a.name)),
+        _ => None,
     }
 }
 

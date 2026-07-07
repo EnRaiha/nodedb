@@ -25,10 +25,15 @@ pub struct CorrelationEq {
 pub struct CorrelationAnalysis {
     /// Equi-join pairs `(outer_col, inner_col)` extracted from `inner.col = outer.col`.
     pub equi_keys: Vec<CorrelationEq>,
-    /// Non-equi correlated predicates as `(inner_col, outer_col)`.
+    /// Non-equi correlated predicates as `(inner_col, outer_col)`. Populated
+    /// as a routing signal (its presence forces the `LateralLoop` shape); the
+    /// predicates themselves are also retained verbatim in `remaining`.
     pub non_equi: Vec<(String, String)>,
-    /// Remaining WHERE expression with correlated predicates stripped.
-    /// `None` when the entire WHERE was consumed.
+    /// WHERE expression with the *equi* correlated predicates stripped (those
+    /// become join keys / correlation keys). Non-equi correlated predicates are
+    /// retained here: they lower to `*Column` scan filters whose outer operand
+    /// is bound per outer row by the Data Plane executor. `None` when nothing
+    /// remains.
     pub remaining: Option<Expr>,
 }
 
@@ -120,25 +125,26 @@ fn extract_correlation_recursive(
                     }
                 }
                 _ => {
-                    // Try non-equi correlation detection.
+                    // Try non-equi correlation detection. A correlated
+                    // non-equi predicate is recorded as a routing signal but
+                    // kept in the residual WHERE so it lowers to a runtime-bound
+                    // `*Column` scan filter.
                     if is_correlated_expr(expr, outer_alias) {
                         extract_non_equi_correlation(expr, outer_alias, non_equi);
-                        None
-                    } else {
-                        Some(expr.clone())
                     }
+                    Some(expr.clone())
                 }
             }
         }
 
-        // Non-equi predicates referencing the outer table.
+        // Non-equi predicates referencing the outer table. Recorded as a
+        // routing signal and retained in the residual WHERE so the executor
+        // can bind the outer operand at runtime.
         Expr::BinaryOp { .. } => {
             if is_correlated_expr(expr, outer_alias) {
                 extract_non_equi_correlation(expr, outer_alias, non_equi);
-                None
-            } else {
-                Some(expr.clone())
             }
+            Some(expr.clone())
         }
 
         Expr::Nested(inner) => {
