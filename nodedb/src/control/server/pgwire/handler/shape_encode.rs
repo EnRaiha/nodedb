@@ -7,14 +7,22 @@
 //! This is the pgwire entrypoint's encoder for the canonical neutral shaping
 //! core: the SELECT-read path builds a `ShapedRows` once and every protocol
 //! entrypoint (pgwire, native, http) renders it in its own wire format. Here,
-//! each cell renders through `json_value_to_text` to match PostgreSQL's text
-//! format exactly — notably `Bool` renders as `t`/`f`, not `true`/`false`.
+//! each cell renders in its column's PostgreSQL text form, driven by the
+//! per-column `DdlColType` the shaper threaded through `ShapedRows`:
+//! `Float8`/`Float4` go through pgwire's native float encoder (so `0.0` stays
+//! `"0.0"`, not `"0"`), `Timestamp`/`Timestamptz` epoch-microsecond cells
+//! render as ISO-8601 text, `Bytea` renders as `\x<hex>`, and everything else
+//! (`Text`, integers, `Bool`) falls back to `json_value_to_text` — notably
+//! `Bool` as `t`/`f`, not `true`/`false`.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response};
 use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
+
+use nodedb_types::NdbDateTime;
 
 use crate::control::server::response_shape::project::json_value_to_text;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
@@ -22,31 +30,91 @@ use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use super::super::ddl_encode::col_type_to_field;
 
 /// Encode one flat row object into a pgwire `DataRow`, using `columns` (in
-/// order) to look up cells in `row`.
+/// order) to look up cells in `row` and `column_types` (parallel to `columns`)
+/// to pick each cell's text rendering.
 ///
-/// Missing keys and explicit JSON `null` both encode as SQL NULL. All other
-/// values render via `json_value_to_text` — this path is all-TEXT columns
-/// with raw JSON cells, so it must not use the typed per-`DdlColType` cell
-/// logic in `ddl_encode.rs` (that renders `Bool` as `true`/`false`, which
-/// would diverge from PostgreSQL's `t`/`f` text format).
+/// Missing keys and explicit JSON `null` both encode as SQL NULL. Every other
+/// cell renders per its column type via [`encode_typed_cell`]; a
+/// missing/short `column_types` entry defaults to `Text`.
 pub(in crate::control::server::pgwire) fn encode_shaped_row(
     schema: &Arc<Vec<FieldInfo>>,
     columns: &[String],
+    column_types: &[DdlColType],
     row: &serde_json::Map<String, serde_json::Value>,
 ) -> PgWireResult<DataRow> {
     let mut encoder = DataRowEncoder::new(schema.clone());
-    for name in columns {
+    for (idx, name) in columns.iter().enumerate() {
+        let ct = column_types.get(idx).copied().unwrap_or(DdlColType::Text);
         match row.get(name) {
             None | Some(serde_json::Value::Null) => {
                 encoder.encode_field(&None::<&str>)?;
             }
-            Some(v) => {
-                let text = json_value_to_text(v);
-                encoder.encode_field(&text)?;
-            }
+            Some(v) => encode_typed_cell(&mut encoder, ct, v)?,
         }
     }
     Ok(encoder.take_row())
+}
+
+/// Encode one non-NULL JSON cell into `encoder` per its column type `ct`.
+///
+/// `Float8`/`Float4` numeric cells go through pgwire's native float encoder
+/// (ryu + `extra_float_digits`) so their text bytes match PostgreSQL exactly;
+/// `Timestamp`/`Timestamptz` epoch-microsecond numbers render as ISO-8601
+/// text; `Bytea` base64 cells render as PostgreSQL's `\x<hex>` form. Any cell
+/// whose JSON shape doesn't match the typed arm (e.g. an already-formatted
+/// timestamp string) falls back to `json_value_to_text`, as does every other
+/// type — `Text`, integers, and `Bool` (`t`/`f`).
+fn encode_typed_cell(
+    encoder: &mut DataRowEncoder,
+    ct: DdlColType,
+    v: &serde_json::Value,
+) -> PgWireResult<()> {
+    use serde_json::Value;
+    match ct {
+        DdlColType::Float8 => match v {
+            Value::Number(n) => match n.as_f64() {
+                Some(f) => encoder.encode_field(&f),
+                None => encoder.encode_field(&None::<f64>),
+            },
+            _ => encoder.encode_field(&json_value_to_text(v)),
+        },
+        DdlColType::Float4 => match v {
+            Value::Number(n) => match n.as_f64() {
+                Some(f) => encoder.encode_field(&(f as f32)),
+                None => encoder.encode_field(&None::<f32>),
+            },
+            _ => encoder.encode_field(&json_value_to_text(v)),
+        },
+        DdlColType::Timestamp | DdlColType::Timestamptz => match v {
+            Value::Number(n) => match n.as_i64() {
+                Some(micros) => {
+                    encoder.encode_field(&NdbDateTime::from_micros(micros).to_iso8601())
+                }
+                None => encoder.encode_field(&json_value_to_text(v)),
+            },
+            _ => encoder.encode_field(&json_value_to_text(v)),
+        },
+        DdlColType::Bytea => match v {
+            Value::String(s) => encoder.encode_field(&bytea_hex_text(s)),
+            _ => encoder.encode_field(&json_value_to_text(v)),
+        },
+        _ => encoder.encode_field(&json_value_to_text(v)),
+    }
+}
+
+/// Render a base64-encoded byte string as PostgreSQL's `bytea` hex text output
+/// (`\x` followed by lowercase hex). The shaper transcodes msgpack `bin`
+/// payloads to base64 JSON strings; a value that fails to base64-decode is
+/// hexed from its raw UTF-8 bytes rather than erroring.
+fn bytea_hex_text(base64_str: &str) -> String {
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_str)
+        .unwrap_or_else(|_| base64_str.as_bytes().to_vec());
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("\\x");
+    for b in &bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Build a `Response::Query` from a protocol-neutral [`ShapedRows`], plus its
@@ -78,7 +146,7 @@ pub(in crate::control::server::pgwire) fn shaped_query_response(
 
     let encoded_rows: Vec<PgWireResult<DataRow>> = rows
         .iter()
-        .map(|row| encode_shaped_row(&schema, &columns, row))
+        .map(|row| encode_shaped_row(&schema, &columns, &column_types, row))
         .collect();
 
     let response = Response::Query(QueryResponse::new(
@@ -236,6 +304,70 @@ mod tests {
         let rows = drain(qr).await;
         assert_eq!(field_text(&rows[0], 0).as_deref(), Some("second"));
         assert_eq!(field_text(&rows[0], 1).as_deref(), Some("first"));
+    }
+
+    /// A user `SELECT` of typed columns on the simple-query path must report
+    /// the correct RowDescription type OID AND render each cell in that type's
+    /// PostgreSQL text form — the two halves that must land together.
+    #[tokio::test]
+    async fn typed_columns_report_correct_oid_and_text() {
+        use pgwire::api::Type;
+
+        use crate::control::server::response_shape::types::DdlColType;
+
+        // A base64 string is how the shaper transcodes a `bytea` msgpack `bin`.
+        let raw = [0xDE_u8, 0xAD];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw);
+
+        let columns: Vec<String> = ["i", "f", "b", "ts", "by"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let column_types = vec![
+            DdlColType::Int8,
+            DdlColType::Float8,
+            DdlColType::Bool,
+            DdlColType::Timestamp,
+            DdlColType::Bytea,
+        ];
+        let row = obj(&[
+            ("i", json!(42)),
+            // Integral float renders Postgres-style "0" (shortest form) via the
+            // native float encoder, not serde's "0.0".
+            ("f", json!(0.0)),
+            ("b", json!(true)),
+            // Epoch microseconds → ISO-8601 text (0 == Unix epoch).
+            ("ts", json!(0)),
+            ("by", json!(b64)),
+        ]);
+        let shaped = ShapedRows {
+            columns,
+            column_types,
+            rows: vec![row],
+            notice: None,
+        };
+
+        let (response, _notice) = shaped_query_response(shaped);
+        let Response::Query(qr) = response else {
+            panic!("expected Query response");
+        };
+        // RowDescription OIDs are the typed ones, not TEXT.
+        let schema = qr.row_schema.clone();
+        assert_eq!(schema[0].datatype(), &Type::INT8);
+        assert_eq!(schema[1].datatype(), &Type::FLOAT8);
+        assert_eq!(schema[2].datatype(), &Type::BOOL);
+        assert_eq!(schema[3].datatype(), &Type::TIMESTAMP);
+        assert_eq!(schema[4].datatype(), &Type::BYTEA);
+
+        let rows = drain(qr).await;
+        assert_eq!(field_text(&rows[0], 0).as_deref(), Some("42"));
+        assert_eq!(field_text(&rows[0], 1).as_deref(), Some("0"));
+        assert_eq!(field_text(&rows[0], 2).as_deref(), Some("t"));
+        assert_eq!(
+            field_text(&rows[0], 3).as_deref(),
+            Some("1970-01-01T00:00:00.000000Z")
+        );
+        assert_eq!(field_text(&rows[0], 4).as_deref(), Some("\\xdead"));
     }
 
     #[tokio::test]

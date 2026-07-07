@@ -14,9 +14,11 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::server::response_shape::compose::shape_decoded_rows;
 use crate::control::server::response_shape::schema::OutputSchema;
+use crate::control::server::response_shape::types::DdlColType;
 use crate::control::server::result_stream::ResultStream;
 use crate::data::executor::response_codec::decode_payload_to_json;
 
+use super::super::ddl_encode::col_type_to_field;
 use super::super::types::{error_to_sqlstate, text_field};
 use super::shape_encode::{encode_shaped_row, shaped_query_response};
 
@@ -104,7 +106,16 @@ pub(crate) fn streaming_shaped_response(
         .iter()
         .map(|c| c.display_name.clone())
         .collect();
-    let fields: Vec<FieldInfo> = display_columns.iter().map(|n| text_field(n)).collect();
+    // Advertise each projected column's real catalog type so the streaming
+    // path's RowDescription OIDs match the non-streaming `shaped_query_response`
+    // (and the extended-query Describe path); `column_types` also drives the
+    // per-cell text rendering in `encode_shaped_row`.
+    let column_types: Vec<DdlColType> = schema_out.columns.iter().map(|c| c.ty).collect();
+    let fields: Vec<FieldInfo> = schema_out
+        .columns
+        .iter()
+        .map(|c| col_type_to_field(&c.display_name, c.ty))
+        .collect();
     let schema = Arc::new(fields);
     let row_schema = schema.clone();
 
@@ -138,7 +149,7 @@ pub(crate) fn streaming_shaped_response(
                 if emitted >= limit {
                     break;
                 }
-                let encoded = encode_shaped_row(&row_schema, &display_columns, row)?;
+                let encoded = encode_shaped_row(&row_schema, &display_columns, &column_types, row)?;
                 emitted += 1;
                 yield encoded;
             }

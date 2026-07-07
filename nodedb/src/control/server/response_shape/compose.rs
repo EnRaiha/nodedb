@@ -34,7 +34,7 @@ use nodedb_types::{DatabaseId, NodeDbError, TenantId};
 use super::kv::apply_kv_wrap;
 use super::project::push_flat_rows;
 use super::schema::OutputSchema;
-use super::types::{PlanKind, ShapedRows};
+use super::types::{DdlColType, PlanKind, ShapedRows};
 
 /// NOTICE text for an `AS OF SYSTEM TIME` cutoff older than the oldest
 /// retained tile version. This is the canonical definition, surfaced to
@@ -248,7 +248,12 @@ pub fn shape_decoded_rows(decoded: &JsonValue, projection: Option<&OutputSchema>
                 .iter()
                 .map(|row| project_row(row, &lookup_keys, &display_names))
                 .collect();
-            let column_types = ShapedRows::text_types(display_names.len());
+            // Carry each projected column's real catalog type, aligned in
+            // order with `display_names`. Only the pgwire encoder consumes
+            // these — mapping them to typed RowDescription OIDs and rendering
+            // each cell in that type's PostgreSQL text form; native/http
+            // ignore column types entirely.
+            let column_types: Vec<DdlColType> = s.columns.iter().map(|c| c.ty).collect();
             ShapedRows {
                 columns: display_names,
                 column_types,
@@ -257,6 +262,9 @@ pub fn shape_decoded_rows(decoded: &JsonValue, projection: Option<&OutputSchema>
             }
         }
         _ => {
+            // Star / derived columns come from JSON rows with no catalog type,
+            // so they stay TEXT — typing them would regress `SELECT *` on
+            // schemaless collections.
             let columns = derive_columns(&rows);
             let column_types = ShapedRows::text_types(columns.len());
             ShapedRows {
