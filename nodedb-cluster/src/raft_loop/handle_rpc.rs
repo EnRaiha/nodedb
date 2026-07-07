@@ -77,11 +77,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
             RaftRpc::AppendEntriesRequest(req) => {
                 let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
                 let resp = mr.handle_append_entries(&req)?;
+                // Persist any term bump (become_follower) durably before the
+                // reply leaves this node, so a restart cannot forget it.
+                mr.persist_group_hard_state(req.group_id)?;
                 Ok(RaftRpc::AppendEntriesResponse(resp))
             }
             RaftRpc::RequestVoteRequest(req) => {
                 let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
                 let resp = mr.handle_request_vote(&req)?;
+                // Persist voted_for/current_term to stable storage BEFORE the
+                // grant leaves this node, so a restart cannot double-vote.
+                mr.persist_group_hard_state(req.group_id)?;
                 Ok(RaftRpc::RequestVoteResponse(resp))
             }
             RaftRpc::InstallSnapshotRequest(mut req) => {
@@ -199,7 +205,10 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                             let resp = {
                                 let mut mr =
                                     self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-                                mr.handle_install_snapshot(&pending_req)?
+                                let resp = mr.handle_install_snapshot(&pending_req)?;
+                                // Persist any term bump before replying.
+                                mr.persist_group_hard_state(group_id)?;
+                                resp
                             };
                             return Ok(RaftRpc::InstallSnapshotResponse(resp));
                         }
@@ -229,7 +238,10 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
                 // Fallback: no data_dir — direct call (unit test path).
                 let resp = {
                     let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-                    mr.handle_install_snapshot(&req)?
+                    let resp = mr.handle_install_snapshot(&req)?;
+                    // Persist any term bump before replying.
+                    mr.persist_group_hard_state(group_id)?;
+                    resp
                 };
                 // Watcher contract: `applied_index` means "state visible
                 // on this node up to index N", NOT "raft has advanced to
@@ -548,6 +560,16 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
     async fn on_timeout_now(&self, req: TimeoutNowRequest) {
         let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
         mr.handle_timeout_now(&req);
+        // A TimeoutNow triggers an immediate election (term bump + self-vote);
+        // persist that HardState before the resulting vote requests are
+        // dispatched by the tick loop, so a restart cannot forget the term.
+        if let Err(e) = mr.persist_group_hard_state(req.group_id) {
+            tracing::error!(
+                group_id = req.group_id,
+                error = %e,
+                "failed to persist hard state after timeout-now election trigger"
+            );
+        }
     }
 }
 

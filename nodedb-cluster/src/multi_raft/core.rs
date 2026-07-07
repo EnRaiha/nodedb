@@ -215,7 +215,15 @@ impl MultiRaft {
         let storage = RedbLogStorage::open(&storage_path).map_err(|e| ClusterError::Transport {
             detail: format!("failed to open raft storage for group {group_id}: {e}"),
         })?;
-        let node = RaftNode::new(config, storage);
+        let mut node = RaftNode::new(config, storage);
+        // Reload durable state (HardState + log) from redb before mounting the
+        // group. On a restart this recovers the persisted term/voted_for — so
+        // a restarted voter cannot forget its vote and double-vote — AND the
+        // persisted log entries, so the node does not depend on full
+        // re-replication from the leader to recover its log. On a fresh group
+        // the storage is empty and this is a no-op (default HardState, empty
+        // log). Also resets the election timeout.
+        node.restore()?;
         self.groups.insert(group_id, node);
 
         info!(
@@ -229,18 +237,25 @@ impl MultiRaft {
     }
 
     /// Tick all Raft groups. Returns aggregated ready output.
-    pub fn tick(&mut self) -> MultiRaftReady {
+    ///
+    /// Any HardState staged by a tick (an election term bump + self-vote from
+    /// an election timeout) is durably persisted BEFORE the aggregated `Ready`
+    /// — and therefore the vote requests it carries — is returned for
+    /// dispatch. A persist failure aborts the tick so the caller never sends
+    /// vote requests for a term that was not made durable.
+    pub fn tick(&mut self) -> Result<MultiRaftReady> {
         let mut ready = MultiRaftReady::default();
 
         for (&group_id, node) in &mut self.groups {
             node.tick();
+            node.persist_hard_state_if_dirty()?;
             let r = node.take_ready();
             if !r.is_empty() {
                 ready.groups.push((group_id, r));
             }
         }
 
-        ready
+        Ok(ready)
     }
 
     /// Clone of the shared routing handle.
@@ -500,7 +515,7 @@ mod tests {
             node.election_deadline_override(Instant::now() - Duration::from_millis(1));
         }
 
-        let ready = mr.tick();
+        let ready = mr.tick().unwrap();
         assert_eq!(ready.groups.len(), 5);
     }
 
@@ -516,8 +531,8 @@ mod tests {
         for node in mr.groups.values_mut() {
             node.election_deadline_override(Instant::now() - Duration::from_millis(1));
         }
-        mr.tick();
-        for (gid, ready) in mr.tick().groups {
+        mr.tick().unwrap();
+        for (gid, ready) in mr.tick().unwrap().groups {
             if let Some(last) = ready.committed_entries.last() {
                 mr.advance_applied(gid, last.index).unwrap();
             }

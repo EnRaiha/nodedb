@@ -35,7 +35,7 @@
 
 use std::collections::HashMap as BatchMap;
 
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use nodedb_raft::transport::RaftTransport;
 
@@ -65,10 +65,25 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// Execute a single tick: drive Raft, dispatch outbound messages,
     /// apply commits, promote caught-up learners.
     pub(super) fn do_tick(&self) {
-        // Tick under lock and extract Ready.
+        // Tick under lock and extract Ready. `tick` durably persists any
+        // HardState staged this tick (election term bump + self-vote) before
+        // returning the vote requests it carries. A persist failure is a
+        // split-brain hazard: dispatching vote requests for a term that was
+        // not made durable is exactly the double-vote bug. Handle it loud and
+        // skip this tick's dispatch entirely — the next tick retries.
         let ready = {
             let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-            mr.tick()
+            match mr.tick() {
+                Ok(ready) => ready,
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "raft tick failed to persist hard state durably; \
+                         skipping message/vote dispatch for this tick"
+                    );
+                    return;
+                }
+            }
         };
 
         // Dispatch outgoing messages and persist log/HardState first (even if
@@ -131,6 +146,11 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                                         {
                                             debug!(group_id, peer, error = %e, "handle ae response");
                                         }
+                                        // A response can bump the term (step
+                                        // down to follower); persist it durably.
+                                        if let Err(e) = mr.persist_group_hard_state(group_id) {
+                                            error!(group_id, peer, error = %e, "persist hard state after ae response");
+                                        }
                                     }
                                     Err(e) => {
                                         warn!(group_id, peer, error = %e, "append_entries RPC failed");
@@ -165,6 +185,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                                             .handle_request_vote_response(group_id, peer, &resp)
                                         {
                                             debug!(group_id, peer, error = %e, "handle vote response");
+                                        }
+                                        // A higher-term response steps this
+                                        // candidate down to follower; persist
+                                        // that term bump durably.
+                                        if let Err(e) = mr.persist_group_hard_state(group_id) {
+                                            error!(group_id, peer, error = %e, "persist hard state after vote response");
                                         }
                                     }
                                     Err(e) => {
@@ -387,6 +413,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                                                             last_log_index: 0,
                                                         },
                                                     );
+                                                    // Persist the term bump durably.
+                                                    if let Err(e) =
+                                                        mr.persist_group_hard_state(group_id)
+                                                    {
+                                                        error!(group_id, peer, error = %e, "persist hard state after snapshot step-down");
+                                                    }
                                                 }
                                                 debug!(group_id, peer, "install_snapshot sent");
                                             }

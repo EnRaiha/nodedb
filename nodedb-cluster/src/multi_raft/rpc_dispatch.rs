@@ -67,6 +67,19 @@ impl MultiRaft {
         }
     }
 
+    /// Durably persist a group's HardState (current_term/voted_for) if it
+    /// changed since the last persist. Must run under the `MultiRaft` lock
+    /// before an RPC reply that granted a vote or bumped the term leaves this
+    /// node, so a restart cannot forget the vote and let two leaders form.
+    ///
+    /// No-op when the group is not mounted on this node.
+    pub fn persist_group_hard_state(&mut self, group_id: u64) -> Result<()> {
+        if let Some(node) = self.groups.get_mut(&group_id) {
+            node.persist_hard_state_if_dirty()?;
+        }
+        Ok(())
+    }
+
     /// Get the current term and snapshot metadata for a group (for building
     /// InstallSnapshot RPCs).
     pub fn snapshot_metadata(&self, group_id: u64) -> Result<(u64, u64, u64)> {

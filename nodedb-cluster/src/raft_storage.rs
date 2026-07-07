@@ -558,4 +558,109 @@ mod tests {
         let hs = s.load_hard_state().unwrap();
         assert_eq!(hs.current_term, 3);
     }
+
+    /// A vote grant AND the log must survive a process restart. After a node
+    /// grants a vote and persists its `HardState`, reopening the SAME redb
+    /// path and calling `restore()` must (a) still refuse a second, different
+    /// candidate in the same term — the split-brain / double-vote guard — and
+    /// (b) still hold its durably-appended log entries rather than an empty
+    /// log. Fails without the persist wiring (double-vote) or without the
+    /// `restore()` log reload (empty log).
+    #[test]
+    fn vote_and_log_survive_restart() {
+        use nodedb_raft::node::RaftConfig;
+        use nodedb_raft::{AppendEntriesRequest, RaftNode, RequestVoteRequest};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote-restart-raft.redb");
+
+        let config = || RaftConfig {
+            node_id: 1,
+            group_id: 7,
+            peers: vec![2, 3],
+            learners: vec![],
+            observers: vec![],
+            starts_as_learner: false,
+            starts_as_observer: false,
+            election_timeout_min: Duration::from_millis(150),
+            election_timeout_max: Duration::from_millis(300),
+            heartbeat_interval: Duration::from_millis(50),
+            log_compaction_threshold: None,
+        };
+
+        const TERM: u64 = 5;
+
+        {
+            let storage = RedbLogStorage::open(&path).unwrap();
+            let mut node = RaftNode::new(config(), storage);
+            node.restore().unwrap();
+
+            // Leader (node 2) replicates two entries at TERM: bumps the node's
+            // term (become_follower) and durably appends the log entries.
+            let ae = AppendEntriesRequest {
+                term: TERM,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: TERM,
+                        index: 1,
+                        data: b"e1".to_vec(),
+                    },
+                    LogEntry {
+                        term: TERM,
+                        index: 2,
+                        data: b"e2".to_vec(),
+                    },
+                ],
+                leader_commit: 0,
+                group_id: 7,
+            };
+            assert!(node.handle_append_entries(&ae).success);
+            node.persist_hard_state_if_dirty().unwrap();
+
+            // Grant a vote to candidate 2 in TERM, then persist it durably.
+            let rv = RequestVoteRequest {
+                term: TERM,
+                candidate_id: 2,
+                last_log_index: 2,
+                last_log_term: TERM,
+                group_id: 7,
+            };
+            assert!(
+                node.handle_request_vote(&rv).vote_granted,
+                "first vote must be granted"
+            );
+            node.persist_hard_state_if_dirty().unwrap();
+        }
+
+        // Simulated crash: node + storage dropped. Reopen the SAME path.
+        let storage = RedbLogStorage::open(&path).unwrap();
+        let mut node = RaftNode::new(config(), storage);
+        node.restore().unwrap();
+
+        // Log-reload half: the durably-appended entries survived the restart.
+        assert_eq!(node.last_log_index(), 2, "log entries must survive restart");
+        // Vote-persistence half: the term survived.
+        assert_eq!(node.current_term(), TERM);
+
+        // A second, DIFFERENT candidate in the same term must be refused: the
+        // restored voter has already voted for candidate 2 this term. (A reject
+        // here — with the candidate's log fully up to date — proves the
+        // restored `voted_for` is 2, not 0 or 3.)
+        let rv2 = RequestVoteRequest {
+            term: TERM,
+            candidate_id: 3,
+            last_log_index: 2,
+            last_log_term: TERM,
+            group_id: 7,
+        };
+        assert!(
+            !node.handle_request_vote(&rv2).vote_granted,
+            "restarted voter must not grant a second vote in the same term"
+        );
+        assert_eq!(node.current_term(), TERM);
+    }
 }

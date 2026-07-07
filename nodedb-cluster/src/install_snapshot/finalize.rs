@@ -138,6 +138,8 @@ pub async fn commit(
 
     let mut mr = multi_raft.lock().unwrap_or_else(|p| p.into_inner());
     let resp = mr.handle_install_snapshot(&req)?;
+    // Persist any term bump (become_follower) durably before replying.
+    mr.persist_group_hard_state(group_id)?;
     Ok(resp)
 }
 

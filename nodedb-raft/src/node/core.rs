@@ -173,6 +173,17 @@ impl<S: LogStorage> RaftNode<S> {
         std::mem::take(&mut self.ready)
     }
 
+    /// Durably persist HardState iff it changed since the last persist.
+    /// Must run before a vote grant / vote requests leave this node
+    /// (Raft: persist voted_for/current_term to stable storage before replying).
+    pub fn persist_hard_state_if_dirty(&mut self) -> crate::error::Result<()> {
+        if self.ready.hard_state.is_some() {
+            self.log.storage_mut().save_hard_state(&self.hard_state)?;
+            self.ready.hard_state = None;
+        }
+        Ok(())
+    }
+
     /// Advance `last_applied` after the caller has applied entries.
     pub fn advance_applied(&mut self, applied_to: u64) {
         self.volatile.last_applied = applied_to;

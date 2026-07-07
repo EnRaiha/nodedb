@@ -334,8 +334,8 @@ mod tests {
         for node in mr.groups_mut().values_mut() {
             node.election_deadline_override(Instant::now() - Duration::from_millis(1));
         }
-        let _ = mr.tick();
-        for (gid, ready) in mr.tick().groups {
+        mr.tick().unwrap();
+        for (gid, ready) in mr.tick().unwrap().groups {
             if let Some(last) = ready.committed_entries.last() {
                 mr.advance_applied(gid, last.index).unwrap();
             }
