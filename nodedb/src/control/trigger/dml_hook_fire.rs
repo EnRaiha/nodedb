@@ -27,6 +27,22 @@ pub enum PreDispatchResult {
     },
 }
 
+/// Parameters shared by [`fire_pre_dispatch_triggers`] and [`fire_post_dispatch_triggers`].
+pub struct DispatchTriggerParams<'a> {
+    /// Shared server state (trigger registry, block cache).
+    pub state: &'a SharedState,
+    /// Caller identity (used unless a trigger is SECURITY DEFINER).
+    pub identity: &'a AuthenticatedIdentity,
+    /// Tenant scope for trigger lookup and execution.
+    pub tenant_id: TenantId,
+    /// The DML write being dispatched.
+    pub info: &'a DmlWriteInfo,
+    /// The row's prior state, for UPDATE/DELETE (`None` for INSERT).
+    pub old_row: &'a Option<HashMap<String, nodedb_types::Value>>,
+    /// Current cascade depth, for infinite-loop protection.
+    pub cascade_depth: u32,
+}
+
 /// Fire BEFORE + INSTEAD OF triggers for a point write.
 ///
 /// Returns `PreDispatchResult::Proceed` if the caller should dispatch normally.
@@ -37,15 +53,18 @@ pub enum PreDispatchResult {
 ///
 /// On BEFORE trigger error (RAISE EXCEPTION), the error propagates and
 /// the caller should abort the write.
-#[allow(clippy::too_many_arguments)]
 pub async fn fire_pre_dispatch_triggers(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    info: &DmlWriteInfo,
-    old_row: &Option<HashMap<String, nodedb_types::Value>>,
-    cascade_depth: u32,
+    params: DispatchTriggerParams<'_>,
 ) -> crate::Result<PreDispatchResult> {
+    let DispatchTriggerParams {
+        state,
+        identity,
+        tenant_id,
+        info,
+        old_row,
+        cascade_depth,
+    } = params;
+
     // Check INSTEAD OF first — if it handles the write, skip everything else.
     match info.event {
         DmlEvent::Insert => {
@@ -70,13 +89,15 @@ pub async fn fire_pre_dispatch_triggers(
             let old_fields = old_row.as_ref().unwrap_or(&empty);
             let new_fields = info.new_fields.as_ref().unwrap_or(&empty);
             match super::fire_instead::fire_instead_of_update(
-                state,
-                identity,
-                tenant_id,
-                &info.collection,
-                old_fields,
-                new_fields,
-                cascade_depth,
+                super::fire_instead::InsteadOfUpdateParams {
+                    state,
+                    identity,
+                    tenant_id,
+                    collection: &info.collection,
+                    old_fields,
+                    new_fields,
+                    cascade_depth,
+                },
             )
             .await?
             {
@@ -168,15 +189,16 @@ pub async fn fire_pre_dispatch_triggers(
 ///
 /// Called after the Data Plane has committed the write. Only fires triggers
 /// with `execution_mode = Sync`. ASYNC triggers are handled by the Event Plane.
-#[allow(clippy::too_many_arguments)]
-pub async fn fire_post_dispatch_triggers(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    info: &DmlWriteInfo,
-    old_row: &Option<HashMap<String, nodedb_types::Value>>,
-    cascade_depth: u32,
-) -> crate::Result<()> {
+pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> crate::Result<()> {
+    let DispatchTriggerParams {
+        state,
+        identity,
+        tenant_id,
+        info,
+        old_row,
+        cascade_depth,
+    } = params;
+
     let empty = HashMap::new();
 
     // Fire SYNC AFTER ROW triggers.
@@ -198,16 +220,16 @@ pub async fn fire_post_dispatch_triggers(
         DmlEvent::Update => {
             let old_fields = old_row.as_ref().unwrap_or(&empty);
             let new_fields = info.new_fields.as_ref().unwrap_or(&empty);
-            fire_after::fire_after_update(
+            fire_after::fire_after_update(fire_after::FireAfterUpdateParams {
                 state,
                 identity,
                 tenant_id,
-                &info.collection,
+                collection: &info.collection,
                 old_fields,
                 new_fields,
                 cascade_depth,
-                Some(TriggerExecutionMode::Sync),
-            )
+                mode_filter: Some(TriggerExecutionMode::Sync),
+            })
             .await?;
         }
         DmlEvent::Delete => {

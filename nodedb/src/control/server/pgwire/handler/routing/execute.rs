@@ -399,12 +399,14 @@ impl NodeDbPgHandler {
             // --- AFTER triggers ---
             if let Some(ref info) = dml_info {
                 crate::control::trigger::dml_hook_fire::fire_post_dispatch_triggers(
-                    &self.state,
-                    identity,
-                    tenant_id,
-                    info,
-                    &old_row,
-                    0,
+                    crate::control::trigger::dml_hook_fire::DispatchTriggerParams {
+                        state: &self.state,
+                        identity,
+                        tenant_id,
+                        info,
+                        old_row: &old_row,
+                        cascade_depth: 0,
+                    },
                 )
                 .await
                 .map_err(|e| {

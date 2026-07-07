@@ -135,21 +135,44 @@ pub(crate) fn resolve_trigger_identity(
 /// Returns the (possibly modified) NEW fields after all BEFORE triggers have run.
 /// If a trigger executes `RAISE EXCEPTION`, the error propagates and the DML is aborted.
 ///
+/// Parameters for [`fire_before_triggers_with_mutation`].
+pub struct BeforeTriggersMutationParams<'a> {
+    /// Shared server state (trigger registry, block cache).
+    pub state: &'a SharedState,
+    /// Caller identity (used unless a trigger is SECURITY DEFINER).
+    pub identity: &'a AuthenticatedIdentity,
+    /// Tenant scope for trigger lookup and execution.
+    pub tenant_id: TenantId,
+    /// Target collection name.
+    pub collection: &'a str,
+    /// BEFORE triggers to run, in registration order.
+    pub triggers: &'a [StoredTrigger],
+    /// Row bindings (OLD/NEW) evaluated against each trigger's WHEN clause.
+    pub bindings: &'a RowBindings,
+    /// Current cascade depth, for infinite-loop protection.
+    pub cascade_depth: u32,
+    /// NEW row fields, mutated in place by ASSIGN statements across triggers.
+    pub new_fields: Option<HashMap<String, nodedb_types::Value>>,
+}
+
 /// BEFORE triggers can modify NEW by executing `SET NEW.field = value` statements.
 /// Currently, modification happens via RAISE EXCEPTION (abort) or by allowing the
 /// trigger body to run side effects. True NEW mutation (returning modified row) is
 /// handled by the caller interpreting ASSIGN statements targeting NEW.* fields.
-#[allow(clippy::too_many_arguments)]
 pub async fn fire_before_triggers_with_mutation(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    collection: &str,
-    triggers: &[StoredTrigger],
-    bindings: &RowBindings,
-    cascade_depth: u32,
-    mut new_fields: Option<HashMap<String, nodedb_types::Value>>,
+    params: BeforeTriggersMutationParams<'_>,
 ) -> crate::Result<Option<HashMap<String, nodedb_types::Value>>> {
+    let BeforeTriggersMutationParams {
+        state,
+        identity,
+        tenant_id,
+        collection,
+        triggers,
+        bindings,
+        cascade_depth,
+        mut new_fields,
+    } = params;
+
     for trigger in triggers {
         if let Some(ref when_cond) = trigger.when_condition {
             // Rebuild bindings with current (possibly mutated) NEW fields.

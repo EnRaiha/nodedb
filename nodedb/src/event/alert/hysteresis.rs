@@ -57,6 +57,27 @@ pub enum HysteresisTransition {
     Recovered,
 }
 
+/// Parameters for [`HysteresisManager::evaluate`].
+#[derive(Debug, Clone, Copy)]
+pub struct EvaluateParams<'a> {
+    /// Tenant scope for the alert's state key.
+    pub tenant_id: u64,
+    /// Alert rule name.
+    pub alert_name: &'a str,
+    /// Group key (e.g. a device/series identifier) within the alert.
+    pub group_key: &'a str,
+    /// Whether the alert condition evaluated true this window.
+    pub condition_met: bool,
+    /// The aggregate value that was evaluated.
+    pub value: f64,
+    /// Consecutive true windows required before firing.
+    pub fire_after: u32,
+    /// Consecutive false windows required before recovering.
+    pub recover_after: u32,
+    /// Timestamp (ms) of this evaluation.
+    pub now_ms: u64,
+}
+
 /// Manages per-(alert, group) hysteresis state.
 ///
 /// Thread-safe for access from the eval loop. State is in-memory only
@@ -75,18 +96,18 @@ impl HysteresisManager {
     }
 
     /// Evaluate a condition result for a group and return any state transition.
-    #[allow(clippy::too_many_arguments)]
-    pub fn evaluate(
-        &self,
-        tenant_id: u64,
-        alert_name: &str,
-        group_key: &str,
-        condition_met: bool,
-        value: f64,
-        fire_after: u32,
-        recover_after: u32,
-        now_ms: u64,
-    ) -> HysteresisTransition {
+    pub fn evaluate(&self, params: EvaluateParams<'_>) -> HysteresisTransition {
+        let EvaluateParams {
+            tenant_id,
+            alert_name,
+            group_key,
+            condition_met,
+            value,
+            fire_after,
+            recover_after,
+            now_ms,
+        } = params;
+
         let key = (tenant_id, alert_name.to_string(), group_key.to_string());
         let mut states = self.states.write().unwrap_or_else(|p| p.into_inner());
         let state = states.entry(key).or_insert_with(AlertGroupState::new);
@@ -164,17 +185,53 @@ mod tests {
         let mgr = HysteresisManager::new();
 
         // fire_after = 3, need 3 consecutive true evaluations.
-        let r1 = mgr.evaluate(1, "alert1", "g1", true, 91.0, 3, 2, 1000);
+        let r1 = mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "alert1",
+            group_key: "g1",
+            condition_met: true,
+            value: 91.0,
+            fire_after: 3,
+            recover_after: 2,
+            now_ms: 1000,
+        });
         assert_eq!(r1, HysteresisTransition::NoChange);
 
-        let r2 = mgr.evaluate(1, "alert1", "g1", true, 92.0, 3, 2, 2000);
+        let r2 = mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "alert1",
+            group_key: "g1",
+            condition_met: true,
+            value: 92.0,
+            fire_after: 3,
+            recover_after: 2,
+            now_ms: 2000,
+        });
         assert_eq!(r2, HysteresisTransition::NoChange);
 
-        let r3 = mgr.evaluate(1, "alert1", "g1", true, 93.0, 3, 2, 3000);
+        let r3 = mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "alert1",
+            group_key: "g1",
+            condition_met: true,
+            value: 93.0,
+            fire_after: 3,
+            recover_after: 2,
+            now_ms: 3000,
+        });
         assert_eq!(r3, HysteresisTransition::Fired);
 
         // Already Active, consecutive true should not re-fire.
-        let r4 = mgr.evaluate(1, "alert1", "g1", true, 94.0, 3, 2, 4000);
+        let r4 = mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "alert1",
+            group_key: "g1",
+            condition_met: true,
+            value: 94.0,
+            fire_after: 3,
+            recover_after: 2,
+            now_ms: 4000,
+        });
         assert_eq!(r4, HysteresisTransition::NoChange);
     }
 
@@ -183,19 +240,64 @@ mod tests {
         let mgr = HysteresisManager::new();
 
         // Fire first.
-        mgr.evaluate(1, "a", "g", true, 91.0, 1, 2, 1000);
-        let _fired = mgr.evaluate(1, "a", "g", true, 92.0, 1, 2, 2000);
+        mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g",
+            condition_met: true,
+            value: 91.0,
+            fire_after: 1,
+            recover_after: 2,
+            now_ms: 1000,
+        });
+        let _fired = mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g",
+            condition_met: true,
+            value: 92.0,
+            fire_after: 1,
+            recover_after: 2,
+            now_ms: 2000,
+        });
         // fire_after=1, so first true fires.
         assert_eq!(
-            mgr.evaluate(1, "a", "g", true, 93.0, 1, 2, 1000),
+            mgr.evaluate(EvaluateParams {
+                tenant_id: 1,
+                alert_name: "a",
+                group_key: "g",
+                condition_met: true,
+                value: 93.0,
+                fire_after: 1,
+                recover_after: 2,
+                now_ms: 1000,
+            }),
             HysteresisTransition::NoChange
         );
 
         // Now recover: need 2 consecutive false.
-        let r1 = mgr.evaluate(1, "a", "g", false, 89.0, 1, 2, 3000);
+        let r1 = mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g",
+            condition_met: false,
+            value: 89.0,
+            fire_after: 1,
+            recover_after: 2,
+            now_ms: 3000,
+        });
         assert_eq!(r1, HysteresisTransition::NoChange);
 
-        let r2 = mgr.evaluate(1, "a", "g", false, 88.0, 1, 2, 4000);
+        let r2 = mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g",
+            condition_met: false,
+            value: 88.0,
+            fire_after: 1,
+            recover_after: 2,
+            now_ms: 4000,
+        });
         assert_eq!(r2, HysteresisTransition::Recovered);
     }
 
@@ -204,11 +306,56 @@ mod tests {
         let mgr = HysteresisManager::new();
 
         // fire_after=3: 2 true, then 1 false, then 2 true → should not fire.
-        mgr.evaluate(1, "a", "g", true, 91.0, 3, 2, 1000);
-        mgr.evaluate(1, "a", "g", true, 92.0, 3, 2, 2000);
-        mgr.evaluate(1, "a", "g", false, 89.0, 3, 2, 3000); // resets consecutive_fire
-        mgr.evaluate(1, "a", "g", true, 91.0, 3, 2, 4000);
-        let r = mgr.evaluate(1, "a", "g", true, 92.0, 3, 2, 5000);
+        mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g",
+            condition_met: true,
+            value: 91.0,
+            fire_after: 3,
+            recover_after: 2,
+            now_ms: 1000,
+        });
+        mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g",
+            condition_met: true,
+            value: 92.0,
+            fire_after: 3,
+            recover_after: 2,
+            now_ms: 2000,
+        });
+        mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g",
+            condition_met: false,
+            value: 89.0,
+            fire_after: 3,
+            recover_after: 2,
+            now_ms: 3000,
+        }); // resets consecutive_fire
+        mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g",
+            condition_met: true,
+            value: 91.0,
+            fire_after: 3,
+            recover_after: 2,
+            now_ms: 4000,
+        });
+        let r = mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g",
+            condition_met: true,
+            value: 92.0,
+            fire_after: 3,
+            recover_after: 2,
+            now_ms: 5000,
+        });
         assert_eq!(r, HysteresisTransition::NoChange); // Only 2 consecutive, not 3.
     }
 
@@ -216,11 +363,29 @@ mod tests {
     fn independent_groups() {
         let mgr = HysteresisManager::new();
 
-        let r1 = mgr.evaluate(1, "a", "device-1", true, 91.0, 1, 1, 1000);
+        let r1 = mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "device-1",
+            condition_met: true,
+            value: 91.0,
+            fire_after: 1,
+            recover_after: 1,
+            now_ms: 1000,
+        });
         assert_eq!(r1, HysteresisTransition::Fired);
 
         // Different group should be independent.
-        let r2 = mgr.evaluate(1, "a", "device-2", false, 80.0, 1, 1, 1000);
+        let r2 = mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "device-2",
+            condition_met: false,
+            value: 80.0,
+            fire_after: 1,
+            recover_after: 1,
+            now_ms: 1000,
+        });
         assert_eq!(r2, HysteresisTransition::NoChange); // Cleared, false → no change.
 
         // device-1 still Active.
@@ -231,9 +396,36 @@ mod tests {
     #[test]
     fn list_states_for_alert() {
         let mgr = HysteresisManager::new();
-        mgr.evaluate(1, "a", "g1", true, 91.0, 1, 1, 1000);
-        mgr.evaluate(1, "a", "g2", true, 92.0, 1, 1, 1000);
-        mgr.evaluate(1, "b", "g3", true, 93.0, 1, 1, 1000);
+        mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g1",
+            condition_met: true,
+            value: 91.0,
+            fire_after: 1,
+            recover_after: 1,
+            now_ms: 1000,
+        });
+        mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g2",
+            condition_met: true,
+            value: 92.0,
+            fire_after: 1,
+            recover_after: 1,
+            now_ms: 1000,
+        });
+        mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "b",
+            group_key: "g3",
+            condition_met: true,
+            value: 93.0,
+            fire_after: 1,
+            recover_after: 1,
+            now_ms: 1000,
+        });
 
         let states = mgr.list_states(1, "a");
         assert_eq!(states.len(), 2);
@@ -242,8 +434,26 @@ mod tests {
     #[test]
     fn remove_alert_clears_all_groups() {
         let mgr = HysteresisManager::new();
-        mgr.evaluate(1, "a", "g1", true, 91.0, 1, 1, 1000);
-        mgr.evaluate(1, "a", "g2", true, 92.0, 1, 1, 1000);
+        mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g1",
+            condition_met: true,
+            value: 91.0,
+            fire_after: 1,
+            recover_after: 1,
+            now_ms: 1000,
+        });
+        mgr.evaluate(EvaluateParams {
+            tenant_id: 1,
+            alert_name: "a",
+            group_key: "g2",
+            condition_met: true,
+            value: 92.0,
+            fire_after: 1,
+            recover_after: 1,
+            now_ms: 1000,
+        });
         mgr.remove_alert(1, "a");
         assert!(mgr.list_states(1, "a").is_empty());
     }

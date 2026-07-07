@@ -75,17 +75,38 @@ pub async fn fire_instead_of_insert(
     Ok(InsteadOfResult::Handled)
 }
 
+/// Parameters for [`fire_instead_of_update`].
+pub struct InsteadOfUpdateParams<'a> {
+    /// Shared server state (trigger registry, block cache).
+    pub state: &'a SharedState,
+    /// Caller identity (used unless a trigger is SECURITY DEFINER).
+    pub identity: &'a AuthenticatedIdentity,
+    /// Tenant scope for trigger lookup and execution.
+    pub tenant_id: TenantId,
+    /// Target collection name.
+    pub collection: &'a str,
+    /// Row fields before the update (bound as `OLD.*`).
+    pub old_fields: &'a HashMap<String, nodedb_types::Value>,
+    /// Row fields after the update (bound as `NEW.*`).
+    pub new_fields: &'a HashMap<String, nodedb_types::Value>,
+    /// Current cascade depth, for infinite-loop protection.
+    pub cascade_depth: u32,
+}
+
 /// Check for and fire INSTEAD OF triggers for an UPDATE operation.
-#[allow(clippy::too_many_arguments)]
 pub async fn fire_instead_of_update(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    collection: &str,
-    old_fields: &HashMap<String, nodedb_types::Value>,
-    new_fields: &HashMap<String, nodedb_types::Value>,
-    cascade_depth: u32,
+    params: InsteadOfUpdateParams<'_>,
 ) -> crate::Result<InsteadOfResult> {
+    let InsteadOfUpdateParams {
+        state,
+        identity,
+        tenant_id,
+        collection,
+        old_fields,
+        new_fields,
+        cascade_depth,
+    } = params;
+
     let triggers =
         state
             .trigger_registry

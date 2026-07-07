@@ -73,21 +73,42 @@ pub async fn fire_after_insert(
     .await
 }
 
+/// Parameters for [`fire_after_update`].
+pub struct FireAfterUpdateParams<'a> {
+    /// Shared server state (trigger registry, block cache).
+    pub state: &'a SharedState,
+    /// Caller identity (used unless a trigger is SECURITY DEFINER).
+    pub identity: &'a AuthenticatedIdentity,
+    /// Tenant scope for trigger lookup and execution.
+    pub tenant_id: TenantId,
+    /// Target collection name.
+    pub collection: &'a str,
+    /// Row fields before the update (bound as `OLD.*`).
+    pub old_fields: &'a HashMap<String, nodedb_types::Value>,
+    /// Row fields after the update (bound as `NEW.*`).
+    pub new_fields: &'a HashMap<String, nodedb_types::Value>,
+    /// Current cascade depth, for infinite-loop protection.
+    pub cascade_depth: u32,
+    /// Restricts firing to a single execution mode; `None` fires all modes.
+    pub mode_filter: Option<TriggerExecutionMode>,
+}
+
 /// Fire AFTER ROW triggers for an UPDATE operation.
 ///
 /// `old_fields` is the row before the update, `new_fields` is after.
 /// Both are available as OLD.field and NEW.field in the trigger body.
-#[allow(clippy::too_many_arguments)]
-pub async fn fire_after_update(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    collection: &str,
-    old_fields: &HashMap<String, nodedb_types::Value>,
-    new_fields: &HashMap<String, nodedb_types::Value>,
-    cascade_depth: u32,
-    mode_filter: Option<TriggerExecutionMode>,
-) -> crate::Result<()> {
+pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> crate::Result<()> {
+    let FireAfterUpdateParams {
+        state,
+        identity,
+        tenant_id,
+        collection,
+        old_fields,
+        new_fields,
+        cascade_depth,
+        mode_filter,
+    } = params;
+
     let triggers =
         state
             .trigger_registry

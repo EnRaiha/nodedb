@@ -106,17 +106,17 @@ pub async fn dispatch_triggers(
             .await
         }
         _ => {
-            let row_result = fire_for_operation(
-                &op_str,
+            let row_result = fire_for_operation(FireForOperationParams {
+                operation: &op_str,
                 state,
-                &identity,
-                event.tenant_id,
-                &event.collection,
-                new_fields.as_ref(),
-                old_fields.as_ref(),
-                0,
+                identity: &identity,
+                tenant_id: event.tenant_id,
+                collection: &event.collection,
+                new_fields: new_fields.as_ref(),
+                old_fields: old_fields.as_ref(),
+                cascade_depth: 0,
                 mode_filter,
-            )
+            })
             .await;
 
             // Also fire STATEMENT-level triggers for individual point operations
@@ -222,36 +222,59 @@ async fn retry_fire(
     state: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
 ) -> crate::Result<()> {
-    fire_for_operation(
-        entry.operation.as_str(),
+    fire_for_operation(FireForOperationParams {
+        operation: entry.operation.as_str(),
         state,
         identity,
-        TenantId::new(entry.tenant_id),
-        &entry.collection,
-        entry.new_fields.as_ref(),
-        entry.old_fields.as_ref(),
-        entry.cascade_depth,
-        Some(TriggerExecutionMode::Async), // Retries are always ASYNC
-    )
+        tenant_id: TenantId::new(entry.tenant_id),
+        collection: &entry.collection,
+        new_fields: entry.new_fields.as_ref(),
+        old_fields: entry.old_fields.as_ref(),
+        cascade_depth: entry.cascade_depth,
+        mode_filter: Some(TriggerExecutionMode::Async), // Retries are always ASYNC
+    })
     .await
+}
+
+/// Parameters for [`fire_for_operation`].
+pub(super) struct FireForOperationParams<'a> {
+    /// DML operation string (`"INSERT"` / `"UPDATE"` / `"DELETE"`).
+    pub operation: &'a str,
+    /// Shared server state (trigger registry, block cache).
+    pub state: &'a Arc<SharedState>,
+    /// Effective identity used to fire the trigger.
+    pub identity: &'a AuthenticatedIdentity,
+    /// Tenant scope for trigger lookup and execution.
+    pub tenant_id: TenantId,
+    /// Target collection name.
+    pub collection: &'a str,
+    /// NEW row fields, when the operation carries a NEW row.
+    pub new_fields: Option<&'a std::collections::HashMap<String, nodedb_types::Value>>,
+    /// OLD row fields, when the operation carries an OLD row.
+    pub old_fields: Option<&'a std::collections::HashMap<String, nodedb_types::Value>>,
+    /// Current cascade depth, for infinite-loop protection.
+    pub cascade_depth: u32,
+    /// Restricts firing to a single execution mode; `None` fires all modes.
+    pub mode_filter: Option<TriggerExecutionMode>,
 }
 
 /// Shared trigger fire logic: routes to the correct `fire_after_*` function.
 ///
 /// Used by both initial dispatch (from `WriteEvent`) and retry (from
 /// `RetryEntry`). `mode_filter` controls which execution mode triggers fire.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn fire_for_operation(
-    operation: &str,
-    state: &Arc<SharedState>,
-    identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    collection: &str,
-    new_fields: Option<&std::collections::HashMap<String, nodedb_types::Value>>,
-    old_fields: Option<&std::collections::HashMap<String, nodedb_types::Value>>,
-    cascade_depth: u32,
-    mode_filter: Option<TriggerExecutionMode>,
-) -> crate::Result<()> {
+pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> crate::Result<()> {
+    let FireForOperationParams {
+        operation,
+        state,
+        identity,
+        tenant_id,
+        collection,
+        new_fields,
+        old_fields,
+        cascade_depth,
+        mode_filter,
+    } = params;
+
     match operation {
         "INSERT" => {
             if let Some(new) = new_fields {
@@ -271,16 +294,16 @@ pub(super) async fn fire_for_operation(
         }
         "UPDATE" => {
             if let (Some(old), Some(new)) = (old_fields, new_fields) {
-                fire::fire_after_update(
+                fire::fire_after_update(fire::FireAfterUpdateParams {
                     state,
                     identity,
                     tenant_id,
                     collection,
-                    old,
-                    new,
+                    old_fields: old,
+                    new_fields: new,
                     cascade_depth,
                     mode_filter,
-                )
+                })
                 .await
             } else {
                 Ok(())

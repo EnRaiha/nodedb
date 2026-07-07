@@ -32,6 +32,24 @@ pub struct BeforeBatchResult {
     pub errors: ErrorAccumulator,
 }
 
+/// Parameters for [`execute_before_batch`].
+pub struct BeforeBatchParams<'a> {
+    /// Shared server state (trigger registry, block cache).
+    pub state: &'a SharedState,
+    /// Caller identity (used unless a trigger is SECURITY DEFINER).
+    pub identity: &'a AuthenticatedIdentity,
+    /// Tenant scope for trigger lookup and execution.
+    pub tenant_id: TenantId,
+    /// Target collection name.
+    pub collection: &'a str,
+    /// DML event kind (INSERT/UPDATE/DELETE) the batch represents.
+    pub event: DmlEvent,
+    /// Rows to process; possibly mutated in place by BEFORE trigger ASSIGN statements.
+    pub rows: Vec<TriggerBatchRow>,
+    /// Current cascade depth, for infinite-loop protection.
+    pub cascade_depth: u32,
+}
+
 /// Execute BEFORE triggers over a batch of rows.
 ///
 /// For each BEFORE trigger on the collection:
@@ -41,16 +59,19 @@ pub struct BeforeBatchResult {
 /// 4. Capture per-row errors from RAISE EXCEPTION
 ///
 /// Returns the mutated batch + error accumulator.
-#[allow(clippy::too_many_arguments)]
 pub async fn execute_before_batch(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    collection: &str,
-    event: DmlEvent,
-    mut rows: Vec<TriggerBatchRow>,
-    cascade_depth: u32,
+    params: BeforeBatchParams<'_>,
 ) -> crate::Result<BeforeBatchResult> {
+    let BeforeBatchParams {
+        state,
+        identity,
+        tenant_id,
+        collection,
+        event,
+        mut rows,
+        cascade_depth,
+    } = params;
+
     let triggers = state
         .trigger_registry
         .get_matching(tenant_id.as_u64(), collection, event);

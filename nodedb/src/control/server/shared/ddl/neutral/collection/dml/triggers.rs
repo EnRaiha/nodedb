@@ -51,14 +51,16 @@ pub(super) async fn fire_sync_after_update_triggers(
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
     if let Err(e) = crate::control::trigger::fire_after::fire_after_update(
-        state,
-        identity,
-        tenant_id,
-        coll_name,
-        old_fields,
-        new_fields,
-        0,
-        Some(TriggerExecutionMode::Sync),
+        crate::control::trigger::fire_after::FireAfterUpdateParams {
+            state,
+            identity,
+            tenant_id,
+            collection: coll_name,
+            old_fields,
+            new_fields,
+            cascade_depth: 0,
+            mode_filter: Some(TriggerExecutionMode::Sync),
+        },
     )
     .await
     {

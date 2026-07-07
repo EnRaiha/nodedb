@@ -18,7 +18,10 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::fire_common::{check_cascade_depth, fire_before_triggers_with_mutation, fire_triggers};
+use super::fire_common::{
+    BeforeTriggersMutationParams, check_cascade_depth, fire_before_triggers_with_mutation,
+    fire_triggers,
+};
 use super::registry::DmlEvent;
 
 /// Fire BEFORE ROW triggers for an INSERT operation.
@@ -54,16 +57,16 @@ pub async fn fire_before_insert(
 
     let bindings = RowBindings::before_insert(collection, new_fields.clone());
 
-    let result = fire_before_triggers_with_mutation(
+    let result = fire_before_triggers_with_mutation(BeforeTriggersMutationParams {
         state,
         identity,
         tenant_id,
         collection,
-        &before_triggers,
-        &bindings,
+        triggers: &before_triggers,
+        bindings: &bindings,
         cascade_depth,
-        Some(new_fields.clone()),
-    )
+        new_fields: Some(new_fields.clone()),
+    })
     .await?;
 
     // Return the (possibly mutated) NEW fields. If None somehow, return original.
@@ -103,16 +106,16 @@ pub async fn fire_before_update(
 
     let bindings = RowBindings::before_update(collection, old_fields.clone(), new_fields.clone());
 
-    let result = fire_before_triggers_with_mutation(
+    let result = fire_before_triggers_with_mutation(BeforeTriggersMutationParams {
         state,
         identity,
         tenant_id,
         collection,
-        &before_triggers,
-        &bindings,
+        triggers: &before_triggers,
+        bindings: &bindings,
         cascade_depth,
-        Some(new_fields.clone()),
-    )
+        new_fields: Some(new_fields.clone()),
+    })
     .await?;
 
     Ok(result.unwrap_or_else(|| new_fields.clone()))

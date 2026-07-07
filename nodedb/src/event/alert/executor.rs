@@ -113,16 +113,16 @@ async fn evaluate_alert(
             .op
             .evaluate(*agg_value, alert.condition.threshold);
 
-        let transition = hysteresis.evaluate(
-            alert.tenant_id,
-            &alert.name,
+        let transition = hysteresis.evaluate(super::hysteresis::EvaluateParams {
+            tenant_id: alert.tenant_id,
+            alert_name: &alert.name,
             group_key,
             condition_met,
-            *agg_value,
-            alert.fire_after,
-            alert.recover_after,
+            value: *agg_value,
+            fire_after: alert.fire_after,
+            recover_after: alert.recover_after,
             now_ms,
-        );
+        });
 
         if transition != HysteresisTransition::NoChange {
             info!(
