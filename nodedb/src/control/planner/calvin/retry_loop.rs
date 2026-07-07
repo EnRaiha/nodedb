@@ -33,16 +33,19 @@ use crate::control::planner::calvin::submit::RoutedAssignment;
 /// `submit` and `rescan` are injected so this loop is unit-testable WITHOUT a
 /// live server/executor: a fake scheduler driving the real
 /// [`CalvinCompletionRegistry`] suffices.
-#[allow(clippy::too_many_arguments)]
+pub struct DependentRetryArgs<'a, P, SF, RF> {
+    pub registry: &'a CalvinCompletionRegistry,
+    pub orchestrator: &'a OllpOrchestrator,
+    pub predicate_class_hash: u64,
+    pub timeout: std::time::Duration,
+    pub ollp_max_retries: u32,
+    pub initial_predicted: P,
+    pub submit: SF,
+    pub rescan: RF,
+}
+
 pub async fn run_dependent_with_retry<P, SF, SFut, RF, RFut>(
-    registry: &CalvinCompletionRegistry,
-    orchestrator: &OllpOrchestrator,
-    predicate_class_hash: u64,
-    timeout: std::time::Duration,
-    ollp_max_retries: u32,
-    initial_predicted: P,
-    mut submit: SF,
-    mut rescan: RF,
+    args: DependentRetryArgs<'_, P, SF, RF>,
 ) -> crate::Result<()>
 where
     SF: FnMut(&P) -> SFut,
@@ -50,6 +53,16 @@ where
     RF: FnMut() -> RFut,
     RFut: std::future::Future<Output = crate::Result<P>>,
 {
+    let DependentRetryArgs {
+        registry,
+        orchestrator,
+        predicate_class_hash,
+        timeout,
+        ollp_max_retries,
+        initial_predicted,
+        mut submit,
+        mut rescan,
+    } = args;
     let mut predicted = initial_predicted;
     let mut retry: u32 = 0;
     loop {

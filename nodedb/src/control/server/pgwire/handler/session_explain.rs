@@ -84,7 +84,12 @@ impl NodeDbPgHandler {
         };
         let (tasks, _output_schema) = self
             .query_ctx
-            .plan_sql_with_rls(inner_sql, tenant_id, database_id, &sec)
+            .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
+                sql: inner_sql,
+                tenant_id,
+                database_id,
+                sec: &sec,
+            })
             .await
             .map_err(|e| {
                 let (severity, code, message) = error_to_sqlstate(&e);

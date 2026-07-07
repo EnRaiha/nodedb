@@ -13,6 +13,14 @@ use super::QueryContext;
 use crate::control::planner::context::security::PlanSecurityContext;
 use crate::control::server::response_shape::schema::OutputSchema;
 
+/// Bundled arguments for [`QueryContext::plan_sql_with_rls`].
+pub struct PlanSqlWithRlsParams<'a> {
+    pub sql: &'a str,
+    pub tenant_id: crate::types::TenantId,
+    pub database_id: crate::types::DatabaseId,
+    pub sec: &'a PlanSecurityContext<'a>,
+}
+
 impl QueryContext {
     /// Parse SQL and convert to NodeDB physical plan(s).
     ///
@@ -145,17 +153,19 @@ impl QueryContext {
     /// Parse SQL, inject RLS predicates, convert to physical plan.
     ///
     /// This is the primary query entry point.
-    #[allow(clippy::too_many_arguments)]
     pub async fn plan_sql_with_rls(
         &self,
-        sql: &str,
-        tenant_id: crate::types::TenantId,
-        database_id: crate::types::DatabaseId,
-        sec: &PlanSecurityContext<'_>,
+        params: PlanSqlWithRlsParams<'_>,
     ) -> crate::Result<(
         Vec<nodedb_physical::physical_task::PhysicalTask>,
         OutputSchema,
     )> {
+        let PlanSqlWithRlsParams {
+            sql,
+            tenant_id,
+            database_id,
+            sec,
+        } = params;
         self.plan_sql_with_rls_returning(sql, tenant_id, database_id, sec, false)
             .await
     }

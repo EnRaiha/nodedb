@@ -29,7 +29,7 @@ use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::extract::resolve_edge_label;
-use super::routed::{push_edge_delete, push_edge_put};
+use super::routed::{EdgeRouteCtx, push_edge_delete, push_edge_put};
 use crate::control::planner::calvin::preexec::ScannedEdge;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
@@ -175,21 +175,30 @@ type EdgeIdentity = (String, String, String);
 /// clause. Emitted ops are deduped so identical `EdgePut` / `EdgeDelete` are not
 /// repeated when several rows map to the same edge identity.
 ///
-/// Mirrors the INSERT / DELETE routed task construction exactly (same surrogate
-/// resolution + `from_key` homing), so cross-shard edges dual-home and
-/// same-shard edges single-home identically.
-#[allow(clippy::too_many_arguments)]
+/// Tenancy/collection identity shared by every task
+/// [`append_implicit_edge_update_tasks`] appends.
+pub struct EdgeUpdateCtx<'a> {
+    pub state: &'a SharedState,
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub trace_id: TraceId,
+    pub collection: &'a str,
+}
+
 pub async fn append_implicit_edge_update_tasks(
-    state: &SharedState,
+    ctx: EdgeUpdateCtx<'_>,
     out: &mut Vec<PhysicalTask>,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    trace_id: TraceId,
-    collection: &str,
     edges: &[ScannedEdge],
     all_surrogates: &[u32],
     overrides: &EdgeFieldOverrides,
 ) -> crate::Result<()> {
+    let EdgeUpdateCtx {
+        state,
+        tenant_id,
+        database_id,
+        trace_id,
+        collection,
+    } = ctx;
     let old_by_surrogate: HashMap<u32, &ScannedEdge> =
         edges.iter().map(|e| (e.surrogate, e)).collect();
 
@@ -238,27 +247,31 @@ pub async fn append_implicit_edge_update_tasks(
             let weight_changed = !matches!(overrides.weight, WeightUpdate::Unchanged);
             if weight_changed && deleted.insert(old_identity.clone()) {
                 push_edge_delete(
-                    state,
+                    EdgeRouteCtx {
+                        state,
+                        tenant_id,
+                        database_id,
+                        trace_id,
+                        collection,
+                        src: &old_identity.0,
+                        dst: &old_identity.1,
+                    },
                     out,
-                    tenant_id,
-                    database_id,
-                    trace_id,
-                    collection,
-                    &old_identity.0,
-                    &old_identity.1,
                     old_identity.2.clone(),
                 )
                 .await?;
                 put.insert(old_identity.clone());
                 push_edge_put(
-                    state,
+                    EdgeRouteCtx {
+                        state,
+                        tenant_id,
+                        database_id,
+                        trace_id,
+                        collection,
+                        src: &old_identity.0,
+                        dst: &old_identity.1,
+                    },
                     out,
-                    tenant_id,
-                    database_id,
-                    trace_id,
-                    collection,
-                    &old_identity.0,
-                    &old_identity.1,
                     old_identity.2.clone(),
                     new_weight,
                 )
@@ -270,14 +283,16 @@ pub async fn append_implicit_edge_update_tasks(
         // Identity changed (or the edge disappeared): retract the old edge.
         if deleted.insert(old_identity.clone()) {
             push_edge_delete(
-                state,
+                EdgeRouteCtx {
+                    state,
+                    tenant_id,
+                    database_id,
+                    trace_id,
+                    collection,
+                    src: &old_identity.0,
+                    dst: &old_identity.1,
+                },
                 out,
-                tenant_id,
-                database_id,
-                trace_id,
-                collection,
-                &old_identity.0,
-                &old_identity.1,
                 old_identity.2.clone(),
             )
             .await?;
@@ -288,14 +303,16 @@ pub async fn append_implicit_edge_update_tasks(
             && put.insert(new_identity.clone())
         {
             push_edge_put(
-                state,
+                EdgeRouteCtx {
+                    state,
+                    tenant_id,
+                    database_id,
+                    trace_id,
+                    collection,
+                    src: &new_identity.0,
+                    dst: &new_identity.1,
+                },
                 out,
-                tenant_id,
-                database_id,
-                trace_id,
-                collection,
-                &new_identity.0,
-                &new_identity.1,
                 new_identity.2.clone(),
                 new_weight,
             )
@@ -330,14 +347,16 @@ pub async fn append_implicit_edge_update_tasks(
 
         if has_new_edge_doc && put.insert(identity.clone()) {
             push_edge_put(
-                state,
+                EdgeRouteCtx {
+                    state,
+                    tenant_id,
+                    database_id,
+                    trace_id,
+                    collection,
+                    src: &identity.0,
+                    dst: &identity.1,
+                },
                 out,
-                tenant_id,
-                database_id,
-                trace_id,
-                collection,
-                &identity.0,
-                &identity.1,
                 identity.2.clone(),
                 new_weight,
             )

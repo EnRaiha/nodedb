@@ -16,22 +16,40 @@ use super::convert::ConvertContext;
 use super::filter::serialize_filters;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+/// Bundled arguments for [`convert_lateral_top_k`].
+pub(super) struct ConvertLateralTopKParams<'a> {
+    pub outer: &'a SqlPlan,
+    pub outer_alias: Option<&'a str>,
+    pub inner_collection: &'a str,
+    pub inner_filters: &'a [Filter],
+    pub inner_order_by: &'a [SortKey],
+    pub inner_limit: usize,
+    pub correlation_keys: &'a [(String, String)],
+    pub lateral_alias: &'a str,
+    pub projection: &'a [Projection],
+    pub left_join: bool,
+    pub tenant_id: TenantId,
+    pub ctx: &'a ConvertContext,
+}
+
 /// Lower `SqlPlan::LateralTopK` to a `QueryOp::LateralTopK` physical task.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn convert_lateral_top_k(
-    outer: &SqlPlan,
-    outer_alias: Option<&str>,
-    inner_collection: &str,
-    inner_filters: &[Filter],
-    inner_order_by: &[SortKey],
-    inner_limit: usize,
-    correlation_keys: &[(String, String)],
-    lateral_alias: &str,
-    projection: &[Projection],
-    left_join: bool,
-    tenant_id: TenantId,
-    ctx: &ConvertContext,
+    params: ConvertLateralTopKParams<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let ConvertLateralTopKParams {
+        outer,
+        outer_alias,
+        inner_collection,
+        inner_filters,
+        inner_order_by,
+        inner_limit,
+        correlation_keys,
+        lateral_alias,
+        projection,
+        left_join,
+        tenant_id,
+        ctx,
+    } = params;
     let outer_tasks = super::convert::convert_one(outer, tenant_id, ctx)?;
     let outer_task = outer_tasks
         .into_iter()
@@ -69,20 +87,36 @@ pub(super) fn convert_lateral_top_k(
     }])
 }
 
+/// Bundled arguments for [`convert_lateral_loop`].
+pub(super) struct ConvertLateralLoopParams<'a> {
+    pub outer: &'a SqlPlan,
+    pub outer_alias: Option<&'a str>,
+    pub inner: &'a SqlPlan,
+    pub correlation_predicates: &'a [(String, String)],
+    pub lateral_alias: &'a str,
+    pub projection: &'a [Projection],
+    pub outer_row_cap: usize,
+    pub left_join: bool,
+    pub tenant_id: TenantId,
+    pub ctx: &'a ConvertContext,
+}
+
 /// Lower `SqlPlan::LateralLoop` to a `QueryOp::LateralLoop` physical task.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn convert_lateral_loop(
-    outer: &SqlPlan,
-    outer_alias: Option<&str>,
-    inner: &SqlPlan,
-    correlation_predicates: &[(String, String)],
-    lateral_alias: &str,
-    projection: &[Projection],
-    outer_row_cap: usize,
-    left_join: bool,
-    tenant_id: TenantId,
-    ctx: &ConvertContext,
+    params: ConvertLateralLoopParams<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let ConvertLateralLoopParams {
+        outer,
+        outer_alias,
+        inner,
+        correlation_predicates,
+        lateral_alias,
+        projection,
+        outer_row_cap,
+        left_join,
+        tenant_id,
+        ctx,
+    } = params;
     let outer_tasks = super::convert::convert_one(outer, tenant_id, ctx)?;
     let outer_task = outer_tasks
         .into_iter()

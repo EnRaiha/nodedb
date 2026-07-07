@@ -215,7 +215,12 @@ async fn execute_planned(
     };
     let (mut tasks, output_schema) = match ctx
         .query_ctx
-        .plan_sql_with_rls(&clean_sql, ctx.tenant_id(), database_id, &sec)
+        .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
+            sql: &clean_sql,
+            tenant_id: ctx.tenant_id(),
+            database_id,
+            sec: &sec,
+        })
         .await
     {
         Ok(t) => t,

@@ -10,5 +10,5 @@ mod catalog_inputs;
 pub mod query;
 pub mod security;
 
-pub use query::{QueryContext, SYSTEM_FUNCTION_NAMES};
+pub use query::{PlanSqlWithRlsParams, QueryContext, SYSTEM_FUNCTION_NAMES};
 pub use security::PlanSecurityContext;

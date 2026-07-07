@@ -185,10 +185,12 @@ impl<'a> StatementExecutor<'a> {
                     else_block,
                 } => {
                     self.execute_if(
-                        condition,
-                        then_block,
-                        elsif_branches,
-                        else_block,
+                        control_flow::IfBranches {
+                            condition,
+                            then_block,
+                            elsif_branches,
+                            else_block,
+                        },
                         bindings,
                         budget,
                     )
@@ -205,8 +207,18 @@ impl<'a> StatementExecutor<'a> {
                     reverse,
                     body,
                 } => {
-                    self.execute_for(var, start, end, *reverse, body, bindings, budget)
-                        .await
+                    self.execute_for(
+                        control_flow::ForLoopSpec {
+                            var,
+                            start,
+                            end,
+                            reverse: *reverse,
+                            body,
+                        },
+                        bindings,
+                        budget,
+                    )
+                    .await
                 }
                 Statement::Break => Ok(Flow::Break),
                 Statement::Continue => Ok(Flow::LoopContinue),

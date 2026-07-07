@@ -23,12 +23,12 @@ use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::planner::calvin::dispatch::collection_name_from_plan;
 use crate::control::planner::calvin::preexec::{PreexecScan, run_preexec_scan};
 use crate::control::planner::calvin::{
-    build_dependent_tx_class, is_dependent_predicate, predicate_class_for_filters,
-    run_dependent_with_retry, submit_calvin_routed_assign,
+    DependentRetryArgs, build_dependent_tx_class, is_dependent_predicate,
+    predicate_class_for_filters, run_dependent_with_retry, submit_calvin_routed_assign,
 };
 use crate::control::planner::implicit_edges::{
-    EdgeFieldOverrides, append_implicit_edge_delete_tasks, append_implicit_edge_update_tasks,
-    parse_edge_field_overrides,
+    EdgeFieldOverrides, EdgeUpdateCtx, append_implicit_edge_delete_tasks,
+    append_implicit_edge_update_tasks, parse_edge_field_overrides,
 };
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
@@ -371,12 +371,14 @@ pub async fn dispatch_dependent_edge_recon(
                 }
                 EdgeLifecycle::Update(overrides) => {
                     append_implicit_edge_update_tasks(
-                        state,
+                        EdgeUpdateCtx {
+                            state,
+                            tenant_id,
+                            database_id,
+                            trace_id: TraceId::ZERO,
+                            collection: dep_collection,
+                        },
                         &mut edge_tasks,
-                        tenant_id,
-                        database_id,
-                        TraceId::ZERO,
-                        dep_collection,
                         &edges,
                         &surrogates,
                         overrides,
@@ -440,16 +442,16 @@ pub async fn dispatch_dependent_edge_recon(
         )
     };
 
-    run_dependent_with_retry(
+    run_dependent_with_retry(DependentRetryArgs {
         registry,
-        orc,
-        pred_class,
+        orchestrator: orc,
+        predicate_class_hash: pred_class,
         timeout,
         ollp_max_retries,
         initial_predicted,
         submit,
         rescan,
-    )
+    })
     .await?;
 
     Ok(DependentReconOutcome {

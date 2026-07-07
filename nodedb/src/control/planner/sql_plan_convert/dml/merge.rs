@@ -15,19 +15,34 @@ use super::super::filter::serialize_filters;
 use super::super::value::{assignments_to_update_values_qualified, sql_value_to_msgpack};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+/// Bundled arguments for [`convert_merge`].
+pub(in super::super) struct ConvertMergeArgs<'a> {
+    pub target: &'a str,
+    pub source: &'a SqlPlan,
+    pub target_join_col: &'a str,
+    pub source_join_col: &'a str,
+    pub source_alias: &'a str,
+    pub clauses: &'a [MergePlanClause],
+    pub returning: bool,
+    pub tenant_id: TenantId,
+    pub ctx: &'a super::super::convert::ConvertContext,
+}
+
 /// Lower a `SqlPlan::Merge` to a single `DocumentOp::Merge` physical task.
-#[allow(clippy::too_many_arguments)]
 pub(in super::super) fn convert_merge(
-    target: &str,
-    source: &SqlPlan,
-    target_join_col: &str,
-    source_join_col: &str,
-    source_alias: &str,
-    clauses: &[MergePlanClause],
-    _returning: bool,
-    tenant_id: TenantId,
-    ctx: &super::super::convert::ConvertContext,
+    args: ConvertMergeArgs<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let ConvertMergeArgs {
+        target,
+        source,
+        target_join_col,
+        source_join_col,
+        source_alias,
+        clauses,
+        returning: _returning,
+        tenant_id,
+        ctx,
+    } = args;
     let target_qualified = super::super::convert::db_qualified(ctx.database_id, target);
     let target = target_qualified.as_str();
     // Extract source collection name from the source scan plan.

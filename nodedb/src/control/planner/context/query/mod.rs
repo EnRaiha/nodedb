@@ -8,6 +8,8 @@ use super::catalog_inputs::CatalogInputs;
 
 mod planning;
 
+pub use planning::PlanSqlWithRlsParams;
+
 /// Query context for the Control Plane.
 ///
 /// SQL queries are parsed and planned via nodedb-sql, then converted

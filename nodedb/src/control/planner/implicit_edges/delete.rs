@@ -7,7 +7,7 @@
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::extract::resolve_edge_label;
-use super::routed::push_edge_delete;
+use super::routed::{EdgeRouteCtx, push_edge_delete};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
 
@@ -40,14 +40,16 @@ pub async fn append_implicit_edge_delete_tasks(
     for edge in edges {
         let label = resolve_edge_label(edge.label.as_deref());
         push_edge_delete(
-            state,
+            EdgeRouteCtx {
+                state,
+                tenant_id,
+                database_id,
+                trace_id,
+                collection,
+                src: &edge.from,
+                dst: &edge.to,
+            },
             out,
-            tenant_id,
-            database_id,
-            trace_id,
-            collection,
-            &edge.from,
-            &edge.to,
             label,
         )
         .await?;

@@ -100,14 +100,14 @@ fn converges_after_two_mismatches() {
             let submit_calls = Arc::clone(&submit_calls);
             let rescan_calls = Arc::clone(&rescan_calls);
             let tx = tx.clone();
-            run_dependent_with_retry(
-                &registry,
-                &orchestrator,
-                0xABCD,
-                std::time::Duration::from_secs(5),
-                5,
-                vec![1, 2, 3],
-                move |_predicted: &Vec<u32>| {
+            run_dependent_with_retry(DependentRetryArgs {
+                registry: &registry,
+                orchestrator: &orchestrator,
+                predicate_class_hash: 0xABCD,
+                timeout: std::time::Duration::from_secs(5),
+                ollp_max_retries: 5,
+                initial_predicted: vec![1, 2, 3],
+                submit: move |_predicted: &Vec<u32>| {
                     let seq = Arc::clone(&seq);
                     let submit_calls = Arc::clone(&submit_calls);
                     let tx = tx.clone();
@@ -120,14 +120,14 @@ fn converges_after_two_mismatches() {
                         Ok::<RoutedAssignment, OllpError>(assignment)
                     }
                 },
-                move || {
+                rescan: move || {
                     let rescan_calls = Arc::clone(&rescan_calls);
                     async move {
                         let n = rescan_calls.fetch_add(1, Ordering::SeqCst);
                         Ok(vec![100 + n])
                     }
                 },
-            )
+            })
             .await
         };
 
@@ -168,14 +168,14 @@ fn exhausts_on_persistent_mismatch() {
             let seq = Arc::clone(&seq);
             let submit_calls = Arc::clone(&submit_calls);
             let tx = tx.clone();
-            run_dependent_with_retry(
-                &registry,
-                &orchestrator,
-                0xABCD,
-                std::time::Duration::from_secs(5),
-                3,
-                vec![1],
-                move |_predicted: &Vec<u32>| {
+            run_dependent_with_retry(DependentRetryArgs {
+                registry: &registry,
+                orchestrator: &orchestrator,
+                predicate_class_hash: 0xABCD,
+                timeout: std::time::Duration::from_secs(5),
+                ollp_max_retries: 3,
+                initial_predicted: vec![1],
+                submit: move |_predicted: &Vec<u32>| {
                     let seq = Arc::clone(&seq);
                     let submit_calls = Arc::clone(&submit_calls);
                     let tx = tx.clone();
@@ -188,8 +188,8 @@ fn exhausts_on_persistent_mismatch() {
                         Ok::<RoutedAssignment, OllpError>(assignment)
                     }
                 },
-                move || async move { Ok(vec![1]) },
-            )
+                rescan: move || async move { Ok(vec![1]) },
+            })
             .await
         };
 
@@ -231,14 +231,14 @@ fn pre_admission_retry_does_not_rescan() {
             let submit_calls = Arc::clone(&submit_calls);
             let rescan_calls = Arc::clone(&rescan_calls);
             let tx = tx.clone();
-            run_dependent_with_retry(
-                &registry,
-                &orchestrator,
-                0xABCD,
-                std::time::Duration::from_secs(5),
-                5,
-                vec![1],
-                move |_predicted: &Vec<u32>| {
+            run_dependent_with_retry(DependentRetryArgs {
+                registry: &registry,
+                orchestrator: &orchestrator,
+                predicate_class_hash: 0xABCD,
+                timeout: std::time::Duration::from_secs(5),
+                ollp_max_retries: 5,
+                initial_predicted: vec![1],
+                submit: move |_predicted: &Vec<u32>| {
                     let seq = Arc::clone(&seq);
                     let submit_calls = Arc::clone(&submit_calls);
                     let tx = tx.clone();
@@ -255,14 +255,14 @@ fn pre_admission_retry_does_not_rescan() {
                         Ok::<RoutedAssignment, OllpError>(assignment)
                     }
                 },
-                move || {
+                rescan: move || {
                     let rescan_calls = Arc::clone(&rescan_calls);
                     async move {
                         rescan_calls.fetch_add(1, Ordering::SeqCst);
                         Ok(vec![1])
                     }
                 },
-            )
+            })
             .await
         };
 

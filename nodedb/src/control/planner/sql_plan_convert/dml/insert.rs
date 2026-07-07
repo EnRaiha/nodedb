@@ -148,18 +148,33 @@ pub(in super::super) fn nodedb_value_to_sql(val: nodedb_types::Value) -> SqlValu
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Bundled arguments for [`convert_insert`].
+pub(in super::super) struct ConvertInsertArgs<'a> {
+    pub collection: &'a str,
+    pub engine: &'a EngineType,
+    pub rows: &'a [Vec<(String, SqlValue)>],
+    pub column_defaults: &'a [(String, String)],
+    pub column_schema: &'a [(String, String)],
+    pub if_absent: bool,
+    pub primary_key: Option<&'a str>,
+    pub tenant_id: TenantId,
+    pub ctx: &'a ConvertContext,
+}
+
 pub(in super::super) fn convert_insert(
-    collection: &str,
-    engine: &EngineType,
-    rows: &[Vec<(String, SqlValue)>],
-    column_defaults: &[(String, String)],
-    column_schema: &[(String, String)],
-    if_absent: bool,
-    primary_key: Option<&str>,
-    tenant_id: TenantId,
-    ctx: &ConvertContext,
+    args: ConvertInsertArgs<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let ConvertInsertArgs {
+        collection,
+        engine,
+        rows,
+        column_defaults,
+        column_schema,
+        if_absent,
+        primary_key,
+        tenant_id,
+        ctx,
+    } = args;
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
@@ -275,18 +290,33 @@ pub(in super::super) fn convert_insert(
     Ok(tasks)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Bundled arguments for [`convert_upsert`].
+pub(in super::super) struct ConvertUpsertArgs<'a> {
+    pub collection: &'a str,
+    pub engine: &'a EngineType,
+    pub rows: &'a [Vec<(String, SqlValue)>],
+    pub column_defaults: &'a [(String, String)],
+    pub column_schema: &'a [(String, String)],
+    pub on_conflict_updates: &'a [(String, SqlExpr)],
+    pub primary_key: Option<&'a str>,
+    pub tenant_id: TenantId,
+    pub ctx: &'a ConvertContext,
+}
+
 pub(in super::super) fn convert_upsert(
-    collection: &str,
-    engine: &EngineType,
-    rows: &[Vec<(String, SqlValue)>],
-    column_defaults: &[(String, String)],
-    column_schema: &[(String, String)],
-    on_conflict_updates: &[(String, SqlExpr)],
-    primary_key: Option<&str>,
-    tenant_id: TenantId,
-    ctx: &ConvertContext,
+    args: ConvertUpsertArgs<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let ConvertUpsertArgs {
+        collection,
+        engine,
+        rows,
+        column_defaults,
+        column_schema,
+        on_conflict_updates,
+        primary_key,
+        tenant_id,
+        ctx,
+    } = args;
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
     let collection = coll_qualified.as_str();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);

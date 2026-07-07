@@ -179,18 +179,33 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
 /// The handler resolves doc IDs through the sparse index, fetches each
 /// document, applies any remaining filters + projection, and emits rows
 /// in the same wire format as a document scan.
-#[allow(clippy::too_many_arguments)]
+/// Bundled arguments for [`convert_document_index_lookup`].
+pub(in crate::control::planner::sql_plan_convert) struct DocumentIndexLookupArgs<'a> {
+    pub collection: &'a str,
+    pub field: &'a str,
+    pub value: &'a SqlValue,
+    pub filters: &'a [Filter],
+    pub projection: &'a [nodedb_sql::types::Projection],
+    pub limit: Option<usize>,
+    pub offset: usize,
+    pub tenant_id: TenantId,
+    pub database_id: crate::types::DatabaseId,
+}
+
 pub(in crate::control::planner::sql_plan_convert) fn convert_document_index_lookup(
-    collection: &str,
-    field: &str,
-    value: &SqlValue,
-    filters: &[Filter],
-    projection: &[nodedb_sql::types::Projection],
-    limit: Option<usize>,
-    offset: usize,
-    tenant_id: TenantId,
-    database_id: crate::types::DatabaseId,
+    args: DocumentIndexLookupArgs<'_>,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let DocumentIndexLookupArgs {
+        collection,
+        field,
+        value,
+        filters,
+        projection,
+        limit,
+        offset,
+        tenant_id,
+        database_id,
+    } = args;
     let coll_qualified = super::super::convert::db_qualified(database_id, collection);
     let collection = coll_qualified.as_str();
     let filter_bytes = serialize_filters(filters)?;

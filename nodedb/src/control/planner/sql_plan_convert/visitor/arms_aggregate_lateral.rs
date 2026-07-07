@@ -43,18 +43,20 @@ macro_rules! impl_aggregate_lateral_arms_for_convert_visitor {
             left_join: bool,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
             super::super::lateral::convert_lateral_top_k(
-                outer,
-                outer_alias,
-                inner_collection,
-                inner_filters,
-                inner_order_by,
-                inner_limit,
-                correlation_keys,
-                lateral_alias,
-                projection,
-                left_join,
-                self.tenant_id,
-                self.ctx,
+                super::super::lateral::ConvertLateralTopKParams {
+                    outer,
+                    outer_alias,
+                    inner_collection,
+                    inner_filters,
+                    inner_order_by,
+                    inner_limit,
+                    correlation_keys,
+                    lateral_alias,
+                    projection,
+                    left_join,
+                    tenant_id: self.tenant_id,
+                    ctx: self.ctx,
+                },
             )
         }
 
@@ -70,16 +72,18 @@ macro_rules! impl_aggregate_lateral_arms_for_convert_visitor {
             left_join: bool,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
             super::super::lateral::convert_lateral_loop(
-                outer,
-                outer_alias,
-                inner,
-                correlation_predicates,
-                lateral_alias,
-                projection,
-                outer_row_cap,
-                left_join,
-                self.tenant_id,
-                self.ctx,
+                super::super::lateral::ConvertLateralLoopParams {
+                    outer,
+                    outer_alias,
+                    inner,
+                    correlation_predicates,
+                    lateral_alias,
+                    projection,
+                    outer_row_cap,
+                    left_join,
+                    tenant_id: self.tenant_id,
+                    ctx: self.ctx,
+                },
             )
         }
     };

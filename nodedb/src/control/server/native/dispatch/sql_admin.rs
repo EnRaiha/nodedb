@@ -140,7 +140,12 @@ pub(super) async fn handle_explain(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -
     let database_id = ctx.database_id();
     match ctx
         .query_ctx
-        .plan_sql_with_rls(inner_sql, ctx.tenant_id(), database_id, &sec)
+        .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
+            sql: inner_sql,
+            tenant_id: ctx.tenant_id(),
+            database_id,
+            sec: &sec,
+        })
         .await
     {
         Ok((tasks, _output_schema)) => {

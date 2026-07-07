@@ -14,7 +14,7 @@ mod spatial;
 mod timeseries;
 
 pub(in crate::control::planner::sql_plan_convert) use core::{
-    convert_document_index_lookup, convert_point_get, convert_scan,
+    DocumentIndexLookupArgs, convert_document_index_lookup, convert_point_get, convert_scan,
 };
 pub(in crate::control::planner::sql_plan_convert) use join::convert_join;
 pub(in crate::control::planner::sql_plan_convert) use recursive::{

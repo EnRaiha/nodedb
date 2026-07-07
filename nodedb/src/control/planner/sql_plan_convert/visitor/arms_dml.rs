@@ -14,17 +14,17 @@ macro_rules! impl_dml_arms_for_convert_visitor {
             column_schema: &[(String, String)],
             primary_key: Option<&str>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-            super::super::dml::convert_insert(
+            super::super::dml::convert_insert(super::super::dml::ConvertInsertArgs {
                 collection,
-                &engine,
+                engine: &engine,
                 rows,
                 column_defaults,
                 column_schema,
                 if_absent,
                 primary_key,
-                self.tenant_id,
-                self.ctx,
-            )
+                tenant_id: self.tenant_id,
+                ctx: self.ctx,
+            })
         }
 
         fn upsert(
@@ -37,17 +37,17 @@ macro_rules! impl_dml_arms_for_convert_visitor {
             column_schema: &[(String, String)],
             primary_key: Option<&str>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-            super::super::dml::convert_upsert(
+            super::super::dml::convert_upsert(super::super::dml::ConvertUpsertArgs {
                 collection,
-                &engine,
+                engine: &engine,
                 rows,
                 column_defaults,
                 column_schema,
                 on_conflict_updates,
                 primary_key,
-                self.tenant_id,
-                self.ctx,
-            )
+                tenant_id: self.tenant_id,
+                ctx: self.ctx,
+            })
         }
 
         fn kv_insert(
@@ -168,7 +168,7 @@ macro_rules! impl_dml_arms_for_convert_visitor {
             clauses: &[nodedb_sql::types::plan::MergePlanClause],
             returning: bool,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-            super::super::dml::convert_merge(
+            super::super::dml::convert_merge(super::super::dml::ConvertMergeArgs {
                 target,
                 source,
                 target_join_col,
@@ -176,9 +176,9 @@ macro_rules! impl_dml_arms_for_convert_visitor {
                 source_alias,
                 clauses,
                 returning,
-                self.tenant_id,
-                self.ctx,
-            )
+                tenant_id: self.tenant_id,
+                ctx: self.ctx,
+            })
         }
     };
 }

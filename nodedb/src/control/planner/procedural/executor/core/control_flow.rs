@@ -9,17 +9,36 @@ use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::planner::procedural::executor::eval;
 use crate::control::planner::procedural::executor::fuel::ExecutionBudget;
 
+/// The condition/branches of an `IF/ELSIF/ELSE` statement.
+pub(super) struct IfBranches<'a> {
+    pub condition: &'a SqlExpr,
+    pub then_block: &'a [Statement],
+    pub elsif_branches: &'a [ElsIfBranch],
+    pub else_block: &'a Option<Vec<Statement>>,
+}
+
+/// The bounds/body of a `FOR` loop statement.
+pub(super) struct ForLoopSpec<'a> {
+    pub var: &'a str,
+    pub start: &'a SqlExpr,
+    pub end: &'a SqlExpr,
+    pub reverse: bool,
+    pub body: &'a [Statement],
+}
+
 impl<'a> StatementExecutor<'a> {
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_if(
         &self,
-        condition: &SqlExpr,
-        then_block: &[Statement],
-        elsif_branches: &[ElsIfBranch],
-        else_block: &Option<Vec<Statement>>,
+        branches: IfBranches<'_>,
         bindings: &RowBindings,
         budget: &mut ExecutionBudget,
     ) -> crate::Result<Flow> {
+        let IfBranches {
+            condition,
+            then_block,
+            elsif_branches,
+            else_block,
+        } = branches;
         let cond_sql = bindings.substitute(&condition.sql);
         if eval::evaluate_condition(self.state, self.tenant_id, &cond_sql).await? {
             return self
@@ -79,17 +98,19 @@ impl<'a> StatementExecutor<'a> {
         Ok(Flow::Continue)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_for(
         &self,
-        var: &str,
-        start: &SqlExpr,
-        end: &SqlExpr,
-        reverse: bool,
-        body: &[Statement],
+        spec: ForLoopSpec<'_>,
         bindings: &RowBindings,
         budget: &mut ExecutionBudget,
     ) -> crate::Result<Flow> {
+        let ForLoopSpec {
+            var,
+            start,
+            end,
+            reverse,
+            body,
+        } = spec;
         let start_sql = bindings.substitute(&start.sql);
         let end_sql = bindings.substitute(&end.sql);
         let start_val = eval::evaluate_int(self.state, self.tenant_id, &start_sql).await?;

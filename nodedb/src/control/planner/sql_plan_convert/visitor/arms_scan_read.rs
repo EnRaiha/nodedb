@@ -70,15 +70,17 @@ macro_rules! impl_scan_read_arms_for_convert_visitor {
             _temporal: &nodedb_sql::temporal::TemporalScope,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
             super::super::scan::convert_document_index_lookup(
-                collection,
-                field,
-                value,
-                filters,
-                projection,
-                limit,
-                offset,
-                self.tenant_id,
-                self.ctx.database_id,
+                super::super::scan::DocumentIndexLookupArgs {
+                    collection,
+                    field,
+                    value,
+                    filters,
+                    projection,
+                    limit,
+                    offset,
+                    tenant_id: self.tenant_id,
+                    database_id: self.ctx.database_id,
+                },
             )
         }
 

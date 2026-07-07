@@ -32,6 +32,6 @@ pub use catalog::mark_collection_edge_bearing;
 pub use delete::append_implicit_edge_delete_tasks;
 pub use insert::append_implicit_edge_tasks;
 pub use update::{
-    EdgeFieldOverrides, FieldUpdate, WeightUpdate, append_implicit_edge_update_tasks,
-    parse_edge_field_overrides,
+    EdgeFieldOverrides, EdgeUpdateCtx, FieldUpdate, WeightUpdate,
+    append_implicit_edge_update_tasks, parse_edge_field_overrides,
 };

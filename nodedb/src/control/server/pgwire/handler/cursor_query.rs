@@ -42,7 +42,12 @@ impl NodeDbPgHandler {
             permission_cache: Some(&*perm_cache),
         };
         let (tasks, _output_schema) = query_ctx
-            .plan_sql_with_rls(sql, tenant_id, database_id, &sec)
+            .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
+                sql,
+                tenant_id,
+                database_id,
+                sec: &sec,
+            })
             .await
             .map_err(|e| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(

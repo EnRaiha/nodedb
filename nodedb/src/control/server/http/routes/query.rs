@@ -145,7 +145,12 @@ pub async fn query(
     };
     let (tasks, output_schema) = state
         .query_ctx
-        .plan_sql_with_rls(&clean_sql, tenant_id, database_id, &sec)
+        .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
+            sql: &clean_sql,
+            tenant_id,
+            database_id,
+            sec: &sec,
+        })
         .await
         .map_err(|e| ApiError::BadRequest(format!("SQL planning failed: {e}")))?;
 
@@ -352,7 +357,12 @@ pub async fn query_ndjson(
         permission_cache: Some(&*perm_cache),
     };
     let (tasks, output_schema) = match query_ctx
-        .plan_sql_with_rls(sql, tenant_id, database_id, &sec)
+        .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
+            sql,
+            tenant_id,
+            database_id,
+            sec: &sec,
+        })
         .await
     {
         Ok(t) => t,

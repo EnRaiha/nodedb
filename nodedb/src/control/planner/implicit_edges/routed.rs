@@ -15,6 +15,19 @@ use crate::control::server::surrogate_exchange::assign_surrogate_routed;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 
+/// Shared routing context for a single implicit-edge task (delete or put):
+/// the endpoint tenancy/collection identity plus the two endpoint keys.
+#[derive(Clone, Copy)]
+pub(super) struct EdgeRouteCtx<'a> {
+    pub state: &'a SharedState,
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub trace_id: TraceId,
+    pub collection: &'a str,
+    pub src: &'a str,
+    pub dst: &'a str,
+}
+
 /// Append a `GraphOp::EdgeDelete` task for `(src, dst, label)`.
 ///
 /// # Surrogate resolution never allocates
@@ -24,18 +37,20 @@ use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 /// guarantees both endpoints are already bound — the matching INSERT assigned
 /// them — so the get-or-create path always hits the existing binding and never
 /// allocates.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn push_edge_delete(
-    state: &SharedState,
+    ctx: EdgeRouteCtx<'_>,
     out: &mut Vec<PhysicalTask>,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    trace_id: TraceId,
-    collection: &str,
-    src: &str,
-    dst: &str,
     label: String,
 ) -> crate::Result<()> {
+    let EdgeRouteCtx {
+        state,
+        tenant_id,
+        database_id,
+        trace_id,
+        collection,
+        src,
+        dst,
+    } = ctx;
     let vsrc = VShardId::from_key(src.as_bytes());
     let vdst = VShardId::from_key(dst.as_bytes());
 
@@ -86,19 +101,21 @@ pub(super) async fn push_edge_delete(
 /// (`None` → empty properties → CSR unit weight). Endpoint surrogates are
 /// resolved get-or-create (a new endpoint may not exist yet), homed on
 /// `from_key(src)`.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn push_edge_put(
-    state: &SharedState,
+    ctx: EdgeRouteCtx<'_>,
     out: &mut Vec<PhysicalTask>,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    trace_id: TraceId,
-    collection: &str,
-    src: &str,
-    dst: &str,
     label: String,
     weight: Option<f64>,
 ) -> crate::Result<()> {
+    let EdgeRouteCtx {
+        state,
+        tenant_id,
+        database_id,
+        trace_id,
+        collection,
+        src,
+        dst,
+    } = ctx;
     let properties = match weight {
         Some(w) => weight_properties(w),
         None => Vec::new(),
