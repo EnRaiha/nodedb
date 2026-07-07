@@ -20,19 +20,33 @@ use nodedb_types::{DatabaseId, TenantId, ms_to_ordinal_upper};
 use super::super::store::{EDGES, Edge, EdgeStore, REVERSE_EDGES, redb_err};
 use super::{EdgeRef, is_sentinel, parse_versioned_edge_key};
 
+/// Parameters shared by [`EdgeStore::neighbors_out_as_of`] and
+/// [`EdgeStore::neighbors_in_as_of`]: the anchor node identity plus the
+/// bitemporal visibility filters. `node` is the outbound source for the
+/// `_out_` query and the inbound destination for the `_in_` query.
+#[derive(Debug, Clone, Copy)]
+pub struct NeighborsAsOfParams<'a> {
+    pub db: u64,
+    pub tid: TenantId,
+    pub collection: &'a str,
+    pub node: &'a str,
+    pub label_filter: Option<&'a str>,
+    pub system_as_of_ms: Option<i64>,
+    pub valid_at_ms: Option<i64>,
+}
+
 impl EdgeStore {
     /// Bitemporal outbound neighbors. See module docs for semantics.
-    #[allow(clippy::too_many_arguments)]
-    pub fn neighbors_out_as_of(
-        &self,
-        db: u64,
-        tid: TenantId,
-        collection: &str,
-        src: &str,
-        label_filter: Option<&str>,
-        system_as_of_ms: Option<i64>,
-        valid_at_ms: Option<i64>,
-    ) -> crate::Result<Vec<Edge>> {
+    pub fn neighbors_out_as_of(&self, params: NeighborsAsOfParams<'_>) -> crate::Result<Vec<Edge>> {
+        let NeighborsAsOfParams {
+            db,
+            tid,
+            collection,
+            node: src,
+            label_filter,
+            system_as_of_ms,
+            valid_at_ms,
+        } = params;
         let cutoff = system_cutoff(system_as_of_ms);
         let prefix = match label_filter {
             Some(label) => format!("{collection}\x00{src}\x00{label}\x00"),
@@ -94,17 +108,16 @@ impl EdgeStore {
     }
 
     /// Bitemporal inbound neighbors. See module docs for semantics.
-    #[allow(clippy::too_many_arguments)]
-    pub fn neighbors_in_as_of(
-        &self,
-        db: u64,
-        tid: TenantId,
-        collection: &str,
-        dst: &str,
-        label_filter: Option<&str>,
-        system_as_of_ms: Option<i64>,
-        valid_at_ms: Option<i64>,
-    ) -> crate::Result<Vec<Edge>> {
+    pub fn neighbors_in_as_of(&self, params: NeighborsAsOfParams<'_>) -> crate::Result<Vec<Edge>> {
+        let NeighborsAsOfParams {
+            db,
+            tid,
+            collection,
+            node: dst,
+            label_filter,
+            system_as_of_ms,
+            valid_at_ms,
+        } = params;
         let cutoff = system_cutoff(system_as_of_ms);
         let prefix = match label_filter {
             Some(label) => format!("{collection}\x00{dst}\x00{label}\x00"),

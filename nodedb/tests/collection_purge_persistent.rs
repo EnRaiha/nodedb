@@ -8,7 +8,7 @@
 //! the cross-engine regression gate that catches a future refactor
 //! where only some engines honor the scoped purge.
 
-use nodedb::engine::kv::KvEngine;
+use nodedb::engine::kv::{KvEngine, KvPutParams};
 use nodedb::engine::sparse::btree::SparseEngine;
 use nodedb::engine::sparse::inverted::InvertedIndex;
 use nodedb::types::TenantId;
@@ -68,36 +68,36 @@ fn kv_engine_purge_leaves_no_keys_for_collection() {
     let now_ms = 0u64;
     let mut kv = KvEngine::new(now_ms, 16, 0.75, 4, 64, 1000, 1024);
 
-    kv.put(
-        0,
-        TENANT,
-        "keep",
-        b"k1",
-        b"v1",
-        0,
+    kv.put(KvPutParams {
+        database_id: 0,
+        tenant_id: TENANT,
+        collection: "keep",
+        key: b"k1",
+        value: b"v1",
+        ttl_ms: 0,
         now_ms,
-        nodedb_types::Surrogate::ZERO,
-    );
-    kv.put(
-        0,
-        TENANT,
-        "purge_me",
-        b"k1",
-        b"v1",
-        0,
+        surrogate: nodedb_types::Surrogate::ZERO,
+    });
+    kv.put(KvPutParams {
+        database_id: 0,
+        tenant_id: TENANT,
+        collection: "purge_me",
+        key: b"k1",
+        value: b"v1",
+        ttl_ms: 0,
         now_ms,
-        nodedb_types::Surrogate::ZERO,
-    );
-    kv.put(
-        0,
-        TENANT,
-        "purge_me",
-        b"k2",
-        b"v2",
-        0,
+        surrogate: nodedb_types::Surrogate::ZERO,
+    });
+    kv.put(KvPutParams {
+        database_id: 0,
+        tenant_id: TENANT,
+        collection: "purge_me",
+        key: b"k2",
+        value: b"v2",
+        ttl_ms: 0,
         now_ms,
-        nodedb_types::Surrogate::ZERO,
-    );
+        surrogate: nodedb_types::Surrogate::ZERO,
+    });
 
     let removed = kv.purge_collection(0, TENANT, "purge_me");
     assert!(
@@ -119,26 +119,26 @@ fn kv_engine_cross_tenant_isolation() {
     let now_ms = 0u64;
     let mut kv = KvEngine::new(now_ms, 16, 0.75, 4, 64, 1000, 1024);
 
-    kv.put(
-        0,
-        1,
-        "docs",
-        b"k",
-        b"a",
-        0,
+    kv.put(KvPutParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection: "docs",
+        key: b"k",
+        value: b"a",
+        ttl_ms: 0,
         now_ms,
-        nodedb_types::Surrogate::ZERO,
-    );
-    kv.put(
-        0,
-        2,
-        "docs",
-        b"k",
-        b"b",
-        0,
+        surrogate: nodedb_types::Surrogate::ZERO,
+    });
+    kv.put(KvPutParams {
+        database_id: 0,
+        tenant_id: 2,
+        collection: "docs",
+        key: b"k",
+        value: b"b",
+        ttl_ms: 0,
         now_ms,
-        nodedb_types::Surrogate::ZERO,
-    );
+        surrogate: nodedb_types::Surrogate::ZERO,
+    });
 
     kv.purge_collection(0, 1, "docs");
     assert!(kv.get(0, 1, "docs", b"k", now_ms).is_none());

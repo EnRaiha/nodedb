@@ -8,7 +8,9 @@ use super::keys::{
     versioned_edge_key,
 };
 use super::payload::EdgeValuePayload;
-use crate::engine::graph::edge_store::stats::update::{decrement_for_delete, increment_for_insert};
+use crate::engine::graph::edge_store::stats::update::{
+    EdgeStatsKey, decrement_for_delete, increment_for_insert,
+};
 use crate::engine::graph::edge_store::store::{EDGES, EdgeStore, REVERSE_EDGES, redb_err};
 
 impl EdgeStore {
@@ -57,12 +59,14 @@ impl EdgeStore {
 
             increment_for_insert(
                 &write_txn,
-                d,
-                t,
-                edge.collection,
-                edge.label,
-                edge.src,
-                edge.dst,
+                EdgeStatsKey {
+                    db: d,
+                    tid: t,
+                    collection: edge.collection,
+                    label: edge.label,
+                    src: edge.src,
+                    dst: edge.dst,
+                },
                 system_from,
             )?;
         }
@@ -183,12 +187,14 @@ impl EdgeStore {
 
             decrement_for_delete(
                 &write_txn,
-                d,
-                t,
-                edge.collection,
-                edge.label,
-                edge.src,
-                edge.dst,
+                EdgeStatsKey {
+                    db: d,
+                    tid: t,
+                    collection: edge.collection,
+                    label: edge.label,
+                    src: edge.src,
+                    dst: edge.dst,
+                },
                 system_from,
             )?;
         }

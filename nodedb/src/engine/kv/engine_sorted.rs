@@ -11,6 +11,17 @@ use super::engine::KvEngine;
 use super::engine_helpers::table_key;
 use super::sorted_index::manager::SortedIndexDef;
 
+/// Parameters for [`KvEngine::sorted_index_range`].
+#[derive(Debug, Clone, Copy)]
+pub struct SortedIndexRangeParams<'a> {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub index_name: &'a str,
+    pub score_min: Option<&'a [u8]>,
+    pub score_max: Option<&'a [u8]>,
+    pub now_ms: u64,
+}
+
 impl KvEngine {
     /// Register a new sorted index with backfill from existing KV data.
     ///
@@ -112,16 +123,18 @@ impl KvEngine {
             .top_k(database_id, tenant_id, index_name, k, now_ms)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn sorted_index_range(
         &self,
-        database_id: u64,
-        tenant_id: u64,
-        index_name: &str,
-        score_min: Option<&[u8]>,
-        score_max: Option<&[u8]>,
-        now_ms: u64,
+        params: SortedIndexRangeParams<'_>,
     ) -> Option<Vec<(u32, Vec<u8>)>> {
+        let SortedIndexRangeParams {
+            database_id,
+            tenant_id,
+            index_name,
+            score_min,
+            score_max,
+            now_ms,
+        } = params;
         self.sorted_indexes.range(
             database_id,
             tenant_id,

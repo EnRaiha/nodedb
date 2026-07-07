@@ -25,6 +25,18 @@ use crate::engine::graph::edge_store::temporal::keys::{
 
 use super::table::{GRAPH_STATS, LabelRow, NodeRow, SummaryRow, label_key, node_key, summary_key};
 
+/// Identity of a base edge `(tid, collection, src, label, dst)` under a
+/// database, used to probe/maintain the GRAPH_STATS counters for it.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeStatsKey<'a> {
+    pub db: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub label: &'a str,
+    pub src: &'a str,
+    pub dst: &'a str,
+}
+
 // ── Insert path ───────────────────────────────────────────────────────────────
 
 /// Called from `put_edge_versioned` inside the same `WriteTransaction`.
@@ -35,27 +47,20 @@ use super::table::{GRAPH_STATS, LabelRow, NodeRow, SummaryRow, label_key, node_k
 /// `node[dst].refcount` (bumping `summary.distinct_node_count` per new node).
 ///
 /// If a prior live version exists this is an update — counters are unchanged.
-#[allow(clippy::too_many_arguments)]
 pub fn increment_for_insert(
     write_txn: &WriteTransaction,
-    db: u64,
-    tid: u64,
-    collection: &str,
-    label: &str,
-    src: &str,
-    dst: &str,
+    key: EdgeStatsKey<'_>,
     current_system_from: i64,
 ) -> crate::Result<()> {
-    if prior_live_exists(
-        write_txn,
+    let EdgeStatsKey {
         db,
         tid,
         collection,
-        src,
         label,
+        src,
         dst,
-        current_system_from,
-    )? {
+    } = key;
+    if prior_live_exists(write_txn, key, current_system_from)? {
         return Ok(());
     }
 
@@ -115,27 +120,20 @@ pub fn increment_for_insert(
 /// decrementing `summary.distinct_node_count` when refcount reaches zero).
 ///
 /// If there was no prior live version, this is a no-op for the counters.
-#[allow(clippy::too_many_arguments)]
 pub fn decrement_for_delete(
     write_txn: &WriteTransaction,
-    db: u64,
-    tid: u64,
-    collection: &str,
-    label: &str,
-    src: &str,
-    dst: &str,
+    key: EdgeStatsKey<'_>,
     sentinel_system_from: i64,
 ) -> crate::Result<()> {
-    if !prior_live_exists(
-        write_txn,
+    let EdgeStatsKey {
         db,
         tid,
         collection,
-        src,
         label,
+        src,
         dst,
-        sentinel_system_from,
-    )? {
+    } = key;
+    if !prior_live_exists(write_txn, key, sentinel_system_from)? {
         return Ok(());
     }
 
@@ -186,17 +184,19 @@ pub fn decrement_for_delete(
 /// Returns `true` when a live (non-sentinel) version of the base edge exists
 /// in EDGES at any `system_from` strictly less than `exclude_system_from`,
 /// using the same `WriteTransaction`'s consistent view.
-#[allow(clippy::too_many_arguments)]
 fn prior_live_exists(
     write_txn: &WriteTransaction,
-    db: u64,
-    tid: u64,
-    collection: &str,
-    src: &str,
-    label: &str,
-    dst: &str,
+    key: EdgeStatsKey<'_>,
     exclude_system_from: i64,
 ) -> crate::Result<bool> {
+    let EdgeStatsKey {
+        db,
+        tid,
+        collection,
+        label,
+        src,
+        dst,
+    } = key;
     let prefix = edge_version_prefix(collection, src, label, dst);
     let edges = write_txn
         .open_table(EDGES)

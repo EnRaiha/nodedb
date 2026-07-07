@@ -85,15 +85,17 @@ impl<'a> DocumentEngine<'a> {
             );
         }
         let prefix_with_value = format!("{value}:");
-        let results = self.sparse.range_scan(
-            self.database_id,
-            self.tenant_id,
-            collection,
-            path,
-            Some(prefix_with_value.as_bytes()),
-            None,
-            1000,
-        )?;
+        let results =
+            self.sparse
+                .range_scan(crate::engine::sparse::btree_index::RangeScanParams {
+                    database_id: self.database_id,
+                    tenant_id: self.tenant_id,
+                    collection,
+                    field: path,
+                    lower: Some(prefix_with_value.as_bytes()),
+                    upper: None,
+                    limit: 1000,
+                })?;
 
         let mut doc_ids = Vec::new();
         for (key, _) in results {

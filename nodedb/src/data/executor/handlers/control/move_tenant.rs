@@ -44,13 +44,14 @@ impl CoreLoop {
         }
 
         // KV engine.
-        self.kv_engine.rename_collection(
-            old_database_id,
-            new_database_id,
-            tenant_id,
-            old_collection,
-            new_collection,
-        );
+        self.kv_engine
+            .rename_collection(crate::engine::kv::RenameCollectionParams {
+                old_database_id,
+                new_database_id,
+                tenant_id,
+                old_collection,
+                new_collection,
+            });
 
         self.response_ok(task)
     }

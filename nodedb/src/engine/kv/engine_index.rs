@@ -7,6 +7,18 @@
 use super::engine::KvEngine;
 use super::engine_helpers::{extract_field_values_from_msgpack, table_key};
 
+/// Parameters for [`KvEngine::register_index`].
+#[derive(Debug, Clone, Copy)]
+pub struct RegisterIndexParams<'a> {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub collection: &'a str,
+    pub field: &'a str,
+    pub field_position: usize,
+    pub backfill: bool,
+    pub now_ms: u64,
+}
+
 impl KvEngine {
     /// Register a secondary index on a field for a collection.
     ///
@@ -15,17 +27,16 @@ impl KvEngine {
     ///
     /// **Note**: backfill scans all entries synchronously. For large collections
     /// (> 10k entries), consider `backfill=false` and rebuilding offline.
-    #[allow(clippy::too_many_arguments)]
-    pub fn register_index(
-        &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        field: &str,
-        field_position: usize,
-        backfill: bool,
-        now_ms: u64,
-    ) -> usize {
+    pub fn register_index(&mut self, params: RegisterIndexParams<'_>) -> usize {
+        let RegisterIndexParams {
+            database_id,
+            tenant_id,
+            collection,
+            field,
+            field_position,
+            backfill,
+            now_ms,
+        } = params;
         let tkey = table_key(database_id, tenant_id, collection);
         let idx_set = self.indexes.entry(tkey).or_default();
 

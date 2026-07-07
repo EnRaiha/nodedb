@@ -529,12 +529,36 @@ mod tests {
             std::collections::HashMap::new(),
         ))
         .unwrap();
-        core.kv_engine
-            .put(0, tid, coll, b"a", &val, 0, now_ms, Surrogate::ZERO);
-        core.kv_engine
-            .put(0, tid, coll, b"b", &val, 0, now_ms, Surrogate::ZERO);
-        core.kv_engine
-            .put(0, tid, coll, b"c", &val, 0, now_ms, Surrogate::ZERO);
+        core.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: 0,
+            tenant_id: tid,
+            collection: coll,
+            key: b"a",
+            value: &val,
+            ttl_ms: 0,
+            now_ms,
+            surrogate: Surrogate::ZERO,
+        });
+        core.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: 0,
+            tenant_id: tid,
+            collection: coll,
+            key: b"b",
+            value: &val,
+            ttl_ms: 0,
+            now_ms,
+            surrogate: Surrogate::ZERO,
+        });
+        core.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: 0,
+            tenant_id: tid,
+            collection: coll,
+            key: b"c",
+            value: &val,
+            ttl_ms: 0,
+            now_ms,
+            surrogate: Surrogate::ZERO,
+        });
 
         let mut expected = core.scan_collection(0, tid, coll, usize::MAX).unwrap();
         expected.sort_by(|a, b| a.0.cmp(&b.0));
@@ -632,14 +656,46 @@ mod tests {
         .unwrap();
 
         // Insert in non-sorted order: "k3", "k1", "k4", "k2".
-        core.kv_engine
-            .put(0, tid, coll, b"k3", &val, 0, now_ms, Surrogate::ZERO);
-        core.kv_engine
-            .put(0, tid, coll, b"k1", &val, 0, now_ms, Surrogate::ZERO);
-        core.kv_engine
-            .put(0, tid, coll, b"k4", &val, 0, now_ms, Surrogate::ZERO);
-        core.kv_engine
-            .put(0, tid, coll, b"k2", &val, 0, now_ms, Surrogate::ZERO);
+        core.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: 0,
+            tenant_id: tid,
+            collection: coll,
+            key: b"k3",
+            value: &val,
+            ttl_ms: 0,
+            now_ms,
+            surrogate: Surrogate::ZERO,
+        });
+        core.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: 0,
+            tenant_id: tid,
+            collection: coll,
+            key: b"k1",
+            value: &val,
+            ttl_ms: 0,
+            now_ms,
+            surrogate: Surrogate::ZERO,
+        });
+        core.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: 0,
+            tenant_id: tid,
+            collection: coll,
+            key: b"k4",
+            value: &val,
+            ttl_ms: 0,
+            now_ms,
+            surrogate: Surrogate::ZERO,
+        });
+        core.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: 0,
+            tenant_id: tid,
+            collection: coll,
+            key: b"k2",
+            value: &val,
+            ttl_ms: 0,
+            now_ms,
+            surrogate: Surrogate::ZERO,
+        });
 
         // Reference output — NOT sorted.
         let expected = core.scan_collection(0, tid, coll, usize::MAX).unwrap();

@@ -200,12 +200,14 @@ impl CoreLoop {
             for v in new_vals.difference(&old_vals) {
                 if let Err(e) = self.sparse.index_put_in_txn(
                     txn,
-                    database_id,
-                    tid,
-                    collection,
-                    &index_path.path,
-                    v,
-                    doc_id,
+                    crate::engine::sparse::btree_index::IndexEntryTxn {
+                        database_id,
+                        tenant_id: tid,
+                        collection,
+                        field: &index_path.path,
+                        value: v,
+                        document_id: doc_id,
+                    },
                 ) {
                     tracing::warn!(
                         core = self.core_id,

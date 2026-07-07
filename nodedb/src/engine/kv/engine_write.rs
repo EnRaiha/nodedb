@@ -9,6 +9,19 @@ use super::engine_helpers::{expiry_key, extract_all_field_values_from_msgpack, t
 use super::entry::NO_EXPIRY;
 use super::hash_table::KvHashTable;
 
+/// Parameters for [`KvEngine::put`].
+#[derive(Debug, Clone, Copy)]
+pub struct KvPutParams<'a> {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub collection: &'a str,
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub ttl_ms: u64,
+    pub now_ms: u64,
+    pub surrogate: Surrogate,
+}
+
 impl KvEngine {
     /// PUT: insert or update. Returns old value if overwritten.
     ///
@@ -18,18 +31,17 @@ impl KvEngine {
     /// `surrogate` is the row's stable global identity. Pass
     /// `Surrogate::ZERO` from internal RMW callers that do not allocate
     /// one — existing entries preserve their bound surrogate either way.
-    #[allow(clippy::too_many_arguments)]
-    pub fn put(
-        &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        key: &[u8],
-        value: &[u8],
-        ttl_ms: u64,
-        now_ms: u64,
-        surrogate: Surrogate,
-    ) -> Option<Vec<u8>> {
+    pub fn put(&mut self, params: KvPutParams<'_>) -> Option<Vec<u8>> {
+        let KvPutParams {
+            database_id,
+            tenant_id,
+            collection,
+            key,
+            value,
+            ttl_ms,
+            now_ms,
+            surrogate,
+        } = params;
         let expire_at = if ttl_ms > 0 {
             now_ms + ttl_ms
         } else {

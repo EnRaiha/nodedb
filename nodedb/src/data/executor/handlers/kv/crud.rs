@@ -150,9 +150,16 @@ impl CoreLoop {
             .epoch_system_ms
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
-        let old = self
-            .kv_engine
-            .put(did, tid, collection, key, value, ttl_ms, now_ms, surrogate);
+        let old = self.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: did,
+            tenant_id: tid,
+            collection,
+            key,
+            value,
+            ttl_ms,
+            now_ms,
+            surrogate,
+        });
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }
@@ -222,8 +229,16 @@ impl CoreLoop {
             );
         }
 
-        self.kv_engine
-            .put(did, tid, collection, key, value, ttl_ms, now_ms, surrogate);
+        self.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: did,
+            tenant_id: tid,
+            collection,
+            key,
+            value,
+            ttl_ms,
+            now_ms,
+            surrogate,
+        });
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }
@@ -276,8 +291,16 @@ impl CoreLoop {
             return self.response_ok(task);
         }
 
-        self.kv_engine
-            .put(did, tid, collection, key, value, ttl_ms, now_ms, surrogate);
+        self.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: did,
+            tenant_id: tid,
+            collection,
+            key,
+            value,
+            ttl_ms,
+            now_ms,
+            surrogate,
+        });
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }
@@ -378,16 +401,16 @@ impl CoreLoop {
             }
         };
 
-        self.kv_engine.put(
-            did,
-            tid,
+        self.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: did,
+            tenant_id: tid,
             collection,
             key,
-            &stored_bytes,
+            value: &stored_bytes,
             ttl_ms,
             now_ms,
             surrogate,
-        );
+        });
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }

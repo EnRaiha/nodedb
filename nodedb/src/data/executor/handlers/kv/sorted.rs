@@ -205,8 +205,14 @@ impl CoreLoop {
 
         match self
             .kv_engine
-            .sorted_index_range(did, tid, index_name, score_min, score_max, now_ms)
-        {
+            .sorted_index_range(crate::engine::kv::SortedIndexRangeParams {
+                database_id: did,
+                tenant_id: tid,
+                index_name,
+                score_min,
+                score_max,
+                now_ms,
+            }) {
             Some(entries) => {
                 let rows: Vec<serde_json::Value> = entries
                     .into_iter()

@@ -302,12 +302,14 @@ impl CoreLoop {
                 }
                 if let Err(e) = self.sparse.index_put_in_txn(
                     &txn,
-                    task.request.database_id.as_u64(),
-                    tid,
-                    collection,
-                    path,
-                    &stored,
-                    doc_id,
+                    crate::engine::sparse::btree_index::IndexEntryTxn {
+                        database_id: task.request.database_id.as_u64(),
+                        tenant_id: tid,
+                        collection,
+                        field: path,
+                        value: &stored,
+                        document_id: doc_id,
+                    },
                 ) {
                     return self.response_error(
                         task,

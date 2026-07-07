@@ -97,16 +97,16 @@ impl CoreLoop {
                     if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
                         continue;
                     }
-                    self.kv_engine.put(
+                    self.kv_engine.put(crate::engine::kv::KvPutParams {
                         database_id,
                         tenant_id,
-                        &collection,
-                        &key,
-                        &value,
+                        collection: &collection,
+                        key: &key,
+                        value: &value,
                         ttl_ms,
                         now_ms,
-                        nodedb_types::Surrogate::ZERO,
-                    );
+                        surrogate: nodedb_types::Surrogate::ZERO,
+                    });
                     puts += 1;
                     continue;
                 }

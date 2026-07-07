@@ -243,16 +243,16 @@ impl CoreLoop {
             } => {
                 let now_ms = current_ms();
                 if let Some(old) = prior_value {
-                    self.kv_engine.put(
-                        did,
-                        tid,
-                        &collection,
-                        &key,
-                        &old,
-                        0,
+                    self.kv_engine.put(crate::engine::kv::KvPutParams {
+                        database_id: did,
+                        tenant_id: tid,
+                        collection: &collection,
+                        key: &key,
+                        value: &old,
+                        ttl_ms: 0,
                         now_ms,
-                        nodedb_types::Surrogate::ZERO,
-                    );
+                        surrogate: nodedb_types::Surrogate::ZERO,
+                    });
                 } else {
                     self.kv_engine.delete(
                         did,
@@ -270,16 +270,16 @@ impl CoreLoop {
                 prior_value,
             } => {
                 let now_ms = current_ms();
-                self.kv_engine.put(
-                    did,
-                    tid,
-                    &collection,
-                    &key,
-                    &prior_value,
-                    0,
+                self.kv_engine.put(crate::engine::kv::KvPutParams {
+                    database_id: did,
+                    tenant_id: tid,
+                    collection: &collection,
+                    key: &key,
+                    value: &prior_value,
+                    ttl_ms: 0,
                     now_ms,
-                    nodedb_types::Surrogate::ZERO,
-                );
+                    surrogate: nodedb_types::Surrogate::ZERO,
+                });
                 Ok(())
             }
             UndoEntry::KvBatchPut {
@@ -289,16 +289,16 @@ impl CoreLoop {
                 let now_ms = current_ms();
                 for (key, prior_value) in entries {
                     if let Some(old) = prior_value {
-                        self.kv_engine.put(
-                            did,
-                            tid,
-                            &collection,
-                            &key,
-                            &old,
-                            0,
+                        self.kv_engine.put(crate::engine::kv::KvPutParams {
+                            database_id: did,
+                            tenant_id: tid,
+                            collection: &collection,
+                            key: &key,
+                            value: &old,
+                            ttl_ms: 0,
                             now_ms,
-                            nodedb_types::Surrogate::ZERO,
-                        );
+                            surrogate: nodedb_types::Surrogate::ZERO,
+                        });
                     } else {
                         self.kv_engine.delete(did, tid, &collection, &[key], now_ms);
                     }
@@ -313,27 +313,27 @@ impl CoreLoop {
                 dest_prior,
             } => {
                 let now_ms = current_ms();
-                self.kv_engine.put(
-                    did,
-                    tid,
-                    &collection,
-                    &source_key,
-                    &source_prior,
-                    0,
+                self.kv_engine.put(crate::engine::kv::KvPutParams {
+                    database_id: did,
+                    tenant_id: tid,
+                    collection: &collection,
+                    key: &source_key,
+                    value: &source_prior,
+                    ttl_ms: 0,
                     now_ms,
-                    nodedb_types::Surrogate::ZERO,
-                );
+                    surrogate: nodedb_types::Surrogate::ZERO,
+                });
                 if let Some(old) = dest_prior {
-                    self.kv_engine.put(
-                        did,
-                        tid,
-                        &collection,
-                        &dest_key,
-                        &old,
-                        0,
+                    self.kv_engine.put(crate::engine::kv::KvPutParams {
+                        database_id: did,
+                        tenant_id: tid,
+                        collection: &collection,
+                        key: &dest_key,
+                        value: &old,
+                        ttl_ms: 0,
                         now_ms,
-                        nodedb_types::Surrogate::ZERO,
-                    );
+                        surrogate: nodedb_types::Surrogate::ZERO,
+                    });
                 } else {
                     self.kv_engine
                         .delete(did, tid, &collection, &[dest_key], now_ms);
@@ -356,28 +356,28 @@ impl CoreLoop {
                 // is always Some because the forward op required the source to
                 // exist; `dest_prior` is None when the dest key was a new insert
                 // and Some(old) when it overwrote an existing row.
-                self.kv_engine.put(
-                    did,
-                    tid,
-                    &source_collection,
-                    &item_key,
-                    &source_prior,
-                    0,
+                self.kv_engine.put(crate::engine::kv::KvPutParams {
+                    database_id: did,
+                    tenant_id: tid,
+                    collection: &source_collection,
+                    key: &item_key,
+                    value: &source_prior,
+                    ttl_ms: 0,
                     now_ms,
-                    nodedb_types::Surrogate::ZERO,
-                );
+                    surrogate: nodedb_types::Surrogate::ZERO,
+                });
                 // Undo the dest write.
                 if let Some(old) = dest_prior {
-                    self.kv_engine.put(
-                        did,
-                        tid,
-                        &dest_collection,
-                        &dest_key,
-                        &old,
-                        0,
+                    self.kv_engine.put(crate::engine::kv::KvPutParams {
+                        database_id: did,
+                        tenant_id: tid,
+                        collection: &dest_collection,
+                        key: &dest_key,
+                        value: &old,
+                        ttl_ms: 0,
                         now_ms,
-                        nodedb_types::Surrogate::ZERO,
-                    );
+                        surrogate: nodedb_types::Surrogate::ZERO,
+                    });
                 } else {
                     self.kv_engine
                         .delete(did, tid, &dest_collection, &[dest_key], now_ms);

@@ -24,6 +24,18 @@ pub struct IndexEntryTxn<'a> {
     pub document_id: &'a str,
 }
 
+/// Parameters for [`SparseEngine::range_scan`].
+#[derive(Debug, Clone, Copy)]
+pub struct RangeScanParams<'a> {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub collection: &'a str,
+    pub field: &'a str,
+    pub lower: Option<&'a [u8]>,
+    pub upper: Option<&'a [u8]>,
+    pub limit: usize,
+}
+
 impl SparseEngine {
     /// Delete all secondary index entries for a document.
     ///
@@ -130,17 +142,16 @@ impl SparseEngine {
     }
 
     /// Range scan on secondary index entries.
-    #[allow(clippy::too_many_arguments)]
-    pub fn range_scan(
-        &self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        field: &str,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        limit: usize,
-    ) -> crate::Result<Vec<(String, Vec<u8>)>> {
+    pub fn range_scan(&self, params: RangeScanParams<'_>) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        let RangeScanParams {
+            database_id,
+            tenant_id,
+            collection,
+            field,
+            lower,
+            upper,
+            limit,
+        } = params;
         let prefix = format!(
             "{}{field}:",
             coll_prefix(database_id, tenant_id, collection)
@@ -228,24 +239,18 @@ impl SparseEngine {
     ///
     /// Use from the PointPut / BatchInsert apply path so document + index
     /// writes commit atomically in the same redb transaction.
-    #[allow(clippy::too_many_arguments)]
     pub fn index_put_in_txn(
         &self,
         txn: &redb::WriteTransaction,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        field: &str,
-        value: &str,
-        document_id: &str,
+        entry: IndexEntryTxn<'_>,
     ) -> crate::Result<()> {
         super::btree::with_tenant_key4(
-            database_id,
-            tenant_id,
-            collection,
-            field,
-            value,
-            document_id,
+            entry.database_id,
+            entry.tenant_id,
+            entry.collection,
+            entry.field,
+            entry.value,
+            entry.document_id,
             |key| {
                 let mut table = txn
                     .open_table(INDEXES)

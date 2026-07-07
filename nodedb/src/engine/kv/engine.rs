@@ -12,6 +12,7 @@ use nodedb_types::Surrogate;
 
 use super::batch_put::KvBatchPutParams;
 use super::engine_helpers::{expiry_prefix, table_key};
+use super::engine_write::KvPutParams;
 use super::expiry_wheel::ExpiryWheel;
 use super::hash_table::KvHashTable;
 use super::index::KvIndexSet;
@@ -284,16 +285,16 @@ impl KvEngine {
         for (i, (key, value)) in entries.iter().enumerate() {
             let surrogate = surrogates.get(i).copied().unwrap_or(Surrogate::ZERO);
             if self
-                .put(
+                .put(KvPutParams {
                     database_id,
                     tenant_id,
                     collection,
-                    key,
-                    value,
+                    key: key.as_slice(),
+                    value: value.as_slice(),
                     ttl_ms,
                     now_ms,
                     surrogate,
-                )
+                })
                 .is_none()
             {
                 new_count += 1;
@@ -511,6 +512,7 @@ impl KvEngine {
 
 #[cfg(test)]
 mod tests {
+    use super::super::engine_index::RegisterIndexParams;
     use super::*;
 
     fn now() -> u64 {
@@ -528,10 +530,28 @@ mod tests {
 
         assert!(e.get(0, 1, "cache", b"k1", n).is_none());
 
-        e.put(0, 1, "cache", b"k1", b"v1", 0, n, Surrogate::ZERO);
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "cache",
+            key: b"k1",
+            value: b"v1",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
         assert_eq!(e.get(0, 1, "cache", b"k1", n).unwrap(), b"v1");
 
-        e.put(0, 1, "cache", b"k1", b"v2", 0, n, Surrogate::ZERO);
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "cache",
+            key: b"k1",
+            value: b"v2",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
         assert_eq!(e.get(0, 1, "cache", b"k1", n).unwrap(), b"v2");
 
         assert_eq!(e.delete(0, 1, "cache", &[b"k1".to_vec()], n), 1);
@@ -544,7 +564,16 @@ mod tests {
         let n = now();
 
         // Put with 5-second TTL.
-        e.put(0, 1, "sess", b"s1", b"data", 5000, n, Surrogate::ZERO);
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sess",
+            key: b"s1",
+            value: b"data",
+            ttl_ms: 5000,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
         assert!(e.get(0, 1, "sess", b"s1", n).is_some());
 
         // Still alive at t+4999.
@@ -566,7 +595,16 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.put(0, 1, "cache", b"k", b"v", 3000, n, Surrogate::ZERO);
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "cache",
+            key: b"k",
+            value: b"v",
+            ttl_ms: 3000,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
         assert!(e.persist(0, 1, "cache", b"k"));
 
         // Should never expire now.
@@ -578,7 +616,16 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.put(0, 1, "cache", b"k", b"v", 0, n, Surrogate::ZERO);
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "cache",
+            key: b"k",
+            value: b"v",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
         assert!(e.get(0, 1, "cache", b"k", n + 100_000).is_some()); // No TTL.
 
         assert!(e.expire(0, 1, "cache", b"k", 2000, n));
@@ -668,8 +715,26 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.put(0, 1, "c", b"k", b"t1", 0, n, Surrogate::ZERO);
-        e.put(0, 2, "c", b"k", b"t2", 0, n, Surrogate::ZERO);
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k",
+            value: b"t1",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 2,
+            collection: "c",
+            key: b"k",
+            value: b"t2",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
 
         assert_eq!(e.get(0, 1, "c", b"k", n).unwrap(), b"t1");
         assert_eq!(e.get(0, 2, "c", b"k", n).unwrap(), b"t2");
@@ -683,7 +748,16 @@ mod tests {
         assert_eq!(e.total_entries(), 0);
 
         for i in 0..10u32 {
-            e.put(0, 1, "c", &i.to_be_bytes(), &[0; 32], 0, n, Surrogate::ZERO);
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "c",
+                key: &i.to_be_bytes(),
+                value: &[0; 32],
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
         }
         assert_eq!(e.total_entries(), 10);
         assert_eq!(e.collection_len(0, 1, "c"), 10);
@@ -705,39 +779,47 @@ mod tests {
         let n = now();
 
         // Insert some entries before creating the index.
-        e.put(
-            0,
-            1,
-            "sessions",
-            b"s1",
-            &mp_obj(&[("region", "us-east"), ("status", "active")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
-        e.put(
-            0,
-            1,
-            "sessions",
-            b"s2",
-            &mp_obj(&[("region", "us-east"), ("status", "inactive")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
-        e.put(
-            0,
-            1,
-            "sessions",
-            b"s3",
-            &mp_obj(&[("region", "eu-west"), ("status", "active")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            key: b"s1",
+            value: &mp_obj(&[("region", "us-east"), ("status", "active")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            key: b"s2",
+            value: &mp_obj(&[("region", "us-east"), ("status", "inactive")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            key: b"s3",
+            value: &mp_obj(&[("region", "eu-west"), ("status", "active")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
 
         // Create index with backfill.
-        let backfilled = e.register_index(0, 1, "sessions", "region", 0, true, n);
+        let backfilled = e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            field: "region",
+            field_position: 0,
+            backfill: true,
+            now_ms: n,
+        });
         assert_eq!(backfilled, 3);
 
         // Lookup by indexed field.
@@ -756,32 +838,40 @@ mod tests {
         let n = now();
 
         // Create index first (no backfill needed — empty collection).
-        e.register_index(0, 1, "c", "status", 0, false, n);
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            field: "status",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
 
         // Insert.
-        e.put(
-            0,
-            1,
-            "c",
-            b"k1",
-            &mp_obj(&[("status", "active")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k1",
+            value: &mp_obj(&[("status", "active")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
         assert_eq!(e.index_lookup_eq(0, 1, "c", "status", b"active").len(), 1);
 
         // Update: status changes.
-        e.put(
-            0,
-            1,
-            "c",
-            b"k1",
-            &mp_obj(&[("status", "inactive")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k1",
+            value: &mp_obj(&[("status", "inactive")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
         assert!(e.index_lookup_eq(0, 1, "c", "status", b"active").is_empty());
         assert_eq!(e.index_lookup_eq(0, 1, "c", "status", b"inactive").len(), 1);
     }
@@ -791,27 +881,35 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.register_index(0, 1, "c", "region", 0, false, n);
-        e.put(
-            0,
-            1,
-            "c",
-            b"k1",
-            &mp_obj(&[("region", "us")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
-        e.put(
-            0,
-            1,
-            "c",
-            b"k2",
-            &mp_obj(&[("region", "us")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            field: "region",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k1",
+            value: &mp_obj(&[("region", "us")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k2",
+            value: &mp_obj(&[("region", "us")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
 
         assert_eq!(e.index_lookup_eq(0, 1, "c", "region", b"us").len(), 2);
 
@@ -826,7 +924,16 @@ mod tests {
 
         // No indexes — PUT should work without index overhead.
         assert!(!e.has_indexes(0, 1, "c"));
-        e.put(0, 1, "c", b"k", b"raw_value", 0, n, Surrogate::ZERO);
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k",
+            value: b"raw_value",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
         assert!(e.get(0, 1, "c", b"k", n).is_some());
         assert_eq!(e.write_amp_ratio(0, 1, "c"), 0.0);
     }
@@ -836,17 +943,25 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.register_index(0, 1, "c", "status", 0, false, n);
-        e.put(
-            0,
-            1,
-            "c",
-            b"k1",
-            &mp_obj(&[("status", "active")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            field: "status",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k1",
+            value: &mp_obj(&[("status", "active")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
         assert_eq!(e.index_count(0, 1, "c"), 1);
 
         let dropped = e.drop_index(0, 1, "c", "status");
@@ -860,21 +975,37 @@ mod tests {
         let mut e = make_engine();
         let n = now();
 
-        e.register_index(0, 1, "c", "a", 0, false, n);
-        e.register_index(0, 1, "c", "b", 1, false, n);
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            field: "a",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            field: "b",
+            field_position: 1,
+            backfill: false,
+            now_ms: n,
+        });
 
         for i in 0..10u32 {
             let k = format!("k{i}");
-            e.put(
-                0,
-                1,
-                "c",
-                k.as_bytes(),
-                &mp_obj(&[("a", "x"), ("b", "y")]),
-                0,
-                n,
-                Surrogate::ZERO,
-            );
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "c",
+                key: k.as_bytes(),
+                value: &mp_obj(&[("a", "x"), ("b", "y")]),
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
         }
 
         // 10 PUTs, 2 indexes each = write amp ratio of 2.0.
@@ -891,7 +1022,16 @@ mod tests {
 
         // Warmup: insert all keys once.
         for key in &keys {
-            e.put(0, 1, "b", key, &value, 0, n, Surrogate::ZERO);
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "b",
+                key,
+                value: &value,
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
         }
 
         // Timed: 100K updates (keys already exist).
@@ -899,7 +1039,16 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..iters {
             let key = &keys[(i as usize) % 10_000];
-            e.put(0, 1, "b", key, &value, 0, n, Surrogate::ZERO);
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "b",
+                key,
+                value: &value,
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
         }
         let elapsed = start.elapsed();
         let ns_per_op = elapsed.as_nanos() / iters as u128;
@@ -928,7 +1077,16 @@ mod tests {
         let mut e = make_engine();
         let n = now();
         for i in 0..5u8 {
-            e.put(0, 1, "c", &[i], &[i * 10], 0, n, Surrogate::ZERO);
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "c",
+                key: &[i],
+                value: &[i * 10],
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
         }
 
         let (materialized, _next) = e.scan(scan_params("c", usize::MAX, n));
@@ -949,7 +1107,16 @@ mod tests {
         let mut e = make_engine();
         let n = now();
         for i in 0..10u8 {
-            e.put(0, 1, "c", &[i], &[i * 10], 0, n, Surrogate::ZERO);
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "c",
+                key: &[i],
+                value: &[i * 10],
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: Surrogate::ZERO,
+            });
         }
 
         let (materialized, _next) = e.scan(scan_params("c", 3, n));
@@ -969,37 +1136,45 @@ mod tests {
     fn scan_for_each_matches_scan_index_path() {
         let mut e = make_engine();
         let n = now();
-        e.register_index(0, 1, "sessions", "region", 0, false, n);
-        e.put(
-            0,
-            1,
-            "sessions",
-            b"s1",
-            &mp_obj(&[("region", "us-east")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
-        e.put(
-            0,
-            1,
-            "sessions",
-            b"s2",
-            &mp_obj(&[("region", "us-east")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
-        e.put(
-            0,
-            1,
-            "sessions",
-            b"s3",
-            &mp_obj(&[("region", "eu-west")]),
-            0,
-            n,
-            Surrogate::ZERO,
-        );
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            field: "region",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            key: b"s1",
+            value: &mp_obj(&[("region", "us-east")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            key: b"s2",
+            value: &mp_obj(&[("region", "us-east")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            key: b"s3",
+            value: &mp_obj(&[("region", "eu-west")]),
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
 
         let indexed_params = || KvScanParams {
             filter_field: Some("region"),
@@ -1022,8 +1197,26 @@ mod tests {
     fn scan_for_each_propagates_callback_error() {
         let mut e = make_engine();
         let n = now();
-        e.put(0, 1, "c", b"k1", b"v1", 0, n, Surrogate::ZERO);
-        e.put(0, 1, "c", b"k2", b"v2", 0, n, Surrogate::ZERO);
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k1",
+            value: b"v1",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            key: b"k2",
+            value: b"v2",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
 
         let mut seen = 0usize;
         let result = e.scan_for_each(scan_params("c", usize::MAX, n), |_k, _v| {

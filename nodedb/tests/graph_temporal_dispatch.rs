@@ -10,7 +10,7 @@
 //! edge-store surface validates the full round-trip.
 
 use nodedb::engine::graph::csr::rebuild::rebuild_sharded_from_store_as_of;
-use nodedb::engine::graph::edge_store::{Direction, EdgeRef, EdgeStore};
+use nodedb::engine::graph::edge_store::{Direction, EdgeRef, EdgeStore, NeighborsAsOfParams};
 use nodedb_types::{TenantId, ms_to_ordinal_upper};
 
 const T: TenantId = TenantId::new(1);
@@ -50,7 +50,15 @@ fn neighbors_out_as_of_none_matches_current_state() {
         .neighbors_out(0, T, COLL, "alice", Some("KNOWS"))
         .unwrap();
     let temporal_none = store
-        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), None, None)
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "alice",
+            label_filter: Some("KNOWS"),
+            system_as_of_ms: None,
+            valid_at_ms: None,
+        })
         .unwrap();
 
     assert_eq!(current.len(), 2);
@@ -70,10 +78,26 @@ fn neighbors_out_as_of_honors_system_cutoff() {
     put(&store, "alice", "KNOWS", "carol", 200);
 
     let at_150 = store
-        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(150), None)
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "alice",
+            label_filter: Some("KNOWS"),
+            system_as_of_ms: Some(150),
+            valid_at_ms: None,
+        })
         .unwrap();
     let at_250 = store
-        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(250), None)
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "alice",
+            label_filter: Some("KNOWS"),
+            system_as_of_ms: Some(250),
+            valid_at_ms: None,
+        })
         .unwrap();
 
     let dsts_150: Vec<_> = at_150.iter().map(|e| e.dst_id.as_str()).collect();
@@ -95,10 +119,26 @@ fn neighbors_out_as_of_respects_tombstone_at_cutoff() {
         .unwrap();
 
     let before = store
-        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(200), None)
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "alice",
+            label_filter: Some("KNOWS"),
+            system_as_of_ms: Some(200),
+            valid_at_ms: None,
+        })
         .unwrap();
     let after = store
-        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(400), None)
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "alice",
+            label_filter: Some("KNOWS"),
+            system_as_of_ms: Some(400),
+            valid_at_ms: None,
+        })
         .unwrap();
 
     assert_eq!(before.len(), 1);
@@ -133,16 +173,40 @@ fn neighbors_out_as_of_applies_valid_time_predicate() {
 
     // No version is valid at t=150 — hole in the valid-time coverage.
     let at_150 = store
-        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(10_000), Some(150))
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "alice",
+            label_filter: Some("KNOWS"),
+            system_as_of_ms: Some(10_000),
+            valid_at_ms: Some(150),
+        })
         .unwrap();
     assert!(at_150.is_empty(), "expected empty, got {at_150:?}");
 
     // Valid-time 50 matches v1; 250 matches v2.
     let at_50 = store
-        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(10_000), Some(50))
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "alice",
+            label_filter: Some("KNOWS"),
+            system_as_of_ms: Some(10_000),
+            valid_at_ms: Some(50),
+        })
         .unwrap();
     let at_250 = store
-        .neighbors_out_as_of(0, T, COLL, "alice", Some("KNOWS"), Some(10_000), Some(250))
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "alice",
+            label_filter: Some("KNOWS"),
+            system_as_of_ms: Some(10_000),
+            valid_at_ms: Some(250),
+        })
         .unwrap();
     assert_eq!(at_50.len(), 1);
     assert_eq!(at_250.len(), 1);
@@ -156,10 +220,26 @@ fn neighbors_in_as_of_honors_system_cutoff() {
     put(&store, "carol", "KNOWS", "bob", 200);
 
     let at_150 = store
-        .neighbors_in_as_of(0, T, COLL, "bob", Some("KNOWS"), Some(150), None)
+        .neighbors_in_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "bob",
+            label_filter: Some("KNOWS"),
+            system_as_of_ms: Some(150),
+            valid_at_ms: None,
+        })
         .unwrap();
     let at_250 = store
-        .neighbors_in_as_of(0, T, COLL, "bob", Some("KNOWS"), Some(250), None)
+        .neighbors_in_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "bob",
+            label_filter: Some("KNOWS"),
+            system_as_of_ms: Some(250),
+            valid_at_ms: None,
+        })
         .unwrap();
 
     let srcs_150: Vec<_> = at_150.iter().map(|e| e.src_id.as_str()).collect();
@@ -206,13 +286,37 @@ fn temporal_algorithm_direction_matters_across_cutoffs() {
 
     // Verify direction of the 1-hop neighbor set.
     let src_out_150 = store
-        .neighbors_out_as_of(0, T, COLL, "source", Some("R"), Some(150), None)
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "source",
+            label_filter: Some("R"),
+            system_as_of_ms: Some(150),
+            valid_at_ms: None,
+        })
         .unwrap();
     let src_out_400 = store
-        .neighbors_out_as_of(0, T, COLL, "source", Some("R"), Some(400), None)
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "source",
+            label_filter: Some("R"),
+            system_as_of_ms: Some(400),
+            valid_at_ms: None,
+        })
         .unwrap();
     let sink_out_400 = store
-        .neighbors_out_as_of(0, T, COLL, "sink", Some("R"), Some(400), None)
+        .neighbors_out_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "sink",
+            label_filter: Some("R"),
+            system_as_of_ms: Some(400),
+            valid_at_ms: None,
+        })
         .unwrap();
 
     assert_eq!(src_out_150.len(), 1);

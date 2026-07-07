@@ -23,7 +23,11 @@ pub use batch_put::KvBatchPutParams;
 pub use engine::KvEngine;
 pub use engine_atomic::{AtomicError, AtomicKeyCtx, CasResult};
 pub use engine_atomic_compute as atomic_compute;
+pub use engine_index::RegisterIndexParams;
+pub use engine_rename::RenameCollectionParams;
+pub use engine_sorted::SortedIndexRangeParams;
 pub use engine_stats::{ExpiredKey, KvStats};
+pub use engine_write::KvPutParams;
 pub use scan::KvScanParams;
 
 /// Get current wall-clock time in milliseconds since Unix epoch.

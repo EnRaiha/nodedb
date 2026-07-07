@@ -253,13 +253,15 @@ impl CoreLoop {
         let overlay = self.match_graph_overlay(task, tid);
         match crate::engine::graph::pattern::executor::execute(
             &query,
-            partition,
-            &self.edge_store,
-            frontier_bitmap,
-            is_remote_node,
-            varlen_caps,
-            &props,
-            overlay.as_ref(),
+            crate::engine::graph::pattern::executor::MatchExecCtx {
+                csr: partition,
+                edge_store: &self.edge_store,
+                frontier_bitmap,
+                is_remote_node,
+                varlen_caps,
+                props: &props,
+                overlay: overlay.as_ref(),
+            },
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
@@ -363,17 +365,19 @@ impl CoreLoop {
         // unit.
         match crate::engine::graph::pattern::executor::execute_continuation(
             &query,
-            partition,
-            &self.edge_store,
-            None, // no anchor prefilter on the resume path
-            is_remote_node,
+            crate::engine::graph::pattern::executor::MatchExecCtx {
+                csr: partition,
+                edge_store: &self.edge_store,
+                frontier_bitmap: None, // no anchor prefilter on the resume path
+                is_remote_node,
+                varlen_caps,
+                props: &props,
+                overlay: None,
+            },
             ContinuationSeed {
                 triple_idx: resume_triple_idx,
                 seed_row,
             },
-            varlen_caps,
-            &props,
-            None,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
@@ -459,14 +463,16 @@ impl CoreLoop {
         // built. Cross-shard MATCH read-your-own-writes is a separate unit.
         match crate::engine::graph::pattern::executor::execute_varlen_resume(
             &query,
-            partition,
-            &self.edge_store,
-            None, // no anchor prefilter on the resume path
-            is_remote_node,
+            crate::engine::graph::pattern::executor::MatchExecCtx {
+                csr: partition,
+                edge_store: &self.edge_store,
+                frontier_bitmap: None, // no anchor prefilter on the resume path
+                is_remote_node,
+                varlen_caps,
+                props: &props,
+                overlay: None,
+            },
             resume,
-            varlen_caps,
-            &props,
-            None,
         ) {
             Ok(outcome) => self.match_outcome_response(task, outcome),
             Err(e) => self.response_error(task, ErrorCode::from(e)),

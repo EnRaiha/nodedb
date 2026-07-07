@@ -57,45 +57,22 @@ impl CoreLoop {
         );
         let database_id = task.request.database_id.as_u64();
         let tenant = TenantId::new(tid);
+        let as_of_params = crate::engine::graph::edge_store::NeighborsAsOfParams {
+            db: database_id,
+            tid: tenant,
+            collection,
+            node: node_id,
+            label_filter: edge_label.as_deref(),
+            system_as_of_ms,
+            valid_at_ms,
+        };
         let edges_result = match direction {
-            Direction::Out => self.edge_store.neighbors_out_as_of(
-                database_id,
-                tenant,
-                collection,
-                node_id,
-                edge_label.as_deref(),
-                system_as_of_ms,
-                valid_at_ms,
-            ),
-            Direction::In => self.edge_store.neighbors_in_as_of(
-                database_id,
-                tenant,
-                collection,
-                node_id,
-                edge_label.as_deref(),
-                system_as_of_ms,
-                valid_at_ms,
-            ),
+            Direction::Out => self.edge_store.neighbors_out_as_of(as_of_params),
+            Direction::In => self.edge_store.neighbors_in_as_of(as_of_params),
             Direction::Both => {
-                let out = self.edge_store.neighbors_out_as_of(
-                    database_id,
-                    tenant,
-                    collection,
-                    node_id,
-                    edge_label.as_deref(),
-                    system_as_of_ms,
-                    valid_at_ms,
-                );
+                let out = self.edge_store.neighbors_out_as_of(as_of_params);
                 match out {
-                    Ok(mut out) => match self.edge_store.neighbors_in_as_of(
-                        database_id,
-                        tenant,
-                        collection,
-                        node_id,
-                        edge_label.as_deref(),
-                        system_as_of_ms,
-                        valid_at_ms,
-                    ) {
+                    Ok(mut out) => match self.edge_store.neighbors_in_as_of(as_of_params) {
                         Ok(inbound) => {
                             out.extend(inbound);
                             Ok(out)

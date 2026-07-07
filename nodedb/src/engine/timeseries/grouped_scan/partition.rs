@@ -73,11 +73,13 @@ pub fn aggregate_memtable(
     };
 
     Some(dispatch_grouping(
-        &resolved,
-        &col_refs,
-        &mask,
-        row_count,
-        num_aggs,
+        super::strategies::GroupedScanInputs {
+            resolved: &resolved,
+            columns: &col_refs,
+            mask: &mask,
+            row_count,
+            num_aggs,
+        },
         group_by,
         &sym_lookup,
         timestamps,
@@ -261,11 +263,13 @@ pub fn aggregate_partition(p: PartitionAggParams<'_>) -> Option<GroupedAggResult
     };
 
     let result = dispatch_grouping(
-        &resolved,
-        &col_refs,
-        &mask,
-        effective_row_count,
-        num_aggs,
+        super::strategies::GroupedScanInputs {
+            resolved: &resolved,
+            columns: &col_refs,
+            mask: &mask,
+            row_count: effective_row_count,
+            num_aggs,
+        },
         p.group_by,
         &sym_lookup,
         timestamps,

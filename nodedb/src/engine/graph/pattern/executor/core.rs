@@ -7,10 +7,28 @@ use std::collections::HashMap;
 use super::super::ast::*;
 use super::continuation;
 use super::expansion;
+use super::expansion::VarLenCaps;
 use super::predicates::PropertyLookup;
 use super::types::{BindingRow, ExecutionState, MatchOutcome, UnresolvedExpansion, VarLenResume};
 use crate::engine::graph::csr::{CsrIndex, GraphOverlayDelta};
 use crate::engine::graph::edge_store::{Direction, EdgeStore};
+
+/// Borrowed execution context shared by every MATCH entry point: the CSR
+/// index, edge store, cross-shard frontier/remote-node hooks, variable-length
+/// caps, property lookup, and the in-transaction staged-edge overlay.
+///
+/// Bundles the parameters that travel together on every `execute*` call so
+/// each entry point stays within clippy's argument budget.
+#[derive(Clone, Copy)]
+pub struct MatchExecCtx<'a> {
+    pub csr: &'a CsrIndex,
+    pub edge_store: &'a EdgeStore,
+    pub frontier_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
+    pub is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
+    pub varlen_caps: VarLenCaps,
+    pub props: &'a PropertyLookup<'a>,
+    pub overlay: Option<&'a GraphOverlayDelta>,
+}
 
 /// Execute a MATCH query on a CSR index and edge store.
 ///
@@ -38,16 +56,9 @@ use crate::engine::graph::edge_store::{Direction, EdgeStore};
 /// own staged edge writes/deletes (read-your-own-writes) via the name-keyed
 /// merge in [`super::overlay_expand`]. `None` (or an empty delta) is the
 /// autocommit path and is byte-identical to committed-CSR-only execution.
-#[allow(clippy::too_many_arguments)]
 pub fn execute<'a>(
     query: &MatchQuery,
-    csr: &CsrIndex,
-    edge_store: &EdgeStore,
-    frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
-    is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
-    varlen_caps: expansion::VarLenCaps,
-    props: &PropertyLookup<'_>,
-    overlay: Option<&GraphOverlayDelta>,
+    ctx: MatchExecCtx<'a>,
 ) -> Result<MatchOutcome, crate::Error> {
     // Optimize query before execution (reorder triples by selectivity). The
     // optimizer only REORDERS triples within a chain (it never drops one), and
@@ -55,9 +66,16 @@ pub fn execute<'a>(
     // selective and simply sorts first — every triple is still visited, so a
     // staged edge/node cannot be pruned out of the plan.
     let mut optimized = query.clone();
-    super::super::optimizer::optimize(&mut optimized, csr);
-    execute_query(
-        &optimized,
+    super::super::optimizer::optimize(&mut optimized, ctx.csr);
+    execute_query(&optimized, ctx)
+}
+
+/// Execute a pre-optimized MATCH query (internal, skip optimizer).
+fn execute_query<'a>(
+    query: &MatchQuery,
+    ctx: MatchExecCtx<'a>,
+) -> Result<MatchOutcome, crate::Error> {
+    let MatchExecCtx {
         csr,
         edge_store,
         frontier_bitmap,
@@ -65,21 +83,7 @@ pub fn execute<'a>(
         varlen_caps,
         props,
         overlay,
-    )
-}
-
-/// Execute a pre-optimized MATCH query (internal, skip optimizer).
-#[allow(clippy::too_many_arguments)]
-fn execute_query<'a>(
-    query: &MatchQuery,
-    csr: &CsrIndex,
-    edge_store: &EdgeStore,
-    frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
-    is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
-    varlen_caps: expansion::VarLenCaps,
-    props: &PropertyLookup<'_>,
-    overlay: Option<&GraphOverlayDelta>,
-) -> Result<MatchOutcome, crate::Error> {
+    } = ctx;
     let mut rows: Vec<BindingRow> = vec![HashMap::new()];
     let mut state = ExecutionState::new(is_remote_node, varlen_caps);
     // Resolve the `IN '<collection>'` scoping once against this partition's
@@ -549,13 +553,15 @@ pub(super) mod tests {
         .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -575,13 +581,15 @@ pub(super) mod tests {
         .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -599,13 +607,15 @@ pub(super) mod tests {
         ).unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -624,13 +634,15 @@ pub(super) mod tests {
         .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -647,13 +659,15 @@ pub(super) mod tests {
                 .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -670,13 +684,15 @@ pub(super) mod tests {
                 .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -703,13 +719,15 @@ pub(super) mod tests {
             super::super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -721,13 +739,15 @@ pub(super) mod tests {
                 .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -739,13 +759,15 @@ pub(super) mod tests {
             .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -760,13 +782,15 @@ pub(super) mod tests {
                 .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -779,13 +803,15 @@ pub(super) mod tests {
                 .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -829,13 +855,15 @@ pub(super) mod tests {
             super::super::super::compiler::parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            Some(&bm),
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: Some(&bm),
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -910,13 +938,15 @@ pub(super) mod tests {
         let is_remote: &dyn Fn(&str) -> bool = &|name| name == "bob";
         let outcome = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            Some(is_remote),
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: Some(is_remote),
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap();
 
@@ -978,13 +1008,15 @@ pub(super) mod tests {
         let is_remote: &dyn Fn(&str) -> bool = &|_| true;
         let outcome = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            Some(is_remote),
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: Some(is_remote),
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap();
 
@@ -1011,13 +1043,15 @@ pub(super) mod tests {
         .unwrap();
         let outcome = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap();
 
@@ -1049,13 +1083,15 @@ pub(super) mod tests {
         let is_remote: &dyn Fn(&str) -> bool = &|name| name == "mid";
         let outcome = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            Some(is_remote),
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: Some(is_remote),
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap();
 
@@ -1132,13 +1168,15 @@ pub(super) mod tests {
 
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -1168,13 +1206,15 @@ pub(super) mod tests {
         .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -1206,13 +1246,15 @@ pub(super) mod tests {
         .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -1249,13 +1291,15 @@ pub(super) mod tests {
 
         let result = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         );
         // `MatchOutcome` (the Ok type) is not `Debug`, so match on the Result
         // directly rather than `unwrap_err()`.
@@ -1333,13 +1377,15 @@ pub(super) mod tests {
 
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -1370,13 +1416,15 @@ pub(super) mod tests {
 
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -1406,13 +1454,15 @@ pub(super) mod tests {
 
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;
@@ -1450,13 +1500,15 @@ pub(super) mod tests {
 
         let result = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         );
         assert!(
             matches!(result, Err(crate::Error::BadRequest { .. })),
@@ -1485,13 +1537,15 @@ pub(super) mod tests {
 
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            expansion::VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: expansion::VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;

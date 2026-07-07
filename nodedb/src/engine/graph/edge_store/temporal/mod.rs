@@ -34,3 +34,4 @@ pub use keys::{
     is_gdpr_erasure, is_sentinel, is_tombstone, parse_versioned_edge_key, versioned_edge_key,
 };
 pub use payload::EdgeValuePayload;
+pub use query::NeighborsAsOfParams;

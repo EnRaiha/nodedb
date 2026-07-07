@@ -9,7 +9,7 @@
 //! [`execute_continuation`].
 
 use super::super::ast::{MatchQuery, PatternChain};
-use super::core::{bind_node, binding_compatible, execute_triple};
+use super::core::{MatchExecCtx, bind_node, binding_compatible, execute_triple};
 use super::expansion::{VarLenCaps, VarLenCursor, VarLenPattern, resume_variable_length};
 use super::predicates;
 use super::predicates::PropertyLookup;
@@ -160,18 +160,20 @@ pub(super) fn finalize_rows(
 /// function returns a typed `BadRequest` error for that case. The frontier is
 /// only ever emitted from the single-chain expansion path today, so this
 /// guard is defensive against a future multi-clause caller.
-#[allow(clippy::too_many_arguments)]
 pub fn execute_continuation<'a>(
     query: &MatchQuery,
-    csr: &CsrIndex,
-    edge_store: &EdgeStore,
-    frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
-    is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
+    ctx: MatchExecCtx<'a>,
     seed: ContinuationSeed,
-    varlen_caps: VarLenCaps,
-    props: &PropertyLookup<'_>,
-    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<MatchOutcome, crate::Error> {
+    let MatchExecCtx {
+        csr,
+        edge_store,
+        frontier_bitmap,
+        is_remote_node,
+        varlen_caps,
+        props,
+        overlay,
+    } = ctx;
     // Mid-pattern resume is only unambiguous for a single clause holding a
     // single pattern chain. Reject anything else with a typed error rather
     // than guessing which chain `seed.triple_idx` refers to.
@@ -266,18 +268,20 @@ pub fn execute_continuation<'a>(
 /// Per the cross-shard contract there is no `visited` carry-over: a node
 /// re-reached on resume yields a duplicate row the coordinator collapses, never
 /// a skipped or mis-depthed one.
-#[allow(clippy::too_many_arguments)]
 pub fn execute_varlen_resume<'a>(
     query: &MatchQuery,
-    csr: &CsrIndex,
-    edge_store: &EdgeStore,
-    frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
-    is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
+    ctx: MatchExecCtx<'a>,
     resume: VarLenResume,
-    varlen_caps: VarLenCaps,
-    props: &PropertyLookup<'_>,
-    overlay: Option<&GraphOverlayDelta>,
 ) -> Result<MatchOutcome, crate::Error> {
+    let MatchExecCtx {
+        csr,
+        edge_store,
+        frontier_bitmap,
+        is_remote_node,
+        varlen_caps,
+        props,
+        overlay,
+    } = ctx;
     // Same single-chain restriction as `execute_continuation`: mid-pattern
     // resume is only unambiguous for a single MATCH clause with one chain.
     let chain = match query.clauses.as_slice() {
@@ -403,6 +407,7 @@ pub fn execute_varlen_resume<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::core::MatchExecCtx;
     use super::super::core::execute;
     use super::super::core::tests::{make_csr, make_sparse, props_for};
     use super::super::expansion::{VarLenCaps, VarLenPattern, expand_variable_length};
@@ -465,13 +470,15 @@ mod tests {
         // Ground truth: single uncapped MATCH.
         let full_b: std::collections::HashSet<String> = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows
@@ -519,14 +526,16 @@ mod tests {
         while let Some(resume) = next.take() {
             let outcome = execute_varlen_resume(
                 &query,
-                &csr,
-                &store,
-                None,
-                None,
+                MatchExecCtx {
+                    csr: &csr,
+                    edge_store: &store,
+                    frontier_bitmap: None,
+                    is_remote_node: None,
+                    varlen_caps: VarLenCaps::default(),
+                    props: &props,
+                    overlay: None,
+                },
                 resume,
-                VarLenCaps::default(),
-                &props,
-                None,
             )
             .unwrap();
             for row in &outcome.rows {
@@ -567,17 +576,19 @@ mod tests {
 
         let outcome = execute_continuation(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
             ContinuationSeed {
                 triple_idx: 1,
                 seed_row: seed,
             },
-            VarLenCaps::default(),
-            &props,
-            None,
         )
         .unwrap();
 
@@ -611,17 +622,19 @@ mod tests {
 
         let outcome = execute_continuation(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
             ContinuationSeed {
                 triple_idx: 1,
                 seed_row: seed,
             },
-            VarLenCaps::default(),
-            &props,
-            None,
         )
         .unwrap();
 
@@ -646,13 +659,15 @@ mod tests {
         .unwrap();
         let rows = execute(
             &query,
-            &csr,
-            &store,
-            None,
-            None,
-            VarLenCaps::default(),
-            &props,
-            None,
+            MatchExecCtx {
+                csr: &csr,
+                edge_store: &store,
+                frontier_bitmap: None,
+                is_remote_node: None,
+                varlen_caps: VarLenCaps::default(),
+                props: &props,
+                overlay: None,
+            },
         )
         .unwrap()
         .rows;

@@ -19,31 +19,37 @@ pub(super) enum IntGroupKey {
     Multi(Vec<u64>),
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Row-level scan inputs shared by every grouping strategy: the resolved
+/// schema, per-column data, the row-selection bitmask, row count, and
+/// aggregate count. Bundled so the top-level dispatch/bucket entry points
+/// stay within clippy's argument budget.
+#[derive(Clone, Copy)]
+pub(super) struct GroupedScanInputs<'a> {
+    pub resolved: &'a ResolvedSchema,
+    pub columns: &'a [Option<&'a ColumnData>],
+    pub mask: &'a [u64],
+    pub row_count: usize,
+    pub num_aggs: usize,
+}
+
 pub(super) fn dispatch_grouping<'a>(
-    resolved: &ResolvedSchema,
-    columns: &[Option<&'a ColumnData>],
-    mask: &[u64],
-    row_count: usize,
-    num_aggs: usize,
+    inputs: GroupedScanInputs<'a>,
     group_by: &[String],
     sym_lookup: &dyn Fn(usize) -> Option<&'a nodedb_types::timeseries::SymbolDictionary>,
     timestamps: Option<&[i64]>,
     bucket_interval_ms: i64,
 ) -> GroupedAggResult {
+    let GroupedScanInputs {
+        resolved,
+        columns,
+        mask,
+        row_count,
+        num_aggs,
+    } = inputs;
     let has_bucket = bucket_interval_ms > 0 && timestamps.is_some();
 
     if has_bucket && let Some(ts) = timestamps {
-        return aggregate_with_bucket(
-            resolved,
-            columns,
-            mask,
-            row_count,
-            num_aggs,
-            ts,
-            bucket_interval_ms,
-            sym_lookup,
-        );
+        return aggregate_with_bucket(inputs, ts, bucket_interval_ms, sym_lookup);
     }
 
     let local_groups = if group_by.is_empty() {
@@ -235,17 +241,19 @@ fn aggregate_two_level(
 ///
 /// Resolves to string keys with "bucket_ts\0group1\0group2" format
 /// so `emit_grouped_results` can parse them.
-#[allow(clippy::too_many_arguments)]
 fn aggregate_with_bucket<'a>(
-    resolved: &ResolvedSchema,
-    columns: &[Option<&'a ColumnData>],
-    mask: &[u64],
-    row_count: usize,
-    num_aggs: usize,
+    inputs: GroupedScanInputs<'a>,
     timestamps: &[i64],
     bucket_interval_ms: i64,
     sym_lookup: &dyn Fn(usize) -> Option<&'a nodedb_types::timeseries::SymbolDictionary>,
 ) -> GroupedAggResult {
+    let GroupedScanInputs {
+        resolved,
+        columns,
+        mask,
+        row_count,
+        num_aggs,
+    } = inputs;
     let key_len = 1 + resolved.group_cols.len(); // bucket + group columns
 
     let mut groups: FxHashMap<Vec<u64>, Vec<AggAccum>> = FxHashMap::default();

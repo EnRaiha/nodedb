@@ -8,6 +8,16 @@
 use super::KvEngine;
 use super::engine_helpers::table_key;
 
+/// Parameters for [`KvEngine::rename_collection`].
+#[derive(Debug, Clone, Copy)]
+pub struct RenameCollectionParams<'a> {
+    pub old_database_id: u64,
+    pub new_database_id: u64,
+    pub tenant_id: u64,
+    pub old_collection: &'a str,
+    pub new_collection: &'a str,
+}
+
 impl KvEngine {
     /// Move all KV data (hash table, indexes, expiry entries, sorted indexes)
     /// from `old_collection` to `new_collection` for `tenant_id`.
@@ -16,15 +26,14 @@ impl KvEngine {
     /// used as the logical collection identifier (e.g. `"2/orders"`).
     ///
     /// Returns the number of entries migrated, or 0 if the source did not exist.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rename_collection(
-        &mut self,
-        old_database_id: u64,
-        new_database_id: u64,
-        tenant_id: u64,
-        old_collection: &str,
-        new_collection: &str,
-    ) -> usize {
+    pub fn rename_collection(&mut self, params: RenameCollectionParams<'_>) -> usize {
+        let RenameCollectionParams {
+            old_database_id,
+            new_database_id,
+            tenant_id,
+            old_collection,
+            new_collection,
+        } = params;
         let old_key = table_key(old_database_id, tenant_id, old_collection);
         let new_key = table_key(new_database_id, tenant_id, new_collection);
 

@@ -24,15 +24,17 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, %collection, %field, "kv register index");
         let now_ms = current_ms();
-        let backfilled = self.kv_engine.register_index(
-            did,
-            tid,
-            collection,
-            field,
-            field_position,
-            backfill,
-            now_ms,
-        );
+        let backfilled = self
+            .kv_engine
+            .register_index(crate::engine::kv::RegisterIndexParams {
+                database_id: did,
+                tenant_id: tid,
+                collection,
+                field,
+                field_position,
+                backfill,
+                now_ms,
+            });
         match response_codec::encode_json(&serde_json::json!({
             "index": field,
             "backfilled": backfilled,

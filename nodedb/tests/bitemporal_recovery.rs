@@ -24,6 +24,7 @@
 //!    of system-time cutoffs.
 
 use nodedb::engine::graph::edge_store::EdgeStore;
+use nodedb::engine::graph::edge_store::NeighborsAsOfParams;
 use nodedb::engine::graph::edge_store::temporal::EdgeRef;
 use nodedb_types::TenantId;
 
@@ -41,7 +42,15 @@ fn snapshot_at(store: &EdgeStore, nodes: &[&str], cutoff: i64) -> Vec<(String, S
     let mut out = Vec::new();
     for n in nodes {
         let outs = store
-            .neighbors_out_as_of(0, T, COLL, n, None, Some(cutoff), None)
+            .neighbors_out_as_of(NeighborsAsOfParams {
+                db: 0,
+                tid: T,
+                collection: COLL,
+                node: n,
+                label_filter: None,
+                system_as_of_ms: Some(cutoff),
+                valid_at_ms: None,
+            })
             .unwrap();
         for ed in outs {
             out.push((
@@ -51,7 +60,15 @@ fn snapshot_at(store: &EdgeStore, nodes: &[&str], cutoff: i64) -> Vec<(String, S
             ));
         }
         let ins = store
-            .neighbors_in_as_of(0, T, COLL, n, None, Some(cutoff), None)
+            .neighbors_in_as_of(NeighborsAsOfParams {
+                db: 0,
+                tid: T,
+                collection: COLL,
+                node: n,
+                label_filter: None,
+                system_as_of_ms: Some(cutoff),
+                valid_at_ms: None,
+            })
             .unwrap();
         for ed in ins {
             out.push((
@@ -126,7 +143,15 @@ fn ceiling_resolves_correctly_after_crash_mid_write() {
 
     // Reverse index symmetry survives reopen.
     let ins = store
-        .neighbors_in_as_of(0, T, COLL, "b", None, Some(1_000), None)
+        .neighbors_in_as_of(NeighborsAsOfParams {
+            db: 0,
+            tid: T,
+            collection: COLL,
+            node: "b",
+            label_filter: None,
+            system_as_of_ms: Some(1_000),
+            valid_at_ms: None,
+        })
         .unwrap();
     assert_eq!(ins.len(), 1, "v2 inbound to b survives reopen");
     assert_eq!(ins[0].properties, b"v2");

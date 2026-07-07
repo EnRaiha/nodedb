@@ -92,16 +92,16 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, e),
         };
 
-        self.kv_engine.put(
-            did,
-            tid,
+        self.kv_engine.put(crate::engine::kv::KvPutParams {
+            database_id: did,
+            tenant_id: tid,
             collection,
             key,
-            &computed.new_value,
-            0,
+            value: &computed.new_value,
+            ttl_ms: 0,
             now_ms,
             surrogate,
-        );
+        });
         match response_codec::encode_json(
             &serde_json::json!({ "fields_added": computed.fields_added }),
         ) {

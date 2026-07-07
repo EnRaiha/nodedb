@@ -541,7 +541,15 @@ mod tests {
         engine.index_put(0, 1, "users", "age", "035", "u3").unwrap();
         engine.index_put(0, 1, "users", "age", "040", "u4").unwrap();
         let results = engine
-            .range_scan(0, 1, "users", "age", Some(b"025"), Some(b"036"), 10)
+            .range_scan(crate::engine::sparse::btree_index::RangeScanParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "users",
+                field: "age",
+                lower: Some(b"025"),
+                upper: Some(b"036"),
+                limit: 10,
+            })
             .unwrap();
         assert_eq!(results.len(), 3);
     }

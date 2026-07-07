@@ -248,6 +248,7 @@ impl KvEngine {
 mod tests {
     use nodedb_types::Surrogate;
 
+    use super::super::engine_write::KvPutParams;
     use super::*;
 
     fn make_engine() -> KvEngine {
@@ -294,7 +295,16 @@ mod tests {
         let mut engine = make_engine();
         // Set to MAX.
         let bytes = zerompk::to_msgpack_vec(&i64::MAX).unwrap();
-        engine.put(0, 1, "counters", b"max", &bytes, 0, 1000, Surrogate::ZERO);
+        engine.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "counters",
+            key: b"max",
+            value: &bytes,
+            ttl_ms: 0,
+            now_ms: 1000,
+            surrogate: Surrogate::ZERO,
+        });
         let result = engine.incr(ctx("counters", b"max"), 1, 0);
         assert!(matches!(result, Err(AtomicError::Overflow)));
     }
@@ -303,7 +313,16 @@ mod tests {
     fn incr_type_mismatch() {
         let mut engine = make_engine();
         let bytes = zerompk::to_msgpack_vec(&"hello").unwrap();
-        engine.put(0, 1, "counters", b"str", &bytes, 0, 1000, Surrogate::ZERO);
+        engine.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "counters",
+            key: b"str",
+            value: &bytes,
+            ttl_ms: 0,
+            now_ms: 1000,
+            surrogate: Surrogate::ZERO,
+        });
         let result = engine.incr(ctx("counters", b"str"), 1, 0);
         assert!(matches!(result, Err(AtomicError::TypeMismatch { .. })));
     }
@@ -324,16 +343,16 @@ mod tests {
         let mut engine = make_engine();
         // Set key with TTL.
         let bytes = zerompk::to_msgpack_vec(&50i64).unwrap();
-        engine.put(
-            0,
-            1,
-            "counters",
-            b"temp",
-            &bytes,
-            5000,
-            1000,
-            Surrogate::ZERO,
-        );
+        engine.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "counters",
+            key: b"temp",
+            value: &bytes,
+            ttl_ms: 5000,
+            now_ms: 1000,
+            surrogate: Surrogate::ZERO,
+        });
         // Incr with ttl_ms=0 should preserve existing TTL.
         engine.incr(ctx("counters", b"temp"), 10, 0).unwrap();
         let ttl = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
@@ -360,7 +379,16 @@ mod tests {
     fn incr_float_infinity_rejected() {
         let mut engine = make_engine();
         let bytes = zerompk::to_msgpack_vec(&f64::MAX).unwrap();
-        engine.put(0, 1, "scores", b"big", &bytes, 0, 1000, Surrogate::ZERO);
+        engine.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "scores",
+            key: b"big",
+            value: &bytes,
+            ttl_ms: 0,
+            now_ms: 1000,
+            surrogate: Surrogate::ZERO,
+        });
         let result = engine.incr_float(ctx("scores", b"big"), f64::MAX);
         assert!(matches!(result, Err(AtomicError::Overflow)));
     }
@@ -379,7 +407,16 @@ mod tests {
     #[test]
     fn cas_success() {
         let mut engine = make_engine();
-        engine.put(0, 1, "state", b"p1", b"idle", 0, 1000, Surrogate::ZERO);
+        engine.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "state",
+            key: b"p1",
+            value: b"idle",
+            ttl_ms: 0,
+            now_ms: 1000,
+            surrogate: Surrogate::ZERO,
+        });
         let result = engine.cas(ctx("state", b"p1"), b"idle", b"in_match");
         assert!(result.success);
         assert_eq!(result.current_value.as_deref(), Some(b"idle".as_slice()));
@@ -390,7 +427,16 @@ mod tests {
     #[test]
     fn cas_failure() {
         let mut engine = make_engine();
-        engine.put(0, 1, "state", b"p1", b"fighting", 0, 1000, Surrogate::ZERO);
+        engine.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "state",
+            key: b"p1",
+            value: b"fighting",
+            ttl_ms: 0,
+            now_ms: 1000,
+            surrogate: Surrogate::ZERO,
+        });
         let result = engine.cas(ctx("state", b"p1"), b"idle", b"in_match");
         assert!(!result.success);
         assert_eq!(
@@ -414,16 +460,16 @@ mod tests {
     #[test]
     fn getset_existing_key() {
         let mut engine = make_engine();
-        engine.put(
-            0,
-            1,
-            "session",
-            b"tok",
-            b"old-token",
-            0,
-            1000,
-            Surrogate::ZERO,
-        );
+        engine.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "session",
+            key: b"tok",
+            value: b"old-token",
+            ttl_ms: 0,
+            now_ms: 1000,
+            surrogate: Surrogate::ZERO,
+        });
         let old = engine.getset(ctx("session", b"tok"), b"new-token");
         assert_eq!(old.as_deref(), Some(b"old-token".as_slice()));
         let val = engine.get(0, 1, "session", b"tok", 1000);
