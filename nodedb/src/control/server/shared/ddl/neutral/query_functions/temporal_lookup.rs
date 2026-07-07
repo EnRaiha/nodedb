@@ -18,6 +18,7 @@ use super::helpers::{clean_arg, empty_result, err, extract_function_args, single
 pub async fn temporal_lookup(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
@@ -36,7 +37,7 @@ pub async fn temporal_lookup(
     let time_column = clean_arg(args[4]);
 
     // Scan the table.
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &table);
+    let vshard = VShardId::from_collection_in_database(database_id, &table);
     let scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: table.clone(),
         limit: usize::MAX,
@@ -55,7 +56,7 @@ pub async fn temporal_lookup(
     let scan_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        crate::types::DatabaseId::DEFAULT,
+        database_id,
         vshard,
         scan_plan,
         TraceId::ZERO,

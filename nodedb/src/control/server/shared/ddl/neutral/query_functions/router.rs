@@ -13,6 +13,7 @@
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 
@@ -24,27 +25,28 @@ use super::super::super::result::{DdlError, DdlResult};
 pub async fn try_dispatch(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     let upper = sql.to_uppercase();
 
     if upper.contains("VERIFY_AUDIT_CHAIN") {
-        return Some(super::verify_audit_chain(state, identity, sql).await);
+        return Some(super::verify_audit_chain(state, identity, database_id, sql).await);
     }
     if upper.contains("VERIFY_HASH_CHAIN") {
-        return Some(super::verify_hash_chain(state, identity, sql).await);
+        return Some(super::verify_hash_chain(state, identity, database_id, sql).await);
     }
     if upper.contains("BALANCE_AS_OF") {
-        return Some(super::balance_as_of(state, identity, sql).await);
+        return Some(super::balance_as_of(state, identity, database_id, sql).await);
     }
     if upper.contains("TEMPORAL_LOOKUP") {
-        return Some(super::temporal_lookup(state, identity, sql).await);
+        return Some(super::temporal_lookup(state, identity, database_id, sql).await);
     }
     if upper.contains("VERIFY_BALANCE") {
-        return Some(super::verify_balance(state, identity, sql).await);
+        return Some(super::verify_balance(state, identity, database_id, sql).await);
     }
     if upper.contains("CONVERT_CURRENCY_LOOKUP") {
-        return Some(super::convert_currency_lookup(state, identity, sql).await);
+        return Some(super::convert_currency_lookup(state, identity, database_id, sql).await);
     }
 
     None

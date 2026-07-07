@@ -143,6 +143,7 @@ pub async fn upsert_document(
     let old_fields = if let Some(ref pk) = pk_for_probe {
         let row = crate::control::trigger::dml_hook::fetch_old_row(
             state,
+            database_id,
             tenant_id,
             &parsed.coll_name,
             pk,

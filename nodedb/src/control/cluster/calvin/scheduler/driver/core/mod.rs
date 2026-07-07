@@ -38,5 +38,5 @@ pub mod scheduler;
 #[cfg(test)]
 mod tests;
 
-pub use propose::propose_calvin_read_result;
+pub use propose::{CalvinReadResultProposal, propose_calvin_read_result};
 pub use scheduler::Scheduler;

@@ -123,6 +123,11 @@ impl NodeDbPgHandler {
         // --- Trigger interception for DML writes ---
         let mut dml_info = crate::control::trigger::dml_hook::classify_dml_write(&task.plan);
 
+        let database_id = self
+            .sessions
+            .get_current_database(addr)
+            .unwrap_or(crate::types::DatabaseId::DEFAULT);
+
         // Fetch OLD row and fire BEFORE/INSTEAD OF triggers if applicable.
         let old_row = if let Some(ref info) = dml_info
             && info.document_id.is_some()
@@ -135,6 +140,7 @@ impl NodeDbPgHandler {
             let doc_id = info.document_id.as_deref().unwrap_or("");
             let row = crate::control::trigger::dml_hook::fetch_old_row(
                 &self.state,
+                database_id,
                 tenant_id,
                 &info.collection,
                 doc_id,

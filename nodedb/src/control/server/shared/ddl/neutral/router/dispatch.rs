@@ -145,7 +145,7 @@ pub async fn try_dispatch(
                 return Some(result);
             }
 
-            return query_functions::try_dispatch(state, identity, sql).await;
+            return query_functions::try_dispatch(state, identity, database_id, sql).await;
         }
     };
 

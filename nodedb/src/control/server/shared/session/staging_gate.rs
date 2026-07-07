@@ -149,6 +149,7 @@ where
 
     let is_write = crate::control::wal_replication::to_replicated_entry(
         task.tenant_id,
+        task.database_id,
         task.vshard_id,
         &task.plan,
     )

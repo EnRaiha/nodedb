@@ -10,6 +10,7 @@
 pub mod decode;
 mod decode_sync_engines;
 pub mod encode;
+mod legacy_entry;
 pub mod propose;
 pub mod types;
 

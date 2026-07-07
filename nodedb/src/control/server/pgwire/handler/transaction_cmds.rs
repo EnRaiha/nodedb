@@ -182,6 +182,7 @@ impl NodeDbPgHandler {
                     for task in &buffered {
                         if let Some(entry) = crate::control::wal_replication::to_replicated_entry(
                             task.tenant_id,
+                            task.database_id,
                             task.vshard_id,
                             &task.plan,
                         ) {

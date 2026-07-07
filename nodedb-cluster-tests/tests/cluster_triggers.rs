@@ -11,7 +11,7 @@ use nodedb::control::trigger::TriggerRegistry;
 use nodedb::control::trigger::registry::DmlEvent;
 use nodedb::event::cross_shard::types::CrossShardWriteRequest;
 use nodedb::event::types::{EventSource, RowId, WriteEvent, WriteOp};
-use nodedb::types::{Lsn, TenantId, VShardId};
+use nodedb::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 use std::sync::Arc;
 
@@ -36,6 +36,7 @@ fn async_trigger_not_in_raft_log() {
     // It should contain ONLY the PointPut — no trigger side effects.
     let entry = nodedb::control::wal_replication::to_replicated_entry(
         TenantId::new(1),
+        DatabaseId::DEFAULT,
         VShardId::new(0),
         &plan,
     );
@@ -183,6 +184,7 @@ fn replicated_entry_roundtrip_point_delete() {
     });
     let entry = nodedb::control::wal_replication::to_replicated_entry(
         TenantId::new(1),
+        DatabaseId::DEFAULT,
         VShardId::new(0),
         &plan,
     )
@@ -211,6 +213,7 @@ fn read_ops_not_replicated() {
     });
     let entry = nodedb::control::wal_replication::to_replicated_entry(
         TenantId::new(1),
+        DatabaseId::DEFAULT,
         VShardId::new(0),
         &plan,
     );
@@ -237,6 +240,7 @@ fn procedure_dml_is_normal_write() {
     assert!(
         nodedb::control::wal_replication::to_replicated_entry(
             TenantId::new(1),
+            DatabaseId::DEFAULT,
             VShardId::new(0),
             &plan,
         )

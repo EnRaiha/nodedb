@@ -182,6 +182,7 @@ impl NodeDbPgHandler {
         if let Some(async_proposer) = self.state.async_raft_proposer.get()
             && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
                 task.tenant_id,
+                task.database_id,
                 task.vshard_id,
                 &task.plan,
             )

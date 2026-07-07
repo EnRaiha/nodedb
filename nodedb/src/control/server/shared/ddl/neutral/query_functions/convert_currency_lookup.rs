@@ -23,6 +23,7 @@ use super::helpers::{clean_arg, err, extract_function_args, json_to_decimal, sin
 pub async fn convert_currency_lookup(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
@@ -60,7 +61,7 @@ pub async fn convert_currency_lookup(
     let key_value = format!("{from_ccy}/{to_ccy}");
 
     // Scan rate table to find latest rate where key_column == key_value AND time_column <= as_of.
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &rate_table);
+    let vshard = VShardId::from_collection_in_database(database_id, &rate_table);
     let scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: rate_table.clone(),
         limit: usize::MAX,
@@ -79,7 +80,7 @@ pub async fn convert_currency_lookup(
     let scan_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        crate::types::DatabaseId::DEFAULT,
+        database_id,
         vshard,
         scan_plan,
         TraceId::ZERO,

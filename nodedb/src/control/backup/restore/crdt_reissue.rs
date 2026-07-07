@@ -62,10 +62,15 @@ async fn reissue_crdt_collection(
     });
 
     if let Some(proposer) = state.async_raft_proposer.get() {
-        let entry = crate::control::wal_replication::to_replicated_entry(tenant_id, vshard, &plan)
-            .ok_or_else(|| Error::Internal {
-                detail: "restore reissue: crdt import did not map to a replicated write".into(),
-            })?;
+        let entry = crate::control::wal_replication::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard,
+            &plan,
+        )
+        .ok_or_else(|| Error::Internal {
+            detail: "restore reissue: crdt import did not map to a replicated write".into(),
+        })?;
         crate::control::wal_replication::propose_replicated_entry(state, proposer, entry).await?;
         return Ok(());
     }

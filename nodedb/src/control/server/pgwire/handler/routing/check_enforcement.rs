@@ -46,6 +46,7 @@ impl NodeDbPgHandler {
         &self,
         sql: &str,
         tenant_id: TenantId,
+        database_id: DatabaseId,
     ) -> PgWireResult<()> {
         let Some((coll_name, is_insert)) = extract_collection_from_sql(sql) else {
             return Ok(());
@@ -53,8 +54,7 @@ impl NodeDbPgHandler {
 
         // Look up collection and its CHECK constraints.
         let catalog = self.state.credentials.catalog();
-        let coll = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &coll_name)
-        {
+        let coll = match catalog.get_collection(database_id, tenant_id.as_u64(), &coll_name) {
             Ok(Some(c)) => c,
             _ => return Ok(()),
         };
@@ -77,6 +77,7 @@ impl NodeDbPgHandler {
         if !is_insert && let Some(doc_id) = extract_where_id(sql) {
             let old = crate::control::trigger::dml_hook::fetch_old_row(
                 &self.state,
+                database_id,
                 tenant_id,
                 &coll_name,
                 &doc_id,
@@ -108,14 +109,14 @@ impl NodeDbPgHandler {
         &self,
         sql: &str,
         tenant_id: crate::types::TenantId,
+        database_id: DatabaseId,
     ) -> PgWireResult<()> {
         let Some((coll_name, is_insert)) = extract_collection_from_sql(sql) else {
             return Ok(());
         };
 
         let catalog = self.state.credentials.catalog();
-        let coll = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &coll_name)
-        {
+        let coll = match catalog.get_collection(database_id, tenant_id.as_u64(), &coll_name) {
             Ok(Some(c)) => c,
             _ => return Ok(()),
         };

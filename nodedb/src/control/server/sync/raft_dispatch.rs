@@ -110,8 +110,11 @@ pub async fn dispatch_sync_response(
     trace_id: TraceId,
     event_source: EventSource,
 ) -> crate::Result<Response> {
+    // The sync inbound envelope carries no session database yet (see
+    // `dispatch_sync_bytes` below), so this path is scoped to the default
+    // database, same as its local-fallback branch a few lines down.
     if let Some(proposer) = state.async_raft_proposer.get()
-        && let Some(entry) = to_replicated_entry(tenant_id, vshard_id, &plan)
+        && let Some(entry) = to_replicated_entry(tenant_id, DatabaseId::DEFAULT, vshard_id, &plan)
     {
         let payload = propose_sync_write(state, entry, proposer).await?;
         let request_id = state.next_request_id();
@@ -239,7 +242,7 @@ pub async fn dispatch_write_replicated(
     let vshard_id = VShardId::from_collection_in_database(database_id, collection);
 
     if let Some(proposer) = state.async_raft_proposer.get()
-        && let Some(entry) = to_replicated_entry(tenant_id, vshard_id, &plan)
+        && let Some(entry) = to_replicated_entry(tenant_id, database_id, vshard_id, &plan)
     {
         return propose_sync_write(state, entry, proposer).await;
     }

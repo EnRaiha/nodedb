@@ -153,6 +153,7 @@ pub async fn reconcile_once(
         let vshard_id = nodedb_cluster::routing::vshard_for_collection(database_id, &stored.name);
         let entry = ReplicatedEntry::new(
             stored.tenant_id,
+            database_id.as_u64(),
             vshard_id,
             ReplicatedWrite::ConstraintChange {
                 collection: stored.name.clone(),

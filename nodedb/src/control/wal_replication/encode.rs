@@ -4,7 +4,7 @@
 
 use super::types::{ReplicatedBatchEdge, ReplicatedEntry, ReplicatedWrite};
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{TenantId, VShardId};
+use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{
     ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, SpatialOp, TextOp, TimeseriesOp, VectorOp,
 };
@@ -27,6 +27,7 @@ fn encode_provenance(
 
 pub fn to_replicated_entry(
     tenant_id: TenantId,
+    database_id: DatabaseId,
     vshard_id: VShardId,
     plan: &PhysicalPlan,
 ) -> Option<ReplicatedEntry> {
@@ -602,6 +603,7 @@ pub fn to_replicated_entry(
 
     Some(ReplicatedEntry::new(
         tenant_id.as_u64(),
+        database_id.as_u64(),
         vshard_id.as_u32(),
         write,
     ))

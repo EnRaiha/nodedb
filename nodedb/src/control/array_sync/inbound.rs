@@ -314,7 +314,14 @@ impl OriginArrayInbound {
             snapshot_payload: msg.snapshot_payload.clone(),
             schema_hlc_bytes: hlc_arr,
         };
-        let entry = ReplicatedEntry::new(self.tenant_id.as_u64(), vshard_id.as_u32(), write);
+        // Array sync is single-database (an edge maps to one embedded DB), so
+        // replicated array schema binds under the default database.
+        let entry = ReplicatedEntry::new(
+            self.tenant_id.as_u64(),
+            crate::types::DatabaseId::DEFAULT.as_u64(),
+            vshard_id.as_u32(),
+            write,
+        );
 
         match self.propose_and_await(entry, &msg.array, remote_hlc).await {
             Ok(()) => Ok(InboundOutcome::SchemaImported),
@@ -454,7 +461,14 @@ impl OriginArrayInbound {
                 .and_then(|p| zerompk::to_msgpack_vec(p).ok()),
         };
         let vshard = self.vshard_for_op(&op);
-        let entry = ReplicatedEntry::new(self.tenant_id.as_u64(), vshard.as_u32(), write);
+        // Array sync is single-database (an edge maps to one embedded DB), so
+        // replicated array ops bind under the default database.
+        let entry = ReplicatedEntry::new(
+            self.tenant_id.as_u64(),
+            crate::types::DatabaseId::DEFAULT.as_u64(),
+            vshard.as_u32(),
+            write,
+        );
 
         match self
             .propose_and_await(entry, &op.header.array, op.header.hlc)

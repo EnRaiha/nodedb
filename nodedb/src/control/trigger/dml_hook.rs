@@ -268,6 +268,7 @@ pub fn patch_task_with_mutated_fields(
 /// Returns an empty map if the document doesn't exist or can't be read.
 pub async fn fetch_old_row(
     state: &SharedState,
+    database_id: DatabaseId,
     tenant_id: TenantId,
     collection: &str,
     document_id: &str,
@@ -275,12 +276,7 @@ pub async fn fetch_old_row(
     let pk_bytes = document_id.as_bytes().to_vec();
     let surrogate = state
         .surrogate_assigner
-        .lookup(
-            crate::types::DatabaseId::DEFAULT,
-            tenant_id,
-            collection,
-            &pk_bytes,
-        )
+        .lookup(database_id, tenant_id, collection, &pk_bytes)
         .ok()
         .flatten()
         .unwrap_or(nodedb_types::Surrogate::ZERO);
@@ -298,7 +294,7 @@ pub async fn fetch_old_row(
     let resp = match crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         vshard_id,
         plan,
         TraceId::ZERO,

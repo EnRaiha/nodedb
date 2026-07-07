@@ -172,18 +172,18 @@ impl NodeDbPgHandler {
         self.query_ctx
             .set_shuffle_agg_threshold(shuffle_agg_threshold);
 
-        // Enforce general CHECK constraints for INSERT/UPDATE before planning.
-        self.enforce_check_constraints_if_needed(&clean_sql, tenant_id)
-            .await?;
-
-        // Validate enum-typed column values for INSERT/UPDATE before planning.
-        self.enforce_enum_labels_if_needed(&clean_sql, tenant_id)
-            .await?;
-
         let database_id = self
             .sessions
             .get_current_database(addr)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
+
+        // Enforce general CHECK constraints for INSERT/UPDATE before planning.
+        self.enforce_check_constraints_if_needed(&clean_sql, tenant_id, database_id)
+            .await?;
+
+        // Validate enum-typed column values for INSERT/UPDATE before planning.
+        self.enforce_enum_labels_if_needed(&clean_sql, tenant_id, database_id)
+            .await?;
 
         // A session-level `nodedb.broadcast_threshold_bytes` override changes the
         // auto-shuffle decision the same way force-shuffle does, and the cache
@@ -326,8 +326,13 @@ impl NodeDbPgHandler {
 /// Determine read consistency for a set of tasks.
 pub(super) fn consistency_for_tasks(tasks: &[PhysicalTask]) -> crate::types::ReadConsistency {
     let has_writes = tasks.iter().any(|t| {
-        crate::control::wal_replication::to_replicated_entry(t.tenant_id, t.vshard_id, &t.plan)
-            .is_some()
+        crate::control::wal_replication::to_replicated_entry(
+            t.tenant_id,
+            t.database_id,
+            t.vshard_id,
+            &t.plan,
+        )
+        .is_some()
     });
 
     if has_writes {

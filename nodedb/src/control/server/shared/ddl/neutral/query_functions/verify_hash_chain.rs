@@ -19,6 +19,7 @@ use super::helpers::{err, extract_function_args, single_result};
 pub async fn verify_hash_chain(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
@@ -34,7 +35,7 @@ pub async fn verify_hash_chain(
         .to_lowercase();
 
     // Scan all documents.
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let vshard = VShardId::from_collection_in_database(database_id, &collection);
     let scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: collection.clone(),
         limit: usize::MAX,
@@ -53,7 +54,7 @@ pub async fn verify_hash_chain(
     let scan_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        crate::types::DatabaseId::DEFAULT,
+        database_id,
         vshard,
         scan_plan,
         TraceId::ZERO,

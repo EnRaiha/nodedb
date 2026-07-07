@@ -315,13 +315,18 @@ pub async fn reissue_timeseries_durably(
     let vshard = VShardId::from_collection_in_database(database_id, collection);
 
     if let Some(proposer) = state.async_raft_proposer.get() {
-        let entry = crate::control::wal_replication::to_replicated_entry(tenant_id, vshard, &plan)
-            .ok_or_else(|| Error::Internal {
-                detail: format!(
-                    "restore reissue: timeseries plan for '{collection}' did not map to a \
+        let entry = crate::control::wal_replication::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard,
+            &plan,
+        )
+        .ok_or_else(|| Error::Internal {
+            detail: format!(
+                "restore reissue: timeseries plan for '{collection}' did not map to a \
                      replicated write"
-                ),
-            })?;
+            ),
+        })?;
         crate::control::wal_replication::propose_replicated_entry(state, proposer, entry).await?;
         return Ok(());
     }

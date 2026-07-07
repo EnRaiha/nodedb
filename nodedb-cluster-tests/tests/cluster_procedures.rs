@@ -34,6 +34,7 @@ fn procedure_dml_creates_replicated_entry() {
     });
     let entry = nodedb::control::wal_replication::to_replicated_entry(
         TenantId::new(1),
+        DatabaseId::DEFAULT,
         VShardId::new(0),
         &plan,
     );
@@ -58,6 +59,7 @@ fn procedure_reads_not_replicated() {
     });
     let entry = nodedb::control::wal_replication::to_replicated_entry(
         TenantId::new(1),
+        DatabaseId::DEFAULT,
         VShardId::new(0),
         &plan,
     );
@@ -111,6 +113,7 @@ fn tx_ctx_commit_yields_independent_tasks() {
         assert!(
             nodedb::control::wal_replication::to_replicated_entry(
                 task.tenant_id,
+                task.database_id,
                 task.vshard_id,
                 &task.plan,
             )

@@ -21,6 +21,7 @@ use super::helpers::{
 pub async fn balance_as_of(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
@@ -40,11 +41,11 @@ pub async fn balance_as_of(
     let as_of_secs = parse_timestamp_secs(&as_of_str)?;
 
     // Read current balance from the target document.
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let vshard = VShardId::from_collection_in_database(database_id, &collection);
     let pk_bytes = key.as_bytes().to_vec();
     let surrogate = state
         .surrogate_assigner
-        .lookup(DatabaseId::DEFAULT, tenant_id, &collection, &pk_bytes)
+        .lookup(database_id, tenant_id, &collection, &pk_bytes)
         .map_err(|e| err("XX000", &format!("surrogate lookup failed: {e}")))?
         .unwrap_or(nodedb_types::Surrogate::ZERO);
     let get_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
@@ -60,7 +61,7 @@ pub async fn balance_as_of(
     let get_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        crate::types::DatabaseId::DEFAULT,
+        database_id,
         vshard,
         get_plan,
         TraceId::ZERO,
@@ -79,7 +80,7 @@ pub async fn balance_as_of(
     // Find materialized sum definitions to know the source collection and value_expr.
     let catalog = state.credentials.catalog();
     let coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
+        .get_collection(database_id, tenant_id.as_u64(), &collection)
         .map_err(|e| err("XX000", &e.to_string()))?
         .ok_or_else(|| err("42P01", &format!("collection '{collection}' not found")))?;
 
@@ -93,7 +94,7 @@ pub async fn balance_as_of(
 
     // Scan the source collection for rows where join_column = key AND created_at > as_of.
     let source_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, &mat_def.source_collection);
+        VShardId::from_collection_in_database(database_id, &mat_def.source_collection);
     let source_scan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: mat_def.source_collection.clone(),
         limit: usize::MAX,
@@ -112,7 +113,7 @@ pub async fn balance_as_of(
     let source_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        crate::types::DatabaseId::DEFAULT,
+        database_id,
         source_vshard,
         source_scan,
         TraceId::ZERO,

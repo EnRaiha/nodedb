@@ -256,8 +256,12 @@ impl LocalPlanExecutor {
                 .unwrap_or(0),
         );
         if let Some(proposer) = self.state.async_raft_proposer.get()
-            && let Some(entry) =
-                crate::control::wal_replication::to_replicated_entry(tenant_id, vshard_id, &plan)
+            && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
+                tenant_id,
+                database_id,
+                vshard_id,
+                &plan,
+            )
         {
             return match crate::control::wal_replication::propose_replicated_entry(
                 &self.state,

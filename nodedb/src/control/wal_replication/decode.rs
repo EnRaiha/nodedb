@@ -39,10 +39,9 @@ pub fn from_replicated_entry(
         _ => {}
     }
     let tenant_id = TenantId::new(entry.tenant_id);
-    // Replicated entries do not carry a database id on the wire; surrogate
-    // identity for these follower-local binds is scoped to the default
-    // database and the entry's tenant.
-    let database_id = DatabaseId::DEFAULT;
+    // `0` decodes to `DatabaseId::DEFAULT` — the same convention used for
+    // entries that pre-date the field (see `LegacyReplicatedEntry`).
+    let database_id = DatabaseId::new(entry.database_id);
     let plan = to_physical_plan(&entry.write, database_id, tenant_id, assigner)?;
     Ok(Some((tenant_id, VShardId::new(entry.vshard_id), plan)))
 }

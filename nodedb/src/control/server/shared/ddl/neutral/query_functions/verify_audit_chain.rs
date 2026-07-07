@@ -11,6 +11,7 @@
 use crate::control::security::audit::entry::hash_entry;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::helpers::{clean_arg, err, extract_function_args, single_result};
@@ -20,9 +21,14 @@ use super::helpers::{clean_arg, err, extract_function_args, single_result};
 /// Reads audit entries from the durable audit WAL (or in-memory cache),
 /// verifies the hash chain over the specified sequence range, and returns
 /// `{valid: true/false, entries: N, broken_at_seq: N}`.
+///
+/// The audit chain is a single node-wide sequence, not scoped per database,
+/// so `database_id` is accepted for call-site uniformity with the other
+/// query functions but is not used to filter entries here.
 pub async fn verify_audit_chain(
     state: &SharedState,
     _identity: &AuthenticatedIdentity,
+    _database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let args = extract_function_args(sql, "VERIFY_AUDIT_CHAIN")?;

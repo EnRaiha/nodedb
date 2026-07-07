@@ -23,6 +23,7 @@ use super::helpers::{clean_arg, err, extract_function_args, json_to_decimal, sin
 pub async fn verify_balance(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
@@ -37,7 +38,7 @@ pub async fn verify_balance(
     // Find the materialized sum definition.
     let catalog = state.credentials.catalog();
     let coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
+        .get_collection(database_id, tenant_id.as_u64(), &collection)
         .map_err(|e| err("XX000", &e.to_string()))?
         .ok_or_else(|| err("42P01", &format!("collection '{collection}' not found")))?;
 
@@ -53,7 +54,7 @@ pub async fn verify_balance(
     };
 
     // Scan all target rows.
-    let target_vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let target_vshard = VShardId::from_collection_in_database(database_id, &collection);
     let target_scan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: collection.clone(),
         limit: usize::MAX,
@@ -71,7 +72,7 @@ pub async fn verify_balance(
     let target_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        crate::types::DatabaseId::DEFAULT,
+        database_id,
         target_vshard,
         target_scan,
         TraceId::ZERO,
@@ -85,7 +86,7 @@ pub async fn verify_balance(
 
     // Scan all source rows.
     let source_vshard =
-        VShardId::from_collection_in_database(DatabaseId::DEFAULT, &mat_def.source_collection);
+        VShardId::from_collection_in_database(database_id, &mat_def.source_collection);
     let source_scan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: mat_def.source_collection.clone(),
         limit: usize::MAX,
@@ -103,7 +104,7 @@ pub async fn verify_balance(
     let source_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        crate::types::DatabaseId::DEFAULT,
+        database_id,
         source_vshard,
         source_scan,
         TraceId::ZERO,
