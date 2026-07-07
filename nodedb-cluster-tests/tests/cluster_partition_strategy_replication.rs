@@ -17,8 +17,7 @@ use nodedb_types::{DatabaseId, PartitionStrategy};
 use common::cluster_harness::{TestCluster, TestClusterNode};
 
 fn get_partition_strategy(node: &TestClusterNode, name: &str) -> Option<PartitionStrategy> {
-    let cat_opt = node.shared.credentials.catalog();
-    let cat = cat_opt.as_ref()?;
+    let cat = node.shared.credentials.catalog();
     let coll = cat
         .get_collection(DatabaseId::DEFAULT, 1, name)
         .ok()

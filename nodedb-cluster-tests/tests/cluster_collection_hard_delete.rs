@@ -21,10 +21,7 @@ use std::time::Duration;
 use common::cluster_harness::{TestCluster, TestClusterNode};
 
 fn catalog_has_collection(node: &TestClusterNode, name: &str) -> bool {
-    let cat_opt = node.shared.credentials.catalog();
-    let Some(cat) = cat_opt.as_ref() else {
-        return false;
-    };
+    let cat = node.shared.credentials.catalog();
     match cat.get_collection(nodedb_types::DatabaseId::DEFAULT, 1, name) {
         Ok(Some(c)) => c.is_active,
         _ => false,
@@ -32,10 +29,7 @@ fn catalog_has_collection(node: &TestClusterNode, name: &str) -> bool {
 }
 
 fn has_tombstone(node: &TestClusterNode, name: &str) -> bool {
-    let cat_opt = node.shared.credentials.catalog();
-    let Some(cat) = cat_opt.as_ref() else {
-        return false;
-    };
+    let cat = node.shared.credentials.catalog();
     cat.load_wal_tombstones()
         .map(|set| {
             set.iter()

@@ -56,11 +56,11 @@ fn document_descriptor(name: &str) -> CollectionDescriptor {
 async fn await_collection(node: &TestClusterNode, name: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let found = node.shared.credentials.catalog().as_ref().and_then(|c| {
-            c.get_collection(DatabaseId::DEFAULT, TENANT, name)
-                .ok()
-                .flatten()
-        });
+        let c = node.shared.credentials.catalog();
+        let found = c
+            .get_collection(DatabaseId::DEFAULT, TENANT, name)
+            .ok()
+            .flatten();
         if found.is_some() {
             return;
         }

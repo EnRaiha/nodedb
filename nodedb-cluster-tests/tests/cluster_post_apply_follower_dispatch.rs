@@ -46,10 +46,7 @@ fn pick_follower_index(cluster: &TestCluster) -> usize {
 /// Tombstone tuples `(tenant_id, collection, purge_lsn)` currently
 /// persisted in this node's `_system.wal_tombstones`.
 fn follower_tombstones(node: &common::cluster_harness::TestClusterNode) -> Vec<(u64, String, u64)> {
-    let catalog_opt = node.shared.credentials.catalog();
-    let catalog = catalog_opt
-        .as_ref()
-        .expect("cluster node must have a persistent system catalog");
+    let catalog = node.shared.credentials.catalog();
     catalog
         .load_wal_tombstones()
         .expect("load_wal_tombstones")
@@ -72,8 +69,7 @@ async fn async_dispatch_fires_on_follower_for_put_and_purge() {
         .expect("CREATE COLLECTION");
 
     for node in &cluster.nodes {
-        let catalog_opt = node.shared.credentials.catalog();
-        let catalog = catalog_opt.as_ref().expect("catalog on every node");
+        let catalog = node.shared.credentials.catalog();
         let coll = catalog
             .get_collection(
                 nodedb_types::DatabaseId::DEFAULT,

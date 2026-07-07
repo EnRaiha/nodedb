@@ -40,7 +40,7 @@ fn surrogate_for_pk(
     collection: &str,
     pk: &str,
 ) -> Option<u32> {
-    let catalog = shared.credentials.catalog().as_ref()?;
+    let catalog = shared.credentials.catalog();
     catalog
         .get_surrogate_for_pk(
             DatabaseId::DEFAULT,

@@ -40,8 +40,8 @@ fn catalog_hwm(shared: &std::sync::Arc<nodedb::control::state::SharedState>) -> 
     shared
         .credentials
         .catalog()
-        .as_ref()
-        .and_then(|c| c.get_surrogate_hwm().ok())
+        .get_surrogate_hwm()
+        .ok()
         .unwrap_or(0)
 }
 

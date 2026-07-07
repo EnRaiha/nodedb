@@ -38,12 +38,9 @@ fn coll_fields(
     node.shared
         .credentials
         .catalog()
-        .as_ref()
-        .and_then(|c| {
-            c.get_collection(DatabaseId::DEFAULT, TENANT, name)
-                .ok()
-                .flatten()
-        })
+        .get_collection(DatabaseId::DEFAULT, TENANT, name)
+        .ok()
+        .flatten()
         .map(|c| (c.bitemporal, c.declared_primary_key))
 }
 

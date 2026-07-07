@@ -61,9 +61,7 @@ fn read_catalog_surrogates(
     shared: &std::sync::Arc<nodedb::control::state::SharedState>,
     collection: &str,
 ) -> Vec<(String, u32)> {
-    let Some(catalog) = shared.credentials.catalog() else {
-        return Vec::new();
-    };
+    let catalog = shared.credentials.catalog();
     catalog
         .scan_surrogates_for_collection(DatabaseId::DEFAULT, TenantId::new(1), collection)
         .unwrap_or_default()
