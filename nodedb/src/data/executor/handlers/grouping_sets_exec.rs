@@ -25,23 +25,41 @@ use nodedb_query::msgpack_scan;
 /// Hidden column name carrying the grouping bitmask for `GROUPING()` support.
 pub const GROUPING_ID_COL: &str = "__grouping_id";
 
+/// Borrowed inputs to [`execute_grouping_sets`]: the target collection, the
+/// GROUP BY / aggregate / filter / HAVING specs, and the expanded grouping
+/// sets to union results over.
+pub(super) struct GroupingSetsParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub group_by: &'a [String],
+    pub aggregates: &'a [AggregateSpec],
+    pub filters: &'a [u8],
+    pub having: &'a [u8],
+    pub limit: usize,
+    pub grouping_sets: &'a [Vec<u32>],
+}
+
 /// Execute a multi-set aggregate (ROLLUP / CUBE / GROUPING SETS).
 ///
 /// Scans the collection once per grouping set, computes aggregates using only
 /// the keys active in that set, NULL-fills the absent keys, and unions rows.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn execute_grouping_sets(
     core: &mut CoreLoop,
-    task: &ExecutionTask,
-    tid: u64,
-    collection: &str,
-    group_by: &[String],
-    aggregates: &[AggregateSpec],
-    filters: &[u8],
-    having: &[u8],
-    limit: usize,
-    grouping_sets: &[Vec<u32>],
+    params: GroupingSetsParams<'_>,
 ) -> Response {
+    let GroupingSetsParams {
+        task,
+        tid,
+        collection,
+        group_by,
+        aggregates,
+        filters,
+        having,
+        limit,
+        grouping_sets,
+    } = params;
+
     let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
         Vec::new()
     } else {

@@ -26,6 +26,18 @@ pub(in crate::data::executor) type AccumulatedGroups = (
     HashMap<String, HashMap<String, GroupState>>,
 );
 
+/// Borrowed inputs to [`CoreLoop::accumulate_groups`]: the doc set, the outer
+/// GROUP BY / aggregate specs, the WHERE-filter bytes, and the optional
+/// sub-grouping specs.
+pub(in crate::data::executor) struct AccumulateGroupsParams<'a> {
+    pub docs: &'a [(String, Vec<u8>)],
+    pub group_by: &'a [GroupKeySpec],
+    pub aggregates: &'a [AggregateSpec],
+    pub filters: &'a [u8],
+    pub sub_group_by: &'a [String],
+    pub sub_aggregates: &'a [AggregateSpec],
+}
+
 impl CoreLoop {
     /// Accumulate `docs` into a consolidated `HashMap<group_key, GroupState>`
     /// (and, when `sub_*` are non-empty, a nested sub-group map).
@@ -39,16 +51,18 @@ impl CoreLoop {
     /// string) is the same one the finalize split logic parses back, and the
     /// same one the distributed-shuffle producer/consumer rely on for
     /// byte-identical merge keys.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn accumulate_groups(
         &mut self,
-        docs: &[(String, Vec<u8>)],
-        group_by: &[GroupKeySpec],
-        aggregates: &[AggregateSpec],
-        filters: &[u8],
-        sub_group_by: &[String],
-        sub_aggregates: &[AggregateSpec],
+        params: AccumulateGroupsParams<'_>,
     ) -> crate::Result<AccumulatedGroups> {
+        let AccumulateGroupsParams {
+            docs,
+            group_by,
+            aggregates,
+            filters,
+            sub_group_by,
+            sub_aggregates,
+        } = params;
         let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
             Vec::new()
         } else {

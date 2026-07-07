@@ -16,9 +16,9 @@
 //! partial-state producer), and `shuffle_merge` (the partial-state consumer).
 
 mod cache_key;
-mod exec;
+pub(in crate::data::executor) mod exec;
 mod invalidate;
 mod rows;
-mod shuffle_merge;
-mod state_emit;
+pub(in crate::data::executor) mod shuffle_merge;
+pub(in crate::data::executor) mod state_emit;
 mod streaming;

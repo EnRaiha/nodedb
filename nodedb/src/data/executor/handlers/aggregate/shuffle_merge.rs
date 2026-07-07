@@ -100,20 +100,36 @@ pub(in crate::data::executor) fn merge_state_frames(
     Ok(merged)
 }
 
+/// Borrowed inputs to [`CoreLoop::execute_shuffle_aggregate`]: the staged
+/// partial-state frame path plus the GROUP BY / aggregate / HAVING / sort
+/// specs needed to merge and finalize it.
+pub(in crate::data::executor) struct ShuffleAggregateParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub state_path: &'a str,
+    pub group_by: &'a [GroupKeySpec],
+    pub aggregates: &'a [AggregateSpec],
+    pub having: &'a [u8],
+    pub limit: usize,
+    pub sort_keys: &'a [(String, bool)],
+}
+
 impl CoreLoop {
     /// Execute a `ShuffleAggregateConsume`: merge the staged partial states,
     /// then finalize / HAVING / sort / LIMIT via the shared finalize tail.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_shuffle_aggregate(
         &mut self,
-        task: &ExecutionTask,
-        state_path: &str,
-        group_by: &[GroupKeySpec],
-        aggregates: &[AggregateSpec],
-        having: &[u8],
-        limit: usize,
-        sort_keys: &[(String, bool)],
+        params: ShuffleAggregateParams<'_>,
     ) -> Response {
+        let ShuffleAggregateParams {
+            task,
+            state_path,
+            group_by,
+            aggregates,
+            having,
+            limit,
+            sort_keys,
+        } = params;
+
         let merged = match merge_state_frames(Path::new(state_path), group_by, aggregates) {
             Ok(m) => m,
             Err(e) => {
@@ -127,17 +143,17 @@ impl CoreLoop {
         };
 
         // Plain GROUP BY: no sub-groups in the shuffle path.
-        match self.finalize_groups(
-            merged,
-            HashMap::new(),
+        match self.finalize_groups(super::streaming::finalize::FinalizeGroupsParams {
+            groups: merged,
+            sub_groups: HashMap::new(),
             group_by,
             aggregates,
             having,
             limit,
-            &[],
-            &[],
+            sub_group_by: &[],
+            sub_aggregates: &[],
             sort_keys,
-        ) {
+        }) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,

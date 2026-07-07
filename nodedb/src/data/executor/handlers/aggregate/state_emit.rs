@@ -29,22 +29,37 @@ use nodedb_types::Value;
 /// producer-emitted row. The consume side looks this exact key up.
 pub(in crate::data::executor) const AGG_STATE_FIELD: &str = "__agg_state";
 
+/// Borrowed inputs to [`CoreLoop::execute_partial_aggregate_state`]: the
+/// source-doc selector (sub-plan or named collection) plus the GROUP BY /
+/// aggregate / filter specs the producer accumulates over.
+pub(in crate::data::executor) struct PartialAggregateStateParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub input: Option<&'a nodedb_physical::physical_plan::PhysicalPlan>,
+    pub group_by: &'a [GroupKeySpec],
+    pub aggregates: &'a [AggregateSpec],
+    pub filters: &'a [u8],
+}
+
 impl CoreLoop {
     /// Execute a `PartialAggregateState` producer: acquire the source documents
     /// (the `input` sub-plan's rows when present, else a per-shard scan of the
     /// named `collection`), accumulate them, then emit one serialized
     /// partial-state row per group.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_partial_aggregate_state(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        input: Option<&nodedb_physical::physical_plan::PhysicalPlan>,
-        group_by: &[GroupKeySpec],
-        aggregates: &[AggregateSpec],
-        filters: &[u8],
+        params: PartialAggregateStateParams<'_>,
     ) -> Response {
+        let PartialAggregateStateParams {
+            task,
+            tid,
+            collection,
+            input,
+            group_by,
+            aggregates,
+            filters,
+        } = params;
         // Input-sourced producer (catalog): the rows come from executing the
         // sub-plan (a coordinator-materialized `ProviderScan`), not from a
         // per-shard collection scan. Decode the sub-plan rows the SAME way
@@ -77,7 +92,14 @@ impl CoreLoop {
 
         // Plain GROUP BY: no sub-groups for the shuffle producer.
         let (groups, _sub) =
-            match self.accumulate_groups(&docs, group_by, aggregates, filters, &[], &[]) {
+            match self.accumulate_groups(super::streaming::accumulate::AccumulateGroupsParams {
+                docs: &docs,
+                group_by,
+                aggregates,
+                filters,
+                sub_group_by: &[],
+                sub_aggregates: &[],
+            }) {
                 Ok(g) => g,
                 Err(e) => {
                     return self.response_error(

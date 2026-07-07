@@ -14,23 +14,43 @@ use crate::engine::timeseries::grouped_scan::{
     GroupedAggResult, PartitionAggParams, aggregate_memtable, aggregate_partition,
 };
 
+/// Borrowed inputs to [`CoreLoop::execute_ts_aggregate`]: the target
+/// collection, time range, GROUP BY / aggregate / filter specs, and gap-fill
+/// / projection settings for one timeseries aggregate dispatch.
+pub(in crate::data::executor) struct TsAggregateParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: crate::types::TenantId,
+    pub collection: &'a str,
+    pub time_range: (i64, i64),
+    pub limit: usize,
+    pub filter_predicates: &'a [crate::bridge::scan_filter::ScanFilter],
+    pub bucket_interval_ms: i64,
+    pub group_by: &'a [String],
+    pub aggregates: &'a [(String, String)],
+    pub gap_fill: &'a str,
+    pub needed_columns: &'a [String],
+}
+
 impl CoreLoop {
     /// Aggregate mode: GROUP BY / time-bucket across memtable + partitions.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_ts_aggregate(
         &mut self,
-        task: &ExecutionTask,
-        tid: crate::types::TenantId,
-        collection: &str,
-        time_range: (i64, i64),
-        limit: usize,
-        filter_predicates: &[crate::bridge::scan_filter::ScanFilter],
-        bucket_interval_ms: i64,
-        group_by: &[String],
-        aggregates: &[(String, String)],
-        gap_fill: &str,
-        needed_columns: &[String],
+        params: TsAggregateParams<'_>,
     ) -> Response {
+        let TsAggregateParams {
+            task,
+            tid,
+            collection,
+            time_range,
+            limit,
+            filter_predicates,
+            bucket_interval_ms,
+            group_by,
+            aggregates,
+            gap_fill,
+            needed_columns,
+        } = params;
+
         let key = (task.request.database_id, tid, collection.to_string());
         let num_aggs = aggregates.len();
 

@@ -16,24 +16,46 @@ use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 use nodedb_query::agg_key::canonical_agg_key;
 use nodedb_query::msgpack_scan;
 
+/// Borrowed inputs to [`CoreLoop::execute_aggregate`]: the target collection
+/// (or input sub-plan), GROUP BY / aggregate / filter / HAVING / sub-group /
+/// grouping-set / sort specs for one aggregate dispatch.
+pub(in crate::data::executor) struct AggregateExecInputs<'a> {
+    pub task: &'a ExecutionTask,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub input: Option<&'a nodedb_physical::physical_plan::PhysicalPlan>,
+    pub group_by: &'a [GroupKeySpec],
+    pub aggregates: &'a [AggregateSpec],
+    pub filters: &'a [u8],
+    pub having: &'a [u8],
+    pub limit: usize,
+    pub sub_group_by: &'a [String],
+    pub sub_aggregates: &'a [AggregateSpec],
+    pub grouping_sets: &'a [Vec<u32>],
+    pub sort_keys: &'a [(String, bool)],
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_aggregate(
         &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        input: Option<&nodedb_physical::physical_plan::PhysicalPlan>,
-        group_by: &[GroupKeySpec],
-        aggregates: &[AggregateSpec],
-        filters: &[u8],
-        having: &[u8],
-        limit: usize,
-        sub_group_by: &[String],
-        sub_aggregates: &[AggregateSpec],
-        grouping_sets: &[Vec<u32>],
-        sort_keys: &[(String, bool)],
+        inputs: AggregateExecInputs<'_>,
     ) -> Response {
+        let AggregateExecInputs {
+            task,
+            tid,
+            collection,
+            input,
+            group_by,
+            aggregates,
+            filters,
+            having,
+            limit,
+            sub_group_by,
+            sub_aggregates,
+            grouping_sets,
+            sort_keys,
+        } = inputs;
+
         debug!(core = self.core_id, %collection, has_input = input.is_some(), group_fields = group_by.len(), aggs = aggregates.len(), "aggregate");
 
         // Input-sourced aggregate (catalog): the rows come from executing the
@@ -53,18 +75,20 @@ impl CoreLoop {
                 crate::data::executor::response_codec::decode_response_to_docs(&sub_response)
                     .unwrap_or_default();
             return self.aggregate_over_docs(
-                task,
-                collection,
-                None,
-                docs,
-                group_by,
-                aggregates,
-                filters,
-                having,
-                limit,
-                sub_group_by,
-                sub_aggregates,
-                sort_keys,
+                super::streaming::over_docs::AggregateOverDocsParams {
+                    task,
+                    collection,
+                    cache_tid: None,
+                    docs,
+                    group_by,
+                    aggregates,
+                    filters,
+                    having,
+                    limit,
+                    sub_group_by,
+                    sub_aggregates,
+                    sort_keys,
+                },
             );
         }
 
@@ -79,15 +103,17 @@ impl CoreLoop {
                 group_by.iter().filter_map(|s| s.field.clone()).collect();
             return super::super::grouping_sets_exec::execute_grouping_sets(
                 self,
-                task,
-                tid,
-                collection,
-                &group_fields,
-                aggregates,
-                filters,
-                having,
-                limit,
-                grouping_sets,
+                super::super::grouping_sets_exec::GroupingSetsParams {
+                    task,
+                    tid,
+                    collection,
+                    group_by: &group_fields,
+                    aggregates,
+                    filters,
+                    having,
+                    limit,
+                    grouping_sets,
+                },
             );
         }
 
@@ -302,10 +328,10 @@ impl CoreLoop {
                 );
             }
         };
-        self.aggregate_over_docs(
+        self.aggregate_over_docs(super::streaming::over_docs::AggregateOverDocsParams {
             task,
             collection,
-            Some(tid),
+            cache_tid: Some(tid),
             docs,
             group_by,
             aggregates,
@@ -315,6 +341,6 @@ impl CoreLoop {
             sub_group_by,
             sub_aggregates,
             sort_keys,
-        )
+        })
     }
 }

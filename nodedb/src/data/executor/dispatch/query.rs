@@ -33,19 +33,21 @@ impl CoreLoop {
                 grouping_sets,
                 sort_keys,
             } => self.execute_aggregate(
-                task,
-                tid,
-                collection,
-                input.as_deref(),
-                group_by,
-                aggregates,
-                filters,
-                having,
-                *limit,
-                sub_group_by,
-                sub_aggregates,
-                grouping_sets,
-                sort_keys,
+                crate::data::executor::handlers::aggregate::exec::AggregateExecInputs {
+                    task,
+                    tid,
+                    collection,
+                    input: input.as_deref(),
+                    group_by,
+                    aggregates,
+                    filters,
+                    having,
+                    limit: *limit,
+                    sub_group_by,
+                    sub_aggregates,
+                    grouping_sets,
+                    sort_keys,
+                },
             ),
 
             QueryOp::Exchange(_) => self.response_error(
@@ -235,19 +237,21 @@ impl CoreLoop {
                     .map(|s| GroupKeySpec::column(s.as_str()))
                     .collect();
                 self.execute_aggregate(
-                    task,
-                    tid,
-                    collection,
-                    None,
-                    &group_specs,
-                    aggregates,
-                    filters,
-                    &[],
-                    usize::MAX,
-                    &[],
-                    &[],
-                    &[],
-                    &[],
+                    crate::data::executor::handlers::aggregate::exec::AggregateExecInputs {
+                        task,
+                        tid,
+                        collection,
+                        input: None,
+                        group_by: &group_specs,
+                        aggregates,
+                        filters,
+                        having: &[],
+                        limit: usize::MAX,
+                        sub_group_by: &[],
+                        sub_aggregates: &[],
+                        grouping_sets: &[],
+                        sort_keys: &[],
+                    },
                 )
             }
 
@@ -258,13 +262,15 @@ impl CoreLoop {
                 aggregates,
                 filters,
             } => self.execute_partial_aggregate_state(
-                task,
-                tid,
-                collection,
-                input.as_deref(),
-                group_by,
-                aggregates,
-                filters,
+                crate::data::executor::handlers::aggregate::state_emit::PartialAggregateStateParams {
+                    task,
+                    tid,
+                    collection,
+                    input: input.as_deref(),
+                    group_by,
+                    aggregates,
+                    filters,
+                },
             ),
 
             QueryOp::ShuffleAggregateConsume {
@@ -282,13 +288,15 @@ impl CoreLoop {
                     .map(|s| GroupKeySpec::column(s.as_str()))
                     .collect();
                 self.execute_shuffle_aggregate(
-                    task,
-                    state_path,
-                    &group_specs,
-                    aggregates,
-                    having,
-                    *limit,
-                    sort_keys,
+                    crate::data::executor::handlers::aggregate::shuffle_merge::ShuffleAggregateParams {
+                        task,
+                        state_path,
+                        group_by: &group_specs,
+                        aggregates,
+                        having,
+                        limit: *limit,
+                        sort_keys,
+                    },
                 )
             }
 

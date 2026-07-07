@@ -16,6 +16,21 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::accum::GroupState;
 use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 
+/// Borrowed/owned inputs to [`CoreLoop::finalize_groups`]: the consolidated
+/// per-group state maps plus the GROUP BY / aggregate / HAVING / sort specs
+/// needed to turn them into an encoded response payload.
+pub(in crate::data::executor) struct FinalizeGroupsParams<'a> {
+    pub groups: HashMap<String, GroupState>,
+    pub sub_groups: HashMap<String, HashMap<String, GroupState>>,
+    pub group_by: &'a [GroupKeySpec],
+    pub aggregates: &'a [AggregateSpec],
+    pub having: &'a [u8],
+    pub limit: usize,
+    pub sub_group_by: &'a [String],
+    pub sub_aggregates: &'a [AggregateSpec],
+    pub sort_keys: &'a [(String, bool)],
+}
+
 impl CoreLoop {
     /// Finalize consolidated per-group states into an encoded response payload.
     ///
@@ -27,19 +42,21 @@ impl CoreLoop {
     ///
     /// `sub_groups` carries the optional sub-aggregation map (empty for plain
     /// GROUP BY, including the distributed-shuffle path).
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn finalize_groups(
         &self,
-        mut groups: HashMap<String, GroupState>,
-        mut sub_groups: HashMap<String, HashMap<String, GroupState>>,
-        group_by: &[GroupKeySpec],
-        aggregates: &[AggregateSpec],
-        having: &[u8],
-        limit: usize,
-        sub_group_by: &[String],
-        sub_aggregates: &[AggregateSpec],
-        sort_keys: &[(String, bool)],
+        params: FinalizeGroupsParams<'_>,
     ) -> crate::Result<Vec<u8>> {
+        let FinalizeGroupsParams {
+            mut groups,
+            mut sub_groups,
+            group_by,
+            aggregates,
+            having,
+            limit,
+            sub_group_by,
+            sub_aggregates,
+            sort_keys,
+        } = params;
         let need_sub = !sub_group_by.is_empty() && !sub_aggregates.is_empty();
 
         // A scalar aggregate (no GROUP BY) over zero input rows must still

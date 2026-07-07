@@ -9,6 +9,24 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 
+/// Borrowed/owned inputs to [`CoreLoop::aggregate_over_docs`]: the
+/// already-materialized doc set plus the GROUP BY / aggregate / filter /
+/// sort specs needed to accumulate and finalize it.
+pub(in crate::data::executor) struct AggregateOverDocsParams<'a> {
+    pub task: &'a ExecutionTask,
+    pub collection: &'a str,
+    pub cache_tid: Option<u64>,
+    pub docs: Vec<(String, Vec<u8>)>,
+    pub group_by: &'a [GroupKeySpec],
+    pub aggregates: &'a [AggregateSpec],
+    pub filters: &'a [u8],
+    pub having: &'a [u8],
+    pub limit: usize,
+    pub sub_group_by: &'a [String],
+    pub sub_aggregates: &'a [AggregateSpec],
+    pub sort_keys: &'a [(String, bool)],
+}
+
 impl CoreLoop {
     /// Streaming aggregation over an already-materialized set of `(doc_id,
     /// msgpack_bytes)` rows.
@@ -31,42 +49,46 @@ impl CoreLoop {
     /// The accumulate and finalize phases are factored into `accumulate_groups`
     /// and `finalize_groups` respectively, so the distributed-shuffle producer
     /// and consumer can reuse each half without duplicating logic.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn aggregate_over_docs(
         &mut self,
-        task: &ExecutionTask,
-        collection: &str,
-        cache_tid: Option<u64>,
-        docs: Vec<(String, Vec<u8>)>,
-        group_by: &[GroupKeySpec],
-        aggregates: &[AggregateSpec],
-        filters: &[u8],
-        having: &[u8],
-        limit: usize,
-        sub_group_by: &[String],
-        sub_aggregates: &[AggregateSpec],
-        sort_keys: &[(String, bool)],
+        params: AggregateOverDocsParams<'_>,
     ) -> Response {
-        let (groups, sub_groups) = match self.accumulate_groups(
-            &docs,
+        let AggregateOverDocsParams {
+            task,
+            collection,
+            cache_tid,
+            docs,
             group_by,
             aggregates,
             filters,
+            having,
+            limit,
             sub_group_by,
             sub_aggregates,
-        ) {
-            Ok(g) => g,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
+            sort_keys,
+        } = params;
 
-        match self.finalize_groups(
+        let (groups, sub_groups) =
+            match self.accumulate_groups(super::accumulate::AccumulateGroupsParams {
+                docs: &docs,
+                group_by,
+                aggregates,
+                filters,
+                sub_group_by,
+                sub_aggregates,
+            }) {
+                Ok(g) => g,
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    );
+                }
+            };
+
+        match self.finalize_groups(super::finalize::FinalizeGroupsParams {
             groups,
             sub_groups,
             group_by,
@@ -76,7 +98,7 @@ impl CoreLoop {
             sub_group_by,
             sub_aggregates,
             sort_keys,
-        ) {
+        }) {
             Ok(payload) => {
                 if let Some(tid) = cache_tid
                     && filters.is_empty()

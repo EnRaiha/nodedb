@@ -15,4 +15,4 @@
 
 pub(in crate::data::executor) mod accumulate;
 pub(in crate::data::executor) mod finalize;
-mod over_docs;
+pub(in crate::data::executor) mod over_docs;

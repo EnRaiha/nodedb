@@ -159,19 +159,19 @@ impl CoreLoop {
 
         // Mode dispatch.
         if is_aggregate || bucket_interval_ms > 0 {
-            self.execute_ts_aggregate(
+            self.execute_ts_aggregate(aggregate::TsAggregateParams {
                 task,
                 tid,
                 collection,
                 time_range,
                 limit,
-                &filter_predicates,
+                filter_predicates: &filter_predicates,
                 bucket_interval_ms,
                 group_by,
                 aggregates,
                 gap_fill,
-                &needed_columns,
-            )
+                needed_columns: &needed_columns,
+            })
         } else {
             // In-transaction read-your-own-writes is confined to the RAW scan
             // branch and to current-version reads: audit-log (`all_versions`)
