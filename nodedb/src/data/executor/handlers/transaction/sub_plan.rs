@@ -313,13 +313,15 @@ impl CoreLoop {
                 wal_lsn: _,
             }) => self.execute_tx_columnar_insert(
                 &dummy_task,
-                collection,
-                payload,
-                format,
-                *intent,
-                on_conflict_updates,
-                surrogates,
-                schema_bytes,
+                super::sub_plan_kv::TxColumnarInsertParams {
+                    collection,
+                    payload,
+                    format,
+                    intent: *intent,
+                    on_conflict_updates,
+                    surrogates,
+                    schema_bytes,
+                },
                 undo_log,
             ),
 
@@ -371,11 +373,13 @@ impl CoreLoop {
                 ..
             }) => self.execute_tx_timeseries_ingest(
                 &dummy_task,
-                TenantId::new(tid),
-                collection,
-                payload,
-                format,
-                *wal_lsn,
+                super::sub_plan_kv::TxTimeseriesIngestParams {
+                    tid: TenantId::new(tid),
+                    collection,
+                    payload,
+                    format,
+                    wal_lsn: *wal_lsn,
+                },
                 undo_log,
             ),
 

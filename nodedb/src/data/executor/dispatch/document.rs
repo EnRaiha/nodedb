@@ -170,18 +170,20 @@ impl CoreLoop {
                 };
                 self.execute_document_scan(
                     task,
-                    tid,
-                    collection,
-                    *limit,
-                    *offset,
-                    sort_keys,
-                    filters,
-                    *distinct,
-                    projection,
-                    computed_columns,
-                    window_functions,
-                    mode,
-                    prefilter.as_ref(),
+                    crate::data::executor::handlers::document::read::scan::DocumentScanParams {
+                        tid,
+                        collection,
+                        limit: *limit,
+                        offset: *offset,
+                        sort_keys,
+                        filters,
+                        distinct: *distinct,
+                        projection,
+                        computed_columns_bytes: computed_columns,
+                        window_functions_bytes: window_functions,
+                        mode,
+                        prefilter: prefilter.as_ref(),
+                    },
                 )
             }
 
@@ -318,13 +320,15 @@ impl CoreLoop {
                 bitemporal,
             } => self.execute_register_document_collection(
                 task,
-                tid,
-                collection,
-                indexes,
-                *crdt_enabled,
-                storage_mode,
-                enforcement,
-                *bitemporal,
+                super::super::handlers::document::write::RegisterDocumentCollectionParams {
+                    tid,
+                    collection,
+                    indexes,
+                    crdt_enabled: *crdt_enabled,
+                    storage_mode,
+                    enforcement,
+                    bitemporal: *bitemporal,
+                },
             ),
 
             DocumentOp::IndexLookup {
@@ -389,13 +393,15 @@ impl CoreLoop {
                 predicate,
             } => self.execute_backfill_index(
                 task,
-                tid,
-                collection,
-                path,
-                *is_array,
-                *unique,
-                *case_insensitive,
-                predicate.as_deref(),
+                super::super::handlers::document::write::BackfillIndexParams {
+                    tid,
+                    collection,
+                    path,
+                    is_array: *is_array,
+                    unique: *unique,
+                    case_insensitive: *case_insensitive,
+                    predicate: predicate.as_deref(),
+                },
             ),
 
             DocumentOp::MaterializeScan {

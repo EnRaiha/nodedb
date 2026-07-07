@@ -121,24 +121,39 @@ impl CoreLoop {
             ),
         }
     }
+}
 
+/// Parameters for [`CoreLoop::execute_register_document_collection`].
+pub(in crate::data::executor) struct RegisterDocumentCollectionParams<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub indexes: &'a [nodedb_physical::physical_plan::RegisteredIndex],
+    pub crdt_enabled: bool,
+    pub storage_mode: &'a nodedb_physical::physical_plan::StorageMode,
+    pub enforcement: &'a nodedb_physical::physical_plan::EnforcementOptions,
+    pub bitemporal: bool,
+}
+
+impl CoreLoop {
     /// Register a document collection's secondary index configuration.
     ///
     /// Stores the `CollectionConfig` in `self.doc_configs` so that subsequent
     /// `PointPut` and `DocumentBatchInsert` operations extract and write secondary
     /// index entries automatically.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_register_document_collection(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        indexes: &[nodedb_physical::physical_plan::RegisteredIndex],
-        crdt_enabled: bool,
-        storage_mode: &nodedb_physical::physical_plan::StorageMode,
-        enforcement: &nodedb_physical::physical_plan::EnforcementOptions,
-        bitemporal: bool,
+        params: RegisterDocumentCollectionParams<'_>,
     ) -> Response {
+        let RegisterDocumentCollectionParams {
+            tid,
+            collection,
+            indexes,
+            crdt_enabled,
+            storage_mode,
+            enforcement,
+            bitemporal,
+        } = params;
         let mode_label = match storage_mode {
             nodedb_physical::physical_plan::StorageMode::Schemaless => "document_schemaless",
             nodedb_physical::physical_plan::StorageMode::Strict { .. } => "document_strict",
@@ -170,25 +185,40 @@ impl CoreLoop {
 
         self.response_ok(task)
     }
+}
 
+/// Parameters for [`CoreLoop::execute_backfill_index`].
+pub(in crate::data::executor) struct BackfillIndexParams<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub path: &'a str,
+    pub is_array: bool,
+    pub unique: bool,
+    pub case_insensitive: bool,
+    pub predicate: Option<&'a str>,
+}
+
+impl CoreLoop {
     /// Backfill an index: scan every document in the collection and
     /// populate sparse-index entries for the given field. Atomic — one
     /// write transaction covers the whole backfill and UNIQUE
     /// violations abort it, leaving the index empty (the caller's
     /// Building→Ready flip is skipped, so readers never see a
     /// partial-index view).
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_backfill_index(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        path: &str,
-        is_array: bool,
-        unique: bool,
-        case_insensitive: bool,
-        predicate: Option<&str>,
+        params: BackfillIndexParams<'_>,
     ) -> Response {
+        let BackfillIndexParams {
+            tid,
+            collection,
+            path,
+            is_array,
+            unique,
+            case_insensitive,
+            predicate,
+        } = params;
         debug!(
             core = self.core_id,
             %collection,

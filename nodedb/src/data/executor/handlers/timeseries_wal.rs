@@ -254,14 +254,16 @@ impl CoreLoop {
         // falls back to fresh allocation as before.
         let response = self.execute_columnar_insert(
             &task,
-            collection,
-            payload,
-            "msgpack",
-            ColumnarInsertIntent::Insert,
-            &[],
-            &surrogates,
-            &[],
-            provenance.as_ref(),
+            crate::data::executor::handlers::columnar_write::ColumnarInsertParams {
+                collection,
+                payload,
+                format: "msgpack",
+                intent: ColumnarInsertIntent::Insert,
+                on_conflict_updates: &[],
+                surrogates: &surrogates,
+                schema_bytes: &[],
+                provenance: provenance.as_ref(),
+            },
         );
         if response.status != crate::bridge::envelope::Status::Ok {
             tracing::warn!(

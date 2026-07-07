@@ -11,20 +11,31 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// Parameters for [`CoreLoop::execute_rename_collection`].
+pub(in crate::data::executor) struct RenameCollectionParams<'a> {
+    pub tenant_id: u64,
+    pub old_database_id: u64,
+    pub new_database_id: u64,
+    pub old_collection: &'a str,
+    pub new_collection: &'a str,
+}
+
 impl CoreLoop {
     /// Handle `MetaOp::RenameCollection`: re-key all documents and secondary
     /// indexes from `old_collection` to `new_collection` for `tenant_id` in
     /// every engine that uses db-qualified collection names for keying.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_rename_collection(
         &mut self,
         task: &ExecutionTask,
-        tenant_id: u64,
-        old_database_id: u64,
-        new_database_id: u64,
-        old_collection: &str,
-        new_collection: &str,
+        params: RenameCollectionParams<'_>,
     ) -> Response {
+        let RenameCollectionParams {
+            tenant_id,
+            old_database_id,
+            new_database_id,
+            old_collection,
+            new_collection,
+        } = params;
         // Sparse engine (document schemaless + document strict).
         if let Err(e) = self.sparse.rename_collection(
             old_database_id,

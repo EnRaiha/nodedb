@@ -68,7 +68,16 @@ impl CoreLoop {
                 distinct,
                 ..
             } => self.execute_provider_scan(
-                task, rows, filters, projection, sort_keys, *limit, *offset, *distinct,
+                task,
+                crate::data::executor::handlers::provider_scan::ProviderScanParams {
+                    rows_bytes: rows,
+                    filters_bytes: filters,
+                    projection,
+                    sort_keys,
+                    limit: *limit,
+                    offset: *offset,
+                    distinct: *distinct,
+                },
             ),
 
             QueryOp::HashJoin {
@@ -186,14 +195,16 @@ impl CoreLoop {
                 limit,
             } => self.execute_recursive_scan(
                 task,
-                tid,
-                collection,
-                base_filters,
-                recursive_filters,
-                join_link.as_ref(),
-                *max_iterations,
-                *distinct,
-                *limit,
+                crate::data::executor::handlers::recursive::RecursiveScanParams {
+                    tid,
+                    collection,
+                    base_filters,
+                    recursive_filters,
+                    join_link: join_link.as_ref(),
+                    max_iterations: *max_iterations,
+                    distinct: *distinct,
+                    limit: *limit,
+                },
             ),
 
             QueryOp::RecursiveValue {
@@ -206,13 +217,15 @@ impl CoreLoop {
                 distinct,
             } => self.execute_recursive_value(
                 task,
-                cte_name,
-                columns,
-                init_exprs,
-                step_exprs,
-                condition.as_deref(),
-                *max_depth,
-                *distinct,
+                crate::data::executor::handlers::recursive_value::RecursiveValueParams {
+                    cte_name,
+                    columns,
+                    init_exprs,
+                    step_exprs,
+                    condition: condition.as_deref(),
+                    max_depth: *max_depth,
+                    distinct: *distinct,
+                },
             ),
 
             QueryOp::FacetCounts {

@@ -219,11 +219,13 @@ impl CoreLoop {
                 new_collection,
             } => self.execute_rename_collection(
                 task,
-                *tenant_id,
-                *old_database_id,
-                *new_database_id,
-                old_collection,
-                new_collection,
+                crate::data::executor::handlers::control::move_tenant::RenameCollectionParams {
+                    tenant_id: *tenant_id,
+                    old_database_id: *old_database_id,
+                    new_database_id: *new_database_id,
+                    old_collection,
+                    new_collection,
+                },
             ),
 
             MetaOp::StageWrite { plan } => self.execute_stage_write(task, tid, plan),

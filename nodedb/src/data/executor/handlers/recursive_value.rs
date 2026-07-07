@@ -19,19 +19,32 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// Parameters for [`CoreLoop::execute_recursive_value`].
+pub(in crate::data::executor) struct RecursiveValueParams<'a> {
+    pub cte_name: &'a str,
+    pub columns: &'a [String],
+    pub init_exprs: &'a [String],
+    pub step_exprs: &'a [String],
+    pub condition: Option<&'a str>,
+    pub max_depth: usize,
+    pub distinct: bool,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_recursive_value(
         &mut self,
         task: &ExecutionTask,
-        cte_name: &str,
-        columns: &[String],
-        init_exprs: &[String],
-        step_exprs: &[String],
-        condition: Option<&str>,
-        max_depth: usize,
-        distinct: bool,
+        params: RecursiveValueParams<'_>,
     ) -> Response {
+        let RecursiveValueParams {
+            cte_name,
+            columns,
+            init_exprs,
+            step_exprs,
+            condition,
+            max_depth,
+            distinct,
+        } = params;
         // ── Anchor row ────────────────────────────────────────────────────────
         let init_values = match eval_row_exprs(init_exprs, &HashMap::new()) {
             Some(v) => v,

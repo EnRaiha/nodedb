@@ -16,6 +16,17 @@ use crate::engine::crdt::tenant_state::ValidatedApplyOutcome;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// Parameters for [`CoreLoop::execute_crdt_apply`].
+pub(in crate::data::executor) struct CrdtApplyParams<'a> {
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub delta: &'a [u8],
+    pub surrogate: Surrogate,
+    pub peer_id: u64,
+    pub provenance: Option<&'a SyncProvenance>,
+    pub constraint_version_required: u64,
+}
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_read(
         &mut self,
@@ -207,18 +218,20 @@ impl CoreLoop {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_crdt_apply(
         &mut self,
         task: &ExecutionTask,
-        collection: &str,
-        document_id: &str,
-        delta: &[u8],
-        surrogate: Surrogate,
-        peer_id: u64,
-        provenance: Option<&SyncProvenance>,
-        constraint_version_required: u64,
+        params: CrdtApplyParams<'_>,
     ) -> Response {
+        let CrdtApplyParams {
+            collection,
+            document_id,
+            delta,
+            surrogate,
+            peer_id,
+            provenance,
+            constraint_version_required,
+        } = params;
         let tenant_id = task.request.tenant_id;
 
         let Some(prov) = provenance else {

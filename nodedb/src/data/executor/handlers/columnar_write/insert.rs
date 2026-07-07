@@ -20,6 +20,18 @@ use nodedb_physical::physical_plan::document::UpdateValue;
 
 use super::schema::{ndb_field_to_value, row_values_to_object};
 
+/// Parameters for [`CoreLoop::execute_columnar_insert`].
+pub(in crate::data::executor) struct ColumnarInsertParams<'a> {
+    pub collection: &'a str,
+    pub payload: &'a [u8],
+    pub format: &'a str,
+    pub intent: ColumnarInsertIntent,
+    pub on_conflict_updates: &'a [(String, UpdateValue)],
+    pub surrogates: &'a [Surrogate],
+    pub schema_bytes: &'a [u8],
+    pub provenance: Option<&'a SyncProvenance>,
+}
+
 impl CoreLoop {
     /// Execute a columnar insert: write rows from MessagePack payload to
     /// `MutationEngine`, applying intent-specific semantics on duplicate
@@ -34,19 +46,21 @@ impl CoreLoop {
     /// `SyncAckResult{Applied}`.
     ///
     /// When `provenance` is `None` (SQL path), behave as before.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_columnar_insert(
         &mut self,
         task: &ExecutionTask,
-        collection: &str,
-        payload: &[u8],
-        _format: &str,
-        intent: ColumnarInsertIntent,
-        on_conflict_updates: &[(String, UpdateValue)],
-        surrogates: &[Surrogate],
-        schema_bytes: &[u8],
-        provenance: Option<&SyncProvenance>,
+        params: ColumnarInsertParams<'_>,
     ) -> Response {
+        let ColumnarInsertParams {
+            collection,
+            payload,
+            format: _format,
+            intent,
+            on_conflict_updates,
+            surrogates,
+            schema_bytes,
+            provenance,
+        } = params;
         // ── Sync idempotency gate (Data-Plane side) ──────────────────────────
         if let Some(prov) = provenance {
             let admit = self.sync_admit(prov);

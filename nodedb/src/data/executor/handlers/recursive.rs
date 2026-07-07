@@ -14,6 +14,18 @@ use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// Parameters for [`CoreLoop::execute_recursive_scan`].
+pub(in crate::data::executor) struct RecursiveScanParams<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub base_filters: &'a [u8],
+    pub recursive_filters: &'a [u8],
+    pub join_link: Option<&'a (String, String)>,
+    pub max_iterations: usize,
+    pub distinct: bool,
+    pub limit: usize,
+}
+
 impl CoreLoop {
     /// Execute a recursive CTE scan.
     ///
@@ -24,19 +36,21 @@ impl CoreLoop {
     /// 3. New matches become the working table for the next iteration
     /// 4. Accumulate all results
     /// 5. Repeat until no new rows or max_iterations reached
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_recursive_scan(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        base_filters: &[u8],
-        recursive_filters: &[u8],
-        join_link: Option<&(String, String)>,
-        max_iterations: usize,
-        distinct: bool,
-        limit: usize,
+        params: RecursiveScanParams<'_>,
     ) -> Response {
+        let RecursiveScanParams {
+            tid,
+            collection,
+            base_filters,
+            recursive_filters,
+            join_link,
+            max_iterations,
+            distinct,
+            limit,
+        } = params;
         // Scan-quiesce gate.
         let _scan_guard = match self.acquire_scan_guard(task, tid, collection) {
             Ok(g) => g,

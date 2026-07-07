@@ -16,23 +16,36 @@ use crate::data::executor::msgpack_utils::write_str;
 use crate::data::executor::response_codec::encode_binary_rows;
 use crate::data::executor::task::ExecutionTask;
 
+/// Parameters for [`CoreLoop::execute_provider_scan`].
+pub(in crate::data::executor) struct ProviderScanParams<'a> {
+    pub rows_bytes: &'a [u8],
+    pub filters_bytes: &'a [u8],
+    pub projection: &'a [String],
+    pub sort_keys: &'a [(String, bool)],
+    pub limit: Option<usize>,
+    pub offset: usize,
+    pub distinct: bool,
+}
+
 impl CoreLoop {
     /// Execute a `ProviderScan` plan node.
     ///
     /// Processing order: decode rows → filter → offset → sort → distinct →
     /// project → limit → emit.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_provider_scan(
         &mut self,
         task: &ExecutionTask,
-        rows_bytes: &[u8],
-        filters_bytes: &[u8],
-        projection: &[String],
-        sort_keys: &[(String, bool)],
-        limit: Option<usize>,
-        offset: usize,
-        distinct: bool,
+        params: ProviderScanParams<'_>,
     ) -> Response {
+        let ProviderScanParams {
+            rows_bytes,
+            filters_bytes,
+            projection,
+            sort_keys,
+            limit,
+            offset,
+            distinct,
+        } = params;
         // ── 1. Decode the flat msgpack row array. ────────────────────────────
         // ProviderScan rows are flat column maps *by contract*: catalog and
         // constant results are produced flat, and a gathered storage side is

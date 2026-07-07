@@ -23,6 +23,26 @@ use super::undo::UndoEntry;
 /// to insert, paired with the prior `RowLocation` of any displaced memtable rows.
 type ColumnarUndoState = (Vec<Vec<u8>>, Vec<(Vec<u8>, RowLocation)>);
 
+/// Parameters for [`CoreLoop::execute_tx_columnar_insert`].
+pub(super) struct TxColumnarInsertParams<'a> {
+    pub collection: &'a str,
+    pub payload: &'a [u8],
+    pub format: &'a str,
+    pub intent: ColumnarInsertIntent,
+    pub on_conflict_updates: &'a [(String, UpdateValue)],
+    pub surrogates: &'a [nodedb_types::Surrogate],
+    pub schema_bytes: &'a [u8],
+}
+
+/// Parameters for [`CoreLoop::execute_tx_timeseries_ingest`].
+pub(super) struct TxTimeseriesIngestParams<'a> {
+    pub tid: TenantId,
+    pub collection: &'a str,
+    pub payload: &'a [u8],
+    pub format: &'a str,
+    pub wal_lsn: Option<u64>,
+}
+
 impl CoreLoop {
     // ── Columnar insert ──────────────────────────────────────────────────────
 
@@ -30,19 +50,21 @@ impl CoreLoop {
     ///
     /// Captures `row_count_before`, inserted PK bytes, and displaced prior-row
     /// locations before the insert so the undo log can reverse the operation.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_tx_columnar_insert(
         &mut self,
         task: &ExecutionTask,
-        collection: &str,
-        payload: &[u8],
-        format: &str,
-        intent: ColumnarInsertIntent,
-        on_conflict_updates: &[(String, UpdateValue)],
-        surrogates: &[nodedb_types::Surrogate],
-        schema_bytes: &[u8],
+        params: TxColumnarInsertParams<'_>,
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
+        let TxColumnarInsertParams {
+            collection,
+            payload,
+            format,
+            intent,
+            on_conflict_updates,
+            surrogates,
+            schema_bytes,
+        } = params;
         let collection_key = (
             task.request.database_id,
             task.request.tenant_id,
@@ -60,14 +82,16 @@ impl CoreLoop {
 
         let resp = self.execute_columnar_insert(
             task,
-            collection,
-            payload,
-            format,
-            intent,
-            on_conflict_updates,
-            surrogates,
-            schema_bytes,
-            None,
+            crate::data::executor::handlers::columnar_write::ColumnarInsertParams {
+                collection,
+                payload,
+                format,
+                intent,
+                on_conflict_updates,
+                surrogates,
+                schema_bytes,
+                provenance: None,
+            },
         );
         if resp.status == Status::Error {
             return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
@@ -154,17 +178,19 @@ impl CoreLoop {
     ///
     /// Captures the memtable row count before ingest so the undo log can
     /// truncate back to that point on batch failure.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_tx_timeseries_ingest(
         &mut self,
         task: &ExecutionTask,
-        tid: TenantId,
-        collection: &str,
-        payload: &[u8],
-        format: &str,
-        wal_lsn: Option<u64>,
+        params: TxTimeseriesIngestParams<'_>,
         undo_log: &mut Vec<UndoEntry>,
     ) -> Result<Response, ErrorCode> {
+        let TxTimeseriesIngestParams {
+            tid,
+            collection,
+            payload,
+            format,
+            wal_lsn,
+        } = params;
         let collection_key = (task.request.database_id, tid, collection.to_string());
 
         let row_count_before = self

@@ -27,13 +27,15 @@ impl CoreLoop {
                 constraint_version_required,
             } => self.execute_crdt_apply(
                 task,
-                collection,
-                document_id,
-                delta,
-                *surrogate,
-                *peer_id,
-                provenance.as_ref(),
-                *constraint_version_required,
+                crate::data::executor::handlers::control::crdt::CrdtApplyParams {
+                    collection,
+                    document_id,
+                    delta,
+                    surrogate: *surrogate,
+                    peer_id: *peer_id,
+                    provenance: provenance.as_ref(),
+                    constraint_version_required: *constraint_version_required,
+                },
             ),
 
             CrdtOp::ImportSnapshot {

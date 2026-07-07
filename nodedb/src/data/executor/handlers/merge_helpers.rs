@@ -31,21 +31,36 @@ pub(super) fn find_arm<'a>(
     })
 }
 
+/// Parameters for [`apply_action`].
+pub(super) struct ApplyActionParams<'a> {
+    pub database_id: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub doc_id: &'a str,
+    pub target_doc: &'a serde_json::Value,
+    pub source_doc: &'a serde_json::Value,
+    pub source_alias: &'a str,
+    pub clause: &'a MergeClauseOp,
+    pub strict_schema: &'a Option<nodedb_types::columnar::StrictSchema>,
+}
+
 /// Apply a MATCHED / NOT MATCHED BY SOURCE arm (UPDATE or DELETE) to a target row.
 /// Returns `Ok(true)` when a write was performed.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_action(
     core: &mut CoreLoop,
-    database_id: u64,
-    tid: u64,
-    collection: &str,
-    doc_id: &str,
-    target_doc: &serde_json::Value,
-    source_doc: &serde_json::Value,
-    source_alias: &str,
-    clause: &MergeClauseOp,
-    strict_schema: &Option<nodedb_types::columnar::StrictSchema>,
+    params: ApplyActionParams<'_>,
 ) -> crate::Result<bool> {
+    let ApplyActionParams {
+        database_id,
+        tid,
+        collection,
+        doc_id,
+        target_doc,
+        source_doc,
+        source_alias,
+        clause,
+        strict_schema,
+    } = params;
     match &clause.action {
         MergeActionOp::DoNothing => Ok(false),
         MergeActionOp::Delete => {
@@ -102,17 +117,29 @@ pub(super) fn apply_action(
     }
 }
 
+/// Parameters for [`apply_insert_action`].
+pub(super) struct ApplyInsertActionParams<'a> {
+    pub database_id: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub source_doc: &'a serde_json::Value,
+    pub clause: &'a MergeClauseOp,
+    pub strict_schema: &'a Option<nodedb_types::columnar::StrictSchema>,
+}
+
 /// Apply a NOT MATCHED arm (INSERT) using the source document.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_insert_action(
     core: &mut CoreLoop,
-    database_id: u64,
-    tid: u64,
-    collection: &str,
-    source_doc: &serde_json::Value,
-    clause: &MergeClauseOp,
-    strict_schema: &Option<nodedb_types::columnar::StrictSchema>,
+    params: ApplyInsertActionParams<'_>,
 ) -> crate::Result<bool> {
+    let ApplyInsertActionParams {
+        database_id,
+        tid,
+        collection,
+        source_doc,
+        clause,
+        strict_schema,
+    } = params;
     match &clause.action {
         MergeActionOp::DoNothing => Ok(false),
         MergeActionOp::Delete | MergeActionOp::Update { .. } => {

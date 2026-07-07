@@ -56,14 +56,16 @@ impl CoreLoop {
                 }
                 self.execute_columnar_insert(
                     task,
-                    collection,
-                    payload,
-                    format,
-                    *intent,
-                    on_conflict_updates,
-                    surrogates,
-                    schema_bytes,
-                    provenance.as_ref(),
+                    crate::data::executor::handlers::columnar_write::ColumnarInsertParams {
+                        collection,
+                        payload,
+                        format,
+                        intent: *intent,
+                        on_conflict_updates,
+                        surrogates,
+                        schema_bytes,
+                        provenance: provenance.as_ref(),
+                    },
                 )
             }
 

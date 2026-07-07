@@ -18,7 +18,8 @@
 use tracing::debug;
 
 use super::merge_helpers::{
-    apply_action, apply_insert_action, build_merged, find_arm, json_to_str,
+    ApplyActionParams, ApplyInsertActionParams, apply_action, apply_insert_action, build_merged,
+    find_arm, json_to_str,
 };
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -186,15 +187,17 @@ impl CoreLoop {
                     let db_id = task.request.database_id.as_u64();
                     match apply_action(
                         self,
-                        db_id,
-                        tid,
-                        target_collection,
-                        doc_id,
-                        &target_doc,
-                        source_doc,
-                        source_alias,
-                        arm,
-                        &strict_schema,
+                        ApplyActionParams {
+                            database_id: db_id,
+                            tid,
+                            collection: target_collection,
+                            doc_id,
+                            target_doc: &target_doc,
+                            source_doc,
+                            source_alias,
+                            clause: arm,
+                            strict_schema: &strict_schema,
+                        },
                     ) {
                         Ok(true) => affected += 1,
                         Ok(false) => {}
@@ -216,15 +219,17 @@ impl CoreLoop {
                     let db_id = task.request.database_id.as_u64();
                     match apply_action(
                         self,
-                        db_id,
-                        tid,
-                        target_collection,
-                        doc_id,
-                        &target_doc,
-                        &serde_json::Value::Null,
-                        source_alias,
-                        arm,
-                        &strict_schema,
+                        ApplyActionParams {
+                            database_id: db_id,
+                            tid,
+                            collection: target_collection,
+                            doc_id,
+                            target_doc: &target_doc,
+                            source_doc: &serde_json::Value::Null,
+                            source_alias,
+                            clause: arm,
+                            strict_schema: &strict_schema,
+                        },
                     ) {
                         Ok(true) => affected += 1,
                         Ok(false) => {}
@@ -249,12 +254,14 @@ impl CoreLoop {
             if let Some(arm) = find_arm(clauses, MergeClauseKindOp::NotMatched, src_doc) {
                 match apply_insert_action(
                     self,
-                    task.request.database_id.as_u64(),
-                    tid,
-                    target_collection,
-                    src_doc,
-                    arm,
-                    &strict_schema,
+                    ApplyInsertActionParams {
+                        database_id: task.request.database_id.as_u64(),
+                        tid,
+                        collection: target_collection,
+                        source_doc: src_doc,
+                        clause: arm,
+                        strict_schema: &strict_schema,
+                    },
                 ) {
                     Ok(true) => affected += 1,
                     Ok(false) => {}

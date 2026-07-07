@@ -16,24 +16,42 @@ use crate::data::executor::response_codec::DocumentRow;
 use crate::data::executor::strict_format;
 use crate::data::executor::task::ExecutionTask;
 
+/// Parameters for [`CoreLoop::execute_document_scan`].
+pub(in crate::data::executor) struct DocumentScanParams<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub limit: usize,
+    pub offset: usize,
+    pub sort_keys: &'a [(String, bool)],
+    pub filters: &'a [u8],
+    pub distinct: bool,
+    pub projection: &'a [String],
+    pub computed_columns_bytes: &'a [u8],
+    pub window_functions_bytes: &'a [u8],
+    pub mode: DocScanMode,
+    pub prefilter: Option<&'a nodedb_types::SurrogateBitmap>,
+}
+
 impl CoreLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::data::executor) fn execute_document_scan(
         &mut self,
         task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        limit: usize,
-        offset: usize,
-        sort_keys: &[(String, bool)],
-        filters: &[u8],
-        distinct: bool,
-        projection: &[String],
-        computed_columns_bytes: &[u8],
-        window_functions_bytes: &[u8],
-        mode: DocScanMode,
-        prefilter: Option<&nodedb_types::SurrogateBitmap>,
+        params: DocumentScanParams<'_>,
     ) -> Response {
+        let DocumentScanParams {
+            tid,
+            collection,
+            limit,
+            offset,
+            sort_keys,
+            filters,
+            distinct,
+            projection,
+            computed_columns_bytes,
+            window_functions_bytes,
+            mode,
+            prefilter,
+        } = params;
         debug!(
             core = self.core_id,
             %collection,
