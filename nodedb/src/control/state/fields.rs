@@ -375,6 +375,27 @@ pub struct SharedState {
     /// the schedulers (which hold `Arc<SharedState>`) advance the same counter
     /// the session reads. 0 in single-node / no-Calvin deployments.
     pub last_applied_calvin_epoch: Arc<AtomicU64>,
+    /// Local, in-process sidecar carrying the applied Data-Plane [`Response`]
+    /// (including RETURNING rows) of a completed Calvin transaction, keyed by
+    /// its sequencer-assigned `TxnId`.
+    ///
+    /// RETURNING rows are a QUERY RESULT, not replicated state, so they MUST NOT
+    /// ride the sequencer Raft log. The per-vShard scheduler deposits the applied
+    /// `Response` here BEFORE proposing the replicated `CompletionAck`; the
+    /// coordinator's completion path (static: `submit_and_await_calvin`;
+    /// dependent: `dispatch_dependent_edge_recon`) drains it once completion
+    /// fires. Only the RETURNING-bearing participant deposits, so the entry is
+    /// never clobbered by a sibling participant's row-less ack. Cross-node, the
+    /// rows travel via the non-Raft routed-submit RPC response instead.
+    ///
+    /// The value is a [`CalvinApplyResult`](super::CalvinApplyResult): `Single`
+    /// for the one RETURNING-bearing participant, or `Conflict` if two ever
+    /// deposit for the same `TxnId` (drained as a loud error, never a silent
+    /// partial). [`Response`](crate::bridge::envelope::Response) is Control-Plane
+    /// `Send + Sync`; it never touches Raft.
+    pub calvin_apply_results: Arc<
+        Mutex<std::collections::HashMap<nodedb_cluster::calvin::TxnId, super::CalvinApplyResult>>,
+    >,
     /// Presence/Awareness manager: ephemeral user state broadcast channels.
     pub presence: Arc<tokio::sync::RwLock<crate::control::server::sync::presence::PresenceManager>>,
     /// Permission tree cache: in-memory resource hierarchy + permission grants.

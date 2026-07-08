@@ -33,9 +33,14 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         _identity: &AuthenticatedIdentity,
         addr: &std::net::SocketAddr,
+        result_formats: &[pgwire::api::results::FieldFormat],
     ) -> PgWireResult<Vec<Response>> {
         let cross_shard_mode = self.sessions.cross_shard_txn_mode(addr);
         let tx_state = self.sessions.transaction_state(addr);
+        let database_id = self
+            .sessions
+            .get_current_database(addr)
+            .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
         // Presence guard preserved from the inlined implementation: BOTH the
         // static and OLLP paths require the completion registry to be wired, so
@@ -86,7 +91,7 @@ impl NodeDbPgHandler {
             // synthesise one command tag per task. This is a pure extraction —
             // behaviour is identical to the inlined static branch.
             let in_txn_block = tx_state == TransactionState::InBlock;
-            dispatch_tasks_to_calvin(
+            let apply_resp = dispatch_tasks_to_calvin(
                 &self.state,
                 &tasks,
                 tenant_id,
@@ -105,7 +110,14 @@ impl NodeDbPgHandler {
 
             let mut calvin_responses: Vec<Response> = Vec::with_capacity(tasks.len());
             for task in &tasks {
-                calvin_responses.push(calvin_execution_response(task));
+                calvin_responses.push(calvin_execution_response(
+                    task,
+                    apply_resp.as_ref(),
+                    &self.state,
+                    tenant_id,
+                    database_id,
+                    result_formats,
+                ));
             }
             return Ok(calvin_responses);
         }
@@ -131,23 +143,34 @@ impl NodeDbPgHandler {
             })?
             .database_id;
 
-        // Pre-collect responses before moving `tasks` into the recon call.
-        // `dispatch_dependent_edge_recon` takes ownership; the tag shape is
-        // determined entirely by the plan variant (not mutated by the recon
-        // path), so collecting first is safe and avoids a full Vec clone.
-        let calvin_responses: Vec<Response> = tasks.iter().map(calvin_execution_response).collect();
+        // Run the recon/OLLP dispatch, which drains this coordinator's sidecar
+        // and returns the applied Data-Plane Response for the RETURNING doc
+        // write (if any). `tasks` is cloned into the recon call so the original
+        // list survives to shape the per-task responses afterwards: a RETURNING
+        // task emits its rows, every other task its command tag.
+        let outcome =
+            dispatch_dependent_edge_recon(&self.state, tasks.clone(), tenant_id, database_id)
+                .await
+                .map_err(|e| {
+                    let (severity, code, message) = error_to_sqlstate(&e);
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        severity.to_owned(),
+                        code.to_owned(),
+                        message,
+                    )))
+                })?;
 
-        dispatch_dependent_edge_recon(&self.state, tasks, tenant_id, database_id)
-            .await
-            .map_err(|e| {
-                let (severity, code, message) = error_to_sqlstate(&e);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?;
-
+        let mut calvin_responses: Vec<Response> = Vec::with_capacity(tasks.len());
+        for task in &tasks {
+            calvin_responses.push(calvin_execution_response(
+                task,
+                outcome.apply_result.as_ref(),
+                &self.state,
+                tenant_id,
+                database_id,
+                result_formats,
+            ));
+        }
         Ok(calvin_responses)
     }
 }

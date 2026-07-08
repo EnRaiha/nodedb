@@ -32,6 +32,12 @@ pub(super) struct PendingTxn {
     pub dispatch_time: Instant,
     /// Wall-clock time at lock acquisition (for wait-latency measurement).
     pub lock_acquired_time: Instant,
+    /// Whether THIS vShard's slice of the transaction carries a RETURNING
+    /// clause. Only the RETURNING-bearing participant deposits its applied
+    /// `Response` into `SharedState::calvin_apply_results`, so a sibling
+    /// participant's row-less ack never clobbers the entry the coordinator
+    /// drains.
+    pub has_returning: bool,
 }
 
 /// A transaction that is blocked on lock acquisition.

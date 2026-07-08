@@ -292,12 +292,30 @@ async fn execute_planned(
                 )
                 .await
                 {
-                    Ok(()) => {
-                        // Calvin committed; report rows affected as one per task,
-                        // mirroring pgwire's one-tag-per-task synthesis.
-                        let mut r = NativeResponse::ok(seq);
-                        r.rows_affected = Some(tasks.len() as u64);
-                        resp(r)
+                    // Calvin committed. A RETURNING write surfaces its rows from
+                    // the applied Response; a plain write reports one row-affected
+                    // per task, mirroring pgwire's one-tag-per-task synthesis.
+                    Ok(apply_resp) => {
+                        let returning_plan = tasks
+                            .iter()
+                            .find(|t| {
+                                matches!(
+                                    crate::control::server::response_shape::types::describe_plan(
+                                        &t.plan,
+                                    ),
+                                    crate::control::server::response_shape::types::PlanKind::ReturningRows
+                                )
+                            })
+                            .map(|t| t.plan.clone());
+                        resp(super::conversion::calvin_native_response(
+                            seq,
+                            apply_resp,
+                            returning_plan.as_ref(),
+                            tasks.len() as u64,
+                            ctx.state,
+                            database_id,
+                            ctx.tenant_id(),
+                        ))
                     }
                     Err(e) => resp(error_to_native(seq, &e)),
                 };

@@ -151,7 +151,10 @@ impl RaftRpcHandler for EchoHandler {
         &self,
         _req: nodedb_cluster::rpc_codec::SubmitCalvinTxnRequest,
     ) -> nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse {
-        nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse { error: None }
+        nodedb_cluster::rpc_codec::SubmitCalvinTxnResponse {
+            error: None,
+            payload_bytes: None,
+        }
     }
 
     async fn on_submit_calvin_inbox(

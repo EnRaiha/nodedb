@@ -186,7 +186,7 @@ impl NodeDbPgHandler {
                     .is_some()
             {
                 return self
-                    .dispatch_calvin_multishard(tasks, tenant_id, identity, addr)
+                    .dispatch_calvin_multishard(tasks, tenant_id, identity, addr, shaping.formats)
                     .await;
             }
         }
@@ -236,7 +236,13 @@ impl NodeDbPgHandler {
                     == crate::control::server::shared::session::cross_shard_mode::CrossShardTxnMode::Strict
                 {
                     return self
-                        .dispatch_calvin_multishard(tasks, tenant_id, identity, addr)
+                        .dispatch_calvin_multishard(
+                            tasks,
+                            tenant_id,
+                            identity,
+                            addr,
+                            shaping.formats,
+                        )
                         .await;
                 }
             }

@@ -52,9 +52,16 @@ pub struct SubmitCalvinTxnRequest {
 /// leader-side submit-and-await failed (sequencer rejected the txn, assignment /
 /// completion timed out, a channel closed, the `TxClass` failed to decode, or no
 /// Calvin-submit hook is configured).
+///
+/// `payload_bytes` carries the applied transaction's RETURNING rows (the
+/// Data-Plane response payload) back to a remote coordinator when the submitted
+/// write had a RETURNING clause; it is `None` for plain writes with no rows to
+/// surface. These are a QUERY RESULT, not replicated state — they ride this
+/// non-Raft RPC response, never the sequencer Raft log.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct SubmitCalvinTxnResponse {
     pub error: Option<TypedClusterError>,
+    pub payload_bytes: Option<Vec<u8>>,
 }
 
 /// Coordinator → sequencer-leader routed Calvin-INBOX request (Cv1).
@@ -223,8 +230,12 @@ mod tests {
 
     #[test]
     fn roundtrip_submit_calvin_txn_response_ok() {
-        let decoded = roundtrip_resp(SubmitCalvinTxnResponse { error: None });
+        let decoded = roundtrip_resp(SubmitCalvinTxnResponse {
+            error: None,
+            payload_bytes: Some(vec![0xAA, 0xBB]),
+        });
         assert!(decoded.error.is_none());
+        assert_eq!(decoded.payload_bytes, Some(vec![0xAA, 0xBB]));
     }
 
     #[test]
@@ -234,6 +245,7 @@ mod tests {
                 code: 0,
                 message: "calvin-submit not configured".into(),
             }),
+            payload_bytes: None,
         });
         match decoded.error {
             Some(TypedClusterError::Internal { code, message }) => {

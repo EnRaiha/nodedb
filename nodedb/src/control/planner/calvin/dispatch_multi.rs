@@ -23,6 +23,7 @@
 //! dependent predicate must route that case through their own OLLP path; this
 //! helper is the static cross-shard write path only.
 
+use crate::bridge::envelope::Response;
 use crate::control::planner::calvin::{
     CrossShardTxnMode, DispatchClass, build_static_tx_class, classify_dispatch,
     submit_calvin_routed,
@@ -40,15 +41,17 @@ use nodedb_physical::physical_task::PhysicalTask;
 ///   block. Cross-shard writes in an explicit block are rejected with
 ///   [`crate::Error::CrossShardInExplicitTransaction`], matching pgwire.
 ///
-/// On `Ok(())` the Calvin transaction has been submitted and acknowledged by
-/// the sequencer leader; the caller synthesises one command tag per task.
+/// On success the Calvin transaction has been submitted and acknowledged by the
+/// sequencer leader. Returns the applied Data-Plane [`Response`] when the write
+/// carried a RETURNING clause (so the caller can emit its rows), or `None` for a
+/// plain write — where the caller synthesises one command tag per task.
 pub async fn dispatch_tasks_to_calvin(
     state: &SharedState,
     tasks: &[PhysicalTask],
     tenant_id: TenantId,
     cross_shard_mode: CrossShardTxnMode,
     in_txn_block: bool,
-) -> crate::Result<()> {
+) -> crate::Result<Option<Response>> {
     match classify_dispatch(tasks) {
         DispatchClass::MultiShard { .. } => {
             if in_txn_block {

@@ -131,7 +131,10 @@ pub(crate) async fn handle_direct_op(
             )
             .await
             {
-                Ok(()) => {
+                // Edge-bearing INSERT: no RETURNING clause is possible here, so
+                // the applied Response (if any) carries no rows — report one
+                // row-affected per task.
+                Ok(_apply) => {
                     let mut r = NativeResponse::ok(seq);
                     r.rows_affected = Some(tasks.len() as u64);
                     r

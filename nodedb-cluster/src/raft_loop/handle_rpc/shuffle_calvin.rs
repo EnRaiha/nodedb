@@ -157,6 +157,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     code: 0,
                     message: "calvin-submit not configured (no CalvinSubmit installed)".into(),
                 }),
+                payload_bytes: None,
             },
         }
     }

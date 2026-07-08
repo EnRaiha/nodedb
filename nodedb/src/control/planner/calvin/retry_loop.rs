@@ -46,7 +46,7 @@ pub struct DependentRetryArgs<'a, P, SF, RF> {
 
 pub async fn run_dependent_with_retry<P, SF, SFut, RF, RFut>(
     args: DependentRetryArgs<'_, P, SF, RF>,
-) -> crate::Result<()>
+) -> crate::Result<TxnId>
 where
     SF: FnMut(&P) -> SFut,
     SFut: std::future::Future<Output = Result<RoutedAssignment, OllpError>>,
@@ -91,10 +91,8 @@ where
         // assignment phase. The coordinator then awaits completion on its local
         // registry, which receives the replicated completion ack on every
         // sequencer-group member.
-        let completion_rx = registry.register_completion(
-            TxnId::new(assignment.epoch, assignment.position),
-            assignment.participants,
-        );
+        let txn_id = TxnId::new(assignment.epoch, assignment.position);
+        let completion_rx = registry.register_completion(txn_id, assignment.participants);
         let outcome = tokio::time::timeout(timeout, completion_rx)
             .await
             .map_err(|_| Error::Internal {
@@ -105,7 +103,9 @@ where
             })?;
 
         match outcome {
-            AttemptOutcome::Completed => return Ok(()),
+            // Return the completed txn's id so the caller can drain the applied
+            // Response (RETURNING rows) the scheduler deposited before the ack.
+            AttemptOutcome::Completed => return Ok(txn_id),
             AttemptOutcome::Mismatch => {
                 // POST-EXEC predicate drift. The scheduler already released the
                 // aborted attempt's locks before signalling the registry, so a

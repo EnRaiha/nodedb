@@ -30,7 +30,7 @@ use crate::control::planner::implicit_edges::{
     EdgeFieldOverrides, EdgeUpdateCtx, append_implicit_edge_delete_tasks,
     append_implicit_edge_update_tasks, parse_edge_field_overrides,
 };
-use crate::control::state::SharedState;
+use crate::control::state::{CalvinApplyResult, SharedState};
 use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_cluster::calvin::sequencer::error::SequencerError;
 use nodedb_physical::physical_plan::{DocumentOp, OllpPredictedEdge, PhysicalPlan};
@@ -46,15 +46,18 @@ enum EdgeLifecycle {
 
 /// Protocol-neutral result of [`dispatch_dependent_edge_recon`].
 ///
-/// The OLLP dependent-read retry loop ([`run_dependent_with_retry`]) returns
-/// `()` on success — its success is the durable, replicated Calvin commit, not a
-/// Data-Plane payload. The per-task command tags are synthesised by each
-/// protocol from the original task list it already owns; the only neutral fact
-/// to carry back is that the recon-and-commit succeeded for that many tasks.
+/// The per-task command tags are synthesised by each protocol from the original
+/// task list it already owns. When the dependent write carried a RETURNING
+/// clause, `apply_result` carries the applied Data-Plane [`Response`] (with the
+/// deleted/updated rows) that the scheduler deposited before the completion ack,
+/// so the caller emits DATA-ROWs for the RETURNING task instead of a bare tag.
 pub struct DependentReconOutcome {
     /// Number of tasks committed in the dependent Calvin transaction. Callers
     /// synthesise one command tag per task from their original task list.
     pub tasks_dispatched: u64,
+    /// Applied Data-Plane response for the RETURNING doc write, if any. `None`
+    /// for a plain (non-RETURNING) dependent write.
+    pub apply_result: Option<crate::bridge::envelope::Response>,
 }
 
 /// Extract the collection name and serialized filter bytes from a
@@ -442,7 +445,7 @@ pub async fn dispatch_dependent_edge_recon(
         )
     };
 
-    run_dependent_with_retry(DependentRetryArgs {
+    let completed_txn = run_dependent_with_retry(DependentRetryArgs {
         registry,
         orchestrator: orc,
         predicate_class_hash: pred_class,
@@ -454,7 +457,29 @@ pub async fn dispatch_dependent_edge_recon(
     })
     .await?;
 
+    // Completion fired: the scheduler deposited the applied Response (with any
+    // RETURNING rows) into the sidecar before proposing the ack that woke the
+    // retry loop, so the entry is present now if this write carried RETURNING.
+    // Drain it (removing the entry) for the caller to shape into DATA-ROWs; a
+    // `Conflict` (>1 RETURNING participant) fails loudly rather than returning a
+    // partial cross-shard union.
+    let drained = state
+        .calvin_apply_results
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&completed_txn);
+    let apply_result = match drained {
+        Some(CalvinApplyResult::Single(response)) => Some(response),
+        Some(CalvinApplyResult::Conflict) => {
+            return Err(Error::Internal {
+                detail: "multi-participant cross-shard RETURNING not supported".to_owned(),
+            });
+        }
+        None => None,
+    };
+
     Ok(DependentReconOutcome {
         tasks_dispatched: tasks.len() as u64,
+        apply_result,
     })
 }

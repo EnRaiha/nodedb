@@ -307,6 +307,52 @@ impl Scheduler {
         }
 
         if response.status == crate::bridge::envelope::Status::Ok {
+            // Deposit the applied Response (carrying RETURNING rows) into the
+            // local sidecar BEFORE proposing the replicated CompletionAck. The
+            // ack fires the coordinator's completion oneshot on every sequencer
+            // member, so depositing first guarantees the rows are present by the
+            // time the coordinator drains them — no lost result, no race. Only
+            // the RETURNING-bearing participant deposits, so a sibling's row-less
+            // ack cannot clobber the entry the coordinator reads. These rows are
+            // a QUERY RESULT and travel via this in-process sidecar only — never
+            // the sequencer Raft log.
+            if self
+                .pending
+                .get(&txn_id)
+                .map(|p| p.has_returning)
+                .unwrap_or(false)
+            {
+                use std::collections::hash_map::Entry;
+
+                use crate::control::state::CalvinApplyResult;
+
+                let key = nodedb_cluster::calvin::TxnId::new(txn_id.epoch, txn_id.position);
+                let mut results = self
+                    .shared
+                    .calvin_apply_results
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                match results.entry(key) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(CalvinApplyResult::Single(response));
+                    }
+                    Entry::Occupied(mut slot) => {
+                        // A second RETURNING-bearing participant for one Calvin
+                        // txn means a cross-shard RETURNING union, which is
+                        // unsupported. Record Conflict so the coordinator fails
+                        // the statement loudly rather than returning one shard's
+                        // rows. Unreachable under collection-level sharding today.
+                        tracing::error!(
+                            epoch = txn_id.epoch,
+                            position = txn_id.position,
+                            vshard = self.vshard_id,
+                            "multiple RETURNING participants for one Calvin txn — cross-shard \
+                             RETURNING union unsupported"
+                        );
+                        slot.insert(CalvinApplyResult::Conflict);
+                    }
+                }
+            }
             if let Err(e) = self.shared.wal.append_calvin_applied(
                 crate::types::VShardId::new(self.vshard_id),
                 txn_id.epoch,

@@ -69,6 +69,7 @@ impl nodedb_cluster::CalvinSubmit for RegistryCalvinSubmit {
                         code: 0,
                         message: format!("calvin-submit: failed to decode TxClass: {e}"),
                     }),
+                    payload_bytes: None,
                 };
             }
         };
@@ -78,12 +79,19 @@ impl nodedb_cluster::CalvinSubmit for RegistryCalvinSubmit {
 
         let timeout = Duration::from_millis(req.deadline_remaining_ms.max(1));
         match submit_and_await_calvin_with_timeout(&self.state, tx_class, timeout).await {
-            Ok(()) => SubmitCalvinTxnResponse { error: None },
+            // Forward the applied RETURNING payload (drained from this leader's
+            // local sidecar) back to the remote coordinator over the non-Raft
+            // RPC response; `None` for a plain write with no rows to surface.
+            Ok(applied) => SubmitCalvinTxnResponse {
+                error: None,
+                payload_bytes: applied.map(|r| r.payload.to_vec()),
+            },
             Err(e) => SubmitCalvinTxnResponse {
                 error: Some(TypedClusterError::Internal {
                     code: 0,
                     message: format!("calvin-submit local submit-and-await failed: {e}"),
                 }),
+                payload_bytes: None,
             },
         }
     }

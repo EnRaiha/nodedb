@@ -83,6 +83,39 @@ pub(crate) fn plan_vshard(plan: &PhysicalPlan) -> Vec<VShardId> {
     )]
 }
 
+/// Whether any plan in `plans` carries a RETURNING clause.
+///
+/// Only the `Document` DML variants can carry `returning`
+/// (`PointUpdate` / `BulkUpdate` / `PointDelete` / `BulkDelete` /
+/// `UpdateFromJoin`); every other plan is row-less. Used to gate the applied
+/// `Response` deposit so only the RETURNING-bearing participant populates the
+/// coordinator's sidecar.
+pub(crate) fn plans_have_returning(plans: &[PhysicalPlan]) -> bool {
+    plans.iter().any(|plan| {
+        matches!(
+            plan,
+            PhysicalPlan::Document(
+                DocumentOp::PointUpdate {
+                    returning: Some(_),
+                    ..
+                } | DocumentOp::BulkUpdate {
+                    returning: Some(_),
+                    ..
+                } | DocumentOp::PointDelete {
+                    returning: Some(_),
+                    ..
+                } | DocumentOp::BulkDelete {
+                    returning: Some(_),
+                    ..
+                } | DocumentOp::UpdateFromJoin {
+                    returning: Some(_),
+                    ..
+                }
+            )
+        )
+    })
+}
+
 impl Scheduler {
     /// Whether THIS node is currently the leader of the data-group owning this
     /// scheduler's vshard.
@@ -182,6 +215,7 @@ impl Scheduler {
                 return;
             }
         };
+        let has_returning = plans_have_returning(&plans);
         let plan = PhysicalPlan::Meta(MetaOp::CalvinExecuteStatic {
             epoch,
             position,
@@ -260,6 +294,7 @@ impl Scheduler {
                 // no-determinism: dispatch_time is scheduler observability, not Calvin WAL data
                 dispatch_time: dispatch_instant,
                 lock_acquired_time,
+                has_returning,
             },
         );
     }
@@ -310,6 +345,7 @@ impl Scheduler {
                 return;
             }
         };
+        let has_returning = plans_have_returning(&plans);
         let plan = PhysicalPlan::Meta(MetaOp::CalvinExecuteActive {
             epoch,
             position,
@@ -389,6 +425,7 @@ impl Scheduler {
                 // no-determinism: dispatch_time is scheduler observability, not Calvin WAL data
                 dispatch_time: dispatch_instant,
                 lock_acquired_time,
+                has_returning,
             },
         );
     }

@@ -71,6 +71,56 @@ pub(crate) fn ddl_result_to_native(
     }
 }
 
+/// Build the native response for a completed Calvin transaction, surfacing
+/// RETURNING rows when the write carried them.
+///
+/// `apply_result` is the applied Data-Plane response drained from the sidecar
+/// (`None` for a plain write) and `returning_plan` is the RETURNING doc task's
+/// plan (used to derive the shaping kind). When both are present and the plan is
+/// a RETURNING write, the payload is shaped into native columns/rows; otherwise
+/// the response falls back to `fallback_affected` rows-affected — matching the
+/// non-Calvin native DML path.
+pub(crate) fn calvin_native_response(
+    seq: u64,
+    apply_result: Option<crate::bridge::envelope::Response>,
+    returning_plan: Option<&crate::bridge::envelope::PhysicalPlan>,
+    fallback_affected: u64,
+    state: &crate::control::state::SharedState,
+    database_id: nodedb_types::DatabaseId,
+    tenant_id: nodedb_types::TenantId,
+) -> NativeResponse {
+    use crate::control::server::response_shape::compose::{
+        ShapeOutcome, shape_response_materialized,
+    };
+    use crate::control::server::response_shape::types::{PlanKind, describe_plan};
+
+    if let (Some(resp), Some(plan)) = (apply_result, returning_plan)
+        && matches!(describe_plan(plan), PlanKind::ReturningRows)
+        && let Ok(ShapeOutcome::Rows(shaped)) = shape_response_materialized(
+            resp.payload.as_bytes(),
+            plan,
+            PlanKind::ReturningRows,
+            None,
+            state,
+            database_id,
+            tenant_id,
+        )
+    {
+        let (cols, rows) = to_native_columns_rows(&shaped);
+        let mut r = NativeResponse::ok(seq);
+        r.watermark_lsn = resp.watermark_lsn.as_u64();
+        if !cols.is_empty() {
+            r.columns = Some(cols);
+        }
+        r.rows = Some(rows);
+        return r;
+    }
+
+    let mut r = NativeResponse::ok(seq);
+    r.rows_affected = Some(fallback_affected);
+    r
+}
+
 /// Convert protocol-neutral `ShapedRows` (produced by
 /// `response_shape::compose::shape_response_materialized`) into native wire
 /// columns/rows: each JSON scalar cell becomes a typed `Value` via

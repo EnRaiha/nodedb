@@ -41,8 +41,30 @@ use nodedb_cluster::{
 };
 
 use crate::Error;
+use crate::bridge::envelope::Response;
 use crate::control::server::exchange::resolve::register_peers_from_topology;
-use crate::control::state::SharedState;
+use crate::control::state::{CalvinApplyResult, SharedState};
+
+/// Build a minimal Control-Plane [`Response`] carrying only the RETURNING
+/// `payload` bytes forwarded over the cross-node routed-submit RPC.
+///
+/// The coordinator only reads `.payload` (and derives the plan kind from the
+/// task) when shaping RETURNING rows, so the other fields are placeholders: the
+/// authoritative status/LSN already lived on the leader that applied the txn.
+fn synthetic_returning_response(payload_bytes: Vec<u8>) -> Response {
+    use crate::bridge::envelope::{Payload, Status};
+    use crate::types::{Lsn, RequestId};
+
+    Response {
+        request_id: RequestId::new(0),
+        status: Status::Ok,
+        attempt: 1,
+        partial: false,
+        payload: Payload::from_vec(payload_bytes),
+        watermark_lsn: Lsn::ZERO,
+        error_code: None,
+    }
+}
 
 /// Submit `tx_class` to THIS node's Calvin sequencer inbox and await completion.
 ///
@@ -52,7 +74,10 @@ use crate::control::state::SharedState;
 ///
 /// The assignment + completion waits are bounded by
 /// `state.tuning.network.default_deadline_secs`.
-pub async fn submit_and_await_calvin(state: &SharedState, tx_class: TxClass) -> crate::Result<()> {
+pub async fn submit_and_await_calvin(
+    state: &SharedState,
+    tx_class: TxClass,
+) -> crate::Result<Option<Response>> {
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
     submit_and_await_calvin_with_timeout(state, tx_class, timeout).await
 }
@@ -66,7 +91,7 @@ pub async fn submit_and_await_calvin_with_timeout(
     state: &SharedState,
     tx_class: TxClass,
     timeout: Duration,
-) -> crate::Result<()> {
+) -> crate::Result<Option<Response>> {
     let inbox = state
         .sequencer_inbox
         .get()
@@ -110,7 +135,25 @@ pub async fn submit_and_await_calvin_with_timeout(
         });
     }
 
-    Ok(())
+    // Completion fired: the scheduler deposited the applied Response (with any
+    // RETURNING rows) into the sidecar BEFORE proposing the ack that woke this
+    // waiter, so the entry is present now if this write carried RETURNING.
+    // Drain it (removing the entry) and hand it back so the coordinator can emit
+    // DATA-ROW output instead of a bare command tag. `None` for plain writes; a
+    // `Conflict` (>1 RETURNING participant) fails loudly rather than returning a
+    // partial cross-shard union.
+    let drained = state
+        .calvin_apply_results
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&TxnId::new(epoch, position));
+    match drained {
+        Some(CalvinApplyResult::Single(response)) => Ok(Some(response)),
+        Some(CalvinApplyResult::Conflict) => Err(Error::Internal {
+            detail: "multi-participant cross-shard RETURNING not supported".to_owned(),
+        }),
+        None => Ok(None),
+    }
 }
 
 /// Submit a cross-shard Calvin `tx_class`, routing it to the sequencer-group
@@ -126,7 +169,10 @@ pub async fn submit_and_await_calvin_with_timeout(
 ///   replies. Map transport / leader errors to a typed `crate::Error`.
 /// - **No leader elected (0 / none)**: return a typed error — never submit
 ///   locally, since a non-leader submit is silently discarded.
-pub async fn submit_calvin_routed(state: &SharedState, tx_class: TxClass) -> crate::Result<()> {
+pub async fn submit_calvin_routed(
+    state: &SharedState,
+    tx_class: TxClass,
+) -> crate::Result<Option<Response>> {
     // Not cluster mode — single-node is the only sequencer member, hence the
     // leader. Submit-and-await locally.
     let (Some(transport), Some(_routing)) = (
@@ -201,12 +247,21 @@ pub async fn submit_calvin_routed(state: &SharedState, tx_class: TxClass) -> cra
         .send_rpc_with_read_timeout(leader, RaftRpc::SubmitCalvinTxnRequest(req), read_timeout)
         .await
     {
-        Ok(RaftRpc::SubmitCalvinTxnResponse(SubmitCalvinTxnResponse { error: None })) => Ok(()),
-        Ok(RaftRpc::SubmitCalvinTxnResponse(SubmitCalvinTxnResponse { error: Some(e) })) => {
-            Err(Error::Internal {
-                detail: format!("calvin-submit failed on sequencer leader node {leader}: {e:?}"),
-            })
+        Ok(RaftRpc::SubmitCalvinTxnResponse(SubmitCalvinTxnResponse {
+            error: None,
+            payload_bytes,
+        })) => {
+            // The leader drained ITS local sidecar and forwarded the RETURNING
+            // payload bytes over this non-Raft RPC response. Reconstruct a
+            // minimal Control-Plane Response carrying just that payload so the
+            // coordinator emits DATA-ROW output; `None` for plain writes.
+            Ok(payload_bytes.map(synthetic_returning_response))
         }
+        Ok(RaftRpc::SubmitCalvinTxnResponse(SubmitCalvinTxnResponse {
+            error: Some(e), ..
+        })) => Err(Error::Internal {
+            detail: format!("calvin-submit failed on sequencer leader node {leader}: {e:?}"),
+        }),
         Ok(other) => Err(Error::Internal {
             detail: format!("calvin-submit: unexpected reply from node {leader}: {other:?}"),
         }),

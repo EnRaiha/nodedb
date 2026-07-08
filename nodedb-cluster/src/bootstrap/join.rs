@@ -621,7 +621,10 @@ mod tests {
                 &self,
                 _req: crate::rpc_codec::SubmitCalvinTxnRequest,
             ) -> crate::rpc_codec::SubmitCalvinTxnResponse {
-                crate::rpc_codec::SubmitCalvinTxnResponse { error: None }
+                crate::rpc_codec::SubmitCalvinTxnResponse {
+                    error: None,
+                    payload_bytes: None,
+                }
             }
 
             async fn on_submit_calvin_inbox(

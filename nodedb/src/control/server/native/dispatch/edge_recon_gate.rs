@@ -67,17 +67,37 @@ pub(super) async fn try_edge_recon_dispatch(
             Ok(Some(pair)) => pair,
         };
 
+    // Capture the RETURNING doc task's plan (if any) before `tasks` is moved
+    // into the recon call, so a RETURNING dependent delete/update can surface
+    // its rows from the applied Response the coordinator drains.
+    let returning_plan = tasks
+        .iter()
+        .find(|t| {
+            matches!(
+                crate::control::server::response_shape::types::describe_plan(&t.plan),
+                crate::control::server::response_shape::types::PlanKind::ReturningRows
+            )
+        })
+        .map(|t| t.plan.clone());
+
     // All three guards passed — run the OLLP/Calvin coordinator.
     let outcome =
         dispatch_dependent_edge_recon(ctx.state, tasks, ctx.tenant_id(), database_id).await;
 
     EdgeReconResult::Outcome(match outcome {
         Ok(recon) => {
-            let mut r = NativeResponse::ok(seq);
-            // One command tag per original task (matching the pgwire
-            // `one-tag-per-task` synthesis and the MultiShard Calvin arm above).
-            r.rows_affected = Some(recon.tasks_dispatched);
-            resp(r)
+            // A RETURNING dependent write surfaces its deleted/updated rows; a
+            // plain write reports one command tag per original task (matching the
+            // pgwire one-tag-per-task synthesis and the MultiShard Calvin arm).
+            resp(super::conversion::calvin_native_response(
+                seq,
+                recon.apply_result,
+                returning_plan.as_ref(),
+                recon.tasks_dispatched,
+                ctx.state,
+                database_id,
+                ctx.tenant_id(),
+            ))
         }
         Err(e) => resp(error_to_native(seq, &e)),
     })

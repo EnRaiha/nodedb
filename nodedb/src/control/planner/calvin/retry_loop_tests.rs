@@ -131,7 +131,7 @@ fn converges_after_two_mismatches() {
             .await
         };
 
-        assert!(result.is_ok(), "expected Ok(()), got {result:?}");
+        assert!(result.is_ok(), "expected Ok(txn_id), got {result:?}");
         assert_eq!(
             submit_calls.load(Ordering::SeqCst),
             3,
@@ -266,7 +266,7 @@ fn pre_admission_retry_does_not_rescan() {
             .await
         };
 
-        assert!(result.is_ok(), "expected Ok(()), got {result:?}");
+        assert!(result.is_ok(), "expected Ok(txn_id), got {result:?}");
         assert_eq!(
             submit_calls.load(Ordering::SeqCst),
             3,
