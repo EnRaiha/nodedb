@@ -108,8 +108,15 @@ pub struct GatherOutcome {
     /// Single merged msgpack array of all row elements.
     /// Consumed by the pgwire/native response path and `ProviderScan` embedding.
     pub merged_array: Vec<u8>,
-    /// Maximum watermark LSN seen across all responding cores.
+    /// Maximum watermark LSN seen across all responding cores. Retained as the
+    /// scalar fence value for Strong-consistency callers that need one LSN.
     pub watermark_lsn: Lsn,
+    /// Per-shard watermark LSNs — one `(vshard, watermark_lsn)` per responding
+    /// core, NOT collapsed to the max. The transaction read-set records one
+    /// entry per participating shard from this, so a predicate read fanned over
+    /// N cores is validated against each core's own version rather than a
+    /// single global max.
+    pub shard_watermarks: Vec<(VShardId, Lsn)>,
 }
 
 /// Fan `plan` to every Data-Plane core in parallel and gather the results.
@@ -149,7 +156,7 @@ pub async fn gather_all_cores(
     let deadline = Duration::from_secs(deadline_secs);
     let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
     let response_futures = receivers.into_iter().map(|(core_id, mut rx)| async move {
-        match tokio::time::timeout(
+        let result = match tokio::time::timeout(
             deadline,
             crate::control::server::dispatch_utils::collect_bounded_response(
                 &mut rx,
@@ -157,35 +164,38 @@ pub async fn gather_all_cores(
             ),
         )
         .await
-        .map_err(|_| crate::Error::Dispatch {
-            detail: format!("gather timeout on core {core_id}"),
-        })? {
-            Ok(resp) => Ok(resp),
-            Err(crate::control::server::dispatch_utils::DispatchCollectError::OverBudget {
+        {
+            Err(_) => Err(crate::Error::Dispatch {
+                detail: format!("gather timeout on core {core_id}"),
+            }),
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(crate::control::server::dispatch_utils::DispatchCollectError::OverBudget {
                 bytes,
-            }) => Err(crate::Error::ExecutionLimitExceeded {
+            })) => Err(crate::Error::ExecutionLimitExceeded {
                 detail: format!(
                     "gather on core {core_id} exceeded max_query_result_bytes \
                      ({bytes} > {max_result_bytes} bytes)"
                 ),
             }),
-            Err(crate::control::server::dispatch_utils::DispatchCollectError::ChannelClosed) => {
-                Err(crate::Error::Dispatch {
-                    detail: format!("gather channel closed on core {core_id}"),
-                })
-            }
-        }
+            Ok(Err(
+                crate::control::server::dispatch_utils::DispatchCollectError::ChannelClosed,
+            )) => Err(crate::Error::Dispatch {
+                detail: format!("gather channel closed on core {core_id}"),
+            }),
+        };
+        (core_id, result)
     });
 
-    let results: Vec<crate::Result<Response>> = join_all(response_futures).await;
+    let results: Vec<(usize, crate::Result<Response>)> = join_all(response_futures).await;
 
     let mut raw = Vec::new();
     let mut all_elements: Vec<Vec<u8>> = Vec::new();
     let mut max_lsn = Lsn::ZERO;
+    let mut shard_watermarks: Vec<(VShardId, Lsn)> = Vec::new();
     let mut had_error = false;
     let mut error_msg = String::new();
 
-    for result in results {
+    for (core_id, result) in results {
         let resp = match result {
             Ok(r) => r,
             Err(e) => {
@@ -207,6 +217,11 @@ pub async fn gather_all_cores(
             }
             continue;
         }
+
+        // Record this core's own watermark as a participating-shard version,
+        // even when its payload is empty — an empty scan slice is still a
+        // validatable observation at that shard's version (phantom safety).
+        shard_watermarks.push((VShardId::new(core_id as u32), resp.watermark_lsn));
 
         if resp.watermark_lsn > max_lsn {
             max_lsn = resp.watermark_lsn;
@@ -231,6 +246,7 @@ pub async fn gather_all_cores(
         raw,
         merged_array,
         watermark_lsn: max_lsn,
+        shard_watermarks,
     })
 }
 
@@ -381,8 +397,12 @@ pub async fn gather_all_vshards(
         // watermark LSNs back through the gateway response, so Strong-consistency
         // LSN fencing degrades to pass-through on this path.  This is consistent
         // with existing gateway behavior (gateway.execute returns no LSN metadata).
-        // Tracked as a follow-up: propagate watermark_lsn through GatewayResponse.
+        // The cross-node per-shard watermark folds into the gateway wire change
+        // (co-located with cross-shard `txn_id`/`database_id` threading), so no
+        // per-shard watermarks are surfaced here yet — a ZERO read version is
+        // over-conservative (never unsafe) and nothing validates it until then.
         watermark_lsn: Lsn::ZERO,
+        shard_watermarks: Vec::new(),
     })
 }
 

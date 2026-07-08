@@ -14,6 +14,7 @@ mod notice;
 pub mod outcome;
 mod params;
 pub mod read_consistency;
+pub mod read_set;
 pub mod savepoint_ops;
 pub mod staging_gate;
 mod state;
@@ -32,6 +33,7 @@ pub use self::params::{
     is_known_pg_runtime_parameter, is_known_settable_runtime_parameter, parse_set_command,
     parse_show_command,
 };
+pub use self::read_set::{EngineTag, ReadKey, ReadSetEntry, record_read_set};
 pub use self::savepoint_ops::SavepointError;
 pub use self::staging_gate::{
     DetachedTxnScope, DmlTxnCtx, InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError,

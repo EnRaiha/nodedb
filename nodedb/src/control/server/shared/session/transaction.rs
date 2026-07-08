@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::types::{Lsn, TxnId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
+use super::read_set::ReadSetEntry;
 use super::state::TransactionState;
 use super::store::SessionStore;
 
@@ -57,19 +58,20 @@ impl SessionStore {
         .unwrap_or(Ok(()))
     }
 
-    /// Record a read for write conflict detection.
-    pub fn record_read(
-        &self,
-        addr: &SocketAddr,
-        collection: String,
-        document_id: String,
-        read_lsn: Lsn,
-    ) {
+    /// Append captured read-set entries for write conflict detection.
+    ///
+    /// The single write path behind [`super::read_set::record_read_set`]: the
+    /// neutral capture helper builds one [`ReadSetEntry`] per observed shard and
+    /// hands them here. Guarded on the connection being inside a transaction
+    /// block — outside one, the entries are dropped (autocommit reads never
+    /// enter validation).
+    pub fn record_read_entries(&self, addr: &SocketAddr, entries: Vec<ReadSetEntry>) {
+        if entries.is_empty() {
+            return;
+        }
         self.write_session(addr, |session| {
             if session.tx_state == TransactionState::InBlock {
-                session
-                    .tx_read_set
-                    .push((collection, document_id, read_lsn));
+                session.tx_read_set.extend(entries);
             }
         });
     }
@@ -120,7 +122,7 @@ impl SessionStore {
     }
 
     /// Drain the read-set for conflict checking at COMMIT time.
-    pub fn take_read_set(&self, addr: &SocketAddr) -> Vec<(String, String, Lsn)> {
+    pub fn take_read_set(&self, addr: &SocketAddr) -> Vec<ReadSetEntry> {
         self.write_session(addr, |session| std::mem::take(&mut session.tx_read_set))
             .unwrap_or_default()
     }

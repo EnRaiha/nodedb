@@ -17,7 +17,7 @@ use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::staging_gate::{
     InTxnRoute, StagedTagKind, StagingGateError, route_in_tx_write,
 };
-use crate::types::DatabaseId;
+use crate::types::{DatabaseId, Lsn, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::sql_gateway::dispatch_task_via_gateway;
@@ -76,64 +76,94 @@ pub(super) async fn run_dispatch_loop(
         // and statement-time constraint errors. Outside a transaction block,
         // `route_in_tx_write` always returns `Read(task)` unchanged, so the
         // autocommit path is untouched.
-        let task = match route_in_tx_write(ctx.sessions, ctx.peer_addr, task, |stage_task| {
-            dispatch_task(ctx, stage_task)
-        })
-        .await
-        {
-            Ok(InTxnRoute::Read(routed_task)) => *routed_task,
-            Ok(InTxnRoute::Buffered) => {
-                total_affected += 1;
-                continue;
-            }
-            Ok(InTxnRoute::Staged(outcome)) => {
-                if matches!(outcome.kind, StagedTagKind::RawPayload) && !outcome.payload.is_empty()
-                {
-                    let plan_kind = describe_plan(&plan_for_staged_response);
-                    match shape_response_materialized(
-                        &outcome.payload,
-                        &plan_for_staged_response,
-                        plan_kind,
-                        output_schema,
-                        ctx.state,
-                        database_id,
-                        ctx.tenant_id(),
-                    ) {
-                        Ok(ShapeOutcome::Rows(mut shaped)) => {
-                            if let Some(notice) = shaped.notice.take() {
-                                warnings.push(notice);
-                            }
-                            let (cols, rows) = to_native_columns_rows(&shaped);
-                            if !cols.is_empty() && all_columns.is_none() {
-                                all_columns = Some(cols);
-                            }
-                            all_rows.extend(rows);
-                        }
-                        Ok(ShapeOutcome::Passthrough) => {
-                            total_affected += 1;
-                        }
-                        Err(e) => return resp(shape_error_to_native(seq, &e)),
-                    }
-                } else {
-                    total_affected += outcome.affected as u64;
+        let task =
+            match route_in_tx_write(ctx.sessions, ctx.peer_addr, task, |stage_task| async move {
+                dispatch_task(ctx, stage_task).await.map(|(resp, _)| resp)
+            })
+            .await
+            {
+                Ok(InTxnRoute::Read(routed_task)) => *routed_task,
+                Ok(InTxnRoute::Buffered) => {
+                    total_affected += 1;
+                    continue;
                 }
-                continue;
-            }
-            Err(StagingGateError::Dispatch(e)) => return resp(error_to_native(seq, &e)),
-            Err(StagingGateError::Rejected { code }) => {
-                let (_, sqlstate, message) = match code {
-                    Some(code) => error_code_to_sqlstate(&code),
-                    None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-                };
-                return resp(NativeResponse::error(seq, sqlstate, message));
-            }
-        };
+                Ok(InTxnRoute::Staged(outcome)) => {
+                    if matches!(outcome.kind, StagedTagKind::RawPayload)
+                        && !outcome.payload.is_empty()
+                    {
+                        let plan_kind = describe_plan(&plan_for_staged_response);
+                        match shape_response_materialized(
+                            &outcome.payload,
+                            &plan_for_staged_response,
+                            plan_kind,
+                            output_schema,
+                            ctx.state,
+                            database_id,
+                            ctx.tenant_id(),
+                        ) {
+                            Ok(ShapeOutcome::Rows(mut shaped)) => {
+                                if let Some(notice) = shaped.notice.take() {
+                                    warnings.push(notice);
+                                }
+                                let (cols, rows) = to_native_columns_rows(&shaped);
+                                if !cols.is_empty() && all_columns.is_none() {
+                                    all_columns = Some(cols);
+                                }
+                                all_rows.extend(rows);
+                            }
+                            Ok(ShapeOutcome::Passthrough) => {
+                                total_affected += 1;
+                            }
+                            Err(e) => return resp(shape_error_to_native(seq, &e)),
+                        }
+                    } else {
+                        total_affected += outcome.affected as u64;
+                    }
+                    continue;
+                }
+                Err(StagingGateError::Dispatch(e)) => return resp(error_to_native(seq, &e)),
+                Err(StagingGateError::Rejected { code }) => {
+                    let (_, sqlstate, message) = match code {
+                        Some(code) => error_code_to_sqlstate(&code),
+                        None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
+                    };
+                    return resp(NativeResponse::error(seq, sqlstate, message));
+                }
+            };
 
         let plan_for_response = task.plan.clone();
-        let task_resp = match dispatch_task(ctx, task).await {
+        let task_vshard = task.vshard_id;
+        let (task_resp, shard_watermarks) = match dispatch_task(ctx, task).await {
             Ok(r) => r,
             Err(e) => return resp(error_to_native(seq, &e)),
         };
+
+        // Track reads for snapshot-isolation / cross-shard conflict detection at
+        // the protocol-neutral layer — the native (canonical) transport records
+        // identically to pgwire. Recorded BEFORE the error short-circuit so an
+        // absent-key point read (a `NotFound` from the Data Plane) is captured
+        // too; a "not found" is a validatable phantom observation. A multi-core
+        // fan read records one entry per participating shard from the gather's
+        // per-shard watermarks; a single read falls back to its one watermark.
+        let records_read = task_resp.status == Status::Ok
+            || task_resp.error_code == Some(crate::bridge::envelope::ErrorCode::NotFound);
+        if records_read
+            && ctx.sessions.transaction_state(ctx.peer_addr)
+                == crate::control::server::shared::session::TransactionState::InBlock
+        {
+            let watermarks = if shard_watermarks.is_empty() {
+                vec![(task_vshard, task_resp.watermark_lsn)]
+            } else {
+                shard_watermarks
+            };
+            crate::control::server::shared::session::record_read_set(
+                ctx.sessions,
+                ctx.peer_addr,
+                ctx.tenant_id(),
+                &plan_for_response,
+                &watermarks,
+            );
+        }
 
         if task_resp.status == Status::Error {
             let msg = if task_resp.payload.is_empty() {
@@ -207,14 +237,22 @@ pub(super) async fn run_dispatch_loop(
 /// Broadcast plans (scans, InsertSelect) are handled locally; all other tasks
 /// flow through `dispatch_task_via_gateway` which routes via the gateway when
 /// available, or falls back to the local SPSC path on single-node boot.
-async fn dispatch_task(ctx: &DispatchCtx<'_>, mut task: PhysicalTask) -> crate::Result<Response> {
+/// Dispatch a single PhysicalTask, returning the response plus the per-shard
+/// watermark LSNs a single-node fan gather observed (one `(vshard, watermark)`
+/// per responding core). The list is empty for a non-gathered dispatch; the
+/// transactional read-recording seam in [`run_dispatch_loop`] then falls back
+/// to the single response watermark.
+async fn dispatch_task(
+    ctx: &DispatchCtx<'_>,
+    mut task: PhysicalTask,
+) -> crate::Result<(Response, Vec<(VShardId, Lsn)>)> {
     if matches!(
         task.plan,
         crate::bridge::envelope::PhysicalPlan::Document(
             nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. }
         )
     ) {
-        return broadcast_count_to_all_cores(
+        let resp = broadcast_count_to_all_cores(
             ctx.state,
             task.tenant_id,
             task.database_id,
@@ -222,7 +260,8 @@ async fn dispatch_task(ctx: &DispatchCtx<'_>, mut task: PhysicalTask) -> crate::
             TraceId::ZERO,
             "inserted",
         )
-        .await;
+        .await?;
+        return Ok((resp, Vec::new()));
     }
 
     // `DROP ARRAY` fans out to every core so per-core stores are released.
@@ -232,7 +271,7 @@ async fn dispatch_task(ctx: &DispatchCtx<'_>, mut task: PhysicalTask) -> crate::
             nodedb_physical::physical_plan::ArrayOp::DropArray { .. }
         )
     ) {
-        return broadcast_count_to_all_cores(
+        let resp = broadcast_count_to_all_cores(
             ctx.state,
             task.tenant_id,
             task.database_id,
@@ -240,7 +279,8 @@ async fn dispatch_task(ctx: &DispatchCtx<'_>, mut task: PhysicalTask) -> crate::
             TraceId::ZERO,
             "dropped",
         )
-        .await;
+        .await?;
+        return Ok((resp, Vec::new()));
     }
 
     // Exchange resolution: materialize catalog providers and resolve any
@@ -256,19 +296,21 @@ async fn dispatch_task(ctx: &DispatchCtx<'_>, mut task: PhysicalTask) -> crate::
     )
     .await?
     {
-        Resolved::Gathered(resp) => return Ok(resp),
+        Resolved::Gathered(resp, shard_watermarks) => return Ok((resp, shard_watermarks)),
         Resolved::Plan(resolved_plan) => {
             task.plan = resolved_plan;
         }
         // Native path materializes the stream into a Response (it streams later
         // in its own effort); preserves the existing gather-then-return shape.
         Resolved::Stream(s) => {
-            return crate::control::server::exchange::gather::stream_to_response(s).await;
+            let resp = crate::control::server::exchange::gather::stream_to_response(s).await?;
+            return Ok((resp, Vec::new()));
         }
     }
 
     // All other tasks — point ops, writes, Raft-replicated writes — route
     // through the gateway when available (cluster-aware routing + retry),
     // or via the local SPSC path when the gateway is not yet wired.
-    dispatch_task_via_gateway(ctx, task).await
+    let resp = dispatch_task_via_gateway(ctx, task).await?;
+    Ok((resp, Vec::new()))
 }

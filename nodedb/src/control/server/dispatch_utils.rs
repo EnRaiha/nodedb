@@ -267,7 +267,9 @@ async fn dispatch_to_data_plane_inner(
     )
     .await?
     {
-        crate::control::server::exchange::Resolved::Gathered(resp) => return Ok(resp),
+        crate::control::server::exchange::Resolved::Gathered(resp, _shard_watermarks) => {
+            return Ok(resp);
+        }
         crate::control::server::exchange::Resolved::Plan(p) => p,
         // Internal funnel callers want a fully-collected Response, not a lazy
         // stream: materialize the stream into one merged-array Response,

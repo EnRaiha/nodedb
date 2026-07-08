@@ -298,7 +298,12 @@ pub async fn resolve_shuffle_join(
     // staged sides are consumed; there is no coordinator-side cleanup hook to
     // call here. No leak: each `(shuffle_id, part, side)` inbox is dropped by
     // the part-owner after its consume completes.
-    Ok(Resolved::Gathered(outcome_to_response(merged, Lsn::ZERO)))
+    // Cross-node shuffle join: per-shard watermarks are not threaded through
+    // the shuffle transport, so no per-shard read versions are surfaced here.
+    Ok(Resolved::Gathered(
+        outcome_to_response(merged, Lsn::ZERO),
+        Vec::new(),
+    ))
 }
 
 /// Send one `ShuffleProduceRequest` and map the reply / RPC error to a typed

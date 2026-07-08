@@ -4,9 +4,11 @@
 //! server entrypoint (pgwire, native, http) and the transaction orchestrator.
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::server::shared::session::read_set::{EngineTag, ReadKey};
+use crate::types::KeyRepr;
 use nodedb_physical::physical_plan::{
-    ColumnarOp, CrdtOp, DocumentOp, GraphOp, MetaOp, QueryOp, SpatialOp, TextOp, TimeseriesOp,
-    VectorOp,
+    ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, MetaOp, QueryOp, SpatialOp, TextOp,
+    TimeseriesOp, VectorOp,
 };
 
 /// Extract the collection name from a physical plan (if applicable).
@@ -94,10 +96,12 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         PhysicalPlan::Query(QueryOp::Exchange(op)) => extract_collection(&op.child),
         // ProviderScan is a catalog/constant source — no user collection.
         PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
-        // All remaining ops carry no extractable user collection here. The
+        // KV ops carry their own collection (sorted-index-only ops return None).
+        PhysicalPlan::Kv(op) => op.collection(),
+        // All remaining ops carry no extractable user collection here: the
         // specific arms above take precedence; these inner wildcards catch the
         // unmatched ops of each engine plus the engines with no arms at all
-        // (Kv, Array, ClusterArray). Exhaustive so a new PhysicalPlan variant
+        // (Array, ClusterArray). Exhaustive so a new PhysicalPlan variant
         // forces a decision rather than silently returning None.
         PhysicalPlan::Document(_)
         | PhysicalPlan::Vector(_)
@@ -107,8 +111,69 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Crdt(_)
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
-        | PhysicalPlan::Kv(_)
         | PhysicalPlan::Array(_)
         | PhysicalPlan::ClusterArray(_) => None,
+    }
+}
+
+/// Classify which peer engine a plan targets. Total over the top-level
+/// [`PhysicalPlan`] variants (one-to-one with [`EngineTag`]) so a new engine
+/// forces an explicit decision rather than a silent default.
+pub(crate) fn plan_engine(plan: &PhysicalPlan) -> EngineTag {
+    match plan {
+        PhysicalPlan::Vector(_) => EngineTag::Vector,
+        PhysicalPlan::Graph(_) => EngineTag::Graph,
+        PhysicalPlan::Document(_) => EngineTag::Document,
+        PhysicalPlan::Kv(_) => EngineTag::Kv,
+        PhysicalPlan::Text(_) => EngineTag::Text,
+        PhysicalPlan::Columnar(_) => EngineTag::Columnar,
+        PhysicalPlan::Timeseries(_) => EngineTag::Timeseries,
+        PhysicalPlan::Spatial(_) => EngineTag::Spatial,
+        PhysicalPlan::Crdt(_) => EngineTag::Crdt,
+        PhysicalPlan::Query(_) => EngineTag::Query,
+        PhysicalPlan::Meta(_) => EngineTag::Meta,
+        PhysicalPlan::Array(_) => EngineTag::Array,
+        PhysicalPlan::ClusterArray(_) => EngineTag::ClusterArray,
+    }
+}
+
+/// Classify a read plan's observed identity for the transaction read-set.
+///
+/// Single-row keyed lookups whose identity maps to exactly one [`KeyRepr`]
+/// record [`ReadKey::Point`]:
+/// - `DocumentOp::PointGet` — the row's cross-engine surrogate.
+/// - `KvOp::Get` / `KvOp::FieldGet` — the raw KV key bytes.
+///
+/// Everything else records [`ReadKey::Predicate`] (collection-scoped, phantom-
+/// safe). This deliberately includes keyed ops whose observation cannot be
+/// captured by a single `KeyRepr` without under-approximating — `KvOp::BatchGet`
+/// (many keys) and `DocumentOp::IndexedFetch` (a secondary-index equality that
+/// can match many rows). A single-key repr for those would MISS the other keys
+/// / rows they observed, which is the one thing phantom safety forbids; the
+/// coarse collection floor over-aborts instead, which is always safe. The match
+/// is total over [`PhysicalPlan`] so a new variant forces a classification.
+pub(crate) fn read_key_of(plan: &PhysicalPlan) -> ReadKey {
+    match plan {
+        PhysicalPlan::Document(DocumentOp::PointGet { surrogate, .. }) => ReadKey::Point {
+            repr: KeyRepr::Surrogate(surrogate.as_u32()),
+        },
+        PhysicalPlan::Kv(KvOp::Get { key, .. }) | PhysicalPlan::Kv(KvOp::FieldGet { key, .. }) => {
+            ReadKey::Point {
+                repr: KeyRepr::KvKey(key.clone().into_boxed_slice()),
+            }
+        }
+        PhysicalPlan::Document(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_) => ReadKey::Predicate,
     }
 }

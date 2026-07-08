@@ -2,11 +2,13 @@
 
 pub mod consistency;
 pub mod id;
+pub mod identity;
 pub mod lsn;
 pub mod snapshot;
 
 pub use consistency::ReadConsistency;
 pub use id::{DatabaseId, DocumentId, RequestId, TenantId, TxnId, VShardId};
+pub use identity::KeyRepr;
 pub use lsn::Lsn;
 pub use nodedb_types::{SpanId, TraceId};
 pub use snapshot::{

@@ -311,7 +311,12 @@ pub async fn resolve_shuffle_aggregate(
     }
     let merged = encode_msgpack_array(&elements);
 
-    Ok(Resolved::Gathered(outcome_to_response(merged, Lsn::ZERO)))
+    // Cross-node shuffle aggregate: per-shard watermarks are not threaded
+    // through the shuffle transport, so no per-shard read versions here.
+    Ok(Resolved::Gathered(
+        outcome_to_response(merged, Lsn::ZERO),
+        Vec::new(),
+    ))
 }
 
 /// Send one `ShuffleProduceRequest` and map the reply / RPC error to a typed

@@ -16,7 +16,7 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::super::types::{error_to_sqlstate, response_status_to_sqlstate, sqlstate_error};
 use super::super::core::NodeDbPgHandler;
-use super::super::plan::{describe_plan, extract_collection, payload_to_response};
+use super::super::plan::{describe_plan, payload_to_response};
 use super::super::shape_encode;
 use super::planning::consistency_for_tasks;
 use super::set_ops;
@@ -313,9 +313,9 @@ impl NodeDbPgHandler {
             }
 
             let plan_kind = describe_plan(&task.plan);
-            let collection_for_si = extract_collection(&task.plan).map(String::from);
             let resp_post_set_op = task.post_set_op;
             let task_database_id = task.database_id;
+            let task_vshard = task.vshard_id;
             let plan_for_response = task.plan.clone();
 
             // Single-node pgwire streaming fast path (autocommit SELECT only).
@@ -367,8 +367,8 @@ impl NodeDbPgHandler {
             // --- Normal dispatch ---
             let user_id: Option<std::sync::Arc<str>> =
                 Some(std::sync::Arc::from(identity.username.as_str()));
-            let resp = self
-                .dispatch_task(task, user_id, Some(identity))
+            let (resp, shard_watermarks) = self
+                .dispatch_task_with_watermarks(task, user_id, Some(identity))
                 .await
                 .map_err(|e| {
                     let (severity, code, message) = error_to_sqlstate(&e);
@@ -378,6 +378,32 @@ impl NodeDbPgHandler {
                         message,
                     )))
                 })?;
+
+            // Track reads for snapshot-isolation / cross-shard conflict detection
+            // at the protocol-neutral layer. Recorded BEFORE the error
+            // short-circuit so an absent-key point read (a `NotFound` from the
+            // Data Plane) is still captured — a "not found" is a validatable
+            // phantom observation, not a no-op. Only successful reads and
+            // not-found reads record; a genuine dispatch failure does not.
+            let records_read = resp.status == crate::bridge::envelope::Status::Ok
+                || resp.error_code == Some(crate::bridge::envelope::ErrorCode::NotFound);
+            if records_read
+                && self.sessions.transaction_state(addr)
+                    == crate::control::server::shared::session::TransactionState::InBlock
+            {
+                let watermarks = if shard_watermarks.is_empty() {
+                    vec![(task_vshard, resp.watermark_lsn)]
+                } else {
+                    shard_watermarks
+                };
+                crate::control::server::shared::session::record_read_set(
+                    &self.sessions,
+                    addr,
+                    identity.tenant_id,
+                    &plan_for_response,
+                    &watermarks,
+                );
+            }
 
             if let Some((severity, code, message)) =
                 response_status_to_sqlstate(resp.status, &resp.error_code)
@@ -421,15 +447,6 @@ impl NodeDbPgHandler {
                 self.state
                     .dml_counter
                     .record_dml(tenant_id.as_u64(), &info.collection);
-            }
-
-            // Track reads for snapshot isolation conflict detection.
-            if self.sessions.transaction_state(addr)
-                == crate::control::server::shared::session::TransactionState::InBlock
-                && let Some(collection) = collection_for_si
-            {
-                self.sessions
-                    .record_read(addr, collection, String::new(), resp.watermark_lsn);
             }
 
             if needs_set_op && resp_post_set_op != PostSetOp::None {

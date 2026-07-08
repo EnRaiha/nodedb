@@ -226,6 +226,23 @@ pub(crate) async fn handle_graph_match(
         Err(e) => return error_to_native(seq, &e),
     };
 
+    // A MATCH issued inside a native transaction records a collection-scoped
+    // predicate read at the shard's watermark, identical to every other read
+    // seam. Single-shard direct op → one watermark, one entry.
+    if (resp.status == Status::Ok
+        || resp.error_code == Some(crate::bridge::envelope::ErrorCode::NotFound))
+        && ctx.sessions.transaction_state(ctx.peer_addr)
+            == crate::control::server::shared::session::TransactionState::InBlock
+    {
+        crate::control::server::shared::session::record_read_set(
+            ctx.sessions,
+            ctx.peer_addr,
+            ctx.tenant_id(),
+            &plan_for_response,
+            &[(vshard_id, resp.watermark_lsn)],
+        );
+    }
+
     if resp.status == Status::Error {
         return data_plane_response_to_native(ctx, seq, &plan_for_response, &resp);
     }
@@ -326,10 +343,33 @@ async fn dispatch_single_task(
     };
 
     let plan_for_response = task.plan.clone();
+    let task_vshard = task.vshard_id;
     match dispatch_single_task_raw(ctx, task.tenant_id, task.vshard_id, task.plan, task.txn_id)
         .await
     {
-        Ok(resp) => data_plane_response_to_native(ctx, seq, &plan_for_response, &resp),
+        Ok(resp) => {
+            // Track direct-op reads (PointGet / RangeScan / VectorSearch / KV
+            // Get) for conflict detection at the protocol-neutral layer, so
+            // native direct-ops record identically to native SQL and pgwire.
+            // Absent-key reads record too (a `NotFound` is a validatable phantom
+            // observation). Direct ops are single-shard, so one watermark → one
+            // entry.
+            let records_read = resp.status == Status::Ok
+                || resp.error_code == Some(crate::bridge::envelope::ErrorCode::NotFound);
+            if records_read
+                && ctx.sessions.transaction_state(ctx.peer_addr)
+                    == crate::control::server::shared::session::TransactionState::InBlock
+            {
+                crate::control::server::shared::session::record_read_set(
+                    ctx.sessions,
+                    ctx.peer_addr,
+                    ctx.tenant_id(),
+                    &plan_for_response,
+                    &[(task_vshard, resp.watermark_lsn)],
+                );
+            }
+            data_plane_response_to_native(ctx, seq, &plan_for_response, &resp)
+        }
         Err(e) => error_to_native(seq, &e),
     }
 }

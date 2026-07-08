@@ -27,6 +27,11 @@ use crate::types::Lsn;
 
 use super::CoreLoop;
 
+/// Row identity type, re-exported from its plane-neutral home
+/// ([`crate::types::KeyRepr`]) so Data-Plane call sites can keep referring to
+/// it through this module. Read keys and write keys share this one namespace.
+pub use crate::types::KeyRepr;
+
 /// Horizon retain window for per-key entries, in LSNs. Horizon GC evicts any
 /// `last_write_lsn` entry whose LSN is more than this far below the core
 /// watermark. Sized in the same order of magnitude as the idempotency-cache
@@ -39,28 +44,6 @@ const RETAIN_WINDOW: u64 = 16_384;
 /// window), the lowest-LSN (oldest) entries are dropped until the map is back
 /// within bound.
 const MAX_KEY_ENTRIES: usize = 65_536;
-
-/// Identity of a written row within a collection.
-///
-/// The engine that owns the write chooses the representation:
-/// - `Surrogate` for the cross-engine `u32` surrogate (schemaless + strict
-///   document writes, and vector-by-document upserts keyed on the owning doc).
-/// - `KvKey` for the raw Key-Value engine key bytes.
-/// - `Edge` for a graph edge, whose identity is the `(src, label, dst)` tuple
-///   rather than a surrogate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum KeyRepr {
-    /// Cross-engine `u32` surrogate identity.
-    Surrogate(u32),
-    /// Raw Key-Value engine key bytes.
-    KvKey(Box<[u8]>),
-    /// Graph edge identity: `(source node, edge label, destination node)`.
-    Edge {
-        src: Box<str>,
-        label: Box<str>,
-        dst: Box<str>,
-    },
-}
 
 /// Fully-qualified per-key version-index key. Scoped by `(database, tenant)`
 /// exactly like the write path, so two tenants (or databases) never alias.

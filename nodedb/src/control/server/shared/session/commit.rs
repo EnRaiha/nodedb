@@ -49,11 +49,13 @@ pub async fn run_commit(
     if let Some(snapshot_lsn) = sessions.snapshot_lsn(addr) {
         let current_lsn = state.wal.next_lsn();
         let current = crate::types::Lsn::new(current_lsn.as_u64().saturating_sub(1));
-        for (collection, _doc_id, read_lsn) in &read_set {
+        for entry in &read_set {
+            let collection = &entry.collection;
+            let read_lsn = entry.read_lsn;
             if written_collections.contains(collection) {
                 continue;
             }
-            if current > *read_lsn && current > snapshot_lsn {
+            if current > read_lsn && current > snapshot_lsn {
                 // WAL advanced past what we read — concurrent write detected.
                 if let Ok(reservations) = sessions.rollback(addr) {
                     for handle in &reservations {

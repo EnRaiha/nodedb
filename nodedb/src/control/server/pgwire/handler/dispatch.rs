@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::bridge::envelope::{Priority, Request, Response};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::exchange::resolve::{Resolved, resolve_and_materialize};
-use crate::types::{DatabaseId, Lsn, ReadConsistency, TraceId};
+use crate::types::{DatabaseId, Lsn, ReadConsistency, TraceId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::core::NodeDbPgHandler;
@@ -43,8 +43,39 @@ impl NodeDbPgHandler {
         user_id: Option<Arc<str>>,
         identity: Option<&AuthenticatedIdentity>,
     ) -> crate::Result<Response> {
+        let mut shard_watermarks = Vec::new();
+        self.dispatch_task_hlc(task, user_id, identity, &mut shard_watermarks)
+            .await
+    }
+
+    /// Dispatch a single physical task and return both the response and the
+    /// per-shard watermark LSNs a single-node fan gather observed (empty for a
+    /// non-gathered read). Used by the transactional read-recording seam so a
+    /// multi-core fan read records one read-set entry per participating shard.
+    pub(super) async fn dispatch_task_with_watermarks(
+        &self,
+        task: PhysicalTask,
+        user_id: Option<Arc<str>>,
+        identity: Option<&AuthenticatedIdentity>,
+    ) -> crate::Result<(Response, Vec<(VShardId, Lsn)>)> {
+        let mut shard_watermarks = Vec::new();
+        let resp = self
+            .dispatch_task_hlc(task, user_id, identity, &mut shard_watermarks)
+            .await?;
+        Ok((resp, shard_watermarks))
+    }
+
+    async fn dispatch_task_hlc(
+        &self,
+        task: PhysicalTask,
+        user_id: Option<Arc<str>>,
+        identity: Option<&AuthenticatedIdentity>,
+        shard_watermarks: &mut Vec<(VShardId, Lsn)>,
+    ) -> crate::Result<Response> {
         let tenant_id = task.tenant_id;
-        let result = self.dispatch_task_inner(task, user_id, identity).await;
+        let result = self
+            .dispatch_task_inner(task, user_id, identity, shard_watermarks)
+            .await;
         // Advance per-tenant observed write-HLC high-water on any
         // successful dispatch (local, raft-replicated, or broadcast).
         // Used by RESTORE's staleness gate. Backup captures envelope
@@ -63,6 +94,7 @@ impl NodeDbPgHandler {
         mut task: PhysicalTask,
         user_id: Option<Arc<str>>,
         identity: Option<&AuthenticatedIdentity>,
+        shard_watermarks: &mut Vec<(VShardId, Lsn)>,
     ) -> crate::Result<Response> {
         // Reject user writes against a source database that is currently
         // frozen by a clone materializer sweep.  Reads and DDL pass through
@@ -174,7 +206,10 @@ impl NodeDbPgHandler {
             )
             .await?
             {
-                Resolved::Gathered(resp) => return Ok(resp),
+                Resolved::Gathered(resp, wms) => {
+                    *shard_watermarks = wms;
+                    return Ok(resp);
+                }
                 Resolved::Plan(resolved_plan) => {
                     task.plan = resolved_plan;
                 }

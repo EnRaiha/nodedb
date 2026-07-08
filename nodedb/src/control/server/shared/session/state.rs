@@ -78,11 +78,12 @@ pub struct ConnSession {
     /// assumption, this is where the staging overlay lives — used to target
     /// `MetaOp::DropTxnOverlay` at COMMIT/ROLLBACK. `None` until the first write.
     pub tx_vshard: Option<VShardId>,
-    /// Read-set: (collection, document_id, read_lsn) tuples for write
-    /// conflict detection. At COMMIT, each entry is checked — if the
-    /// document's current LSN > read_lsn, a concurrent write occurred
-    /// and the transaction is rejected with SERIALIZATION_FAILURE.
-    pub tx_read_set: Vec<(String, String, Lsn)>,
+    /// Read-set: LSN-versioned, predicate-aware entries for write conflict
+    /// detection, captured on the shared read seam by every transport. At
+    /// COMMIT, each entry is checked — if the entry's collection has a current
+    /// write-LSN past `read_lsn`, a concurrent write occurred and the
+    /// transaction is rejected with SERIALIZATION_FAILURE.
+    pub tx_read_set: Vec<super::read_set::ReadSetEntry>,
     /// Savepoint stack: each entry is `(name, tx_buffer_len_at_savepoint,
     /// value_overlay_marker, graph_overlay_marker)`.
     /// On ROLLBACK TO, truncate tx_buffer to the saved length AND rewind both
