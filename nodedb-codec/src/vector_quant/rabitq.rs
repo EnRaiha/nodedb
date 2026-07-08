@@ -245,14 +245,13 @@ impl RaBitQCodec {
         wht_inplace(&mut sign_buf);
         // Re-apply signed diagonal (D is its own inverse since flips are ±1)
         let mut seed = self.rotation_seed;
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..dim {
+        for x in sign_buf.iter_mut().take(dim) {
             let flip = if xorshift64(&mut seed) & 1 == 0 {
                 1.0f32
             } else {
                 -1.0f32
             };
-            sign_buf[i] *= flip;
+            *x *= flip;
         }
         let dot_raw: f32 = residual
             .iter()

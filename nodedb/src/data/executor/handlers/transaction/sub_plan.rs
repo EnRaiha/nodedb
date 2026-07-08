@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Per-sub-plan execution within a transaction batch.
+//! Per-sub-plan dispatch within a transaction batch.
+//!
+//! Write-op execution helpers (the pieces that actually mutate engine state
+//! and record undo entries) live in `sub_plan_write.rs`; this file only
+//! routes each `PhysicalPlan` variant to its engine-specific handler.
 
-use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
+use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{DatabaseId, TenantId, TraceId};
@@ -11,6 +15,7 @@ use nodedb_physical::physical_plan::{
 };
 
 use super::sub_plan_doc::{TxPointDelete, TxPointPut};
+use super::sub_plan_write::{TxEdgeDeleteParams, TxEdgePutParams, TxVectorInsertParams};
 use super::undo::UndoEntry;
 
 impl CoreLoop {
@@ -19,10 +24,10 @@ impl CoreLoop {
     /// CRDT deltas are NOT applied immediately — they are buffered in
     /// `crdt_deltas` and only applied after all sub-plans succeed.
     ///
-    /// The match is exhaustive: every `PhysicalPlan` variant is explicitly
-    /// handled. Write-producing variants push an `UndoEntry`; read-only and
-    /// DDL variants pass through without undo tracking.
-    #[allow(clippy::too_many_lines)]
+    /// Dispatches by outer `PhysicalPlan` variant to a per-engine helper.
+    /// Each helper handles that engine's write sub-ops (pushing an
+    /// `UndoEntry`) and routes every other sub-op through the standard
+    /// read-only / DDL dispatch path.
     pub(super) fn execute_tx_sub_plan(
         &mut self,
         tid: u64,
@@ -31,8 +36,38 @@ impl CoreLoop {
         crdt_deltas: &mut Vec<(Vec<u8>, u64, String)>,
         user_roles: &[String],
     ) -> Result<Response, ErrorCode> {
-        // Temporary task used for sub-plan response construction.
-        let dummy_task = ExecutionTask::new(crate::bridge::envelope::Request {
+        let dummy_task = Self::build_dummy_task(tid);
+
+        match plan {
+            PhysicalPlan::Document(op) => {
+                self.exec_tx_document(&dummy_task, tid, plan, op, user_roles, undo_log)
+            }
+            PhysicalPlan::Vector(op) => self.exec_tx_vector(&dummy_task, tid, plan, op, undo_log),
+            PhysicalPlan::Graph(op) => self.exec_tx_graph(&dummy_task, tid, plan, op, undo_log),
+            PhysicalPlan::Crdt(op) => self.exec_tx_crdt(&dummy_task, tid, plan, op, crdt_deltas),
+            PhysicalPlan::Kv(kv_op) => self.execute_tx_kv(&dummy_task, tid, kv_op, undo_log),
+            PhysicalPlan::Columnar(op) => {
+                self.exec_tx_columnar(&dummy_task, tid, plan, op, undo_log)
+            }
+            PhysicalPlan::Timeseries(op) => {
+                self.exec_tx_timeseries(&dummy_task, tid, plan, op, undo_log)
+            }
+            PhysicalPlan::Spatial(_)
+            | PhysicalPlan::Text(_)
+            | PhysicalPlan::Query(_)
+            | PhysicalPlan::Meta(_)
+            | PhysicalPlan::Array(_)
+            | PhysicalPlan::ClusterArray(_) => self.exec_tx_passthrough(tid, plan),
+        }
+    }
+
+    /// Build the ephemeral task used for sub-plan response construction.
+    ///
+    /// no-determinism: the deadline is ephemeral, not written to WAL. The
+    /// placeholder `plan` (a no-op `Meta::Cancel`) is never executed; it
+    /// only carries request metadata for response building.
+    pub(super) fn build_dummy_task(tid: u64) -> ExecutionTask {
+        ExecutionTask::new(crate::bridge::envelope::Request {
             request_id: crate::types::RequestId::new(0),
             tenant_id: TenantId::new(tid),
             database_id: DatabaseId::DEFAULT,
@@ -40,7 +75,6 @@ impl CoreLoop {
             plan: PhysicalPlan::Meta(MetaOp::Cancel {
                 target_request_id: crate::types::RequestId::new(0),
             }),
-            // no-determinism: sub-plan deadline is ephemeral, not written to WAL
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
             priority: crate::bridge::envelope::Priority::Normal,
             trace_id: TraceId::ZERO,
@@ -51,19 +85,30 @@ impl CoreLoop {
             user_id: None,
             statement_digest: None,
             txn_id: None,
-        });
+        })
+    }
 
-        match plan {
-            // ── Document writes ──────────────────────────────────────────────
-            PhysicalPlan::Document(DocumentOp::PointPut {
+    /// Document engine: point writes are undo-tracked; everything else
+    /// (point reads, scans, DDL) passes through the standard dispatch path.
+    fn exec_tx_document(
+        &mut self,
+        dummy_task: &ExecutionTask,
+        tid: u64,
+        plan: &PhysicalPlan,
+        op: &DocumentOp,
+        user_roles: &[String],
+        undo_log: &mut Vec<UndoEntry>,
+    ) -> Result<Response, ErrorCode> {
+        match op {
+            DocumentOp::PointPut {
                 collection,
                 document_id,
                 value,
                 surrogate,
                 ..
-            }) => self.tx_point_put(
+            } => self.tx_point_put(
                 TxPointPut {
-                    task: &dummy_task,
+                    task: dummy_task,
                     tid,
                     collection,
                     document_id,
@@ -75,15 +120,15 @@ impl CoreLoop {
                 undo_log,
             ),
 
-            PhysicalPlan::Document(DocumentOp::PointInsert {
+            DocumentOp::PointInsert {
                 collection,
                 document_id,
                 value,
                 if_absent,
                 surrogate,
-            }) => self.tx_point_put(
+            } => self.tx_point_put(
                 TxPointPut {
-                    task: &dummy_task,
+                    task: dummy_task,
                     tid,
                     collection,
                     document_id,
@@ -95,14 +140,14 @@ impl CoreLoop {
                 undo_log,
             ),
 
-            PhysicalPlan::Document(DocumentOp::PointDelete {
+            DocumentOp::PointDelete {
                 collection,
                 document_id,
                 surrogate,
                 ..
-            }) => self.tx_point_delete(
+            } => self.tx_point_delete(
                 TxPointDelete {
-                    task: &dummy_task,
+                    task: dummy_task,
                     tid,
                     collection,
                     document_id,
@@ -112,8 +157,22 @@ impl CoreLoop {
                 undo_log,
             ),
 
-            // ── Vector writes ────────────────────────────────────────────────
-            PhysicalPlan::Vector(VectorOp::Insert {
+            _ => self.exec_tx_passthrough(tid, plan),
+        }
+    }
+
+    /// Vector engine: primary-vector insert/delete are undo-tracked;
+    /// everything else passes through the standard dispatch path.
+    fn exec_tx_vector(
+        &mut self,
+        dummy_task: &ExecutionTask,
+        tid: u64,
+        plan: &PhysicalPlan,
+        op: &VectorOp,
+        undo_log: &mut Vec<UndoEntry>,
+    ) -> Result<Response, ErrorCode> {
+        match op {
+            VectorOp::Insert {
                 collection,
                 vector,
                 dim,
@@ -121,81 +180,40 @@ impl CoreLoop {
                 surrogate,
                 pk_bytes: _,
                 provenance: _,
-            }) => {
-                let index_key = Self::vector_index_key(
-                    dummy_task.request.database_id.as_u64(),
-                    tid,
+            } => self.exec_tx_vector_insert(
+                dummy_task,
+                tid,
+                TxVectorInsertParams {
                     collection,
+                    vector,
+                    dim: *dim,
                     field_name,
-                );
-                let params = self
-                    .vector_params
-                    .get(&index_key)
-                    .cloned()
-                    .unwrap_or_default();
-                let index = self
-                    .vector_collections
-                    .entry(index_key.clone())
-                    .or_insert_with(|| {
-                        crate::engine::vector::collection::VectorCollection::new(*dim, params)
-                    });
+                    surrogate: *surrogate,
+                },
+                undo_log,
+            ),
 
-                if vector.len() != index.dim() {
-                    return Err(ErrorCode::Internal {
-                        detail: format!(
-                            "dimension mismatch: expected {}, got {}",
-                            index.dim(),
-                            vector.len()
-                        ),
-                    });
-                }
-
-                let vector_id = index.len() as u32;
-                index.insert_with_surrogate(vector.clone(), *surrogate);
-                // This is the direct primary-vector write path (VectorOp), not
-                // the document auto-index cascade — it never populates
-                // `vector_doc_map` (that reverse map is keyed by document id,
-                // which this path doesn't have). Empty `doc_id` tells
-                // `apply_undo_vector` to skip the `vector_doc_map` mutation.
-                undo_log.push(UndoEntry::InsertVector {
-                    index_key,
-                    vector_id,
-                    collection: collection.clone(),
-                    field: field_name.clone(),
-                    doc_id: String::new(),
-                });
-                Ok(self.response_ok(&dummy_task))
-            }
-
-            PhysicalPlan::Vector(VectorOp::Delete {
+            VectorOp::Delete {
                 collection,
                 vector_id,
-            }) => {
-                let index_key = Self::vector_index_key(
-                    dummy_task.request.database_id.as_u64(),
-                    tid,
-                    collection,
-                    "",
-                );
-                if let Some(index) = self.vector_collections.get_mut(&index_key)
-                    && index.delete(*vector_id)
-                {
-                    // Same direct primary-vector path as `VectorOp::Insert`
-                    // above — no `vector_doc_map` entry to restore, so an
-                    // empty `doc_id` skips that mutation in `apply_undo_vector`.
-                    undo_log.push(UndoEntry::DeleteVector {
-                        index_key,
-                        vector_id: *vector_id,
-                        collection: collection.clone(),
-                        field: String::new(),
-                        doc_id: String::new(),
-                    });
-                }
-                Ok(self.response_ok(&dummy_task))
-            }
+            } => Ok(self.exec_tx_vector_delete(dummy_task, tid, collection, *vector_id, undo_log)),
 
-            // ── Graph writes ─────────────────────────────────────────────────
-            PhysicalPlan::Graph(GraphOp::EdgePut {
+            _ => self.exec_tx_passthrough(tid, plan),
+        }
+    }
+
+    /// Graph engine: edge put/delete are undo-tracked; everything else
+    /// passes through the standard dispatch path.
+    fn exec_tx_graph(
+        &mut self,
+        dummy_task: &ExecutionTask,
+        tid: u64,
+        plan: &PhysicalPlan,
+        op: &GraphOp,
+        undo_log: &mut Vec<UndoEntry>,
+    ) -> Result<Response, ErrorCode> {
+        match op {
+            GraphOp::EdgePut {
                 collection,
                 src_id,
                 label,
@@ -203,105 +221,86 @@ impl CoreLoop {
                 properties,
                 src_surrogate,
                 dst_surrogate,
-            }) => {
-                let old_properties = self
-                    .edge_store
-                    .get_edge(
-                        dummy_task.request.database_id.as_u64(),
-                        nodedb_types::TenantId::new(tid),
-                        collection,
-                        src_id,
-                        label,
-                        dst_id,
-                    )
-                    .ok()
-                    .flatten();
+            } => self.exec_tx_edge_put(
+                dummy_task,
+                tid,
+                TxEdgePutParams {
+                    collection,
+                    src_id,
+                    label,
+                    dst_id,
+                    properties,
+                    src_surrogate: *src_surrogate,
+                    dst_surrogate: *dst_surrogate,
+                },
+                undo_log,
+            ),
 
-                let resp = self.execute_edge_put(
-                    &dummy_task,
-                    crate::data::executor::handlers::graph::EdgePutParams {
-                        tid,
-                        collection,
-                        src_id,
-                        label,
-                        dst_id,
-                        properties,
-                        src_surrogate: *src_surrogate,
-                        dst_surrogate: *dst_surrogate,
-                    },
-                );
-                if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
-                        detail: "edge put failed".into(),
-                    }));
-                }
-
-                undo_log.push(UndoEntry::PutEdge {
-                    collection: collection.clone(),
-                    src_id: src_id.clone(),
-                    label: label.clone(),
-                    dst_id: dst_id.clone(),
-                    old_properties,
-                });
-                Ok(resp)
-            }
-
-            PhysicalPlan::Graph(GraphOp::EdgeDelete {
+            GraphOp::EdgeDelete {
                 collection,
                 src_id,
                 label,
                 dst_id,
                 ..
-            }) => {
-                let old_properties = self
-                    .edge_store
-                    .get_edge(
-                        dummy_task.request.database_id.as_u64(),
-                        nodedb_types::TenantId::new(tid),
-                        collection,
-                        src_id,
-                        label,
-                        dst_id,
-                    )
-                    .ok()
-                    .flatten();
+            } => self.exec_tx_edge_delete(
+                dummy_task,
+                tid,
+                TxEdgeDeleteParams {
+                    collection,
+                    src_id,
+                    label,
+                    dst_id,
+                },
+                undo_log,
+            ),
 
-                let resp =
-                    self.execute_edge_delete(&dummy_task, tid, collection, src_id, label, dst_id);
-                if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
-                        detail: "edge delete failed".into(),
-                    }));
-                }
+            _ => self.exec_tx_passthrough(tid, plan),
+        }
+    }
 
-                if let Some(props) = old_properties {
-                    undo_log.push(UndoEntry::DeleteEdge {
-                        collection: collection.clone(),
-                        src_id: src_id.clone(),
-                        label: label.clone(),
-                        dst_id: dst_id.clone(),
-                        old_properties: props,
-                    });
-                }
-                Ok(resp)
-            }
-
-            // ── CRDT (buffered until commit) ──────────────────────────────────
-            PhysicalPlan::Crdt(CrdtOp::Apply {
+    /// CRDT engine: deltas are buffered (not applied) until commit; every
+    /// other `CrdtOp` passes through the standard dispatch path.
+    fn exec_tx_crdt(
+        &mut self,
+        dummy_task: &ExecutionTask,
+        tid: u64,
+        plan: &PhysicalPlan,
+        op: &CrdtOp,
+        crdt_deltas: &mut Vec<(Vec<u8>, u64, String)>,
+    ) -> Result<Response, ErrorCode> {
+        match op {
+            CrdtOp::Apply {
                 collection,
                 delta,
                 peer_id,
                 ..
-            }) => {
+            } => {
                 crdt_deltas.push((delta.clone(), *peer_id, collection.clone()));
-                Ok(self.response_ok(&dummy_task))
+                Ok(self.response_ok(dummy_task))
             }
+            _ => self.exec_tx_passthrough(tid, plan),
+        }
+    }
 
-            // ── KV writes (tracked) and reads (passthrough) ──────────────────
-            PhysicalPlan::Kv(kv_op) => self.execute_tx_kv(&dummy_task, tid, kv_op, undo_log),
-
-            // ── Columnar insert (tracked) ────────────────────────────────────
-            PhysicalPlan::Columnar(ColumnarOp::Insert {
+    /// Columnar engine: insert / predicate update / predicate delete are
+    /// undo-tracked; everything else passes through the standard dispatch
+    /// path.
+    ///
+    /// Predicate update/delete are staged at statement time; this is the
+    /// durable COMMIT replay. Undo is captured here so a sibling sub-plan
+    /// failing later in the same COMMIT batch reverses this mutation —
+    /// without it the columnar change would survive an atomic-rollback
+    /// (partial commit).
+    fn exec_tx_columnar(
+        &mut self,
+        dummy_task: &ExecutionTask,
+        tid: u64,
+        plan: &PhysicalPlan,
+        op: &ColumnarOp,
+        undo_log: &mut Vec<UndoEntry>,
+    ) -> Result<Response, ErrorCode> {
+        match op {
+            ColumnarOp::Insert {
                 collection,
                 payload,
                 format,
@@ -311,8 +310,8 @@ impl CoreLoop {
                 schema_bytes,
                 provenance: _,
                 wal_lsn: _,
-            }) => self.execute_tx_columnar_insert(
-                &dummy_task,
+            } => self.execute_tx_columnar_insert(
+                dummy_task,
                 super::sub_plan_kv::TxColumnarInsertParams {
                     collection,
                     payload,
@@ -325,54 +324,40 @@ impl CoreLoop {
                 undo_log,
             ),
 
-            // ── Columnar predicate UPDATE / DELETE (tracked) ─────────────────
-            // Staged at statement time; this is the durable COMMIT replay. Undo
-            // is captured here so a sibling sub-plan failing later in the same
-            // COMMIT batch reverses this mutation — without it the columnar
-            // change would survive an atomic-rollback (partial commit).
-            PhysicalPlan::Columnar(ColumnarOp::Update {
+            ColumnarOp::Update {
                 collection,
                 filters,
                 updates,
-            }) => {
-                let resp = self.execute_columnar_update(
-                    &dummy_task,
-                    collection,
-                    filters,
-                    updates,
-                    Some(undo_log),
-                );
-                if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
-                        detail: "columnar update failed".into(),
-                    }));
-                }
-                Ok(resp)
-            }
+            } => self.exec_tx_columnar_update(dummy_task, collection, filters, updates, undo_log),
 
-            PhysicalPlan::Columnar(ColumnarOp::Delete {
+            ColumnarOp::Delete {
                 collection,
                 filters,
-            }) => {
-                let resp =
-                    self.execute_columnar_delete(&dummy_task, collection, filters, Some(undo_log));
-                if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
-                        detail: "columnar delete failed".into(),
-                    }));
-                }
-                Ok(resp)
-            }
+            } => self.exec_tx_columnar_delete(dummy_task, collection, filters, undo_log),
 
-            // ── Timeseries ingest (tracked) ──────────────────────────────────
-            PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            _ => self.exec_tx_passthrough(tid, plan),
+        }
+    }
+
+    /// Timeseries engine: ingest is undo-tracked; everything else passes
+    /// through the standard dispatch path.
+    fn exec_tx_timeseries(
+        &mut self,
+        dummy_task: &ExecutionTask,
+        tid: u64,
+        plan: &PhysicalPlan,
+        op: &TimeseriesOp,
+        undo_log: &mut Vec<UndoEntry>,
+    ) -> Result<Response, ErrorCode> {
+        match op {
+            TimeseriesOp::Ingest {
                 collection,
                 payload,
                 format,
                 wal_lsn,
                 ..
-            }) => self.execute_tx_timeseries_ingest(
-                &dummy_task,
+            } => self.execute_tx_timeseries_ingest(
+                dummy_task,
                 super::sub_plan_kv::TxTimeseriesIngestParams {
                     tid: TenantId::new(tid),
                     collection,
@@ -383,46 +368,7 @@ impl CoreLoop {
                 undo_log,
             ),
 
-            // ── Read-only / passthrough variants ─────────────────────────────
-            // None of these mutate engine state, so no undo entry is needed.
-            // They execute normally via the standard dispatch path.
-            PhysicalPlan::Document(_)
-            | PhysicalPlan::Vector(_)
-            | PhysicalPlan::Graph(_)
-            | PhysicalPlan::Crdt(_)
-            | PhysicalPlan::Columnar(_)
-            | PhysicalPlan::Timeseries(_)
-            | PhysicalPlan::Spatial(_)
-            | PhysicalPlan::Text(_)
-            | PhysicalPlan::Query(_)
-            | PhysicalPlan::Meta(_)
-            | PhysicalPlan::Array(_)
-            | PhysicalPlan::ClusterArray(_) => {
-                let resp = self.execute(&ExecutionTask::new(crate::bridge::envelope::Request {
-                    request_id: crate::types::RequestId::new(0),
-                    tenant_id: TenantId::new(tid),
-                    database_id: DatabaseId::DEFAULT,
-                    vshard_id: crate::types::VShardId::new(0),
-                    plan: plan.clone(),
-                    // no-determinism: sub-plan deadline is ephemeral, not written to WAL
-                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
-                    priority: crate::bridge::envelope::Priority::Normal,
-                    trace_id: TraceId::ZERO,
-                    consistency: crate::types::ReadConsistency::Strong,
-                    idempotency_key: None,
-                    event_source: crate::event::EventSource::User,
-                    user_roles: Vec::new(),
-                    user_id: None,
-                    statement_digest: None,
-                    txn_id: None,
-                }));
-                if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
-                        detail: "sub-plan execution failed".into(),
-                    }));
-                }
-                Ok(resp)
-            }
+            _ => self.exec_tx_passthrough(tid, plan),
         }
     }
 }

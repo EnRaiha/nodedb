@@ -70,7 +70,6 @@ pub enum DocumentOp {
         /// If non-empty, the Data Plane evaluates these after fetching
         /// the document. Returns `NOT_FOUND` on denial (no info leak).
         /// Injected by the Control Plane planner from RLS policies.
-        #[allow(clippy::doc_markdown)]
         rls_filters: Vec<u8>,
         /// System-time selection. `Current` = current state. Honored only by
         /// bitemporal collections; the planner rejects temporal point-gets on

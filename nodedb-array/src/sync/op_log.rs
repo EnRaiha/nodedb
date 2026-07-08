@@ -22,7 +22,6 @@ pub type OpIter<'a> = Box<dyn Iterator<Item = ArrayResult<ArrayOp>> + 'a>;
 /// Implementations are expected to be `Send + Sync` and durable. An
 /// in-memory implementation suitable for tests is provided by
 /// [`InMemoryOpLog`] below.
-#[allow(clippy::len_without_is_empty)]
 pub trait OpLog: Send + Sync {
     /// Append an operation to the log.
     ///
@@ -38,6 +37,11 @@ pub trait OpLog: Send + Sync {
 
     /// Return the total number of ops in the log (across all arrays).
     fn len(&self) -> ArrayResult<u64>;
+
+    /// Return `true` if the log contains no ops in any array.
+    fn is_empty(&self) -> ArrayResult<bool> {
+        Ok(self.len()? == 0)
+    }
 
     /// Drop all ops whose `hlc < hlc` and return the count dropped.
     ///

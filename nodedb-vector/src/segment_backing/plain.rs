@@ -36,28 +36,15 @@ use super::VectorSegmentBacking;
 /// The `Arc<MmapVectorSegment>` wrapper ensures the segment (and therefore
 /// the mmap region) outlives any `&[f32]` slice handed out through this type.
 ///
-/// SAFETY: given the above invariants, treating `PlainMmapBacking` as
-/// `Send + Sync` is correct.
+/// `PlainMmapBacking` is `Send + Sync` automatically: [`MmapVectorSegment`]
+/// carries the `unsafe impl Send + Sync` (justified by the invariants above),
+/// so `Arc<MmapVectorSegment>` — and therefore this wrapper — is too.
 pub struct PlainMmapBacking {
     inner: Arc<MmapVectorSegment>,
 }
 
-// SAFETY: see struct-level doc comment.  `MmapVectorSegment` holds a
-// `*const u8` (`base`) into a read-only MAP_PRIVATE mmap region.  The region
-// is immutable after construction, process-global, and valid for the lifetime
-// of the Arc.  No interior mutability exists; concurrent reads are safe.
-unsafe impl Send for PlainMmapBacking {}
-unsafe impl Sync for PlainMmapBacking {}
-
 impl PlainMmapBacking {
     /// Wrap a [`MmapVectorSegment`] that is not yet reference-counted.
-    ///
-    /// `MmapVectorSegment` holds a `*const u8` raw pointer which makes it
-    /// `!Send + !Sync` by default. The `unsafe impl Send + Sync` on
-    /// `PlainMmapBacking` (see struct-level doc comment) establishes the safety
-    /// invariants; clippy cannot see through the `Arc` to the impl, so we
-    /// suppress the lint here.
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(seg: MmapVectorSegment) -> Self {
         Self {
             inner: Arc::new(seg),

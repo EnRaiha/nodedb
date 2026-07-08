@@ -21,7 +21,8 @@ use crate::error::VectorError;
 /// Exposes a `&[f32]` view of the vector data block and a `&[u64]` view of
 /// the surrogate ID block — both zero-copy slices into the mmap region.
 ///
-/// Not `Send` or `Sync` — owned by a single Data Plane core.
+/// Typically owned by a single Data Plane core, but safe to share across
+/// threads behind an [`Arc`]: see the `Send`/`Sync` safety note below.
 #[derive(Debug)]
 pub struct MmapVectorSegment {
     path: PathBuf,
@@ -40,6 +41,13 @@ pub struct MmapVectorSegment {
     /// mapping; released automatically on `Drop` alongside `munmap`.
     _budget_guard: Option<BudgetGuard>,
 }
+
+// SAFETY: `MmapVectorSegment` holds a `*const u8` (`base`) into a read-only
+// `MAP_PRIVATE` mmap region. The region is immutable after construction,
+// process-global, and valid for the lifetime of the value. There is no
+// interior mutability, so concurrent reads from multiple threads are sound.
+unsafe impl Send for MmapVectorSegment {}
+unsafe impl Sync for MmapVectorSegment {}
 
 impl MmapVectorSegment {
     // ── Constructors ──────────────────────────────────────────────────────────

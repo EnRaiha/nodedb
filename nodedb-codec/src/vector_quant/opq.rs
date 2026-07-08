@@ -209,11 +209,10 @@ fn matvec(r: &[f32], v: &[f32], dim: usize) -> Vec<f32> {
 
 fn pq_encode(v: &[f32], codebooks: &[Vec<Vec<f32>>], m: usize, sub_dim: usize) -> Vec<u8> {
     let mut codes = Vec::with_capacity(m);
-    #[allow(clippy::needless_range_loop)]
-    for s in 0..m {
+    for (s, codebook) in codebooks.iter().enumerate().take(m) {
         let offset = s * sub_dim;
         let sub = &v[offset..offset + sub_dim];
-        let best = codebooks[s]
+        let best = codebook
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {

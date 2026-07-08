@@ -93,9 +93,8 @@ pub fn build_vamana<C: VectorCodec>(
     }
 
     // --- Pass 1 refinement: beam-search to replace random neighbors ---
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..n {
-        let query = codec.prepare_query(&vectors[i]);
+    for (i, vector) in vectors.iter().enumerate().take(n) {
+        let query = codec.prepare_query(vector);
         let candidates = greedy_beam_search_quantized(&graph, &query, codec, quantized, i, l);
         // Take the R closest from the candidates, excluding self.
         let mut nbrs: Vec<(u32, f32)> = candidates

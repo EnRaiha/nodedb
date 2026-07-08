@@ -7,4 +7,5 @@ mod sub_plan;
 mod sub_plan_doc;
 mod sub_plan_kv;
 mod sub_plan_kv_ops;
+mod sub_plan_write;
 pub(super) mod undo;

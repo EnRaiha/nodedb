@@ -18,6 +18,11 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 
 use super::undo::UndoEntry;
 
+/// A CRDT delta buffered during a transaction batch: `(delta_bytes, id,
+/// collection)`. Deltas accumulate in a scratch buffer and are applied to
+/// the LoroDoc only on full-batch success.
+type CrdtDelta = (Vec<u8>, u64, String);
+
 impl CoreLoop {
     /// Execute a transaction batch atomically.
     ///
@@ -27,7 +32,6 @@ impl CoreLoop {
     ///
     /// The Control Plane has already written a single `RecordType::Transaction`
     /// WAL record covering all operations before dispatching this batch.
-    #[allow(clippy::too_many_lines)]
     pub(in crate::data::executor) fn execute_transaction_batch(
         &mut self,
         task: &ExecutionTask,
@@ -40,16 +44,68 @@ impl CoreLoop {
             "transaction batch begin"
         );
 
-        let mut undo_log: Vec<UndoEntry> = Vec::with_capacity(plans.len());
-        let mut crdt_deltas: Vec<(Vec<u8>, u64, String)> = Vec::new();
+        let undo_log: Vec<UndoEntry> = Vec::with_capacity(plans.len());
+        let crdt_deltas: Vec<CrdtDelta> = Vec::new();
+
+        let (last_response, undo_log, crdt_deltas) =
+            match self.run_sub_plans(task, tid, plans, undo_log, crdt_deltas) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+
+        let undo_log = match self.apply_balanced_constraint_check(task, tid, undo_log) {
+            Ok(u) => u,
+            Err(resp) => return resp,
+        };
+
+        if let Some(resp) = self.apply_crdt_deltas(task, tid, crdt_deltas) {
+            return resp;
+        }
+
+        debug!(
+            core = self.core_id,
+            committed = plans.len(),
+            "transaction batch committed"
+        );
+
+        self.emit_deferred_writes(task, undo_log);
+
+        // Return the last sub-plan payload, but keyed to the outer transaction request.
+        Response {
+            request_id: task.request_id(),
+            status: Status::Ok,
+            attempt: 1,
+            partial: false,
+            payload: last_response.payload,
+            watermark_lsn: self.watermark,
+            error_code: None,
+        }
+    }
+
+    /// Run every sub-plan in order, tracking undo entries and buffered CRDT
+    /// deltas as it goes.
+    ///
+    /// On success, returns the last sub-plan's response plus the accumulated
+    /// undo log and CRDT delta buffer (for the caller's subsequent commit
+    /// steps). On failure, rolls back all writes performed so far and
+    /// returns the terminal error `Response` directly — the caller must
+    /// return it unchanged.
+    ///
+    /// A panic (real or test-injected) during a sub-apply is caught so it
+    /// routes through the same typed-rollback path instead of unwinding past
+    /// `undo_log`, which would drop the log without running rollback and
+    /// leave the shard half-committed.
+    fn run_sub_plans(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        plans: &[PhysicalPlan],
+        mut undo_log: Vec<UndoEntry>,
+        mut crdt_deltas: Vec<CrdtDelta>,
+    ) -> Result<(Response, Vec<UndoEntry>, Vec<CrdtDelta>), Response> {
         let mut last_response = self.response_ok(task);
 
         for (i, plan) in plans.iter().enumerate() {
-            // Wrap the sub-apply + post-apply fail-point in catch_unwind so a
-            // panic (real or test-injected) routes through the typed-rollback
-            // arm below instead of unwinding past `undo_log`. Without this,
-            // a panic between sub-applies would drop the undo log without
-            // running rollback and leave the shard half-committed.
             let user_roles = &task.request.user_roles;
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let r = self.execute_tx_sub_plan(
@@ -118,7 +174,7 @@ impl CoreLoop {
                     // Discard CRDT scratch buffer (never applied).
                     drop(crdt_deltas);
 
-                    return Response {
+                    return Err(Response {
                         request_id: task.request_id(),
                         status: Status::Error,
                         attempt: 1,
@@ -126,12 +182,24 @@ impl CoreLoop {
                         payload: crate::bridge::envelope::Payload::empty(),
                         watermark_lsn: self.watermark,
                         error_code: Some(rollback_error_code),
-                    };
+                    });
                 }
             }
         }
 
-        // Pre-commit: BALANCED constraint check across all inserts in this transaction.
+        Ok((last_response, undo_log, crdt_deltas))
+    }
+
+    /// Pre-commit: check the `BALANCED` constraint across all inserts in
+    /// this transaction. On violation, rolls back and returns the terminal
+    /// error `Response`; on success, hands the undo log back for the
+    /// deferred-trigger step.
+    fn apply_balanced_constraint_check(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        undo_log: Vec<UndoEntry>,
+    ) -> Result<Vec<UndoEntry>, Response> {
         if let Err(error_code) =
             self.check_balanced_constraints(task.request.database_id.as_u64(), tid, &undo_log)
         {
@@ -160,7 +228,7 @@ impl CoreLoop {
                     }
                 }
             };
-            return Response {
+            return Err(Response {
                 request_id: task.request_id(),
                 status: Status::Error,
                 attempt: 1,
@@ -168,16 +236,27 @@ impl CoreLoop {
                 payload: crate::bridge::envelope::Payload::empty(),
                 watermark_lsn: self.watermark,
                 error_code: Some(rollback_error_code),
-            };
+            });
         }
+        Ok(undo_log)
+    }
 
-        // All sub-plans succeeded. Apply buffered CRDT deltas.
-        // Failure here means the CRDT state is inconsistent with the already-committed
-        // forward writes — return RollbackFailed so the client knows the shard needs
-        // a restart to restore consistency via WAL replay. Never warn-and-continue.
+    /// Apply all buffered CRDT deltas now that every sub-plan and the
+    /// `BALANCED` constraint check have succeeded.
+    ///
+    /// Failure here means the CRDT state is inconsistent with the
+    /// already-committed forward writes — returns a `RollbackFailed`
+    /// `Response` so the client knows the shard needs a restart to restore
+    /// consistency via WAL replay. Never warn-and-continue.
+    fn apply_crdt_deltas(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        crdt_deltas: Vec<CrdtDelta>,
+    ) -> Option<Response> {
         for (crdt_idx, (delta, _peer_id, collection)) in crdt_deltas.into_iter().enumerate() {
-            // Second crash-injection point — between forward-write commit and
-            // CRDT apply. WAL replay must roll the CRDT side forward (or roll
+            // Crash-injection point — between forward-write commit and CRDT
+            // apply. WAL replay must roll the CRDT side forward (or roll
             // forward writes back) to restore consistency.
             crate::fail_point!("transaction_batch::between_crdt_delta");
 
@@ -197,7 +276,7 @@ impl CoreLoop {
                             "CRDT delta apply failed after forward writes committed; \
                              shard state unknown — restart required for WAL replay"
                         );
-                        return Response {
+                        return Some(Response {
                             request_id: task.request_id(),
                             status: Status::Error,
                             attempt: 1,
@@ -208,7 +287,7 @@ impl CoreLoop {
                                 entry_index: crdt_idx,
                                 detail: format!("CRDT delta apply failed: {e}"),
                             }),
-                        };
+                        });
                     }
                 }
                 Err(e) => {
@@ -219,7 +298,7 @@ impl CoreLoop {
                         "CRDT engine not found after forward writes committed; \
                          shard state unknown — restart required for WAL replay"
                     );
-                    return Response {
+                    return Some(Response {
                         request_id: task.request_id(),
                         status: Status::Error,
                         attempt: 1,
@@ -230,18 +309,16 @@ impl CoreLoop {
                             entry_index: crdt_idx,
                             detail: format!("CRDT engine not available: {e}"),
                         }),
-                    };
+                    });
                 }
             }
         }
+        None
+    }
 
-        debug!(
-            core = self.core_id,
-            committed = plans.len(),
-            "transaction batch committed"
-        );
-
-        // Emit deferred trigger events for all writes in the committed transaction.
+    /// Emit deferred trigger events for every write recorded in the
+    /// committed transaction's undo log.
+    fn emit_deferred_writes(&mut self, task: &ExecutionTask, undo_log: Vec<UndoEntry>) {
         use crate::data::executor::core_loop::deferred::DeferredWrite;
         let deferred_writes: Vec<DeferredWrite> = undo_log
             .into_iter()
@@ -285,17 +362,6 @@ impl CoreLoop {
                 task.request.tenant_id,
                 task.request.vshard_id,
             );
-        }
-
-        // Return the last sub-plan payload, but keyed to the outer transaction request.
-        Response {
-            request_id: task.request_id(),
-            status: Status::Ok,
-            attempt: 1,
-            partial: false,
-            payload: last_response.payload,
-            watermark_lsn: self.watermark,
-            error_code: None,
         }
     }
 }
