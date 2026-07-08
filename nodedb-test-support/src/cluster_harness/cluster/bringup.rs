@@ -34,6 +34,7 @@ impl TestCluster {
             num_cores,
             log_compaction_threshold,
             replication_factor,
+            single_node_calvin: false,
         };
 
         let node1 = TestClusterNode::spawn_with_full_config(1, vec![], &config).await?;

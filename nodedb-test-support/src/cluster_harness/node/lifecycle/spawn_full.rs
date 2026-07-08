@@ -58,37 +58,6 @@ impl TestClusterNode {
         let data_dir = tempfile::tempdir()?;
         let data_dir_path: PathBuf = data_dir.path().to_path_buf();
 
-        // Pre-bind the QUIC transport on a random port so we know the
-        // listen address before wiring seeds / cluster settings.
-        let transport = Arc::new(nodedb_cluster::NexarTransport::new(
-            node_id,
-            "127.0.0.1:0".parse()?,
-            nodedb_cluster::TransportCredentials::Insecure,
-        )?);
-        let listen_addr = transport.local_addr();
-
-        // Build cluster settings. Empty `seed_nodes` → single-node
-        // bootstrap by listing only our own address.
-        let seeds = if seed_nodes.is_empty() {
-            vec![listen_addr]
-        } else {
-            seed_nodes
-        };
-        let cluster_settings = ClusterSettings {
-            node_id,
-            listen: listen_addr,
-            seed_nodes: seeds,
-            num_groups: 2,
-            replication_factor,
-            force_bootstrap: false,
-            tls: None,
-            max_active_sessions: 0,
-            login_attempts_per_ip_per_min: 30,
-            login_attempts_per_user_per_min: 10,
-            insecure_transport: true,
-            log_compaction_threshold,
-        };
-
         // Open WAL + dispatcher + event bus.
         let wal = Arc::new(WalManager::open_for_testing(
             &data_dir_path.join("test.wal"),
@@ -106,14 +75,57 @@ impl TestClusterNode {
         let mut shared =
             SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)?;
 
-        // Initialise the cluster using the pre-bound transport.
-        let handle = nodedb::control::cluster::init_cluster_with_transport(
-            &cluster_settings,
-            transport.clone(),
-            &data_dir_path,
-            tuning,
-        )
-        .await?;
+        // Acquire the cluster handle. The single-node-Calvin path drives the
+        // production `init_single_node_calvin` synthesis (which binds its own
+        // loopback transport); every multi-node path pre-binds a transport and
+        // builds explicit `ClusterSettings`.
+        let (handle, listen_addr) = if config.single_node_calvin {
+            let handle =
+                nodedb::control::cluster::init_single_node_calvin(&data_dir_path, tuning).await?;
+            let listen_addr = handle.transport.local_addr();
+            (handle, listen_addr)
+        } else {
+            // Pre-bind the QUIC transport on a random port so we know the
+            // listen address before wiring seeds / cluster settings.
+            let transport = Arc::new(nodedb_cluster::NexarTransport::new(
+                node_id,
+                "127.0.0.1:0".parse()?,
+                nodedb_cluster::TransportCredentials::Insecure,
+            )?);
+            let listen_addr = transport.local_addr();
+
+            // Build cluster settings. Empty `seed_nodes` → single-node
+            // bootstrap by listing only our own address.
+            let seeds = if seed_nodes.is_empty() {
+                vec![listen_addr]
+            } else {
+                seed_nodes
+            };
+            let cluster_settings = ClusterSettings {
+                node_id,
+                listen: listen_addr,
+                seed_nodes: seeds,
+                num_groups: 2,
+                replication_factor,
+                force_bootstrap: false,
+                tls: None,
+                max_active_sessions: 0,
+                login_attempts_per_ip_per_min: 30,
+                login_attempts_per_user_per_min: 10,
+                insecure_transport: true,
+                log_compaction_threshold,
+            };
+
+            // Initialise the cluster using the pre-bound transport.
+            let handle = nodedb::control::cluster::init_cluster_with_transport(
+                &cluster_settings,
+                transport.clone(),
+                &data_dir_path,
+                tuning,
+            )
+            .await?;
+            (handle, listen_addr)
+        };
 
         // Wire cluster handles into SharedState (mirrors main.rs).
         // `Arc::get_mut` is valid here: `shared` has not been cloned.

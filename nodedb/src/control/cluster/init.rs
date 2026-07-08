@@ -2,6 +2,7 @@
 
 //! Cluster startup: create transport, open catalog, bootstrap/join/restart.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tracing::info;
@@ -12,6 +13,16 @@ use nodedb_cluster::GroupAppliedWatchers;
 
 use crate::config::server::ClusterSettings;
 use crate::control::cluster::handle::ClusterHandle;
+
+/// Node id for the synthesized single-node Calvin deployment. A standalone
+/// server is a cluster of one, so the id is fixed and non-zero.
+const SINGLE_NODE_CALVIN_NODE_ID: u64 = 1;
+
+/// Raft group count for the synthesized single-node Calvin deployment. This
+/// node is the sole member of every group, so the value only affects how the
+/// vShard space is partitioned into groups — never placement (this node hosts
+/// every vShard regardless).
+const SINGLE_NODE_CALVIN_NUM_GROUPS: u64 = 4;
 
 /// Initialize the cluster: create transport, open catalog, bootstrap/join/restart.
 ///
@@ -149,6 +160,71 @@ pub async fn init_cluster_with_transport(
             config: cluster_config,
         })),
     })
+}
+
+/// Initialize a flag-gated single-node Calvin deployment on a standalone server.
+///
+/// Synthesizes a one-node cluster configuration — this node as its own sole
+/// seed, replication factor 1 — and drives the SAME cluster startup a real
+/// deployment uses ([`init_cluster_with_transport`]). The QUIC transport binds
+/// to an ephemeral loopback port and never dials a peer; a single-member Raft
+/// group is the deterministic bootstrapper and self-elects, committing locally.
+/// The single node therefore hosts every vShard, so the sequencer group and
+/// per-vShard schedulers all come up and `calvin_available` becomes true.
+///
+/// The caller must still call [`super::start_raft::start_raft`] after
+/// `SharedState` is constructed, exactly as for [`init_cluster`].
+///
+/// Only reached when `server.single_node_calvin` is set and `[cluster]` is
+/// absent; when the flag is off (the default) the standalone boot path never
+/// calls this and no Calvin stack is started.
+pub async fn init_single_node_calvin(
+    data_dir: &std::path::Path,
+    transport_tuning: &ClusterTransportTuning,
+) -> crate::Result<ClusterHandle> {
+    // Bind a loopback QUIC transport on an ephemeral port. Channel
+    // authentication is disabled: the listener is loopback-only and never
+    // dials a peer. The bound port is known only after binding, so it is read
+    // back below to build a self-referential seed list.
+    let listen_placeholder = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let transport = Arc::new(
+        nodedb_cluster::NexarTransport::with_tuning(
+            SINGLE_NODE_CALVIN_NODE_ID,
+            listen_placeholder,
+            transport_tuning,
+            nodedb_cluster::TransportCredentials::Insecure,
+        )
+        .map_err(|e| crate::Error::Config {
+            detail: format!("single-node calvin transport: {e}"),
+        })?,
+    );
+    let listen = transport.local_addr();
+
+    info!(
+        node_id = SINGLE_NODE_CALVIN_NODE_ID,
+        addr = %listen,
+        "single-node Calvin transport bound"
+    );
+
+    // This node is its own sole seed → the deterministic bootstrapper of a
+    // one-node cluster. Replication factor 1: the single node hosts every
+    // vShard, so a scheduler spawns here for each.
+    let settings = ClusterSettings {
+        node_id: SINGLE_NODE_CALVIN_NODE_ID,
+        listen,
+        seed_nodes: vec![listen],
+        num_groups: SINGLE_NODE_CALVIN_NUM_GROUPS,
+        replication_factor: 1,
+        force_bootstrap: false,
+        tls: None,
+        max_active_sessions: 0,
+        login_attempts_per_ip_per_min: 0,
+        login_attempts_per_user_per_min: 0,
+        insecure_transport: true,
+        log_compaction_threshold: None,
+    };
+
+    init_cluster_with_transport(&settings, transport, data_dir, transport_tuning).await
 }
 
 /// Build the join retry policy, honouring two optional environment

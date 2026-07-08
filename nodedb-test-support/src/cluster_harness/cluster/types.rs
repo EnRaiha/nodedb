@@ -25,6 +25,13 @@ pub(crate) struct ClusterSpawnConfig {
     /// `min(replication_factor, node_count)`). Defaults to 3 for every
     /// spawn entry point except [`TestCluster::spawn_three_with_compaction_threshold_and_rf`].
     pub(crate) replication_factor: usize,
+    /// When `true`, the node acquires its cluster handle from
+    /// `init_single_node_calvin` (the flag-gated standalone Calvin
+    /// synthesis) instead of building explicit `ClusterSettings` and
+    /// calling `init_cluster_with_transport`. Used only by
+    /// [`TestClusterNode::spawn_single_node_calvin`]. Defaults to `false`
+    /// for every multi-node spawn path.
+    pub(crate) single_node_calvin: bool,
 }
 
 /// An in-process cluster of `TestClusterNode`s.

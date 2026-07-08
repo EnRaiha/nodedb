@@ -102,7 +102,39 @@ impl TestClusterNode {
             num_cores,
             log_compaction_threshold: None,
             replication_factor: 3,
+            single_node_calvin: false,
         };
         Self::spawn_with_full_config(node_id, seed_nodes, &config).await
+    }
+
+    /// Spawn a standalone node with the flag-gated single-node Calvin stack
+    /// (`server.single_node_calvin = true`), exercising the same
+    /// `init_single_node_calvin` synthesis the production standalone boot uses.
+    ///
+    /// The node stands up its own sequencer Raft group and per-vShard
+    /// schedulers, so `calvin_available` becomes true and a cross-vShard
+    /// transaction traverses the deterministic Calvin path — all on one node.
+    /// `num_cores` should be `>= 2` so distinct vShards map to distinct cores.
+    pub async fn spawn_single_node_calvin(
+        num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Sub-second election so the lone sequencer voter self-elects quickly
+        // under the shared CI CPU pool without spurious re-elections.
+        let tuning = ClusterTransportTuning {
+            health_ping_interval_secs: 1,
+            election_timeout_min_ms: 500,
+            election_timeout_max_ms: 1000,
+            ..ClusterTransportTuning::default()
+        };
+        let config = ClusterSpawnConfig {
+            tuning,
+            graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
+            query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores,
+            log_compaction_threshold: None,
+            replication_factor: 1,
+            single_node_calvin: true,
+        };
+        Self::spawn_with_full_config(1, vec![], &config).await
     }
 }

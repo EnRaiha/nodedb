@@ -39,7 +39,7 @@ pub mod warm_peers;
 pub use array_cluster_exec::ClusterArrayExecutor;
 pub use array_executor::DataPlaneArrayExecutor;
 pub use handle::ClusterHandle;
-pub use init::{init_cluster, init_cluster_with_transport};
+pub use init::{init_cluster, init_cluster_with_transport, init_single_node_calvin};
 pub use metadata_applier::MetadataCommitApplier;
 pub use recovery_check::{VerifyReport, verify_and_repair};
 pub use spsc_applier::SpscCommitApplier;

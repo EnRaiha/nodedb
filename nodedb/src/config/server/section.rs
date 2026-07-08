@@ -70,6 +70,23 @@ pub struct ServerSection {
     /// opt out via the per-protocol bool fields on [`TlsSettings`].
     #[serde(default)]
     pub tls: Option<TlsSettings>,
+
+    /// Enable the Calvin transaction stack on a standalone (non-cluster)
+    /// server. Default `false`.
+    ///
+    /// When `true` and `[cluster]` is absent, the server synthesizes a
+    /// one-node cluster (this node as its own sole seed, replication
+    /// factor 1) and drives the same cluster startup a real deployment
+    /// uses: the sequencer Raft group and per-vShard schedulers come up,
+    /// its QUIC transport binds to a loopback port that never dials a
+    /// peer, and a cross-core (cross-vShard) transaction traverses the
+    /// deterministic Calvin path exactly as in cluster mode.
+    ///
+    /// When `false` (the default) the standalone boot path is unchanged:
+    /// no Calvin stack is started and every write stays on the existing
+    /// single-node path.
+    #[serde(default)]
+    pub single_node_calvin: bool,
 }
 
 impl Default for ServerSection {
@@ -83,6 +100,7 @@ impl Default for ServerSection {
             max_connections: default_max_connections(),
             log_format: LogFormat::Text,
             tls: None,
+            single_node_calvin: false,
         }
     }
 }

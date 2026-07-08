@@ -115,6 +115,17 @@ pub(crate) async fn bootstrap_data_plane(
         )
         .await?;
         Some(handle)
+    } else if config.server.single_node_calvin {
+        // Flag-gated single-node Calvin: synthesize a one-node cluster so the
+        // sequencer + per-vShard schedulers run and cross-core transactions
+        // take the deterministic Calvin path. Off by default → this branch is
+        // skipped and the standalone path (the `else` below) is unchanged.
+        let handle = nodedb::control::cluster::init_single_node_calvin(
+            &config.server.data_dir,
+            &config.tuning.cluster_transport,
+        )
+        .await?;
+        Some(handle)
     } else {
         None
     };
