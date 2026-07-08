@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! In-transaction staging for single-home graph-edge writes issued through the
+//! In-transaction staging for graph-edge writes issued through the
 //! `GRAPH ... EDGE` DSL.
 //!
 //! The `GRAPH INSERT EDGE` / `GRAPH DELETE EDGE` handlers dispatch a single
@@ -8,7 +8,7 @@
 //! Inside an explicit `BEGIN..COMMIT` block that direct dispatch would apply
 //! the write DURABLY at statement time, so an in-transaction `MATCH` / `GRAPH
 //! NEIGHBORS` would not observe it as staged (breaking read-your-own-writes)
-//! and a ROLLBACK could not undo it. This helper instead routes the write
+//! and a ROLLBACK could not undo it. These helpers instead route the write
 //! through the protocol-neutral staging gate
 //! ([`route_in_tx_write`](crate::control::server::shared::session::staging_gate::route_in_tx_write)),
 //! exactly like every other in-transaction point write: the Data Plane stages
@@ -16,11 +16,12 @@
 //! Hop for RYOW), the plan is buffered for COMMIT's durable replay, and
 //! ROLLBACK drops the overlay.
 //!
-//! Only a SINGLE-HOME edge (both endpoints on one vShard, or single-node) is
-//! stageable this way — the buffered `GraphOp` commits through the single-shard
-//! WAL + `TransactionBatch` path. A cross-shard (dual-home) edge inside an
-//! explicit transaction needs the cross-shard-commit machinery and is rejected
-//! by the caller before reaching here.
+//! A SINGLE-HOME edge (both endpoints on one vShard, or single-node) stages
+//! once into `vsrc`. A cross-shard (dual-home) edge is reachable from BOTH
+//! endpoints, and each core merges only its OWN overlay on a read, so
+//! [`stage_edge_dual_home`] stages the same edge into both the `vsrc` and `vdst`
+//! overlays — read-your-own-writes works from either endpoint, and the touched
+//! vShard set records both homes so ROLLBACK tears down both.
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::shared::session::DmlTxnCtx;
@@ -29,17 +30,81 @@ use crate::control::server::shared::session::staging_gate::{
 };
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use nodedb_physical::physical_plan::GraphOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::super::result::DdlError;
+use super::edge::EdgeHomes;
 use super::support::ddl_err;
 
-/// Stage a single-home graph-edge write (`GraphOp::EdgePut` / `EdgeDelete`)
-/// into the active transaction's overlay through the neutral staging gate.
+/// Stage a graph-edge write into the active transaction's overlay on EVERY
+/// vShard the edge homes to.
+///
+/// A single-home edge (both endpoints on one vShard, or single-node) stages
+/// once, into `vsrc`. A cross-shard (dual-home) edge is reachable from BOTH
+/// endpoints, and each Data-Plane core merges only its OWN transaction overlay
+/// on a read — so a reverse/IN traversal that scatters to `from_key(dst)` would
+/// never observe an edge staged only on `vsrc`. The dual-home case therefore
+/// stages the SAME `GraphOp` into both the `vsrc` and `vdst` overlays, giving
+/// read-your-own-writes from either endpoint. Each stage buffers its task, so
+/// the session's touched-vShard set records both homes and ROLLBACK fans
+/// `DropTxnOverlay` to both; COMMIT routes the buffered 2-vShard set through the
+/// existing cross-shard commit path.
+///
+/// Caller invariant: the session is `InBlock`.
+pub(super) async fn stage_edge_dual_home(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    homes: EdgeHomes,
+    op: GraphOp,
+    txn_ctx: &DmlTxnCtx<'_>,
+) -> Result<(), DdlError> {
+    let EdgeHomes {
+        vsrc,
+        vdst,
+        single_home,
+    } = homes;
+
+    if single_home {
+        return stage_edge_write_in_txn(
+            state,
+            tenant_id,
+            database_id,
+            vsrc,
+            PhysicalPlan::Graph(op),
+            txn_ctx,
+        )
+        .await;
+    }
+
+    // Dual-home: stage the same edge into both endpoint overlays.
+    stage_edge_write_in_txn(
+        state,
+        tenant_id,
+        database_id,
+        vsrc,
+        PhysicalPlan::Graph(op.clone()),
+        txn_ctx,
+    )
+    .await?;
+    stage_edge_write_in_txn(
+        state,
+        tenant_id,
+        database_id,
+        vdst,
+        PhysicalPlan::Graph(op),
+        txn_ctx,
+    )
+    .await
+}
+
+/// Stage a graph-edge write (`GraphOp::EdgePut` / `EdgeDelete`) into the active
+/// transaction's overlay on ONE `vshard` through the neutral staging gate.
 ///
 /// Caller invariant: the session is `InBlock` and `plan` is a stageable
-/// single-home `GraphOp` write. Returns `Ok(())` once the write is staged +
-/// buffered; a staging rejection or dispatch failure maps to a [`DdlError`].
+/// `GraphOp` write. Returns `Ok(())` once the write is staged + buffered; a
+/// staging rejection or dispatch failure maps to a [`DdlError`].
 pub(super) async fn stage_edge_write_in_txn(
     state: &SharedState,
     tenant_id: TenantId,

@@ -150,32 +150,26 @@ pub async fn insert_edge(
         state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
     let single_home = vsrc == vdst || !calvin_available;
 
-    // Inside an explicit transaction block a single-home edge insert stages into
-    // the per-transaction `GraphTxnOverlay` through the neutral gate instead of
+    // Inside an explicit transaction block an edge insert stages into the
+    // per-transaction `GraphTxnOverlay` through the neutral gate instead of
     // applying durably now: an in-transaction `MATCH` / `GRAPH NEIGHBORS` then
     // observes the edge as present (read-your-own-writes), COMMIT replays the
-    // buffered `EdgePut` via the single-shard WAL + `TransactionBatch` path, and
-    // ROLLBACK discards the overlay. This is the write-side complement to the
-    // `delete_edge` staging above; both reuse `stage_edge_write_in_txn`.
-    // Autocommit is untouched.
+    // buffered `EdgePut`, and ROLLBACK discards the overlay. A cross-shard
+    // (dual-home) edge stages into BOTH endpoint overlays via
+    // `stage_edge_dual_home` so RYOW works from either endpoint; a single-home
+    // edge stages once. This is the write-side complement to the `delete_edge`
+    // staging below. Autocommit is untouched.
     if txn_ctx.sessions.transaction_state(txn_ctx.addr) == TransactionState::InBlock {
-        if !single_home {
-            // A cross-shard (dual-home) edge insert inside an explicit
-            // transaction needs the cross-shard-commit machinery to stage both
-            // homes atomically across the outer transaction boundary — out of
-            // scope for single-home staging. Reject with the same signal a
-            // cross-shard predicate write inside a transaction produces.
-            return Err(ddl_err(
-                "XX000",
-                crate::Error::CrossShardInExplicitTransaction.to_string(),
-            ));
-        }
-        super::edge_stage::stage_edge_write_in_txn(
+        super::edge_stage::stage_edge_dual_home(
             state,
             tenant_id,
             database_id,
-            vsrc,
-            PhysicalPlan::Graph(edge_put),
+            EdgeHomes {
+                vsrc,
+                vdst,
+                single_home,
+            },
+            edge_put,
             txn_ctx,
         )
         .await?;
@@ -237,6 +231,19 @@ pub struct EdgeRef {
     pub src: String,
     pub dst: String,
     pub label: String,
+}
+
+/// The home vShard(s) an edge resolves to. An edge is reachable from BOTH
+/// endpoints (forward from `src`, reverse from `dst`), so a cross-shard edge
+/// (`!single_home`) has two distinct homes: `vsrc` holds the forward row and
+/// `vdst` holds the reverse row. `single_home` is true when both endpoints share
+/// one vShard, or when Calvin is unavailable (single-node) so one write covers
+/// both. Bundled so [`stage_edge_dual_home`](super::edge_stage::stage_edge_dual_home)
+/// stays within the argument budget.
+pub struct EdgeHomes {
+    pub vsrc: VShardId,
+    pub vdst: VShardId,
+    pub single_home: bool,
 }
 
 /// `GRAPH DELETE EDGE IN '<collection>' FROM '<src>' TO '<dst>' TYPE '<label>'`
@@ -316,30 +323,23 @@ pub async fn delete_edge(
         state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
     let single_home = vsrc == vdst || !calvin_available;
 
-    // Inside an explicit transaction block a single-home edge delete stages into
-    // the per-transaction `GraphTxnOverlay` through the neutral gate instead of
+    // Inside an explicit transaction block an edge delete stages into the
+    // per-transaction `GraphTxnOverlay` through the neutral gate instead of
     // applying durably now: an in-transaction `MATCH` / `GRAPH NEIGHBORS` then
     // observes the edge as removed (read-your-own-writes), COMMIT replays the
-    // buffered `EdgeDelete` via the single-shard WAL + `TransactionBatch` path,
-    // and ROLLBACK discards the overlay. Autocommit is untouched.
+    // buffered `EdgeDelete`, and ROLLBACK discards the overlay. Autocommit is
+    // untouched.
     if txn_ctx.sessions.transaction_state(txn_ctx.addr) == TransactionState::InBlock {
-        if !single_home {
-            // A cross-shard (dual-home) edge delete inside an explicit
-            // transaction needs the cross-shard-commit machinery to stage both
-            // homes atomically across the outer transaction boundary — out of
-            // scope for single-home staging. Reject with the same signal a
-            // cross-shard predicate write inside a transaction produces.
-            return Err(ddl_err(
-                "XX000",
-                crate::Error::CrossShardInExplicitTransaction.to_string(),
-            ));
-        }
-        super::edge_stage::stage_edge_write_in_txn(
+        super::edge_stage::stage_edge_dual_home(
             state,
             tenant_id,
             database_id,
-            vsrc,
-            PhysicalPlan::Graph(edge_delete),
+            EdgeHomes {
+                vsrc,
+                vdst,
+                single_home,
+            },
+            edge_delete,
             txn_ctx,
         )
         .await?;
