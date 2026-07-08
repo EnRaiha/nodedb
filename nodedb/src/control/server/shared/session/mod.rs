@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 pub mod audit_context;
+pub mod commit;
+mod commit_calvin;
 pub mod cross_shard_mode;
 mod cursor;
 pub mod cursor_spill;
 pub mod ddl_buffer;
+pub mod lifecycle;
 mod listen;
 mod live;
 mod notice;
+pub mod outcome;
 mod params;
 pub mod read_consistency;
+pub mod savepoint_ops;
 pub mod staging_gate;
 mod state;
 mod store;
@@ -22,10 +27,12 @@ pub mod plan_cache;
 pub mod prepared_cache;
 
 pub use self::cross_shard_mode::{CrossShardTxnMode, parse_value as parse_cross_shard_value};
+pub use self::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
 pub use self::params::{
     is_known_pg_runtime_parameter, is_known_settable_runtime_parameter, parse_set_command,
     parse_show_command,
 };
+pub use self::savepoint_ops::SavepointError;
 pub use self::staging_gate::{
     DetachedTxnScope, DmlTxnCtx, InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError,
     route_in_tx_write,

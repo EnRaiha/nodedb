@@ -1,192 +1,142 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Transaction control: BEGIN, COMMIT, ROLLBACK.
+//! Transaction control adapters for the native protocol: BEGIN, COMMIT,
+//! ROLLBACK — thin shims over the protocol-neutral orchestrator in
+//! `control/server/shared/session/`.
+//!
+//! Driving the neutral core means native GAINS everything pgwire already did:
+//! Calvin multi-shard COMMIT, read-your-own-write SI exclusion, deferred offset
+//! / GAP_FREE / DDL / notify flush on COMMIT, and DDL-buffer + GAP_FREE + cursor
+//! + notify cleanup on ROLLBACK.
+
+use std::future::Future;
+use std::pin::Pin;
 
 use nodedb_types::TraceId;
-use nodedb_types::id::DatabaseId;
 use nodedb_types::protocol::NativeResponse;
 
-use crate::bridge::envelope::PhysicalPlan;
-use crate::control::gateway::GatewayErrorMap;
+use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
 use crate::control::gateway::core::QueryContext as GatewayQueryContext;
-use nodedb_physical::physical_plan::MetaOp;
-use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+use crate::control::server::shared::session::{
+    AbortReason, CommitOutcome, TxnDataPlane, commit, lifecycle,
+};
+use crate::control::state::SharedState;
+use crate::types::{Lsn, RequestId};
+use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::super::dispatch_utils;
-use super::{DispatchCtx, error_to_native};
+use super::DispatchCtx;
+
+/// Native Data-Plane dispatch seam for the neutral transaction orchestrator.
+///
+/// Routes a task through the cluster gateway when one is configured, otherwise
+/// through the direct SPSC dispatch path — the exact branch native COMMIT used
+/// before extraction. The gateway path synthesizes an `Ok` [`Response`] on
+/// success (carrying the first vShard payload so overlay-marker meta-ops still
+/// decode), and surfaces gateway errors as a Rust `Err`.
+pub(crate) struct NativeTxnDp<'a> {
+    pub(crate) state: &'a SharedState,
+}
+
+impl TxnDataPlane for NativeTxnDp<'_> {
+    fn dispatch_no_wal<'a>(
+        &'a self,
+        task: PhysicalTask,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
+        let state = self.state;
+        Box::pin(async move {
+            match state.gateway.as_ref() {
+                Some(gw) => {
+                    let gw_ctx = GatewayQueryContext {
+                        tenant_id: task.tenant_id,
+                        trace_id: TraceId::generate(),
+                        database_id: task.database_id,
+                    };
+                    let payloads = gw.execute(&gw_ctx, task.plan).await?;
+                    Ok(Response {
+                        request_id: RequestId::new(0),
+                        status: Status::Ok,
+                        attempt: 0,
+                        partial: false,
+                        payload: Payload::from_vec(payloads.into_iter().next().unwrap_or_default()),
+                        watermark_lsn: Lsn::new(0),
+                        error_code: None,
+                    })
+                }
+                None => {
+                    dispatch_utils::dispatch_to_data_plane(
+                        state,
+                        task.tenant_id,
+                        task.database_id,
+                        task.vshard_id,
+                        task.plan,
+                        TraceId::ZERO,
+                    )
+                    .await
+                }
+            }
+        })
+    }
+}
 
 pub(crate) fn handle_begin(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
-    let snapshot_lsn = {
-        let next = ctx.state.wal.next_lsn();
-        crate::types::Lsn::new(next.as_u64().saturating_sub(1))
-    };
-    match ctx.sessions.begin(ctx.peer_addr, snapshot_lsn) {
+    match lifecycle::run_begin(ctx.sessions, ctx.peer_addr, ctx.state) {
         Ok(()) => NativeResponse::status_row(seq, "BEGIN"),
-        Err(msg) => NativeResponse::error(seq, "25P02", msg),
+        Err(e) => {
+            let message = match &e {
+                crate::Error::BadRequest { detail } => detail.clone(),
+                other => other.to_string(),
+            };
+            NativeResponse::error(seq, "25P02", message)
+        }
     }
 }
 
 pub(crate) async fn handle_commit(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
-    // Snapshot isolation conflict check.
-    let read_set = ctx.sessions.take_read_set(ctx.peer_addr);
-    if let Some(snapshot_lsn) = ctx.sessions.snapshot_lsn(ctx.peer_addr) {
-        let current_lsn = ctx.state.wal.next_lsn();
-        let current = crate::types::Lsn::new(current_lsn.as_u64().saturating_sub(1));
-        for (_collection, _doc_id, read_lsn) in &read_set {
-            if current > *read_lsn && current > snapshot_lsn {
-                let _ = ctx.sessions.rollback(ctx.peer_addr);
-                return NativeResponse::error(
-                    seq,
-                    "40001",
-                    "could not serialize access due to concurrent update",
-                );
-            }
-        }
+    let dp = NativeTxnDp { state: ctx.state };
+    match commit::run_commit(ctx.sessions, ctx.peer_addr, ctx.identity, ctx.state, &dp).await {
+        CommitOutcome::Committed => NativeResponse::status_row(seq, "COMMIT"),
+        CommitOutcome::Aborted { reason } => commit_abort_to_native(seq, &reason),
     }
-
-    let buffered = match ctx.sessions.commit(ctx.peer_addr) {
-        Ok(b) => b,
-        Err(msg) => return NativeResponse::error(seq, "25000", msg),
-    };
-
-    if !buffered.is_empty() {
-        let tenant_id = ctx.identity.tenant_id;
-        let vshard_id = buffered[0].vshard_id;
-
-        // WAL transaction record.
-        let mut sub_records: Vec<(u16, Vec<u8>)> = Vec::with_capacity(buffered.len());
-        for task in &buffered {
-            if let Some(entry) = crate::control::wal_replication::to_replicated_entry(
-                task.tenant_id,
-                task.database_id,
-                task.vshard_id,
-                &task.plan,
-            ) {
-                let bytes = entry.to_bytes();
-                sub_records.push((nodedb_wal::record::RecordType::Put as u16, bytes));
-            }
-        }
-
-        if !sub_records.is_empty() {
-            match zerompk::to_msgpack_vec(&sub_records) {
-                Ok(tx_payload) => {
-                    if let Err(e) = ctx.state.wal.append_transaction(
-                        tenant_id,
-                        vshard_id,
-                        DatabaseId::DEFAULT,
-                        &tx_payload,
-                    ) {
-                        return error_to_native(seq, &e);
-                    }
-                }
-                Err(e) => {
-                    return NativeResponse::error(
-                        seq,
-                        "XX000",
-                        format!("transaction WAL serialization failed: {e}"),
-                    );
-                }
-            }
-        }
-
-        // Dispatch as atomic TransactionBatch.
-        let plans: Vec<PhysicalPlan> = buffered.iter().map(|t| t.plan.clone()).collect();
-        let batch_plan = PhysicalPlan::Meta(MetaOp::TransactionBatch { plans });
-
-        let dispatch_err: Option<(&'static str, String)> = match ctx.state.gateway.as_ref() {
-            Some(gw) => {
-                let gw_ctx = GatewayQueryContext {
-                    tenant_id,
-                    trace_id: TraceId::generate(),
-                    database_id: nodedb_types::id::DatabaseId::DEFAULT,
-                };
-                gw.execute(&gw_ctx, batch_plan).await.err().map(|e| {
-                    let (_code, msg) = GatewayErrorMap::to_native(&e);
-                    ("40001", msg)
-                })
-            }
-            None => {
-                let batch_task = PhysicalTask {
-                    tenant_id,
-                    vshard_id,
-                    database_id: DatabaseId::DEFAULT,
-                    plan: batch_plan,
-                    post_set_op: PostSetOp::None,
-                    txn_id: None,
-                };
-                match dispatch_utils::dispatch_to_data_plane(
-                    ctx.state,
-                    batch_task.tenant_id,
-                    batch_task.database_id,
-                    batch_task.vshard_id,
-                    batch_task.plan,
-                    TraceId::ZERO,
-                )
-                .await
-                {
-                    Err(e) => Some(("40001", e.to_string())),
-                    Ok(resp) if resp.status != crate::bridge::envelope::Status::Ok => {
-                        let code = resp.error_code.clone().unwrap_or(
-                            crate::bridge::envelope::ErrorCode::RejectedPrevalidation {
-                                reason: "transaction commit failed".to_owned(),
-                            },
-                        );
-                        let (_severity, sqlstate, message) =
-                            crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(
-                                &code,
-                            );
-                        Some((sqlstate, message))
-                    }
-                    Ok(_) => None,
-                }
-            }
-        };
-
-        if let Some((sqlstate, msg)) = dispatch_err {
-            return NativeResponse::error(
-                seq,
-                sqlstate,
-                format!("transaction commit failed: {msg}"),
-            );
-        }
-
-        // Release the staging overlay now that the durable batch has flushed.
-        if let Some(txn_id) = buffered[0].txn_id {
-            drop_txn_overlay(ctx, tenant_id, vshard_id, txn_id).await;
-        }
-    }
-
-    NativeResponse::status_row(seq, "COMMIT")
 }
 
 pub(crate) async fn handle_rollback(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
-    // Snapshot overlay identity BEFORE rollback() clears session state.
-    let (overlay_txn_id, overlay_vshard) = ctx.sessions.txn_identity(ctx.peer_addr);
-    let _ = ctx.sessions.rollback(ctx.peer_addr);
-    if let (Some(txn_id), Some(vshard_id)) = (overlay_txn_id, overlay_vshard) {
-        drop_txn_overlay(ctx, ctx.identity.tenant_id, vshard_id, txn_id).await;
-    }
+    let dp = NativeTxnDp { state: ctx.state };
+    lifecycle::run_rollback(ctx.sessions, ctx.peer_addr, ctx.identity, ctx.state, &dp).await;
     NativeResponse::status_row(seq, "ROLLBACK")
 }
 
-/// Best-effort release of a transaction's staging overlay on its home vShard.
-async fn drop_txn_overlay(
-    ctx: &DispatchCtx<'_>,
-    tenant_id: crate::types::TenantId,
-    vshard_id: crate::types::VShardId,
-    txn_id: crate::types::TxnId,
-) {
-    let plan = PhysicalPlan::Meta(MetaOp::DropTxnOverlay { txn_id });
-    if let Err(e) = dispatch_utils::dispatch_to_data_plane(
-        ctx.state,
-        tenant_id,
-        DatabaseId::DEFAULT,
-        vshard_id,
-        plan,
-        TraceId::ZERO,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, "failed to drop per-transaction staging overlay");
-    }
+/// Map a neutral commit abort reason to the native error frame native emitted
+/// before extraction (batch/dispatch failures collapse to `40001`, batch
+/// rejections carry the Data-Plane SQLSTATE).
+fn commit_abort_to_native(seq: u64, reason: &AbortReason) -> NativeResponse {
+    let (code, message): (&'static str, String) = match reason {
+        AbortReason::Serialization => (
+            "40001",
+            "could not serialize access due to concurrent update".to_owned(),
+        ),
+        AbortReason::NoTransaction => (
+            "25000",
+            "current transaction is aborted, commands ignored until end of transaction block"
+                .to_owned(),
+        ),
+        AbortReason::BatchRejected { code } => {
+            let code = code.clone().unwrap_or(ErrorCode::RejectedPrevalidation {
+                reason: "transaction commit failed".to_owned(),
+            });
+            let (_severity, sqlstate, message) = error_code_to_sqlstate(&code);
+            (sqlstate, format!("transaction commit failed: {message}"))
+        }
+        AbortReason::CalvinCancelled => (
+            "57014",
+            "Calvin coordinator cancelled (deadline exceeded)".to_owned(),
+        ),
+        AbortReason::CalvinTimeout => {
+            ("57014", "timed out waiting for Calvin sequencer".to_owned())
+        }
+        AbortReason::Dispatch(e) => ("40001", format!("transaction commit failed: {e}")),
+        AbortReason::DdlPropose(e) => ("XX000", format!("{e}")),
+    };
+    NativeResponse::error(seq, code, message)
 }

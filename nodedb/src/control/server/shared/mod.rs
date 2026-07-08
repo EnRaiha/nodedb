@@ -1,5 +1,6 @@
 //! Protocol-neutral machinery shared by every server entrypoint (pgwire, native, http).
 pub mod check_constraint;
 pub mod ddl;
+pub mod plan_util;
 pub mod session;
 pub mod sql;
