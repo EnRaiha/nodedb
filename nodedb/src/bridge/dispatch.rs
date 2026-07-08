@@ -14,6 +14,8 @@ use crate::bridge::envelope;
 use crate::control::router::vshard::VShardRouter;
 use crate::data::eventfd::EventFdNotifier;
 
+use crate::bridge::admission_chokepoint::assert_write_admitted;
+
 /// Serialized form of a request that goes through the SPSC ring buffer.
 ///
 /// The bridge crate is generic over `T` — we serialize our typed `Request`
@@ -273,6 +275,7 @@ impl Dispatcher {
     /// then flushes WFQ → physical ring. Returns `Err` when the WFQ itself is
     /// full (total capacity reached across all active databases on that core).
     pub fn dispatch(&mut self, request: envelope::Request) -> crate::Result<()> {
+        assert_write_admitted(&request);
         let tenant_id = request.tenant_id.as_u64();
         let req_id = request.request_id.as_u64();
         let database_id = request.database_id.as_u64();
@@ -373,6 +376,7 @@ impl Dispatcher {
         core_id: usize,
         request: envelope::Request,
     ) -> crate::Result<()> {
+        assert_write_admitted(&request);
         if core_id >= self.cores.len() {
             return Err(crate::Error::Dispatch {
                 detail: format!("core {core_id} out of range (have {})", self.cores.len()),
@@ -510,6 +514,7 @@ mod tests {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: Admission::Exempt(ExemptReason::Read),
         }
     }
 
@@ -539,6 +544,7 @@ mod tests {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: Admission::Exempt(ExemptReason::Read),
         }
     }
 

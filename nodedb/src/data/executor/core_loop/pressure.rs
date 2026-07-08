@@ -233,6 +233,9 @@ mod tests {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: crate::bridge::envelope::Admission::Exempt(
+                crate::bridge::envelope::ExemptReason::Read,
+            ),
         })
     }
 
@@ -417,6 +420,9 @@ mod tests {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: crate::bridge::envelope::Admission::Exempt(
+                crate::bridge::envelope::ExemptReason::Read,
+            ),
         };
         tx.try_push(BridgeRequest { inner: req }).unwrap();
         // Set suspend flag.
@@ -459,6 +465,9 @@ mod tests {
                 statement_digest: None,
                 txn_id: None,
                 wal_lsn: None,
+                admission: crate::bridge::envelope::Admission::Exempt(
+                    crate::bridge::envelope::ExemptReason::Read,
+                ),
             };
             tx.try_push(BridgeRequest { inner: req }).unwrap();
         }

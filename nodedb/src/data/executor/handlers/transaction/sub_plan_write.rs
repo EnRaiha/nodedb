@@ -298,6 +298,9 @@ impl CoreLoop {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: crate::bridge::envelope::Admission::Exempt(
+                crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+            ),
         }));
         if resp.status == Status::Error {
             return Err(resp.error_code.unwrap_or(ErrorCode::Internal {

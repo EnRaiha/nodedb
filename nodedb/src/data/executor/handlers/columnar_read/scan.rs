@@ -456,6 +456,9 @@ mod tests {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: crate::bridge::envelope::Admission::Exempt(
+                crate::bridge::envelope::ExemptReason::Read,
+            ),
         })
     }
 

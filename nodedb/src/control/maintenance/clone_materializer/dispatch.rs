@@ -56,6 +56,9 @@ pub(super) async fn dispatch_local(
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
+        admission: crate::bridge::envelope::Admission::Exempt(
+            crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+        ),
     };
     let mut rx = state.tracker.register(req_id);
     match state.dispatcher.lock() {

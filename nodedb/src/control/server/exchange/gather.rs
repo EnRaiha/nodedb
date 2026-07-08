@@ -86,6 +86,9 @@ pub(crate) fn eager_dispatch_to_all_cores(
             statement_digest: None,
             txn_id,
             wal_lsn: None,
+            admission: crate::bridge::envelope::Admission::Exempt(
+                crate::bridge::envelope::ExemptReason::Read,
+            ),
         };
 
         let rx = state.tracker.register(request_id);

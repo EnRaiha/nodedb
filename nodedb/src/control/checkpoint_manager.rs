@@ -125,6 +125,9 @@ pub async fn run_checkpoint_cycle(
                 statement_digest: None,
                 txn_id: None,
                 wal_lsn: None,
+                admission: crate::bridge::envelope::Admission::Exempt(
+                    crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+                ),
             };
 
             let rx = tracker.register(request_id);

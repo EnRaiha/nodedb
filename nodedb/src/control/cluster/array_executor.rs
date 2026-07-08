@@ -85,6 +85,9 @@ impl DataPlaneArrayExecutor {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: crate::bridge::envelope::Admission::Exempt(
+                crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+            ),
         };
 
         let mut rx = self.state.tracker.register(request_id);

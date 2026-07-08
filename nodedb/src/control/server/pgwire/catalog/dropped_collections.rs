@@ -110,6 +110,9 @@ async fn query_collection_size(
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
+        admission: crate::bridge::envelope::Admission::Exempt(
+            crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+        ),
     };
     let mut rx = state.tracker.register(request_id);
     {

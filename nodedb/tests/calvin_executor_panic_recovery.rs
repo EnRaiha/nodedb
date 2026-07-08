@@ -348,6 +348,7 @@ fn calvin_static_replay_sees_only_committed_data() {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: nodedb::bridge::envelope::Admission::Admitted,
         };
 
         // Commit a value before the panic batch.
@@ -434,6 +435,9 @@ fn calvin_static_replay_sees_only_committed_data() {
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
+        admission: nodedb::bridge::envelope::Admission::Exempt(
+            nodedb::bridge::envelope::ExemptReason::Read,
+        ),
     };
 
     // Note: this test does NOT assert that the pre-panic committed value is

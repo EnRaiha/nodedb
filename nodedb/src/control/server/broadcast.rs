@@ -111,6 +111,19 @@ pub async fn broadcast_count_to_all_cores(
     for core_id in 0..num_cores {
         let request_id = shared.next_request_id();
         let vshard_id = VShardId::new(core_id as u32);
+        // This fan-out builds its own per-core Request and enqueues directly
+        // (not via the autocommit funnel), so it passes the write-admission
+        // gate here: write-class plans (e.g. `INSERT ... SELECT`) are stamped
+        // `Admitted`, DDL / reads `Exempt`. No lock is taken in this change.
+        let admission = crate::control::server::shared::write_admission::admit(
+            shared,
+            &crate::control::server::shared::write_admission::WriteTarget {
+                tenant_id,
+                database_id,
+                vshard_id,
+                plan: &plan,
+            },
+        );
         let request = Request {
             request_id,
             tenant_id,
@@ -129,6 +142,7 @@ pub async fn broadcast_count_to_all_cores(
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission,
         };
 
         let rx = shared.tracker.register(request_id);
@@ -219,6 +233,19 @@ pub async fn broadcast_register_to_all_cores(
     for core_id in 0..num_cores {
         let request_id = shared.next_request_id();
         let vshard_id = VShardId::new(core_id as u32);
+        // This fan-out builds its own per-core Request and enqueues directly
+        // (not via the autocommit funnel), so it passes the write-admission
+        // gate here: write-class plans (e.g. `INSERT ... SELECT`) are stamped
+        // `Admitted`, DDL / reads `Exempt`. No lock is taken in this change.
+        let admission = crate::control::server::shared::write_admission::admit(
+            shared,
+            &crate::control::server::shared::write_admission::WriteTarget {
+                tenant_id,
+                database_id,
+                vshard_id,
+                plan: &plan,
+            },
+        );
         let request = Request {
             request_id,
             tenant_id,
@@ -237,6 +264,7 @@ pub async fn broadcast_register_to_all_cores(
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission,
         };
 
         let rx = shared.tracker.register(request_id);

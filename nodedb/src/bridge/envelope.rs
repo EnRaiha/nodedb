@@ -151,6 +151,73 @@ pub struct Request {
     ///
     /// [`ExecutionTask`]: crate::data::executor::task::ExecutionTask
     pub wal_lsn: Option<Lsn>,
+
+    /// Write-admission decision for this request.
+    ///
+    /// Every write-class [`PhysicalPlan`] MUST pass the neutral write-admission
+    /// gate (`crate::control::server::shared::write_admission`) before it is
+    /// enqueued to a Data-Plane core; the gate stamps [`Admission::Admitted`].
+    /// Requests that do not re-enter the gate carry [`Admission::Exempt`] with
+    /// an [`ExemptReason`] — [`ExemptReason::Read`] for reads / savepoint /
+    /// overlay meta ops, [`ExemptReason::AlreadyOrdered`] for writes already
+    /// serialized elsewhere (Calvin-scheduled applies, Raft-follower / replay /
+    /// clone / checkpoint).
+    ///
+    /// The field is REQUIRED (no `Default`, no `#[serde(default)]`) so every
+    /// `Request` construction site makes an explicit choice — that is the
+    /// write-ingress completeness enforcement. The SPSC enqueue chokepoint
+    /// (`crate::bridge::dispatch`) asserts no write-class plan reaches a core
+    /// with the decision unmade.
+    pub admission: Admission,
+}
+
+/// Write-admission marker carried by every [`Request`].
+///
+/// A write-class plan becomes [`Admission::Admitted`] only by passing the
+/// neutral write-admission gate. Everything that does not re-enter the gate's
+/// OCC fence carries [`Admission::Exempt`] with an explicit [`ExemptReason`].
+/// There is intentionally no "unresolved" variant: the required field makes an
+/// unmade decision unrepresentable, so a missed write path is a compile error
+/// at the construction site rather than a silent serializability hole at
+/// runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Passed the write-admission gate.
+    Admitted,
+    /// Does not re-enter the write-admission gate — either a non-write, or a
+    /// write whose ordering was already decided elsewhere. The [`ExemptReason`]
+    /// records which, so the SPSC chokepoint can tell a legitimately exempt
+    /// write apart from a base-state write that bypassed the gate.
+    Exempt(ExemptReason),
+}
+
+/// Why a [`Request`] is exempt from the write-admission gate.
+///
+/// The distinction is load-bearing at the SPSC chokepoint: a write-class plan
+/// marked [`ExemptReason::Read`] is a bug (a write that bypassed the gate),
+/// whereas [`ExemptReason::AlreadyOrdered`] is a legitimately exempt write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExemptReason {
+    /// The plan is not a base-state write — a read / query, or an overlay /
+    /// savepoint meta-op. It never needs the write fence.
+    Read,
+    /// A write-class plan whose ordering was ALREADY decided elsewhere and does
+    /// NOT re-enter the OCC fence: Calvin-scheduler applies (the scheduler
+    /// already holds the locks), replicated / Raft-follower applies, recovery /
+    /// replay, clone / copy-up materialization, and checkpoint. These are
+    /// legitimately exempt writes.
+    AlreadyOrdered,
+}
+
+impl Admission {
+    /// Whether this marker is [`Admission::Exempt`] with reason
+    /// [`ExemptReason::Read`] — i.e. claims the plan is not a base-state write.
+    ///
+    /// The SPSC chokepoint uses this to catch a write-class plan wrongly marked
+    /// exempt-as-read: such a plan bypassed the write-admission gate.
+    pub fn is_exempt_as_read(&self) -> bool {
+        matches!(self, Admission::Exempt(ExemptReason::Read))
+    }
 }
 
 /// Response envelope: Data Plane -> Control Plane.
@@ -391,6 +458,7 @@ mod tests {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: Admission::Exempt(ExemptReason::Read),
         }
     }
 
@@ -460,6 +528,7 @@ mod tests {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: Admission::Exempt(ExemptReason::Read),
         };
         match req.plan {
             PhysicalPlan::Meta(MetaOp::Cancel { target_request_id }) => {

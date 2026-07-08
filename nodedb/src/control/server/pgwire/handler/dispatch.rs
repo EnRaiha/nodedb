@@ -354,6 +354,20 @@ impl NodeDbPgHandler {
             txn_id,
             wal_lsn,
         } = args;
+        // Neutral write-admission seam. This path builds its own `Request` and
+        // enqueues directly (it does not flow through the autocommit funnel), so
+        // it passes the gate here to stamp `Admitted` on writes / `Exempt` on
+        // reads. The gate acquires no lock in this change — behavior unchanged.
+        use crate::control::server::shared::write_admission::{WriteTarget, admit};
+        let admission = admit(
+            &self.state,
+            &WriteTarget {
+                tenant_id,
+                database_id,
+                vshard_id,
+                plan: &plan,
+            },
+        );
         let request_id = self.next_request_id();
         let request = Request {
             request_id,
@@ -373,6 +387,7 @@ impl NodeDbPgHandler {
             statement_digest: None,
             txn_id,
             wal_lsn,
+            admission,
         };
 
         let mut rx = self.state.tracker.register(request_id);

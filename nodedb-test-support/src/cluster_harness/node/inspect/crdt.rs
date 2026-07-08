@@ -56,6 +56,9 @@ impl TestClusterNode {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: nodedb::bridge::envelope::Admission::Exempt(
+                nodedb::bridge::envelope::ExemptReason::Read,
+            ),
         };
 
         // Register for response routing before dispatching, then submit through
@@ -126,6 +129,7 @@ impl TestClusterNode {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission: nodedb::bridge::envelope::Admission::Admitted,
         };
 
         let mut rx = self.shared.tracker.register(request_id);

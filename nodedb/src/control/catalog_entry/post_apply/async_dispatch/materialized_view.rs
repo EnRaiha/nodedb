@@ -51,6 +51,9 @@ pub async fn delete_async(tenant_id: u64, name: String, shared: Arc<SharedState>
                 statement_digest: None,
                 txn_id: None,
                 wal_lsn: None,
+                admission: crate::bridge::envelope::Admission::Exempt(
+                    crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+                ),
             };
             let rx = shared.tracker.register(request_id);
             if d.dispatch_to_core(core_id, request).is_err() {

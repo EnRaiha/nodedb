@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub mod admission_chokepoint;
 pub mod dispatch;
 pub mod envelope;
 pub mod quiesce;
@@ -19,5 +20,6 @@ pub mod window_func {
     pub use nodedb_query::window::*;
 }
 
+pub use admission_chokepoint::writes_bypassed_admission_gate;
 pub use dispatch::Dispatcher;
 pub use envelope::{Request, Response, Status};

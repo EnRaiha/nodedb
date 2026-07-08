@@ -50,6 +50,7 @@ fn make_request(plan: PhysicalPlan, id: u64) -> Request {
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
+        admission: crate::bridge::envelope::Admission::Admitted,
     }
 }
 

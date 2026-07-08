@@ -96,6 +96,9 @@ pub async fn perform_kv_clone_copyup(params: KvCopyUpParams<'_>) -> crate::Resul
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
+        admission: crate::bridge::envelope::Admission::Exempt(
+            crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+        ),
     };
 
     let mut rx = state.tracker.register(req_id);
@@ -250,6 +253,9 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
+        admission: crate::bridge::envelope::Admission::Exempt(
+            crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+        ),
     };
 
     let mut rx = state.tracker.register(req_id);

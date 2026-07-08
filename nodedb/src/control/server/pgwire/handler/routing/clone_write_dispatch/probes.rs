@@ -152,6 +152,9 @@ pub(super) async fn dispatch_data_plane_raw(
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
+        admission: crate::bridge::envelope::Admission::Exempt(
+            crate::bridge::envelope::ExemptReason::Read,
+        ),
     };
     let mut rx = state.tracker.register(req_id);
     match state.dispatcher.lock() {

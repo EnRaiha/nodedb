@@ -317,6 +317,21 @@ impl Session {
         vshard_id: VShardId,
         plan: PhysicalPlan,
     ) -> crate::Result<Vec<u8>> {
+        // The sync/native steady-state session builds its own Request and
+        // enqueues directly (it does not flow through the autocommit funnel),
+        // so it passes the gate here to stamp `Admitted` on writes / `Exempt`
+        // on reads. The gate acquires no lock in this change — behavior
+        // unchanged.
+        use crate::control::server::shared::write_admission::{WriteTarget, admit};
+        let admission = admit(
+            &self.state,
+            &WriteTarget {
+                tenant_id,
+                database_id,
+                vshard_id,
+                plan: &plan,
+            },
+        );
         let request = Request {
             request_id,
             tenant_id,
@@ -335,6 +350,7 @@ impl Session {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            admission,
         };
 
         // Register for response routing before dispatching.

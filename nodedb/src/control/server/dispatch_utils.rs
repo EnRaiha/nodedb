@@ -288,6 +288,21 @@ async fn dispatch_to_data_plane_inner(
     );
     let change_meta = extract_write_metadata(&plan, tenant_id);
 
+    // Neutral write-admission seam: every write-class plan on this near-universal
+    // autocommit / internal funnel passes the gate here and is stamped
+    // `Admitted`; reads and control ops are `Exempt`. The gate acquires no lock
+    // in this change (always-ready no-op) — behavior is unchanged.
+    use crate::control::server::shared::write_admission::{WriteTarget, admit};
+    let admission = admit(
+        shared,
+        &WriteTarget {
+            tenant_id,
+            database_id,
+            vshard_id,
+            plan: &plan,
+        },
+    );
+
     // Per-vShard QPS + latency timer. `dispatch_started` marks the
     // wall-clock moment the request enters the Control Plane dispatch
     // site; observation happens on every exit path (success, budget
@@ -314,6 +329,7 @@ async fn dispatch_to_data_plane_inner(
         statement_digest: None,
         txn_id,
         wal_lsn,
+        admission,
     };
 
     let mut rx = shared.tracker.register(request_id);

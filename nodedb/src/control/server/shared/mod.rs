@@ -4,3 +4,4 @@ pub mod ddl;
 pub mod plan_util;
 pub mod session;
 pub mod sql;
+pub mod write_admission;

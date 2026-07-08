@@ -537,6 +537,9 @@ fn startup_replay_recovers_all_wal_data() {
                 statement_digest: None,
                 txn_id: None,
                 wal_lsn: None,
+                admission: nodedb::bridge::envelope::Admission::Exempt(
+                    nodedb::bridge::envelope::ExemptReason::Read,
+                ),
             },
         })
         .unwrap();

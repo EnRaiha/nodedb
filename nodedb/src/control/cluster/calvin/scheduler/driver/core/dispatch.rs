@@ -217,6 +217,12 @@ impl Scheduler {
             // scheduler's response handler), so no committed LSN is known at
             // dispatch time to stamp here.
             wal_lsn: None,
+            // Calvin-scheduled apply: the deterministic scheduler already holds
+            // this transaction's locks, so it does not re-acquire at the
+            // write-admission gate — Exempt.
+            admission: crate::bridge::envelope::Admission::Exempt(
+                crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+            ),
         };
 
         let resp_rx = self.shared.tracker.register(request_id);
@@ -340,6 +346,12 @@ impl Scheduler {
             // scheduler's response handler), so no committed LSN is known at
             // dispatch time to stamp here.
             wal_lsn: None,
+            // Calvin-scheduled apply: the deterministic scheduler already holds
+            // this transaction's locks, so it does not re-acquire at the
+            // write-admission gate — Exempt.
+            admission: crate::bridge::envelope::Admission::Exempt(
+                crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+            ),
         };
 
         let resp_rx = self.shared.tracker.register(request_id);
