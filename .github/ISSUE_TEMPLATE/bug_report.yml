@@ -127,13 +127,14 @@ body:
     attributes:
       label: Proposed severity
       description: >
-        Use the facts above. SEV-1: data loss / corruption / security / crash with no workaround.
-        SEV-2: major functionality broken, no acceptable workaround. SEV-3: feature wrong but
-        system operational and a workaround exists. SEV-4: minimal impact / cosmetic.
-        Maintainers confirm or adjust this at triage.
+        The line that gets abused is SEV-1 vs SEV-2. SEV-1 is only irreversible harm:
+        stored data actually lost/corrupted/resurrected on disk, the server crashing or
+        failing to start, or a cross-tenant breach. A query that silently returns the
+        WRONG rows while the stored data is intact is SEV-2, not SEV-1 — and "no
+        workaround" on its own is SEV-2, not SEV-1. Maintainers confirm or adjust at triage.
       options:
-        - "SEV-1 — Critical: data loss, corruption, security, or crash; no workaround"
-        - "SEV-2 — High: major functionality broken; no acceptable workaround"
+        - "SEV-1 — Critical: stored data lost/corrupted, crash/won't start, or cross-tenant breach"
+        - "SEV-2 — High: major functionality broken or silently-wrong results; stored data intact"
         - "SEV-3 — Medium: feature wrong, but operational and a workaround exists"
         - "SEV-4 — Low: minimal / cosmetic"
     validations:
