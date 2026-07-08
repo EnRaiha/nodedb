@@ -1,0 +1,21 @@
+name: Documentation issue
+description: Something in the docs is wrong, missing, or misleading.
+title: "<one-line summary>"
+labels: ["type:docs", "status:needs-triage"]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Where
+      description: URL or file path of the doc.
+      placeholder: "https://docs.nodedb... or nodedb/docs/..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's wrong
+      description: What is incorrect, missing, or confusing — and what it should say.
+    validations:
+      required: true

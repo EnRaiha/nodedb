@@ -1,0 +1,25 @@
+name: Sync labels
+
+# Keeps this repo's labels identical to .github/labels.yml.
+# Run manually, or automatically whenever the manifest changes on main.
+on:
+  push:
+    branches: [main]
+    paths: [".github/labels.yml"]
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crazy-max/ghaction-github-labeler@v5
+        with:
+          yaml-file: .github/labels.yml
+          # Set to true only after confirming the manifest is complete —
+          # it deletes any label not listed here.
+          skip-delete: true
+          dry-run: false

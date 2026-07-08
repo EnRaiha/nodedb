@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability (private)
+    url: https://github.com/NodeDB-Lab/nodedb/security/advisories/new
+    about: Report security or data-isolation issues privately. Never in a public issue.
+  - name: Question / discussion
+    url: https://github.com/NodeDB-Lab/nodedb/discussions
+    about: Usage questions, design discussion, and "is this a bug?" go here first.

@@ -1,0 +1,184 @@
+name: Bug report
+description: Something is broken, incorrect, or lost data. Report a defect in the engine.
+title: "<one-line summary of what is broken>"
+labels: ["type:bug", "status:needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. A good bug report is **reproducible** and pins **exactly when it happened**.
+        Fill every required field — an issue we cannot reproduce or place in a build cannot be fixed.
+
+        - **Security vulnerability?** Do **not** file it here — use a
+          [private security advisory](https://github.com/NodeDB-Lab/nodedb/security/advisories/new).
+        - **A usage question, not a defect?** Use
+          [Discussions](https://github.com/NodeDB-Lab/nodedb/discussions).
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / build tested against
+      description: >
+        Where it happened. A released tag (`v0.3.0`), or `origin/main @ <short-sha>`
+        for a source build. `SELECT version();` prints this. Never "latest".
+      placeholder: "origin/main @ 8e84501a  (or  v0.3.0)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment mode
+      options:
+        - "Origin — single node (local)"
+        - "Origin — distributed / cluster"
+        - "NodeDB-Lite — embedded"
+        - "NodeDB-Lite — WASM (browser)"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engines
+    attributes:
+      label: Engine(s) involved
+      description: Select all that apply. Leave at "Not engine-specific / unsure" if it is cross-cutting (SQL, WAL, cluster, pgwire).
+      multiple: true
+      options:
+        - "Not engine-specific / unsure"
+        - "Document (schemaless)"
+        - "Document (strict)"
+        - "Key-Value"
+        - "Columnar"
+        - "Timeseries"
+        - "Spatial"
+        - "Vector"
+        - "Array"
+        - "Graph (overlay)"
+        - "Full-Text Search (overlay)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One paragraph — what is wrong, and why it matters. No repro yet.
+      placeholder: "count(*) on a document collection never decrements after DELETE, so cardinality reads drift permanently above the real row set with no error."
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Exact, minimal, copy-pasteable steps from a fresh data directory — SQL preferred.
+        Annotate what each step returned. This is the single most important field.
+      render: sql
+      placeholder: |
+        CREATE COLLECTION r (id TEXT PRIMARY KEY, v TEXT) WITH (engine='document_strict');
+        INSERT INTO r (id, v) VALUES ('a','1'), ('b','2');
+        SELECT count(*) FROM r;          -- 2   (correct)
+        DELETE FROM r WHERE id = 'a';    -- DELETE 1
+        SELECT count(*) FROM r;          -- 2   <- WRONG, expected 1
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: "count(*) reflects the live row set — DELETE decrements it. An empty collection returns a single row with 0."
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: "The counter only ever increments; after the first DELETE it permanently exceeds the real row set, while a scan returns the correct rows."
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        ### Severity — answer the facts, then pick the level
+
+        Severity is a **technical** measure of impact. It is **not** priority (urgency/scheduling)
+        — the maintainers set priority at triage based on release context. Answer the questions
+        below honestly; they determine the level.
+
+  - type: checkboxes
+    id: severity-facts
+    attributes:
+      label: What actually happened? (check all that are true)
+      options:
+        - label: "Acknowledged/committed data was lost, corrupted, or silently wrong"
+        - label: "The server crashed, hung, or failed to start"
+        - label: "A security or isolation boundary was crossed"
+        - label: "Core functionality is broken with no acceptable workaround"
+        - label: "A workaround exists (rewrite the query, avoid one path, etc.)"
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Proposed severity
+      description: >
+        Use the facts above. SEV-1: data loss / corruption / security / crash with no workaround.
+        SEV-2: major functionality broken, no acceptable workaround. SEV-3: feature wrong but
+        system operational and a workaround exists. SEV-4: minimal impact / cosmetic.
+        Maintainers confirm or adjust this at triage.
+      options:
+        - "SEV-1 — Critical: data loss, corruption, security, or crash; no workaround"
+        - "SEV-2 — High: major functionality broken; no acceptable workaround"
+        - "SEV-3 — Medium: feature wrong, but operational and a workaround exists"
+        - "SEV-4 — Low: minimal / cosmetic"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reproducibility
+    attributes:
+      label: Reproducibility
+      description: A consistently reproducible defect carries more confidence (and usually higher severity) than an intermittent one.
+      options:
+        - "Always — every attempt"
+        - "Intermittent — some attempts"
+        - "Seen once — could not reproduce again"
+    validations:
+      required: true
+
+  - type: input
+    id: regression
+    attributes:
+      label: Last known-good version / commit (if a regression)
+      description: If this worked on an earlier build, the tag or short SHA where it last worked. Leave blank if unknown or never worked.
+      placeholder: "67c4572d"
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment & logs
+      description: OS + arch, notable build flags or `WITH (...)` options, and any relevant server log lines or stack traces.
+      placeholder: |
+        Linux x86_64, release build.
+        Log: "Shutting down..." then on restart: <paste>
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I reproduced this on a released tag or a current `main` build (not a stale local branch).
+          required: true
+        - label: This is not a security vulnerability (those go to a private advisory).
+          required: true

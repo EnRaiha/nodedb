@@ -1,0 +1,62 @@
+name: Feature request
+description: Propose new capability or a change to existing behavior.
+title: "<one-line summary of the proposal>"
+labels: ["type:feature", "status:needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals are judged on the **problem**, not the solution. Lead with what you can't do today.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that you can't (or can only do painfully) today? Concrete, from real usage.
+      placeholder: "I run metrics ingestion and need continuous aggregates to survive restart without re-scanning the full retention window."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What behavior, SQL surface, or API would solve it. Sketch the syntax if relevant.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engines
+    attributes:
+      label: Engine / area
+      multiple: true
+      options:
+        - "Not engine-specific / cross-cutting (SQL, cluster, storage)"
+        - "Document (schemaless)"
+        - "Document (strict)"
+        - "Key-Value"
+        - "Columnar"
+        - "Timeseries"
+        - "Spatial"
+        - "Vector"
+        - "Array"
+        - "Graph (overlay)"
+        - "Full-Text Search (overlay)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives & workarounds
+      description: What you do today instead, and why it's insufficient. Prior art in other databases is useful here.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions for this proposal.
+          required: true
