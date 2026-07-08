@@ -90,7 +90,7 @@ pub fn route_write_to_calvin<'a>(
         }
 
         // Point write: its key is known, so build a static TxClass and submit it.
-        let tx_class = build_static_tx_class(std::slice::from_ref(&task), tenant_id)?;
+        let tx_class = build_static_tx_class(std::slice::from_ref(&task), tenant_id, &[])?;
         submit_calvin_routed(shared, tx_class).await
     })
 }

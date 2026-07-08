@@ -419,6 +419,7 @@ pub async fn dispatch_dependent_edge_recon(
                         tenant_id,
                         dep_collection,
                         &surrogates,
+                        &[],
                     )
                     .map_err(|_| {
                         nodedb_cluster::error::CalvinError::Sequencer(SequencerError::Unavailable)

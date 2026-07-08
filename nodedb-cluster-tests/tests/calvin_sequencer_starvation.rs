@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 use nodedb_cluster::calvin::sequencer::config::SequencerConfig;
 use nodedb_cluster::calvin::sequencer::inbox::{Inbox, new_inbox};
 use nodedb_cluster::calvin::sequencer::validator::validate_batch;
-use nodedb_cluster::calvin::types::{EngineKeySet, ReadWriteSet, SortedVec, TxClass};
+use nodedb_cluster::calvin::types::{
+    EngineKeySet, ReadWriteSet, SortedVec, TxClass, VersionedReadSet,
+};
 use nodedb_types::{
     TenantId,
     id::{DatabaseId, VShardId},
@@ -67,6 +69,7 @@ fn make_conflicting_tx(col_a: &str, col_b: &str, unique_surr: u32, tenant: u64) 
         vec![unique_surr as u8],
         TenantId::new(tenant),
         None,
+        VersionedReadSet::default(),
     )
     .expect("valid TxClass")
 }

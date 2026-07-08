@@ -65,7 +65,8 @@ pub async fn dispatch_tasks_to_calvin(
                     if state.sequencer_inbox.get().is_none() {
                         return Err(crate::Error::SequencerUnavailable);
                     }
-                    let tx_class = build_static_tx_class(tasks, tenant_id)?;
+                    // Autocommit cross-shard write: no session read-set yet.
+                    let tx_class = build_static_tx_class(tasks, tenant_id, &[])?;
                     submit_calvin_routed(state, tx_class).await
                 }
                 CrossShardTxnMode::BestEffortNonAtomic => {

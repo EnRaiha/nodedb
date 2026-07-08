@@ -4,7 +4,10 @@ pub mod primitives;
 pub mod sequencer;
 pub mod transaction;
 
-pub use primitives::{DependentReadSpec, EngineKeySet, PassiveReadKey, SortedVec};
+pub use primitives::{
+    DependentReadSpec, EngineKeySet, EngineTag, PassiveReadKey, ReadKeyIdent, SortedVec,
+    VersionedReadEntry, VersionedReadSet,
+};
 pub use sequencer::{EpochBatch, SequencedTxn};
 pub use transaction::{ReadWriteSet, TxClass};
 
@@ -78,6 +81,7 @@ mod tests {
             vec![0x01, 0x02],
             TenantId::new(1),
             None,
+            VersionedReadSet::default(),
         )
         .expect("valid TxClass")
     }
@@ -173,6 +177,7 @@ mod tests {
             vec![],
             TenantId::new(1),
             None,
+            VersionedReadSet::default(),
         )
         .unwrap_err();
         assert!(matches!(err, CalvinError::EmptyWriteSet));
@@ -189,6 +194,7 @@ mod tests {
             vec![],
             TenantId::new(1),
             None,
+            VersionedReadSet::default(),
         )
         .unwrap_err();
         assert!(matches!(err, CalvinError::SingleVshardTxn { .. }));
@@ -364,6 +370,7 @@ mod tests {
             vec![],
             TenantId::new(1),
             Some(spec),
+            VersionedReadSet::default(),
         )
         .expect("valid TxClass with dependent reads");
 

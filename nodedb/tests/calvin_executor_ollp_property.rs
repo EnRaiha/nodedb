@@ -21,7 +21,7 @@ use std::time::Duration;
 use nodedb::control::cluster::calvin::executor::ollp::{OllpConfig, OllpError, OllpOrchestrator};
 use nodedb_cluster::calvin::{
     sequencer::{SequencerConfig, new_inbox},
-    types::{EngineKeySet, ReadWriteSet, SortedVec, TxClass},
+    types::{EngineKeySet, ReadWriteSet, SortedVec, TxClass, VersionedReadSet},
 };
 use nodedb_types::{TenantId, id::VShardId};
 
@@ -61,6 +61,7 @@ fn make_tx_class(surr_a: u32, surr_b: u32) -> TxClass {
         vec![],
         TenantId::new(1),
         None,
+        VersionedReadSet::default(),
     )
     .expect("valid TxClass")
 }

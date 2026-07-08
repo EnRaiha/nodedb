@@ -321,6 +321,7 @@ mod tests {
             vec![inbox_seq as u8],
             TenantId::new(1),
             None,
+            crate::calvin::types::VersionedReadSet::default(),
         )
         .expect("valid TxClass");
         AdmittedTx {

@@ -11,7 +11,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub use nodedb_types::calvin::{EngineKeySet, PassiveReadKey, SortedVec};
+pub use nodedb_types::calvin::{
+    EngineKeySet, EngineTag, PassiveReadKey, ReadKeyIdent, SortedVec, VersionedReadEntry,
+    VersionedReadSet,
+};
 
 /// Describes the passive-read participants for a dependent-read Calvin txn.
 ///

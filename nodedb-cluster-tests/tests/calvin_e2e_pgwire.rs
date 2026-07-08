@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use nodedb_cluster::calvin::{
     sequencer::{SequencerConfig, new_inbox},
-    types::{EngineKeySet, ReadWriteSet, SequencedTxn, SortedVec, TxClass},
+    types::{EngineKeySet, ReadWriteSet, SequencedTxn, SortedVec, TxClass, VersionedReadSet},
 };
 use nodedb_types::{
     TenantId,
@@ -74,6 +74,7 @@ fn make_multi_vshard_insert(col_a: &str, col_b: &str) -> TxClass {
         vec![],
         TenantId::new(1),
         None,
+        VersionedReadSet::default(),
     )
     .expect("valid TxClass for multi-vshard INSERT")
 }

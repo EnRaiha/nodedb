@@ -30,22 +30,11 @@ use super::store::SessionStore;
 /// Which peer engine served a read. Mirrors the top-level [`PhysicalPlan`]
 /// variants one-to-one so the classifier is total and a new engine forces a
 /// decision at compile time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngineTag {
-    Vector,
-    Graph,
-    Document,
-    Kv,
-    Text,
-    Columnar,
-    Timeseries,
-    Spatial,
-    Crdt,
-    Query,
-    Meta,
-    Array,
-    ClusterArray,
-}
+///
+/// Defined in `nodedb-types` because it also travels on the replicated Calvin
+/// `TxClass` versioned read-set; re-exported here so read-capture call sites
+/// keep referring to it by this path.
+pub use nodedb_types::calvin::EngineTag;
 
 /// The identity a read observed within a collection.
 ///
@@ -53,8 +42,8 @@ pub enum EngineTag {
 /// validation later). `Predicate` is the coarse, collection-scoped observation
 /// for scans / searches / aggregates and for keyed ops whose observation spans
 /// more than one row (batch gets, secondary-index equality) — safe against
-/// phantoms, never under-approximating. U9 refines `Predicate` to an
-/// index-range signature without a type change.
+/// phantoms, never under-approximating. A future refinement may narrow
+/// `Predicate` to an index-range signature without a type change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadKey {
     /// A single-row keyed observation.

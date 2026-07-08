@@ -13,13 +13,47 @@
 
 use crate::Error;
 use crate::control::planner::calvin::dispatch::is_write_plan;
+use crate::control::server::shared::session::read_set::{ReadKey, ReadSetEntry};
 use crate::types::VShardId;
-use nodedb_cluster::calvin::types::{EngineKeySet, ReadWriteSet, SortedVec, TxClass};
+use nodedb_cluster::calvin::types::{
+    EngineKeySet, ReadKeyIdent, ReadWriteSet, SortedVec, TxClass, VersionedReadEntry,
+    VersionedReadSet,
+};
 use nodedb_physical::physical_plan::{
     DocumentOp, GraphOp, KvOp, PhysicalPlan, TimeseriesOp, VectorOp,
 };
 use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::TenantId;
+
+/// Map the neutral session read-set into the replicated, LSN-versioned
+/// [`VersionedReadSet`] carried on the `TxClass`.
+///
+/// Each [`ReadSetEntry`] becomes one [`VersionedReadEntry`], preserving the
+/// engine, collection, per-shard `read_lsn`, and the point/predicate
+/// distinction. The entry's `(database_id, tenant_id)` scope is not re-carried
+/// per entry: the enclosing `TxClass` already scopes the tenant.
+///
+/// Own-overlay (read-your-own-write) exclusion is a capture-time concern (a
+/// read satisfied by the txn's own staged writes is never recorded, and a
+/// mixed committed-base + staged read records only the committed portion) — it
+/// cannot be reconstructed here from key identity alone, so this mapping is a
+/// faithful 1:1 projection of whatever the session captured.
+fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
+    VersionedReadSet::new(
+        reads
+            .iter()
+            .map(|entry| VersionedReadEntry {
+                engine: entry.engine,
+                collection: entry.collection.clone(),
+                key: match &entry.key {
+                    ReadKey::Point { repr } => ReadKeyIdent::Point(repr.clone()),
+                    ReadKey::Predicate => ReadKeyIdent::Predicate,
+                },
+                read_lsn: entry.read_lsn,
+            })
+            .collect(),
+    )
+}
 
 /// Build a `TxClass` from a static write task slice.
 ///
@@ -28,10 +62,15 @@ use nodedb_types::TenantId;
 /// pairs), constructs the `ReadWriteSet`, msgpack-encodes plans into `Vec<u8>`,
 /// and calls `TxClass::new`.
 ///
+/// `reads` is the neutral session read-set captured during the transaction;
+/// it is projected onto the `TxClass`'s LSN-versioned `versioned_reads` field.
+/// Autocommit and pure-write paths pass an empty slice.
+///
 /// Returns `Err(SequencerUnavailable)` if msgpack encoding of plans fails.
 pub fn build_static_tx_class(
     tasks: &[PhysicalTask],
     tenant_id: TenantId,
+    reads: &[ReadSetEntry],
 ) -> crate::Result<TxClass> {
     use std::collections::HashMap;
 
@@ -165,7 +204,17 @@ pub fn build_static_tx_class(
         detail: format!("failed to encode PhysicalPlan vec for Calvin TxClass: {e}"),
     })?;
 
-    TxClass::new(read_set, write_set, plans_bytes, tenant_id, None).map_err(|e| Error::BadRequest {
+    let versioned_reads = versioned_reads_from(reads);
+
+    TxClass::new(
+        read_set,
+        write_set,
+        plans_bytes,
+        tenant_id,
+        None,
+        versioned_reads,
+    )
+    .map_err(|e| Error::BadRequest {
         detail: format!("invalid TxClass: {e}"),
     })
 }
@@ -226,12 +275,16 @@ fn vector_write_surrogates(op: &VectorOp) -> Option<(String, Vec<u32>)> {
 /// txns that contain an OLLP bulk operation alongside static-key writes still
 /// produce a valid multi-vshard `TxClass`.
 ///
+/// `reads` is the neutral session read-set, projected onto the `TxClass`'s
+/// LSN-versioned `versioned_reads` field; autocommit paths pass an empty slice.
+///
 /// Returns `Err` if encoding fails or the resulting TxClass is invalid.
 pub fn build_dependent_tx_class(
     tasks: &[PhysicalTask],
     tenant_id: TenantId,
     collection: &str,
     predicted_surrogates: &[u32],
+    reads: &[ReadSetEntry],
 ) -> crate::Result<TxClass> {
     use std::collections::BTreeMap;
 
@@ -328,7 +381,17 @@ pub fn build_dependent_tx_class(
         detail: format!("failed to encode PhysicalPlan vec for Calvin dependent TxClass: {e}"),
     })?;
 
-    TxClass::new(read_set, write_set, plans_bytes, tenant_id, None).map_err(|e| Error::BadRequest {
+    let versioned_reads = versioned_reads_from(reads);
+
+    TxClass::new(
+        read_set,
+        write_set,
+        plans_bytes,
+        tenant_id,
+        None,
+        versioned_reads,
+    )
+    .map_err(|e| Error::BadRequest {
         detail: format!("invalid dependent TxClass: {e}"),
     })
 }
@@ -378,5 +441,112 @@ fn surrogate_from_plan(plan: &PhysicalPlan) -> u32 {
             | DocumentOp::PointUpdate { surrogate, .. },
         ) => surrogate.as_u32(),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::server::shared::session::read_set::EngineTag;
+    use crate::types::{DatabaseId, KeyRepr, Lsn};
+    use nodedb_types::Surrogate;
+
+    /// Find two collection names whose default-database vShards differ, so the
+    /// built `TxClass` spans ≥2 vShards (required by `TxClass::new`).
+    fn two_distinct_collections() -> (String, String) {
+        let mut first: Option<(String, u32)> = None;
+        for i in 0u32..1024 {
+            let name = format!("coll_{i}");
+            let v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            match &first {
+                Some((fname, fv)) if *fv != v => return (fname.clone(), name),
+                Some(_) => {}
+                None => first = Some((name, v)),
+            }
+        }
+        panic!("could not find two distinct-vShard collections in 1024 tries");
+    }
+
+    fn point_insert_task(collection: &str, surrogate: u32) -> PhysicalTask {
+        PhysicalTask {
+            tenant_id: TenantId::new(1),
+            vshard_id: VShardId::new(0),
+            database_id: DatabaseId::DEFAULT,
+            plan: PhysicalPlan::Document(DocumentOp::PointInsert {
+                collection: collection.to_owned(),
+                document_id: "d1".to_owned(),
+                surrogate: Surrogate::new(surrogate),
+                value: vec![],
+                if_absent: false,
+            }),
+            post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+            txn_id: None,
+        }
+    }
+
+    fn read_entry(collection: &str, key: ReadKey, read_lsn: u64) -> ReadSetEntry {
+        ReadSetEntry {
+            engine: EngineTag::Document,
+            database_id: DatabaseId::DEFAULT,
+            tenant_id: TenantId::new(1),
+            collection: collection.to_owned(),
+            key,
+            read_lsn: Lsn::new(read_lsn),
+        }
+    }
+
+    #[test]
+    fn build_static_carries_versioned_reads_and_keeps_write_derived_vshards() {
+        let (col_a, col_b) = two_distinct_collections();
+        let tasks = vec![point_insert_task(&col_a, 1), point_insert_task(&col_b, 2)];
+
+        // Synthetic read-set: one point read (surrogate identity) at LSN 7 and
+        // one collection-scoped predicate read at LSN 11.
+        let reads = vec![
+            read_entry(
+                "read_col",
+                ReadKey::Point {
+                    repr: KeyRepr::Surrogate(42),
+                },
+                7,
+            ),
+            read_entry("scan_col", ReadKey::Predicate, 11),
+        ];
+
+        let tx = build_static_tx_class(&tasks, TenantId::new(1), &reads)
+            .expect("valid multi-vShard TxClass");
+
+        // Versioned reads are carried on the new field, faithfully mapped.
+        assert_eq!(tx.versioned_reads.len(), 2);
+        let point = tx
+            .versioned_reads
+            .iter()
+            .find(|e| matches!(e.key, ReadKeyIdent::Point(_)))
+            .expect("point entry present");
+        assert_eq!(point.read_lsn, Lsn::new(7));
+        assert_eq!(point.engine, EngineTag::Document);
+        assert_eq!(point.key, ReadKeyIdent::Point(KeyRepr::Surrogate(42)));
+
+        let predicate = tx
+            .versioned_reads
+            .iter()
+            .find(|e| matches!(e.key, ReadKeyIdent::Predicate))
+            .expect("predicate entry present");
+        assert_eq!(predicate.read_lsn, Lsn::new(11));
+
+        // participating_vshards stays WRITE-derived: exactly the two write
+        // collections' vShards, unaffected by the read-set.
+        let expected = tx.write_set.participating_vshards();
+        assert_eq!(tx.participating_vshards(), expected.as_slice());
+        assert_eq!(tx.participating_vshards().len(), 2);
+    }
+
+    #[test]
+    fn empty_read_set_yields_empty_versioned_reads() {
+        let (col_a, col_b) = two_distinct_collections();
+        let tasks = vec![point_insert_task(&col_a, 1), point_insert_task(&col_b, 2)];
+        let tx = build_static_tx_class(&tasks, TenantId::new(1), &[])
+            .expect("valid multi-vShard TxClass");
+        assert!(tx.versioned_reads.is_empty());
     }
 }

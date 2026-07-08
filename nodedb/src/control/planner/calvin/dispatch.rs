@@ -207,7 +207,9 @@ pub async fn dispatch_calvin_or_fast(
             match mode {
                 CrossShardTxnMode::Strict => {
                     let inbox = inbox.ok_or(Error::SequencerUnavailable)?;
-                    let tx_class = build_static_tx_class(tasks, tenant_id)?;
+                    // Autocommit cross-shard write: no session read-set is
+                    // accumulated (interactive COMMIT carries one later).
+                    let tx_class = build_static_tx_class(tasks, tenant_id, &[])?;
                     let inbox_seq = inbox.submit(tx_class).map_err(|e| Error::BadRequest {
                         detail: format!("Calvin sequencer rejected transaction: {e}"),
                     })?;

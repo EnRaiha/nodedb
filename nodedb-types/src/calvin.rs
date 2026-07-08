@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::{KeyRepr, Lsn};
+
 /// A newtype over `Vec<T>` that guarantees sorted, deduplicated contents.
 ///
 /// Constructed via [`SortedVec::new`], which sorts and deduplicates at
@@ -172,4 +174,137 @@ impl EngineKeySet {
 pub struct PassiveReadKey {
     /// The engine key set to read on the passive vshard.
     pub engine_key: EngineKeySet,
+}
+
+/// Which peer engine served a read. Mirrors the top-level physical-plan
+/// engine variants one-to-one so the classifier is total and a new engine
+/// forces a decision at compile time.
+///
+/// Encoded as a plain integer discriminant (`#[msgpack(c_enum)]`): stable,
+/// compact, and comparable across the wire. The discriminant assignment is
+/// load-bearing for on-wire stability — do NOT reorder variants.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+#[msgpack(c_enum)]
+pub enum EngineTag {
+    Vector,
+    Graph,
+    Document,
+    Kv,
+    Text,
+    Columnar,
+    Timeseries,
+    Spatial,
+    Crdt,
+    Query,
+    Meta,
+    Array,
+    ClusterArray,
+}
+
+/// The identity a read observed within a collection, carried on the
+/// replicated Calvin `TxClass`.
+///
+/// `Point` carries the exact row identity ([`KeyRepr`]) for a keyed lookup
+/// (per-key optimistic-concurrency validation). `Predicate` is the coarse,
+/// collection-scoped observation for scans / searches / aggregates — safe
+/// against phantoms, never under-approximating.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub enum ReadKeyIdent {
+    /// A single-row keyed observation.
+    Point(KeyRepr),
+    /// A collection-scoped predicate observation.
+    Predicate,
+}
+
+/// One LSN-versioned, predicate-aware read observed by a transaction, carried
+/// on the replicated Calvin `TxClass` so participants can validate it at the
+/// commit serialization point.
+///
+/// `read_lsn` is the responding shard's write-LSN watermark at read time. The
+/// enclosing `TxClass` scopes the tenant; per-database scoping is carried by
+/// the transaction as a whole.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct VersionedReadEntry {
+    /// Which engine served the read.
+    pub engine: EngineTag,
+    /// The collection the read observed.
+    pub collection: String,
+    /// Point-key or collection-scoped-predicate identity of the observation.
+    pub key: ReadKeyIdent,
+    /// The responding shard's write-LSN watermark at read time.
+    pub read_lsn: Lsn,
+}
+
+/// The LSN-versioned read-set of a Calvin transaction.
+///
+/// Empty for pure-write transactions and for autocommit statements (which
+/// accumulate no session read-set). Populated at commit time from the neutral
+/// session read-set. Nothing validates it yet — this is the carriage
+/// mechanism onto the replicated `TxClass`.
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct VersionedReadSet(pub Vec<VersionedReadEntry>);
+
+impl VersionedReadSet {
+    /// Build from a vector of entries.
+    pub fn new(entries: Vec<VersionedReadEntry>) -> Self {
+        Self(entries)
+    }
+
+    /// Returns `true` if no reads were recorded.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Number of recorded read entries.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Iterate the recorded read entries.
+    pub fn iter(&self) -> std::slice::Iter<'_, VersionedReadEntry> {
+        self.0.iter()
+    }
+
+    /// Borrow the entries as a slice.
+    pub fn as_slice(&self) -> &[VersionedReadEntry] {
+        &self.0
+    }
 }

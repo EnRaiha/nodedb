@@ -305,6 +305,7 @@ mod tests {
             vec![surr_a as u8],
             TenantId::new(1),
             None,
+            crate::calvin::types::VersionedReadSet::default(),
         )
         .expect("valid TxClass")
     }

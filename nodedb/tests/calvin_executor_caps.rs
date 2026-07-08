@@ -13,6 +13,7 @@ use nodedb_cluster::calvin::sequencer::error::SequencerError;
 use nodedb_cluster::calvin::sequencer::inbox::new_inbox;
 use nodedb_cluster::calvin::types::{
     DependentReadSpec, EngineKeySet, PassiveReadKey, ReadWriteSet, SortedVec, TxClass,
+    VersionedReadSet,
 };
 use nodedb_types::{TenantId, id::VShardId};
 
@@ -53,6 +54,7 @@ fn base_tx_class() -> TxClass {
         vec![],
         TenantId::new(1),
         None,
+        VersionedReadSet::default(),
     )
     .expect("valid base TxClass")
 }

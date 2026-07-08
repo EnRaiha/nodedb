@@ -209,7 +209,7 @@ pub async fn insert_edge(
             post_set_op: PostSetOp::None,
             txn_id: None,
         };
-        let tx_class = build_static_tx_class(&[task], tenant_id)
+        let tx_class = build_static_tx_class(&[task], tenant_id, &[])
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
         submit_calvin_routed(state, tx_class)
             .await
@@ -379,7 +379,7 @@ pub async fn delete_edge(
             post_set_op: PostSetOp::None,
             txn_id: None,
         };
-        let tx_class = build_static_tx_class(&[task], tenant_id)
+        let tx_class = build_static_tx_class(&[task], tenant_id, &[])
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
         submit_calvin_routed(state, tx_class)
             .await

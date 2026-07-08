@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::CalvinError;
 
-use super::primitives::{DependentReadSpec, EngineKeySet};
+use super::primitives::{DependentReadSpec, EngineKeySet, VersionedReadSet};
 
 // ── ReadWriteSet ──────────────────────────────────────────────────────────────
 
@@ -96,6 +96,12 @@ impl ReadWriteSet {
 /// the participating-vshard set. The `participating_vshards` field is skipped
 /// during serialization and re-derived on decode to keep serialized bytes
 /// byte-deterministic.
+///
+/// Map-encoded (`#[msgpack(map)]`) so fields can be added additively: an older
+/// serialized `TxClass` that predates a field decodes it to its default (the
+/// field carries `#[serde(default)]` + `#[msgpack(default)]`). This is what
+/// lets `TxClass` bytes already on the sequencer Raft log survive a schema
+/// addition and still replay on restart.
 #[derive(
     Debug,
     Clone,
@@ -106,8 +112,13 @@ impl ReadWriteSet {
     zerompk::ToMessagePack,
     zerompk::FromMessagePack,
 )]
+#[msgpack(map)]
 pub struct TxClass {
     /// Keys that must be read (may be empty for pure-write transactions).
+    ///
+    /// This is the key-IDENTITY set used for locking/routing. The
+    /// LSN-versioned read observations used for optimistic-concurrency
+    /// validation live in `versioned_reads`.
     pub read_set: ReadWriteSet,
     /// Keys that will be written. Must span at least two vShards.
     pub write_set: ReadWriteSet,
@@ -126,7 +137,18 @@ pub struct TxClass {
     ///
     /// `None` for static-set transactions (the common case).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[msgpack(default)]
     pub dependent_reads: Option<DependentReadSpec>,
+    /// LSN-versioned, predicate-aware read-set captured during the session.
+    ///
+    /// Each entry carries the responding shard's write-LSN watermark at read
+    /// time plus the point/predicate identity, so a participant can validate
+    /// the read at the commit serialization point. Empty for pure-write and
+    /// autocommit transactions. Additive: predates nothing that consumes it
+    /// yet — carried here so the version travels on the replicated log.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub versioned_reads: VersionedReadSet,
     /// Cached participating-vshard set. Re-derived on decode; not serialized.
     #[serde(skip)]
     #[msgpack(ignore)]
@@ -143,12 +165,17 @@ impl TxClass {
     ///
     /// Pass `dependent_reads: None` for static-set transactions (the common
     /// case).  Pass `Some(spec)` for dependent-read (OLLP) transactions.
+    ///
+    /// `versioned_reads` carries the LSN-versioned read observations; pass
+    /// [`VersionedReadSet::default`] (empty) for pure-write / autocommit
+    /// transactions that accumulated no session read-set.
     pub fn new(
         read_set: ReadWriteSet,
         write_set: ReadWriteSet,
         plans: Vec<u8>,
         tenant_id: TenantId,
         dependent_reads: Option<DependentReadSpec>,
+        versioned_reads: VersionedReadSet,
     ) -> Result<Self, CalvinError> {
         if write_set.is_empty() {
             return Err(CalvinError::EmptyWriteSet);
@@ -180,21 +207,31 @@ impl TxClass {
             plans,
             tenant_id,
             dependent_reads,
+            versioned_reads,
             participating_vshards,
         })
     }
 
     /// Ergonomic constructor for dependent-read Calvin transactions.
     ///
-    /// Equivalent to `TxClass::new(read_set, write_set, plans, tenant_id, Some(dependent_reads))`.
+    /// Equivalent to `TxClass::new(read_set, write_set, plans, tenant_id,
+    /// Some(dependent_reads), versioned_reads)`.
     pub fn new_dependent(
         read_set: ReadWriteSet,
         write_set: ReadWriteSet,
         plans: Vec<u8>,
         tenant_id: TenantId,
         dependent_reads: DependentReadSpec,
+        versioned_reads: VersionedReadSet,
     ) -> Result<Self, CalvinError> {
-        Self::new(read_set, write_set, plans, tenant_id, Some(dependent_reads))
+        Self::new(
+            read_set,
+            write_set,
+            plans,
+            tenant_id,
+            Some(dependent_reads),
+            versioned_reads,
+        )
     }
 
     /// The vShards that must receive this transaction's slice.
@@ -225,8 +262,108 @@ impl TxClass {
 
 #[cfg(test)]
 mod tests {
-    use super::super::primitives::SortedVec;
+    use super::super::primitives::{
+        EngineTag, ReadKeyIdent, SortedVec, VersionedReadEntry, VersionedReadSet,
+    };
     use super::*;
+    use nodedb_types::{KeyRepr, Lsn};
+
+    fn sample_versioned_reads() -> VersionedReadSet {
+        VersionedReadSet::new(vec![
+            VersionedReadEntry {
+                engine: EngineTag::Kv,
+                collection: "kv_col".to_owned(),
+                key: ReadKeyIdent::Point(KeyRepr::KvKey(Box::from(&b"k1"[..]))),
+                read_lsn: Lsn::new(7),
+            },
+            VersionedReadEntry {
+                engine: EngineTag::Document,
+                collection: "doc_col".to_owned(),
+                key: ReadKeyIdent::Predicate,
+                read_lsn: Lsn::new(11),
+            },
+        ])
+    }
+
+    fn two_home_write_set() -> ReadWriteSet {
+        let (_src, _dst, sv, dv) = two_distinct_key_vshards();
+        ReadWriteSet::new(vec![EngineKeySet::Edge {
+            collection: "follows".to_owned(),
+            edges: SortedVec::new(vec![(1u32, 2u32)]),
+            home_vshards: SortedVec::new(vec![sv, dv]),
+        }])
+    }
+
+    #[test]
+    fn versioned_reads_survive_msgpack_roundtrip() {
+        let reads = sample_versioned_reads();
+        let tx = TxClass::new(
+            ReadWriteSet::new(vec![]),
+            two_home_write_set(),
+            vec![0x09, 0x09],
+            TenantId::new(1),
+            None,
+            reads.clone(),
+        )
+        .expect("valid TxClass");
+
+        let bytes = zerompk::to_msgpack_vec(&tx).expect("encode TxClass");
+        let mut decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode TxClass");
+        decoded.restore_derived();
+
+        // Every read_lsn and the Point/Predicate distinction survive exactly.
+        assert_eq!(decoded.versioned_reads, reads);
+        assert_eq!(decoded.versioned_reads.len(), 2);
+        let point = decoded
+            .versioned_reads
+            .iter()
+            .find(|e| matches!(e.key, ReadKeyIdent::Point(_)))
+            .expect("point entry");
+        assert_eq!(point.read_lsn, Lsn::new(7));
+        assert_eq!(
+            point.key,
+            ReadKeyIdent::Point(KeyRepr::KvKey(Box::from(&b"k1"[..])))
+        );
+        let predicate = decoded
+            .versioned_reads
+            .iter()
+            .find(|e| matches!(e.key, ReadKeyIdent::Predicate))
+            .expect("predicate entry");
+        assert_eq!(predicate.read_lsn, Lsn::new(11));
+    }
+
+    /// Mirror of `TxClass`'s wire shape from BEFORE `versioned_reads` existed:
+    /// map-encoded with the original fields only. Proves an old serialized
+    /// `TxClass` (no `versioned_reads` key) still decodes — the field defaults
+    /// to empty — so Raft-logged transactions survive the schema addition.
+    #[derive(zerompk::ToMessagePack)]
+    #[msgpack(map)]
+    struct LegacyTxClass {
+        read_set: ReadWriteSet,
+        write_set: ReadWriteSet,
+        plans: Vec<u8>,
+        tenant_id: TenantId,
+    }
+
+    #[test]
+    fn decodes_legacy_bytes_without_versioned_reads_field() {
+        let legacy = LegacyTxClass {
+            read_set: ReadWriteSet::new(vec![]),
+            write_set: two_home_write_set(),
+            plans: vec![0x01, 0x02],
+            tenant_id: TenantId::new(3),
+        };
+        let bytes = zerompk::to_msgpack_vec(&legacy).expect("encode legacy");
+
+        let mut decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode legacy as TxClass");
+        decoded.restore_derived();
+
+        assert!(decoded.versioned_reads.is_empty());
+        assert!(decoded.dependent_reads.is_none());
+        assert_eq!(decoded.tenant_id, TenantId::new(3));
+        assert_eq!(decoded.plans, vec![0x01, 0x02]);
+        assert_eq!(decoded.participating_vshards().len(), 2);
+    }
 
     /// Find two distinct string keys whose `from_key` vShards differ.
     fn two_distinct_key_vshards() -> (String, String, u32, u32) {

@@ -35,6 +35,7 @@ pub mod hlc;
 pub mod hnsw;
 pub mod id;
 pub mod id_gen;
+pub mod identity;
 pub mod json_msgpack;
 pub mod kv;
 pub mod kv_parsing;
@@ -87,6 +88,7 @@ pub use id::{
     CollectionId, DatabaseId, DocumentId, EdgeId, EdgeIdParseError, IdError, IdType, NodeId,
     ShapeId, TenantId,
 };
+pub use identity::KeyRepr;
 pub use json_msgpack::{
     JsonValue, json_from_msgpack, json_to_msgpack, json_to_msgpack_or_empty,
     msgpack_to_json_string, value_from_msgpack, value_to_msgpack,

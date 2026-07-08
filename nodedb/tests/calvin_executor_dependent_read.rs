@@ -20,7 +20,8 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 use nodedb_cluster::calvin::types::{
-    DependentReadSpec, EngineKeySet, PassiveReadKey, ReadWriteSet, SequencedTxn, SortedVec, TxClass,
+    DependentReadSpec, EngineKeySet, PassiveReadKey, ReadWriteSet, SequencedTxn, SortedVec,
+    TxClass, VersionedReadSet,
 };
 use nodedb_types::id::VShardId;
 
@@ -75,6 +76,7 @@ fn make_dependent_txn(passive_vshard: u32) -> SequencedTxn {
         vec![],
         TenantId::new(1),
         spec,
+        VersionedReadSet::default(),
     )
     .expect("valid dependent TxClass");
     SequencedTxn {
@@ -169,6 +171,7 @@ fn dependent_barrier_not_complete_with_multiple_passives() {
         vec![],
         TenantId::new(1),
         spec,
+        VersionedReadSet::default(),
     )
     .expect("valid");
 

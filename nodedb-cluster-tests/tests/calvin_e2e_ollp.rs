@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use nodedb_cluster::calvin::{
     sequencer::{SequencerConfig, new_inbox},
-    types::{EngineKeySet, ReadWriteSet, SequencedTxn, SortedVec, TxClass},
+    types::{EngineKeySet, ReadWriteSet, SequencedTxn, SortedVec, TxClass, VersionedReadSet},
 };
 use nodedb_types::{
     TenantId,
@@ -101,6 +101,7 @@ fn make_ollp_tx_class(
         vec![],
         TenantId::new(1),
         None,
+        VersionedReadSet::default(),
     )
     .expect("valid multi-vshard OLLP TxClass")
 }

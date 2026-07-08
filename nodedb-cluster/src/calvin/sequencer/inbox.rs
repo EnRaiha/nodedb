@@ -395,6 +395,7 @@ mod tests {
             vec![],
             TenantId::new(tenant),
             None,
+            crate::calvin::types::VersionedReadSet::default(),
         )
         .expect("valid TxClass")
     }
