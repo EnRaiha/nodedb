@@ -155,6 +155,16 @@ fn is_valid_column_name(name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
 }
 
+/// Whether `b` can appear inside a SQL identifier (letter, digit, or `_`).
+///
+/// Underscore is an identifier character, so a keyword match must NOT treat a
+/// neighbouring `_` as a word boundary — otherwise `RETURNING` is falsely found
+/// inside an identifier such as `orders_returning`, splitting the statement at
+/// the wrong place.
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// Find the byte offset of `word` in `upper_text` respecting word boundaries.
 fn find_word_boundary(upper_text: &str, word: &str) -> Option<usize> {
     let bytes = upper_text.as_bytes();
@@ -164,8 +174,8 @@ fn find_word_boundary(upper_text: &str, word: &str) -> Option<usize> {
     let mut i = 0;
     while i + wlen <= bytes.len() {
         if &bytes[i..i + wlen] == wbytes {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-            let after_ok = i + wlen >= bytes.len() || !bytes[i + wlen].is_ascii_alphanumeric();
+            let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            let after_ok = i + wlen >= bytes.len() || !is_ident_byte(bytes[i + wlen]);
             if before_ok && after_ok {
                 return Some(i);
             }
@@ -204,8 +214,8 @@ fn find_returning_keyword(upper: &str) -> Option<usize> {
 
         if i + kw_len <= bytes.len()
             && &bytes[i..i + kw_len] == keyword
-            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-            && (i + kw_len >= bytes.len() || !bytes[i + kw_len].is_ascii_alphanumeric())
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && (i + kw_len >= bytes.len() || !is_ident_byte(bytes[i + kw_len]))
         {
             return Some(i);
         }
@@ -281,6 +291,22 @@ mod tests {
         let (sql, spec) = strip_returning("UPDATE products SET stock = 0 WHERE id = 'p1'").unwrap();
         assert!(spec.is_none());
         assert_eq!(sql, "UPDATE products SET stock = 0 WHERE id = 'p1'");
+    }
+
+    #[test]
+    fn returning_inside_identifier_not_treated_as_keyword() {
+        // A collection/table whose name embeds "returning" (with `_` as an
+        // identifier boundary) must NOT match the RETURNING keyword inside the
+        // name — the real keyword is the trailing one after WHERE.
+        let (sql, spec) =
+            strip_returning("DELETE FROM orders_returning WHERE id = 'p1' RETURNING *").unwrap();
+        assert_eq!(sql, "DELETE FROM orders_returning WHERE id = 'p1'");
+        assert_eq!(spec.unwrap().columns, ReturningColumns::Star);
+
+        // Same identifier with no trailing RETURNING clause → no spec, unchanged.
+        let (sql, spec) = strip_returning("DELETE FROM orders_returning WHERE id = 'p1'").unwrap();
+        assert!(spec.is_none());
+        assert_eq!(sql, "DELETE FROM orders_returning WHERE id = 'p1'");
     }
 
     #[test]
