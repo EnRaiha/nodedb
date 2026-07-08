@@ -318,12 +318,16 @@ impl Session {
         plan: PhysicalPlan,
     ) -> crate::Result<Vec<u8>> {
         // The sync/native steady-state session builds its own Request and
-        // enqueues directly (it does not flow through the autocommit funnel),
-        // so it passes the gate here to stamp `Admitted` on writes / `Exempt`
-        // on reads. The gate acquires no lock in this change — behavior
-        // unchanged.
-        use crate::control::server::shared::write_admission::{WriteTarget, admit};
-        let admission = admit(
+        // enqueues directly (it does not flow through the autocommit funnel), so
+        // it passes the write-admission gate here. An uncontended point write
+        // takes the fast path holding its per-vShard deterministic locks (guard
+        // held across enqueue + response); a contended or bulk write is submitted
+        // through the deterministic scheduler and its applied response is
+        // serialized and returned; reads / control ops are `Exempt`.
+        use crate::control::server::shared::write_admission::{
+            WriteAdmission, WriteTarget, admit, bare_ok_response, route_write_to_calvin,
+        };
+        let (admission, _admission_guard) = match admit(
             &self.state,
             &WriteTarget {
                 tenant_id,
@@ -331,7 +335,24 @@ impl Session {
                 vshard_id,
                 plan: &plan,
             },
-        );
+        ) {
+            WriteAdmission::ExemptRead => (
+                crate::bridge::envelope::Admission::Exempt(
+                    crate::bridge::envelope::ExemptReason::Read,
+                ),
+                None,
+            ),
+            WriteAdmission::FastPath { guard } => {
+                (crate::bridge::envelope::Admission::Admitted, guard)
+            }
+            WriteAdmission::RouteToCalvin => {
+                let routed =
+                    route_write_to_calvin(&self.state, tenant_id, database_id, vshard_id, plan)
+                        .await?;
+                let response = routed.unwrap_or_else(|| bare_ok_response(RequestId::new(0)));
+                return Ok(serialize_dispatch_response_json(&response));
+            }
+        };
         let request = Request {
             request_id,
             tenant_id,
@@ -373,34 +394,40 @@ impl Session {
             detail: "response channel closed".into(),
         })?;
 
-        // Serialize response to JSON.
-        let status_str = match response.status {
-            Status::Ok => "ok",
-            Status::Partial => "partial",
-            Status::Error => "error",
-        };
-
-        let payload_b64 = if response.payload.is_empty() {
-            String::new()
-        } else {
-            // Return raw payload as lossy UTF-8 for now.
-            String::from_utf8_lossy(&response.payload).into_owned()
-        };
-
-        let error_code_str = response.error_code.as_ref().map(|ec| format!("{ec:?}"));
-
-        let resp_json = format!(
-            r#"{{"request_id":{},"status":"{}","payload":"{}","watermark_lsn":{},"error_code":{}}}"#,
-            response.request_id.as_u64(),
-            status_str,
-            payload_b64,
-            response.watermark_lsn.as_u64(),
-            error_code_str
-                .as_ref()
-                .map(|s| format!("\"{s}\""))
-                .unwrap_or_else(|| "null".to_string()),
-        );
-
-        Ok(resp_json.into_bytes())
+        Ok(serialize_dispatch_response_json(&response))
     }
+}
+
+/// Serialize a Data-Plane [`Response`] to this path's JSON wire shape. Shared by
+/// the fast-dispatch path and the scheduler-routed path so both emit an
+/// identical envelope.
+fn serialize_dispatch_response_json(response: &crate::bridge::envelope::Response) -> Vec<u8> {
+    let status_str = match response.status {
+        Status::Ok => "ok",
+        Status::Partial => "partial",
+        Status::Error => "error",
+    };
+
+    let payload_str = if response.payload.is_empty() {
+        String::new()
+    } else {
+        // Return raw payload as lossy UTF-8 for now.
+        String::from_utf8_lossy(&response.payload).into_owned()
+    };
+
+    let error_code_str = response.error_code.as_ref().map(|ec| format!("{ec:?}"));
+
+    let resp_json = format!(
+        r#"{{"request_id":{},"status":"{}","payload":"{}","watermark_lsn":{},"error_code":{}}}"#,
+        response.request_id.as_u64(),
+        status_str,
+        payload_str,
+        response.watermark_lsn.as_u64(),
+        error_code_str
+            .as_ref()
+            .map(|s| format!("\"{s}\""))
+            .unwrap_or_else(|| "null".to_string()),
+    );
+
+    resp_json.into_bytes()
 }

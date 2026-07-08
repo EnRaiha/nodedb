@@ -288,12 +288,16 @@ async fn dispatch_to_data_plane_inner(
     );
     let change_meta = extract_write_metadata(&plan, tenant_id);
 
-    // Neutral write-admission seam: every write-class plan on this near-universal
-    // autocommit / internal funnel passes the gate here and is stamped
-    // `Admitted`; reads and control ops are `Exempt`. The gate acquires no lock
-    // in this change (always-ready no-op) — behavior is unchanged.
-    use crate::control::server::shared::write_admission::{WriteTarget, admit};
-    let admission = admit(
+    // Write-admission gate: every write-class plan on this near-universal
+    // autocommit / internal funnel passes here. An uncontended point write takes
+    // the fast path holding its per-vShard deterministic locks (the guard is held
+    // across enqueue + response, releasing on drop); a contended or bulk write is
+    // submitted through the deterministic scheduler and its applied response is
+    // surfaced here; reads / control ops are `Exempt`.
+    use crate::control::server::shared::write_admission::{
+        WriteAdmission, WriteTarget, admit, bare_ok_response, route_write_to_calvin,
+    };
+    let (admission, _admission_guard) = match admit(
         shared,
         &WriteTarget {
             tenant_id,
@@ -301,7 +305,21 @@ async fn dispatch_to_data_plane_inner(
             vshard_id,
             plan: &plan,
         },
-    );
+    ) {
+        WriteAdmission::ExemptRead => (
+            crate::bridge::envelope::Admission::Exempt(crate::bridge::envelope::ExemptReason::Read),
+            None,
+        ),
+        WriteAdmission::FastPath { guard } => (crate::bridge::envelope::Admission::Admitted, guard),
+        WriteAdmission::RouteToCalvin => {
+            // The deterministic scheduler applies the write (emitting its own
+            // WriteEvents) and returns the applied response; a plain write with
+            // no RETURNING rows yields `None`, synthesized into a bare `Ok`.
+            let routed =
+                route_write_to_calvin(shared, tenant_id, database_id, vshard_id, plan).await?;
+            return Ok(routed.unwrap_or_else(|| bare_ok_response(crate::types::RequestId::new(0))));
+        }
+    };
 
     // Per-vShard QPS + latency timer. `dispatch_started` marks the
     // wall-clock moment the request enters the Control Plane dispatch

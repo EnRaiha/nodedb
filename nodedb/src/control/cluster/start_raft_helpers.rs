@@ -153,6 +153,19 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             .unwrap_or_else(|p| p.into_inner())
             .insert(vshard_id, read_result_tx);
 
+        // The deterministic lock table is shared between this scheduler and the
+        // Control-Plane write-admission gate: build it once and register the
+        // SAME `Arc` in `calvin_lock_managers` so a fast-path point write and
+        // this scheduler's validation contend on one mutex.
+        let lock_manager = Arc::new(Mutex::new(
+            crate::control::cluster::calvin::scheduler::lock_manager::LockManager::new(),
+        ));
+        shared
+            .calvin_lock_managers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(vshard_id, Arc::clone(&lock_manager));
+
         let scheduler = Scheduler::new(SchedulerParams {
             vshard_id,
             receiver: sequenced_rx,
@@ -163,6 +176,7 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             config: scheduler_config.clone(),
             metrics: SchedulerMetrics::new(),
             read_result_rx,
+            lock_manager,
         });
         let shutdown = shared.shutdown.subscribe();
         tokio::spawn(async move {

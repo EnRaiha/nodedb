@@ -396,6 +396,27 @@ pub struct SharedState {
     pub calvin_apply_results: Arc<
         Mutex<std::collections::HashMap<nodedb_cluster::calvin::TxnId, super::CalvinApplyResult>>,
     >,
+    /// Per-vShard deterministic lock managers, lifted out of each Calvin
+    /// `Scheduler` so the Control-Plane write-admission gate shares the SAME
+    /// `Arc<Mutex<LockManager>>` the scheduler holds. A fast-path uncontended
+    /// point write and a Calvin transaction's lock validation then contend on
+    /// one OS mutex — whoever takes it first wins, with no time-of-check /
+    /// time-of-use gap. Keyed by vShard id. Empty in single-node / no-Calvin
+    /// deployments (the gate then admits point writes without a fence).
+    pub calvin_lock_managers: Arc<
+        Mutex<
+            std::collections::BTreeMap<
+                u32,
+                Arc<Mutex<crate::control::cluster::calvin::scheduler::lock_manager::LockManager>>,
+            >,
+        >,
+    >,
+    /// Monotonic `position` source for autocommit fast-path lock holders. Paired
+    /// with [`TxnId::AUTOCOMMIT_EPOCH`] to mint holder identities that never
+    /// collide with a real Calvin `(epoch, position)` schedule position.
+    ///
+    /// [`TxnId::AUTOCOMMIT_EPOCH`]: crate::control::cluster::calvin::scheduler::lock_manager::TxnId::AUTOCOMMIT_EPOCH
+    pub autocommit_lock_seq: std::sync::atomic::AtomicU32,
     /// Presence/Awareness manager: ephemeral user state broadcast channels.
     pub presence: Arc<tokio::sync::RwLock<crate::control::server::sync::presence::PresenceManager>>,
     /// Permission tree cache: in-memory resource hierarchy + permission grants.

@@ -50,8 +50,14 @@ pub struct Scheduler {
     /// the sequencer group.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) multi_raft:
         Arc<Mutex<MultiRaft>>,
-    /// Deterministic lock manager for this vshard.
-    pub(in crate::control::cluster::calvin::scheduler::driver::core) lock_manager: LockManager,
+    /// Deterministic lock manager for this vshard. Shared (via `Arc<Mutex<_>>`)
+    /// with the Control-Plane write-admission gate through
+    /// `SharedState.calvin_lock_managers`, so a fast-path point write contends
+    /// on the SAME lock table this scheduler validates against. The scheduler
+    /// still runs single-threaded per vShard, so the mutex is uncontended except
+    /// for the brief probe the gate takes.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) lock_manager:
+        Arc<Mutex<LockManager>>,
     /// In-flight static/active transactions awaiting executor response.
     /// `BTreeMap` ensures deterministic iteration order.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) pending:
@@ -100,6 +106,10 @@ pub struct SchedulerParams {
     pub config: SchedulerConfig,
     pub metrics: Arc<SchedulerMetrics>,
     pub read_result_rx: mpsc::Receiver<ReadResultEvent>,
+    /// The shared lock table for this vShard. Constructed by
+    /// `reconcile_vshard_schedulers` and registered in
+    /// `SharedState.calvin_lock_managers` under the SAME `Arc` passed here.
+    pub lock_manager: Arc<Mutex<LockManager>>,
 }
 
 impl Scheduler {
@@ -115,6 +125,7 @@ impl Scheduler {
             config,
             metrics,
             read_result_rx,
+            lock_manager,
         } = params;
 
         // Capacity: at most one completion per inflight txn. Use the incoming
@@ -127,7 +138,7 @@ impl Scheduler {
             receiver,
             shared,
             multi_raft,
-            lock_manager: LockManager::new(),
+            lock_manager,
             pending: BTreeMap::new(),
             blocked: BTreeMap::new(),
             dependent_barrier: BTreeMap::new(),
@@ -307,21 +318,32 @@ impl Scheduler {
         }
 
         if response.status == crate::bridge::envelope::Status::Ok {
-            // Deposit the applied Response (carrying RETURNING rows) into the
-            // local sidecar BEFORE proposing the replicated CompletionAck. The
-            // ack fires the coordinator's completion oneshot on every sequencer
-            // member, so depositing first guarantees the rows are present by the
-            // time the coordinator drains them — no lost result, no race. Only
-            // the RETURNING-bearing participant deposits, so a sibling's row-less
-            // ack cannot clobber the entry the coordinator reads. These rows are
-            // a QUERY RESULT and travel via this in-process sidecar only — never
-            // the sequencer Raft log.
-            if self
+            // Deposit the FULL applied Response (affected-count + watermark +
+            // any RETURNING rows) into the local sidecar BEFORE proposing the
+            // replicated CompletionAck. The ack fires the coordinator's
+            // completion oneshot on every sequencer member, so depositing first
+            // guarantees the result is present by the time the coordinator drains
+            // it — no lost result, no race.
+            //
+            // Gated on the PRIMARY-WRITE participant: the sole participant whose
+            // slice carries the user's non-edge DML (Document/KV/Vector/etc.),
+            // as opposed to the implicit graph-edge cleanup that dual-homes
+            // alongside it. This subsumes the old RETURNING-only gate (a RETURNING
+            // write is a primary write, so its rows are still deposited) while
+            // ALSO carrying the affected-count of a plain (non-RETURNING) write —
+            // which the RETURNING-only gate dropped, making a routed plain write
+            // report zero rows affected. Exactly one participant carries the
+            // primary write for a single-collection user DML (+ its edges), so
+            // the edge participants never clobber the entry; the
+            // `CalvinApplyResult::{Single,Conflict}` guard below stays as
+            // belt-and-suspenders. Results travel via this in-process sidecar
+            // only — never the sequencer Raft log.
+            let has_primary_write = self
                 .pending
                 .get(&txn_id)
-                .map(|p| p.has_returning)
-                .unwrap_or(false)
-            {
+                .map(|p| p.has_primary_write)
+                .unwrap_or(false);
+            if has_primary_write {
                 use std::collections::hash_map::Entry;
 
                 use crate::control::state::CalvinApplyResult;

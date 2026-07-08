@@ -20,8 +20,8 @@
 
 use crate::Error;
 use crate::control::cluster::calvin::executor::ollp::error::OllpError;
-use crate::control::planner::calvin::dispatch::collection_name_from_plan;
 use crate::control::planner::calvin::preexec::{PreexecScan, run_preexec_scan};
+use crate::control::planner::calvin::tx_class::collection_name_from_plan;
 use crate::control::planner::calvin::{
     DependentRetryArgs, build_dependent_tx_class, is_dependent_predicate,
     predicate_class_for_filters, run_dependent_with_retry, submit_calvin_routed_assign,

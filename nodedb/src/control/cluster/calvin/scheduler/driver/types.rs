@@ -32,12 +32,13 @@ pub(super) struct PendingTxn {
     pub dispatch_time: Instant,
     /// Wall-clock time at lock acquisition (for wait-latency measurement).
     pub lock_acquired_time: Instant,
-    /// Whether THIS vShard's slice of the transaction carries a RETURNING
-    /// clause. Only the RETURNING-bearing participant deposits its applied
-    /// `Response` into `SharedState::calvin_apply_results`, so a sibling
-    /// participant's row-less ack never clobbers the entry the coordinator
-    /// drains.
-    pub has_returning: bool,
+    /// Whether this vShard's slice carries a primary user data write (a non-edge
+    /// Document/KV/Vector/Timeseries/Columnar/Array write). Only the primary-write
+    /// participant deposits its applied `Response` (affected-count and any
+    /// RETURNING rows) into `SharedState::calvin_apply_results`. The implicit-edge
+    /// cleanup participants that dual-home alongside it carry no primary write and
+    /// so never clobber the entry the coordinator drains.
+    pub has_primary_write: bool,
 }
 
 /// A transaction that is blocked on lock acquisition.

@@ -354,12 +354,16 @@ impl NodeDbPgHandler {
             txn_id,
             wal_lsn,
         } = args;
-        // Neutral write-admission seam. This path builds its own `Request` and
-        // enqueues directly (it does not flow through the autocommit funnel), so
-        // it passes the gate here to stamp `Admitted` on writes / `Exempt` on
-        // reads. The gate acquires no lock in this change — behavior unchanged.
-        use crate::control::server::shared::write_admission::{WriteTarget, admit};
-        let admission = admit(
+        // Write-admission gate. This path builds its own `Request` and enqueues
+        // directly (it does not flow through the autocommit funnel). An
+        // uncontended point write takes the fast path holding its per-vShard
+        // deterministic locks (guard held across enqueue + response); a contended
+        // or bulk write is submitted through the deterministic scheduler and its
+        // applied response is surfaced; reads / control ops are `Exempt`.
+        use crate::control::server::shared::write_admission::{
+            WriteAdmission, WriteTarget, admit, bare_ok_response, route_write_to_calvin,
+        };
+        let (admission, _admission_guard) = match admit(
             &self.state,
             &WriteTarget {
                 tenant_id,
@@ -367,7 +371,25 @@ impl NodeDbPgHandler {
                 vshard_id,
                 plan: &plan,
             },
-        );
+        ) {
+            WriteAdmission::ExemptRead => (
+                crate::bridge::envelope::Admission::Exempt(
+                    crate::bridge::envelope::ExemptReason::Read,
+                ),
+                None,
+            ),
+            WriteAdmission::FastPath { guard } => {
+                (crate::bridge::envelope::Admission::Admitted, guard)
+            }
+            WriteAdmission::RouteToCalvin => {
+                let routed =
+                    route_write_to_calvin(&self.state, tenant_id, database_id, vshard_id, plan)
+                        .await?;
+                return Ok(
+                    routed.unwrap_or_else(|| bare_ok_response(crate::types::RequestId::new(0)))
+                );
+            }
+        };
         let request_id = self.next_request_id();
         let request = Request {
             request_id,

@@ -412,6 +412,20 @@ pub(super) fn calvin_execution_response(
         return response;
     }
 
+    // Plain (non-RETURNING) write with a deposited applied Response: surface its
+    // ACTUAL affected count from the payload — exactly as the non-Calvin write
+    // path does — rather than a fixed synthesized tag. `None` (multishard,
+    // undeposited) falls through to the synthesized tag below.
+    if let Some(resp) = apply_resp
+        && let PlanKind::DmlResult(_) = describe_plan(&task.plan)
+    {
+        return super::super::plan::payload_to_response(
+            resp.payload.as_bytes(),
+            describe_plan(&task.plan),
+        )
+        .response;
+    }
+
     let tag = if is_calvin_foldable(&task.plan) {
         calvin_tag_for_plan(&task.plan)
     } else {

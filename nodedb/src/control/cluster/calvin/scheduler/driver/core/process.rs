@@ -4,6 +4,7 @@
 //! bookkeeping for the Calvin scheduler.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use nodedb_cluster::calvin::types::SequencedTxn;
@@ -37,7 +38,10 @@ impl Scheduler {
             keys_count,
         )
         .entered();
-        let outcome = self.lock_manager.acquire(txn_id, keys.clone());
+        let outcome = {
+            let mut lm = self.lock_manager.lock().unwrap_or_else(|p| p.into_inner());
+            lm.acquire(txn_id, keys.clone())
+        };
 
         match outcome {
             AcquireOutcome::Ready => {
@@ -116,27 +120,44 @@ impl Scheduler {
     ) {
         let epoch = txn_id.epoch;
 
-        let newly_unblocked = self.lock_manager.release(txn_id);
+        // Release this txn's locks, promote any newly-unblocked waiters, and
+        // collect the ones ready to dispatch — all under ONE guard so the
+        // release and the promoted re-acquire are atomic against a concurrent
+        // gate probe. Dispatch happens AFTER the guard drops: `dispatch_or_barrier`
+        // does not touch the lock table, but holding the guard across it would
+        // deadlock if it ever did, so the collect-then-dispatch split keeps the
+        // critical section minimal and re-entrancy-safe.
+        let lm = Arc::clone(&self.lock_manager);
+        let mut to_dispatch: Vec<(SequencedTxn, TxnId, std::collections::BTreeSet<LockKey>)> =
+            Vec::new();
+        {
+            let mut guard = lm.lock().unwrap_or_else(|p| p.into_inner());
+            let newly_unblocked = guard.release(txn_id);
 
-        for waiter_id in newly_unblocked {
-            if let Some(blocked) = self.blocked.get(&waiter_id)
-                && self.lock_manager.is_ready(waiter_id, &blocked.keys)
-            {
-                let keys = blocked.keys.clone();
-                let outcome = self.lock_manager.acquire(waiter_id, keys.clone());
-                debug_assert_eq!(
-                    outcome,
-                    AcquireOutcome::Ready,
-                    "is_ready returned true but acquire returned Blocked"
-                );
+            for waiter_id in newly_unblocked {
+                if let Some(blocked) = self.blocked.get(&waiter_id)
+                    && guard.is_ready(waiter_id, &blocked.keys)
+                {
+                    let keys = blocked.keys.clone();
+                    let outcome = guard.acquire(waiter_id, keys.clone());
+                    debug_assert_eq!(
+                        outcome,
+                        AcquireOutcome::Ready,
+                        "is_ready returned true but acquire returned Blocked"
+                    );
 
-                if let Some(blocked_txn) = self.blocked.remove(&waiter_id) {
-                    let wait_ms = blocked_txn.blocked_at.elapsed().as_millis() as u64;
-                    self.metrics.record_lock_wait_ms(wait_ms);
-                    // no-determinism: lock_acquired_time for unblocked txn is scheduler observability, not Calvin WAL data
-                    self.dispatch_or_barrier(blocked_txn.txn, waiter_id, keys, Instant::now());
+                    if let Some(blocked_txn) = self.blocked.remove(&waiter_id) {
+                        let wait_ms = blocked_txn.blocked_at.elapsed().as_millis() as u64;
+                        self.metrics.record_lock_wait_ms(wait_ms);
+                        to_dispatch.push((blocked_txn.txn, waiter_id, keys));
+                    }
                 }
             }
+        }
+
+        for (txn, waiter_id, keys) in to_dispatch {
+            // no-determinism: lock_acquired_time for unblocked txn is scheduler observability, not Calvin WAL data
+            self.dispatch_or_barrier(txn, waiter_id, keys, Instant::now());
         }
 
         if self.last_applied_epoch

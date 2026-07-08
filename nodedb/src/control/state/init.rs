@@ -351,6 +351,8 @@ impl SharedState {
             wal_catchup_lsn: AtomicU64::new(0),
             last_applied_calvin_epoch: Arc::new(AtomicU64::new(0)),
             calvin_apply_results: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            calvin_lock_managers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            autocommit_lock_seq: std::sync::atomic::AtomicU32::new(0),
             presence: Arc::new(tokio::sync::RwLock::new(
                 crate::control::server::sync::presence::PresenceManager::new(
                     crate::control::server::sync::presence::PresenceConfig::default(),

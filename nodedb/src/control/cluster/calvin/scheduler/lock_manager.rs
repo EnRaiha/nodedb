@@ -72,8 +72,21 @@ pub struct TxnId {
 }
 
 impl TxnId {
+    /// Reserved epoch band for autocommit fast-path lock holders. A holder in
+    /// this band never collides with a real Calvin `(epoch, position)` schedule
+    /// position, so the fast path and the deterministic scheduler can share one
+    /// lock table without identity aliasing.
+    pub const AUTOCOMMIT_EPOCH: u64 = u64::MAX;
+
     pub fn new(epoch: u64, position: u32) -> Self {
         Self { epoch, position }
+    }
+
+    /// Whether this id belongs to the reserved autocommit fast-path band. FIFO
+    /// waiter ordering is insertion-order (`VecDeque`), and `BTreeMap` iteration
+    /// merely sorts the reserved band last — neither is affected by the band.
+    pub fn is_autocommit(&self) -> bool {
+        self.epoch == Self::AUTOCOMMIT_EPOCH
     }
 }
 
@@ -193,6 +206,34 @@ impl LockManager {
         }
     }
 
+    /// Non-blocking acquire: take all `keys` for `txn` iff every one is free (or
+    /// already held by `txn`), returning `true`; otherwise return `false` WITHOUT
+    /// enqueuing a waiter or recording any pending state.
+    ///
+    /// This is the fast path's probe. Unlike [`acquire`](Self::acquire), the
+    /// contended (`false`) path touches NOTHING — no holder, no `pending_keys`,
+    /// no waiter `VecDeque` — so a caller that does not intend to block (an
+    /// autocommit point write that will instead route to the scheduler) never
+    /// leaves an orphaned waiter that a later `release` would promote to an
+    /// unowned holder. It also never perturbs the FIFO ordering that Calvin
+    /// transactions depend on.
+    pub fn try_acquire(&mut self, txn: TxnId, keys: BTreeSet<LockKey>) -> bool {
+        if !self.is_ready(txn, &keys) {
+            // Contended: leave the table, waiter queues, and pending_keys
+            // completely untouched.
+            return false;
+        }
+        // Every key is free or already held by `txn`, so `acquire` takes its
+        // all-available path — it inserts the holder and never enqueues.
+        let outcome = self.acquire(txn, keys);
+        debug_assert_eq!(
+            outcome,
+            AcquireOutcome::Ready,
+            "try_acquire: is_ready was true but acquire returned Blocked"
+        );
+        true
+    }
+
     /// Release all locks held by `txn`.
     ///
     /// For each released key, promotes the front-of-queue waiter to holder.
@@ -221,14 +262,19 @@ impl LockManager {
 
                     // Check whether `next` is now holder on ALL of its pending
                     // keys.  If so, it is fully ready — move to held_locks.
-                    if let Some(pending) = self.pending_keys.get(&next) {
+                    // Remove first (rather than `get` + a follow-up `remove`)
+                    // so there is no unwrap/expect on a "just confirmed Some"
+                    // invariant: the owned `pending` set is reinserted on the
+                    // not-yet-ready path.
+                    if let Some(pending) = self.pending_keys.remove(&next) {
                         let all_held = pending
                             .iter()
                             .all(|k| self.table.get(k).is_none_or(|e| e.holder == next));
                         if all_held {
-                            let keys = self.pending_keys.remove(&next).expect("invariant: pending_keys.get(&next) succeeded in the enclosing if-let");
-                            self.held_locks.insert(next, keys);
+                            self.held_locks.insert(next, pending);
                             newly_promoted.insert(next);
+                        } else {
+                            self.pending_keys.insert(next, pending);
                         }
                     }
                 } else {

@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Write-admission fence tests.
+//!
+//! The fast-path point-write gate and the deterministic Calvin scheduler share
+//! ONE per-vShard lock table (`SharedState::calvin_lock_managers`). These tests
+//! drive the gate directly against that shared table to prove the fence:
+//!
+//! - A point write whose key is held by a pending commit (a normal Calvin-band
+//!   `TxnId` acquired and not released) is NOT admitted to the fast path — it is
+//!   routed to the scheduler, which queues it FIFO behind the holder. Once the
+//!   commit releases, the same write is admitted fast.
+//! - Two concurrent point writes to the same key serialize: the first takes the
+//!   fast path holding the lock; the second observes that lock and is routed.
+//!
+//! The routed write's actual apply is delegated to the existing
+//! `submit_calvin_routed` primitive (exercised end-to-end by the Calvin executor
+//! test suite); these tests assert the gate's fence DECISION, which is the piece
+//! this change introduces.
+
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+
+use nodedb::bridge::dispatch::Dispatcher;
+use nodedb::control::cluster::calvin::scheduler::lock_manager::{
+    AcquireOutcome, LockKey, LockManager, TxnId,
+};
+use nodedb::control::server::shared::write_admission::{
+    WriteAdmission, WriteTarget, admit, cp_routed_to_calvin,
+};
+use nodedb::control::state::SharedState;
+use nodedb::types::{DatabaseId, TenantId, VShardId};
+use nodedb::wal::WalManager;
+use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_types::Surrogate;
+
+/// Build a single-node `SharedState` over a throwaway WAL. The returned
+/// `TempDir` must be kept alive for the WAL's lifetime.
+fn build_shared() -> (Arc<SharedState>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wal =
+        Arc::new(WalManager::open_for_testing(&dir.path().join("fence.wal")).expect("open wal"));
+    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+    let shared = SharedState::new(dispatcher, wal).expect("shared state");
+    (shared, dir)
+}
+
+/// Register an empty lock table for `collection`'s vShard and return both the
+/// shared `Arc` and the vShard the gate will resolve the plan to.
+fn register_lock_manager(
+    shared: &SharedState,
+    collection: &str,
+) -> (Arc<Mutex<LockManager>>, VShardId) {
+    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection);
+    let lm = Arc::new(Mutex::new(LockManager::new()));
+    shared
+        .calvin_lock_managers
+        .lock()
+        .expect("lock managers")
+        .insert(vshard.as_u32(), Arc::clone(&lm));
+    (lm, vshard)
+}
+
+/// A single-key KV point write to `collection` / `key`.
+fn kv_put(collection: &str, key: &[u8]) -> PhysicalPlan {
+    PhysicalPlan::Kv(KvOp::Put {
+        collection: collection.to_owned(),
+        key: key.to_vec(),
+        value: b"v".to_vec(),
+        ttl_ms: 0,
+        surrogate: Surrogate::ZERO,
+    })
+}
+
+/// The deterministic lock key the gate derives for `kv_put(collection, key)`.
+fn kv_lock_key(collection: &str, key: &[u8]) -> LockKey {
+    LockKey::Kv {
+        collection: Arc::from(collection),
+        key: Arc::from(key),
+    }
+}
+
+fn target<'a>(vshard: VShardId, plan: &'a PhysicalPlan) -> WriteTarget<'a> {
+    WriteTarget {
+        tenant_id: TenantId::new(1),
+        database_id: DatabaseId::DEFAULT,
+        vshard_id: vshard,
+        plan,
+    }
+}
+
+/// A point write whose key a pending commit already holds is routed to the
+/// scheduler (not fast-pathed); once the commit releases, it is admitted fast.
+#[tokio::test]
+async fn fence_write_blocks_behind_held_commit_lock() {
+    let (shared, _dir) = build_shared();
+    let coll = "fence_coll";
+    let (lm, vshard) = register_lock_manager(&shared, coll);
+
+    // A pending commit (a normal Calvin-band txn) holds the fence on key K.
+    let commit_txn = TxnId::new(5, 0);
+    let held: BTreeSet<LockKey> = [kv_lock_key(coll, b"K")].into();
+    assert_eq!(
+        lm.lock().expect("lm").acquire(commit_txn, held),
+        AcquireOutcome::Ready,
+        "the simulated commit takes the lock first"
+    );
+
+    // The autocommit point write to K cannot fast-path — it is routed behind the
+    // holder via the scheduler's FIFO queue.
+    let plan = kv_put(coll, b"K");
+    let before = cp_routed_to_calvin();
+    match admit(&shared, &target(vshard, &plan)) {
+        WriteAdmission::RouteToCalvin => {}
+        _ => panic!("a point write behind a held commit lock must route to Calvin"),
+    }
+    assert!(
+        cp_routed_to_calvin() > before,
+        "the routed write must bump the routed-to-Calvin counter"
+    );
+
+    // The commit releases; the same write is now admitted to the fast path.
+    let _ = lm.lock().expect("lm").release(commit_txn);
+    match admit(&shared, &target(vshard, &plan)) {
+        WriteAdmission::FastPath { guard: Some(_) } => {}
+        _ => panic!("after release, the point write must fast-path with a real lock guard"),
+    }
+}
+
+/// Two concurrent point writes to the same key serialize: the first holds the
+/// lock on the fast path; the second observes it and is routed; after the first
+/// releases, the key is admitted fast again.
+#[tokio::test]
+async fn two_concurrent_same_key_point_writes_serialize() {
+    let (shared, _dir) = build_shared();
+    let coll = "serialize_coll";
+    let (_lm, vshard) = register_lock_manager(&shared, coll);
+    let plan = kv_put(coll, b"K");
+
+    // First write takes the fast path and holds the lock via its RAII guard.
+    let guard1 = match admit(&shared, &target(vshard, &plan)) {
+        WriteAdmission::FastPath { guard: Some(g) } => g,
+        _ => panic!("first same-key write must fast-path with a real lock guard"),
+    };
+
+    // Second write to the same key observes the held lock and is routed.
+    let before = cp_routed_to_calvin();
+    match admit(&shared, &target(vshard, &plan)) {
+        WriteAdmission::RouteToCalvin => {}
+        _ => panic!("second same-key write must route to Calvin behind the first"),
+    }
+    assert!(
+        cp_routed_to_calvin() > before,
+        "the second write must bump the routed-to-Calvin counter"
+    );
+
+    // First write completes (guard drops, releasing the lock); the key is free.
+    drop(guard1);
+    match admit(&shared, &target(vshard, &plan)) {
+        WriteAdmission::FastPath { guard: Some(_) } => {}
+        _ => panic!("after the first write releases, the key must fast-path again"),
+    }
+}

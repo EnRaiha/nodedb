@@ -37,6 +37,22 @@ pub(crate) fn broadcast_call_count_increment() {
     BROADCAST_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The `Admission` stamp for a per-core fan-out `Request`.
+///
+/// This fan-out builds its own per-core `Request` and enqueues directly (not
+/// via the autocommit funnel). A cross-core fan-out write (e.g.
+/// `INSERT ... SELECT`) is not a single-vShard point write, so the point-lock
+/// fence does not apply — its isolation is enforced by collection-version
+/// validation, not here. Write-class plans are stamped `Admitted`; DDL / reads
+/// are `Exempt`.
+fn broadcast_admission(plan: &PhysicalPlan) -> crate::bridge::envelope::Admission {
+    if crate::control::server::shared::write_admission::plan_is_write(plan) {
+        crate::bridge::envelope::Admission::Admitted
+    } else {
+        crate::bridge::envelope::Admission::Exempt(crate::bridge::envelope::ExemptReason::Read)
+    }
+}
+
 /// Fan a read plan to every Data-Plane core and return the merged response.
 ///
 /// Thin wrapper over the single gather primitive
@@ -111,19 +127,7 @@ pub async fn broadcast_count_to_all_cores(
     for core_id in 0..num_cores {
         let request_id = shared.next_request_id();
         let vshard_id = VShardId::new(core_id as u32);
-        // This fan-out builds its own per-core Request and enqueues directly
-        // (not via the autocommit funnel), so it passes the write-admission
-        // gate here: write-class plans (e.g. `INSERT ... SELECT`) are stamped
-        // `Admitted`, DDL / reads `Exempt`. No lock is taken in this change.
-        let admission = crate::control::server::shared::write_admission::admit(
-            shared,
-            &crate::control::server::shared::write_admission::WriteTarget {
-                tenant_id,
-                database_id,
-                vshard_id,
-                plan: &plan,
-            },
-        );
+        let admission = broadcast_admission(&plan);
         let request = Request {
             request_id,
             tenant_id,
@@ -233,19 +237,7 @@ pub async fn broadcast_register_to_all_cores(
     for core_id in 0..num_cores {
         let request_id = shared.next_request_id();
         let vshard_id = VShardId::new(core_id as u32);
-        // This fan-out builds its own per-core Request and enqueues directly
-        // (not via the autocommit funnel), so it passes the write-admission
-        // gate here: write-class plans (e.g. `INSERT ... SELECT`) are stamped
-        // `Admitted`, DDL / reads `Exempt`. No lock is taken in this change.
-        let admission = crate::control::server::shared::write_admission::admit(
-            shared,
-            &crate::control::server::shared::write_admission::WriteTarget {
-                tenant_id,
-                database_id,
-                vshard_id,
-                plan: &plan,
-            },
-        );
+        let admission = broadcast_admission(&plan);
         let request = Request {
             request_id,
             tenant_id,

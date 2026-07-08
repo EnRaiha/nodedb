@@ -83,36 +83,25 @@ pub(crate) fn plan_vshard(plan: &PhysicalPlan) -> Vec<VShardId> {
     )]
 }
 
-/// Whether any plan in `plans` carries a RETURNING clause.
+/// Whether this vShard's slice carries a PRIMARY user data write — the write
+/// whose applied `Response` (affected-count + any RETURNING rows) the
+/// coordinator surfaces.
 ///
-/// Only the `Document` DML variants can carry `returning`
-/// (`PointUpdate` / `BulkUpdate` / `PointDelete` / `BulkDelete` /
-/// `UpdateFromJoin`); every other plan is row-less. Used to gate the applied
-/// `Response` deposit so only the RETURNING-bearing participant populates the
-/// coordinator's sidecar.
-pub(crate) fn plans_have_returning(plans: &[PhysicalPlan]) -> bool {
+/// A primary write is a Document / KV / Vector / Timeseries / Columnar / Array
+/// write — NOT the implicit graph-edge cleanup (`EdgePut` / `EdgeDelete`) that
+/// dual-homes alongside a document delete/update. For a single-collection user
+/// DML (plus its implicit edges) exactly ONE participant carries the primary
+/// write, so only it deposits the applied `Response` into the coordinator's
+/// sidecar and the edge participants never clobber the entry.
+///
+/// This gate subsumes the RETURNING case (a RETURNING write IS a primary write,
+/// so its rows are still deposited) while ALSO carrying the affected-count of a
+/// plain (non-RETURNING) write — which a RETURNING-only gate dropped, making a
+/// routed plain write report zero rows affected.
+pub(crate) fn plans_have_primary_write(plans: &[PhysicalPlan]) -> bool {
     plans.iter().any(|plan| {
-        matches!(
-            plan,
-            PhysicalPlan::Document(
-                DocumentOp::PointUpdate {
-                    returning: Some(_),
-                    ..
-                } | DocumentOp::BulkUpdate {
-                    returning: Some(_),
-                    ..
-                } | DocumentOp::PointDelete {
-                    returning: Some(_),
-                    ..
-                } | DocumentOp::BulkDelete {
-                    returning: Some(_),
-                    ..
-                } | DocumentOp::UpdateFromJoin {
-                    returning: Some(_),
-                    ..
-                }
-            )
-        )
+        crate::control::planner::calvin::is_write_plan(plan)
+            && !matches!(plan, PhysicalPlan::Graph(_))
     })
 }
 
@@ -215,7 +204,7 @@ impl Scheduler {
                 return;
             }
         };
-        let has_returning = plans_have_returning(&plans);
+        let has_primary_write = plans_have_primary_write(&plans);
         let plan = PhysicalPlan::Meta(MetaOp::CalvinExecuteStatic {
             epoch,
             position,
@@ -294,7 +283,7 @@ impl Scheduler {
                 // no-determinism: dispatch_time is scheduler observability, not Calvin WAL data
                 dispatch_time: dispatch_instant,
                 lock_acquired_time,
-                has_returning,
+                has_primary_write,
             },
         );
     }
@@ -345,7 +334,7 @@ impl Scheduler {
                 return;
             }
         };
-        let has_returning = plans_have_returning(&plans);
+        let has_primary_write = plans_have_primary_write(&plans);
         let plan = PhysicalPlan::Meta(MetaOp::CalvinExecuteActive {
             epoch,
             position,
@@ -425,7 +414,7 @@ impl Scheduler {
                 // no-determinism: dispatch_time is scheduler observability, not Calvin WAL data
                 dispatch_time: dispatch_instant,
                 lock_acquired_time,
-                has_returning,
+                has_primary_write,
             },
         );
     }

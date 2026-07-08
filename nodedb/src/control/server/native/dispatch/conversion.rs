@@ -94,7 +94,7 @@ pub(crate) fn calvin_native_response(
     };
     use crate::control::server::response_shape::types::{PlanKind, describe_plan};
 
-    if let (Some(resp), Some(plan)) = (apply_result, returning_plan)
+    if let (Some(resp), Some(plan)) = (apply_result.as_ref(), returning_plan)
         && matches!(describe_plan(plan), PlanKind::ReturningRows)
         && let Ok(ShapeOutcome::Rows(shaped)) = shape_response_materialized(
             resp.payload.as_bytes(),
@@ -116,8 +116,21 @@ pub(crate) fn calvin_native_response(
         return r;
     }
 
+    // Plain write with a deposited applied Response: surface its ACTUAL affected
+    // count + watermark from the payload rather than the caller's fallback
+    // estimate. `None` (multishard, undeposited) keeps the fallback.
     let mut r = NativeResponse::ok(seq);
-    r.rows_affected = Some(fallback_affected);
+    if let Some(resp) = &apply_result {
+        r.watermark_lsn = resp.watermark_lsn.as_u64();
+        r.rows_affected = Some(
+            crate::control::server::shared::sql::staging_predicates::extract_affected_count(
+                resp.payload.as_bytes(),
+            )
+            .unwrap_or(fallback_affected),
+        );
+    } else {
+        r.rows_affected = Some(fallback_affected);
+    }
     r
 }
 
