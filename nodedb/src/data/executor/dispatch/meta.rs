@@ -228,6 +228,16 @@ impl CoreLoop {
                 },
             ),
 
+            MetaOp::RecordCalvinWriteVersions { tenant_id, plans } => {
+                // The Calvin apply already committed; this records the write
+                // version of every key it wrote at the CalvinApplied WAL LSN the
+                // scheduler threaded onto the request envelope, reusing the same
+                // recorder the single-shard fast-path commit funnels through. A
+                // no-op when the envelope carries no LSN.
+                self.record_batch_write_versions(task, tenant_id.as_u64(), plans);
+                self.response_ok(task)
+            }
+
             MetaOp::StageWrite { plan } => self.execute_stage_write(task, tid, plan),
 
             // Release the staging overlay once a transaction resolves (commit

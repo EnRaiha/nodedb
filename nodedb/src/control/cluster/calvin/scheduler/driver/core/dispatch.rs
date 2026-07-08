@@ -128,7 +128,7 @@ impl Scheduler {
         mr.vshard_role_is_leader(self.vshard_id)
     }
 
-    fn local_calvin_plans(
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn local_calvin_plans(
         &self,
         plans: Vec<PhysicalPlan>,
         epoch: u64,

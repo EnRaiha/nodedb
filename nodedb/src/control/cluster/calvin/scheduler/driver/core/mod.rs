@@ -15,6 +15,8 @@
 //! - [`dispatch`] — static / active dispatch to the Data Plane executor.
 //! - [`read_result`] — `CalvinReadResult` handling and barrier timeouts.
 //! - [`propose`] — propose `CalvinReadResult` Raft entries.
+//! - [`write_version_record`] — post-apply write-version recording for
+//!   committed Calvin transactions (at the CalvinApplied WAL LSN).
 //!
 //! # Determinism
 //!
@@ -34,6 +36,7 @@ pub mod process;
 pub mod propose;
 pub mod read_result;
 pub mod scheduler;
+pub mod write_version_record;
 
 #[cfg(test)]
 mod tests;

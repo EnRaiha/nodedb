@@ -350,6 +350,7 @@ impl SharedState {
                 crate::control::server::shared::ddl::neutral::maintenance::auto_analyze::DmlCounter::new(),
             wal_catchup_lsn: AtomicU64::new(0),
             last_applied_calvin_epoch: Arc::new(AtomicU64::new(0)),
+            calvin_write_versions_recorded: Arc::new(AtomicU64::new(0)),
             calvin_apply_results: Arc::new(Mutex::new(std::collections::HashMap::new())),
             calvin_lock_managers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             autocommit_lock_seq: std::sync::atomic::AtomicU32::new(0),

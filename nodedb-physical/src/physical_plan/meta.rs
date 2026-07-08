@@ -479,4 +479,22 @@ pub enum MetaOp {
         value_marker: u64,
         graph_marker: u64,
     },
+
+    /// Record the per-key / per-collection write versions of a committed
+    /// Calvin transaction's locally-applied write plans.
+    ///
+    /// A Calvin apply's committed WAL LSN is known only after the apply
+    /// succeeds, so the apply itself cannot advance the version index. The
+    /// scheduler stamps that LSN onto this op's `wal_lsn` and dispatches it back
+    /// to the same core, which funnels `plans` through the shared write-version
+    /// recorder at that LSN — landing in the same shard-local WAL-LSN space the
+    /// single-shard fast path and read watermarks use. Records only: no base
+    /// mutation, no WAL append, no event emission. Wire-additive (appended last)
+    /// so older log entries decode unchanged.
+    RecordCalvinWriteVersions {
+        /// Tenant scope for all plans.
+        tenant_id: TenantId,
+        /// The locally-applied write plans whose keys' versions are recorded.
+        plans: Vec<super::PhysicalPlan>,
+    },
 }

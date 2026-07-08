@@ -180,7 +180,8 @@ pub async fn execute_plan_all_local_cores(
             | MetaOp::StageWrite { .. }
             | MetaOp::DropTxnOverlay { .. }
             | MetaOp::MarkSavepoint { .. }
-            | MetaOp::RollbackToSavepoint { .. } => {
+            | MetaOp::RollbackToSavepoint { .. }
+            | MetaOp::RecordCalvinWriteVersions { .. } => {
                 generic_gather(state, tenant_id, database_id, plan, trace_id).await
             }
         },

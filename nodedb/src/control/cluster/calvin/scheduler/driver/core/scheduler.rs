@@ -375,18 +375,25 @@ impl Scheduler {
                     }
                 }
             }
-            if let Err(e) = self.shared.wal.append_calvin_applied(
+            match self.shared.wal.append_calvin_applied(
                 crate::types::VShardId::new(self.vshard_id),
                 txn_id.epoch,
                 txn_id.position,
             ) {
-                tracing::error!(
-                    vshard_id = self.vshard_id,
-                    epoch = txn_id.epoch,
-                    position = txn_id.position,
-                    error = %e,
-                    "calvin: failed to write CalvinApplied WAL record"
-                );
+                // The CalvinApplied WAL LSN is the committed write-LSN for this
+                // apply — the SAME shard-local WAL-LSN space fast-path writes and
+                // read watermarks use. Record the apply's per-key write versions
+                // at it now that it exists (it did not at dispatch time).
+                Ok(applied_lsn) => self.record_calvin_write_versions(txn_id, applied_lsn),
+                Err(e) => {
+                    tracing::error!(
+                        vshard_id = self.vshard_id,
+                        epoch = txn_id.epoch,
+                        position = txn_id.position,
+                        error = %e,
+                        "calvin: failed to write CalvinApplied WAL record"
+                    );
+                }
             }
             self.propose_sequencer_entry(
                 SequencerEntry::CompletionAck {
