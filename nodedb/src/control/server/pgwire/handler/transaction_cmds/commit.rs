@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Transaction command handlers: BEGIN, COMMIT, ROLLBACK, SAVEPOINT.
-//!
-//! Extracted from `sql_exec.rs` — handles all transactional state management
-//! including snapshot isolation conflict detection, WAL transaction batching,
-//! GAP_FREE sequence reservation lifecycle, and deferred offset commits.
+//! COMMIT / END / END TRANSACTION handler: snapshot isolation conflict
+//! detection, WAL transaction batching (single-shard and Calvin multi-shard
+//! dispatch), GAP_FREE sequence finalization, and deferred offset commits.
 
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
@@ -15,111 +13,16 @@ use crate::control::planner::calvin::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use nodedb_cluster::calvin::{AttemptOutcome, TxnId};
 
-use super::core::NodeDbPgHandler;
+use super::super::core::NodeDbPgHandler;
+use super::errors::{batch_dispatch_to_commit_error, calvin_cancelled_error};
 use crate::control::server::pgwire::types::error_to_sqlstate;
 
-/// Builds the canonical SQLSTATE 57014 error emitted when a Calvin coordinator
-/// channel is closed (coordinator task dropped due to deadline expiry).  Both
-/// the assignment-recv and completion-recv arms use this constructor so the
-/// mapping is defined exactly once and the tests exercise the production path.
-fn calvin_cancelled_error() -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_owned(),
-        "57014".to_owned(),
-        "Calvin coordinator cancelled (deadline exceeded)".to_owned(),
-    )))
-}
-
-/// Converts a batch-dispatch result into a COMMIT-time error, if any.
-/// `dispatch_task_no_wal` returns `Ok(Response { status: Error, .. })` for a
-/// failed batch rather than a Rust `Err` — callers must check `status`
-/// explicitly or a failed sub-plan reports as COMMIT success.
-fn batch_dispatch_to_commit_error(
-    result: crate::Result<crate::bridge::envelope::Response>,
-) -> Result<(), PgWireError> {
-    match result {
-        Err(e) => {
-            tracing::warn!(error = %e, "transaction batch dispatch failed");
-            Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "40001".to_owned(),
-                format!("transaction commit failed: {e}"),
-            ))))
-        }
-        Ok(resp) if resp.status != crate::bridge::envelope::Status::Ok => {
-            let code = resp.error_code.clone().unwrap_or(
-                crate::bridge::envelope::ErrorCode::RejectedPrevalidation {
-                    reason: "transaction commit failed".to_owned(),
-                },
-            );
-            let (severity, sqlstate, message) =
-                crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(&code);
-            tracing::warn!(
-                sqlstate = sqlstate,
-                message = %message,
-                "transaction batch reported error status"
-            );
-            Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                severity.to_owned(),
-                sqlstate.to_owned(),
-                message,
-            ))))
-        }
-        Ok(_) => Ok(()),
-    }
-}
-
 impl NodeDbPgHandler {
-    /// Release the per-transaction staging overlay on the vShard that hosted
-    /// the transaction's staged point writes.
-    ///
-    /// Best-effort cleanup dispatched AFTER the durable resolution (COMMIT
-    /// batch flush / ROLLBACK). A failure here leaks in-memory overlay state
-    /// on that core but does not affect the already-resolved transaction, so it
-    /// is logged rather than surfaced to the client.
-    async fn dispatch_drop_txn_overlay(
-        &self,
-        tenant_id: crate::types::TenantId,
-        vshard_id: crate::types::VShardId,
-        txn_id: crate::types::TxnId,
-    ) {
-        let task = nodedb_physical::physical_task::PhysicalTask {
-            tenant_id,
-            vshard_id,
-            database_id: crate::types::DatabaseId::DEFAULT,
-            plan: crate::bridge::envelope::PhysicalPlan::Meta(
-                nodedb_physical::physical_plan::MetaOp::DropTxnOverlay { txn_id },
-            ),
-            post_set_op: nodedb_physical::physical_task::PostSetOp::None,
-            txn_id: None,
-        };
-        if let Err(e) = self.dispatch_task_no_wal(task, None).await {
-            tracing::warn!(error = %e, "failed to drop per-transaction staging overlay");
-        }
-    }
-
-    /// Handle BEGIN / START TRANSACTION.
-    pub(super) fn handle_begin(&self, addr: &std::net::SocketAddr) -> PgWireResult<Vec<Response>> {
-        let snapshot_lsn = {
-            let next = self.state.wal.next_lsn();
-            crate::types::Lsn::new(next.as_u64().saturating_sub(1))
-        };
-        crate::control::server::shared::session::ddl_buffer::activate();
-        self.sessions.begin(addr, snapshot_lsn).map_err(|msg| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "25P02".to_owned(),
-                msg.to_owned(),
-            )))
-        })?;
-        Ok(vec![Response::Execution(Tag::new("BEGIN"))])
-    }
-
     /// Handle COMMIT / END / END TRANSACTION.
     ///
     /// Performs snapshot isolation conflict detection, WAL transaction batching,
     /// GAP_FREE sequence finalization, and deferred offset commits.
-    pub(super) async fn handle_commit(
+    pub(in crate::control::server::pgwire::handler) async fn handle_commit(
         &self,
         identity: &AuthenticatedIdentity,
         addr: &std::net::SocketAddr,
@@ -132,7 +35,7 @@ impl NodeDbPgHandler {
         // the staging overlay, which reports no watermark) must not abort the
         // commit. The read-set is collection-granular, so exclusion is too.
         let written_collections = self.sessions.buffered_collections(addr, |plan| {
-            super::plan::extract_collection(plan).map(String::from)
+            super::super::plan::extract_collection(plan).map(String::from)
         });
         if let Some(snapshot_lsn) = self.sessions.snapshot_lsn(addr) {
             let current_lsn = self.state.wal.next_lsn();
@@ -453,112 +356,5 @@ impl NodeDbPgHandler {
         self.sessions
             .flush_pending_notifies(addr, identity.tenant_id, &self.state.notify_bus);
         Ok(vec![Response::Execution(Tag::new("COMMIT"))])
-    }
-
-    /// Handle ROLLBACK / ABORT.
-    pub(super) async fn handle_rollback(
-        &self,
-        identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
-    ) -> PgWireResult<Vec<Response>> {
-        crate::control::server::shared::session::ddl_buffer::discard();
-        // Snapshot the overlay identity BEFORE `rollback()` clears session
-        // state, so the staging overlay can be released on its home vShard.
-        let (overlay_txn_id, overlay_vshard) = self.sessions.txn_identity(addr);
-        let reservations = self.sessions.rollback(addr).unwrap_or_default();
-        for handle in &reservations {
-            let key = &handle.sequence_key;
-            let registry = &self.state.sequence_registry;
-            registry.gap_free_manager().rollback(handle, || {
-                let map = registry.sequences_read();
-                if let Some(h) = map.get(key.as_str()) {
-                    h.rollback_one();
-                }
-            });
-            {
-                let catalog = self.state.credentials.catalog();
-                crate::control::sequence::log::log_reservation(
-                    catalog,
-                    &crate::control::sequence::log::rolled_back(
-                        key,
-                        handle.value,
-                        &identity.username,
-                        identity.tenant_id.as_u64(),
-                    ),
-                );
-            }
-        }
-        self.sessions.close_non_hold_cursors(addr);
-        // Discard NOTIFY messages buffered during this transaction.
-        self.sessions.discard_pending_notifies(addr);
-
-        // Release any staging overlay populated by statement-time point writes.
-        if let (Some(txn_id), Some(vshard_id)) = (overlay_txn_id, overlay_vshard) {
-            self.dispatch_drop_txn_overlay(identity.tenant_id, vshard_id, txn_id)
-                .await;
-        }
-        Ok(vec![Response::Execution(Tag::new("ROLLBACK"))])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::calvin_cancelled_error;
-    use pgwire::error::{ErrorInfo, PgWireError};
-
-    #[test]
-    fn calvin_assignment_channel_closed_returns_57014() {
-        // Exercises the production constructor directly — no replicated mapping.
-        let err = calvin_cancelled_error();
-        match err {
-            PgWireError::UserError(info) => {
-                assert_eq!(
-                    info.code, "57014",
-                    "expected SQLSTATE 57014 (query_canceled) for Calvin channel-closed, got {}",
-                    info.code
-                );
-                assert_ne!(
-                    info.code, "XX000",
-                    "must not surface XX000 (internal_error) for a coordinator deadline cancel"
-                );
-            }
-            other => panic!("expected PgWireError::UserError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn calvin_completion_channel_closed_returns_57014() {
-        // Completion arm uses the same production constructor — assert it here too.
-        let err = calvin_cancelled_error();
-        match err {
-            PgWireError::UserError(info) => {
-                assert_eq!(
-                    info.code, "57014",
-                    "expected SQLSTATE 57014 for Calvin completion channel-closed, got {}",
-                    info.code
-                );
-            }
-            other => panic!("expected PgWireError::UserError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ollp_mismatch_is_not_57014() {
-        // Verify the OLLP mismatch arm (a genuine invariant violation) stays
-        // XX000 — a distinct code path from coordinator deadline cancellation.
-        let err = PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_owned(),
-            "XX000".to_owned(),
-            "OLLP mismatch outcome on non-dependent Calvin path".to_owned(),
-        )));
-        match err {
-            PgWireError::UserError(info) => {
-                assert_eq!(
-                    info.code, "XX000",
-                    "OLLP mismatch must stay XX000 (internal_error)"
-                );
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
     }
 }
