@@ -45,6 +45,21 @@ pub struct DeferredEntry {
     pub ttl_deadline_ms: u64,
 }
 
+/// Parameters for [`DeferredQueue::enqueue`].
+pub struct EnqueueDeferredArgs {
+    pub peer_id: u64,
+    pub user_id: u64,
+    pub tenant_id: u64,
+    pub delta: Vec<u8>,
+    pub collection: String,
+    pub constraint_name: String,
+    pub attempt: u32,
+    pub max_retries: u32,
+    pub now_ms: u64,
+    pub first_retry_after_ms: u64,
+    pub ttl_secs: u64,
+}
+
 /// Queue of deferred entries awaiting retry.
 #[derive(Debug)]
 pub struct DeferredQueue {
@@ -65,8 +80,6 @@ impl DeferredQueue {
 
     /// Enqueue a deferred entry.
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer that produced the delta
     /// * `delta` — the raw delta bytes
     /// * `collection` — the target collection
@@ -76,21 +89,20 @@ impl DeferredQueue {
     /// * `now_ms` — current time in milliseconds since epoch
     /// * `first_retry_after_ms` — milliseconds to wait before first retry
     /// * `ttl_secs` — seconds from now until this entry expires
-    #[allow(clippy::too_many_arguments)]
-    pub fn enqueue(
-        &mut self,
-        peer_id: u64,
-        user_id: u64,
-        tenant_id: u64,
-        delta: Vec<u8>,
-        collection: String,
-        constraint_name: String,
-        attempt: u32,
-        max_retries: u32,
-        now_ms: u64,
-        first_retry_after_ms: u64,
-        ttl_secs: u64,
-    ) -> u64 {
+    pub fn enqueue(&mut self, args: EnqueueDeferredArgs) -> u64 {
+        let EnqueueDeferredArgs {
+            peer_id,
+            user_id,
+            tenant_id,
+            delta,
+            collection,
+            constraint_name,
+            attempt,
+            max_retries,
+            now_ms,
+            first_retry_after_ms,
+            ttl_secs,
+        } = args;
         let id = self.next_id;
         self.next_id += 1;
 
@@ -195,19 +207,19 @@ mod tests {
         let now = 1000;
 
         // Enqueue an entry ready to retry at now + 500ms
-        queue.enqueue(
-            42,
-            0,
-            0,
-            b"delta".to_vec(),
-            "posts".to_string(),
-            "posts_author_fk".to_string(),
-            0,
-            3,
-            now,
-            500,
-            60,
-        );
+        queue.enqueue(EnqueueDeferredArgs {
+            peer_id: 42,
+            user_id: 0,
+            tenant_id: 0,
+            delta: b"delta".to_vec(),
+            collection: "posts".to_string(),
+            constraint_name: "posts_author_fk".to_string(),
+            attempt: 0,
+            max_retries: 3,
+            now_ms: now,
+            first_retry_after_ms: 500,
+            ttl_secs: 60,
+        });
 
         // At time=now, entry is not ready
         assert!(queue.poll_ready(now).is_empty());
@@ -225,19 +237,19 @@ mod tests {
         let now = 1000;
 
         // Enqueue with TTL of 10 seconds
-        queue.enqueue(
-            42,
-            0,
-            0,
-            b"delta".to_vec(),
-            "posts".to_string(),
-            "posts_author_fk".to_string(),
-            0,
-            3,
-            now,
-            500,
-            10,
-        );
+        queue.enqueue(EnqueueDeferredArgs {
+            peer_id: 42,
+            user_id: 0,
+            tenant_id: 0,
+            delta: b"delta".to_vec(),
+            collection: "posts".to_string(),
+            constraint_name: "posts_author_fk".to_string(),
+            attempt: 0,
+            max_retries: 3,
+            now_ms: now,
+            first_retry_after_ms: 500,
+            ttl_secs: 10,
+        });
 
         // Before TTL expires
         assert!(queue.expire(now + 5000).is_empty());
@@ -255,19 +267,19 @@ mod tests {
         let now = 1000;
 
         // Enqueue initial entry
-        let id = queue.enqueue(
-            42,
-            0,
-            0,
-            b"delta".to_vec(),
-            "posts".to_string(),
-            "posts_author_fk".to_string(),
-            0,
-            3,
-            now,
-            500,
-            60,
-        );
+        let id = queue.enqueue(EnqueueDeferredArgs {
+            peer_id: 42,
+            user_id: 0,
+            tenant_id: 0,
+            delta: b"delta".to_vec(),
+            collection: "posts".to_string(),
+            constraint_name: "posts_author_fk".to_string(),
+            attempt: 0,
+            max_retries: 3,
+            now_ms: now,
+            first_retry_after_ms: 500,
+            ttl_secs: 60,
+        });
 
         // Poll and get the entry
         let ready = queue.poll_ready(now + 500);
@@ -300,19 +312,19 @@ mod tests {
         let now = 1000;
 
         // Enqueue with max_retries=3
-        queue.enqueue(
-            42,
-            0,
-            0,
-            b"delta".to_vec(),
-            "posts".to_string(),
-            "posts_author_fk".to_string(),
-            0,
-            3,
-            now,
-            500,
-            60,
-        );
+        queue.enqueue(EnqueueDeferredArgs {
+            peer_id: 42,
+            user_id: 0,
+            tenant_id: 0,
+            delta: b"delta".to_vec(),
+            collection: "posts".to_string(),
+            constraint_name: "posts_author_fk".to_string(),
+            attempt: 0,
+            max_retries: 3,
+            now_ms: now,
+            first_retry_after_ms: 500,
+            ttl_secs: 60,
+        });
 
         let ready = queue.poll_ready(now + 500);
         let mut entry = ready[0].clone();
@@ -336,19 +348,19 @@ mod tests {
 
         // Enqueue three entries with same retry time
         for i in 0..3 {
-            queue.enqueue(
-                40 + i,
-                0,
-                0,
-                format!("delta{}", i).into_bytes(),
-                "posts".to_string(),
-                "posts_author_fk".to_string(),
-                0,
-                3,
-                now,
-                500,
-                60,
-            );
+            queue.enqueue(EnqueueDeferredArgs {
+                peer_id: 40 + i,
+                user_id: 0,
+                tenant_id: 0,
+                delta: format!("delta{}", i).into_bytes(),
+                collection: "posts".to_string(),
+                constraint_name: "posts_author_fk".to_string(),
+                attempt: 0,
+                max_retries: 3,
+                now_ms: now,
+                first_retry_after_ms: 500,
+                ttl_secs: 60,
+            });
         }
 
         assert_eq!(queue.len(), 3);
@@ -367,49 +379,49 @@ mod tests {
         let mut queue = DeferredQueue::new(2);
         let now = 1000;
 
-        queue.enqueue(
-            1,
-            0,
-            0,
-            b"d1".to_vec(),
-            "c".into(),
-            "cn".into(),
-            0,
-            3,
-            now,
-            500,
-            60,
-        );
-        queue.enqueue(
-            2,
-            0,
-            0,
-            b"d2".to_vec(),
-            "c".into(),
-            "cn".into(),
-            0,
-            3,
-            now,
-            500,
-            60,
-        );
+        queue.enqueue(EnqueueDeferredArgs {
+            peer_id: 1,
+            user_id: 0,
+            tenant_id: 0,
+            delta: b"d1".to_vec(),
+            collection: "c".into(),
+            constraint_name: "cn".into(),
+            attempt: 0,
+            max_retries: 3,
+            now_ms: now,
+            first_retry_after_ms: 500,
+            ttl_secs: 60,
+        });
+        queue.enqueue(EnqueueDeferredArgs {
+            peer_id: 2,
+            user_id: 0,
+            tenant_id: 0,
+            delta: b"d2".to_vec(),
+            collection: "c".into(),
+            constraint_name: "cn".into(),
+            attempt: 0,
+            max_retries: 3,
+            now_ms: now,
+            first_retry_after_ms: 500,
+            ttl_secs: 60,
+        });
 
         assert_eq!(queue.len(), 2);
 
         // Capacity is 2, so this still works (no error checking in enqueue)
-        queue.enqueue(
-            3,
-            0,
-            0,
-            b"d3".to_vec(),
-            "c".into(),
-            "cn".into(),
-            0,
-            3,
-            now,
-            500,
-            60,
-        );
+        queue.enqueue(EnqueueDeferredArgs {
+            peer_id: 3,
+            user_id: 0,
+            tenant_id: 0,
+            delta: b"d3".to_vec(),
+            collection: "c".into(),
+            constraint_name: "cn".into(),
+            attempt: 0,
+            max_retries: 3,
+            now_ms: now,
+            first_retry_after_ms: 500,
+            ttl_secs: 60,
+        });
         assert_eq!(queue.len(), 3); // The queue doesn't enforce capacity strictly; it's advisory.
     }
 
@@ -418,32 +430,32 @@ mod tests {
         let mut queue = DeferredQueue::new(10);
         let now = 1000;
 
-        queue.enqueue(
-            1,
-            0,
-            0,
-            b"d1".to_vec(),
-            "c".into(),
-            "cn".into(),
-            0,
-            3,
-            now,
-            500,
-            60,
-        );
-        queue.enqueue(
-            2,
-            0,
-            0,
-            b"d2".to_vec(),
-            "c".into(),
-            "cn".into(),
-            0,
-            3,
-            now,
-            500,
-            60,
-        );
+        queue.enqueue(EnqueueDeferredArgs {
+            peer_id: 1,
+            user_id: 0,
+            tenant_id: 0,
+            delta: b"d1".to_vec(),
+            collection: "c".into(),
+            constraint_name: "cn".into(),
+            attempt: 0,
+            max_retries: 3,
+            now_ms: now,
+            first_retry_after_ms: 500,
+            ttl_secs: 60,
+        });
+        queue.enqueue(EnqueueDeferredArgs {
+            peer_id: 2,
+            user_id: 0,
+            tenant_id: 0,
+            delta: b"d2".to_vec(),
+            collection: "c".into(),
+            constraint_name: "cn".into(),
+            attempt: 0,
+            max_retries: 3,
+            now_ms: now,
+            first_retry_after_ms: 500,
+            ttl_secs: 60,
+        });
 
         assert_eq!(queue.len(), 2);
         queue.clear();

@@ -55,7 +55,7 @@ pub use preamble::{
 };
 pub use record::{
     CalvinAppliedPayload, FtsDeletePayload, FtsIndexPayload, RecordHeader, RecordType,
-    SpatialDeletePayload, SpatialPutPayload, WalRecord,
+    SpatialDeletePayload, SpatialPutPayload, WalRecord, WalRecordArgs,
 };
 pub use recovery::{RecoveryInfo, recover};
 pub use replay::{TombstoneSet, extract_tombstones};

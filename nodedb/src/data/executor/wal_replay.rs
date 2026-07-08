@@ -454,16 +454,16 @@ mod crdt_replay_tests {
             provenance: None,
         };
         let payload = zerompk::to_msgpack_vec(&wal_payload).expect("encode payload");
-        nodedb_wal::WalRecord::new(
-            RecordType::CrdtDelta as u32,
-            1,
-            tid.as_u64(),
+        nodedb_wal::WalRecord::new(nodedb_wal::WalRecordArgs {
+            record_type: RecordType::CrdtDelta as u32,
+            lsn: 1,
+            tenant_id: tid.as_u64(),
             vshard_id,
-            0,
+            database_id: 0,
             payload,
-            None,
-            None,
-        )
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .expect("wal record")
     }
 

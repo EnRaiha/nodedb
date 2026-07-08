@@ -26,7 +26,7 @@ use io_uring::{IoUring, opcode, types};
 
 use crate::align::{AlignedBuf, DEFAULT_ALIGNMENT};
 use crate::error::{Result, WalError};
-use crate::record::{HEADER_SIZE, WalRecord};
+use crate::record::{HEADER_SIZE, WalRecord, WalRecordArgs};
 
 /// io_uring WAL writer configuration.
 #[derive(Debug, Clone)]
@@ -159,16 +159,16 @@ impl UringWriter {
 
         let lsn = self.next_lsn.fetch_add(1, Ordering::Relaxed);
         let preamble_bytes = self.segment_preamble.as_ref().map(|p| p.to_bytes());
-        let record = WalRecord::new(
+        let record = WalRecord::new(WalRecordArgs {
             record_type,
             lsn,
             tenant_id,
             vshard_id,
             database_id,
-            payload.to_vec(),
-            self.encryption_key.as_ref(),
-            preamble_bytes.as_ref(),
-        )?;
+            payload: payload.to_vec(),
+            encryption_key: self.encryption_key.as_ref(),
+            preamble_bytes: preamble_bytes.as_ref(),
+        })?;
 
         let header_bytes = record.header.to_bytes();
         let total_size = HEADER_SIZE + record.payload.len();

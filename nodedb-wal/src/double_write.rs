@@ -479,7 +479,7 @@ fn pwrite_all(file: &File, data: &[u8], offset: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::RecordType;
+    use crate::record::{RecordType, WalRecordArgs};
 
     fn open_buffered(path: &Path) -> DoubleWriteBuffer {
         DoubleWriteBuffer::open(path, DwbMode::Buffered).unwrap()
@@ -492,16 +492,16 @@ mod tests {
 
         let mut dwb = open_buffered(&dwb_path);
 
-        let record = WalRecord::new(
-            RecordType::Put as u32,
-            42,
-            1,
-            0,
-            0,
-            b"hello double-write".to_vec(),
-            None,
-            None,
-        )
+        let record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::Put as u32,
+            lsn: 42,
+            tenant_id: 1,
+            vshard_id: 0,
+            database_id: 0,
+            payload: b"hello double-write".to_vec(),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap();
 
         dwb.write_record(&record).unwrap();
@@ -531,16 +531,16 @@ mod tests {
 
         {
             let mut dwb = open_buffered(&dwb_path);
-            let record = WalRecord::new(
-                RecordType::Put as u32,
-                7,
-                1,
-                0,
-                0,
-                b"durable".to_vec(),
-                None,
-                None,
-            )
+            let record = WalRecord::new(WalRecordArgs {
+                record_type: RecordType::Put as u32,
+                lsn: 7,
+                tenant_id: 1,
+                vshard_id: 0,
+                database_id: 0,
+                payload: b"durable".to_vec(),
+                encryption_key: None,
+                preamble_bytes: None,
+            })
             .unwrap();
             dwb.write_record(&record).unwrap();
         }
@@ -559,16 +559,16 @@ mod tests {
         let mut dwb = open_buffered(&dwb_path);
 
         for lsn in 1..=5u64 {
-            let record = WalRecord::new(
-                RecordType::Put as u32,
+            let record = WalRecord::new(WalRecordArgs {
+                record_type: RecordType::Put as u32,
                 lsn,
-                1,
-                0,
-                0,
-                format!("batch-{lsn}").into_bytes(),
-                None,
-                None,
-            )
+                tenant_id: 1,
+                vshard_id: 0,
+                database_id: 0,
+                payload: format!("batch-{lsn}").into_bytes(),
+                encryption_key: None,
+                preamble_bytes: None,
+            })
             .unwrap();
             dwb.write_record_deferred(&record).unwrap();
         }
@@ -597,16 +597,16 @@ mod tests {
         dwb.flush().unwrap();
         assert!(!dwb.dirty);
 
-        let record = WalRecord::new(
-            RecordType::Put as u32,
-            1,
-            1,
-            0,
-            0,
-            b"data".to_vec(),
-            None,
-            None,
-        )
+        let record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::Put as u32,
+            lsn: 1,
+            tenant_id: 1,
+            vshard_id: 0,
+            database_id: 0,
+            payload: b"data".to_vec(),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap();
         dwb.write_record_deferred(&record).unwrap();
         dwb.flush().unwrap();
@@ -640,16 +640,16 @@ mod tests {
 
         let total = DWB_CAPACITY as u64 + 5;
         for lsn in 1..=total {
-            let record = WalRecord::new(
-                RecordType::Put as u32,
+            let record = WalRecord::new(WalRecordArgs {
+                record_type: RecordType::Put as u32,
                 lsn,
-                1,
-                0,
-                0,
-                format!("wrap-{lsn}").into_bytes(),
-                None,
-                None,
-            )
+                tenant_id: 1,
+                vshard_id: 0,
+                database_id: 0,
+                payload: format!("wrap-{lsn}").into_bytes(),
+                encryption_key: None,
+                preamble_bytes: None,
+            })
             .unwrap();
             dwb.write_record_deferred(&record).unwrap();
         }
@@ -683,16 +683,16 @@ mod tests {
         let before = wal_dwb_bytes_written_total();
 
         let mut dwb = open_buffered(&dwb_path);
-        let rec = WalRecord::new(
-            RecordType::Put as u32,
-            1,
-            1,
-            0,
-            0,
-            b"counted".to_vec(),
-            None,
-            None,
-        )
+        let rec = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::Put as u32,
+            lsn: 1,
+            tenant_id: 1,
+            vshard_id: 0,
+            database_id: 0,
+            payload: b"counted".to_vec(),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap();
         dwb.write_record(&rec).unwrap();
 

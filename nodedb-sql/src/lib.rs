@@ -34,6 +34,7 @@ pub mod visitor;
 pub use temporal::{TemporalScope, ValidTime};
 pub use visitor::PlanVisitor;
 pub use visitor::dispatch;
+pub use visitor::plan_visitor::args::*;
 
 pub use catalog::{SqlCatalog, SqlCatalogError};
 pub use error::{Result, SqlError};

@@ -31,7 +31,7 @@ use crate::align::{AlignedBuf, DEFAULT_ALIGNMENT};
 use crate::double_write::DwbMode;
 use crate::error::{Result, WalError};
 use crate::preamble::SegmentPreamble;
-use crate::record::{HEADER_SIZE, WalRecord};
+use crate::record::{HEADER_SIZE, WalRecord, WalRecordArgs};
 
 /// Default write buffer size: 2 MiB.
 ///
@@ -285,16 +285,16 @@ impl WalWriter {
 
         let lsn = self.next_lsn.fetch_add(1, Ordering::Relaxed);
         let preamble_bytes = self.segment_preamble.as_ref().map(|p| p.to_bytes());
-        let record = WalRecord::new(
+        let record = WalRecord::new(WalRecordArgs {
             record_type,
             lsn,
             tenant_id,
             vshard_id,
             database_id,
-            payload.to_vec(),
-            self.encryption_ring.as_ref().map(|r| r.current()),
-            preamble_bytes.as_ref(),
-        )?;
+            payload: payload.to_vec(),
+            encryption_key: self.encryption_ring.as_ref().map(|r| r.current()),
+            preamble_bytes: preamble_bytes.as_ref(),
+        })?;
 
         // Write to double-write buffer (deferred — no fsync yet).
         // The DWB is fsynced in batch during `sync()`, before the WAL fsync.

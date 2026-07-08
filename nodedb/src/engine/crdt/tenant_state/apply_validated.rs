@@ -125,15 +125,19 @@ impl TenantCrdtEngine {
         let reason = violation.reason.clone();
         match constraint {
             Some(constraint) => {
-                if let Err(e) = self.validator.dlq_mut().enqueue(
-                    peer_id,
-                    user_id,
-                    tenant_id,
-                    delta.to_vec(),
-                    &constraint,
-                    reason,
-                    violation.hint.clone(),
-                ) {
+                if let Err(e) =
+                    self.validator
+                        .dlq_mut()
+                        .enqueue(nodedb_crdt::EnqueueDeadLetterArgs {
+                            peer_id,
+                            user_id,
+                            tenant_id,
+                            delta: delta.to_vec(),
+                            constraint: &constraint,
+                            reason,
+                            hint: violation.hint.clone(),
+                        })
+                {
                     tracing::warn!(
                         tenant = tenant_id,
                         collection,
@@ -155,15 +159,19 @@ impl TenantCrdtEngine {
                 let hint = nodedb_crdt::CompensationHint::ManualIntervention {
                     reason: reason.clone(),
                 };
-                if let Err(e) = self.validator.dlq_mut().enqueue(
-                    peer_id,
-                    user_id,
-                    tenant_id,
-                    delta.to_vec(),
-                    &fallback,
-                    reason,
-                    hint,
-                ) {
+                if let Err(e) =
+                    self.validator
+                        .dlq_mut()
+                        .enqueue(nodedb_crdt::EnqueueDeadLetterArgs {
+                            peer_id,
+                            user_id,
+                            tenant_id,
+                            delta: delta.to_vec(),
+                            constraint: &fallback,
+                            reason,
+                            hint,
+                        })
+                {
                     tracing::warn!(
                         tenant = tenant_id,
                         collection,

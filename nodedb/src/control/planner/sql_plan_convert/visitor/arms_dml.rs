@@ -6,14 +6,17 @@ macro_rules! impl_dml_arms_for_convert_visitor {
     () => {
         fn insert(
             &mut self,
-            collection: &str,
-            engine: nodedb_sql::types::query::EngineType,
-            rows: &[Vec<(String, nodedb_sql::types_expr::SqlValue)>],
-            column_defaults: &[(String, String)],
-            if_absent: bool,
-            column_schema: &[(String, String)],
-            primary_key: Option<&str>,
+            args: nodedb_sql::InsertVisitArgs<'_>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+            let nodedb_sql::InsertVisitArgs {
+                collection,
+                engine,
+                rows,
+                column_defaults,
+                if_absent,
+                column_schema,
+                primary_key,
+            } = args;
             super::super::dml::convert_insert(super::super::dml::ConvertInsertArgs {
                 collection,
                 engine: &engine,
@@ -29,14 +32,17 @@ macro_rules! impl_dml_arms_for_convert_visitor {
 
         fn upsert(
             &mut self,
-            collection: &str,
-            engine: nodedb_sql::types::query::EngineType,
-            rows: &[Vec<(String, nodedb_sql::types_expr::SqlValue)>],
-            column_defaults: &[(String, String)],
-            on_conflict_updates: &[(String, nodedb_sql::types_expr::SqlExpr)],
-            column_schema: &[(String, String)],
-            primary_key: Option<&str>,
+            args: nodedb_sql::UpsertVisitArgs<'_>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+            let nodedb_sql::UpsertVisitArgs {
+                collection,
+                engine,
+                rows,
+                column_defaults,
+                on_conflict_updates,
+                column_schema,
+                primary_key,
+            } = args;
             super::super::dml::convert_upsert(super::super::dml::ConvertUpsertArgs {
                 collection,
                 engine: &engine,
@@ -95,15 +101,18 @@ macro_rules! impl_dml_arms_for_convert_visitor {
 
         fn update_from(
             &mut self,
-            collection: &str,
-            _engine: nodedb_sql::types::query::EngineType,
-            source: &nodedb_sql::types::SqlPlan,
-            target_join_col: &str,
-            source_join_col: &str,
-            assignments: &[(String, nodedb_sql::types_expr::SqlExpr)],
-            target_filters: &[nodedb_sql::types::filter::Filter],
-            returning: bool,
+            args: nodedb_sql::UpdateFromVisitArgs<'_>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+            let nodedb_sql::UpdateFromVisitArgs {
+                collection,
+                engine: _engine,
+                source,
+                target_join_col,
+                source_join_col,
+                assignments,
+                target_filters,
+                returning,
+            } = args;
             super::super::dml::convert_update_from(super::super::dml::UpdateFromParams {
                 collection,
                 source,
@@ -159,15 +168,18 @@ macro_rules! impl_dml_arms_for_convert_visitor {
 
         fn merge(
             &mut self,
-            target: &str,
-            _engine: nodedb_sql::types::query::EngineType,
-            source: &nodedb_sql::types::SqlPlan,
-            target_join_col: &str,
-            source_join_col: &str,
-            source_alias: &str,
-            clauses: &[nodedb_sql::types::plan::MergePlanClause],
-            returning: bool,
+            args: nodedb_sql::MergeVisitArgs<'_>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+            let nodedb_sql::MergeVisitArgs {
+                target,
+                engine: _engine,
+                source,
+                target_join_col,
+                source_join_col,
+                source_alias,
+                clauses,
+                returning,
+            } = args;
             super::super::dml::convert_merge(super::super::dml::ConvertMergeArgs {
                 target,
                 source,

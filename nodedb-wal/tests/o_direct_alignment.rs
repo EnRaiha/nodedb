@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use nodedb_wal::align::{DEFAULT_ALIGNMENT, is_aligned};
 use nodedb_wal::double_write::{DoubleWriteBuffer, DwbMode};
-use nodedb_wal::record::{HEADER_SIZE, RecordType, WalRecord};
+use nodedb_wal::record::{HEADER_SIZE, RecordType, WalRecord, WalRecordArgs};
 use nodedb_wal::uring_writer::{UringWriter, UringWriterConfig};
 
 fn target_dir() -> PathBuf {
@@ -134,16 +134,16 @@ fn dwb_direct_mode_write_and_recover() {
     };
 
     for lsn in 1..=3u64 {
-        let rec = WalRecord::new(
-            RecordType::Put as u32,
+        let rec = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::Put as u32,
             lsn,
-            1,
-            0,
-            0,
-            format!("direct-{lsn}").into_bytes(),
-            None,
-            None,
-        )
+            tenant_id: 1,
+            vshard_id: 0,
+            database_id: 0,
+            payload: format!("direct-{lsn}").into_bytes(),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap();
         dwb.write_record_deferred(&rec).unwrap();
     }

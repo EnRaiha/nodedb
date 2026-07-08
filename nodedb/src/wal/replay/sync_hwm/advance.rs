@@ -124,16 +124,16 @@ mod tests {
         let payload_bytes = SyncSeqAdvancePayload::new(producer_id, epoch, stream_id, seq)
             .to_bytes()
             .to_vec();
-        WalRecord::new(
-            RecordType::SyncSeqAdvance as u32,
-            0,
-            0,
-            0,
-            0,
-            payload_bytes,
-            None,
-            None,
-        )
+        WalRecord::new(nodedb_wal::WalRecordArgs {
+            record_type: RecordType::SyncSeqAdvance as u32,
+            lsn: 0,
+            tenant_id: 0,
+            vshard_id: 0,
+            database_id: 0,
+            payload: payload_bytes,
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .expect("WalRecord::new")
     }
 

@@ -10,7 +10,8 @@ use super::constraint::extract_join_spec;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::lateral::plan::{
-    is_lateral_derived, lateral_alias_from_factor, plan_lateral_join, subquery_from_factor,
+    LateralJoinArgs, is_lateral_derived, lateral_alias_from_factor, plan_lateral_join,
+    subquery_from_factor,
 };
 use crate::resolver::columns::TableScope;
 use crate::types::*;
@@ -50,16 +51,16 @@ pub fn plan_join_from_select(
                 .expect("is_lateral_derived guarantees Derived variant");
             let left_join = is_left_join_operator(&join_item.join_operator);
             let projection = super::super::select::convert_projection(&select.projection)?;
-            return Ok(Some(plan_lateral_join(
-                current_plan,
+            return Ok(Some(plan_lateral_join(LateralJoinArgs {
+                outer_plan: current_plan,
                 outer_alias,
                 subquery,
-                &lateral_alias,
+                lateral_alias: &lateral_alias,
                 left_join,
-                projection,
+                outer_projection: projection,
                 catalog,
                 temporal,
-            )?));
+            })?));
         }
 
         // Right side: array TVF or named table.

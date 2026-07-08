@@ -6,16 +6,19 @@ macro_rules! impl_array_arms_for_convert_visitor {
     () => {
         fn create_array(
             &mut self,
-            name: &str,
-            dims: &[nodedb_sql::types_array::ArrayDimAst],
-            attrs: &[nodedb_sql::types_array::ArrayAttrAst],
-            tile_extents: &[i64],
-            cell_order: nodedb_sql::types_array::ArrayCellOrderAst,
-            tile_order: nodedb_sql::types_array::ArrayTileOrderAst,
-            prefix_bits: u8,
-            audit_retain_ms: Option<u64>,
-            minimum_audit_retain_ms: Option<u64>,
+            args: nodedb_sql::CreateArrayVisitArgs<'_>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+            let nodedb_sql::CreateArrayVisitArgs {
+                name,
+                dims,
+                attrs,
+                tile_extents,
+                cell_order,
+                tile_order,
+                prefix_bits,
+                audit_retain_ms,
+                minimum_audit_retain_ms,
+            } = args;
             super::super::array_convert::convert_create_array(
                 super::super::array_convert::CreateArrayArgs {
                     name,

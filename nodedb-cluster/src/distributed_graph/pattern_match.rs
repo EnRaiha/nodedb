@@ -72,6 +72,16 @@ pub struct DistributedMatchCoordinator {
     pub max_rounds: u32,
 }
 
+/// Raw routing-resolved fields for [`PatternContinuation::from_resolved`].
+pub struct ResolvedContinuationArgs {
+    pub target_shard: u32,
+    pub source_shard: u32,
+    pub bindings: HashMap<String, String>,
+    pub next_triple_idx: usize,
+    pub start_node: String,
+    pub start_binding: String,
+}
+
 impl PatternContinuation {
     /// Construct a continuation from its raw routing-resolved fields.
     ///
@@ -81,15 +91,15 @@ impl PatternContinuation {
     /// routing classification itself stays in the CP layer — `nodedb-cluster`
     /// has no access to the routing table — but the field assembly lives with
     /// the type so the shape cannot drift from the struct definition.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_resolved(
-        target_shard: u32,
-        source_shard: u32,
-        bindings: HashMap<String, String>,
-        next_triple_idx: usize,
-        start_node: String,
-        start_binding: String,
-    ) -> Self {
+    pub fn from_resolved(args: ResolvedContinuationArgs) -> Self {
+        let ResolvedContinuationArgs {
+            target_shard,
+            source_shard,
+            bindings,
+            next_triple_idx,
+            start_node,
+            start_binding,
+        } = args;
         Self {
             target_shard,
             source_shard,

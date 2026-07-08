@@ -14,7 +14,7 @@ use nodedb_wal::reader::WalReader;
 use nodedb_wal::record::RecordType;
 use nodedb_wal::recovery::recover;
 use nodedb_wal::writer::WalWriter;
-use nodedb_wal::{Result, WalRecord};
+use nodedb_wal::{Result, WalRecord, WalRecordArgs};
 
 /// Helper: write N records and sync.
 fn write_records(path: &std::path::Path, count: u32) -> Vec<u64> {
@@ -96,16 +96,16 @@ fn torn_write_mid_payload() {
 
     // Manually construct a valid header but truncate the payload.
     {
-        let record = WalRecord::new(
-            RecordType::Put as u32,
-            99,
-            1,
-            0,
-            0,
-            b"full-payload".to_vec(),
-            None,
-            None,
-        )
+        let record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::Put as u32,
+            lsn: 99,
+            tenant_id: 1,
+            vshard_id: 0,
+            database_id: 0,
+            payload: b"full-payload".to_vec(),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap();
         let header_bytes = record.header.to_bytes();
 

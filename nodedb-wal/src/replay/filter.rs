@@ -127,22 +127,22 @@ pub fn extract_tombstones(records: &[WalRecord]) -> TombstoneSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::WalRecord;
+    use crate::record::{WalRecord, WalRecordArgs};
 
     fn tombstone_record(tenant: u64, name: &str, purge_lsn: u64, record_lsn: u64) -> WalRecord {
         let payload = CollectionTombstonePayload::new(name, purge_lsn)
             .to_bytes()
             .unwrap();
-        WalRecord::new(
-            RecordType::CollectionTombstoned as u32,
-            record_lsn,
-            tenant,
-            0,
-            0,
+        WalRecord::new(WalRecordArgs {
+            record_type: RecordType::CollectionTombstoned as u32,
+            lsn: record_lsn,
+            tenant_id: tenant,
+            vshard_id: 0,
+            database_id: 0,
             payload,
-            None,
-            None,
-        )
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap()
     }
 
@@ -185,18 +185,28 @@ mod tests {
     fn extract_ignores_non_tombstone_records() {
         let records = vec![
             tombstone_record(1, "users", 100, 10),
-            WalRecord::new(
-                RecordType::Put as u32,
-                11,
-                1,
-                0,
-                0,
-                b"junk".to_vec(),
-                None,
-                None,
-            )
+            WalRecord::new(WalRecordArgs {
+                record_type: RecordType::Put as u32,
+                lsn: 11,
+                tenant_id: 1,
+                vshard_id: 0,
+                database_id: 0,
+                payload: b"junk".to_vec(),
+                encryption_key: None,
+                preamble_bytes: None,
+            })
             .unwrap(),
-            WalRecord::new(RecordType::Noop as u32, 12, 1, 0, 0, vec![], None, None).unwrap(),
+            WalRecord::new(WalRecordArgs {
+                record_type: RecordType::Noop as u32,
+                lsn: 12,
+                tenant_id: 1,
+                vshard_id: 0,
+                database_id: 0,
+                payload: vec![],
+                encryption_key: None,
+                preamble_bytes: None,
+            })
+            .unwrap(),
         ];
         let set = extract_tombstones(&records);
         assert_eq!(set.len(), 1);
@@ -205,16 +215,16 @@ mod tests {
     #[test]
     fn extract_tolerates_corrupt_payload() {
         // Build a tombstone-typed record whose payload is too short to decode.
-        let bogus = WalRecord::new(
-            RecordType::CollectionTombstoned as u32,
-            5,
-            1,
-            0,
-            0,
-            vec![0xFF, 0xFF, 0xFF], // truncated name_len, no body
-            None,
-            None,
-        )
+        let bogus = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::CollectionTombstoned as u32,
+            lsn: 5,
+            tenant_id: 1,
+            vshard_id: 0,
+            database_id: 0,
+            payload: vec![0xFF, 0xFF, 0xFF], // truncated name_len, no body
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap();
         let records = vec![bogus, tombstone_record(1, "users", 100, 10)];
         let set = extract_tombstones(&records);

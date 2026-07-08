@@ -105,6 +105,17 @@ pub struct DeadLetter {
     pub retry_count: u32,
 }
 
+/// Parameters for [`DeadLetterQueue::enqueue`].
+pub struct EnqueueDeadLetterArgs<'a> {
+    pub peer_id: u64,
+    pub user_id: u64,
+    pub tenant_id: u64,
+    pub delta: Vec<u8>,
+    pub constraint: &'a Constraint,
+    pub reason: String,
+    pub hint: CompensationHint,
+}
+
 /// Bounded dead-letter queue.
 ///
 /// Stores rejected deltas for later inspection and retry. The queue is bounded
@@ -126,17 +137,17 @@ impl DeadLetterQueue {
     }
 
     /// Enqueue a rejected delta with full auth context.
-    #[allow(clippy::too_many_arguments)]
-    pub fn enqueue(
-        &mut self,
-        peer_id: u64,
-        user_id: u64,
-        tenant_id: u64,
-        delta: Vec<u8>,
-        constraint: &Constraint,
-        reason: String,
-        hint: CompensationHint,
-    ) -> Result<u64> {
+    pub fn enqueue(&mut self, args: EnqueueDeadLetterArgs<'_>) -> Result<u64> {
+        let EnqueueDeadLetterArgs {
+            peer_id,
+            user_id,
+            tenant_id,
+            delta,
+            constraint,
+            reason,
+            hint,
+        } = args;
+
         if self.entries.len() >= self.capacity {
             return Err(CrdtError::DlqFull {
                 capacity: self.capacity,
@@ -253,19 +264,19 @@ mod tests {
         let c = test_constraint();
 
         let id = dlq
-            .enqueue(
-                42,
-                0,
-                0,
-                b"delta-bytes".to_vec(),
-                &c,
-                "email already exists".into(),
-                CompensationHint::RetryWithDifferentValue {
+            .enqueue(EnqueueDeadLetterArgs {
+                peer_id: 42,
+                user_id: 0,
+                tenant_id: 0,
+                delta: b"delta-bytes".to_vec(),
+                constraint: &c,
+                reason: "email already exists".into(),
+                hint: CompensationHint::RetryWithDifferentValue {
                     field: "email".into(),
                     conflicting_value: "alice@example.com".into(),
                     suggestion: "alice+1@example.com".into(),
                 },
-            )
+            })
             .unwrap();
 
         assert_eq!(dlq.len(), 1);
@@ -285,12 +296,36 @@ mod tests {
             reason: "test".into(),
         };
 
-        dlq.enqueue(1, 0, 0, vec![], &c, "r1".into(), hint.clone())
-            .unwrap();
-        dlq.enqueue(2, 0, 0, vec![], &c, "r2".into(), hint.clone())
-            .unwrap();
+        dlq.enqueue(EnqueueDeadLetterArgs {
+            peer_id: 1,
+            user_id: 0,
+            tenant_id: 0,
+            delta: vec![],
+            constraint: &c,
+            reason: "r1".into(),
+            hint: hint.clone(),
+        })
+        .unwrap();
+        dlq.enqueue(EnqueueDeadLetterArgs {
+            peer_id: 2,
+            user_id: 0,
+            tenant_id: 0,
+            delta: vec![],
+            constraint: &c,
+            reason: "r2".into(),
+            hint: hint.clone(),
+        })
+        .unwrap();
 
-        let err = dlq.enqueue(3, 0, 0, vec![], &c, "r3".into(), hint);
+        let err = dlq.enqueue(EnqueueDeadLetterArgs {
+            peer_id: 3,
+            user_id: 0,
+            tenant_id: 0,
+            delta: vec![],
+            constraint: &c,
+            reason: "r3".into(),
+            hint,
+        });
         assert!(matches!(err, Err(CrdtError::DlqFull { .. })));
     }
 
@@ -314,14 +349,46 @@ mod tests {
         // Two entries for tenant 1 / users, one for tenant 1 / orders,
         // one for tenant 2 / users — only the first two should be
         // dropped by `purge_collection(1, "users")`.
-        dlq.enqueue(10, 0, 1, vec![], &users_c, "a".into(), hint.clone())
-            .unwrap();
-        dlq.enqueue(11, 0, 1, vec![], &users_c, "b".into(), hint.clone())
-            .unwrap();
-        dlq.enqueue(12, 0, 1, vec![], &orders_c, "c".into(), hint.clone())
-            .unwrap();
-        dlq.enqueue(13, 0, 2, vec![], &users_c, "d".into(), hint.clone())
-            .unwrap();
+        dlq.enqueue(EnqueueDeadLetterArgs {
+            peer_id: 10,
+            user_id: 0,
+            tenant_id: 1,
+            delta: vec![],
+            constraint: &users_c,
+            reason: "a".into(),
+            hint: hint.clone(),
+        })
+        .unwrap();
+        dlq.enqueue(EnqueueDeadLetterArgs {
+            peer_id: 11,
+            user_id: 0,
+            tenant_id: 1,
+            delta: vec![],
+            constraint: &users_c,
+            reason: "b".into(),
+            hint: hint.clone(),
+        })
+        .unwrap();
+        dlq.enqueue(EnqueueDeadLetterArgs {
+            peer_id: 12,
+            user_id: 0,
+            tenant_id: 1,
+            delta: vec![],
+            constraint: &orders_c,
+            reason: "c".into(),
+            hint: hint.clone(),
+        })
+        .unwrap();
+        dlq.enqueue(EnqueueDeadLetterArgs {
+            peer_id: 13,
+            user_id: 0,
+            tenant_id: 2,
+            delta: vec![],
+            constraint: &users_c,
+            reason: "d".into(),
+            hint: hint.clone(),
+        })
+        .unwrap();
 
         let removed = dlq.purge_collection(1, "users");
         assert_eq!(removed, 2);
@@ -352,11 +419,36 @@ mod tests {
             reason: "test".into(),
         };
 
-        dlq.enqueue(1, 0, 0, vec![], &c, "a".into(), hint.clone())
-            .unwrap();
-        dlq.enqueue(2, 0, 0, vec![], &c, "b".into(), hint.clone())
-            .unwrap();
-        dlq.enqueue(1, 0, 0, vec![], &c, "c".into(), hint).unwrap();
+        dlq.enqueue(EnqueueDeadLetterArgs {
+            peer_id: 1,
+            user_id: 0,
+            tenant_id: 0,
+            delta: vec![],
+            constraint: &c,
+            reason: "a".into(),
+            hint: hint.clone(),
+        })
+        .unwrap();
+        dlq.enqueue(EnqueueDeadLetterArgs {
+            peer_id: 2,
+            user_id: 0,
+            tenant_id: 0,
+            delta: vec![],
+            constraint: &c,
+            reason: "b".into(),
+            hint: hint.clone(),
+        })
+        .unwrap();
+        dlq.enqueue(EnqueueDeadLetterArgs {
+            peer_id: 1,
+            user_id: 0,
+            tenant_id: 0,
+            delta: vec![],
+            constraint: &c,
+            reason: "c".into(),
+            hint,
+        })
+        .unwrap();
 
         let peer1 = dlq.drain_peer(1);
         assert_eq!(peer1.len(), 2);
@@ -372,9 +464,27 @@ mod tests {
         };
 
         let id1 = dlq
-            .enqueue(1, 0, 0, vec![], &c, "a".into(), hint.clone())
+            .enqueue(EnqueueDeadLetterArgs {
+                peer_id: 1,
+                user_id: 0,
+                tenant_id: 0,
+                delta: vec![],
+                constraint: &c,
+                reason: "a".into(),
+                hint: hint.clone(),
+            })
             .unwrap();
-        let _id2 = dlq.enqueue(1, 0, 0, vec![], &c, "b".into(), hint).unwrap();
+        let _id2 = dlq
+            .enqueue(EnqueueDeadLetterArgs {
+                peer_id: 1,
+                user_id: 0,
+                tenant_id: 0,
+                delta: vec![],
+                constraint: &c,
+                reason: "b".into(),
+                hint,
+            })
+            .unwrap();
 
         let removed = dlq.remove(id1).unwrap();
         assert_eq!(removed.reason, "a");

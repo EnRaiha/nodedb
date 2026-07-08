@@ -15,6 +15,18 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
+/// Parameters for [`WalRecord::new`].
+pub struct WalRecordArgs<'a> {
+    pub record_type: u32,
+    pub lsn: u64,
+    pub tenant_id: u64,
+    pub vshard_id: u32,
+    pub database_id: u64,
+    pub payload: Vec<u8>,
+    pub encryption_key: Option<&'a crate::crypto::WalEncryptionKey>,
+    pub preamble_bytes: Option<&'a [u8; PREAMBLE_SIZE]>,
+}
+
 impl WalRecord {
     /// Create a new WAL record with computed CRC32C.
     ///
@@ -30,17 +42,17 @@ impl WalRecord {
     /// `database_id` is stored in header bytes 34-41 (previously reserved,
     /// zero-filled). Pre-existing records with zeros decode to `DatabaseId(0)`
     /// (the default database), preserving backward compatibility.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        record_type: u32,
-        lsn: u64,
-        tenant_id: u64,
-        vshard_id: u32,
-        database_id: u64,
-        payload: Vec<u8>,
-        encryption_key: Option<&crate::crypto::WalEncryptionKey>,
-        preamble_bytes: Option<&[u8; PREAMBLE_SIZE]>,
-    ) -> Result<Self> {
+    pub fn new(args: WalRecordArgs<'_>) -> Result<Self> {
+        let WalRecordArgs {
+            record_type,
+            lsn,
+            tenant_id,
+            vshard_id,
+            database_id,
+            payload,
+            encryption_key,
+            preamble_bytes,
+        } = args;
         if payload.len() > MAX_WAL_PAYLOAD_SIZE {
             return Err(WalError::PayloadTooLarge {
                 size: payload.len(),
@@ -212,16 +224,16 @@ mod tests {
     #[test]
     fn checksum_roundtrip() {
         let payload = b"hello nodedb";
-        let record = WalRecord::new(
-            RecordType::Put as u32,
-            1,
-            0,
-            0,
-            0,
-            payload.to_vec(),
-            None,
-            None,
-        )
+        let record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::Put as u32,
+            lsn: 1,
+            tenant_id: 0,
+            vshard_id: 0,
+            database_id: 0,
+            payload: payload.to_vec(),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap();
         record.verify_checksum().unwrap();
     }
@@ -229,16 +241,16 @@ mod tests {
     #[test]
     fn checksum_detects_corruption() {
         let payload = b"hello nodedb";
-        let mut record = WalRecord::new(
-            RecordType::Put as u32,
-            1,
-            0,
-            0,
-            0,
-            payload.to_vec(),
-            None,
-            None,
-        )
+        let mut record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::Put as u32,
+            lsn: 1,
+            tenant_id: 0,
+            vshard_id: 0,
+            database_id: 0,
+            payload: payload.to_vec(),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap();
         record.payload[0] ^= 0xFF;
         assert!(matches!(
@@ -251,7 +263,16 @@ mod tests {
     fn payload_too_large_rejected() {
         let big_payload = vec![0u8; MAX_WAL_PAYLOAD_SIZE + 1];
         assert!(matches!(
-            WalRecord::new(RecordType::Put as u32, 1, 0, 0, 0, big_payload, None, None),
+            WalRecord::new(WalRecordArgs {
+                record_type: RecordType::Put as u32,
+                lsn: 1,
+                tenant_id: 0,
+                vshard_id: 0,
+                database_id: 0,
+                payload: big_payload,
+                encryption_key: None,
+                preamble_bytes: None,
+            }),
             Err(WalError::PayloadTooLarge { .. })
         ));
     }
@@ -260,16 +281,16 @@ mod tests {
     fn anchor_payload_in_record() {
         use super::super::anchor::LsnMsAnchorPayload;
         let anchor = LsnMsAnchorPayload::new(42, 1_700_000_000_000);
-        let record = WalRecord::new(
-            RecordType::LsnMsAnchor as u32,
-            42,
-            0,
-            0,
-            0,
-            anchor.to_bytes().to_vec(),
-            None,
-            None,
-        )
+        let record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::LsnMsAnchor as u32,
+            lsn: 42,
+            tenant_id: 0,
+            vshard_id: 0,
+            database_id: 0,
+            payload: anchor.to_bytes().to_vec(),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap();
         record.verify_checksum().unwrap();
         assert_eq!(record.logical_record_type(), RecordType::LsnMsAnchor as u32);

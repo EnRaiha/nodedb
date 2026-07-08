@@ -8,6 +8,8 @@ pub mod wcc;
 
 pub use coordinator::BspCoordinator;
 pub use pagerank::ShardPageRankState;
-pub use pattern_match::{DistributedMatchCoordinator, PatternContinuation, ShardMatchResult};
+pub use pattern_match::{
+    DistributedMatchCoordinator, PatternContinuation, ResolvedContinuationArgs, ShardMatchResult,
+};
 pub use types::{AlgoComplete, BoundaryContributions, SuperstepAck, SuperstepBarrier};
 pub use wcc::stitch_components;

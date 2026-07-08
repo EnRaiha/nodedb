@@ -12,7 +12,8 @@ use crate::functions::registry::FunctionRegistry;
 use crate::parser::normalize::normalize_ident;
 use crate::planner::ast_helpers::strip_single_table_qualifiers;
 use crate::planner::lateral::plan::{
-    is_lateral_derived, lateral_alias_from_factor, plan_lateral_join, subquery_from_factor,
+    LateralJoinArgs, is_lateral_derived, lateral_alias_from_factor, plan_lateral_join,
+    subquery_from_factor,
 };
 use crate::resolver::columns::TableScope;
 use crate::temporal::TemporalScope;
@@ -129,16 +130,16 @@ pub(super) fn plan_select(
         let subquery = subquery_from_factor(&lateral_twj.relation)
             .expect("is_lateral_derived guarantees Derived variant");
         let projection = convert_projection(&select.projection)?;
-        return plan_lateral_join(
-            outer_scan,
+        return plan_lateral_join(LateralJoinArgs {
+            outer_plan: outer_scan,
             outer_alias,
             subquery,
-            &lateral_alias,
-            false, // comma-LATERAL is INNER (no LEFT semantics)
-            projection,
+            lateral_alias: &lateral_alias,
+            left_join: false, // comma-LATERAL is INNER (no LEFT semantics)
+            outer_projection: projection,
             catalog,
             temporal,
-        )
+        })
         .map(Ok)?;
     }
 

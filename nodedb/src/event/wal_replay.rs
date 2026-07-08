@@ -502,16 +502,16 @@ mod tests {
         vshard_id: u32,
         lsn: u64,
     ) -> WalRecord {
-        WalRecord::new(
-            rt as u32,
+        WalRecord::new(nodedb_wal::WalRecordArgs {
+            record_type: rt as u32,
             lsn,
             tenant_id,
             vshard_id,
-            0,
-            payload.to_vec(),
-            None,
-            None,
-        )
+            database_id: 0,
+            payload: payload.to_vec(),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
         .unwrap()
     }
 }

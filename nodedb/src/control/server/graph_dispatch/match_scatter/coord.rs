@@ -12,7 +12,7 @@ use crate::control::state::SharedState;
 use crate::engine::graph::pattern::executor::{UnresolvedExpansion, VarLenResume, rows_to_msgpack};
 use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_cluster::distributed_graph::{
-    DistributedMatchCoordinator, PatternContinuation, ShardMatchResult,
+    DistributedMatchCoordinator, PatternContinuation, ResolvedContinuationArgs, ShardMatchResult,
 };
 
 use super::resume_queue::{PendingResume, resume_to_pending};
@@ -257,12 +257,14 @@ fn frontier_to_continuations(
             continue;
         }
         out.push(PatternContinuation::from_resolved(
-            target_vshard,
-            emitting_node as u32,
-            entry.partial_row,
-            entry.triple_idx,
-            entry.node_name,
-            entry.binding_var,
+            ResolvedContinuationArgs {
+                target_shard: target_vshard,
+                source_shard: emitting_node as u32,
+                bindings: entry.partial_row,
+                next_triple_idx: entry.triple_idx,
+                start_node: entry.node_name,
+                start_binding: entry.binding_var,
+            },
         ));
     }
     Ok(out)

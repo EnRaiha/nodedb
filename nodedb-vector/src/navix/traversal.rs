@@ -254,43 +254,43 @@ fn navix_search_layer_0(
 
         match heuristic {
             NavixHeuristic::Standard => {
-                expand_standard(
+                expand_standard(ExpandArgs {
                     index,
                     query,
                     neighbors_1hop,
                     allowed,
                     ef,
                     metric,
-                    &mut visited,
-                    &mut candidates,
-                    &mut results,
-                );
+                    visited: &mut visited,
+                    candidates: &mut candidates,
+                    results: &mut results,
+                });
             }
             NavixHeuristic::Directed => {
-                expand_directed(
+                expand_directed(ExpandArgs {
                     index,
                     query,
                     neighbors_1hop,
                     allowed,
                     ef,
                     metric,
-                    &mut visited,
-                    &mut candidates,
-                    &mut results,
-                );
+                    visited: &mut visited,
+                    candidates: &mut candidates,
+                    results: &mut results,
+                });
             }
             NavixHeuristic::Blind => {
-                expand_blind(
+                expand_blind(ExpandArgs {
                     index,
                     query,
                     neighbors_1hop,
                     allowed,
                     ef,
                     metric,
-                    &mut visited,
-                    &mut candidates,
-                    &mut results,
-                );
+                    visited: &mut visited,
+                    candidates: &mut candidates,
+                    results: &mut results,
+                });
             }
         }
     }
@@ -300,19 +300,32 @@ fn navix_search_layer_0(
     v
 }
 
-/// Standard expansion: score every allowed 1-hop neighbor and add to heaps.
-#[allow(clippy::too_many_arguments)]
-fn expand_standard(
-    index: &HnswIndex,
-    query: &[f32],
-    neighbors_1hop: &[u32],
-    allowed: &RoaringBitmap,
+/// Shared beam-search state bundled for the per-heuristic `expand_*` helpers.
+struct ExpandArgs<'a> {
+    index: &'a HnswIndex,
+    query: &'a [f32],
+    neighbors_1hop: &'a [u32],
+    allowed: &'a RoaringBitmap,
     ef: usize,
     metric: nodedb_types::vector_distance::DistanceMetric,
-    visited: &mut HashSet<u32>,
-    candidates: &mut BinaryHeap<Reverse<Candidate>>,
-    results: &mut BinaryHeap<Candidate>,
-) {
+    visited: &'a mut HashSet<u32>,
+    candidates: &'a mut BinaryHeap<Reverse<Candidate>>,
+    results: &'a mut BinaryHeap<Candidate>,
+}
+
+/// Standard expansion: score every allowed 1-hop neighbor and add to heaps.
+fn expand_standard(args: ExpandArgs<'_>) {
+    let ExpandArgs {
+        index,
+        query,
+        neighbors_1hop,
+        allowed,
+        ef,
+        metric,
+        visited,
+        candidates,
+        results,
+    } = args;
     for &nb in neighbors_1hop {
         if !visited.insert(nb) {
             continue;
@@ -334,18 +347,18 @@ fn expand_standard(
 
 /// Directed expansion: score 1-hop, pick the single best allowed neighbor,
 /// then expand that neighbor's 2-hop neighbors into the heaps.
-#[allow(clippy::too_many_arguments)]
-fn expand_directed(
-    index: &HnswIndex,
-    query: &[f32],
-    neighbors_1hop: &[u32],
-    allowed: &RoaringBitmap,
-    ef: usize,
-    metric: nodedb_types::vector_distance::DistanceMetric,
-    visited: &mut HashSet<u32>,
-    candidates: &mut BinaryHeap<Reverse<Candidate>>,
-    results: &mut BinaryHeap<Candidate>,
-) {
+fn expand_directed(args: ExpandArgs<'_>) {
+    let ExpandArgs {
+        index,
+        query,
+        neighbors_1hop,
+        allowed,
+        ef,
+        metric,
+        visited,
+        candidates,
+        results,
+    } = args;
     // Score 1-hop; track the best allowed neighbor.
     let mut best_allowed: Option<(u32, f32)> = None;
 
@@ -397,18 +410,18 @@ fn expand_directed(
 
 /// Blind expansion: skip scoring 1-hop; expand 2-hop of all 1-hop neighbors,
 /// adding to heaps only IDs that are in `allowed`.
-#[allow(clippy::too_many_arguments)]
-fn expand_blind(
-    index: &HnswIndex,
-    query: &[f32],
-    neighbors_1hop: &[u32],
-    allowed: &RoaringBitmap,
-    ef: usize,
-    metric: nodedb_types::vector_distance::DistanceMetric,
-    visited: &mut HashSet<u32>,
-    candidates: &mut BinaryHeap<Reverse<Candidate>>,
-    results: &mut BinaryHeap<Candidate>,
-) {
+fn expand_blind(args: ExpandArgs<'_>) {
+    let ExpandArgs {
+        index,
+        query,
+        neighbors_1hop,
+        allowed,
+        ef,
+        metric,
+        visited,
+        candidates,
+        results,
+    } = args;
     for &nb1 in neighbors_1hop {
         // Mark 1-hop as visited so we do not double-score them later,
         // but do not score them — that is the Blind heuristic.

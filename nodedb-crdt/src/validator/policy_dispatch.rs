@@ -128,19 +128,19 @@ impl Validator {
                         let base_ms = 500u64;
                         let first_retry_after_ms = base_ms;
 
-                        let id = self.deferred.enqueue(
+                        let id = self.deferred.enqueue(crate::deferred::EnqueueDeferredArgs {
                             peer_id,
-                            auth.user_id,
-                            auth.tenant_id,
-                            delta_bytes,
-                            change.collection.clone(),
-                            constraint.name.clone(),
-                            0,
-                            *max_retries,
+                            user_id: auth.user_id,
+                            tenant_id: auth.tenant_id,
+                            delta: delta_bytes,
+                            collection: change.collection.clone(),
+                            constraint_name: constraint.name.clone(),
+                            attempt: 0,
+                            max_retries: *max_retries,
                             now_ms,
                             first_retry_after_ms,
-                            *ttl_secs,
-                        );
+                            ttl_secs: *ttl_secs,
+                        });
 
                         tracing::info!(
                             constraint = %v.constraint_name,
@@ -174,15 +174,16 @@ impl Validator {
                     }
 
                     ConflictPolicy::EscalateToDlq => {
-                        self.dlq.enqueue(
-                            peer_id,
-                            auth.user_id,
-                            auth.tenant_id,
-                            delta_bytes,
-                            &constraint,
-                            v.reason.clone(),
-                            v.hint.clone(),
-                        )?;
+                        self.dlq
+                            .enqueue(crate::dead_letter::EnqueueDeadLetterArgs {
+                                peer_id,
+                                user_id: auth.user_id,
+                                tenant_id: auth.tenant_id,
+                                delta: delta_bytes,
+                                constraint: &constraint,
+                                reason: v.reason.clone(),
+                                hint: v.hint.clone(),
+                            })?;
 
                         tracing::info!(
                             constraint = %v.constraint_name,

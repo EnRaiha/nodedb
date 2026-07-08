@@ -16,29 +16,40 @@ use crate::types::*;
 /// The maximum outer-row count allowed for `LateralLoop` queries.
 pub const LATERAL_LOOP_CAP: usize = 100_000;
 
+/// Parameters for [`plan_lateral_join`].
+pub struct LateralJoinArgs<'a> {
+    /// Plan for the driving (outer) side.
+    pub outer_plan: SqlPlan,
+    /// Alias or name of the outer table for correlation detection.
+    pub outer_alias: Option<String>,
+    /// The LATERAL inner subquery.
+    pub subquery: &'a ast::Query,
+    /// Alias given to the LATERAL in the SQL (e.g. `x` in `LATERAL (...) x`).
+    pub lateral_alias: &'a str,
+    /// True when the enclosing join is LEFT JOIN LATERAL (outer rows
+    /// preserved when inner produces no rows).
+    pub left_join: bool,
+    /// SELECT list projection to apply after the lateral.
+    pub outer_projection: Vec<Projection>,
+    pub catalog: &'a dyn SqlCatalog,
+    pub temporal: TemporalScope,
+}
+
 /// Plan a LATERAL subquery join.
 ///
 /// Called when the right side of a JOIN (or a comma-separated FROM item) is a
 /// `TableFactor::Derived { lateral: true, .. }`.
-///
-/// `outer_plan` — plan for the driving (outer) side.
-/// `outer_alias` — alias or name of the outer table for correlation detection.
-/// `subquery` — the LATERAL inner subquery.
-/// `lateral_alias` — alias given to the LATERAL in the SQL (e.g. `x` in `LATERAL (...) x`).
-/// `left_join` — true when the enclosing join is LEFT JOIN LATERAL (outer rows
-///               preserved when inner produces no rows).
-/// `outer_projection` — SELECT list projection to apply after the lateral.
-#[allow(clippy::too_many_arguments)]
-pub fn plan_lateral_join(
-    outer_plan: SqlPlan,
-    outer_alias: Option<String>,
-    subquery: &ast::Query,
-    lateral_alias: &str,
-    left_join: bool,
-    outer_projection: Vec<Projection>,
-    catalog: &dyn SqlCatalog,
-    temporal: TemporalScope,
-) -> Result<SqlPlan> {
+pub fn plan_lateral_join(args: LateralJoinArgs<'_>) -> Result<SqlPlan> {
+    let LateralJoinArgs {
+        outer_plan,
+        outer_alias,
+        subquery,
+        lateral_alias,
+        left_join,
+        outer_projection,
+        catalog,
+        temporal,
+    } = args;
     let select = match subquery.body.as_ref() {
         sqlparser::ast::SetExpr::Select(s) => s,
         _ => {
@@ -61,17 +72,17 @@ pub fn plan_lateral_join(
     let is_top_k = has_equi && inner_limit.is_some() && analysis.non_equi.is_empty();
 
     if is_top_k {
-        plan_lateral_top_k(
+        plan_lateral_top_k(LateralTopKPlanArgs {
             outer_plan,
             outer_alias,
             select,
             subquery,
-            analysis.equi_keys,
-            inner_limit.expect("checked above"),
+            equi_keys: analysis.equi_keys,
+            inner_limit: inner_limit.expect("checked above"),
             lateral_alias,
             left_join,
             outer_projection,
-        )
+        })
     } else if has_equi && analysis.non_equi.is_empty() {
         // Equi-correlated, no LIMIT: rewrite as a regular hash join.
         //
@@ -179,19 +190,32 @@ fn extract_inner_alias(select: &sqlparser::ast::Select) -> Option<String> {
     }
 }
 
-/// Plan the `LateralTopK` variant: equi-correlated + ORDER BY + LIMIT k.
-#[allow(clippy::too_many_arguments)]
-fn plan_lateral_top_k(
+/// Parameters for [`plan_lateral_top_k`].
+struct LateralTopKPlanArgs<'a> {
     outer_plan: SqlPlan,
     outer_alias: Option<String>,
-    select: &sqlparser::ast::Select,
-    subquery: &ast::Query,
+    select: &'a sqlparser::ast::Select,
+    subquery: &'a ast::Query,
     equi_keys: Vec<super::correlation::CorrelationEq>,
     inner_limit: usize,
-    lateral_alias: &str,
+    lateral_alias: &'a str,
     left_join: bool,
     outer_projection: Vec<Projection>,
-) -> Result<SqlPlan> {
+}
+
+/// Plan the `LateralTopK` variant: equi-correlated + ORDER BY + LIMIT k.
+fn plan_lateral_top_k(args: LateralTopKPlanArgs<'_>) -> Result<SqlPlan> {
+    let LateralTopKPlanArgs {
+        outer_plan,
+        outer_alias,
+        select,
+        subquery,
+        equi_keys,
+        inner_limit,
+        lateral_alias,
+        left_join,
+        outer_projection,
+    } = args;
     // Build a bare inner Scan without correlation filters (those are injected
     // at runtime per outer row).
     let inner_collection = extract_inner_collection(select)?;
