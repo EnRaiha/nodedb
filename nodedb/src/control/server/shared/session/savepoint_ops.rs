@@ -8,10 +8,11 @@
 //! neutral `SessionStore` savepoint stack. Transports translate the returned
 //! [`SavepointError`] into their own SQLSTATE (`25P01` / `3B001`).
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::TenantId;
+use crate::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -20,6 +21,7 @@ use super::state::TransactionState;
 use super::store::SessionStore;
 
 /// Typed savepoint failure. Adapters map each variant to its SQLSTATE.
+#[derive(Debug)]
 pub enum SavepointError {
     /// A savepoint command was issued outside a transaction block. → `25P01`.
     NoActiveTransaction,
@@ -36,19 +38,14 @@ fn require_active_txn(sessions: &SessionStore, addr: &SocketAddr) -> Result<(), 
     Ok(())
 }
 
-/// Dispatch a savepoint overlay meta-op to the transaction's home vShard and
-/// return the raw response payload bytes, or `None` when no staged write has
-/// homed a vShard yet (the overlay — and its journal — is empty, so there is
-/// nothing on the Data Plane to mark or rewind).
+/// Dispatch a savepoint overlay meta-op to a specific vShard's core and return
+/// the raw response payload bytes, or `None` on dispatch failure.
 async fn dispatch_overlay_savepoint(
-    sessions: &SessionStore,
-    addr: &SocketAddr,
     tenant_id: TenantId,
+    vshard_id: VShardId,
     dp: &impl TxnDataPlane,
     op: MetaOp,
 ) -> Option<Vec<u8>> {
-    let (txn_id, vshard) = sessions.txn_identity(addr);
-    let (_txn_id, vshard_id) = (txn_id?, vshard?);
     let task = PhysicalTask {
         tenant_id,
         vshard_id,
@@ -88,10 +85,11 @@ fn decode_markers(payload: Option<Vec<u8>>) -> (usize, usize) {
 
 /// Handle SAVEPOINT `<name>`.
 ///
-/// Captures the composite overlay undo-journal marker on the txn's home vShard
-/// so a later ROLLBACK TO reverts staged value/TTL AND graph state to exactly
-/// here. A missing/short payload (or no vShard yet) means empty journals →
-/// `(0, 0)`.
+/// Captures the composite overlay undo-journal marker on EVERY vShard the
+/// transaction has staged writes to, so a later ROLLBACK TO reverts staged
+/// value/TTL AND graph state on all of them to exactly here. A missing/short
+/// payload means empty journals → `(0, 0)`. With no vShard staged yet the
+/// marker map is empty.
 pub async fn run_savepoint(
     sessions: &SessionStore,
     addr: &SocketAddr,
@@ -100,21 +98,21 @@ pub async fn run_savepoint(
     name: &str,
 ) -> Result<(), SavepointError> {
     require_active_txn(sessions, addr)?;
-    let (value_marker, graph_marker) = match sessions.tx_id(addr) {
-        Some(txn_id) => {
+    let (txn_id, vshards) = sessions.txn_identity(addr);
+    let mut markers: BTreeMap<VShardId, (usize, usize)> = BTreeMap::new();
+    if let Some(txn_id) = txn_id {
+        for vshard_id in vshards {
             let payload = dispatch_overlay_savepoint(
-                sessions,
-                addr,
                 tenant_id,
+                vshard_id,
                 dp,
                 MetaOp::MarkSavepoint { txn_id },
             )
             .await;
-            decode_markers(payload)
+            markers.insert(vshard_id, decode_markers(payload));
         }
-        None => (0, 0),
-    };
-    sessions.create_savepoint(addr, name.to_string(), value_marker, graph_marker);
+    }
+    sessions.create_savepoint(addr, name.to_string(), markers);
     Ok(())
 }
 
@@ -139,7 +137,12 @@ pub fn run_release_savepoint(
 /// Handle ROLLBACK TO SAVEPOINT `<name>`.
 ///
 /// Truncates the write buffer to the saved position and rewinds BOTH the
-/// value/TTL overlay and the graph overlay to the marked journal points.
+/// value/TTL overlay and the graph overlay on every vShard the transaction has
+/// staged to. Iterates the CURRENT staged set (a superset of the savepoint's,
+/// since writes may have staged to NEW vShards after the savepoint): a vShard
+/// with a saved marker rewinds to it; a vShard first staged AFTER the savepoint
+/// has no saved marker and rewinds to `(0, 0)`, dropping ALL of its staged
+/// writes.
 pub async fn run_rollback_to_savepoint(
     sessions: &SessionStore,
     addr: &SocketAddr,
@@ -148,25 +151,28 @@ pub async fn run_rollback_to_savepoint(
     name: &str,
 ) -> Result<(), SavepointError> {
     require_active_txn(sessions, addr)?;
-    let (value_marker, graph_marker) =
+    let markers =
         sessions
             .rollback_to_savepoint(addr, name)
             .map_err(|e| SavepointError::NotFound {
                 message: e.to_string(),
             })?;
-    if let Some(txn_id) = sessions.tx_id(addr) {
-        dispatch_overlay_savepoint(
-            sessions,
-            addr,
-            tenant_id,
-            dp,
-            MetaOp::RollbackToSavepoint {
-                txn_id,
-                value_marker: value_marker as u64,
-                graph_marker: graph_marker as u64,
-            },
-        )
-        .await;
+    let (txn_id, vshards) = sessions.txn_identity(addr);
+    if let Some(txn_id) = txn_id {
+        for vshard_id in vshards {
+            let (value_marker, graph_marker) = markers.get(&vshard_id).copied().unwrap_or((0, 0));
+            dispatch_overlay_savepoint(
+                tenant_id,
+                vshard_id,
+                dp,
+                MetaOp::RollbackToSavepoint {
+                    txn_id,
+                    value_marker: value_marker as u64,
+                    graph_marker: graph_marker as u64,
+                },
+            )
+            .await;
+        }
     }
     Ok(())
 }

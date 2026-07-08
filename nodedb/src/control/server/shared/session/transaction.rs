@@ -2,6 +2,7 @@
 
 //! Transaction lifecycle methods on SessionStore.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,7 +10,7 @@ use crate::types::{Lsn, TxnId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::read_set::ReadSetEntry;
-use super::state::TransactionState;
+use super::state::{SavepointEntry, TransactionState};
 use super::store::SessionStore;
 
 /// Global monotonic counter minting `TxnId`s across all sessions on this
@@ -44,7 +45,7 @@ impl SessionStore {
                 session.tx_snapshot_epoch = Some(snapshot_epoch);
                 session.tx_read_set.clear();
                 session.tx_id = Some(TxnId::new(NEXT_TXN_ID.fetch_add(1, Ordering::Relaxed)));
-                session.tx_vshard = None;
+                session.tx_vshards.clear();
                 Ok(())
             }
             TransactionState::InBlock => {
@@ -92,12 +93,15 @@ impl SessionStore {
         self.read_session(addr, |s| s.tx_id).flatten()
     }
 
-    /// Snapshot the current transaction's overlay identity (id + homing vShard)
-    /// WITHOUT clearing it. Called before `rollback()` releases session state so
-    /// the caller can dispatch `MetaOp::DropTxnOverlay` to the right vShard.
-    pub fn txn_identity(&self, addr: &SocketAddr) -> (Option<TxnId>, Option<VShardId>) {
-        self.read_session(addr, |s| (s.tx_id, s.tx_vshard))
-            .unwrap_or((None, None))
+    /// Snapshot the current transaction's overlay identity (id + the SET of
+    /// vShards it has staged writes to) WITHOUT clearing it. Called before
+    /// `rollback()` releases session state so the caller can dispatch
+    /// `MetaOp::DropTxnOverlay` to EVERY vShard hosting a staging overlay, and by
+    /// savepoint mark/rewind to fan the overlay meta-op over all staged vShards.
+    /// The returned Vec is empty when no write has staged yet.
+    pub fn txn_identity(&self, addr: &SocketAddr) -> (Option<TxnId>, Vec<VShardId>) {
+        self.read_session(addr, |s| (s.tx_id, s.tx_vshards.iter().copied().collect()))
+            .unwrap_or((None, Vec::new()))
     }
 
     /// Collect a value from each buffered write task's plan. Used at commit to
@@ -137,7 +141,7 @@ impl SessionStore {
             session.tx_snapshot_lsn = None;
             session.tx_snapshot_epoch = None;
             session.tx_id = None;
-            session.tx_vshard = None;
+            session.tx_vshards.clear();
             session.savepoints.clear();
             // Note: pending_sequence_reservations are taken separately via
             // take_pending_reservations() so the caller can finalize them
@@ -203,9 +207,7 @@ impl SessionStore {
         self.write_session(addr, |session| {
             if session.tx_state == TransactionState::InBlock {
                 task.txn_id = session.tx_id;
-                if session.tx_vshard.is_none() {
-                    session.tx_vshard = Some(task.vshard_id);
-                }
+                session.tx_vshards.insert(task.vshard_id);
                 session.tx_buffer.push(task);
                 true
             } else {
@@ -228,7 +230,7 @@ impl SessionStore {
                 session.tx_snapshot_lsn = None;
                 session.tx_snapshot_epoch = None;
                 session.tx_id = None;
-                session.tx_vshard = None;
+                session.tx_vshards.clear();
                 session.tx_read_set.clear();
                 session.savepoints.clear();
                 session.pending_offset_commits.clear();
@@ -249,22 +251,23 @@ impl SessionStore {
 
     /// Create a savepoint at the current tx_buffer position.
     ///
-    /// `value_marker` / `graph_marker` are the Data-Plane value/TTL and GRAPH
-    /// overlay undo-journal lengths captured on the transaction's home vShard
-    /// (via `MetaOp::MarkSavepoint`), so a later ROLLBACK TO can rewind both
-    /// staging overlays to exactly this point.
+    /// `markers` maps each vShard that had staged writes at savepoint time to its
+    /// Data-Plane value/TTL and GRAPH overlay undo-journal lengths (captured via
+    /// `MetaOp::MarkSavepoint`), so a later ROLLBACK TO can rewind every staging
+    /// overlay to exactly this point.
     pub fn create_savepoint(
         &self,
         addr: &SocketAddr,
         name: String,
-        value_marker: usize,
-        graph_marker: usize,
+        markers: BTreeMap<VShardId, (usize, usize)>,
     ) {
         self.write_session(addr, |session| {
-            let pos = session.tx_buffer.len();
-            session
-                .savepoints
-                .push((name, pos, value_marker, graph_marker));
+            let buffer_len = session.tx_buffer.len();
+            session.savepoints.push(SavepointEntry {
+                name,
+                buffer_len,
+                markers,
+            });
         });
     }
 
@@ -276,7 +279,7 @@ impl SessionStore {
             let pos = session
                 .savepoints
                 .iter()
-                .rposition(|(n, _, _, _)| n == name)
+                .rposition(|e| e.name == name)
                 .ok_or_else(|| crate::Error::BadRequest {
                     detail: format!("savepoint \"{name}\" does not exist"),
                 })?;
@@ -291,29 +294,30 @@ impl SessionStore {
     }
 
     /// Rollback to a savepoint: truncate tx_buffer to the saved position and
-    /// return the `(value_marker, graph_marker)` overlay journal markers the
-    /// caller must rewind the two Data-Plane staging overlays to.
+    /// return the per-vShard `(value_marker, graph_marker)` overlay journal
+    /// markers the caller must rewind each staged vShard's Data-Plane staging
+    /// overlays to. A vShard first staged AFTER the savepoint is absent from the
+    /// returned map; the caller rewinds it to `(0, 0)`.
     ///
     /// Returns `Err` if the savepoint does not exist (matches PostgreSQL behavior).
     pub fn rollback_to_savepoint(
         &self,
         addr: &SocketAddr,
         name: &str,
-    ) -> crate::Result<(usize, usize)> {
+    ) -> crate::Result<BTreeMap<VShardId, (usize, usize)>> {
         self.write_session(addr, |session| {
             let pos = session
                 .savepoints
                 .iter()
-                .rposition(|(n, _, _, _)| n == name)
+                .rposition(|e| e.name == name)
                 .ok_or_else(|| crate::Error::BadRequest {
                     detail: format!("savepoint \"{name}\" does not exist"),
                 })?;
-            let buffer_pos = session.savepoints[pos].1;
-            let value_marker = session.savepoints[pos].2;
-            let graph_marker = session.savepoints[pos].3;
-            session.tx_buffer.truncate(buffer_pos);
+            let buffer_len = session.savepoints[pos].buffer_len;
+            let markers = session.savepoints[pos].markers.clone();
+            session.tx_buffer.truncate(buffer_len);
             session.savepoints.truncate(pos + 1);
-            Ok((value_marker, graph_marker))
+            Ok(markers)
         })
         .unwrap_or_else(|| {
             Err(crate::Error::BadRequest {

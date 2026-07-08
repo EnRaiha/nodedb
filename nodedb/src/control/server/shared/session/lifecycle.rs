@@ -58,8 +58,9 @@ pub async fn run_rollback(
 ) {
     ddl_buffer::discard();
     // Snapshot the overlay identity BEFORE `rollback()` clears session state,
-    // so the staging overlay can be released on its home vShard.
-    let (overlay_txn_id, overlay_vshard) = sessions.txn_identity(addr);
+    // so the staging overlay can be released on EVERY vShard the transaction
+    // staged writes to (a transaction may span multiple cores).
+    let (overlay_txn_id, overlay_vshards) = sessions.txn_identity(addr);
     let reservations = sessions.rollback(addr).unwrap_or_default();
     for handle in &reservations {
         let key = &handle.sequence_key;
@@ -87,8 +88,11 @@ pub async fn run_rollback(
     // Discard NOTIFY messages buffered during this transaction.
     sessions.discard_pending_notifies(addr);
 
-    // Release any staging overlay populated by statement-time point writes.
-    if let (Some(txn_id), Some(vshard_id)) = (overlay_txn_id, overlay_vshard) {
-        drop_txn_overlay(dp, identity.tenant_id, vshard_id, txn_id).await;
+    // Release any staging overlay populated by statement-time point writes on
+    // every vShard the transaction staged to, so no core's overlay leaks.
+    if let Some(txn_id) = overlay_txn_id {
+        for vshard_id in overlay_vshards {
+            drop_txn_overlay(dp, identity.tenant_id, vshard_id, txn_id).await;
+        }
     }
 }

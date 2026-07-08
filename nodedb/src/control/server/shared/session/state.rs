@@ -2,10 +2,27 @@
 
 //! Per-connection session state types.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::types::{DatabaseId, Lsn, TenantId, TxnId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
+
+/// One entry on the transaction's savepoint stack.
+///
+/// A savepoint captures the write buffer length AND, for each vShard that had
+/// staged writes when the savepoint was established, that vShard's value/TTL and
+/// graph overlay undo-journal markers. On ROLLBACK TO, the buffer is truncated
+/// to `buffer_len` and every currently-staged vShard's overlays are rewound —
+/// to its saved marker if present, else to `(0, 0)` (a vShard first staged
+/// AFTER the savepoint must have ALL of its staged writes rewound).
+pub struct SavepointEntry {
+    /// User-visible savepoint name.
+    pub name: String,
+    /// `tx_buffer` length captured when the savepoint was established.
+    pub buffer_len: usize,
+    /// Per-vShard `(value_marker, graph_marker)` overlay journal markers.
+    pub markers: BTreeMap<VShardId, (usize, usize)>,
+}
 
 /// PostgreSQL transaction state for ReadyForQuery status byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,23 +90,23 @@ pub struct ConnSession {
     /// and cleared on `COMMIT`/`ROLLBACK`. Keys the per-transaction staging
     /// overlay. `None` outside a transaction block.
     pub tx_id: Option<TxnId>,
-    /// vShard this transaction's staged writes were homed on, captured on the
-    /// first staged/buffered write. Under the single-vshard-per-transaction
-    /// assumption, this is where the staging overlay lives — used to target
-    /// `MetaOp::DropTxnOverlay` at COMMIT/ROLLBACK. `None` until the first write.
-    pub tx_vshard: Option<VShardId>,
+    /// Set of vShards this transaction has staged writes to, recorded on every
+    /// staged/buffered write. A transaction can stage to multiple vShards/cores
+    /// (e.g. two INSERTs to collections homed on different cores), so overlay
+    /// teardown (`MetaOp::DropTxnOverlay` at ROLLBACK) and per-vShard savepoint
+    /// mark/rewind must fan over ALL of them. Ordered (BTree) for deterministic
+    /// teardown. Empty until the first staged write.
+    pub tx_vshards: BTreeSet<VShardId>,
     /// Read-set: LSN-versioned, predicate-aware entries for write conflict
     /// detection, captured on the shared read seam by every transport. At
     /// COMMIT, each entry is checked — if the entry's collection has a current
     /// write-LSN past `read_lsn`, a concurrent write occurred and the
     /// transaction is rejected with SERIALIZATION_FAILURE.
     pub tx_read_set: Vec<super::read_set::ReadSetEntry>,
-    /// Savepoint stack: each entry is `(name, tx_buffer_len_at_savepoint,
-    /// value_overlay_marker, graph_overlay_marker)`.
-    /// On ROLLBACK TO, truncate tx_buffer to the saved length AND rewind both
-    /// Data-Plane staging overlays (value/TTL and GRAPH) to their saved
-    /// journal markers.
-    pub savepoints: Vec<(String, usize, usize, usize)>,
+    /// Savepoint stack. On ROLLBACK TO, truncate tx_buffer to the saved length
+    /// AND rewind each staged vShard's two Data-Plane staging overlays (value/TTL
+    /// and GRAPH) to their saved journal markers. See [`SavepointEntry`].
+    pub savepoints: Vec<SavepointEntry>,
     /// Pending consumer offset commits deferred until COMMIT.
     /// Each entry: (tenant_id, stream_name, group_name, partition_id, lsn).
     /// Flushed atomically on COMMIT, discarded on ROLLBACK.
@@ -159,7 +176,7 @@ impl ConnSession {
             tx_snapshot_lsn: None,
             tx_snapshot_epoch: None,
             tx_id: None,
-            tx_vshard: None,
+            tx_vshards: BTreeSet::new(),
             tx_read_set: Vec::new(),
             savepoints: Vec::new(),
             pending_offset_commits: Vec::new(),

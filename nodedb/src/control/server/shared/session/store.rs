@@ -164,7 +164,7 @@ impl SessionStore {
             session.tx_snapshot_lsn = None;
             session.tx_snapshot_epoch = None;
             session.tx_id = None;
-            session.tx_vshard = None;
+            session.tx_vshards.clear();
             session.tx_read_set.clear();
             session.savepoints.clear();
             session.pending_offset_commits.clear();
