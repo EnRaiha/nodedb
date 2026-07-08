@@ -189,7 +189,10 @@ async fn dispatch_single_shard(
         }
     }
 
-    if !sub_records.is_empty() {
+    // The single transaction WAL record's LSN is stamped onto the batch
+    // dispatch below so the Data Plane records the committed write version for
+    // every key in the batch. `None` when the batch has no durable writes.
+    let wal_lsn = if !sub_records.is_empty() {
         let tx_payload = match zerompk::to_msgpack_vec(&sub_records) {
             Ok(p) => p,
             Err(e) => {
@@ -198,17 +201,22 @@ async fn dispatch_single_shard(
                 }));
             }
         };
-        if let Err(e) = state.wal.append_transaction(
+        match state.wal.append_transaction(
             tenant_id,
             vshard_id,
             crate::types::DatabaseId::DEFAULT,
             &tx_payload,
         ) {
-            return Some(AbortReason::Dispatch(crate::Error::Internal {
-                detail: format!("transaction WAL append failed: {e}"),
-            }));
+            Ok(lsn) => Some(lsn),
+            Err(e) => {
+                return Some(AbortReason::Dispatch(crate::Error::Internal {
+                    detail: format!("transaction WAL append failed: {e}"),
+                }));
+            }
         }
-    }
+    } else {
+        None
+    };
 
     let plans: Vec<PhysicalPlan> = buffered.iter().map(|t| t.plan.clone()).collect();
     let batch_task = PhysicalTask {
@@ -219,7 +227,7 @@ async fn dispatch_single_shard(
         post_set_op: PostSetOp::None,
         txn_id: None,
     };
-    classify_batch_dispatch(dp.dispatch_no_wal(batch_task).await)
+    classify_batch_dispatch(dp.dispatch_no_wal(batch_task, wal_lsn).await)
 }
 
 /// Convert a transaction-batch dispatch result into a commit abort reason, if
@@ -301,7 +309,8 @@ pub(super) async fn drop_txn_overlay(
         post_set_op: PostSetOp::None,
         txn_id: None,
     };
-    if let Err(e) = dp.dispatch_no_wal(task).await {
+    // Overlay teardown is not a write — no WAL record, no write version.
+    if let Err(e) = dp.dispatch_no_wal(task, None).await {
         tracing::warn!(error = %e, "failed to drop per-transaction staging overlay");
     }
 }

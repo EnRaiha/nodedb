@@ -169,6 +169,7 @@ fn critical_check_engine_pressure_increments_metric() {
         user_id: None,
         statement_digest: None,
         txn_id: None,
+        wal_lsn: None,
     });
 
     let result = core.check_engine_pressure(&task, EngineId::Vector);
@@ -236,6 +237,7 @@ fn emergency_pressure_suspends_reads_and_increments_metric() {
         user_id: None,
         statement_digest: None,
         txn_id: None,
+        wal_lsn: None,
     });
 
     let result = core.check_engine_pressure(&task, EngineId::Vector);

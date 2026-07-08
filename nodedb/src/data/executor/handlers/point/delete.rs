@@ -53,6 +53,13 @@ impl CoreLoop {
 
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
+        // Record the committed delete's version against its surrogate +
+        // collection, but only when a row was actually removed — a delete that
+        // matched nothing changes no state and creates no OCC conflict.
+        if prior.is_some() {
+            self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+        }
+
         // Emit delete event to Event Plane if the row actually existed.
         // `apply_point_delete` returns the prior bytes — we thread them
         // through so CDC/trigger consumers see the pre-delete state as

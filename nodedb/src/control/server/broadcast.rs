@@ -128,6 +128,7 @@ pub async fn broadcast_count_to_all_cores(
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            wal_lsn: None,
         };
 
         let rx = shared.tracker.register(request_id);
@@ -235,6 +236,7 @@ pub async fn broadcast_register_to_all_cores(
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            wal_lsn: None,
         };
 
         let rx = shared.tracker.register(request_id);

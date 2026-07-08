@@ -237,22 +237,28 @@ pub(super) async fn dispatch_plan(
     vshard_id: crate::types::VShardId,
     plan: crate::bridge::envelope::PhysicalPlan,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
-    if let Err(e) = crate::control::server::wal_dispatch::wal_append_if_write(
+    let wal_lsn = match crate::control::server::wal_dispatch::wal_append_if_write(
         &state.wal,
         tenant_id,
         vshard_id,
         crate::types::DatabaseId::DEFAULT,
         &plan,
     ) {
-        return Some(Err(ddl_err("XX000", e.to_string())));
-    }
-    if let Err(e) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+        Ok(lsn) => lsn,
+        Err(e) => return Some(Err(ddl_err("XX000", e.to_string()))),
+    };
+    if let Err(e) = crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
         state,
-        tenant_id,
-        crate::types::DatabaseId::DEFAULT,
-        vshard_id,
-        plan,
-        TraceId::ZERO,
+        crate::control::server::dispatch_utils::WriteDispatch {
+            tenant_id,
+            database_id: crate::types::DatabaseId::DEFAULT,
+            vshard_id,
+            plan,
+            trace_id: TraceId::ZERO,
+            event_source: crate::event::EventSource::User,
+            txn_id: None,
+            wal_lsn,
+        },
     )
     .await
     {
@@ -426,7 +432,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
 
         // Not in a transaction block (or a read): reproduce today's
         // immediate autocommit path exactly — WAL append then dispatch.
-        crate::control::server::wal_dispatch::wal_append_if_write(
+        let wal_lsn = crate::control::server::wal_dispatch::wal_append_if_write(
             &state.wal,
             tenant_id,
             task_vshard_id,
@@ -434,13 +440,18 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             &task.plan,
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
-        let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+        let response = crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
             state,
-            tenant_id,
-            task_database_id,
-            task_vshard_id,
-            task.plan,
-            TraceId::ZERO,
+            crate::control::server::dispatch_utils::WriteDispatch {
+                tenant_id,
+                database_id: task_database_id,
+                vshard_id: task_vshard_id,
+                plan: task.plan,
+                trace_id: TraceId::ZERO,
+                event_source: crate::event::EventSource::User,
+                txn_id: None,
+                wal_lsn,
+            },
         )
         .await
         .map_err(|e| ddl_err("XX000", e.to_string()))?;

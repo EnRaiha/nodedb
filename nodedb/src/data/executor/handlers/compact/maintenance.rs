@@ -136,6 +136,10 @@ impl CoreLoop {
             return !flush_plan.is_empty();
         }
         self.last_maintenance = Some(now);
+        // Horizon-GC the per-core last-write-LSN version index: evict entries
+        // far below the watermark and enforce the entry-count backstop. Rides
+        // the compaction interval — no dedicated timer.
+        self.gc_write_index();
         self.run_compaction(false);
         true
     }

@@ -349,6 +349,7 @@ impl SharedState {
             dml_counter:
                 crate::control::server::shared::ddl::neutral::maintenance::auto_analyze::DmlCounter::new(),
             wal_catchup_lsn: AtomicU64::new(0),
+            last_applied_calvin_epoch: Arc::new(AtomicU64::new(0)),
             presence: Arc::new(tokio::sync::RwLock::new(
                 crate::control::server::sync::presence::PresenceManager::new(
                     crate::control::server::sync::presence::PresenceConfig::default(),

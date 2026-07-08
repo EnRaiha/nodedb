@@ -85,6 +85,7 @@ pub(crate) fn eager_dispatch_to_all_cores(
             user_id: None,
             statement_digest: None,
             txn_id,
+            wal_lsn: None,
         };
 
         let rx = state.tracker.register(request_id);

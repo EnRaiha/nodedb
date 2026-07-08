@@ -123,6 +123,7 @@ pub(crate) async fn dispatch_async_response_with_source(
         user_id: None,
         statement_digest: None,
         txn_id: None,
+        wal_lsn: None,
     };
 
     let mut rx = state.tracker.register(request_id);

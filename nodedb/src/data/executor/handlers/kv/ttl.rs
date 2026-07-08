@@ -32,6 +32,7 @@ impl CoreLoop {
             .kv_engine
             .expire(did, tid, collection, key, ttl_ms, now_ms)
         {
+            self.note_kv_write_lsn(task, did, tid, collection, key);
             self.response_ok(task)
         } else {
             self.response_error(task, ErrorCode::NotFound)
@@ -48,6 +49,7 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, %collection, "kv persist");
         if self.kv_engine.persist(did, tid, collection, key) {
+            self.note_kv_write_lsn(task, did, tid, collection, key);
             self.response_ok(task)
         } else {
             self.response_error(task, ErrorCode::NotFound)

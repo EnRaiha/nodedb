@@ -369,6 +369,12 @@ pub struct SharedState {
         crate::control::server::shared::ddl::neutral::maintenance::auto_analyze::DmlCounter,
     /// Highest WAL LSN confirmed delivered to Data Plane for timeseries catch-up.
     pub wal_catchup_lsn: AtomicU64,
+    /// Last globally-applied Calvin epoch, advanced by the per-vShard
+    /// deterministic schedulers as they apply epochs. Read at `BEGIN` to anchor
+    /// a session's cross-shard snapshot version (`tx_snapshot_epoch`). `Arc` so
+    /// the schedulers (which hold `Arc<SharedState>`) advance the same counter
+    /// the session reads. 0 in single-node / no-Calvin deployments.
+    pub last_applied_calvin_epoch: Arc<AtomicU64>,
     /// Presence/Awareness manager: ephemeral user state broadcast channels.
     pub presence: Arc<tokio::sync::RwLock<crate::control::server::sync::presence::PresenceManager>>,
     /// Permission tree cache: in-memory resource hierarchy + permission grants.

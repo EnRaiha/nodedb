@@ -463,6 +463,11 @@ impl CoreLoop {
         self.checkpoint_coordinator
             .mark_dirty("columnar", accepted as usize);
 
+        // Advance the collection floor for this committed columnar write.
+        if accepted > 0 {
+            self.note_collection_write_lsn(task, collection);
+        }
+
         // On the sync path, advance the HWM and return SyncAckResult payload.
         if let Some(prov) = provenance {
             self.sync_commit(prov);

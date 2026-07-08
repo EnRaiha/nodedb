@@ -33,6 +33,7 @@ pub fn dispatch_maintenance_to_all_cores(state: &SharedState, tenant_id: TenantI
         user_id: None,
         statement_digest: None,
         txn_id: None,
+        wal_lsn: None,
     };
 
     match state.dispatcher.lock() {

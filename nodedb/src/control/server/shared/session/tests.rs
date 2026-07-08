@@ -13,13 +13,13 @@ fn transaction_lifecycle() {
 
     assert_eq!(store.transaction_state(&addr), TransactionState::Idle);
 
-    store.begin(&addr, crate::types::Lsn::new(1)).unwrap();
+    store.begin(&addr, crate::types::Lsn::new(1), 0).unwrap();
     assert_eq!(store.transaction_state(&addr), TransactionState::InBlock);
 
     store.commit(&addr).unwrap();
     assert_eq!(store.transaction_state(&addr), TransactionState::Idle);
 
-    store.begin(&addr, crate::types::Lsn::new(1)).unwrap();
+    store.begin(&addr, crate::types::Lsn::new(1), 0).unwrap();
     store.fail_transaction(&addr);
     assert_eq!(store.transaction_state(&addr), TransactionState::Failed);
 
@@ -146,4 +146,38 @@ fn live_subscription_no_session_returns_empty() {
     let notifications = store.drain_live_notifications(&addr);
     assert!(notifications.is_empty());
     assert!(!store.has_live_subscriptions(&addr));
+}
+
+/// `run_begin` anchors the session's cross-shard snapshot to the last
+/// globally-applied Calvin epoch from `SharedState::last_applied_calvin_epoch`.
+#[tokio::test]
+async fn run_begin_anchors_snapshot_epoch() {
+    use std::sync::atomic::Ordering;
+
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::server::shared::session::lifecycle::run_begin;
+    use crate::control::state::SharedState;
+    use crate::wal::WalManager;
+
+    let dir = tempfile::tempdir().unwrap();
+    let wal =
+        std::sync::Arc::new(WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap());
+    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+    let state = SharedState::new(dispatcher, wal).unwrap();
+
+    let store = SessionStore::new();
+    let addr: std::net::SocketAddr = "127.0.0.1:5100".parse().unwrap();
+    store.ensure_session(addr);
+
+    // Seed the applied epoch to 7 and BEGIN — the session anchors to 7.
+    state.last_applied_calvin_epoch.store(7, Ordering::Release);
+    run_begin(&store, &addr, &state).unwrap();
+    assert_eq!(store.snapshot_epoch(&addr), Some(7));
+    store.commit(&addr).unwrap();
+    assert_eq!(store.snapshot_epoch(&addr), None);
+
+    // Unset (single-node / no-Calvin): BEGIN anchors to 0.
+    state.last_applied_calvin_epoch.store(0, Ordering::Release);
+    run_begin(&store, &addr, &state).unwrap();
+    assert_eq!(store.snapshot_epoch(&addr), Some(0));
 }

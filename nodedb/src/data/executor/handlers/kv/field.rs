@@ -102,6 +102,7 @@ impl CoreLoop {
             now_ms,
             surrogate,
         });
+        self.note_kv_write_lsn(task, did, tid, collection, key);
         match response_codec::encode_json(
             &serde_json::json!({ "fields_added": computed.fields_added }),
         ) {

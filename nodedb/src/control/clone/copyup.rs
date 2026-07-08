@@ -95,6 +95,7 @@ pub async fn perform_kv_clone_copyup(params: KvCopyUpParams<'_>) -> crate::Resul
         user_id: None,
         statement_digest: None,
         txn_id: None,
+        wal_lsn: None,
     };
 
     let mut rx = state.tracker.register(req_id);
@@ -248,6 +249,7 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
         user_id: None,
         statement_digest: None,
         txn_id: None,
+        wal_lsn: None,
     };
 
     let mut rx = state.tracker.register(req_id);

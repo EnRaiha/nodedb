@@ -140,6 +140,17 @@ pub struct Request {
     /// keys the per-transaction staging overlay. `None` for autocommit /
     /// non-transactional / system requests.
     pub txn_id: Option<TxnId>,
+
+    /// WAL LSN the Control Plane allocated for this write at wal-dispatch time.
+    /// The committed write-LSN is part of the cross-plane write contract: the
+    /// Data Plane copies it onto the [`ExecutionTask`] so the apply chokepoint
+    /// records the per-key / per-collection write version (see
+    /// `data::executor::core_loop::write_index`). `None` for reads, control
+    /// ops, and writes whose LSN is not (yet) threaded — the version index is
+    /// skipped rather than advanced with a wrong value.
+    ///
+    /// [`ExecutionTask`]: crate::data::executor::task::ExecutionTask
+    pub wal_lsn: Option<Lsn>,
 }
 
 /// Response envelope: Data Plane -> Control Plane.
@@ -379,6 +390,7 @@ mod tests {
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            wal_lsn: None,
         }
     }
 
@@ -447,6 +459,7 @@ mod tests {
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            wal_lsn: None,
         };
         match req.plan {
             PhysicalPlan::Meta(MetaOp::Cancel { target_request_id }) => {

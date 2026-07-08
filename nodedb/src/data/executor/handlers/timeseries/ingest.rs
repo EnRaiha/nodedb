@@ -175,6 +175,11 @@ impl CoreLoop {
             return self.sync_ack_response(task, AckStatus::Applied, applied_seq);
         }
 
+        // Advance the collection floor for this committed timeseries write.
+        if ingest_response.status == Status::Ok {
+            self.note_collection_write_lsn(task, collection);
+        }
+
         // Either no provenance, or ingest failed on the Apply path — surface
         // the response as-is; the HWM is NOT advanced (record not applied).
         ingest_response

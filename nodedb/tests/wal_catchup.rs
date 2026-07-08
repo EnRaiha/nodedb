@@ -536,6 +536,7 @@ fn startup_replay_recovers_all_wal_data() {
                 user_id: None,
                 statement_digest: None,
                 txn_id: None,
+                wal_lsn: None,
             },
         })
         .unwrap();

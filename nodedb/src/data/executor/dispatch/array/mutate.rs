@@ -54,6 +54,18 @@ impl CoreLoop {
                 },
             );
         }
+        // Advance the collection floor for this committed array write. The
+        // Control Plane allocated `wal_lsn` from the central WAL writer, so it
+        // is the committed write LSN in the same space as the core watermark.
+        if wal_lsn > 0 {
+            self.note_write_lsn(
+                task.request.database_id,
+                task.request.tenant_id,
+                &array_id.name,
+                None,
+                crate::types::Lsn::new(wal_lsn),
+            );
+        }
         // Advance HWM after durable write so the producer's array stream
         // frontier is tracked and reconstructable on replay.
         if let Some(prov) = provenance {
@@ -102,6 +114,17 @@ impl CoreLoop {
                 ErrorCode::Internal {
                     detail: format!("array delete: {e}"),
                 },
+            );
+        }
+        // Advance the collection floor for this committed array delete (see
+        // `handle_array_put` for why `wal_lsn` is the committed write LSN).
+        if wal_lsn > 0 {
+            self.note_write_lsn(
+                task.request.database_id,
+                task.request.tenant_id,
+                &array_id.name,
+                None,
+                crate::types::Lsn::new(wal_lsn),
             );
         }
         if let Some(prov) = provenance {
@@ -230,6 +253,7 @@ mod tests {
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            wal_lsn: None,
         }
     }
 

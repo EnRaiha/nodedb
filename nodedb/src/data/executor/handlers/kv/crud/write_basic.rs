@@ -67,6 +67,7 @@ impl CoreLoop {
         };
         self.emit_write_event(task, collection, op, &key_str, Some(value), old_slice);
 
+        self.note_kv_write_lsn(task, did, tid, collection, key);
         self.response_ok(task)
     }
 
@@ -147,6 +148,7 @@ impl CoreLoop {
             None,
         );
 
+        self.note_kv_write_lsn(task, did, tid, collection, key);
         self.response_ok(task)
     }
 
@@ -211,6 +213,30 @@ impl CoreLoop {
             None,
         );
 
+        self.note_kv_write_lsn(task, did, tid, collection, key);
         self.response_ok(task)
+    }
+
+    /// Record a committed KV point write's version, keyed by the raw KV key
+    /// bytes, if a WAL LSN was threaded onto the task. Shared by every KV write
+    /// chokepoint (basic put/delete, atomic ops, batch, field, TTL).
+    pub(in crate::data::executor) fn note_kv_write_lsn(
+        &mut self,
+        task: &ExecutionTask,
+        did: u64,
+        tid: u64,
+        collection: &str,
+        key: &[u8],
+    ) {
+        let Some(lsn) = task.wal_lsn() else {
+            return;
+        };
+        self.note_write_lsn(
+            crate::types::DatabaseId::new(did),
+            crate::types::TenantId::new(tid),
+            collection,
+            Some(crate::data::executor::core_loop::write_index::KeyRepr::KvKey(Box::from(key))),
+            lsn,
+        );
     }
 }

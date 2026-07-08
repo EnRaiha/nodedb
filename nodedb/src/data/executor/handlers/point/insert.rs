@@ -126,6 +126,8 @@ impl CoreLoop {
 
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
+        self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+
         // Implicit graph-edge extraction now lives on the Control Plane
         // (`control/planner/implicit_edges/`): a `_from`/`_to` document is
         // mirrored as a `GraphOp::EdgePut` task BEFORE dispatch, so the edge is

@@ -151,6 +151,7 @@ pub(super) async fn dispatch_data_plane_raw(
         user_id: None,
         statement_digest: None,
         txn_id: None,
+        wal_lsn: None,
     };
     let mut rx = state.tracker.register(req_id);
     match state.dispatcher.lock() {

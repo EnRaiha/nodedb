@@ -79,7 +79,7 @@ impl<'a> StatementExecutor<'a> {
             }
         } else {
             for task in tasks {
-                crate::control::server::wal_dispatch::wal_append_if_write(
+                let wal_lsn = crate::control::server::wal_dispatch::wal_append_if_write(
                     &self.state.wal,
                     task.tenant_id,
                     task.vshard_id,
@@ -87,14 +87,18 @@ impl<'a> StatementExecutor<'a> {
                     &task.plan,
                 )?;
 
-                crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
+                crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
                     self.state,
-                    task.tenant_id,
-                    task.database_id,
-                    task.vshard_id,
-                    task.plan,
-                    TraceId::ZERO,
-                    self.event_source,
+                    crate::control::server::dispatch_utils::WriteDispatch {
+                        tenant_id: task.tenant_id,
+                        database_id: task.database_id,
+                        vshard_id: task.vshard_id,
+                        plan: task.plan,
+                        trace_id: TraceId::ZERO,
+                        event_source: self.event_source,
+                        txn_id: None,
+                        wal_lsn,
+                    },
                 )
                 .await?;
             }
@@ -165,26 +169,37 @@ impl<'a> StatementExecutor<'a> {
             return Ok(());
         }
 
+        // Each task's WAL record has its own LSN; the batch dispatch below
+        // carries the highest so the Data Plane's write-version floor advances
+        // past every write it applies.
+        let mut max_wal_lsn: Option<crate::types::Lsn> = None;
         for task in &tasks {
-            crate::control::server::wal_dispatch::wal_append_if_write(
+            let lsn = crate::control::server::wal_dispatch::wal_append_if_write(
                 &self.state.wal,
                 task.tenant_id,
                 task.vshard_id,
                 task.database_id,
                 &task.plan,
             )?;
+            if let Some(lsn) = lsn {
+                max_wal_lsn = Some(max_wal_lsn.map_or(lsn, |cur| cur.max(lsn)));
+            }
         }
 
         if tasks.len() == 1 {
             if let Some(task) = tasks.into_iter().next() {
-                crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
+                crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
                     self.state,
-                    task.tenant_id,
-                    task.database_id,
-                    task.vshard_id,
-                    task.plan,
-                    TraceId::ZERO,
-                    self.event_source,
+                    crate::control::server::dispatch_utils::WriteDispatch {
+                        tenant_id: task.tenant_id,
+                        database_id: task.database_id,
+                        vshard_id: task.vshard_id,
+                        plan: task.plan,
+                        trace_id: TraceId::ZERO,
+                        event_source: self.event_source,
+                        txn_id: None,
+                        wal_lsn: max_wal_lsn,
+                    },
                 )
                 .await?;
             }
@@ -196,14 +211,18 @@ impl<'a> StatementExecutor<'a> {
             let batch_plan = crate::bridge::envelope::PhysicalPlan::Meta(
                 nodedb_physical::physical_plan::MetaOp::TransactionBatch { plans },
             );
-            crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
+            crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
                 self.state,
-                tenant_id,
-                database_id,
-                vshard_id,
-                batch_plan,
-                TraceId::ZERO,
-                self.event_source,
+                crate::control::server::dispatch_utils::WriteDispatch {
+                    tenant_id,
+                    database_id,
+                    vshard_id,
+                    plan: batch_plan,
+                    trace_id: TraceId::ZERO,
+                    event_source: self.event_source,
+                    txn_id: None,
+                    wal_lsn: max_wal_lsn,
+                },
             )
             .await?;
         }

@@ -57,7 +57,8 @@ async fn dispatch_overlay_savepoint(
         post_set_op: PostSetOp::None,
         txn_id: None,
     };
-    match dp.dispatch_no_wal(task).await {
+    // Savepoint overlay meta-ops are not writes — no WAL record, no version.
+    match dp.dispatch_no_wal(task, None).await {
         Ok(resp) => Some(resp.payload.to_vec()),
         Err(e) => {
             tracing::warn!(error = %e, "savepoint overlay meta-op dispatch failed");

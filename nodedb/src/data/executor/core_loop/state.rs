@@ -134,16 +134,11 @@ pub struct CoreLoop {
     /// vShards that are paused for write operations (during Phase 3 migration cutover).
     pub(in crate::data::executor) paused_vshards: std::collections::HashSet<crate::types::VShardId>,
 
-    /// Nodes that have been explicitly deleted via PointDelete cascade,
-    /// keyed per-tenant. Used for edge referential integrity —
-    /// `EdgePut` to a deleted node is rejected with
-    /// `RejectedDanglingEdge`. Cleared periodically or on compaction.
-    ///
-    /// Stored as `HashMap<TenantId, HashSet<UnscopedNodeName>>`: one
-    /// set per tenant, entries are raw user-visible names. This is the
-    /// last piece of state in `CoreLoop` that used to live as a flat
-    /// scoped-string tracker; it's now structurally tenant-partitioned
-    /// like every other graph concern.
+    /// Nodes explicitly deleted via PointDelete cascade, keyed per
+    /// `(database, tenant)`. Used for edge referential integrity — an
+    /// `EdgePut` to a deleted node is rejected with `RejectedDanglingEdge`.
+    /// Cleared periodically or on compaction. Entries are raw user-visible
+    /// node names, structurally tenant-partitioned like every graph concern.
     pub(in crate::data::executor) deleted_nodes:
         HashMap<(nodedb_types::DatabaseId, TenantId), std::collections::HashSet<String>>,
 
@@ -497,4 +492,8 @@ pub struct CoreLoop {
     /// drops still-empty entries (rollback) and leaves filled ones (commit).
     pub(in crate::data::executor) txn_created_columnar_engines:
         HashMap<crate::types::TxnId, std::collections::HashSet<(DatabaseId, TenantId, String)>>,
+
+    /// Per-core last-write-LSN version index (per key + per collection),
+    /// advanced by every committed write-apply. Type + GC in `write_index.rs`.
+    pub(in crate::data::executor) write_index: super::write_index::WriteVersionIndex,
 }

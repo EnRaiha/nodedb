@@ -68,6 +68,11 @@ impl CoreLoop {
             "transaction batch committed"
         );
 
+        // Record the per-key / per-collection write version for every sub-plan
+        // in the committed batch. Covers the fast-path commit AND every Calvin
+        // apply (both funnel through here); one batch WAL LSN for all keys.
+        self.record_batch_write_versions(task, tid, plans);
+
         self.emit_deferred_writes(task, undo_log);
 
         // Return the last sub-plan payload, but keyed to the outer transaction request.

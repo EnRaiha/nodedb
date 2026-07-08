@@ -26,13 +26,21 @@ impl SessionStore {
 
     /// BEGIN — enter transaction block with snapshot isolation.
     ///
-    /// Captures the current WAL LSN as the snapshot point. All reads
-    /// within this transaction see data as of this LSN.
-    pub fn begin(&self, addr: &SocketAddr, current_lsn: Lsn) -> Result<(), &'static str> {
+    /// Captures the current WAL LSN as the local snapshot point (single-shard
+    /// fast path) and the last globally-applied Calvin `snapshot_epoch` as the
+    /// cross-shard-valid version anchor. All reads within this transaction see
+    /// data as of this LSN.
+    pub fn begin(
+        &self,
+        addr: &SocketAddr,
+        current_lsn: Lsn,
+        snapshot_epoch: u64,
+    ) -> Result<(), &'static str> {
         self.write_session(addr, |session| match session.tx_state {
             TransactionState::Idle => {
                 session.tx_state = TransactionState::InBlock;
                 session.tx_snapshot_lsn = Some(current_lsn);
+                session.tx_snapshot_epoch = Some(snapshot_epoch);
                 session.tx_read_set.clear();
                 session.tx_id = Some(TxnId::new(NEXT_TXN_ID.fetch_add(1, Ordering::Relaxed)));
                 session.tx_vshard = None;
@@ -69,6 +77,11 @@ impl SessionStore {
     /// Get the snapshot LSN for the current transaction.
     pub fn snapshot_lsn(&self, addr: &SocketAddr) -> Option<Lsn> {
         self.read_session(addr, |s| s.tx_snapshot_lsn)?
+    }
+
+    /// Get the cross-shard snapshot epoch for the current transaction.
+    pub fn snapshot_epoch(&self, addr: &SocketAddr) -> Option<u64> {
+        self.read_session(addr, |s| s.tx_snapshot_epoch)?
     }
 
     /// Current transaction's overlay id, for stamping a `StageWrite` task
@@ -120,6 +133,7 @@ impl SessionStore {
             let buffer = std::mem::take(&mut session.tx_buffer);
             session.tx_state = TransactionState::Idle;
             session.tx_snapshot_lsn = None;
+            session.tx_snapshot_epoch = None;
             session.tx_id = None;
             session.tx_vshard = None;
             session.savepoints.clear();
@@ -210,6 +224,7 @@ impl SessionStore {
                 session.tx_buffer.clear();
                 session.tx_state = TransactionState::Idle;
                 session.tx_snapshot_lsn = None;
+                session.tx_snapshot_epoch = None;
                 session.tx_id = None;
                 session.tx_vshard = None;
                 session.tx_read_set.clear();

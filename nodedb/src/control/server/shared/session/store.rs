@@ -162,6 +162,7 @@ impl SessionStore {
             session.tx_state = TransactionState::Idle;
             session.tx_buffer.clear();
             session.tx_snapshot_lsn = None;
+            session.tx_snapshot_epoch = None;
             session.tx_id = None;
             session.tx_vshard = None;
             session.tx_read_set.clear();

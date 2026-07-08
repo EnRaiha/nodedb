@@ -52,21 +52,25 @@ pub(super) async fn dispatch_task_via_gateway(
         }
         None => {
             // Boot fallback: no gateway yet, dispatch locally.
-            wal_dispatch::wal_append_if_write(
+            let wal_lsn = wal_dispatch::wal_append_if_write(
                 &ctx.state.wal,
                 tenant_id,
                 vshard_id,
                 database_id,
                 &plan,
             )?;
-            dispatch_utils::dispatch_to_data_plane_with_txn(
+            dispatch_utils::dispatch_write_to_data_plane(
                 ctx.state,
-                tenant_id,
-                database_id,
-                vshard_id,
-                plan,
-                TraceId::ZERO,
-                txn_id,
+                dispatch_utils::WriteDispatch {
+                    tenant_id,
+                    database_id,
+                    vshard_id,
+                    plan,
+                    trace_id: TraceId::ZERO,
+                    event_source: crate::event::EventSource::User,
+                    txn_id,
+                    wal_lsn,
+                },
             )
             .await
         }

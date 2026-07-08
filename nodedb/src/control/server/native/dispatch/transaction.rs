@@ -43,6 +43,7 @@ impl TxnDataPlane for NativeTxnDp<'_> {
     fn dispatch_no_wal<'a>(
         &'a self,
         task: PhysicalTask,
+        wal_lsn: Option<Lsn>,
     ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
         let state = self.state;
         Box::pin(async move {
@@ -65,13 +66,18 @@ impl TxnDataPlane for NativeTxnDp<'_> {
                     })
                 }
                 None => {
-                    dispatch_utils::dispatch_to_data_plane(
+                    dispatch_utils::dispatch_write_to_data_plane(
                         state,
-                        task.tenant_id,
-                        task.database_id,
-                        task.vshard_id,
-                        task.plan,
-                        TraceId::ZERO,
+                        dispatch_utils::WriteDispatch {
+                            tenant_id: task.tenant_id,
+                            database_id: task.database_id,
+                            vshard_id: task.vshard_id,
+                            plan: task.plan,
+                            trace_id: TraceId::ZERO,
+                            event_source: crate::event::EventSource::User,
+                            txn_id: None,
+                            wal_lsn,
+                        },
                     )
                     .await
                 }

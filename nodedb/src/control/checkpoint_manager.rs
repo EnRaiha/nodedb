@@ -124,6 +124,7 @@ pub async fn run_checkpoint_cycle(
                 user_id: None,
                 statement_digest: None,
                 txn_id: None,
+                wal_lsn: None,
             };
 
             let rx = tracker.register(request_id);

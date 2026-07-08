@@ -100,6 +100,13 @@ impl CoreLoop {
             now_ms,
             surrogates,
         });
+        // One WAL record covers the whole batch; record every written key's
+        // version against that single LSN.
+        if task.wal_lsn().is_some() {
+            for (key, _) in entries {
+                self.note_kv_write_lsn(task, did, tid, collection, key);
+            }
+        }
         match response_codec::encode_count("inserted", new_count) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(

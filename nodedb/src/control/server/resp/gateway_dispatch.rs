@@ -73,7 +73,7 @@ pub(super) async fn dispatch_kv_write(
     plan: PhysicalPlan,
 ) -> crate::Result<Response> {
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &session.collection);
-    wal_dispatch::wal_append_if_write(
+    let wal_lsn = wal_dispatch::wal_append_if_write(
         &state.wal,
         session.tenant_id,
         vshard,
@@ -94,13 +94,18 @@ pub(super) async fn dispatch_kv_write(
                 })
                 .map(gateway_payloads_to_response)
         }
-        None => dispatch_utils::dispatch_to_data_plane(
+        None => dispatch_utils::dispatch_write_to_data_plane(
             state,
-            session.tenant_id,
-            DatabaseId::DEFAULT,
-            vshard,
-            plan,
-            TraceId::ZERO,
+            dispatch_utils::WriteDispatch {
+                tenant_id: session.tenant_id,
+                database_id: DatabaseId::DEFAULT,
+                vshard_id: vshard,
+                plan,
+                trace_id: TraceId::ZERO,
+                event_source: crate::event::EventSource::User,
+                txn_id: None,
+                wal_lsn,
+            },
         )
         .await
         .map_err(map_busy_error),

@@ -60,6 +60,8 @@ impl CoreLoop {
             .index_document(database_id, tenant_id, collection, surrogate, text)
         {
             Ok(()) => {
+                // Advance the collection floor for this committed FTS write.
+                self.note_collection_write_lsn(task, collection);
                 if let Some(prov) = provenance {
                     self.sync_commit(prov);
                     return self.sync_ack_response(task, AckStatus::Applied, prov.seq);
@@ -114,6 +116,8 @@ impl CoreLoop {
             .remove_document(database_id, tenant_id, collection, surrogate)
         {
             Ok(()) => {
+                // Advance the collection floor for this committed FTS delete.
+                self.note_collection_write_lsn(task, collection);
                 if let Some(prov) = provenance {
                     self.sync_commit(prov);
                     return self.sync_ack_response(task, AckStatus::Applied, prov.seq);

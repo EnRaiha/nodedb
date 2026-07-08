@@ -297,6 +297,7 @@ impl CoreLoop {
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            wal_lsn: None,
         }));
         if resp.status == Status::Error {
             return Err(resp.error_code.unwrap_or(ErrorCode::Internal {

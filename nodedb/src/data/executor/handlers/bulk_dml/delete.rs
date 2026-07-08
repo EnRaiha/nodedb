@@ -210,6 +210,12 @@ impl CoreLoop {
                     collection,
                     doc_id,
                 );
+                // Record the committed delete's write version against its
+                // surrogate + collection.
+                if let Some(surrogate) = crate::engine::document::store::doc_id_to_surrogate(doc_id)
+                {
+                    self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+                }
                 affected += 1;
                 if let Some(doc) = pre_delete_doc {
                     returned_docs.push(doc);

@@ -232,6 +232,7 @@ mod tests {
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            wal_lsn: None,
         })
     }
 
@@ -415,6 +416,7 @@ mod tests {
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            wal_lsn: None,
         };
         tx.try_push(BridgeRequest { inner: req }).unwrap();
         // Set suspend flag.
@@ -456,6 +458,7 @@ mod tests {
                 user_id: None,
                 statement_digest: None,
                 txn_id: None,
+                wal_lsn: None,
             };
             tx.try_push(BridgeRequest { inner: req }).unwrap();
         }

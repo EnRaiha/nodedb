@@ -73,6 +73,7 @@ impl CoreLoop {
                     Some(&new_bytes),
                     None,
                 );
+                self.note_kv_write_lsn(task, did, tid, collection, key);
                 match response_codec::encode_json(&serde_json::json!({ "value": new_value })) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => self.response_error(
@@ -147,6 +148,7 @@ impl CoreLoop {
                     Some(&new_bytes),
                     None,
                 );
+                self.note_kv_write_lsn(task, did, tid, collection, key);
                 match response_codec::encode_json(&serde_json::json!({ "value": new_value })) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => self.response_error(
@@ -223,6 +225,7 @@ impl CoreLoop {
                 Some(new_value),
                 None,
             );
+            self.note_kv_write_lsn(task, did, tid, collection, key);
         }
 
         let current_b64 = result
@@ -290,6 +293,7 @@ impl CoreLoop {
             Some(new_value),
             old.as_deref(),
         );
+        self.note_kv_write_lsn(task, did, tid, collection, key);
 
         let old_b64 = old
             .as_ref()

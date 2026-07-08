@@ -100,6 +100,7 @@ impl CoreLoop {
                         partition.set_node_surrogate(src_id, src_surrogate);
                         partition.set_node_surrogate(dst_id, dst_surrogate);
                         self.checkpoint_coordinator.mark_dirty("sparse", 1);
+                        self.note_edge_write_lsn(task, tid, collection, src_id, label, dst_id);
                         self.response_ok(task)
                     }
                     Err(e) => self.response_error(
@@ -194,6 +195,16 @@ impl CoreLoop {
             self.checkpoint_coordinator
                 .mark_dirty("sparse", edges.len());
         }
+        for edge in edges {
+            self.note_edge_write_lsn(
+                task,
+                tid,
+                &edge.collection,
+                &edge.src_id,
+                &edge.label,
+                &edge.dst_id,
+            );
+        }
         self.response_ok(task)
     }
 
@@ -236,6 +247,16 @@ impl CoreLoop {
             self.checkpoint_coordinator
                 .mark_dirty("sparse", edges.len());
         }
+        for edge in edges {
+            self.note_edge_write_lsn(
+                task,
+                tid,
+                &edge.collection,
+                &edge.src_id,
+                &edge.label,
+                &edge.dst_id,
+            );
+        }
         self.response_ok(task)
     }
 
@@ -267,6 +288,7 @@ impl CoreLoop {
                 let partition = self.csr_partition_mut(database_id, tid);
                 partition.remove_edge_in_collection(src_id, label, dst_id, collection);
                 self.checkpoint_coordinator.mark_dirty("sparse", 1);
+                self.note_edge_write_lsn(task, tid, collection, src_id, label, dst_id);
                 self.response_ok(task)
             }
             Err(e) => self.response_error(
@@ -276,5 +298,34 @@ impl CoreLoop {
                 },
             ),
         }
+    }
+
+    /// Record a committed edge write's version, keyed by the edge's
+    /// `(src, label, dst)` identity, if a WAL LSN was threaded onto the task.
+    fn note_edge_write_lsn(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        collection: &str,
+        src_id: &str,
+        label: &str,
+        dst_id: &str,
+    ) {
+        let Some(lsn) = task.wal_lsn() else {
+            return;
+        };
+        self.note_write_lsn(
+            task.request.database_id,
+            TenantId::new(tid),
+            collection,
+            Some(
+                crate::data::executor::core_loop::write_index::KeyRepr::Edge {
+                    src: Box::from(src_id),
+                    label: Box::from(label),
+                    dst: Box::from(dst_id),
+                },
+            ),
+            lsn,
+        );
     }
 }

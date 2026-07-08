@@ -16,5 +16,6 @@ mod state;
 #[cfg(test)]
 pub(crate) mod tests;
 mod tick;
+pub(in crate::data::executor) mod write_index;
 
 pub use state::CoreLoop;

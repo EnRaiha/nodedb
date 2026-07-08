@@ -347,6 +347,7 @@ fn calvin_static_replay_sees_only_committed_data() {
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            wal_lsn: None,
         };
 
         // Commit a value before the panic batch.
@@ -432,6 +433,7 @@ fn calvin_static_replay_sees_only_committed_data() {
         user_id: None,
         statement_digest: None,
         txn_id: None,
+        wal_lsn: None,
     };
 
     // Note: this test does NOT assert that the pre-panic committed value is

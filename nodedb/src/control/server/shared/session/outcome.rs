@@ -67,8 +67,14 @@ pub enum AbortReason {
 pub trait TxnDataPlane {
     /// Dispatch one task to the Data Plane without a per-task WAL append (the
     /// whole transaction is written as a single WAL record by the caller).
+    ///
+    /// `wal_lsn` is the LSN of that single transaction WAL record: it is
+    /// stamped onto the dispatched `Request` so the Data Plane records the
+    /// committed write version for every key in the batch. `None` when no WAL
+    /// record was written (empty / read-only commit).
     fn dispatch_no_wal<'a>(
         &'a self,
         task: PhysicalTask,
+        wal_lsn: Option<crate::types::Lsn>,
     ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>>;
 }

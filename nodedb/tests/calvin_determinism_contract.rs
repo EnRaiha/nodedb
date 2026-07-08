@@ -82,6 +82,7 @@ fn make_request(plan: PhysicalPlan) -> Request {
         user_id: None,
         statement_digest: None,
         txn_id: None,
+        wal_lsn: None,
     }
 }
 

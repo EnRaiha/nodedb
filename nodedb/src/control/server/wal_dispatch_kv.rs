@@ -8,16 +8,16 @@ use nodedb_physical::physical_plan::KvOp;
 
 /// Serialize a KV operation and append to the WAL.
 ///
-/// Returns `true` if the operation was handled (i.e. it is a KV write),
-/// `false` if the caller should continue matching other plan variants.
+/// Returns the appended write's WAL LSN (`Some`) for KV writes, or `None` for
+/// read-only / non-WAL KV ops.
 pub fn wal_append_kv_op(
     wal: &WalManager,
     tenant_id: TenantId,
     vshard_id: VShardId,
     database_id: DatabaseId,
     op: &KvOp,
-) -> crate::Result<bool> {
-    match op {
+) -> crate::Result<Option<crate::types::Lsn>> {
+    let lsn: Option<crate::types::Lsn> = match op {
         KvOp::Put {
             collection,
             key,
@@ -30,7 +30,7 @@ pub fn wal_append_kv_op(
                     format: "msgpack".into(),
                     detail: format!("wal kv put: {e}"),
                 })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Insert {
             collection,
@@ -59,7 +59,7 @@ pub fn wal_append_kv_op(
                     format: "msgpack".into(),
                     detail: format!("wal kv insert-like put: {e}"),
                 })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Delete { collection, keys } => {
             let entry = zerompk::to_msgpack_vec(&("kv_delete", collection, keys)).map_err(|e| {
@@ -68,7 +68,7 @@ pub fn wal_append_kv_op(
                     detail: format!("wal kv delete: {e}"),
                 }
             })?;
-            wal.append_delete(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::BatchPut {
             collection,
@@ -81,7 +81,7 @@ pub fn wal_append_kv_op(
                     format: "msgpack".into(),
                     detail: format!("wal kv batch put: {e}"),
                 })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Expire {
             collection,
@@ -95,7 +95,7 @@ pub fn wal_append_kv_op(
                         detail: format!("wal kv expire: {e}"),
                     }
                 })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Persist { collection, key } => {
             let entry = zerompk::to_msgpack_vec(&("kv_persist", collection, key)).map_err(|e| {
@@ -104,7 +104,7 @@ pub fn wal_append_kv_op(
                     detail: format!("wal kv persist: {e}"),
                 }
             })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::RegisterIndex {
             collection,
@@ -118,7 +118,7 @@ pub fn wal_append_kv_op(
                         format: "msgpack".into(),
                         detail: format!("wal kv register index: {e}"),
                     })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::DropIndex { collection, field } => {
             let entry =
@@ -128,7 +128,7 @@ pub fn wal_append_kv_op(
                         detail: format!("wal kv drop index: {e}"),
                     }
                 })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::FieldSet {
             collection,
@@ -147,7 +147,7 @@ pub fn wal_append_kv_op(
                 format: "msgpack".into(),
                 detail: format!("wal kv field set: {e}"),
             })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Incr {
             collection,
@@ -168,7 +168,7 @@ pub fn wal_append_kv_op(
                 format: "msgpack".into(),
                 detail: format!("wal kv incr: {e}"),
             })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::IncrFloat {
             collection,
@@ -187,7 +187,7 @@ pub fn wal_append_kv_op(
                 format: "msgpack".into(),
                 detail: format!("wal kv incr_float: {e}"),
             })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Cas {
             collection,
@@ -208,7 +208,7 @@ pub fn wal_append_kv_op(
                 format: "msgpack".into(),
                 detail: format!("wal kv cas: {e}"),
             })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::GetSet {
             collection,
@@ -227,7 +227,7 @@ pub fn wal_append_kv_op(
                 format: "msgpack".into(),
                 detail: format!("wal kv getset: {e}"),
             })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::RegisterSortedIndex {
             collection,
@@ -254,7 +254,7 @@ pub fn wal_append_kv_op(
                 format: "msgpack".into(),
                 detail: format!("wal kv register sorted index: {e}"),
             })?;
-            wal.append_put(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::DropSortedIndex { index_name } => {
             let entry =
@@ -264,7 +264,7 @@ pub fn wal_append_kv_op(
                         detail: format!("wal kv drop sorted index: {e}"),
                     }
                 })?;
-            wal.append_delete(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Truncate { collection } => {
             let entry = zerompk::to_msgpack_vec(&("kv_truncate", collection)).map_err(|e| {
@@ -273,7 +273,7 @@ pub fn wal_append_kv_op(
                     detail: format!("wal kv truncate: {e}"),
                 }
             })?;
-            wal.append_delete(tenant_id, vshard_id, database_id, &entry)?;
+            Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         // Read-only or non-WAL KV ops.
         KvOp::Get { .. }
@@ -288,9 +288,7 @@ pub fn wal_append_kv_op(
         | KvOp::SortedIndexCount { .. }
         | KvOp::SortedIndexScore { .. }
         | KvOp::SortedIndexTopK { .. }
-        | KvOp::MaterializeScan { .. } => {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+        | KvOp::MaterializeScan { .. } => None,
+    };
+    Ok(lsn)
 }

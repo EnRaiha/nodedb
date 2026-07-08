@@ -145,6 +145,13 @@ impl Scheduler {
         {
             self.last_applied_epoch = epoch;
             self.metrics.update_last_applied_epoch(epoch);
+            // Publish the globally-applied epoch to the shared control-plane
+            // state so `BEGIN` can anchor a session's cross-shard snapshot
+            // version. `fetch_max` keeps it monotonic across all per-vShard
+            // schedulers writing the same counter.
+            self.shared
+                .last_applied_calvin_epoch
+                .fetch_max(epoch, std::sync::atomic::Ordering::Release);
         }
 
         self.pending.remove(&txn_id);

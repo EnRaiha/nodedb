@@ -130,9 +130,62 @@ pub async fn dispatch_to_data_plane_with_source(
             trace_id,
             event_source,
             txn_id: None,
+            wal_lsn: None,
         },
     )
     .await
+}
+
+/// Dispatch a write to the Data Plane carrying the WAL LSN allocated for it.
+///
+/// Used by autocommit write endpoints that call `wal_append_if_write` and then
+/// dispatch: the returned LSN is stamped onto the `Request` so the Data Plane
+/// records the committed per-key / per-collection write version. The write's
+/// identity and LSN travel in a [`WriteDispatch`] to keep the argument list
+/// short; `wal_lsn` is `None` when the write was WAL-bypassed (e.g.
+/// `timeseries` `wal=false`).
+pub(crate) async fn dispatch_write_to_data_plane(
+    shared: &SharedState,
+    write: WriteDispatch,
+) -> crate::Result<Response> {
+    let WriteDispatch {
+        tenant_id,
+        database_id,
+        vshard_id,
+        plan,
+        trace_id,
+        event_source,
+        txn_id,
+        wal_lsn,
+    } = write;
+    dispatch_to_data_plane_inner(
+        shared,
+        DataPlaneDispatch {
+            tenant_id,
+            database_id,
+            vshard_id,
+            plan,
+            trace_id,
+            event_source,
+            txn_id,
+            wal_lsn,
+        },
+    )
+    .await
+}
+
+/// Identity + WAL LSN of a single autocommit write dispatched to the Data
+/// Plane. Bundles the fields so [`dispatch_write_to_data_plane`] avoids a long
+/// positional argument list.
+pub(crate) struct WriteDispatch {
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub vshard_id: VShardId,
+    pub plan: PhysicalPlan,
+    pub trace_id: TraceId,
+    pub event_source: crate::event::EventSource,
+    pub txn_id: Option<crate::types::TxnId>,
+    pub wal_lsn: Option<crate::types::Lsn>,
 }
 
 /// Dispatch a physical plan to the Data Plane carrying an explicit transaction
@@ -158,6 +211,9 @@ pub async fn dispatch_to_data_plane_with_txn(
             trace_id,
             event_source: crate::event::EventSource::User,
             txn_id,
+            // Staged in-transaction writes are not yet durably committed; the
+            // committed write version is recorded at COMMIT via the batch funnel.
+            wal_lsn: None,
         },
     )
     .await
@@ -173,6 +229,10 @@ struct DataPlaneDispatch {
     trace_id: TraceId,
     event_source: crate::event::EventSource,
     txn_id: Option<crate::types::TxnId>,
+    /// WAL LSN allocated for this write (from `wal_append_if_write`), stamped
+    /// onto the `Request` so the Data Plane records the committed write
+    /// version. `None` for reads and control ops.
+    wal_lsn: Option<crate::types::Lsn>,
 }
 
 async fn dispatch_to_data_plane_inner(
@@ -187,6 +247,7 @@ async fn dispatch_to_data_plane_inner(
         trace_id,
         event_source,
         txn_id,
+        wal_lsn,
     } = params;
     // Resolve any Exchange data-movement nodes before dispatch: a root-level
     // Gather fans the child to all cores and returns the merged response here;
@@ -250,6 +311,7 @@ async fn dispatch_to_data_plane_inner(
         user_id: None,
         statement_digest: None,
         txn_id,
+        wal_lsn,
     };
 
     let mut rx = shared.tracker.register(request_id);

@@ -275,6 +275,18 @@ impl CoreLoop {
                             doc_id,
                             &updated_bytes,
                         );
+                        // Record the committed row's write version against its
+                        // surrogate + collection.
+                        if let Some(surrogate) =
+                            crate::engine::document::store::doc_id_to_surrogate(doc_id)
+                        {
+                            self.note_surrogate_write_lsn(
+                                task,
+                                tid,
+                                collection,
+                                surrogate.as_u32(),
+                            );
+                        }
                         affected += 1;
                         if returning.is_some() {
                             // Include document ID in the returned document.

@@ -64,6 +64,11 @@ pub struct ConnSession {
     /// All reads within the transaction see data as of this LSN.
     /// Concurrent writes after this point are invisible to the transaction.
     pub tx_snapshot_lsn: Option<Lsn>,
+    /// Snapshot epoch captured at BEGIN: the last globally-applied Calvin epoch,
+    /// read from `SharedState::last_applied_calvin_epoch`. The cross-shard-valid
+    /// version anchor for the transaction (0 in single-node / no-Calvin). `None`
+    /// outside a transaction block.
+    pub tx_snapshot_epoch: Option<u64>,
     /// Identity of the current session transaction block, minted on `BEGIN`
     /// and cleared on `COMMIT`/`ROLLBACK`. Keys the per-transaction staging
     /// overlay. `None` outside a transaction block.
@@ -151,6 +156,7 @@ impl ConnSession {
             parameters,
             tx_buffer: Vec::new(),
             tx_snapshot_lsn: None,
+            tx_snapshot_epoch: None,
             tx_id: None,
             tx_vshard: None,
             tx_read_set: Vec::new(),

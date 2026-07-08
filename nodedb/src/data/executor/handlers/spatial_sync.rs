@@ -183,6 +183,9 @@ impl CoreLoop {
         rtree.insert(RTreeEntry { id: entry_id, bbox });
         self.spatial_doc_map.insert(doc_map_key, doc_id);
 
+        // Advance the collection floor for this committed spatial write.
+        self.note_collection_write_lsn(task, collection);
+
         // Advance HWM and return gate result payload when provenance is present.
         if let Some(prov) = provenance {
             self.sync_commit(prov);
@@ -265,6 +268,9 @@ impl CoreLoop {
             rtree.delete(entry_id);
         }
         self.spatial_doc_map.remove(&doc_map_key);
+
+        // Advance the collection floor for this committed spatial delete.
+        self.note_collection_write_lsn(task, collection);
 
         if let Some(prov) = provenance {
             self.sync_commit(prov);

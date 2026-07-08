@@ -13,6 +13,18 @@ use nodedb_physical::physical_task::PhysicalTask;
 
 use super::core::NodeDbPgHandler;
 
+/// Inputs for [`NodeDbPgHandler::submit_to_data_plane`]: the request identity,
+/// the plan, and the optional transaction id + committed write LSN.
+struct SubmitArgs {
+    tenant_id: crate::types::TenantId,
+    vshard_id: crate::types::VShardId,
+    database_id: DatabaseId,
+    plan: crate::bridge::envelope::PhysicalPlan,
+    user_id: Option<Arc<str>>,
+    txn_id: Option<crate::types::TxnId>,
+    wal_lsn: Option<Lsn>,
+}
+
 impl NodeDbPgHandler {
     /// Dispatch a single physical task and wait for the response.
     ///
@@ -234,16 +246,18 @@ impl NodeDbPgHandler {
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
     ) -> crate::Result<Response> {
-        self.wal_append_if_write(task.tenant_id, task.vshard_id, task.database_id, &task.plan)?;
+        let wal_lsn =
+            self.wal_append_if_write(task.tenant_id, task.vshard_id, task.database_id, &task.plan)?;
         let txn_id = task.txn_id;
-        self.submit_to_data_plane(
-            task.tenant_id,
-            task.vshard_id,
-            task.database_id,
-            task.plan,
+        self.submit_to_data_plane(SubmitArgs {
+            tenant_id: task.tenant_id,
+            vshard_id: task.vshard_id,
+            database_id: task.database_id,
+            plan: task.plan,
             user_id,
             txn_id,
-        )
+            wal_lsn,
+        })
         .await
     }
 
@@ -256,6 +270,7 @@ impl NodeDbPgHandler {
         &self,
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
+        wal_lsn: Option<crate::types::Lsn>,
     ) -> crate::Result<Response> {
         // Same materialize-freeze gate as `dispatch_task_inner`. Without this,
         // a transaction that began before the freeze could COMMIT writes
@@ -276,28 +291,34 @@ impl NodeDbPgHandler {
             });
         }
         let txn_id = task.txn_id;
-        self.submit_to_data_plane(
-            task.tenant_id,
-            task.vshard_id,
-            task.database_id,
-            task.plan,
+        // The transaction's writes were durably recorded under a single
+        // `RecordType::Transaction` WAL record at COMMIT; per-task WAL append is
+        // skipped here (would double-write). `wal_lsn` is that record's LSN,
+        // stamped so the Data Plane records the batch's write versions.
+        self.submit_to_data_plane(SubmitArgs {
+            tenant_id: task.tenant_id,
+            vshard_id: task.vshard_id,
+            database_id: task.database_id,
+            plan: task.plan,
             user_id,
             txn_id,
-        )
+            wal_lsn,
+        })
         .await
     }
 
     /// Build a `Request`, register with the tracker, dispatch to the Data Plane,
     /// and await the response. Shared by `dispatch_local` and `dispatch_task_no_wal`.
-    async fn submit_to_data_plane(
-        &self,
-        tenant_id: crate::types::TenantId,
-        vshard_id: crate::types::VShardId,
-        database_id: DatabaseId,
-        plan: crate::bridge::envelope::PhysicalPlan,
-        user_id: Option<Arc<str>>,
-        txn_id: Option<crate::types::TxnId>,
-    ) -> crate::Result<Response> {
+    async fn submit_to_data_plane(&self, args: SubmitArgs) -> crate::Result<Response> {
+        let SubmitArgs {
+            tenant_id,
+            vshard_id,
+            database_id,
+            plan,
+            user_id,
+            txn_id,
+            wal_lsn,
+        } = args;
         let request_id = self.next_request_id();
         let request = Request {
             request_id,
@@ -316,6 +337,7 @@ impl NodeDbPgHandler {
             user_id,
             statement_digest: None,
             txn_id,
+            wal_lsn,
         };
 
         let mut rx = self.state.tracker.register(request_id);

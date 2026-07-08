@@ -109,7 +109,11 @@ pub(super) async fn run_commit_calvin(
                     post_set_op: PostSetOp::None,
                     txn_id: None,
                 };
-                if let Some(reason) = classify_batch_dispatch(dp.dispatch_no_wal(batch_task).await)
+                // Calvin owns durability + write-version recording on its apply
+                // path (the scheduler's `append_calvin_applied` LSN is stamped
+                // there); no session-level WAL record exists here to stamp.
+                if let Some(reason) =
+                    classify_batch_dispatch(dp.dispatch_no_wal(batch_task, None).await)
                 {
                     return Some(reason);
                 }

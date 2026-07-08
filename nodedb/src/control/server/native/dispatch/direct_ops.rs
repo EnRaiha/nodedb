@@ -375,21 +375,26 @@ async fn dispatch_single_task_raw(
             // single-shard edge bundle — so an implicit edge written on the boot
             // path is durable. (Cross-shard bundles route via Calvin, which owns
             // its own replicated durability and never reaches this branch.)
-            wal_dispatch::wal_append_if_write(
+            let wal_lsn = wal_dispatch::wal_append_if_write(
                 &ctx.state.wal,
                 tenant_id,
                 vshard_id,
                 ctx.database_id(),
                 &plan,
             )?;
-            dispatch_utils::dispatch_to_data_plane_with_txn(
+            let database_id = ctx.database_id();
+            dispatch_utils::dispatch_write_to_data_plane(
                 ctx.state,
-                tenant_id,
-                ctx.database_id(),
-                vshard_id,
-                plan,
-                TraceId::ZERO,
-                txn_id,
+                dispatch_utils::WriteDispatch {
+                    tenant_id,
+                    database_id,
+                    vshard_id,
+                    plan,
+                    trace_id: TraceId::ZERO,
+                    event_source: crate::event::EventSource::User,
+                    txn_id,
+                    wal_lsn,
+                },
             )
             .await
         }

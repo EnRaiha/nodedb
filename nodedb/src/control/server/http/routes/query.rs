@@ -13,12 +13,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
-use crate::bridge::envelope::{PhysicalPlan, Status};
+use crate::bridge::envelope::Status;
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::identity::{required_permission, role_grants_permission};
 use crate::control::server::response_shape::types::describe_plan;
-use crate::types::{TraceId, VShardId};
 
 use super::super::auth::{ApiError, AppState, resolve_identity};
 use super::super::types::HttpQueryRequest;
@@ -184,8 +183,10 @@ pub async fn query(
                 return Err(ApiError::Forbidden("tenant isolation violation".into()));
             }
 
-            // WAL append for write operations.
-            wal_append_if_write(&state, &task)?;
+            // WAL append for write operations. The allocated LSN is stamped
+            // onto the local-dispatch write below so the Data Plane records the
+            // committed write version.
+            let wal_lsn = wal_append_if_write(&state, &task)?;
 
             // Captured before dispatch moves `task.plan` — needed by the
             // protocol-neutral shaping core below.
@@ -208,19 +209,25 @@ pub async fn query(
                 }
                 None => {
                     // Single-node boot: gateway not yet initialised — dispatch locally.
-                    let response = dispatch_to_data_plane(
-                        &state,
-                        task.tenant_id,
-                        task.database_id,
-                        task.vshard_id,
-                        task.plan,
-                        trace_id,
-                    )
-                    .await
-                    .map_err(|e| {
-                        let (status, msg) = GatewayErrorMap::to_http(&e);
-                        ApiError::HttpStatus(status, msg)
-                    })?;
+                    let response =
+                        crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
+                            &state.shared,
+                            crate::control::server::dispatch_utils::WriteDispatch {
+                                tenant_id: task.tenant_id,
+                                database_id: task.database_id,
+                                vshard_id: task.vshard_id,
+                                plan: task.plan,
+                                trace_id,
+                                event_source: crate::event::EventSource::User,
+                                txn_id: None,
+                                wal_lsn,
+                            },
+                        )
+                        .await
+                        .map_err(|e| {
+                            let (status, msg) = GatewayErrorMap::to_http(&e);
+                            ApiError::HttpStatus(status, msg)
+                        })?;
                     if response.status != Status::Ok {
                         let detail = response
                             .error_code
@@ -267,7 +274,7 @@ pub async fn query(
 fn wal_append_if_write(
     state: &AppState,
     task: &nodedb_physical::physical_task::PhysicalTask,
-) -> Result<(), ApiError> {
+) -> Result<Option<crate::types::Lsn>, ApiError> {
     crate::control::server::wal_dispatch::wal_append_if_write(
         &state.shared.wal,
         task.tenant_id,
@@ -276,28 +283,6 @@ fn wal_append_if_write(
         &task.plan,
     )
     .map_err(|e| ApiError::Internal(format!("WAL append: {e}")))
-}
-
-/// Dispatch a physical plan locally (single-node fallback path).
-///
-/// Called only when `shared.gateway` is `None` (pre-cluster-init boot).
-async fn dispatch_to_data_plane(
-    state: &AppState,
-    tenant_id: crate::types::TenantId,
-    database_id: nodedb_types::DatabaseId,
-    vshard_id: VShardId,
-    plan: PhysicalPlan,
-    trace_id: TraceId,
-) -> crate::Result<crate::bridge::envelope::Response> {
-    crate::control::server::dispatch_utils::dispatch_to_data_plane(
-        &state.shared,
-        tenant_id,
-        database_id,
-        vshard_id,
-        plan,
-        trace_id,
-    )
-    .await
 }
 
 /// POST /v1/query/stream — execute SQL and return results as NDJSON (newline-delimited JSON).

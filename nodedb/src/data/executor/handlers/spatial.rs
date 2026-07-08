@@ -500,6 +500,7 @@ mod tests {
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            wal_lsn: None,
         })
     }
 

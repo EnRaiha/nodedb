@@ -73,6 +73,9 @@ impl CoreLoop {
             );
         }
 
+        // Record the committed write's version against its surrogate + collection.
+        self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
         // Emit write event to Event Plane. Insert vs Update is derived

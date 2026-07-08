@@ -109,6 +109,7 @@ async fn query_collection_size(
         user_id: None,
         statement_digest: None,
         txn_id: None,
+        wal_lsn: None,
     };
     let mut rx = state.tracker.register(request_id);
     {

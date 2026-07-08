@@ -213,6 +213,10 @@ impl Scheduler {
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            // Calvin allocates the CalvinApplied WAL LSN post-apply (in the
+            // scheduler's response handler), so no committed LSN is known at
+            // dispatch time to stamp here.
+            wal_lsn: None,
         };
 
         let resp_rx = self.shared.tracker.register(request_id);
@@ -332,6 +336,10 @@ impl Scheduler {
             user_id: None,
             statement_digest: None,
             txn_id: None,
+            // Calvin allocates the CalvinApplied WAL LSN post-apply (in the
+            // scheduler's response handler), so no committed LSN is known at
+            // dispatch time to stamp here.
+            wal_lsn: None,
         };
 
         let resp_rx = self.shared.tracker.register(request_id);
