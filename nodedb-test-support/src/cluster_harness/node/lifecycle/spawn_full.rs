@@ -1,29 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Spawn and shutdown lifecycle for [`TestClusterNode`].
-//!
-//! A `TestClusterNode` owns one full NodeDB server instance configured
-//! for cluster mode. Spawn via [`TestClusterNode::spawn`], passing the
-//! node id and the seed list (empty for the bootstrap node; otherwise
-//! a list of already-running peer addresses). On return the node has:
-//!
-//! - Pre-bound QUIC transport (so the listen address is known before
-//!   peers need it).
-//! - `SharedState` wired with credentials, metadata_cache, and the
-//!   cluster handles (topology / routing / transport / applied-index
-//!   watcher).
-//! - Data Plane core running on a spawn_blocking task.
-//! - Response poller running on a tokio task.
-//! - Event Plane spawned.
-//! - Raft loop + QUIC RPC server started via `start_raft` (installs
-//!   the production `MetadataCommitApplier` with `Weak<SharedState>`
-//!   so committed `CollectionDdl::Create` entries trigger Data Plane
-//!   registers on every node).
-//! - pgwire listener bound on an ephemeral port.
-//! - `tokio_postgres::Client` connected to that listener.
-//!
-//! Shutdown flips every shutdown channel, aborts background tasks,
-//! and drops the TempDir.
+//! The lowest-level cluster-node spawn body: pre-binds QUIC transport,
+//! opens WAL + credentials, wires cluster handles into `SharedState`,
+//! starts every Data-Plane core, the Event Plane, Raft, the descriptor
+//! lease loop, the gateway, and the pgwire/native listeners, then
+//! connects a `tokio_postgres::Client`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -37,128 +18,12 @@ use nodedb::control::server::pgwire::listener::PgListener;
 use nodedb::control::state::SharedState;
 use nodedb::event::{EventPlane, create_event_bus};
 use nodedb::wal::WalManager;
-use nodedb_types::config::tuning::ClusterTransportTuning;
 
 use crate::cluster_harness::cluster::ClusterSpawnConfig;
 
-/// Running cluster node.
-pub struct TestClusterNode {
-    pub node_id: u64,
-    pub listen_addr: SocketAddr,
-    pub pg_addr: SocketAddr,
-    /// Native (MessagePack) protocol listener port. Bound on an ephemeral port
-    /// so `NativeClient::connect("127.0.0.1:<native_port>")` works in tests.
-    pub native_port: u16,
-    pub client: tokio_postgres::Client,
-    pub shared: Arc<SharedState>,
-    pub(super) _data_dir: tempfile::TempDir,
-    pub(super) _conn_handle: tokio::task::JoinHandle<()>,
-    pub(super) pg_shutdown_bus: nodedb::control::shutdown::ShutdownBus,
-    pub(super) poller_shutdown_tx: tokio::sync::watch::Sender<bool>,
-    pub(super) cluster_shutdown_tx: tokio::sync::watch::Sender<bool>,
-    pub(super) core_stop_txs: Vec<std::sync::mpsc::Sender<()>>,
-    pub(super) _pg_handle: tokio::task::JoinHandle<()>,
-    pub(super) _native_handle: tokio::task::JoinHandle<()>,
-    pub(super) _poller_handle: tokio::task::JoinHandle<()>,
-    pub(super) _core_handles: Vec<tokio::task::JoinHandle<()>>,
-    pub(super) _event_plane: EventPlane,
-}
+use super::types::TestClusterNode;
 
 impl TestClusterNode {
-    /// Spawn a cluster node.
-    ///
-    /// - `node_id` — non-zero unique id within the cluster.
-    /// - `seed_nodes` — empty for the bootstrap node; otherwise the
-    ///   pre-bound listen address of at least one already-running
-    ///   peer (typically node 1).
-    pub async fn spawn(
-        node_id: u64,
-        seed_nodes: Vec<SocketAddr>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::spawn_with_tuning(node_id, seed_nodes, ClusterTransportTuning::default()).await
-    }
-
-    /// Spawn a cluster node with a custom `ClusterTransportTuning`.
-    /// Used by tests that need to override the descriptor lease
-    /// duration or renewal cadence to drive renewal within a
-    /// short test budget.
-    pub async fn spawn_with_tuning(
-        node_id: u64,
-        seed_nodes: Vec<SocketAddr>,
-        tuning: ClusterTransportTuning,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::spawn_with_tuning_and_cores(node_id, seed_nodes, tuning, 1).await
-    }
-
-    /// Spawn a cluster node with a custom `ClusterTransportTuning` and a
-    /// specific number of Data-Plane cores. Used to exercise multi-core
-    /// code paths in cluster tests. Graph tuning defaults (100k varlen caps).
-    pub async fn spawn_with_tuning_and_cores(
-        node_id: u64,
-        seed_nodes: Vec<SocketAddr>,
-        tuning: ClusterTransportTuning,
-        num_cores: usize,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::spawn_with_tuning_graph_and_cores(
-            node_id,
-            seed_nodes,
-            tuning,
-            nodedb_types::config::tuning::GraphTuning::default(),
-            num_cores,
-        )
-        .await
-    }
-
-    /// Spawn a cluster node with custom cluster-transport AND graph engine
-    /// tuning plus a specific core count. The `graph_tuning` knob lets cluster
-    /// tests lower the variable-length MATCH expansion caps to drive truncation
-    /// (and exercise the cross-shard resume drain) on small graphs.
-    pub async fn spawn_with_tuning_graph_and_cores(
-        node_id: u64,
-        seed_nodes: Vec<SocketAddr>,
-        tuning: ClusterTransportTuning,
-        graph_tuning: nodedb_types::config::tuning::GraphTuning,
-        num_cores: usize,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::spawn_with_tuning_graph_query_and_cores(
-            node_id,
-            seed_nodes,
-            tuning,
-            graph_tuning,
-            nodedb_types::config::tuning::QueryTuning::default(),
-            num_cores,
-        )
-        .await
-    }
-
-    /// Spawn a cluster node with custom cluster-transport, graph engine
-    /// tuning, query execution tuning, and a specific core count.
-    ///
-    /// The `query_tuning` knob lets cluster tests override per-core Data Plane
-    /// parameters (e.g. `columnar_flush_threshold`) to exercise flush behaviour
-    /// on small datasets.
-    ///
-    /// Delegates to [`Self::spawn_with_full_config`] with
-    /// `log_compaction_threshold = None` (auto-compaction disabled).
-    pub async fn spawn_with_tuning_graph_query_and_cores(
-        node_id: u64,
-        seed_nodes: Vec<SocketAddr>,
-        tuning: ClusterTransportTuning,
-        graph_tuning: nodedb_types::config::tuning::GraphTuning,
-        query_tuning: nodedb_types::config::tuning::QueryTuning,
-        num_cores: usize,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let config = ClusterSpawnConfig {
-            tuning,
-            graph_tuning,
-            query_tuning,
-            num_cores,
-            log_compaction_threshold: None,
-            replication_factor: 3,
-        };
-        Self::spawn_with_full_config(node_id, seed_nodes, &config).await
-    }
-
     /// Lowest-level cluster-node spawn. In addition to the tuning knobs of
     /// [`Self::spawn_with_tuning_graph_query_and_cores`], this accepts the
     /// Raft `log_compaction_threshold`: when `Some(n)`, every Raft group on
@@ -482,80 +347,5 @@ impl TestClusterNode {
             _core_handles: core_handles,
             _event_plane: event_plane,
         })
-    }
-
-    /// Execute a simple query; returns an error message on SQL error.
-    pub async fn exec(&self, sql: &str) -> Result<(), String> {
-        match self.client.simple_query(sql).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(pg_error_detail(&e)),
-        }
-    }
-
-    /// Cooperatively shut down every background task this node owns.
-    pub async fn shutdown(self) {
-        self.pg_shutdown_bus.initiate();
-        let _ = self.cluster_shutdown_tx.send(true);
-        let _ = self.poller_shutdown_tx.send(true);
-        for tx in &self.core_stop_txs {
-            let _ = tx.send(());
-        }
-        // Give tokio a chance to drop the task futures before TempDir
-        // is dropped — otherwise redb file locks can linger.
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
-    }
-}
-
-/// Panic-safe teardown. Without this, a test that panics (e.g. a
-/// `wait_for` tripping its budget) would drop `TestClusterNode`
-/// without ever calling the async `shutdown()`, leaving every
-/// background task still running:
-///
-/// - `watch::Sender`s close on drop but DO NOT transmit their last
-///   value, so the raft / pgwire / poller loops block on
-///   `select { shutdown.changed() }` forever.
-/// - `JoinHandle`s on drop DETACH the task instead of cancelling it.
-/// - Those detached tasks keep the tempdir's redb files open, so
-///   `TempDir::drop` either hangs or the whole test process sticks
-///   around until nextest kills it at `slow-timeout` (previously
-///   ~2 minutes of wasted CI time per flaky cluster test).
-///
-/// The Drop here fires the watch senders synchronously and aborts
-/// every JoinHandle we own. `abort()` is non-blocking: the next time
-/// the task hits an `.await` it gets cancelled and releases its
-/// resources, including the redb handles. Combined with the
-/// already-present `core_stop_tx` drop (which disconnects the
-/// blocking Data Plane loop), this guarantees the node tears down
-/// in milliseconds instead of minutes.
-impl Drop for TestClusterNode {
-    fn drop(&mut self) {
-        self.pg_shutdown_bus.initiate();
-        let _ = self.cluster_shutdown_tx.send(true);
-        let _ = self.poller_shutdown_tx.send(true);
-        // `core_stop_tx` is a std mpsc Sender; dropping it disconnects
-        // the receiver the spawn_blocking data-plane loop polls, so
-        // no explicit signal needed here.
-        self._conn_handle.abort();
-        self._pg_handle.abort();
-        self._native_handle.abort();
-        self._poller_handle.abort();
-        for h in &self._core_handles {
-            h.abort();
-        }
-    }
-}
-
-pub(super) fn pg_error_detail(e: &tokio_postgres::Error) -> String {
-    if let Some(db_err) = e.as_db_error() {
-        format!(
-            "{}: {} (SQLSTATE {})",
-            db_err.severity(),
-            db_err.message(),
-            db_err.code().code()
-        )
-    } else {
-        format!("{e:?}")
     }
 }

@@ -6,6 +6,13 @@
 //! `TenantDataSnapshot`, then splits the merged snapshot into per-node
 //! sub-snapshots according to the *current* cluster topology and
 //! dispatches `MetaOp::RestoreTenantSnapshot` to each owning node.
+//!
+//! Durable re-issue of columnar/timeseries rows lives in [`reissue`];
+//! post-install surrogate rebinding and tombstone warnings live in
+//! [`rebind`].
+
+mod rebind;
+mod reissue;
 
 use std::sync::Arc;
 
@@ -14,19 +21,16 @@ use nodedb_types::backup_envelope::{
 };
 use serde::Serialize;
 
-use nodedb_types::Surrogate;
-
 use crate::Error;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
-use crate::types::{SurrogateBindEntry, TenantDataSnapshot, TenantId};
+use crate::types::TenantId;
 use nodedb_physical::physical_plan::MetaOp;
 
 use super::remote::{NODE_RESTORE_TIMEOUT, dispatch_remote, envelope_to_err};
 use super::sections::{apply_metadata_sections, merge_sections};
 use super::topology::{SplitOutput, is_self, split_by_current_topology};
-use crate::control::backup::snapshot_keys::extract_db_scoped_collection;
 
 /// Aggregate stats returned to the client at the end of a restore.
 #[derive(Debug, Default, Clone, Serialize)]
@@ -140,7 +144,7 @@ pub async fn restore_tenant(
     stats.flushed_ts_segments = merged.flushed_ts_segments.len();
     stats.surrogate_pk = merged.surrogate_pk.len();
 
-    warn_on_tombstoned_restores(state, tenant_id, &merged, env.meta.snapshot_watermark);
+    rebind::warn_on_tombstoned_restores(state, tenant_id, &merged, env.meta.snapshot_watermark);
 
     if dry_run {
         stats.columnar_engines = merged.columnar_engines.len();
@@ -249,7 +253,7 @@ pub async fn restore_tenant(
     // is present in the doc store. A rebind failure is FATAL — silently
     // shipping unqueryable rows is the partial-success anti-pattern this
     // codebase forbids.
-    rebind_surrogates(state, surrogate_binds)?;
+    rebind::rebind_surrogates(state, surrogate_binds)?;
 
     // Durable re-issue of plain-columnar rows. Each restored collection's live
     // rows are decoded from the snapshot and replayed as a durable
@@ -257,7 +261,7 @@ pub async fn restore_tenant(
     // installed in single-node mode). Collections that decode to zero live rows
     // are skipped. Any failure is fatal — no warn-and-continue.
     stats.columnar_engines =
-        reissue_columnar_snapshots(state, tenant_id, columnar_snapshots).await?;
+        reissue::reissue_columnar_snapshots(state, tenant_id, columnar_snapshots).await?;
 
     // Durable re-issue of timeseries rows. Each restored collection's memtable
     // rows plus every flushed partition's rows are decoded from the snapshot and
@@ -265,9 +269,13 @@ pub async fn restore_tenant(
     // mode; WAL-appended then installed in single-node mode). Collections that
     // decode to zero live rows are skipped. Any failure is fatal — no
     // warn-and-continue.
-    stats.timeseries_reissued =
-        reissue_timeseries_snapshots(state, tenant_id, timeseries_memtables, flushed_ts_segments)
-            .await?;
+    stats.timeseries_reissued = reissue::reissue_timeseries_snapshots(
+        state,
+        tenant_id,
+        timeseries_memtables,
+        flushed_ts_segments,
+    )
+    .await?;
 
     // Durable re-issue of CRDT state. Each collection's Loro snapshot is
     // proposed through Raft to the data group owning that collection's vshard
@@ -278,248 +286,4 @@ pub async fn restore_tenant(
     stats.crdt_reissued = super::crdt_reissue::reissue_crdt_snapshots(state, crdt_state).await?;
 
     Ok(stats)
-}
-
-/// Decode and durably re-issue every restored timeseries collection.
-///
-/// Returns the number of collections that produced at least one live row and
-/// were re-issued. `memtables` are `("{db}:{tid}:{collection}", msgpack)` pairs
-/// (the captured `MemtableSnapshot` wire shape); `flushed` carries the flushed
-/// partition blobs keyed by the same `"{db}:{tid}:{collection}"` key. The union
-/// of the two key sets is re-issued once per collection (memtable + flushed rows
-/// merged into a single ingest).
-async fn reissue_timeseries_snapshots(
-    state: &Arc<SharedState>,
-    tenant_id: u64,
-    memtables: Vec<(String, Vec<u8>)>,
-    flushed: Vec<crate::types::TsFlushedCollectionBlob>,
-) -> Result<usize, Error> {
-    // Timeseries segment KEK == the WAL encryption key (segments are written via
-    // the same key). Absent when at-rest encryption is not configured, in which
-    // case segments are plaintext and decode with `kek = None`.
-    let kek = state.wal.encryption_key().cloned();
-    let database_id = crate::types::DatabaseId::DEFAULT;
-
-    // Index memtable bytes and flushed blobs by their `{db}:{tid}:{collection}`
-    // key so each collection is decoded + re-issued exactly once.
-    let mut memtable_by_key: std::collections::HashMap<String, Vec<u8>> =
-        memtables.into_iter().collect();
-    let mut keys_in_order: Vec<String> = Vec::new();
-    let mut flushed_by_key: std::collections::HashMap<
-        String,
-        crate::types::TsFlushedCollectionBlob,
-    > = std::collections::HashMap::new();
-    for blob in flushed {
-        keys_in_order.push(blob.collection_key.clone());
-        flushed_by_key.insert(blob.collection_key.clone(), blob);
-    }
-    for key in memtable_by_key.keys() {
-        if !flushed_by_key.contains_key(key) {
-            keys_in_order.push(key.clone());
-        }
-    }
-
-    let empty_flushed = crate::types::TsFlushedCollectionBlob::default();
-    let mut reissued = 0usize;
-    for key in keys_in_order {
-        let Some(collection) = extract_db_scoped_collection(&key, tenant_id) else {
-            return Err(Error::Internal {
-                detail: format!("restore reissue: malformed timeseries snapshot key '{key}'"),
-            });
-        };
-        let collection = collection.to_owned();
-
-        let memtable_bytes = memtable_by_key.remove(&key);
-        let flushed_blob = flushed_by_key.get(&key).unwrap_or(&empty_flushed);
-
-        let rows = super::timeseries_reissue::decode_timeseries_live_rows(
-            &collection,
-            memtable_bytes.as_deref(),
-            flushed_blob,
-            kek.as_ref(),
-        )?;
-        if rows.is_empty() {
-            continue;
-        }
-
-        let plan = super::timeseries_reissue::build_timeseries_ingest_plan(&collection, rows)?;
-        super::timeseries_reissue::reissue_timeseries_durably(
-            state,
-            TenantId::new(tenant_id),
-            database_id,
-            &collection,
-            plan,
-        )
-        .await?;
-        reissued += 1;
-    }
-    Ok(reissued)
-}
-
-/// Decode and durably re-issue every restored plain-columnar collection.
-///
-/// Returns the number of collections that produced at least one live row and
-/// were re-issued. `entries` are `("{db}:{tid}:{collection}", msgpack)` pairs
-/// (the `ColumnarEngineSnapshot` wire shape).
-async fn reissue_columnar_snapshots(
-    state: &Arc<SharedState>,
-    tenant_id: u64,
-    entries: Vec<(String, Vec<u8>)>,
-) -> Result<usize, Error> {
-    // Columnar segment KEK == the WAL encryption key (segments are written via
-    // `SegmentWriter::plain().write_segment(..., kek)` with this key). Absent
-    // when at-rest encryption is not configured, in which case segments are
-    // plaintext NDBS and decode with `kek = None`.
-    let kek = state.wal.encryption_key().cloned();
-    let database_id = crate::types::DatabaseId::DEFAULT;
-
-    let mut reissued = 0usize;
-    for (key, bytes) in entries {
-        let Some(collection) = extract_db_scoped_collection(&key, tenant_id) else {
-            return Err(Error::Internal {
-                detail: format!("restore reissue: malformed columnar snapshot key '{key}'"),
-            });
-        };
-        let collection = collection.to_owned();
-
-        let snap: nodedb_columnar::ColumnarEngineSnapshot =
-            zerompk::from_msgpack(&bytes).map_err(|e| Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!(
-                    "restore reissue: deserialize ColumnarEngineSnapshot for '{collection}': {e}"
-                ),
-            })?;
-
-        let decoded =
-            super::columnar_reissue::decode_snapshot_live_rows(&collection, snap, kek.as_ref())?;
-        if decoded.rows.is_empty() {
-            continue;
-        }
-
-        let plan = super::columnar_reissue::build_columnar_insert_plan(&collection, decoded)?;
-        super::columnar_reissue::reissue_columnar_durably(
-            state,
-            TenantId::new(tenant_id),
-            database_id,
-            &collection,
-            plan,
-        )
-        .await?;
-        reissued += 1;
-    }
-    Ok(reissued)
-}
-
-/// Rebind every PK→surrogate identity carried in the backup into the
-/// destination catalog so restored rows resolve by PK point-lookup.
-///
-/// No-op when the snapshot carried no bindings (e.g. an older backup created
-/// before the surrogate-pk section existed) or when the node has no catalog.
-/// Any catalog write failure is FATAL.
-fn rebind_surrogates(
-    state: &Arc<SharedState>,
-    binds: Vec<SurrogateBindEntry>,
-) -> Result<(), Error> {
-    if binds.is_empty() {
-        return Ok(());
-    }
-    let catalog = state.credentials.catalog();
-    let database_id = crate::types::DatabaseId::DEFAULT;
-    for e in &binds {
-        catalog.put_surrogate(
-            database_id,
-            TenantId::new(e.tenant_id),
-            &e.collection,
-            &e.pk,
-            Surrogate::new(e.surrogate),
-        )?;
-    }
-    Ok(())
-}
-
-fn warn_on_tombstoned_restores(
-    state: &Arc<SharedState>,
-    tenant_id: u64,
-    merged: &TenantDataSnapshot,
-    snapshot_watermark: u64,
-) {
-    let catalog = state.credentials.catalog();
-    let Ok(tombstones) = catalog.load_wal_tombstones() else {
-        return;
-    };
-    if tombstones.is_empty() {
-        return;
-    }
-
-    let mut names = std::collections::BTreeSet::new();
-    let sections: [&[(String, Vec<u8>)]; 6] = [
-        &merged.documents,
-        &merged.indexes,
-        &merged.vectors,
-        &merged.kv_tables,
-        &merged.timeseries,
-        &merged.edges,
-    ];
-    for section in sections {
-        for (key, _) in section {
-            if let Some(name) = collection_from_key(key) {
-                names.insert(name.to_string());
-            }
-        }
-    }
-
-    for name in &names {
-        let Some(purge_lsn) = tombstones.purge_lsn(tenant_id, name) else {
-            continue;
-        };
-        if snapshot_watermark != 0 && snapshot_watermark >= purge_lsn {
-            continue;
-        }
-        tracing::warn!(
-            tenant_id,
-            collection = %name,
-            purge_lsn,
-            snapshot_watermark,
-            "RESTORE: bringing back a collection that was hard-deleted on this cluster"
-        );
-        state.audit_record(
-            crate::control::security::audit::AuditEvent::AdminAction,
-            Some(TenantId::new(tenant_id)),
-            "__restore",
-            &format!(
-                "restore resurrected tombstoned collection '{name}' \
-                 (purge_lsn={purge_lsn}, snapshot_watermark={snapshot_watermark})"
-            ),
-        );
-    }
-}
-
-fn collection_from_key(key: &str) -> Option<&str> {
-    let tail = key.split_once(':')?.1;
-    tail.split([':', '\0']).next()
-}
-
-#[cfg(test)]
-mod collection_key_tests {
-    use super::collection_from_key;
-
-    #[test]
-    fn extracts_collection_with_colon_separator() {
-        assert_eq!(collection_from_key("1:users:doc-1"), Some("users"));
-    }
-
-    #[test]
-    fn extracts_collection_with_null_separator() {
-        assert_eq!(collection_from_key("1:src\0label\0"), Some("src"));
-    }
-
-    #[test]
-    fn vector_and_kv_key_shapes() {
-        assert_eq!(collection_from_key("1:events"), Some("events"));
-    }
-
-    #[test]
-    fn no_tenant_prefix_returns_none() {
-        assert_eq!(collection_from_key("no_colon"), None);
-    }
 }

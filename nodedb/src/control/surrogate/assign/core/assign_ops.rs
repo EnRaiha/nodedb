@@ -1,132 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! CP-side helper that turns a `(collection, pk_bytes)` into a stable
-//! `Surrogate`, allocating from the registry on the first call and
-//! returning the persisted value on every subsequent call (UPSERT
-//! preserves the surrogate).
-//!
-//! Cross-cutting flush trigger: every successful allocation runs the
-//! registry's `should_flush()` check; if true, we persist the new
-//! high-watermark to both the catalog row (`_system.surrogate_hwm`)
-//! and the WAL (`SurrogateAlloc` record) before returning. The two
-//! writes form one logical checkpoint — if either fails we surface
-//! the error to the caller rather than silently letting the registry
-//! advance past a non-durable hwm.
-//!
-//! The cross-node HiLo reservation path (multi-node batch reservation +
-//! the background refill loop that keeps the blocking metadata-Raft
-//! round-trip OFF this hot path) lives in the sibling
-//! [`super::cluster_reserve`] module.
+//! The read/allocate/bind operations on [`super::SurrogateAssigner`]:
+//! `assign`, `assign_fresh`, `assign_anonymous`, `bind`, and `lookup`.
 
 use nodedb_types::{DatabaseId, TenantId};
-use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, RwLock, Weak};
-
-use tokio::sync::{Notify, oneshot};
 
 use nodedb_types::Surrogate;
 
-use super::super::persist::SurrogateHwmPersist;
-use super::super::registry::SurrogateRegistry;
-use super::super::wal_appender::SurrogateWalAppender;
-use crate::control::security::catalog::SystemCatalog;
-use crate::control::security::credential::CredentialStore;
-use crate::control::state::SharedState;
-
-/// Shared handle to the surrogate registry. Lives on `SharedState`
-/// and is cloned (cheaply) into every CP path that allocates
-/// surrogates.
-///
-/// The inner `RwLock` is held only for the duration of one
-/// `assign_surrogate` call (write lock) — the registry's hot-path
-/// `alloc_one` uses atomics, so the lock is uncontended.
-pub type SurrogateRegistryHandle = Arc<RwLock<SurrogateRegistry>>;
-
-/// CP-side surrogate assigner. Owning shape — bundles the registry,
-/// the credential store (which exposes the catalog), and the WAL
-/// appender so call sites only need to pass `(collection, pk_bytes)`.
-///
-/// Stored as `Arc<SurrogateAssigner>` on `SharedState`.
-///
-/// Fields are `pub(super)` so the sibling [`super::cluster_reserve`]
-/// module's `impl` block (the cross-node reservation methods) can reach
-/// them; they remain private outside the `assign` module.
-pub struct SurrogateAssigner {
-    pub(super) registry: SurrogateRegistryHandle,
-    pub(super) credential_store: Arc<CredentialStore>,
-    pub(super) wal_appender: Arc<dyn SurrogateWalAppender>,
-    /// Weak handle to SharedState for Raft-mediated HWM proposals.
-    /// Set after SharedState construction to break the Arc cycle.
-    /// When set and a Raft cluster is active, the flush path proposes
-    /// `MetadataEntry::SurrogateAlloc { hwm }` in addition to the
-    /// local WAL record so all followers advance their HWM.
-    pub(super) shared: std::sync::OnceLock<Weak<SharedState>>,
-    /// Pending cluster-mode batch reservations keyed by `request_id`.
-    /// `ensure_batch` registers a oneshot here before proposing; the
-    /// metadata applier removes + fires it via `complete_reservation`
-    /// once the carved `[start, end)` range is known at apply time.
-    pub(super) pending_reservations: Mutex<HashMap<u64, oneshot::Sender<(u32, u32)>>>,
-    /// Monotonic source of unique `request_id`s for reservations on
-    /// this node. Only ever read/incremented locally.
-    pub(super) next_request_id: AtomicU64,
-    /// Serializes in-flight reservations so at most one batch is being
-    /// reserved at a time per node. Without this, a burst of allocators
-    /// that all observe an empty batch would each propose a reservation,
-    /// over-reserving and wasting surrogate space.
-    pub(super) reserve_gate: tokio::sync::Mutex<()>,
-    /// Monotonic cache for `should_use_reservation`: set once the node
-    /// first observes a multi-member metadata group, after which the
-    /// per-row hot path skips the contended `cluster_topology` /
-    /// `cluster_routing` RwLock reads.
-    pub(super) reservation_latched: std::sync::atomic::AtomicBool,
-    /// Wakes the background refill loop. The hot path nudges it (via
-    /// `notify_one`) whenever a draw fails or the batch dips below the
-    /// low-watermark; the refiller then performs the blocking reservation
-    /// OFF the latency-critical insert path. `Notify` coalesces: a nudge
-    /// while the refiller is already running is remembered as one pending
-    /// permit, so no top-up is ever lost.
-    pub(super) refill_notify: Arc<Notify>,
-}
+use super::types::SurrogateAssigner;
 
 impl SurrogateAssigner {
-    pub fn new(
-        registry: SurrogateRegistryHandle,
-        credential_store: Arc<CredentialStore>,
-        wal_appender: Arc<dyn SurrogateWalAppender>,
-    ) -> Self {
-        Self {
-            registry,
-            credential_store,
-            wal_appender,
-            shared: std::sync::OnceLock::new(),
-            pending_reservations: Mutex::new(HashMap::new()),
-            next_request_id: AtomicU64::new(1),
-            reserve_gate: tokio::sync::Mutex::new(()),
-            reservation_latched: std::sync::atomic::AtomicBool::new(false),
-            refill_notify: Arc::new(Notify::new()),
-        }
-    }
-
-    /// Install a weak SharedState handle so the flush path can
-    /// propose to Raft when in cluster mode. Called by `start_raft`
-    /// after SharedState is fully wired.
-    pub fn install_shared(&self, shared: Weak<SharedState>) {
-        let _ = self.shared.set(shared);
-    }
-
-    /// Highest surrogate ever issued by this assigner.  Used by `CLONE
-    /// DATABASE` to capture the source's surrogate high-water at the
-    /// AS-OF point — every binding allocated *after* this value belongs
-    /// strictly to source-side writes that must NOT be visible from the
-    /// resulting clone.  Returns `0` on a fresh assigner.
-    pub fn current_hwm(&self) -> u32 {
-        self.registry
-            .read()
-            .map(|reg| reg.current_hwm())
-            .unwrap_or_else(|p| p.into_inner().current_hwm())
-    }
-
     /// Resolve `(collection, pk_bytes)` to a stable surrogate.
     ///
     /// - If the credential store has no catalog (in-memory test fixture),
@@ -275,51 +158,6 @@ impl SurrogateAssigner {
         }
     }
 
-    /// Local flush trigger: durably checkpoint the new hwm if the ops or
-    /// elapsed-time threshold has tripped. This runs whenever the node is
-    /// NOT using the cross-node reservation path — i.e. on a single-node
-    /// (no Raft) deployment OR a single-member-with-Raft deployment. In
-    /// the latter case the flush's `CombinedPersist` also proposes
-    /// `SurrogateAlloc { hwm }` so the metadata watermark `G` stays in
-    /// sync with the locally-allocated hwm; this gives a future node-join
-    /// a correct base to advance past (see `should_use_reservation`
-    /// follow-up (1)).
-    ///
-    /// When the reservation path IS in use (multi-member metadata group)
-    /// this is a no-op — the global watermark is advanced and persisted
-    /// by the `SurrogateReserve` apply path, so running the local flush
-    /// here would double-advance `counter` (which is `G` in that mode)
-    /// and corrupt determinism.
-    pub(super) fn maybe_flush(
-        &self,
-        registry: &SurrogateRegistry,
-        catalog: &SystemCatalog,
-    ) -> crate::Result<()> {
-        if self.should_use_reservation() {
-            return Ok(());
-        }
-        if registry.should_flush() {
-            let raft_shared = self.shared.get().and_then(|w| w.upgrade());
-            let combined = CombinedPersist {
-                catalog,
-                wal_appender: self.wal_appender.as_ref(),
-                raft_shared: raft_shared.as_deref(),
-            };
-            registry.flush(&combined)?;
-        }
-        Ok(())
-    }
-
-    /// Acquire a write lock on the registry, converting a poisoned-lock
-    /// error into the crate's typed `Internal` error.
-    pub(super) fn registry_write(
-        &self,
-    ) -> crate::Result<std::sync::RwLockWriteGuard<'_, SurrogateRegistry>> {
-        self.registry.write().map_err(|_| crate::Error::Internal {
-            detail: "surrogate registry lock poisoned".into(),
-        })
-    }
-
     /// Read-only lookup: return the surrogate previously bound to
     /// `(collection, pk_bytes)` without ever allocating or writing.
     /// Used by point-read/update/delete planning where a missing
@@ -429,15 +267,6 @@ impl SurrogateAssigner {
         Ok(surrogate)
     }
 
-    /// Expose the registry handle for read access by the Raft applier.
-    ///
-    /// The returned `Arc<RwLock<SurrogateRegistry>>` is used by
-    /// `MetadataCommitApplier` to call `restore_hwm` when a
-    /// `SurrogateAlloc` entry commits on a follower.
-    pub fn registry_handle(&self) -> &SurrogateRegistryHandle {
-        &self.registry
-    }
-
     /// Allocate a fresh surrogate for an entity that has no user-facing
     /// primary key (e.g. headless vector inserts). The surrogate is
     /// self-keyed in the catalog (`pk_bytes = surrogate.as_u32().to_be_bytes()`)
@@ -482,45 +311,15 @@ impl SurrogateAssigner {
     }
 }
 
-/// `SurrogateHwmPersist` impl that writes the catalog row AND emits
-/// the WAL record on every checkpoint. When `raft_shared` is set and
-/// the node is in cluster mode, also proposes `SurrogateAlloc { hwm }`
-/// to the metadata Raft group so followers advance their in-memory HWM.
-struct CombinedPersist<'a> {
-    catalog: &'a SystemCatalog,
-    wal_appender: &'a dyn SurrogateWalAppender,
-    /// Present when the Raft cluster is active; drives the Raft propose.
-    raft_shared: Option<&'a SharedState>,
-}
-
-impl SurrogateHwmPersist for CombinedPersist<'_> {
-    fn checkpoint(&self, hwm: u32) -> crate::Result<()> {
-        self.catalog.put_surrogate_hwm(hwm)?;
-        self.wal_appender.record_alloc_to_wal(hwm)?;
-        // Propose to Raft when in cluster mode so followers advance
-        // their in-memory HWM. Failure is non-fatal for the local
-        // write (which is already durable via the catalog and WAL);
-        // the follower will catch up on the next flush cycle or via
-        // snapshot. We log at warn so operators can detect systemic
-        // issues without breaking the local write path.
-        if let Some(shared) = self.raft_shared
-            && let Err(e) = crate::control::metadata_proposer::propose_surrogate_hwm(shared, hwm)
-        {
-            tracing::warn!(hwm, error = %e, "surrogate hwm raft propose failed; followers may lag");
-        }
-        Ok(())
-    }
-
-    fn load(&self) -> crate::Result<u32> {
-        self.catalog.get_surrogate_hwm()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::types::SurrogateAssigner;
+    use nodedb_types::{DatabaseId, Surrogate, TenantId};
+    use std::sync::{Arc, RwLock};
+
     use crate::control::security::credential::CredentialStore;
-    use crate::control::surrogate::wal_appender::NoopWalAppender;
+    use crate::control::surrogate::registry::SurrogateRegistry;
+    use crate::control::surrogate::wal_appender::{NoopWalAppender, SurrogateWalAppender};
 
     fn open_test() -> (tempfile::TempDir, Arc<SurrogateAssigner>) {
         let dir = tempfile::tempdir().unwrap();
