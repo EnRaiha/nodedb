@@ -7,7 +7,7 @@
 //! through to the standard sqlparser path. When the prefix matches, the
 //! parser commits — any further error is surfaced as `SqlError::Parse`.
 
-#[path = "parse_impl.rs"]
+#[path = "parse_impl/mod.rs"]
 mod parse_impl;
 
 use super::ast::ArrayStatement;
