@@ -141,6 +141,28 @@ pub(crate) fn encode_kv_incr_float(
     })
 }
 
+/// Encode a `kv_field_set` WAL payload: `("kv_field_set", collection, key,
+/// updates, surrogate)`.
+///
+/// Delta record: `updates` carries the field-level inputs, not the
+/// post-merge document. Replay re-reads whatever value is present in the KV
+/// engine at that point in LSN order and re-runs the same
+/// `merge_field_updates` computation the live handler uses, rather than
+/// trusting a captured post-image.
+pub(crate) fn encode_kv_field_set(
+    collection: &str,
+    key: &[u8],
+    updates: &[(String, Vec<u8>)],
+    surrogate: u32,
+) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(&("kv_field_set", collection, key, updates, surrogate)).map_err(|e| {
+        crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal kv field set: {e}"),
+        }
+    })
+}
+
 /// Encode a `kv_getset` WAL payload: `("kv_getset", collection, key,
 /// new_value, surrogate)`.
 pub(crate) fn encode_kv_getset(
@@ -279,17 +301,7 @@ pub fn wal_append_kv_op(
             updates,
             surrogate,
         } => {
-            let entry = zerompk::to_msgpack_vec(&(
-                "kv_field_set",
-                collection,
-                key,
-                updates,
-                surrogate.as_u32(),
-            ))
-            .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal kv field set: {e}"),
-            })?;
+            let entry = encode_kv_field_set(collection, key, updates, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Incr {
@@ -442,8 +454,8 @@ pub fn wal_append_kv_op(
 #[cfg(test)]
 mod tests {
     use super::{
-        KvTransferFields, encode_kv_cas, encode_kv_getset, encode_kv_incr_float, encode_kv_put,
-        encode_kv_transfer, encode_kv_transfer_item,
+        KvTransferFields, encode_kv_cas, encode_kv_field_set, encode_kv_getset,
+        encode_kv_incr_float, encode_kv_put, encode_kv_transfer, encode_kv_transfer_item,
     };
 
     #[test]
@@ -564,6 +576,24 @@ mod tests {
         assert_eq!(key, b"dmg");
         assert_eq!(delta, 3.125);
         assert_eq!(surrogate, 5);
+    }
+
+    #[test]
+    fn kv_field_set_encodes_updates_with_surrogate() {
+        let updates = vec![
+            ("score".to_string(), b"42".to_vec()),
+            ("name".to_string(), b"alice".to_vec()),
+        ];
+        let entry = encode_kv_field_set("players", b"p1", &updates, 11).unwrap();
+
+        let (disc, collection, key, decoded_updates, surrogate) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<(String, Vec<u8>)>, u32)>(&entry)
+                .unwrap();
+        assert_eq!(disc, "kv_field_set");
+        assert_eq!(collection, "players");
+        assert_eq!(key, b"p1");
+        assert_eq!(decoded_updates, updates);
+        assert_eq!(surrogate, 11);
     }
 
     #[test]

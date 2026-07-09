@@ -6,7 +6,8 @@
 //! `kv_transfer_item` delta-record replay (decode, tombstone gate, and
 //! mutation) lives in `wal_replay_kv_transfer.rs`. The `kv_cas` /
 //! `kv_incr_float` / `kv_getset` delta-record replay lives in
-//! `wal_replay_kv_atomic.rs`.
+//! `wal_replay_kv_atomic.rs`. The `kv_field_set` delta-record replay lives in
+//! `wal_replay_kv_field.rs`.
 
 use super::core_loop::CoreLoop;
 use std::sync::Arc;
@@ -229,12 +230,21 @@ impl CoreLoop {
                     continue;
                 }
 
-                // kv_field_set: ("kv_field_set", collection, key, updates)
-                // Not replayed: resolving the merge requires the pre-update
-                // document, and (unlike kv_transfer/kv_transfer_item) there is
-                // no delta-replay path for it. This falls through and the
-                // record is silently dropped for every WAL record shape, not
-                // just the autocommit path.
+                // kv_field_set (delta record, not a post-image): re-runs the
+                // same field merge against whatever value is present in this
+                // core's KV engine at this point in LSN order — see
+                // `wal_replay_kv_field.rs`.
+                if let Some(applied) = self.try_replay_kv_field_set(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
+                    continue;
+                }
             }
 
             if is_delete {
