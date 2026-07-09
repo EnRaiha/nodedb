@@ -186,6 +186,7 @@ fn autocommit_put(core: &mut Core) {
             index_text: true,
             user_roles: &[],
             enforce: true,
+            wal_lsn: None,
         },
     )
     .unwrap();

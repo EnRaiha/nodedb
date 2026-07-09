@@ -87,6 +87,13 @@ impl CoreLoop {
 
         let vector_id = index.len() as u32;
         index.insert_with_surrogate(vector.to_vec(), surrogate);
+        // Advance the checkpoint watermark with this transaction's WAL LSN so a
+        // later vector checkpoint records the write as absorbed; the redo replay
+        // (which carries the same enclosing record LSN) is then gated instead of
+        // appending a duplicate node.
+        if let Some(lsn) = dummy_task.wal_lsn() {
+            index.note_checkpoint_lsn(lsn.as_u64());
+        }
         // This is the direct primary-vector write path (VectorOp), not
         // the document auto-index cascade — it never populates
         // `vector_doc_map` (that reverse map is keyed by document id,

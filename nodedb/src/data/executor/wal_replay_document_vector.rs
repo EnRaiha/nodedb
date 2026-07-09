@@ -101,12 +101,15 @@ impl CoreLoop {
             // so a later delete can still find and soft-delete the node.
             let row_key = surrogate_to_doc_id(surrogate);
             let deltas = self.apply_point_put_vector_indexes(
-                database_id,
-                tenant_id,
-                &collection,
-                &row_key,
-                surrogate,
-                &value,
+                crate::data::executor::handlers::point::apply_put::VectorIndexPutParams {
+                    database_id,
+                    tid: tenant_id,
+                    collection: &collection,
+                    document_id: &row_key,
+                    surrogate,
+                    value: &value,
+                    wal_lsn: record_lsn,
+                },
             );
             if !deltas.is_empty() {
                 rebuilt += deltas.len();

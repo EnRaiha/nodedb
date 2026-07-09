@@ -187,6 +187,12 @@ impl CoreLoop {
         }
 
         let node_id = coll.insert_with_surrogate(vector.to_vec(), surrogate);
+        // Advance the checkpoint watermark so a later vector checkpoint records
+        // this write as absorbed; startup replay then skips the straddling WAL
+        // record instead of appending a duplicate node.
+        if let Some(lsn) = task.wal_lsn() {
+            coll.note_checkpoint_lsn(lsn.as_u64());
+        }
 
         // Step 4: update payload bitmap indexes.
         // If this panics (pure in-memory, should not happen), attempt rollback.

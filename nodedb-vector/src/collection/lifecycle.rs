@@ -87,6 +87,15 @@ pub struct VectorCollection {
     /// `nodedb_mem::CollectionArenaRegistry`. Used only for stats reporting;
     /// the actual arena pinning is handled externally.
     pub arena_index: Option<u32>,
+    /// Highest WAL LSN whose write is already reflected in this collection's
+    /// in-memory state. Persisted in the checkpoint so that startup WAL replay
+    /// can skip records the restored checkpoint already absorbed — the same
+    /// watermark discipline the timeseries engine applies via
+    /// `last_flushed_wal_lsn`. Advanced at each apply chokepoint (live and
+    /// replay) via [`Self::note_checkpoint_lsn`]. `0` means "no write recorded"
+    /// (a fresh collection or a legacy checkpoint predating this field), which
+    /// never gates replay.
+    pub(crate) checkpoint_wal_lsn: u64,
 }
 
 impl VectorCollection {
@@ -138,7 +147,28 @@ impl VectorCollection {
             quantization: VectorQuantization::default(),
             payload: PayloadIndexSet::default(),
             arena_index: None,
+            checkpoint_wal_lsn: 0,
         }
+    }
+
+    /// Advance the checkpoint watermark to `lsn` if it is higher than the
+    /// current value. Called at every apply chokepoint (live write and WAL
+    /// replay) with the WAL LSN of the applied write. `0` is ignored — an
+    /// unassigned LSN must never move the watermark, since a checkpoint stamped
+    /// with a stale-low value would fail to gate a straddling-segment replay.
+    pub fn note_checkpoint_lsn(&mut self, lsn: u64) {
+        if lsn > self.checkpoint_wal_lsn {
+            self.checkpoint_wal_lsn = lsn;
+        }
+    }
+
+    /// Highest WAL LSN already reflected in this collection's in-memory state.
+    ///
+    /// Startup replay skips any record whose `lsn <= checkpoint_wal_lsn()` for
+    /// this collection: the restored checkpoint already contains that write, so
+    /// re-applying it would append a duplicate HNSW node.
+    pub fn checkpoint_wal_lsn(&self) -> u64 {
+        self.checkpoint_wal_lsn
     }
 
     /// Create with a specific seed (for deterministic testing).

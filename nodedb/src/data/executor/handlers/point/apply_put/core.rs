@@ -49,6 +49,7 @@ impl CoreLoop {
             index_text,
             user_roles,
             enforce,
+            wal_lsn,
         } = params;
         // Evaluate generated columns before encoding.
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
@@ -400,12 +401,15 @@ impl CoreLoop {
         let spatial_inserts =
             self.apply_point_put_spatial(database_id, tid, collection, document_id, value);
         let vector_inserts = self.apply_point_put_vector_indexes(
-            database_id,
-            tid,
-            collection,
-            document_id,
-            surrogate,
-            value,
+            crate::data::executor::handlers::point::apply_put::VectorIndexPutParams {
+                database_id,
+                tid,
+                collection,
+                document_id,
+                surrogate,
+                value,
+                wal_lsn: wal_lsn.map(|l| l.as_u64()).unwrap_or(0),
+            },
         );
 
         Ok(PointPutOutcome {

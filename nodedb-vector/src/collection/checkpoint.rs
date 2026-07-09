@@ -92,6 +92,13 @@ pub(crate) struct CollectionSnapshot {
     /// Empty vec = no payload indexes (default, backward-compatible).
     #[serde(default)]
     pub payload_index_bytes: Vec<u8>,
+    /// Highest WAL LSN whose write is included in this checkpoint. Startup WAL
+    /// replay skips records at or below it for this collection so a
+    /// straddling-segment record already absorbed here is not re-applied.
+    /// `0` (default) on legacy checkpoints predating this field — those gate
+    /// nothing and replay everything, exactly as before.
+    #[serde(default)]
+    pub checkpoint_wal_lsn: u64,
 }
 
 #[derive(Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack)]
@@ -213,6 +220,7 @@ impl VectorCollection {
                     }
                 }
             },
+            checkpoint_wal_lsn: self.checkpoint_wal_lsn,
         };
         let msgpack = match zerompk::to_msgpack_vec(&snapshot) {
             Ok(bytes) => bytes,
@@ -402,6 +410,7 @@ impl VectorCollection {
                     .unwrap_or_default()
             },
             arena_index: None,
+            checkpoint_wal_lsn: snap.checkpoint_wal_lsn,
         }))
     }
 }
@@ -525,6 +534,51 @@ mod tests {
 
         let results = restored.search(&[25.0, 0.0, 0.0], 1, 64);
         assert_eq!(results[0].id, 25);
+    }
+
+    /// The checkpoint watermark (`checkpoint_wal_lsn`) must survive a
+    /// checkpoint round-trip: it is the value startup WAL replay gates on to
+    /// skip records the checkpoint already absorbed. A legacy checkpoint
+    /// predating the field decodes to `0` (via `#[serde(default)]`), which
+    /// gates nothing.
+    #[test]
+    fn checkpoint_roundtrip_preserves_wal_lsn() {
+        let mut coll = VectorCollection::new(
+            3,
+            HnswParams {
+                metric: DistanceMetric::L2,
+                ..HnswParams::default()
+            },
+        );
+        coll.insert(vec![1.0, 0.0, 0.0]);
+        coll.note_checkpoint_lsn(42);
+        assert_eq!(coll.checkpoint_wal_lsn(), 42);
+
+        let bytes = coll.checkpoint_to_bytes(None);
+        let restored = VectorCollection::from_checkpoint(&bytes, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.checkpoint_wal_lsn(),
+            42,
+            "checkpoint watermark must persist so replay can gate absorbed records"
+        );
+    }
+
+    /// `note_checkpoint_lsn` is monotonic and ignores `0` (an unassigned LSN
+    /// must never move the watermark, or a stale-low checkpoint would fail to
+    /// gate a straddling replay).
+    #[test]
+    fn note_checkpoint_lsn_is_monotonic_and_ignores_zero() {
+        let mut coll = VectorCollection::new(3, HnswParams::default());
+        coll.note_checkpoint_lsn(10);
+        assert_eq!(coll.checkpoint_wal_lsn(), 10);
+        coll.note_checkpoint_lsn(5); // lower — ignored
+        assert_eq!(coll.checkpoint_wal_lsn(), 10);
+        coll.note_checkpoint_lsn(0); // unassigned — ignored
+        assert_eq!(coll.checkpoint_wal_lsn(), 10);
+        coll.note_checkpoint_lsn(20); // higher — advances
+        assert_eq!(coll.checkpoint_wal_lsn(), 20);
     }
 
     /// Payload bitmap indexes registered on a vector-primary collection

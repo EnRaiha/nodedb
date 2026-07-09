@@ -197,6 +197,7 @@ impl CoreLoop {
                 index_text: true,
                 user_roles,
                 enforce: true,
+                wal_lsn: dummy_task.wal_lsn(),
             },
         ) {
             Ok(o) => o,

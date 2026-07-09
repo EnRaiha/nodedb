@@ -14,6 +14,21 @@ use crate::data::executor::doc_format;
 /// (`collection`, `field`, `doc_id`). Replaces a raw `(index_key, vector_id)`
 /// tuple so undo can restore/remove the reverse-lookup map symmetrically with
 /// the R-tree's `SpatialInsert`/`SpatialDelete` undo pattern.
+/// Inputs to `apply_point_put_vector_indexes` for one document write.
+///
+/// `wal_lsn` is the WAL LSN of the document write driving this indexing (`0`
+/// when unassigned); it advances each touched collection's checkpoint watermark
+/// and, on replay, gates a record the collection's checkpoint already absorbed.
+pub(in crate::data::executor) struct VectorIndexPutParams<'a> {
+    pub database_id: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub surrogate: nodedb_types::Surrogate,
+    pub value: &'a [u8],
+    pub wal_lsn: u64,
+}
+
 pub(in crate::data::executor) struct VectorIndexDelta {
     pub index_key: (nodedb_types::DatabaseId, crate::types::TenantId, String),
     pub vector_id: u32,
@@ -177,15 +192,25 @@ impl CoreLoop {
     /// vector is also recorded in `vector_doc_map` keyed by the hex surrogate
     /// row key, so `apply_point_delete` can soft-delete it when the owning
     /// document is removed (closing the vector-orphan leak).
+    /// `wal_lsn` is the WAL LSN of the document write driving this indexing
+    /// (`0` when unassigned). It advances each touched collection's checkpoint
+    /// watermark so a later vector checkpoint records that this document's
+    /// embedding is already indexed; on WAL replay the same value gates a
+    /// straddling-segment record — a field whose collection already absorbed
+    /// this LSN is skipped rather than re-appended as a duplicate HNSW node.
     pub(in crate::data::executor) fn apply_point_put_vector_indexes(
         &mut self,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        document_id: &str,
-        surrogate: nodedb_types::Surrogate,
-        value: &[u8],
+        params: VectorIndexPutParams<'_>,
     ) -> Vec<VectorIndexDelta> {
+        let VectorIndexPutParams {
+            database_id,
+            tid,
+            collection,
+            document_id,
+            surrogate,
+            value,
+            wal_lsn,
+        } = params;
         let mut inserts: Vec<VectorIndexDelta> = Vec::new();
 
         // Vector index: if the strict schema declares Vector(dim) columns,
@@ -226,12 +251,19 @@ impl CoreLoop {
                                 .or_insert_with(|| {
                                     nodedb_vector::VectorCollection::new(*dim as usize, params)
                                 });
+                            // Skip a straddling-segment record the restored
+                            // checkpoint already absorbed (replay only; a live
+                            // write always carries a higher, unseen LSN).
+                            if wal_lsn != 0 && wal_lsn <= coll.checkpoint_wal_lsn() {
+                                continue;
+                            }
                             // Bind the vector node to the document's global
                             // surrogate so cross-engine identity holds: a search
                             // hit resolves back to this row's surrogate (and
                             // thus its user PK at the response boundary) instead
                             // of leaking a headless local node id.
                             let vector_id = coll.insert_with_surrogate(floats, surrogate);
+                            coll.note_checkpoint_lsn(wal_lsn);
                             self.vector_doc_map.insert(
                                 (
                                     index_key.0,
@@ -319,12 +351,19 @@ impl CoreLoop {
                                 .or_insert_with(|| {
                                     nodedb_vector::VectorCollection::new(floats.len(), params)
                                 });
+                            // Skip a straddling-segment record the restored
+                            // checkpoint already absorbed (replay only; a live
+                            // write always carries a higher, unseen LSN).
+                            if wal_lsn != 0 && wal_lsn <= coll.checkpoint_wal_lsn() {
+                                continue;
+                            }
                             // Bind the vector node to the document's global
                             // surrogate so cross-engine identity holds: a search
                             // hit resolves back to this row's surrogate (and
                             // thus its user PK at the response boundary) instead
                             // of leaking a headless local node id.
                             let vector_id = coll.insert_with_surrogate(floats, surrogate);
+                            coll.note_checkpoint_lsn(wal_lsn);
                             self.vector_doc_map.insert(
                                 (
                                     store_key.0,

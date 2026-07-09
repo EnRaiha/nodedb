@@ -36,6 +36,13 @@ pub(in crate::data::executor) struct PointPutParams<'a> {
     /// commit phase), so re-running enforcement here would double-check
     /// already-accepted writes.
     pub enforce: bool,
+    /// WAL LSN the Control Plane allocated for this write (`None` for writes
+    /// with no threaded LSN — e.g. some internal/materialization paths). Used
+    /// to advance the checkpoint watermark of any secondary vector index this
+    /// document feeds, so startup WAL replay can skip a straddling-segment
+    /// record the vector checkpoint already absorbed. On the replay paths this
+    /// carries the record's own LSN.
+    pub wal_lsn: Option<crate::types::Lsn>,
 }
 
 /// Capture of the mutations an [`CoreLoop::apply_point_put`](crate::data::executor::core_loop::CoreLoop::apply_point_put)

@@ -94,6 +94,7 @@ impl CoreLoop {
                     &collection,
                     surrogate_u32,
                     &value,
+                    record_lsn,
                 ) {
                     puts += 1;
                 }
@@ -137,6 +138,7 @@ impl CoreLoop {
         collection: &str,
         surrogate_u32: u32,
         value: &[u8],
+        record_lsn: u64,
     ) -> bool {
         let surrogate = Surrogate::new(surrogate_u32);
         let row_key = surrogate_to_doc_id(surrogate);
@@ -164,6 +166,7 @@ impl CoreLoop {
                 index_text: true,
                 user_roles: &[],
                 enforce: false,
+                wal_lsn: (record_lsn != 0).then(|| crate::types::Lsn::new(record_lsn)),
             },
         ) {
             Ok(_) => match txn.commit() {
@@ -499,15 +502,15 @@ mod tests {
         );
     }
 
-    /// LOUD: Vector Insert is NOT idempotent under double full-replay. The redo
-    /// path reuses `replay_vector_wal` verbatim, and the underlying
-    /// `VectorCollection::insert` appends a fresh HNSW node each call without
-    /// deduping — so replaying the same insert twice leaves TWO copies. This is
-    /// identical to the pre-existing standalone vector replay and is safe in
-    /// practice because crash recovery replays the WAL exactly once per boot;
-    /// this test pins the known behavior rather than asserting convergence.
+    /// The raw engine op `VectorCollection::insert` is still append-only (it
+    /// never dedups), but the per-collection checkpoint watermark now makes WAL
+    /// replay itself idempotent: `replay_vector_wal` records the applied LSN on
+    /// the collection and skips any record at or below it. Replaying the exact
+    /// same redo record (LSN 1) twice therefore leaves ONE copy, not two —
+    /// closing the straddling-segment duplication where a checkpoint that
+    /// already absorbed a write is replayed on top of on the next boot.
     #[test]
-    fn redo_vector_insert_duplicates_on_double_replay() {
+    fn redo_vector_insert_idempotent_on_double_replay() {
         let mut h = make_core();
         let record = redo_record(7, 0, vec![vector_put_sub("emb", vec![1.0, 2.0, 3.0])]);
         let tomb = nodedb_wal::TombstoneSet::new();
@@ -521,8 +524,9 @@ mod tests {
         let len = h.core.vector_collections.get(&key).map(|c| c.len());
         assert_eq!(
             len,
-            Some(2),
-            "vector insert is append-only on replay: double replay duplicates (known, single-pass-safe)"
+            Some(1),
+            "checkpoint-LSN gate makes replay idempotent: a record at or below the \
+             collection's recorded watermark is skipped on re-replay"
         );
     }
 

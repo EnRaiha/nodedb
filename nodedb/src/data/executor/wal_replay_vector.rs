@@ -200,6 +200,24 @@ impl CoreLoop {
                         );
                         continue;
                     }
+                    // Checkpoint watermark gate: a restored checkpoint already
+                    // contains every write at or below its `checkpoint_wal_lsn`.
+                    // Re-applying a straddling-segment record would append a
+                    // duplicate HNSW node (`insert_with_surrogate` never dedups),
+                    // so skip it. Records above the watermark are the WAL tail
+                    // the checkpoint has not yet absorbed and must replay.
+                    let insert_index_key = CoreLoop::vector_index_key(
+                        database_id,
+                        tenant_id,
+                        &collection,
+                        &field_name,
+                    );
+                    if let Some(existing) = self.vector_collections.get(&insert_index_key)
+                        && record_lsn <= existing.checkpoint_wal_lsn()
+                    {
+                        skipped += 1;
+                        continue;
+                    }
                     let surrogate = nodedb_types::Surrogate::new(surrogate_u32);
                     // Local replay rebinds by the carried surrogate; the
                     // compat doc-id slot (always `None` on this write path)
@@ -245,6 +263,12 @@ impl CoreLoop {
                         skipped += 1;
                         continue;
                     }
+                    // Advance the (possibly freshly created) collection's
+                    // watermark so the next checkpoint records this replayed
+                    // write and a subsequent restart does not re-apply it.
+                    if let Some(coll) = self.vector_collections.get_mut(&insert_index_key) {
+                        coll.note_checkpoint_lsn(record_lsn);
+                    }
                     inserted += 1;
                 } else if let Ok((collection, vector, dim, field_name, doc_id)) =
                     zerompk::from_msgpack::<(String, Vec<f32>, usize, String, Option<String>)>(
@@ -271,6 +295,13 @@ impl CoreLoop {
                         &collection,
                         &field_name,
                     );
+                    // Checkpoint watermark gate (see the surrogate arm above).
+                    if let Some(existing) = self.vector_collections.get(&index_key)
+                        && record_lsn <= existing.checkpoint_wal_lsn()
+                    {
+                        skipped += 1;
+                        continue;
+                    }
                     let params = self
                         .vector_params
                         .get(&index_key)
@@ -303,6 +334,7 @@ impl CoreLoop {
                     // local-id-only and bind to `Surrogate::ZERO`.
                     let _ = doc_id;
                     index.insert_with_surrogate(vector, nodedb_types::Surrogate::ZERO);
+                    index.note_checkpoint_lsn(record_lsn);
                     inserted += 1;
                 } else if let Ok((collection, vector, dim)) =
                     zerompk::from_msgpack::<(String, Vec<f32>, usize)>(&record.payload)
@@ -323,6 +355,13 @@ impl CoreLoop {
                     }
                     let index_key =
                         CoreLoop::vector_index_key(database_id, tenant_id, &collection, "");
+                    // Checkpoint watermark gate (see the surrogate arm above).
+                    if let Some(existing) = self.vector_collections.get(&index_key)
+                        && record_lsn <= existing.checkpoint_wal_lsn()
+                    {
+                        skipped += 1;
+                        continue;
+                    }
                     let params = self
                         .vector_params
                         .get(&index_key)
@@ -350,6 +389,7 @@ impl CoreLoop {
                         continue;
                     }
                     index.insert(vector);
+                    index.note_checkpoint_lsn(record_lsn);
                     inserted += 1;
                 } else if let Ok((collection, vectors, dim)) =
                     zerompk::from_msgpack::<(String, Vec<Vec<f32>>, usize)>(&record.payload)
@@ -360,6 +400,13 @@ impl CoreLoop {
                     }
                     let index_key =
                         CoreLoop::vector_index_key(database_id, tenant_id, &collection, "");
+                    // Checkpoint watermark gate (see the surrogate arm above).
+                    if let Some(existing) = self.vector_collections.get(&index_key)
+                        && record_lsn <= existing.checkpoint_wal_lsn()
+                    {
+                        skipped += 1;
+                        continue;
+                    }
                     let params = self
                         .vector_params
                         .get(&index_key)
@@ -379,6 +426,7 @@ impl CoreLoop {
                     for vector in vectors {
                         index.insert(vector);
                     }
+                    index.note_checkpoint_lsn(record_lsn);
                     inserted += 1;
                 }
             } else if is_vector_delete {
@@ -477,5 +525,158 @@ impl CoreLoop {
                 "WAL vector replay complete"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::vector::collection::VectorCollection;
+    use crate::engine::vector::hnsw::HnswParams;
+    use std::sync::Arc;
+
+    /// Holds the bridge endpoints + tempdir alive for the core's lifetime. The
+    /// tests drive `replay_vector_wal` directly and never tick the event loop,
+    /// so the far ends are unused — they just must not be dropped.
+    struct CoreHarness {
+        core: CoreLoop,
+        _req_tx: nodedb_bridge::buffer::Producer<crate::bridge::dispatch::BridgeRequest>,
+        _resp_rx: nodedb_bridge::buffer::Consumer<crate::bridge::dispatch::BridgeResponse>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn make_core() -> CoreHarness {
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+        use nodedb_bridge::buffer::RingBuffer;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("open core");
+        CoreHarness {
+            core,
+            _req_tx: req_tx,
+            _resp_rx: resp_rx,
+            _dir: dir,
+        }
+    }
+
+    /// A bare (unfielded) `VectorPut` WAL record at `lsn` — decodes through the
+    /// 3-element replay arm.
+    fn vector_put_record(
+        lsn: u64,
+        tenant_id: u64,
+        collection: &str,
+        vector: Vec<f32>,
+    ) -> nodedb_wal::WalRecord {
+        let dim = vector.len();
+        let payload =
+            zerompk::to_msgpack_vec(&(collection, vector, dim)).expect("encode vector put");
+        nodedb_wal::WalRecord::new(nodedb_wal::record::WalRecordArgs {
+            record_type: nodedb_wal::record::RecordType::VectorPut as u32,
+            lsn,
+            tenant_id,
+            vshard_id: 0,
+            database_id: 0,
+            payload,
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("wal record")
+    }
+
+    /// Simulate `load_vector_checkpoints` restoring a checkpoint that already
+    /// contains one vector, stamped with watermark `lsn`.
+    fn restore_checkpoint(
+        core: &mut CoreLoop,
+        tenant_id: u64,
+        collection: &str,
+        vector: Vec<f32>,
+        lsn: u64,
+    ) {
+        let dim = vector.len();
+        let mut coll = VectorCollection::new(dim, HnswParams::default());
+        coll.insert(vector);
+        coll.note_checkpoint_lsn(lsn);
+        let key = CoreLoop::vector_index_key(0, tenant_id, collection, "");
+        core.vector_collections.insert(key, coll);
+    }
+
+    fn coll_len(core: &CoreLoop, tenant_id: u64, collection: &str) -> Option<usize> {
+        let key = CoreLoop::vector_index_key(0, tenant_id, collection, "");
+        core.vector_collections.get(&key).map(|c| c.len())
+    }
+
+    /// The regression: a WAL record at LSN N whose write the restored checkpoint
+    /// (watermark N) already absorbed must NOT be replayed — otherwise the
+    /// straddling segment's record appends a duplicate HNSW node. Before the
+    /// checkpoint-LSN gate this left TWO copies.
+    #[test]
+    fn straddling_record_not_reapplied_over_checkpoint() {
+        let mut h = make_core();
+        restore_checkpoint(&mut h.core, 7, "emb", vec![1.0, 2.0, 3.0], 10);
+        let rec = vector_put_record(10, 7, "emb", vec![1.0, 2.0, 3.0]);
+        h.core.replay_vector_wal(
+            std::slice::from_ref(&rec),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        assert_eq!(
+            coll_len(&h.core, 7, "emb"),
+            Some(1),
+            "a record at/below the restored checkpoint watermark must be skipped exactly once"
+        );
+    }
+
+    /// A record above the restored watermark is the genuine WAL tail the
+    /// checkpoint has not absorbed and MUST replay.
+    #[test]
+    fn record_above_watermark_still_replays() {
+        let mut h = make_core();
+        restore_checkpoint(&mut h.core, 7, "emb", vec![1.0, 2.0, 3.0], 10);
+        let rec = vector_put_record(11, 7, "emb", vec![4.0, 5.0, 6.0]);
+        h.core.replay_vector_wal(
+            std::slice::from_ref(&rec),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        assert_eq!(
+            coll_len(&h.core, 7, "emb"),
+            Some(2),
+            "a record above the watermark is the WAL tail and must replay"
+        );
+    }
+
+    /// A checkpoint restored for collection A must not suppress replay of a
+    /// record for collection B, even when B's record LSN is below A's watermark.
+    #[test]
+    fn checkpoint_watermark_is_per_collection() {
+        let mut h = make_core();
+        restore_checkpoint(&mut h.core, 7, "col_a", vec![1.0, 2.0, 3.0], 10);
+        // Collection B has no checkpoint; its record at LSN 5 (below A's
+        // watermark of 10) must still replay.
+        let rec = vector_put_record(5, 7, "col_b", vec![7.0, 8.0, 9.0]);
+        h.core.replay_vector_wal(
+            std::slice::from_ref(&rec),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        assert_eq!(
+            coll_len(&h.core, 7, "col_b"),
+            Some(1),
+            "collection A's watermark must not gate collection B's records"
+        );
+        assert_eq!(
+            coll_len(&h.core, 7, "col_a"),
+            Some(1),
+            "collection A must be untouched by B's replay"
+        );
     }
 }
