@@ -261,19 +261,46 @@ pub(crate) fn encode_kv_drop_index(collection: &str, field: &str) -> crate::Resu
     encode("drop index", &("kv_drop_index", collection, field))
 }
 
-/// Encode a `kv_incr` WAL payload: `("kv_incr", collection, key, delta,
-/// ttl_ms, surrogate)`.
+/// Encode a `kv_incr` WAL payload in the shape the KV replay path decodes.
+///
+/// With `expire_at_ms = None` this produces the historical six-element tuple
+/// `("kv_incr", collection, key, delta, ttl_ms, surrogate)` byte-for-byte —
+/// `ttl_ms == 0` means "preserve whatever TTL the key already had" (see
+/// `atomic_put`'s preserve branch), and there is no clock-derived instant to
+/// carry for that case. With `Some(instant)` it appends the resolved
+/// absolute expiry as a seventh element, the same additive trailing-field
+/// convention `encode_kv_put` uses — recorded only when the live write's
+/// `ttl_ms > 0`, so replay installs the exact instant the Control Plane
+/// resolved instead of recomputing `now_ms + ttl_ms` (which would drift by
+/// the crash-to-restart delay). Both shapes are genuinely produced in
+/// production (one per `ttl_ms` case), so replay must decode both; zerompk's
+/// strict array-length check means the two never alias.
 pub(crate) fn encode_kv_incr(
     collection: &str,
     key: &[u8],
     delta: i64,
     ttl_ms: u64,
     surrogate: u32,
+    expire_at_ms: Option<u64>,
 ) -> crate::Result<Vec<u8>> {
-    encode(
-        "incr",
-        &("kv_incr", collection, key, delta, ttl_ms, surrogate),
-    )
+    match expire_at_ms {
+        None => encode(
+            "incr",
+            &("kv_incr", collection, key, delta, ttl_ms, surrogate),
+        ),
+        Some(expire_at_ms) => encode(
+            "incr",
+            &(
+                "kv_incr",
+                collection,
+                key,
+                delta,
+                ttl_ms,
+                surrogate,
+                expire_at_ms,
+            ),
+        ),
+    }
 }
 
 /// Fields of a `kv_register_sorted_index` WAL payload, bundled so
@@ -327,7 +354,7 @@ pub(crate) fn encode_kv_truncate(collection: &str) -> crate::Result<Vec<u8>> {
 mod tests {
     use super::{
         KvTransferFields, encode_kv_batch_put, encode_kv_cas, encode_kv_expire,
-        encode_kv_field_set, encode_kv_getset, encode_kv_incr_float, encode_kv_put,
+        encode_kv_field_set, encode_kv_getset, encode_kv_incr, encode_kv_incr_float, encode_kv_put,
         encode_kv_register_index, encode_kv_transfer, encode_kv_transfer_item,
     };
 
@@ -562,6 +589,55 @@ mod tests {
         assert_eq!(key, b"tok2");
         assert_eq!(ttl_ms, 0);
         assert_eq!(expire_at_ms, 1_234);
+    }
+
+    #[test]
+    fn kv_incr_without_expire_at_matches_historical_shape() {
+        let entry = encode_kv_incr("counters", b"hits", 3, 0, 7, None).unwrap();
+
+        // Byte-identical to the historical six-element tuple encoding.
+        let expected =
+            zerompk::to_msgpack_vec(&("kv_incr", "counters", b"hits", 3i64, 0u64, 7u32)).unwrap();
+        assert_eq!(entry, expected);
+
+        let (disc, collection, key, delta, ttl_ms, surrogate) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, i64, u64, u32)>(&entry).unwrap();
+        assert_eq!(disc, "kv_incr");
+        assert_eq!(collection, "counters");
+        assert_eq!(key, b"hits");
+        assert_eq!(delta, 3);
+        assert_eq!(ttl_ms, 0);
+        assert_eq!(surrogate, 7);
+    }
+
+    #[test]
+    fn kv_incr_with_expire_at_carries_absolute_instant() {
+        let entry = encode_kv_incr(
+            "counters",
+            b"daily",
+            1,
+            86_400_000,
+            9,
+            Some(1_700_000_000_000),
+        )
+        .unwrap();
+
+        let (disc, collection, key, delta, ttl_ms, surrogate, expire_at_ms) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, i64, u64, u32, u64)>(&entry).unwrap();
+        assert_eq!(disc, "kv_incr");
+        assert_eq!(collection, "counters");
+        assert_eq!(key, b"daily");
+        assert_eq!(delta, 1);
+        assert_eq!(ttl_ms, 86_400_000);
+        assert_eq!(surrogate, 9);
+        assert_eq!(expire_at_ms, 1_700_000_000_000);
+
+        // The historical six-element decode rejects the extended payload
+        // (strict array-length check), so the two shapes never alias.
+        assert!(
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, i64, u64, u32)>(&entry).is_err(),
+            "extended payload must not decode as the six-element tuple"
+        );
     }
 
     #[test]

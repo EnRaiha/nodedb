@@ -43,10 +43,11 @@ impl CoreLoop {
             return self.response_error(task, ErrorCode::ResourcesExhausted);
         }
 
-        let now_ms: u64 = self
-            .epoch_system_ms
-            .map(|ms| ms as u64)
-            .unwrap_or_else(current_ms);
+        // `Incr` carries a TTL that installs a new absolute `expire_at_ms`
+        // when `ttl_ms > 0` (see `atomic_put`), so the live-installed instant
+        // must be the same one `wal_append_kv_op` resolved and recorded —
+        // see `CoreLoop::kv_ttl_now_ms` for the precedence this resolves.
+        let now_ms: u64 = self.kv_ttl_now_ms(task);
         match self.kv_engine.incr(
             crate::engine::kv::AtomicKeyCtx {
                 database_id: did,

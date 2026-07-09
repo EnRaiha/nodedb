@@ -64,12 +64,54 @@ impl KvEngine {
         delta: i64,
         ttl_ms: u64,
     ) -> Result<i64, AtomicError> {
+        self.incr_resolved(ctx, delta, ttl_ms, None)
+    }
+
+    /// Atomically increment an i64 value by `delta`, installing an
+    /// already-resolved absolute `expire_at_ms` instant instead of deriving
+    /// one as `now_ms + ttl_ms`.
+    ///
+    /// Only meaningful when `ttl_ms > 0` — WAL redo replay uses this so a
+    /// TTL'd `INCR`'s expiry recovers with the exact instant the original
+    /// write computed, rather than recomputing `now_ms + ttl_ms` at recovery
+    /// time (which would push expiry forward by the crash-to-restart delay).
+    /// When `ttl_ms == 0`, `expire_at_ms` is ignored and the existing TTL is
+    /// preserved, exactly as [`incr`] preserves it.
+    ///
+    /// [`incr`]: KvEngine::incr
+    pub fn incr_with_absolute_expiry(
+        &mut self,
+        ctx: AtomicKeyCtx<'_>,
+        delta: i64,
+        ttl_ms: u64,
+        expire_at_ms: u64,
+    ) -> Result<i64, AtomicError> {
+        self.incr_resolved(ctx, delta, ttl_ms, Some(expire_at_ms))
+    }
+
+    /// Shared INCR body: computes the new value, then installs it via
+    /// `atomic_put` with an optional resolved-expiry override. `expire_override`
+    /// is only consulted when `ttl_ms > 0` — see `atomic_put`'s doc comment.
+    fn incr_resolved(
+        &mut self,
+        ctx: AtomicKeyCtx<'_>,
+        delta: i64,
+        ttl_ms: u64,
+        expire_override: Option<u64>,
+    ) -> Result<i64, AtomicError> {
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
         let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
         let (new_i64, new_bytes) = compute::incr(current.as_deref(), delta)?;
-        self.atomic_put(ctx, tkey, &new_bytes, ttl_ms, current.is_none());
+        self.atomic_put(
+            ctx,
+            tkey,
+            &new_bytes,
+            ttl_ms,
+            current.is_none(),
+            expire_override,
+        );
 
         Ok(new_i64)
     }
@@ -87,7 +129,7 @@ impl KvEngine {
         let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
         let (new_f64, new_bytes) = compute::incr_float(current.as_deref(), delta)?;
         // incr_float always preserves existing TTL (ttl_ms = 0).
-        self.atomic_put(ctx, tkey, &new_bytes, 0, current.is_none());
+        self.atomic_put(ctx, tkey, &new_bytes, 0, current.is_none(), None);
 
         Ok(new_f64)
     }
@@ -106,7 +148,7 @@ impl KvEngine {
         let (matches, write_bytes) = compute::cas(current.as_deref(), expected, new_value);
 
         if matches {
-            self.atomic_put(ctx, tkey, &write_bytes, 0, current.is_none());
+            self.atomic_put(ctx, tkey, &write_bytes, 0, current.is_none(), None);
             CasResult {
                 success: true,
                 current_value: current,
@@ -130,7 +172,7 @@ impl KvEngine {
         let write_bytes = compute::getset(old.as_deref(), new_value);
 
         // GetSet preserves existing TTL (ttl_ms = 0).
-        self.atomic_put(ctx, tkey, &write_bytes, 0, old.is_none());
+        self.atomic_put(ctx, tkey, &write_bytes, 0, old.is_none(), None);
         old
     }
 
@@ -157,8 +199,14 @@ impl KvEngine {
 
     /// Internal helper: put a value into the hash table, handling TTL and expiry.
     ///
-    /// If `ttl_ms == 0`, preserves the existing TTL on an existing key.
-    /// If `ttl_ms > 0`, sets/resets TTL. If key is new and `ttl_ms == 0`, no TTL.
+    /// If `ttl_ms == 0`, preserves the existing TTL on an existing key —
+    /// `expire_override` is ignored entirely in this case, so a caller that
+    /// passes `Some(..)` alongside `ttl_ms == 0` cannot accidentally install
+    /// an absolute instant into the preserve branch.
+    /// If `ttl_ms > 0`, installs `expire_override` verbatim when given
+    /// (WAL redo replay uses this so a TTL survives crash-restart with the
+    /// exact instant the original write resolved), otherwise derives
+    /// `now_ms + ttl_ms` the way a live write does.
     fn atomic_put(
         &mut self,
         ctx: AtomicKeyCtx<'_>,
@@ -166,6 +214,7 @@ impl KvEngine {
         value: &[u8],
         ttl_ms: u64,
         is_new_key: bool,
+        expire_override: Option<u64>,
     ) {
         let AtomicKeyCtx {
             database_id,
@@ -184,8 +233,9 @@ impl KvEngine {
 
         // Determine the target expire_at.
         let expire_at = if ttl_ms > 0 {
-            // Explicit TTL: set/reset.
-            now_ms + ttl_ms
+            // Explicit TTL: install the caller-resolved absolute instant if
+            // given (replay), otherwise derive it live.
+            expire_override.unwrap_or(now_ms + ttl_ms)
         } else if let Some(ref meta) = old_meta {
             // Existing key, preserve TTL.
             meta.expire_at_ms
@@ -375,6 +425,51 @@ mod tests {
         let ttl = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
         assert!(ttl.is_some());
         assert!(ttl.unwrap() > 0);
+    }
+
+    #[test]
+    fn incr_with_absolute_expiry_installs_recorded_instant_not_now_plus_ttl() {
+        let mut engine = make_engine();
+        // now_ms in `ctx()` is 1000; a live derivation would install
+        // 1000 + 5000 = 6000. Passing an explicit absolute instant must
+        // override that derivation entirely.
+        engine
+            .incr_with_absolute_expiry(ctx("counters", b"daily"), 1, 5_000, 1_000_000)
+            .unwrap();
+        let ttl = engine.get_ttl_ms(0, 1, "counters", b"daily", 1000);
+        assert_eq!(
+            ttl,
+            Some(1_000_000 - 1000),
+            "must install the caller-supplied absolute instant verbatim, not now_ms + ttl_ms"
+        );
+    }
+
+    #[test]
+    fn incr_with_absolute_expiry_and_zero_ttl_still_preserves_existing_expiry() {
+        let mut engine = make_engine();
+        let bytes = zerompk::to_msgpack_vec(&50i64).unwrap();
+        engine.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "counters",
+            key: b"temp",
+            value: &bytes,
+            ttl_ms: 5000,
+            now_ms: 1000,
+            surrogate: Surrogate::ZERO,
+        });
+        let ttl_before = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
+
+        // ttl_ms == 0 must ignore the supplied absolute instant and preserve
+        // the existing expiry exactly as `incr` does.
+        engine
+            .incr_with_absolute_expiry(ctx("counters", b"temp"), 10, 0, 999_999_999)
+            .unwrap();
+        let ttl_after = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
+        assert_eq!(
+            ttl_before, ttl_after,
+            "ttl_ms == 0 must preserve the existing expiry, ignoring expire_override"
+        );
     }
 
     #[test]

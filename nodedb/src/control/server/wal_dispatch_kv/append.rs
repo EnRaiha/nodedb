@@ -167,7 +167,16 @@ pub fn wal_append_kv_op(
             ttl_ms,
             surrogate,
         } => {
-            let entry = encode_kv_incr(collection, key, *delta, *ttl_ms, surrogate.as_u32())?;
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
+            resolved_now_ms = now_ms;
+            let entry = encode_kv_incr(
+                collection,
+                key,
+                *delta,
+                *ttl_ms,
+                surrogate.as_u32(),
+                expire_at_ms,
+            )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::IncrFloat {

@@ -288,6 +288,22 @@ impl CoreLoop {
                     puts += applied;
                     continue;
                 }
+
+                // kv_incr (delta record, not a post-image): re-runs the same
+                // integer increment against whatever value is present in
+                // this core's KV engine at this point in LSN order — see
+                // `wal_replay_kv_incr.rs`.
+                if let Some(applied) = self.try_replay_kv_incr(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
+                    continue;
+                }
             }
 
             if is_delete {
