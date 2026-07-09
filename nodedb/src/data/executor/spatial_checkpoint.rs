@@ -57,7 +57,7 @@ impl CoreLoop {
             return 0;
         }
 
-        let kek = self.spatial_checkpoint_kek.as_ref();
+        let kek = self.segment_keks.spatial_checkpoint_kek.as_ref();
 
         let mut checkpointed = 0;
         for ((db, tid, coll, field), rtree) in &self.spatial_indexes {
@@ -164,7 +164,7 @@ impl CoreLoop {
                 continue;
             };
 
-            let kek = self.spatial_checkpoint_kek.as_ref();
+            let kek = self.segment_keks.spatial_checkpoint_kek.as_ref();
             let rtree = match crate::engine::spatial::RTree::from_checkpoint(&bytes, kek) {
                 Ok(r) => r,
                 Err(e) => {

@@ -43,7 +43,7 @@ impl CoreLoop {
             .iter()
             .filter_map(|(key, coll)| {
                 let checkpoint_bytes =
-                    coll.checkpoint_to_bytes(self.vector_checkpoint_kek.as_ref());
+                    coll.checkpoint_to_bytes(self.segment_keks.vector_checkpoint_kek.as_ref());
                 if checkpoint_bytes.is_empty() {
                     return None;
                 }

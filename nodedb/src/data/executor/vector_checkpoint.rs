@@ -103,7 +103,8 @@ impl CoreLoop {
             if collection.is_empty() {
                 continue;
             }
-            let bytes = collection.checkpoint_to_bytes(self.vector_checkpoint_kek.as_ref());
+            let bytes =
+                collection.checkpoint_to_bytes(self.segment_keks.vector_checkpoint_kek.as_ref());
             if bytes.is_empty() {
                 continue;
             }
@@ -174,7 +175,7 @@ impl CoreLoop {
             let Ok(bytes) = nodedb_wal::segment::read_checkpoint_dontneed(&path) else {
                 continue;
             };
-            let kek = self.vector_checkpoint_kek.as_ref();
+            let kek = self.segment_keks.vector_checkpoint_kek.as_ref();
             let load_result =
                 crate::engine::vector::collection::VectorCollection::from_checkpoint(&bytes, kek);
             let collection = match load_result {

@@ -12,10 +12,12 @@ mod open;
 pub(in crate::data::executor) mod pressure;
 pub(in crate::data::executor) mod priority_queues;
 mod response;
+mod segment_keks;
 mod state;
 #[cfg(test)]
 pub(crate) mod tests;
 mod tick;
 pub(in crate::data::executor) mod write_index;
 
+pub(in crate::data::executor) use segment_keks::SegmentKeks;
 pub use state::CoreLoop;

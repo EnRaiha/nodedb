@@ -75,7 +75,7 @@ impl CoreLoop {
     /// `checkpoint_vector_indexes` encrypts checkpoint files and
     /// `load_vector_checkpoints` refuses plaintext ones.
     pub fn set_vector_checkpoint_kek(&mut self, kek: nodedb_wal::crypto::WalEncryptionKey) {
-        self.vector_checkpoint_kek = Some(kek);
+        self.segment_keks.vector_checkpoint_kek = Some(kek);
     }
 
     /// Install the encryption key used for spatial checkpoint at-rest encryption.
@@ -83,7 +83,7 @@ impl CoreLoop {
     /// When set, `checkpoint_spatial_indexes` encrypts checkpoint files and
     /// `load_spatial_checkpoints` refuses plaintext ones.
     pub fn set_spatial_checkpoint_kek(&mut self, kek: nodedb_wal::crypto::WalEncryptionKey) {
-        self.spatial_checkpoint_kek = Some(kek);
+        self.segment_keks.spatial_checkpoint_kek = Some(kek);
     }
 
     /// Install the encryption key used for columnar segment at-rest encryption.
@@ -91,7 +91,7 @@ impl CoreLoop {
     /// When set, columnar segment flushes produce AES-256-GCM encrypted SEGC
     /// envelopes and the segment reader refuses to load plaintext segments.
     pub fn set_columnar_segment_kek(&mut self, kek: nodedb_wal::crypto::WalEncryptionKey) {
-        self.columnar_segment_kek = Some(kek);
+        self.segment_keks.columnar_segment_kek = Some(kek);
     }
 
     /// Install the encryption key used for array segment at-rest encryption.
@@ -100,7 +100,7 @@ impl CoreLoop {
     /// envelopes and the segment handle refuses to load plaintext segments.
     pub fn set_array_segment_kek(&mut self, kek: nodedb_wal::crypto::WalEncryptionKey) {
         self.array_engine.set_kek(kek.clone());
-        self.array_segment_kek = Some(kek);
+        self.segment_keks.array_segment_kek = Some(kek);
     }
 
     /// Returns the current SPSC drain batch size.
@@ -131,7 +131,7 @@ impl CoreLoop {
     /// When set, `flush_ts_collection` wraps each output file in a `SEGT`
     /// AES-256-GCM envelope and readers refuse to load plaintext segment files.
     pub fn set_ts_segment_kek(&mut self, kek: nodedb_wal::crypto::WalEncryptionKey) {
-        self.ts_segment_kek = Some(kek);
+        self.segment_keks.ts_segment_kek = Some(kek);
     }
 
     /// Install the shared quarantine registry.

@@ -317,7 +317,7 @@ impl CoreLoop {
             let flushed_surrogates: Vec<Option<nodedb_types::Surrogate>> =
                 engine.memtable_surrogates().to_vec();
             if row_count > 0 {
-                let kek = self.columnar_segment_kek.as_ref();
+                let kek = self.segment_keks.columnar_segment_kek.as_ref();
                 match nodedb_columnar::SegmentWriter::plain()
                     .write_segment(&schema, &columns, row_count, kek)
                 {
