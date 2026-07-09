@@ -58,8 +58,31 @@ pub enum RecordType {
 
     /// Atomic transaction: wraps multiple sub-records into a single WAL
     /// group. On replay, either all sub-records apply or none.
-    /// Payload: MessagePack-encoded `Vec<(record_type: u32, payload: Vec<u8>)>`.
+    /// Payload: MessagePack-encoded `Vec<(record_type: u16, payload: Vec<u8>)>`.
+    ///
+    /// The sub-record tag is written as a `u16` and hard-codes the generic
+    /// `Put` type for every sub-op, so replay cannot tell which engine each
+    /// sub-op targeted. This record is a durability placeholder only — it is
+    /// never replayed into any engine. `TransactionRedo` supersedes it for
+    /// replayable transaction groups.
     Transaction = 50 | 0x8000,
+
+    /// Redo-log transaction group: an ordered set of engine-native sub-records
+    /// committed as one durable unit and replayable into their engines.
+    ///
+    /// Unlike `Transaction`, each sub-record preserves its own engine
+    /// `record_type` as a `u32` tag (matching this header's `record_type`
+    /// width) and carries the exact payload that engine's per-op WAL record
+    /// uses, so replay reconstitutes a `WalRecord` per sub-op and feeds it to
+    /// that engine's existing replay path — no tag loss, no re-encoding.
+    ///
+    /// May also carry a Calvin stamp so a cross-shard transaction's durable
+    /// record doubles as its sequencer applied-marker.
+    /// Payload: zerompk-encoded `RedoRecord` (see the `wal::redo` module).
+    ///
+    /// Required: skipping this record on replay would drop a committed
+    /// transaction's writes, diverging from the leader's state.
+    TransactionRedo = 58 | 0x8000,
 
     /// Surrogate allocator: high-watermark flush record.
     ///
@@ -186,6 +209,7 @@ impl RecordType {
             x if x == 12 | 0x8000 => Some(Self::VectorParams),
             x if x == 20 | 0x8000 => Some(Self::CrdtDelta),
             x if x == 50 | 0x8000 => Some(Self::Transaction),
+            x if x == 58 | 0x8000 => Some(Self::TransactionRedo),
             x if x == 51 | 0x8000 => Some(Self::SurrogateAlloc),
             x if x == 52 | 0x8000 => Some(Self::SurrogateBind),
             30 => Some(Self::TimeseriesBatch),
@@ -227,6 +251,7 @@ mod tests {
         assert!(RecordType::is_required(RecordType::FtsDelete as u32));
         assert!(RecordType::is_required(RecordType::SpatialPut as u32));
         assert!(RecordType::is_required(RecordType::SpatialDelete as u32));
+        assert!(RecordType::is_required(RecordType::TransactionRedo as u32));
     }
 
     #[test]
@@ -245,6 +270,7 @@ mod tests {
             RecordType::ArrayDelete,
             RecordType::ArrayFlush,
             RecordType::Transaction,
+            RecordType::TransactionRedo,
             RecordType::SurrogateAlloc,
             RecordType::SurrogateBind,
             RecordType::Checkpoint,

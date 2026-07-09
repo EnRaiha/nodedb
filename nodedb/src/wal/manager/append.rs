@@ -88,6 +88,23 @@ impl WalManager {
         self.append_record(RecordType::Transaction, tid, vs, db, p)
     }
 
+    /// Append a `TransactionRedo` record wrapping an ordered set of
+    /// engine-native sub-records as one durable, replayable unit.
+    ///
+    /// The record is serialized here and appended atomically; the returned LSN
+    /// is the write's WAL position, which the caller uses to write-ahead the
+    /// transaction before installing its effects.
+    pub fn append_transaction_redo(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        record: &crate::wal::RedoRecord,
+    ) -> crate::Result<Lsn> {
+        let payload = record.to_bytes()?;
+        self.append_record(RecordType::TransactionRedo, tid, vs, db, &payload)
+    }
+
     pub fn append_crdt_delta(
         &self,
         tid: TenantId,

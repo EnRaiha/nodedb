@@ -54,6 +54,7 @@ pub fn replay_surrogate_records(
             | RecordType::ArrayDelete
             | RecordType::ArrayFlush
             | RecordType::Transaction
+            | RecordType::TransactionRedo
             | RecordType::Checkpoint
             | RecordType::CollectionTombstoned
             | RecordType::LsnMsAnchor

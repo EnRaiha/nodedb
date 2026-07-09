@@ -60,6 +60,50 @@ fn append_and_replay() {
 }
 
 #[test]
+fn append_transaction_redo_returns_monotonic_lsn() {
+    use crate::wal::{RedoRecord, RedoSubRecord};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wal_dir");
+
+    let wal = WalManager::open_for_testing(&path).unwrap();
+
+    let t = TenantId::new(3);
+    let v = VShardId::new(1);
+    let db = DatabaseId::DEFAULT;
+
+    let record = RedoRecord {
+        version: 1,
+        ops: vec![RedoSubRecord {
+            record_type: RecordType::Put as u32,
+            payload: vec![1, 2, 3],
+        }],
+        calvin_stamp: None,
+    };
+
+    let lsn1 = wal.append_transaction_redo(t, v, db, &record).unwrap();
+    let lsn2 = wal.append_transaction_redo(t, v, db, &record).unwrap();
+    let lsn3 = wal.append_transaction_redo(t, v, db, &record).unwrap();
+
+    assert_eq!(lsn1, Lsn::new(1));
+    assert_eq!(lsn2, Lsn::new(2));
+    assert_eq!(lsn3, Lsn::new(3));
+    assert!(lsn2 > lsn1);
+    assert!(lsn3 > lsn2);
+
+    wal.sync().unwrap();
+
+    let records = wal.replay().unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(
+        records[0].header.record_type,
+        RecordType::TransactionRedo as u32
+    );
+    let decoded = RedoRecord::from_bytes(&records[0].payload).unwrap();
+    assert_eq!(decoded, record);
+}
+
+#[test]
 fn crdt_delta_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wal_dir");

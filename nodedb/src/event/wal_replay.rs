@@ -142,6 +142,7 @@ fn record_to_event(record: &WalRecord, sequence: &mut u64) -> Option<WriteEvent>
         | RecordType::ArrayDelete
         | RecordType::ArrayFlush
         | RecordType::Transaction
+        | RecordType::TransactionRedo
         | RecordType::SurrogateAlloc
         | RecordType::SurrogateBind
         | RecordType::Checkpoint

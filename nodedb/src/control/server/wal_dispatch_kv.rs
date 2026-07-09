@@ -6,6 +6,34 @@ use crate::types::{DatabaseId, TenantId, VShardId};
 use crate::wal::manager::WalManager;
 use nodedb_physical::physical_plan::KvOp;
 
+/// Encode a `kv_put` WAL payload in the shape the KV replay path decodes.
+///
+/// With `expire_at_ms = None` this produces the historical five-element tuple
+/// `("kv_put", collection, key, value, ttl_ms)` byte-for-byte, so the autocommit
+/// path's on-disk format is unchanged. With `Some(instant)` it appends the
+/// resolved absolute expiry as a sixth element — an additive, trailing field a
+/// redo sub-record uses to carry the exact expiry instant, so replay need not
+/// recompute `now_ms + ttl_ms` (which would drift). Payloads without the sixth
+/// element remain valid; the relative `ttl_ms` is always retained.
+pub(crate) fn encode_kv_put(
+    collection: &str,
+    key: &[u8],
+    value: &[u8],
+    ttl_ms: u64,
+    expire_at_ms: Option<u64>,
+) -> crate::Result<Vec<u8>> {
+    let result = match expire_at_ms {
+        None => zerompk::to_msgpack_vec(&("kv_put", collection, key, value, ttl_ms)),
+        Some(expire_at_ms) => {
+            zerompk::to_msgpack_vec(&("kv_put", collection, key, value, ttl_ms, expire_at_ms))
+        }
+    };
+    result.map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal kv put: {e}"),
+    })
+}
+
 /// Serialize a KV operation and append to the WAL.
 ///
 /// Returns the appended write's WAL LSN (`Some`) for KV writes, or `None` for
@@ -25,11 +53,7 @@ pub fn wal_append_kv_op(
             ttl_ms,
             surrogate: _,
         } => {
-            let entry = zerompk::to_msgpack_vec(&("kv_put", collection, key, value, ttl_ms))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv put: {e}"),
-                })?;
+            let entry = encode_kv_put(collection, key, value, *ttl_ms, None)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Insert {
@@ -54,11 +78,7 @@ pub fn wal_append_kv_op(
             updates: _,
             surrogate: _,
         } => {
-            let entry = zerompk::to_msgpack_vec(&("kv_put", collection, key, value, ttl_ms))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal kv insert-like put: {e}"),
-                })?;
+            let entry = encode_kv_put(collection, key, value, *ttl_ms, None)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Delete { collection, keys } => {
@@ -291,4 +311,50 @@ pub fn wal_append_kv_op(
         | KvOp::MaterializeScan { .. } => None,
     };
     Ok(lsn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_kv_put;
+
+    #[test]
+    fn kv_put_without_expire_at_matches_historical_shape() {
+        let entry = encode_kv_put("users", b"k1", b"v1", 5_000, None).unwrap();
+
+        // Byte-identical to the historical five-element tuple encoding.
+        let expected =
+            zerompk::to_msgpack_vec(&("kv_put", "users", b"k1", b"v1", 5_000u64)).unwrap();
+        assert_eq!(entry, expected);
+
+        // Decodes with the KV replay path's five-element tuple.
+        let (disc, collection, key, value, ttl_ms) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&entry).unwrap();
+        assert_eq!(disc, "kv_put");
+        assert_eq!(collection, "users");
+        assert_eq!(key, b"k1");
+        assert_eq!(value, b"v1");
+        assert_eq!(ttl_ms, 5_000);
+    }
+
+    #[test]
+    fn kv_put_with_expire_at_carries_absolute_instant() {
+        let entry = encode_kv_put("users", b"k1", b"v1", 5_000, Some(1_700_000_000_000)).unwrap();
+
+        // The six-element tuple carries the resolved absolute expiry.
+        let (disc, collection, key, value, ttl_ms, expire_at_ms) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(&entry).unwrap();
+        assert_eq!(disc, "kv_put");
+        assert_eq!(collection, "users");
+        assert_eq!(key, b"k1");
+        assert_eq!(value, b"v1");
+        assert_eq!(ttl_ms, 5_000);
+        assert_eq!(expire_at_ms, 1_700_000_000_000);
+
+        // The historical five-element decode rejects the extended payload
+        // (strict array-length check), so the two shapes never alias.
+        assert!(
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&entry).is_err(),
+            "extended payload must not decode as the five-element tuple"
+        );
+    }
 }
