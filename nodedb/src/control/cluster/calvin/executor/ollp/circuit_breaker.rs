@@ -203,21 +203,18 @@ mod tests {
 
     #[test]
     fn circuit_breaker_half_opens_after_window() {
-        let mut cb = CircuitBreaker::new(
-            256,
-            Duration::from_secs(60),
-            50,
-            Duration::from_millis(1), // open_duration = 1ms
-            4,
-        );
+        // The open window must comfortably exceed the time it takes to force the
+        // breaker open, or the window elapses mid-setup under parallel test load
+        // and the breaker reads HalfOpen before the Open assertion runs.
+        const OPEN_WINDOW: Duration = Duration::from_millis(100);
+        let mut cb = CircuitBreaker::new(256, Duration::from_secs(60), 50, OPEN_WINDOW, 4);
         // Force open.
         for _ in 0..10 {
             cb.record_retry();
         }
         assert_eq!(cb.state(), CircuitState::Open);
 
-        // Wait > 1ms.
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(OPEN_WINDOW + Duration::from_millis(50));
 
         assert_eq!(cb.state(), CircuitState::HalfOpen);
     }
