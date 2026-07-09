@@ -131,6 +131,7 @@ pub async fn dispatch_to_data_plane_with_source(
             event_source,
             txn_id: None,
             wal_lsn: None,
+            resolved_now_ms: None,
         },
     )
     .await
@@ -143,7 +144,9 @@ pub async fn dispatch_to_data_plane_with_source(
 /// records the committed per-key / per-collection write version. The write's
 /// identity and LSN travel in a [`WriteDispatch`] to keep the argument list
 /// short; `wal_lsn` is `None` when the write was WAL-bypassed (e.g.
-/// `timeseries` `wal=false`).
+/// `timeseries` `wal=false`). `resolved_now_ms` carries the wall-clock instant
+/// the Control Plane resolved for a TTL-bearing KV write's `expire_at_ms` — see
+/// [`WriteDispatch::resolved_now_ms`].
 pub(crate) async fn dispatch_write_to_data_plane(
     shared: &SharedState,
     write: WriteDispatch,
@@ -157,6 +160,7 @@ pub(crate) async fn dispatch_write_to_data_plane(
         event_source,
         txn_id,
         wal_lsn,
+        resolved_now_ms,
     } = write;
     dispatch_to_data_plane_inner(
         shared,
@@ -169,6 +173,7 @@ pub(crate) async fn dispatch_write_to_data_plane(
             event_source,
             txn_id,
             wal_lsn,
+            resolved_now_ms,
         },
     )
     .await
@@ -186,6 +191,13 @@ pub(crate) struct WriteDispatch {
     pub event_source: crate::event::EventSource,
     pub txn_id: Option<crate::types::TxnId>,
     pub wal_lsn: Option<crate::types::Lsn>,
+    /// Wall-clock instant (ms since epoch) the Control Plane resolved at
+    /// WAL-append time for a TTL-bearing KV write's `expire_at_ms`. Stamped
+    /// onto the `Request` (same as `wal_lsn`) so the Data Plane installs the
+    /// SAME instant the durable WAL record carries instead of re-reading the
+    /// clock at apply time. `None` for reads, non-TTL writes, and writes whose
+    /// resolved instant is not (yet) threaded.
+    pub resolved_now_ms: Option<u64>,
 }
 
 /// Dispatch a physical plan to the Data Plane carrying an explicit transaction
@@ -214,6 +226,7 @@ pub async fn dispatch_to_data_plane_with_txn(
             // Staged in-transaction writes are not yet durably committed; the
             // committed write version is recorded at COMMIT via the batch funnel.
             wal_lsn: None,
+            resolved_now_ms: None,
         },
     )
     .await
@@ -233,6 +246,9 @@ struct DataPlaneDispatch {
     /// onto the `Request` so the Data Plane records the committed write
     /// version. `None` for reads and control ops.
     wal_lsn: Option<crate::types::Lsn>,
+    /// Resolved TTL instant, stamped onto the `Request` alongside `wal_lsn` —
+    /// see [`WriteDispatch::resolved_now_ms`].
+    resolved_now_ms: Option<u64>,
 }
 
 async fn dispatch_to_data_plane_inner(
@@ -248,6 +264,7 @@ async fn dispatch_to_data_plane_inner(
         event_source,
         txn_id,
         wal_lsn,
+        resolved_now_ms,
     } = params;
     // Resolve any Exchange data-movement nodes before dispatch: a root-level
     // Gather fans the child to all cores and returns the merged response here;
@@ -347,6 +364,7 @@ async fn dispatch_to_data_plane_inner(
         statement_digest: None,
         txn_id,
         wal_lsn,
+        resolved_now_ms,
         admission,
     };
 

@@ -496,6 +496,7 @@ mod tests {
             statement_digest: None,
             txn_id,
             wal_lsn: None,
+            resolved_now_ms: None,
             admission: Admission::Exempt(ExemptReason::Read),
         };
         ExecutionTask::new(request)

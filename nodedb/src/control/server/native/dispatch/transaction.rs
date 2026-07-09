@@ -78,6 +78,9 @@ impl TxnDataPlane for NativeTxnDp<'_> {
                             event_source: crate::event::EventSource::User,
                             txn_id: None,
                             wal_lsn,
+                            // Batch COMMIT record, not per-task WAL append — see
+                            // `dispatch_task_no_wal`'s equivalent limitation.
+                            resolved_now_ms: None,
                         },
                     )
                     .await

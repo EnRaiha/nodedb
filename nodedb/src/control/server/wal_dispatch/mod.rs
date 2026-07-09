@@ -9,7 +9,7 @@ mod core;
 mod timeseries;
 mod vector;
 
-pub use core::{wal_append_if_write, wal_append_if_write_with_creds};
+pub use core::{WalAppendOutcome, wal_append_if_write, wal_append_if_write_with_creds};
 pub use timeseries::{ColumnarWalAppendArgs, wal_append_columnar, wal_append_timeseries};
 pub use vector::{
     VectorDeleteWalArgs, VectorPutWalArgs, wal_append_vector_delete_by_surrogate,

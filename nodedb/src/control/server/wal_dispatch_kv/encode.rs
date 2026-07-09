@@ -176,14 +176,29 @@ pub(crate) fn encode_kv_delete(collection: &str, keys: &[Vec<u8>]) -> crate::Res
     encode("delete", &("kv_delete", collection, keys))
 }
 
-/// Encode a `kv_batch_put` WAL payload: `("kv_batch_put", collection,
-/// entries, ttl_ms)`.
+/// Encode a `kv_batch_put` WAL payload in the shape the KV replay path decodes.
+///
+/// With `expire_at_ms = None` this produces the historical four-element tuple
+/// `("kv_batch_put", collection, entries, ttl_ms)` byte-for-byte. With
+/// `Some(instant)` it appends the resolved absolute expiry as a fifth element
+/// — the same additive, trailing-field convention `encode_kv_put` uses — so
+/// replay installs the exact instant the Control Plane resolved instead of
+/// recomputing `now_ms + ttl_ms` at replay time (which would drift by the
+/// crash-to-restart delay). zerompk's strict array-length check means the two
+/// shapes never alias.
 pub(crate) fn encode_kv_batch_put(
     collection: &str,
     entries: &[(Vec<u8>, Vec<u8>)],
     ttl_ms: u64,
+    expire_at_ms: Option<u64>,
 ) -> crate::Result<Vec<u8>> {
-    encode("batch put", &("kv_batch_put", collection, entries, ttl_ms))
+    match expire_at_ms {
+        None => encode("batch put", &("kv_batch_put", collection, entries, ttl_ms)),
+        Some(expire_at_ms) => encode(
+            "batch put",
+            &("kv_batch_put", collection, entries, ttl_ms, expire_at_ms),
+        ),
+    }
 }
 
 /// Encode a `kv_expire` WAL payload: `("kv_expire", collection, key,
@@ -298,9 +313,9 @@ pub(crate) fn encode_kv_truncate(collection: &str) -> crate::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        KvTransferFields, encode_kv_cas, encode_kv_field_set, encode_kv_getset,
-        encode_kv_incr_float, encode_kv_put, encode_kv_register_index, encode_kv_transfer,
-        encode_kv_transfer_item,
+        KvTransferFields, encode_kv_batch_put, encode_kv_cas, encode_kv_field_set,
+        encode_kv_getset, encode_kv_incr_float, encode_kv_put, encode_kv_register_index,
+        encode_kv_transfer, encode_kv_transfer_item,
     };
 
     #[test]
@@ -341,6 +356,49 @@ mod tests {
         assert!(
             zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&entry).is_err(),
             "extended payload must not decode as the five-element tuple"
+        );
+    }
+
+    #[test]
+    fn kv_batch_put_without_expire_at_matches_historical_shape() {
+        let entries = vec![
+            (b"k1".to_vec(), b"v1".to_vec()),
+            (b"k2".to_vec(), b"v2".to_vec()),
+        ];
+        let entry = encode_kv_batch_put("users", &entries, 5_000, None).unwrap();
+
+        let expected =
+            zerompk::to_msgpack_vec(&("kv_batch_put", "users", &entries, 5_000u64)).unwrap();
+        assert_eq!(entry, expected);
+
+        let (disc, collection, decoded_entries, ttl_ms) =
+            zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(&entry).unwrap();
+        assert_eq!(disc, "kv_batch_put");
+        assert_eq!(collection, "users");
+        assert_eq!(decoded_entries, entries);
+        assert_eq!(ttl_ms, 5_000);
+    }
+
+    #[test]
+    fn kv_batch_put_with_expire_at_carries_absolute_instant() {
+        let entries = vec![
+            (b"k1".to_vec(), b"v1".to_vec()),
+            (b"k2".to_vec(), b"v2".to_vec()),
+        ];
+        let entry = encode_kv_batch_put("users", &entries, 5_000, Some(1_700_000_000_000)).unwrap();
+
+        let (disc, collection, decoded_entries, ttl_ms, expire_at_ms) =
+            zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64, u64)>(&entry)
+                .unwrap();
+        assert_eq!(disc, "kv_batch_put");
+        assert_eq!(collection, "users");
+        assert_eq!(decoded_entries, entries);
+        assert_eq!(ttl_ms, 5_000);
+        assert_eq!(expire_at_ms, 1_700_000_000_000);
+
+        assert!(
+            zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(&entry).is_err(),
+            "extended payload must not decode as the four-element tuple"
         );
     }
 

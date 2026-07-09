@@ -112,6 +112,8 @@ impl Scheduler {
             // The committed write-LSN for this Calvin apply — recorded against
             // every key the plans wrote, in the same WAL-LSN space as fast-path.
             wal_lsn: Some(applied_lsn),
+            // Record-only pass: no TTL resolution happens here.
+            resolved_now_ms: None,
             // Recording only — the scheduler already held (and is releasing) this
             // transaction's locks; the write-admission gate must not re-acquire.
             admission: Admission::Exempt(ExemptReason::AlreadyOrdered),

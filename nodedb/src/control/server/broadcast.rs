@@ -147,6 +147,7 @@ pub async fn broadcast_count_to_all_cores(
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            resolved_now_ms: None,
             admission,
         };
 
@@ -258,6 +259,7 @@ pub async fn broadcast_register_to_all_cores(
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            resolved_now_ms: None,
             admission,
         };
 

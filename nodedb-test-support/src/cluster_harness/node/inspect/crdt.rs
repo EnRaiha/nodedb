@@ -56,6 +56,7 @@ impl TestClusterNode {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            resolved_now_ms: None,
             admission: nodedb::bridge::envelope::Admission::Exempt(
                 nodedb::bridge::envelope::ExemptReason::Read,
             ),
@@ -129,6 +130,7 @@ impl TestClusterNode {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            resolved_now_ms: None,
             admission: nodedb::bridge::envelope::Admission::Admitted,
         };
 

@@ -183,10 +183,11 @@ pub async fn query(
                 return Err(ApiError::Forbidden("tenant isolation violation".into()));
             }
 
-            // WAL append for write operations. The allocated LSN is stamped
-            // onto the local-dispatch write below so the Data Plane records the
-            // committed write version.
-            let wal_lsn = wal_append_if_write(&state, &task)?;
+            // WAL append for write operations. The allocated LSN (and, for a
+            // TTL-bearing KV write, the resolved instant) is stamped onto the
+            // local-dispatch write below so the Data Plane records the
+            // committed write version and installs the same TTL instant.
+            let wal_outcome = wal_append_if_write(&state, &task)?;
 
             // Captured before dispatch moves `task.plan` — needed by the
             // protocol-neutral shaping core below.
@@ -220,7 +221,8 @@ pub async fn query(
                                 trace_id,
                                 event_source: crate::event::EventSource::User,
                                 txn_id: None,
-                                wal_lsn,
+                                wal_lsn: wal_outcome.lsn,
+                                resolved_now_ms: wal_outcome.resolved_now_ms,
                             },
                         )
                         .await
@@ -274,7 +276,7 @@ pub async fn query(
 fn wal_append_if_write(
     state: &AppState,
     task: &nodedb_physical::physical_task::PhysicalTask,
-) -> Result<Option<crate::types::Lsn>, ApiError> {
+) -> Result<crate::control::server::wal_dispatch::WalAppendOutcome, ApiError> {
     crate::control::server::wal_dispatch::wal_append_if_write(
         &state.shared.wal,
         task.tenant_id,

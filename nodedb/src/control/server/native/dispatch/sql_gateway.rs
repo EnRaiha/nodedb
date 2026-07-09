@@ -52,7 +52,7 @@ pub(super) async fn dispatch_task_via_gateway(
         }
         None => {
             // Boot fallback: no gateway yet, dispatch locally.
-            let wal_lsn = wal_dispatch::wal_append_if_write(
+            let wal_outcome = wal_dispatch::wal_append_if_write(
                 &ctx.state.wal,
                 tenant_id,
                 vshard_id,
@@ -69,7 +69,8 @@ pub(super) async fn dispatch_task_via_gateway(
                     trace_id: TraceId::ZERO,
                     event_source: crate::event::EventSource::User,
                     txn_id,
-                    wal_lsn,
+                    wal_lsn: wal_outcome.lsn,
+                    resolved_now_ms: wal_outcome.resolved_now_ms,
                 },
             )
             .await

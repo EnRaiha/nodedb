@@ -23,6 +23,10 @@ struct SubmitArgs {
     user_id: Option<Arc<str>>,
     txn_id: Option<crate::types::TxnId>,
     wal_lsn: Option<Lsn>,
+    /// Wall-clock instant the Control Plane resolved for a TTL-bearing KV
+    /// write, stamped onto the `Request` alongside `wal_lsn` — see
+    /// `dispatch_utils::WriteDispatch::resolved_now_ms`.
+    resolved_now_ms: Option<u64>,
 }
 
 impl NodeDbPgHandler {
@@ -282,7 +286,7 @@ impl NodeDbPgHandler {
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
     ) -> crate::Result<Response> {
-        let wal_lsn =
+        let outcome =
             self.wal_append_if_write(task.tenant_id, task.vshard_id, task.database_id, &task.plan)?;
         let txn_id = task.txn_id;
         self.submit_to_data_plane(SubmitArgs {
@@ -292,7 +296,8 @@ impl NodeDbPgHandler {
             plan: task.plan,
             user_id,
             txn_id,
-            wal_lsn,
+            wal_lsn: outcome.lsn,
+            resolved_now_ms: outcome.resolved_now_ms,
         })
         .await
     }
@@ -339,6 +344,11 @@ impl NodeDbPgHandler {
             user_id,
             txn_id,
             wal_lsn,
+            // The batch WAL record above does not carry a per-task resolved TTL
+            // instant (see `flush_transaction_buffer`'s equivalent limitation);
+            // a TTL-bearing KV write inside a multi-task COMMIT batch falls back
+            // to `epoch_system_ms` / the wall clock at apply time.
+            resolved_now_ms: None,
         })
         .await
     }
@@ -354,6 +364,7 @@ impl NodeDbPgHandler {
             user_id,
             txn_id,
             wal_lsn,
+            resolved_now_ms,
         } = args;
         // Write-admission gate. This path builds its own `Request` and enqueues
         // directly (it does not flow through the autocommit funnel). An
@@ -410,6 +421,7 @@ impl NodeDbPgHandler {
             statement_digest: None,
             txn_id,
             wal_lsn,
+            resolved_now_ms,
             admission,
         };
 

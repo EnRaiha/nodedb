@@ -170,6 +170,7 @@ fn critical_check_engine_pressure_increments_metric() {
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
+        resolved_now_ms: None,
         admission: nodedb::bridge::envelope::Admission::Admitted,
     });
 
@@ -239,6 +240,7 @@ fn emergency_pressure_suspends_reads_and_increments_metric() {
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
+        resolved_now_ms: None,
         admission: nodedb::bridge::envelope::Admission::Admitted,
     });
 

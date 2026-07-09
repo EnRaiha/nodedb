@@ -9,7 +9,6 @@ use super::types::KvWriteParams;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use crate::engine::kv::current_ms;
 
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_put(
@@ -38,10 +37,8 @@ impl CoreLoop {
             );
         }
 
-        let now_ms: u64 = self
-            .epoch_system_ms
-            .map(|ms| ms as u64)
-            .unwrap_or_else(current_ms);
+        // See `CoreLoop::kv_ttl_now_ms` for the precedence this resolves.
+        let now_ms: u64 = self.kv_ttl_now_ms(task);
         let old = self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: did,
             tenant_id: tid,
@@ -104,7 +101,8 @@ impl CoreLoop {
             );
         }
 
-        let now_ms = current_ms();
+        // See `CoreLoop::kv_ttl_now_ms` for the precedence this resolves.
+        let now_ms = self.kv_ttl_now_ms(task);
         if self
             .kv_engine
             .get(did, tid, collection, key, now_ms)
@@ -179,7 +177,8 @@ impl CoreLoop {
             );
         }
 
-        let now_ms = current_ms();
+        // See `CoreLoop::kv_ttl_now_ms` for the precedence this resolves.
+        let now_ms = self.kv_ttl_now_ms(task);
         if self
             .kv_engine
             .get(did, tid, collection, key, now_ms)

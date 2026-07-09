@@ -86,6 +86,7 @@ pub(crate) fn eager_dispatch_to_all_cores(
             statement_digest: None,
             txn_id,
             wal_lsn: None,
+            resolved_now_ms: None,
             admission: crate::bridge::envelope::Admission::Exempt(
                 crate::bridge::envelope::ExemptReason::Read,
             ),

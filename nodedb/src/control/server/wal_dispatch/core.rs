@@ -12,6 +12,31 @@ use nodedb_physical::physical_plan::{ArrayOp, CrdtOp, DocumentOp, GraphOp, Times
 
 use super::super::wal_dispatch_kv;
 
+/// Outcome of [`wal_append_if_write`] / [`wal_append_if_write_with_creds`]:
+/// the allocated WAL LSN (if a durable record was appended) and, for a
+/// TTL-bearing KV write, the wall-clock instant resolved at append time.
+///
+/// `resolved_now_ms` mirrors `lsn`'s cross-plane contract: the caller stamps
+/// it onto the dispatched `Request` (via `WriteDispatch` / `DataPlaneDispatch`)
+/// so the Data Plane's live apply installs the SAME instant the durable WAL
+/// record carries, rather than re-reading the wall clock at apply time — the
+/// two must agree by construction, or a crash between WAL append and apply
+/// lets replay recompute `now_ms` at restart time and drift the TTL's expiry
+/// forward by the crash-to-restart delay. A plain struct rather than a
+/// `(Option<Lsn>, Option<u64>)` tuple: both fields are the same "maybe a
+/// number" shape and trivially swappable by position across the several call
+/// sites this threads through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalAppendOutcome {
+    /// WAL LSN allocated for this write, or `None` for reads / control ops /
+    /// WAL-bypassed writes.
+    pub lsn: Option<crate::types::Lsn>,
+    /// Wall-clock instant (ms since epoch) resolved for a TTL-bearing KV
+    /// write's `expire_at_ms`. `None` for every non-KV plan and every KV write
+    /// without a TTL.
+    pub resolved_now_ms: Option<u64>,
+}
+
 /// Append a write operation to the WAL for single-node durability.
 ///
 /// Serializes the write as MessagePack and appends to the appropriate
@@ -27,7 +52,7 @@ pub fn wal_append_if_write(
     vshard_id: VShardId,
     database_id: DatabaseId,
     plan: &PhysicalPlan,
-) -> crate::Result<Option<crate::types::Lsn>> {
+) -> crate::Result<WalAppendOutcome> {
     wal_append_if_write_with_creds(wal, tenant_id, vshard_id, database_id, plan, None)
 }
 
@@ -42,7 +67,8 @@ pub fn wal_append_if_write_with_creds(
     database_id: DatabaseId,
     plan: &PhysicalPlan,
     credentials: Option<&CredentialStore>,
-) -> crate::Result<Option<crate::types::Lsn>> {
+) -> crate::Result<WalAppendOutcome> {
+    let mut resolved_now_ms: Option<u64> = None;
     let appended: Option<crate::types::Lsn> = match plan {
         PhysicalPlan::Document(DocumentOp::PointPut {
             collection,
@@ -229,7 +255,10 @@ pub fn wal_append_if_write_with_creds(
                 && config.get("wal").and_then(|v| v.as_str()) == Some("false")
             {
                 // WAL bypassed — acceptable data loss of last flush interval on crash.
-                return Ok(None);
+                return Ok(WalAppendOutcome {
+                    lsn: None,
+                    resolved_now_ms: None,
+                });
             }
 
             // Provenance is appended last; older 3-element decoders ignore
@@ -243,7 +272,10 @@ pub fn wal_append_if_write_with_creds(
         }
         // KV write operations — delegated to wal_dispatch_kv.
         PhysicalPlan::Kv(kv_op) => {
-            wal_dispatch_kv::wal_append_kv_op(wal, tenant_id, vshard_id, database_id, kv_op)?
+            let outcome =
+                wal_dispatch_kv::wal_append_kv_op(wal, tenant_id, vshard_id, database_id, kv_op)?;
+            resolved_now_ms = outcome.resolved_now_ms;
+            outcome.lsn
         }
         PhysicalPlan::Array(ArrayOp::Put {
             array_id,
@@ -303,5 +335,8 @@ pub fn wal_append_if_write_with_creds(
         // where any, are logged on their own dedicated paths).
         _ => None,
     };
-    Ok(appended)
+    Ok(WalAppendOutcome {
+        lsn: appended,
+        resolved_now_ms,
+    })
 }

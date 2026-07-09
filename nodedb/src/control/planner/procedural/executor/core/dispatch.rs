@@ -79,7 +79,7 @@ impl<'a> StatementExecutor<'a> {
             }
         } else {
             for task in tasks {
-                let wal_lsn = crate::control::server::wal_dispatch::wal_append_if_write(
+                let outcome = crate::control::server::wal_dispatch::wal_append_if_write(
                     &self.state.wal,
                     task.tenant_id,
                     task.vshard_id,
@@ -97,7 +97,8 @@ impl<'a> StatementExecutor<'a> {
                         trace_id: TraceId::ZERO,
                         event_source: self.event_source,
                         txn_id: None,
-                        wal_lsn,
+                        wal_lsn: outcome.lsn,
+                        resolved_now_ms: outcome.resolved_now_ms,
                     },
                 )
                 .await?;
@@ -171,19 +172,27 @@ impl<'a> StatementExecutor<'a> {
 
         // Each task's WAL record has its own LSN; the batch dispatch below
         // carries the highest so the Data Plane's write-version floor advances
-        // past every write it applies.
+        // past every write it applies. Same approximation for the resolved TTL
+        // instant: a single scalar can't represent one-per-task resolved
+        // instants for a heterogeneous multi-statement batch, so it is only
+        // threaded through when the buffer holds exactly one task (below);
+        // resolving that properly for N>1 would need `MetaOp::TransactionBatch`
+        // to carry a per-plan `Vec<Option<u64>>`, a separate, wider change to
+        // the procedural batch-flush path, not this KV-write fix.
         let mut max_wal_lsn: Option<crate::types::Lsn> = None;
+        let mut single_task_resolved_now_ms: Option<u64> = None;
         for task in &tasks {
-            let lsn = crate::control::server::wal_dispatch::wal_append_if_write(
+            let outcome = crate::control::server::wal_dispatch::wal_append_if_write(
                 &self.state.wal,
                 task.tenant_id,
                 task.vshard_id,
                 task.database_id,
                 &task.plan,
             )?;
-            if let Some(lsn) = lsn {
+            if let Some(lsn) = outcome.lsn {
                 max_wal_lsn = Some(max_wal_lsn.map_or(lsn, |cur| cur.max(lsn)));
             }
+            single_task_resolved_now_ms = outcome.resolved_now_ms;
         }
 
         if tasks.len() == 1 {
@@ -199,6 +208,7 @@ impl<'a> StatementExecutor<'a> {
                         event_source: self.event_source,
                         txn_id: None,
                         wal_lsn: max_wal_lsn,
+                        resolved_now_ms: single_task_resolved_now_ms,
                     },
                 )
                 .await?;
@@ -222,6 +232,9 @@ impl<'a> StatementExecutor<'a> {
                     event_source: self.event_source,
                     txn_id: None,
                     wal_lsn: max_wal_lsn,
+                    // N>1 batch: no single instant represents every task's
+                    // resolved TTL — see the comment above the WAL-append loop.
+                    resolved_now_ms: None,
                 },
             )
             .await?;

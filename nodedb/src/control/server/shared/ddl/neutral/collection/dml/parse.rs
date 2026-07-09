@@ -237,14 +237,14 @@ pub(super) async fn dispatch_plan(
     vshard_id: crate::types::VShardId,
     plan: crate::bridge::envelope::PhysicalPlan,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
-    let wal_lsn = match crate::control::server::wal_dispatch::wal_append_if_write(
+    let wal_outcome = match crate::control::server::wal_dispatch::wal_append_if_write(
         &state.wal,
         tenant_id,
         vshard_id,
         crate::types::DatabaseId::DEFAULT,
         &plan,
     ) {
-        Ok(lsn) => lsn,
+        Ok(outcome) => outcome,
         Err(e) => return Some(Err(ddl_err("XX000", e.to_string()))),
     };
     if let Err(e) = crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
@@ -257,7 +257,8 @@ pub(super) async fn dispatch_plan(
             trace_id: TraceId::ZERO,
             event_source: crate::event::EventSource::User,
             txn_id: None,
-            wal_lsn,
+            wal_lsn: wal_outcome.lsn,
+            resolved_now_ms: wal_outcome.resolved_now_ms,
         },
     )
     .await
@@ -432,7 +433,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
 
         // Not in a transaction block (or a read): reproduce today's
         // immediate autocommit path exactly — WAL append then dispatch.
-        let wal_lsn = crate::control::server::wal_dispatch::wal_append_if_write(
+        let wal_outcome = crate::control::server::wal_dispatch::wal_append_if_write(
             &state.wal,
             tenant_id,
             task_vshard_id,
@@ -450,7 +451,8 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
                 trace_id: TraceId::ZERO,
                 event_source: crate::event::EventSource::User,
                 txn_id: None,
-                wal_lsn,
+                wal_lsn: wal_outcome.lsn,
+                resolved_now_ms: wal_outcome.resolved_now_ms,
             },
         )
         .await

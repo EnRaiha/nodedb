@@ -109,6 +109,42 @@ impl CoreLoop {
                     continue;
                 }
 
+                // kv_batch_put with absolute expiry (redo sub-record):
+                //   ("kv_batch_put", collection, entries, ttl_ms, expire_at_ms)
+                //
+                // Same rationale as the six-element `kv_put` arm above: zerompk's
+                // strict array-length check means this five-element tuple decodes
+                // ONLY the extended shape, never the historical four-element one
+                // below (and vice versa). The resolved absolute instant is
+                // installed verbatim on every entry instead of recomputing
+                // `now_ms + ttl_ms`, which would drift the expiry forward by the
+                // crash-to-restart delay.
+                if let Ok((disc, collection, entries, ttl_ms, expire_at_ms)) =
+                    zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64, u64)>(
+                        &record.payload,
+                    )
+                    && disc == "kv_batch_put"
+                {
+                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+                        continue;
+                    }
+                    let surrogates = vec![nodedb_types::Surrogate::ZERO; entries.len()];
+                    self.kv_engine.batch_put_with_absolute_expiry(
+                        crate::engine::kv::KvBatchPutParams {
+                            database_id,
+                            tenant_id,
+                            collection: &collection,
+                            entries: &entries,
+                            ttl_ms,
+                            now_ms,
+                            surrogates: &surrogates,
+                        },
+                        expire_at_ms,
+                    );
+                    puts += entries.len();
+                    continue;
+                }
+
                 // kv_batch_put: ("kv_batch_put", collection, entries, ttl_ms)
                 if let Ok((disc, collection, entries, ttl_ms)) =
                     zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(

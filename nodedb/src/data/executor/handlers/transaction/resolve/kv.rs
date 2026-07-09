@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 
 use nodedb_wal::record::RecordType;
 
-use crate::control::server::wal_dispatch_kv::encode_kv_put;
+use crate::control::server::wal_dispatch_kv::encode::encode_kv_put;
 use crate::data::executor::handlers::transaction::overlay::{Staged, StagedTtl, TxnOverlay};
 use crate::data::executor::handlers::transaction::stage_write::unhex_key;
 use crate::types::{DatabaseId, TenantId};

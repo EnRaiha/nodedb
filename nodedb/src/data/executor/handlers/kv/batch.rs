@@ -87,10 +87,8 @@ impl CoreLoop {
             surrogates,
         } = args;
         debug!(core = self.core_id, %collection, count = entries.len(), "kv batch put");
-        let now_ms: u64 = self
-            .epoch_system_ms
-            .map(|ms| ms as u64)
-            .unwrap_or_else(current_ms);
+        // See `CoreLoop::kv_ttl_now_ms` for the precedence this resolves.
+        let now_ms: u64 = self.kv_ttl_now_ms(task);
         let new_count = self.kv_engine.batch_put(KvBatchPutParams {
             database_id: did,
             tenant_id: tid,

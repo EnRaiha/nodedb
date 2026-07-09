@@ -133,7 +133,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("wal tempdir");
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
         for plan in plans {
-            let lsn = wal_append_if_write(
+            let outcome = wal_append_if_write(
                 &wal,
                 TenantId::new(TID),
                 VShardId::new(0),
@@ -142,7 +142,7 @@ mod tests {
             )
             .expect("wal append");
             assert!(
-                lsn.is_some(),
+                outcome.lsn.is_some(),
                 "kv field_set autocommit writes must produce a durable WAL record"
             );
         }

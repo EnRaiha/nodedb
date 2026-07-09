@@ -53,6 +53,7 @@ fn build_request(
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
+        resolved_now_ms: None,
         admission: crate::bridge::envelope::Admission::Exempt(
             crate::bridge::envelope::ExemptReason::AlreadyOrdered,
         ),

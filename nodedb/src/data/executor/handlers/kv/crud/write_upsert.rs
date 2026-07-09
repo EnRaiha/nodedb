@@ -8,7 +8,6 @@ use super::types::KvInsertOnConflictUpdateParams;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use crate::engine::kv::current_ms;
 
 impl CoreLoop {
     /// SQL `INSERT ... ON CONFLICT (key) DO UPDATE SET ...` semantics.
@@ -42,7 +41,8 @@ impl CoreLoop {
             );
         }
 
-        let now_ms = current_ms();
+        // See `CoreLoop::kv_ttl_now_ms` for the precedence this resolves.
+        let now_ms = self.kv_ttl_now_ms(task);
         let existing_bytes = self.kv_engine.get(did, tid, collection, key, now_ms);
 
         let stored_bytes: Vec<u8> = match &existing_bytes {

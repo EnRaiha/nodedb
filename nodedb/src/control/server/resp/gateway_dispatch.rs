@@ -73,7 +73,7 @@ pub(super) async fn dispatch_kv_write(
     plan: PhysicalPlan,
 ) -> crate::Result<Response> {
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &session.collection);
-    let wal_lsn = wal_dispatch::wal_append_if_write(
+    let wal_outcome = wal_dispatch::wal_append_if_write(
         &state.wal,
         session.tenant_id,
         vshard,
@@ -104,7 +104,8 @@ pub(super) async fn dispatch_kv_write(
                 trace_id: TraceId::ZERO,
                 event_source: crate::event::EventSource::User,
                 txn_id: None,
-                wal_lsn,
+                wal_lsn: wal_outcome.lsn,
+                resolved_now_ms: wal_outcome.resolved_now_ms,
             },
         )
         .await

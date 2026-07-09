@@ -182,7 +182,7 @@ mod tests {
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
         let mut lsns = Vec::with_capacity(plans.len());
         for plan in plans {
-            let lsn = wal_append_if_write(
+            let outcome = wal_append_if_write(
                 &wal,
                 TenantId::new(TID),
                 VShardId::new(0),
@@ -191,10 +191,10 @@ mod tests {
             )
             .expect("wal append");
             assert!(
-                lsn.is_some(),
+                outcome.lsn.is_some(),
                 "kv sorted index writes must produce a durable WAL record"
             );
-            lsns.push(lsn.expect("checked above").as_u64());
+            lsns.push(outcome.lsn.expect("checked above").as_u64());
         }
         wal.sync().expect("wal sync");
         let records = wal.replay().expect("wal replay read");

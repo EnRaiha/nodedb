@@ -14,17 +14,55 @@ use super::encode::{
     encode_kv_transfer_item, encode_kv_truncate,
 };
 
+/// Outcome of [`wal_append_kv_op`]: the allocated WAL LSN (if a durable
+/// record was appended) and, for a TTL-bearing write, the single wall-clock
+/// instant this call resolved.
+///
+/// `resolved_now_ms` is the one value the durable WAL record and the live
+/// Data-Plane apply must both use — resolving `now_ms` independently at WAL
+/// append time and again at apply time lets the two disagree by the dispatch
+/// latency (harmless day-to-day, but a crash between the two turns into
+/// "replay recomputes `now_ms` at restart time", pushing a TTL's expiry
+/// forward by the crash-to-restart delay). A plain struct rather than a
+/// `(Option<Lsn>, Option<u64>)` tuple: the two `Option<u64>`/`Option<Lsn>`
+/// fields are trivially swappable by position, and this outcome threads
+/// through several more call sites on its way to the Data Plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvAppendOutcome {
+    /// WAL LSN allocated for this write, or `None` for read-only / non-WAL ops.
+    pub lsn: Option<crate::types::Lsn>,
+    /// The wall-clock instant (ms since epoch) resolved for a TTL-bearing
+    /// write's `expire_at_ms`. `None` for non-TTL writes and for ops that
+    /// carry no TTL at all.
+    pub resolved_now_ms: Option<u64>,
+}
+
+/// Resolve `now_ms` and the absolute expiry for a TTL-bearing write, exactly
+/// once. Returns `(resolved_now_ms, expire_at_ms)`, both `None` when
+/// `ttl_ms == 0` so the caller's encode call preserves the historical
+/// no-TTL payload shape byte-for-byte.
+fn resolve_expiry(ttl_ms: u64) -> (Option<u64>, Option<u64>) {
+    if ttl_ms == 0 {
+        (None, None)
+    } else {
+        let now_ms = crate::engine::kv::current_ms();
+        (Some(now_ms), Some(now_ms + ttl_ms))
+    }
+}
+
 /// Serialize a KV operation and append to the WAL.
 ///
 /// Returns the appended write's WAL LSN (`Some`) for KV writes, or `None` for
-/// read-only / non-WAL KV ops.
+/// read-only / non-WAL KV ops, alongside the resolved TTL instant (if any) —
+/// see [`KvAppendOutcome`].
 pub fn wal_append_kv_op(
     wal: &WalManager,
     tenant_id: TenantId,
     vshard_id: VShardId,
     database_id: DatabaseId,
     op: &KvOp,
-) -> crate::Result<Option<crate::types::Lsn>> {
+) -> crate::Result<KvAppendOutcome> {
+    let mut resolved_now_ms: Option<u64> = None;
     let lsn: Option<crate::types::Lsn> = match op {
         KvOp::Put {
             collection,
@@ -33,7 +71,9 @@ pub fn wal_append_kv_op(
             ttl_ms,
             surrogate: _,
         } => {
-            let entry = encode_kv_put(collection, key, value, *ttl_ms, None)?;
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
+            resolved_now_ms = now_ms;
+            let entry = encode_kv_put(collection, key, value, *ttl_ms, expire_at_ms)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Insert {
@@ -58,7 +98,9 @@ pub fn wal_append_kv_op(
             updates: _,
             surrogate: _,
         } => {
-            let entry = encode_kv_put(collection, key, value, *ttl_ms, None)?;
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
+            resolved_now_ms = now_ms;
+            let entry = encode_kv_put(collection, key, value, *ttl_ms, expire_at_ms)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Delete { collection, keys } => {
@@ -71,7 +113,9 @@ pub fn wal_append_kv_op(
             ttl_ms,
             surrogates: _,
         } => {
-            let entry = encode_kv_batch_put(collection, entries, *ttl_ms)?;
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
+            resolved_now_ms = now_ms;
+            let entry = encode_kv_batch_put(collection, entries, *ttl_ms, expire_at_ms)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Expire {
@@ -225,5 +269,8 @@ pub fn wal_append_kv_op(
         | KvOp::SortedIndexTopK { .. }
         | KvOp::MaterializeScan { .. } => None,
     };
-    Ok(lsn)
+    Ok(KvAppendOutcome {
+        lsn,
+        resolved_now_ms,
+    })
 }

@@ -152,6 +152,19 @@ pub struct Request {
     /// [`ExecutionTask`]: crate::data::executor::task::ExecutionTask
     pub wal_lsn: Option<Lsn>,
 
+    /// Wall-clock instant (ms since epoch) the Control Plane resolved at
+    /// WAL-append time for a TTL-bearing KV write. The durable WAL record and
+    /// the live Data-Plane apply MUST use this same instant for `expire_at_ms`
+    /// — resolving it independently at apply time would let live state
+    /// disagree with the durable record by the dispatch latency, and on a
+    /// crash-then-replay, replay would recompute `now_ms` at restart time
+    /// instead of installing the original instant, pushing the TTL forward by
+    /// the crash-to-restart delay. `None` for reads, non-TTL writes, and
+    /// writes whose resolved instant is not (yet) threaded — the live apply
+    /// falls back to `epoch_system_ms` (Calvin) or the wall clock, same as
+    /// before this field existed.
+    pub resolved_now_ms: Option<u64>,
+
     /// Write-admission decision for this request.
     ///
     /// Every write-class [`PhysicalPlan`] MUST pass the neutral write-admission
@@ -471,6 +484,7 @@ mod tests {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            resolved_now_ms: None,
             admission: Admission::Exempt(ExemptReason::Read),
         }
     }
@@ -543,6 +557,7 @@ mod tests {
             statement_digest: None,
             txn_id: None,
             wal_lsn: None,
+            resolved_now_ms: None,
             admission: Admission::Exempt(ExemptReason::Read),
         };
         match req.plan {

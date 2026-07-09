@@ -199,6 +199,24 @@ impl CoreLoop {
             .unwrap_or(0)
     }
 
+    /// Resolve the wall-clock instant (ms since epoch) for a TTL-bearing KV
+    /// write's `expire_at_ms`. Precedence: the Control-Plane-resolved instant
+    /// carried on `task` (so the durable WAL record and this live apply
+    /// install the identical `expire_at_ms`) wins first; Calvin's
+    /// `epoch_system_ms` is the deterministic-replay fallback (unchanged from
+    /// before `resolved_now_ms` existed); a fresh wall-clock read is the last
+    /// resort. Shared by every KV write handler that derives a TTL instant
+    /// from a task carrying a Control-Plane-resolved one (`Put`, `Insert`,
+    /// `InsertIfAbsent`, `InsertOnConflictUpdate`, `BatchPut`).
+    pub(in crate::data::executor) fn kv_ttl_now_ms(
+        &self,
+        task: &crate::data::executor::task::ExecutionTask,
+    ) -> u64 {
+        task.resolved_now_ms()
+            .or_else(|| self.epoch_system_ms.map(|ms| ms as u64))
+            .unwrap_or_else(crate::engine::kv::current_ms)
+    }
+
     /// Write a raw segment blob directly into the FTS LSM segment store for
     /// a given `(tenant, collection)`.
     ///

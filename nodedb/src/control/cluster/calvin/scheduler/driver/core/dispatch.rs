@@ -244,6 +244,9 @@ impl Scheduler {
             // scheduler's response handler), so no committed LSN is known at
             // dispatch time to stamp here.
             wal_lsn: None,
+            // Calvin resolves TTL instants via `epoch_system_ms`, not this
+            // field — see `resolved_now_ms` precedence in the KV write handlers.
+            resolved_now_ms: None,
             // Calvin-scheduled apply: the deterministic scheduler already holds
             // this transaction's locks, so it does not re-acquire at the
             // write-admission gate — Exempt.
@@ -379,6 +382,9 @@ impl Scheduler {
             // scheduler's response handler), so no committed LSN is known at
             // dispatch time to stamp here.
             wal_lsn: None,
+            // Calvin resolves TTL instants via `epoch_system_ms`, not this
+            // field — see `resolved_now_ms` precedence in the KV write handlers.
+            resolved_now_ms: None,
             // Calvin-scheduled apply: the deterministic scheduler already holds
             // this transaction's locks, so it does not re-acquire at the
             // write-admission gate — Exempt.

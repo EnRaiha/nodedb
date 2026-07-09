@@ -64,6 +64,7 @@ fn make_request(plan: PhysicalPlan, vshard: u32, wal_lsn: Option<Lsn>) -> Reques
         statement_digest: None,
         txn_id: None,
         wal_lsn,
+        resolved_now_ms: None,
         admission: nodedb::bridge::envelope::Admission::Admitted,
     }
 }

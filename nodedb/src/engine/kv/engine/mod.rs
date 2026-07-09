@@ -305,4 +305,51 @@ impl KvEngine {
         }
         new_count
     }
+
+    /// BATCH PUT installing an already-resolved absolute expiry instant on
+    /// every entry. Mirrors [`KvEngine::put_with_absolute_expiry`]: WAL redo
+    /// replay uses this so a TTL'd batch recovers with the exact expiry the
+    /// original write computed, rather than recomputing `now_ms + ttl_ms` at
+    /// recovery time (which would push expiry forward by the crash-to-restart
+    /// delay). `params.ttl_ms` is carried through `put_with_absolute_expiry`
+    /// only for `KvPutParams`'s shape; the installed expiry is `expire_at_ms`
+    /// verbatim, same for every entry in the batch.
+    pub fn batch_put_with_absolute_expiry(
+        &mut self,
+        params: KvBatchPutParams<'_>,
+        expire_at_ms: u64,
+    ) -> usize {
+        let KvBatchPutParams {
+            database_id,
+            tenant_id,
+            collection,
+            entries,
+            ttl_ms,
+            now_ms,
+            surrogates,
+        } = params;
+        let mut new_count = 0;
+        for (i, (key, value)) in entries.iter().enumerate() {
+            let surrogate = surrogates.get(i).copied().unwrap_or(Surrogate::ZERO);
+            if self
+                .put_with_absolute_expiry(
+                    KvPutParams {
+                        database_id,
+                        tenant_id,
+                        collection,
+                        key: key.as_slice(),
+                        value: value.as_slice(),
+                        ttl_ms,
+                        now_ms,
+                        surrogate,
+                    },
+                    expire_at_ms,
+                )
+                .is_none()
+            {
+                new_count += 1;
+            }
+        }
+        new_count
+    }
 }

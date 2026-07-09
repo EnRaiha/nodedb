@@ -262,6 +262,9 @@ impl Scheduler {
             // A flush allocates its CalvinApplied WAL LSN post-apply (in
             // `commit_apply_tail`), so no committed LSN is known here.
             wal_lsn: None,
+            // Calvin resolves TTL instants via `epoch_system_ms`, not this
+            // field — see `resolved_now_ms` precedence in the KV write handlers.
+            resolved_now_ms: None,
             // The scheduler already holds this transaction's locks, so the
             // write-admission gate must not re-acquire — Exempt.
             admission: Admission::Exempt(ExemptReason::AlreadyOrdered),
