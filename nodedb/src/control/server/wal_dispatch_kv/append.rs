@@ -90,9 +90,9 @@ pub fn wal_append_kv_op(
             collection,
             field,
             field_position,
-            backfill: _,
+            backfill,
         } => {
-            let entry = encode_kv_register_index(collection, field, *field_position)?;
+            let entry = encode_kv_register_index(collection, field, *field_position, *backfill)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::DropIndex { collection, field } => {

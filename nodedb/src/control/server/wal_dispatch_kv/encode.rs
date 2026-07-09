@@ -202,15 +202,28 @@ pub(crate) fn encode_kv_persist(collection: &str, key: &[u8]) -> crate::Result<V
 }
 
 /// Encode a `kv_register_index` WAL payload: `("kv_register_index",
-/// collection, field, field_position)`.
+/// collection, field, field_position, backfill)`.
+///
+/// `backfill` is a live-registration input, not a derivable fact: `true`
+/// scans existing rows at registration time and populates the index, `false`
+/// indexes only rows written afterwards. Replay must reproduce whichever the
+/// user chose, so `backfill` travels in the record rather than being
+/// inferred or defaulted at replay time.
 pub(crate) fn encode_kv_register_index(
     collection: &str,
     field: &str,
     field_position: usize,
+    backfill: bool,
 ) -> crate::Result<Vec<u8>> {
     encode(
         "register index",
-        &("kv_register_index", collection, field, field_position),
+        &(
+            "kv_register_index",
+            collection,
+            field,
+            field_position,
+            backfill,
+        ),
     )
 }
 
@@ -286,7 +299,8 @@ pub(crate) fn encode_kv_truncate(collection: &str) -> crate::Result<Vec<u8>> {
 mod tests {
     use super::{
         KvTransferFields, encode_kv_cas, encode_kv_field_set, encode_kv_getset,
-        encode_kv_incr_float, encode_kv_put, encode_kv_transfer, encode_kv_transfer_item,
+        encode_kv_incr_float, encode_kv_put, encode_kv_register_index, encode_kv_transfer,
+        encode_kv_transfer_item,
     };
 
     #[test]
@@ -425,6 +439,29 @@ mod tests {
         assert_eq!(key, b"p1");
         assert_eq!(decoded_updates, updates);
         assert_eq!(surrogate, 11);
+    }
+
+    #[test]
+    fn kv_register_index_round_trips_backfill_flag() {
+        let entry_backfill_true = encode_kv_register_index("players", "name", 2, true).unwrap();
+        let (disc, collection, field, field_position, backfill) =
+            zerompk::from_msgpack::<(&str, String, String, usize, bool)>(&entry_backfill_true)
+                .unwrap();
+        assert_eq!(disc, "kv_register_index");
+        assert_eq!(collection, "players");
+        assert_eq!(field, "name");
+        assert_eq!(field_position, 2);
+        assert!(backfill);
+
+        let entry_backfill_false = encode_kv_register_index("players", "name", 2, false).unwrap();
+        let (_, _, _, _, backfill_false) =
+            zerompk::from_msgpack::<(&str, String, String, usize, bool)>(&entry_backfill_false)
+                .unwrap();
+        assert!(!backfill_false);
+
+        // The two payloads must not be byte-identical: the backfill flag is
+        // the only difference and it must actually change the encoded bytes.
+        assert_ne!(entry_backfill_true, entry_backfill_false);
     }
 
     #[test]

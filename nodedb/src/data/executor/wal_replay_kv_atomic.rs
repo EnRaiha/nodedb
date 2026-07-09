@@ -26,7 +26,7 @@ impl CoreLoop {
     /// Try each atomic KV delta-record shape (`kv_cas`, `kv_incr_float`,
     /// `kv_getset`) in turn against one WAL payload. Returns `None` only when
     /// none of the three discriminators match (caller tries the next
-    /// candidate arm in `wal_replay.rs`), otherwise `Some(puts)` from
+    /// candidate arm in `wal_replay/kv.rs`), otherwise `Some(puts)` from
     /// whichever arm decoded.
     pub(super) fn try_replay_kv_atomic(
         &mut self,

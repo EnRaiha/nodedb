@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! WAL replay for CoreLoop startup recovery: KV, CRDT, and Array engines.
+//!
+//! Vector replay lives in `wal_replay_vector.rs`. The `kv_transfer` /
+//! `kv_transfer_item` delta-record replay (decode, tombstone gate, and
+//! mutation) lives in `wal_replay_kv_transfer.rs`. The `kv_cas` /
+//! `kv_incr_float` / `kv_getset` delta-record replay lives in
+//! `wal_replay_kv_atomic.rs`. The `kv_field_set` delta-record replay lives in
+//! `wal_replay_kv_field.rs`. The `kv_register_index` / `kv_drop_index`
+//! secondary-index replay lives in `wal_replay_kv_index.rs`.
+//!
+//! Split by engine concern: `kv` (`replay_kv_wal`), `crdt` (`replay_crdt_wal`),
+//! `array` (`ensure_array_open_for_replay` + `replay_array_wal`).
+
+mod array;
+mod crdt;
+mod kv;

@@ -3,7 +3,7 @@
 //! Self-describing WAL payload for CRDT delta records.
 //!
 //! Both the writer (`control/server/wal_dispatch/core.rs`) and the reader
-//! (`data/executor/wal_replay.rs`) live in this crate and use this single
+//! (`data/executor/wal_replay/crdt.rs`) live in this crate and use this single
 //! struct, encoded/decoded with `zerompk`, so there is exactly one
 //! unambiguous decode path — no arity guessing.
 
