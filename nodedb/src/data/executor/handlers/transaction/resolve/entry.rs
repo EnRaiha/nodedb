@@ -12,14 +12,17 @@
 //!
 //! Two serializer families live in this module. The overlay-driven family (KV,
 //! Document, Graph) reads resolved per-surrogate post-images from the staging
-//! overlay. The plan-driven family (Vector, Array, Columnar, Timeseries) is not
-//! staged into any overlay — vector post-images are inexpressible and the
-//! array / columnar / timeseries batches ride the buffered-plan path, their
-//! redo replay re-running the engine-native batch payload — so they serialize
-//! directly from the plan node. Every writing op either serializes to its
-//! engine-native sub-record or raises a typed error; none is silently omitted,
-//! since dropping an op class would lose those rows on install. Spatial remains
-//! a typed error (it is overlay-driven and its serializer is not built here).
+//! overlay. The plan-driven family (Vector, Array, Columnar, Timeseries,
+//! Spatial) is not staged into any overlay for redo purposes — vector
+//! post-images are inexpressible, array / columnar / timeseries batches ride
+//! the buffered-plan path re-running the engine-native batch payload, and
+//! spatial `Insert` / `Delete` plan nodes already carry their complete
+//! absolute post-image (the overlay `stage_spatial` writes into exists only
+//! for same-transaction read-your-own-writes, not for redo — see
+//! `resolve/spatial.rs` module docs) — so all four serialize directly from
+//! the plan node. Every writing op either serializes to its engine-native
+//! sub-record or raises a typed error; none is silently omitted, since
+//! dropping an op class would lose those rows on install.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,7 +35,7 @@ use crate::types::{TenantId, TxnId};
 use crate::wal::{RedoRecord, RedoSubRecord};
 
 use super::graph::EdgeIdentityKey;
-use super::{array, columnar, document, graph, kv, vector};
+use super::{array, columnar, document, graph, kv, spatial, vector};
 
 impl CoreLoop {
     /// Resolve a committing transaction's staged writes into a [`RedoRecord`]
@@ -135,15 +138,14 @@ impl CoreLoop {
                 PhysicalPlan::Columnar(op) => columnar::serialize_columnar_op(op, &mut ops)?,
                 PhysicalPlan::Timeseries(op) => columnar::serialize_timeseries_op(op, &mut ops)?,
 
-                // Spatial is genuinely serializable in principle (it has an
-                // autocommit encoder and a `replay_spatial_wal` path), but it
-                // is OVERLAY-driven (staged via `stage_spatial` with its own
-                // R-tree overlay merge), placing it in the overlay-driven
-                // serializer family (KV / document / graph), not the plan-driven
-                // family implemented here. Its dedicated overlay-walking
-                // serializer is out of scope for this change, so a spatial write
-                // raises a typed error rather than being silently dropped.
-                PhysicalPlan::Spatial(_) => return Err(unsupported_engine("spatial")),
+                // Spatial `Insert` / `Delete` plan nodes already carry the
+                // complete absolute post-image (collection, field, surrogate,
+                // geometry, provenance), so — like vector — they serialize
+                // directly from the plan node rather than an overlay walk.
+                // `Scan` is a read and emits nothing; either write with no
+                // sync provenance raises a typed error (see
+                // `resolve/spatial.rs` module docs).
+                PhysicalPlan::Spatial(op) => spatial::serialize_spatial_op(op, &mut ops)?,
 
                 // Coordinator-only op; never legal on the Data Plane.
                 PhysicalPlan::ClusterArray(_) => {
@@ -457,15 +459,6 @@ fn classify_graph_op(
                     .to_string(),
             })
         }
-    }
-}
-
-/// The typed error a writing engine without a resolve serializer raises. Used
-/// for the overlay-driven spatial engine, whose resolve serializer belongs to
-/// the KV / document / graph family and is not built here.
-fn unsupported_engine(engine: &str) -> crate::Error {
-    crate::Error::PlanError {
-        detail: format!("{engine} writes are not supported in transaction resolve"),
     }
 }
 
@@ -2089,5 +2082,368 @@ mod tests {
             Some(1),
             "columnar sub-record must replay"
         );
+    }
+
+    // ── Spatial resolve tests ────────────────────────────────────────────────
+    //
+    // Spatial `Insert` / `Delete` plan nodes carry the complete post-image
+    // directly (see `resolve/spatial.rs`), so these mirror the vector/columnar
+    // plan-driven tests above rather than the KV/document overlay tests.
+
+    use nodedb_physical::physical_plan::SpatialOp;
+    use nodedb_types::geometry::Geometry;
+
+    fn spatial_prov(seq: u64) -> SyncProvenance {
+        SyncProvenance {
+            producer_id: 1,
+            epoch: 1,
+            stream_id: 1,
+            seq,
+        }
+    }
+
+    fn spatial_point(x: f64, y: f64) -> Geometry {
+        Geometry::point(x, y)
+    }
+
+    fn spatial_insert_plan(
+        collection: &str,
+        field: &str,
+        surrogate: u32,
+        geometry: Geometry,
+        seq: u64,
+    ) -> PhysicalPlan {
+        PhysicalPlan::Spatial(SpatialOp::Insert {
+            collection: collection.to_string(),
+            field: field.to_string(),
+            surrogate: Surrogate::new(surrogate),
+            geometry,
+            provenance: Some(spatial_prov(seq)),
+        })
+    }
+
+    fn spatial_delete_plan(
+        collection: &str,
+        field: &str,
+        surrogate: u32,
+        seq: u64,
+    ) -> PhysicalPlan {
+        PhysicalPlan::Spatial(SpatialOp::Delete {
+            collection: collection.to_string(),
+            field: field.to_string(),
+            surrogate: Surrogate::new(surrogate),
+            provenance: Some(spatial_prov(seq)),
+        })
+    }
+
+    /// R-tree entry id for a surrogate, mirroring `execute_spatial_insert`'s
+    /// `fnv1a_hash(doc_id.as_bytes())` keying.
+    fn spatial_entry_id(surrogate: u32) -> u64 {
+        let doc_id = surrogate_to_doc_id(Surrogate::new(surrogate));
+        crate::util::fnv1a_hash(doc_id.as_bytes())
+    }
+
+    #[test]
+    fn spatial_insert_resolves_and_replay_is_queryable() {
+        let (src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(40);
+        let surrogate = 7u32;
+
+        let plan = spatial_insert_plan("places", "loc", surrogate, spatial_point(10.0, 20.0), 1);
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1, "one spatial insert -> one sub-record");
+        assert_eq!(redo.ops[0].record_type, RecordType::SpatialPut as u32);
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        // The geometry is queryable: the R-tree entry and the sparse document
+        // body were both rebuilt by replay's `execute_spatial_insert` call.
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "places".to_string(),
+            "loc".to_string(),
+        );
+        let entries = dst
+            .spatial_indexes
+            .get(&key)
+            .expect("R-tree index rebuilt by replay")
+            .entries();
+        assert_eq!(entries.len(), 1, "R-tree must carry the replayed geometry");
+        assert_eq!(entries[0].id, spatial_entry_id(surrogate));
+
+        let doc_map_key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "places".to_string(),
+            "loc".to_string(),
+            spatial_entry_id(surrogate),
+        );
+        assert!(
+            dst.spatial_doc_map.contains_key(&doc_map_key),
+            "surrogate -> doc-id reverse map must be rebuilt"
+        );
+        let row_key = surrogate_to_doc_id(Surrogate::new(surrogate));
+        assert!(
+            dst.sparse
+                .get(
+                    DatabaseId::DEFAULT.as_u64(),
+                    TID,
+                    "places",
+                    row_key.as_str()
+                )
+                .expect("get")
+                .is_some(),
+            "sparse geometry document must be rebuilt by replay"
+        );
+    }
+
+    #[test]
+    fn spatial_delete_resolves_and_replay_removes_entry() {
+        let (seed_core, _seed_dir) = make_core();
+        let task = make_task();
+        let surrogate = 9u32;
+
+        // Seed a geometry via a resolved insert replayed into the target core.
+        let insert_txn = TxnId::new(41);
+        let insert_plan =
+            spatial_insert_plan("places", "loc", surrogate, spatial_point(1.0, 1.0), 1);
+        let insert_resp = seed_core.execute_resolve_txn(&task, TID, insert_txn, &[insert_plan]);
+        let insert_redo = decode_redo(&insert_resp);
+        let insert_record = wrap_redo(&insert_redo);
+
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&insert_record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "places".to_string(),
+            "loc".to_string(),
+        );
+        assert_eq!(
+            dst.spatial_indexes.get(&key).expect("rtree seeded").len(),
+            1,
+            "seeded entry present before delete"
+        );
+
+        // Now resolve a delete for the same surrogate and replay it.
+        let delete_txn = TxnId::new(42);
+        let delete_plan = spatial_delete_plan("places", "loc", surrogate, 2);
+        let resp = seed_core.execute_resolve_txn(&task, TID, delete_txn, &[delete_plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1);
+        assert_eq!(redo.ops[0].record_type, RecordType::SpatialDelete as u32);
+
+        let del_record = wrap_redo(&redo);
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&del_record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        assert_eq!(
+            dst.spatial_indexes
+                .get(&key)
+                .map(|rt| rt.len())
+                .unwrap_or(0),
+            0,
+            "redo delete must remove the R-tree entry"
+        );
+        let row_key = surrogate_to_doc_id(Surrogate::new(surrogate));
+        assert!(
+            dst.sparse
+                .get(
+                    DatabaseId::DEFAULT.as_u64(),
+                    TID,
+                    "places",
+                    row_key.as_str()
+                )
+                .expect("get")
+                .is_none(),
+            "redo delete must remove the sparse geometry document"
+        );
+    }
+
+    #[test]
+    fn spatial_resolve_is_deterministic_across_two_resolves() {
+        let (src, _src_dir) = make_core();
+        let task = make_task();
+
+        let plans = [
+            spatial_insert_plan("places", "loc", 1, spatial_point(1.0, 1.0), 10),
+            spatial_insert_plan("places", "loc", 2, spatial_point(2.0, 2.0), 11),
+        ];
+
+        let resp1 = src.execute_resolve_txn(&task, TID, TxnId::new(50), &plans);
+        let resp2 = src.execute_resolve_txn(&task, TID, TxnId::new(51), &plans);
+        let redo1 = decode_redo(&resp1);
+        let redo2 = decode_redo(&resp2);
+
+        assert_eq!(redo1.ops.len(), 2);
+        assert_eq!(
+            redo1
+                .ops
+                .iter()
+                .map(|o| o.payload.clone())
+                .collect::<Vec<_>>(),
+            redo2
+                .ops
+                .iter()
+                .map(|o| o.payload.clone())
+                .collect::<Vec<_>>(),
+            "resolving the same plan twice must emit byte-identical sub-records"
+        );
+    }
+
+    #[test]
+    fn spatial_resolve_does_not_mutate_base() {
+        let (core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(43);
+        let surrogate = 5u32;
+
+        let plan = spatial_insert_plan("places", "loc", surrogate, spatial_point(3.0, 3.0), 1);
+        let resp = core.execute_resolve_txn(&task, TID, txn, &[plan]);
+        assert_eq!(resp.status, Status::Ok);
+
+        // Resolve must not touch the live R-tree / sparse store / doc map —
+        // only the buffered-plan install path (outside resolve) does that.
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "places".to_string(),
+            "loc".to_string(),
+        );
+        assert!(
+            !core.spatial_indexes.contains_key(&key),
+            "resolve must not mutate the base spatial R-tree"
+        );
+        let row_key = surrogate_to_doc_id(Surrogate::new(surrogate));
+        assert!(
+            core.sparse
+                .get(
+                    DatabaseId::DEFAULT.as_u64(),
+                    TID,
+                    "places",
+                    row_key.as_str()
+                )
+                .expect("get")
+                .is_none(),
+            "resolve must not mutate the base sparse store"
+        );
+    }
+
+    #[test]
+    fn mixed_kv_and_spatial_resolve_into_one_record_and_both_replay() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(44);
+        let surrogate = 13u32;
+
+        src.txn_overlays.entry(txn).or_default().insert_put(
+            coll_key("kvc"),
+            1,
+            &hex_key(b"k"),
+            b"V".to_vec(),
+        );
+
+        let plans = [
+            kv_write_plan("kvc"),
+            spatial_insert_plan("places", "loc", surrogate, spatial_point(4.0, 4.0), 1),
+        ];
+        let resp = src.execute_resolve_txn(&task, TID, txn, &plans);
+        let redo = decode_redo(&resp);
+        assert_eq!(
+            redo.ops.len(),
+            2,
+            "one KV row + one spatial insert -> two sub-records in one record"
+        );
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let db = DatabaseId::DEFAULT.as_u64();
+        let now = crate::engine::kv::current_ms();
+        assert_eq!(
+            dst.kv_engine.get(db, TID, "kvc", b"k", now).as_deref(),
+            Some(b"V".as_slice()),
+            "KV sub-record must replay"
+        );
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "places".to_string(),
+            "loc".to_string(),
+        );
+        assert_eq!(
+            dst.spatial_indexes.get(&key).map(|rt| rt.len()),
+            Some(1),
+            "spatial sub-record must replay"
+        );
+    }
+
+    #[test]
+    fn spatial_scan_op_emits_nothing() {
+        let (core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(45);
+
+        let plan = PhysicalPlan::Spatial(SpatialOp::Scan {
+            collection: "places".to_string(),
+            field: "loc".to_string(),
+            predicate: nodedb_physical::physical_plan::SpatialPredicate::Intersects,
+            query_geometry: spatial_point(0.0, 0.0),
+            distance_meters: 0.0,
+            attribute_filters: Vec::new(),
+            limit: 10,
+            projection: Vec::new(),
+            rls_filters: Vec::new(),
+            prefilter: None,
+        });
+        let resp = core.execute_resolve_txn(&task, TID, txn, &[plan]);
+        let redo = decode_redo(&resp);
+        assert!(
+            redo.ops.is_empty(),
+            "read-only spatial scan emits no sub-record"
+        );
+    }
+
+    #[test]
+    fn spatial_insert_without_provenance_yields_typed_error() {
+        let (core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(46);
+
+        let plan = PhysicalPlan::Spatial(SpatialOp::Insert {
+            collection: "places".to_string(),
+            field: "loc".to_string(),
+            surrogate: Surrogate::new(1),
+            geometry: spatial_point(0.0, 0.0),
+            provenance: None,
+        });
+        let resp = core.execute_resolve_txn(&task, TID, txn, &[plan]);
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "a spatial insert with no provenance must raise a typed error, not silently drop"
+        );
+        assert!(resp.error_code.is_some());
     }
 }

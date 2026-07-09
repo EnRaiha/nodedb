@@ -6,4 +6,5 @@ mod document;
 mod entry;
 mod graph;
 mod kv;
+mod spatial;
 mod vector;

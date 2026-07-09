@@ -24,6 +24,9 @@ pub(crate) use vector::{
     encode_vector_delete_payload, encode_vector_put_payload,
 };
 
+pub(crate) use super::wal_dispatch_fts_spatial::{
+    encode_spatial_delete_payload, encode_spatial_put_payload,
+};
 pub use super::wal_dispatch_fts_spatial::{
     wal_append_fts_delete, wal_append_fts_index, wal_append_spatial_delete, wal_append_spatial_put,
 };

@@ -89,6 +89,7 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
     ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
         use crate::control::server::wal_dispatch::wal_append_spatial_put;
+        use crate::control::server::wal_dispatch_fts_spatial::encode_spatial_put_payload;
         use nodedb_physical::physical_plan::SpatialOp;
 
         let prov = provenance;
@@ -99,22 +100,8 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             geometry,
         } = target;
 
-        // Encode geometry to msgpack bytes for WAL storage (same format as
-        // `SpatialInsertMsg.geometry_bytes`).
-        let geometry_bytes =
-            zerompk::to_msgpack_vec(&geometry).map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("spatial put: encode geometry for WAL: {e}"),
-            })?;
-
-        let surrogate_hex = crate::engine::document::store::surrogate_to_doc_id(surrogate);
-        let spatial_put_payload = nodedb_wal::record::SpatialPutPayload::new(
-            prov.clone(),
-            &collection,
-            &field,
-            &surrogate_hex,
-            geometry_bytes,
-        );
+        let spatial_put_payload =
+            encode_spatial_put_payload(&collection, &field, surrogate, &geometry, &prov)?;
         wal_append_spatial_put(
             &self.shared.wal,
             tenant_id,
@@ -145,17 +132,13 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
     ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
         use crate::control::server::wal_dispatch::wal_append_spatial_delete;
+        use crate::control::server::wal_dispatch_fts_spatial::encode_spatial_delete_payload;
         use nodedb_physical::physical_plan::SpatialOp;
 
         let prov = provenance;
 
-        let surrogate_hex = crate::engine::document::store::surrogate_to_doc_id(surrogate);
-        let spatial_delete_payload = nodedb_wal::record::SpatialDeletePayload::new(
-            prov.clone(),
-            &collection,
-            &field,
-            &surrogate_hex,
-        );
+        let spatial_delete_payload =
+            encode_spatial_delete_payload(&collection, &field, surrogate, &prov);
         wal_append_spatial_delete(
             &self.shared.wal,
             tenant_id,
