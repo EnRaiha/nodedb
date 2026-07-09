@@ -135,6 +135,11 @@ fn record_to_event(record: &WalRecord, sequence: &mut u64) -> Option<WriteEvent>
         RecordType::VectorPut
         | RecordType::VectorDelete
         | RecordType::VectorParams
+        | RecordType::VectorDirectUpsert
+        | RecordType::SparseVectorPut
+        | RecordType::SparseVectorDelete
+        | RecordType::MultiVectorPut
+        | RecordType::MultiVectorDelete
         | RecordType::CrdtDelta
         | RecordType::TimeseriesBatch
         | RecordType::LogBatch

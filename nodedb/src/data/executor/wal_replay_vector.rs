@@ -14,7 +14,7 @@ impl CoreLoop {
     /// Mirrors the equivalent helper in `timeseries_wal.rs`. The task carries
     /// no meaningful request semantics — it is only needed so that the handler
     /// methods can return a typed `Response`.
-    fn replay_vector_task(
+    pub(in crate::data::executor) fn replay_vector_task(
         tenant_id: crate::types::TenantId,
         database_id: DatabaseId,
         vshard_id: crate::types::VShardId,

@@ -47,6 +47,11 @@ pub fn replay_surrogate_records(
             | RecordType::VectorPut
             | RecordType::VectorDelete
             | RecordType::VectorParams
+            | RecordType::VectorDirectUpsert
+            | RecordType::SparseVectorPut
+            | RecordType::SparseVectorDelete
+            | RecordType::MultiVectorPut
+            | RecordType::MultiVectorDelete
             | RecordType::CrdtDelta
             | RecordType::TimeseriesBatch
             | RecordType::LogBatch

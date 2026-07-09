@@ -32,6 +32,45 @@ pub enum RecordType {
     /// Vector engine: set HNSW index parameters for a collection.
     VectorParams = 12 | 0x8000,
 
+    /// Vector engine: direct upsert into a vector-primary collection.
+    ///
+    /// Distinct from `VectorPut`: a vector-primary insert bypasses the
+    /// document store and carries its own payload sidecar, quantization,
+    /// storage dtype, and payload-index registration. Replaying it as a plain
+    /// `VectorPut` would restore the HNSW node but drop the payload body and
+    /// bitmap indexes, so it needs its own record and replay arm.
+    ///
+    /// Required: skipping on replay loses an acknowledged vector-primary write.
+    VectorDirectUpsert = 13 | 0x8000,
+
+    /// Vector engine: insert (upsert) a sparse vector into the inverted index.
+    ///
+    /// Targets the `SparseInvertedIndex` (keyed by document id), a separate
+    /// in-memory structure from the HNSW graph, so it needs its own record.
+    ///
+    /// Required: skipping on replay loses an acknowledged sparse write.
+    SparseVectorPut = 14 | 0x8000,
+
+    /// Vector engine: delete a document from the sparse inverted index.
+    ///
+    /// Required: skipping on replay resurrects a deleted sparse document.
+    SparseVectorDelete = 15 | 0x8000,
+
+    /// Vector engine: insert all vectors of a multi-vector (ColBERT-style)
+    /// document, bound to one shared document surrogate.
+    ///
+    /// Distinct from `VectorPut`: N vectors share one surrogate and are tracked
+    /// in `multi_doc_map` for bulk deletion. Replaying as N `VectorPut`s would
+    /// not reconstruct that grouping, so it needs its own record and replay arm.
+    ///
+    /// Required: skipping on replay loses an acknowledged multi-vector write.
+    MultiVectorPut = 16 | 0x8000,
+
+    /// Vector engine: delete all vectors of a multi-vector document.
+    ///
+    /// Required: skipping on replay resurrects a deleted multi-vector document.
+    MultiVectorDelete = 17 | 0x8000,
+
     /// CRDT engine: delta application.
     CrdtDelta = 20 | 0x8000,
 
@@ -207,6 +246,11 @@ impl RecordType {
             x if x == 10 | 0x8000 => Some(Self::VectorPut),
             x if x == 11 | 0x8000 => Some(Self::VectorDelete),
             x if x == 12 | 0x8000 => Some(Self::VectorParams),
+            x if x == 13 | 0x8000 => Some(Self::VectorDirectUpsert),
+            x if x == 14 | 0x8000 => Some(Self::SparseVectorPut),
+            x if x == 15 | 0x8000 => Some(Self::SparseVectorDelete),
+            x if x == 16 | 0x8000 => Some(Self::MultiVectorPut),
+            x if x == 17 | 0x8000 => Some(Self::MultiVectorDelete),
             x if x == 20 | 0x8000 => Some(Self::CrdtDelta),
             x if x == 50 | 0x8000 => Some(Self::Transaction),
             x if x == 58 | 0x8000 => Some(Self::TransactionRedo),
@@ -263,6 +307,11 @@ mod tests {
             RecordType::VectorPut,
             RecordType::VectorDelete,
             RecordType::VectorParams,
+            RecordType::VectorDirectUpsert,
+            RecordType::SparseVectorPut,
+            RecordType::SparseVectorDelete,
+            RecordType::MultiVectorPut,
+            RecordType::MultiVectorDelete,
             RecordType::CrdtDelta,
             RecordType::TimeseriesBatch,
             RecordType::LogBatch,

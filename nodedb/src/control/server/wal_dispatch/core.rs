@@ -8,9 +8,7 @@ use crate::engine::array::wal::{
 };
 use crate::types::{DatabaseId, TenantId, VShardId};
 use crate::wal::manager::WalManager;
-use nodedb_physical::physical_plan::{
-    ArrayOp, CrdtOp, DocumentOp, GraphOp, TimeseriesOp, VectorOp,
-};
+use nodedb_physical::physical_plan::{ArrayOp, CrdtOp, DocumentOp, GraphOp, TimeseriesOp};
 
 use super::super::wal_dispatch_kv;
 
@@ -111,49 +109,10 @@ pub fn wal_append_if_write_with_creds(
             })?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
-        PhysicalPlan::Vector(VectorOp::Insert {
-            collection,
-            vector,
-            dim,
-            field_name,
-            surrogate,
-            pk_bytes: _,
-            provenance,
-        }) => {
-            // The local-WAL record carries the surrogate as a u32 so
-            // recovery can rebind without consulting the catalog. The
-            // `Option<String>` slot remains for follower decoders that
-            // pre-date surrogate identity (compatibility shape only —
-            // always None on this path). Provenance is appended last so
-            // older 6-element decoders can still parse the leading fields.
-            let entry = super::vector::encode_vector_put_payload(
-                collection,
-                vector,
-                *dim,
-                field_name,
-                *surrogate,
-                provenance.as_ref(),
-            )?;
-            Some(wal.append_vector_put(tenant_id, vshard_id, database_id, &entry)?)
-        }
-        PhysicalPlan::Vector(VectorOp::BatchInsert {
-            collection,
-            vectors,
-            dim,
-            surrogates: _,
-        }) => {
-            let entry = super::vector::encode_vector_batch_put_payload(collection, vectors, *dim)?;
-            Some(wal.append_vector_put(tenant_id, vshard_id, database_id, &entry)?)
-        }
-        PhysicalPlan::Vector(VectorOp::Delete {
-            collection,
-            vector_id,
-        }) => {
-            // Provenance is always None for local delete-by-node-id; appended
-            // as trailing element so older 2-element decoders fall back
-            // gracefully via the legacy arity arm.
-            let entry = super::vector::encode_vector_delete_payload(collection, *vector_id)?;
-            Some(wal.append_vector_delete(tenant_id, vshard_id, database_id, &entry)?)
+        // All vector-engine ops route through one exhaustive `VectorOp` match
+        // so a future write variant cannot silently become non-durable.
+        PhysicalPlan::Vector(op) => {
+            super::vector::wal_append_vector_op(wal, tenant_id, vshard_id, database_id, op)?
         }
         PhysicalPlan::Crdt(CrdtOp::Apply {
             collection,
@@ -226,36 +185,6 @@ pub fn wal_append_if_write_with_creds(
                     }
                 })?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
-        }
-        PhysicalPlan::Vector(VectorOp::SetParams {
-            collection,
-            field_name,
-            m,
-            ef_construction,
-            metric,
-            index_type,
-            pq_m,
-            ivf_cells,
-            ivf_nprobe,
-        }) => {
-            // `field_name` is appended last so older 4-/8-element WAL records
-            // still decode (the replay reads the leading positions first).
-            let entry = zerompk::to_msgpack_vec(&(
-                collection,
-                m,
-                ef_construction,
-                metric,
-                index_type,
-                pq_m,
-                ivf_cells,
-                ivf_nprobe,
-                field_name,
-            ))
-            .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal set vector params: {e}"),
-            })?;
-            Some(wal.append_vector_params(tenant_id, vshard_id, database_id, &entry)?)
         }
         PhysicalPlan::Columnar(nodedb_physical::physical_plan::ColumnarOp::Insert {
             collection,
@@ -366,7 +295,12 @@ pub fn wal_append_if_write_with_creds(
                 })?;
             Some(wal.append_array_delete(tenant_id, vshard_id, database_id, &bytes)?)
         }
-        // Read operations and control commands: no WAL needed.
+        // Non-vector reads and control commands: no WAL needed. Every vector
+        // write is handled above by the exhaustive `wal_append_vector_op`, so
+        // this arm covers only non-vector read/scan ops, the non-write sub-ops
+        // of Document / Graph / Kv / Columnar / Timeseries, and the Text /
+        // Spatial / Query / Meta / ClusterArray plans (whose durable writes,
+        // where any, are logged on their own dedicated paths).
         _ => None,
     };
     Ok(appended)
