@@ -314,7 +314,9 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             MetaOp::CalvinExecuteStatic { .. }
             | MetaOp::CalvinExecutePassive { .. }
             | MetaOp::CalvinExecuteActive { .. }
-            | MetaOp::RecordCalvinWriteVersions { .. },
+            | MetaOp::RecordCalvinWriteVersions { .. }
+            | MetaOp::CalvinFlush { .. }
+            | MetaOp::CalvinDrop { .. },
         ) => Permission::Write,
 
         // Synonym group DDL: Alter permission (same tier as CREATE/DROP other DDL objects).

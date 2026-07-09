@@ -141,7 +141,8 @@ impl Scheduler {
             let _ = rx.recv().await;
         });
         self.shared
-            .calvin_write_versions_recorded
+            .calvin_counters
+            .write_versions_recorded
             .fetch_add(1, Ordering::Relaxed);
     }
 }

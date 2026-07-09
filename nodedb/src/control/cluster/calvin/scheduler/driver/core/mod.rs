@@ -13,6 +13,8 @@
 //! - [`process`] — new-txn processing, dependent-read barrier setup,
 //!   txn-completion bookkeeping.
 //! - [`dispatch`] — static / active dispatch to the Data Plane executor.
+//! - [`commit_resolve`] — verdict-driven flush-or-drop of a staged static
+//!   transaction, plus the shared commit tail.
 //! - [`read_result`] — `CalvinReadResult` handling and barrier timeouts.
 //! - [`propose`] — propose `CalvinReadResult` Raft entries.
 //! - [`write_version_record`] — post-apply write-version recording for
@@ -31,6 +33,7 @@
 //!
 //! Never used for WAL-influencing values.
 
+pub mod commit_resolve;
 pub mod dispatch;
 pub mod process;
 pub mod propose;

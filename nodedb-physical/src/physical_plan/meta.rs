@@ -8,37 +8,7 @@ use nodedb_types::calvin::{PassiveReadKey, VersionedReadEntry};
 use nodedb_types::timeseries::continuous_agg::ContinuousAggregateDef;
 use nodedb_types::{TenantId, Value};
 
-/// Identity of a single key read by a passive Calvin participant.
-///
-/// Used as the map key in `CalvinExecuteActive::injected_reads` so active
-/// participants can look up which value belongs to which key.
-///
-/// `String` is used for `collection` rather than `Arc<str>` because
-/// `zerompk` derives work directly with `String`; callers may intern
-/// the string downstream if needed.
-///
-/// `BTreeMap` key: `Ord` is derived lexicographically — collection first,
-/// surrogate second. This is the determinism contract: all replicas must
-/// iterate `injected_reads` in the same order.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-    zerompk::ToMessagePack,
-    zerompk::FromMessagePack,
-)]
-pub struct PassiveReadKeyId {
-    /// Collection the key belongs to.
-    pub collection: String,
-    /// Global surrogate for the row.
-    pub surrogate: u32,
-}
+pub use super::meta_calvin::PassiveReadKeyId;
 
 /// Meta / maintenance physical operations.
 #[derive(
@@ -497,4 +467,23 @@ pub enum MetaOp {
         /// The locally-applied write plans whose keys' versions are recorded.
         plans: Vec<super::PhysicalPlan>,
     },
+
+    /// Flush the staged writes of a Calvin transaction to base storage.
+    ///
+    /// `CalvinExecuteStatic` validates and STAGES the transaction's plans into
+    /// the per-core commit-pending buffer without mutating base. Once the local
+    /// commit vote resolves to commit, the scheduler dispatches this op back to
+    /// the same core, which pops the staged plans keyed by `(epoch, position)`
+    /// and replays them through the durable apply funnel (base + side effects +
+    /// version recording). Absent key (already flushed/dropped) is an idempotent
+    /// no-op, not an error.
+    CalvinFlush { epoch: u64, position: u32 },
+
+    /// Discard the staged writes of a Calvin transaction.
+    ///
+    /// Dispatched by the scheduler when the local commit vote resolves to abort.
+    /// The handler removes the staged plans keyed by `(epoch, position)` and
+    /// fires nothing — no base mutation, no side effects. Absent key is an
+    /// idempotent no-op.
+    CalvinDrop { epoch: u64, position: u32 },
 }

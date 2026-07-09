@@ -247,13 +247,16 @@ pub struct Response {
     pub error_code: Option<ErrorCode>,
 
     /// Whether this response's originating transaction found its slice of the
-    /// versioned read-set still current against the local write versions at
-    /// apply time. `Some(true)` = still current (or no reads observed for this
-    /// slice); `Some(false)` = at least one read was superseded; `None` = the
-    /// response did not carry a read-set check (reads, control ops, and every
-    /// non-transaction response). Populated only by the transaction-apply path.
-    /// Reporting only — the apply commits regardless; a `Some(false)` here does
-    /// not abort or alter the write.
+    /// versioned read-set still current against the local write versions.
+    /// `Some(true)` = still current (or no reads observed for this slice);
+    /// `Some(false)` = at least one read was superseded; `None` = the response
+    /// did not carry a read-set check (reads, control ops, and every
+    /// non-transaction response).
+    ///
+    /// For the direct-apply (dependent/active, fast-path) path this is reporting
+    /// only — the apply commits regardless. For a staged static Calvin
+    /// transaction it is the LOCAL COMMIT VOTE: the scheduler flushes the staged
+    /// buffer to base on `Some(true)` and drops it on `Some(false)`.
     pub read_set_valid: Option<bool>,
 }
 

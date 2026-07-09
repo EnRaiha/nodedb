@@ -72,6 +72,35 @@ fn tx_batch(plans: Vec<PhysicalPlan>) -> PhysicalPlan {
     PhysicalPlan::Meta(MetaOp::TransactionBatch { plans })
 }
 
+/// Build the `MetaOp::CalvinFlush` that resolves a staged transaction to
+/// commit. `CalvinExecuteStatic` stages the plans; the flush replays them
+/// through `execute_transaction_batch` (where the panic fail point fires).
+#[cfg(feature = "failpoints")]
+fn calvin_flush(epoch: u64) -> PhysicalPlan {
+    PhysicalPlan::Meta(MetaOp::CalvinFlush { epoch, position: 0 })
+}
+
+/// Stage a static Calvin batch (validate + buffer) then flush it to base,
+/// returning the flush response (where any apply-time panic surfaces). The
+/// stage step must always return `Status::Ok`.
+#[cfg(feature = "failpoints")]
+fn stage_then_flush(
+    core: &mut nodedb::data::executor::core_loop::CoreLoop,
+    tx: &mut nodedb_bridge::buffer::Producer<nodedb::bridge::dispatch::BridgeRequest>,
+    rx: &mut nodedb_bridge::buffer::Consumer<nodedb::bridge::dispatch::BridgeResponse>,
+    epoch: u64,
+    plans: Vec<PhysicalPlan>,
+) -> nodedb::bridge::envelope::Response {
+    let staged = send_raw(core, tx, rx, calvin_static(epoch, plans));
+    assert_eq!(
+        staged.status,
+        Status::Ok,
+        "stage must succeed (validate + buffer, no apply); got {:?}",
+        staged.error_code
+    );
+    send_raw(core, tx, rx, calvin_flush(epoch))
+}
+
 /// Build a KV Put plan for the given collection.
 #[cfg(feature = "failpoints")]
 fn kv_put_in(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
@@ -110,17 +139,16 @@ fn calvin_static_panic_returns_internal_error() {
 
     let _guard = FailGuard::install("transaction_batch::between_subapply", FailAction::Panic);
 
-    let resp = send_raw(
+    // Stage succeeds (no apply); the panic fires when the flush replays the plans.
+    let resp = stage_then_flush(
         &mut core,
         &mut tx,
         &mut rx,
-        calvin_static(
-            1,
-            vec![
-                kv_put_in("orders", b"panic_key", b"should_not_persist"),
-                kv_put_in("orders", b"panic_key2", b"should_not_persist"),
-            ],
-        ),
+        1,
+        vec![
+            kv_put_in("orders", b"panic_key", b"should_not_persist"),
+            kv_put_in("orders", b"panic_key2", b"should_not_persist"),
+        ],
     );
 
     assert_eq!(
@@ -164,17 +192,15 @@ fn calvin_static_panic_rollback_not_visible() {
     // Inject a panic on the second sub-apply.
     let _guard = FailGuard::install("transaction_batch::between_subapply", FailAction::Panic);
 
-    let resp = send_raw(
+    let resp = stage_then_flush(
         &mut core,
         &mut tx,
         &mut rx,
-        calvin_static(
-            2,
-            vec![
-                kv_put_in("orders", b"rolled_back_key", b"should_be_gone"),
-                kv_put_in("orders", b"rolled_back_key2", b"should_be_gone"),
-            ],
-        ),
+        2,
+        vec![
+            kv_put_in("orders", b"rolled_back_key", b"should_be_gone"),
+            kv_put_in("orders", b"rolled_back_key2", b"should_be_gone"),
+        ],
     );
     assert_eq!(
         resp.status,
@@ -232,17 +258,15 @@ fn calvin_static_normal_operation_resumes_after_panic() {
     // Trigger a panic batch.
     {
         let _guard = FailGuard::install("transaction_batch::between_subapply", FailAction::Panic);
-        let resp = send_raw(
+        let resp = stage_then_flush(
             &mut core,
             &mut tx,
             &mut rx,
-            calvin_static(
-                1,
-                vec![
-                    kv_put_in("resume_coll", b"panic_k", b"v"),
-                    kv_put_in("resume_coll", b"panic_k2", b"v"),
-                ],
-            ),
+            1,
+            vec![
+                kv_put_in("resume_coll", b"panic_k", b"v"),
+                kv_put_in("resume_coll", b"panic_k2", b"v"),
+            ],
         );
         assert_eq!(
             resp.status,
@@ -253,15 +277,13 @@ fn calvin_static_normal_operation_resumes_after_panic() {
         // Guard drops here, clearing the fail point.
     }
 
-    // Normal CalvinExecuteStatic batch after the fail point is cleared.
-    let success_resp = send_raw(
+    // Normal staged Calvin batch after the fail point is cleared: stage + flush.
+    let success_resp = stage_then_flush(
         &mut core,
         &mut tx,
         &mut rx,
-        calvin_static(
-            2,
-            vec![kv_put_in("resume_coll", b"normal_key", b"normal_val")],
-        ),
+        2,
+        vec![kv_put_in("resume_coll", b"normal_key", b"normal_val")],
     );
     assert_eq!(
         success_resp.status,
@@ -370,7 +392,8 @@ fn calvin_static_replay_sees_only_committed_data() {
             pre_resp.error_code
         );
 
-        // Panic batch — writes must not persist.
+        // Panic batch — writes must not persist. Stage first (no apply, always
+        // Ok), then flush (where the panic fires during the replay).
         let _guard = FailGuard::install("transaction_batch::between_subapply", FailAction::Panic);
 
         tx.try_push(BridgeRequest {
@@ -384,11 +407,24 @@ fn calvin_static_replay_sees_only_committed_data() {
         })
         .unwrap();
         core.tick();
+        let stage_resp = rx.try_pop().unwrap().inner;
+        assert_eq!(
+            stage_resp.status,
+            Status::Ok,
+            "stage must succeed (validate + buffer); got {:?}",
+            stage_resp.error_code
+        );
+
+        tx.try_push(BridgeRequest {
+            inner: make_req(calvin_flush(1)),
+        })
+        .unwrap();
+        core.tick();
         let panic_resp = rx.try_pop().unwrap().inner;
         assert_eq!(
             panic_resp.status,
             Status::Error,
-            "panic batch must return Error; got {:?}",
+            "flush of panic batch must return Error; got {:?}",
             panic_resp.status
         );
         // Guard drops, clearing the fail point.

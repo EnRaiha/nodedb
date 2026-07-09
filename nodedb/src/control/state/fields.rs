@@ -18,6 +18,7 @@ use crate::control::security::rls::RlsPolicyStore;
 use crate::control::security::role::RoleStore;
 use crate::control::security::tenant::TenantIsolation;
 use crate::control::server::sync::dlq::SyncDlq;
+use crate::control::state::calvin_counters::CalvinCounters;
 use crate::wal::WalManager;
 
 /// Shared state accessible by all Control Plane sessions.
@@ -375,26 +376,9 @@ pub struct SharedState {
     /// the schedulers (which hold `Arc<SharedState>`) advance the same counter
     /// the session reads. 0 in single-node / no-Calvin deployments.
     pub last_applied_calvin_epoch: Arc<AtomicU64>,
-    /// Count of committed Calvin applies whose write versions were recorded into
-    /// the per-core write-version index — incremented once per apply for which a
-    /// per-vShard scheduler dispatched a write-version record op after obtaining
-    /// the CalvinApplied WAL LSN. Node-global observability so tests and metrics
-    /// can confirm cross-shard-committed writes advance the version index without
-    /// reaching into the `!Send` Data-Plane index. `Arc` so the schedulers (which
-    /// hold `Arc<SharedState>`) increment the same counter a reader observes. 0 in
-    /// single-node / no-Calvin deployments and until the first Calvin write apply.
-    pub calvin_write_versions_recorded: Arc<AtomicU64>,
-    /// Count of committed Calvin applies whose participant reported that its
-    /// slice of the transaction's reads was no longer current against the local
-    /// write versions at apply time. Advanced once per apply whose executor
-    /// response carried a not-current read-set outcome. This is observation only
-    /// — the apply still committed; nothing is aborted on a not-current outcome
-    /// here. Node-global so tests and metrics can observe the check firing
-    /// without reaching into the `!Send` Data-Plane index. `Arc` so the
-    /// schedulers (which hold `Arc<SharedState>`) advance the same counter a
-    /// reader observes. 0 in single-node / no-Calvin deployments and until the
-    /// first not-current read-set is observed.
-    pub read_set_validation_failures: Arc<AtomicU64>,
+    /// Node-global Calvin observability counters (write versions recorded,
+    /// read-set validation failures, commits flushed/dropped).
+    pub calvin_counters: CalvinCounters,
     /// Local, in-process sidecar carrying the applied Data-Plane [`Response`]
     /// (including RETURNING rows) of a completed Calvin transaction, keyed by
     /// its sequencer-assigned `TxnId`.

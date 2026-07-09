@@ -181,6 +181,7 @@ impl CoreLoop {
             graph_txn_overlays: HashMap::new(),
             txn_created_columnar_engines: HashMap::new(),
             write_index: super::write_index::WriteVersionIndex::new(),
+            commit_pending: HashMap::new(),
         })
     }
 }

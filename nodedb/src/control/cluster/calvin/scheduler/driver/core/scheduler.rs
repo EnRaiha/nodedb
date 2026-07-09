@@ -14,7 +14,7 @@ use nodedb_cluster::calvin::{SEQUENCER_GROUP_ID, SequencerEntry};
 
 use super::super::barrier::{PendingDependentBarrier, ReadResultEvent};
 use super::super::config::SchedulerConfig;
-use super::super::types::{BlockedTxn, PendingTxn};
+use super::super::types::{BlockedTxn, CommitState, PendingTxn};
 use crate::bridge::envelope::Response;
 use crate::control::cluster::calvin::scheduler::lock_manager::{LockManager, TxnId};
 use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
@@ -317,104 +317,36 @@ impl Scheduler {
             return;
         }
 
+        // Staged static Calvin apply: a STAGED response carries the local commit
+        // vote; drive the flush-or-drop and let the resolve response run the
+        // commit tail. Dependent / active txns carry no `commit_state` and apply
+        // directly below.
+        let commit_state = self.pending.get(&txn_id).and_then(|p| p.commit_state);
+        match commit_state {
+            Some(CommitState::Staged) => {
+                self.resolve_staged_commit(txn_id, &response);
+                return;
+            }
+            Some(CommitState::AwaitingResolve { committed }) => {
+                self.finish_resolved_commit(txn_id, response, committed);
+                return;
+            }
+            None => {}
+        }
+
         if response.status == crate::bridge::envelope::Status::Ok {
             // Observe whether the applying participant reported its slice of the
             // transaction's reads as no longer current against the local write
-            // versions. Observation only: the apply already committed and nothing
-            // is aborted here — the count is a node-global signal for tests and
-            // metrics. `None` means no read-set was checked (fast path / no reads).
+            // versions. Direct-apply (dependent/active) observation only: the
+            // staged path folds this into its commit vote instead. `None` means
+            // no read-set was checked.
             if response.read_set_valid == Some(false) {
                 self.shared
+                    .calvin_counters
                     .read_set_validation_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-
-            // Deposit the FULL applied Response (affected-count + watermark +
-            // any RETURNING rows) into the local sidecar BEFORE proposing the
-            // replicated CompletionAck. The ack fires the coordinator's
-            // completion oneshot on every sequencer member, so depositing first
-            // guarantees the result is present by the time the coordinator drains
-            // it — no lost result, no race.
-            //
-            // Gated on the PRIMARY-WRITE participant: the sole participant whose
-            // slice carries the user's non-edge DML (Document/KV/Vector/etc.),
-            // as opposed to the implicit graph-edge cleanup that dual-homes
-            // alongside it. This subsumes the old RETURNING-only gate (a RETURNING
-            // write is a primary write, so its rows are still deposited) while
-            // ALSO carrying the affected-count of a plain (non-RETURNING) write —
-            // which the RETURNING-only gate dropped, making a routed plain write
-            // report zero rows affected. Exactly one participant carries the
-            // primary write for a single-collection user DML (+ its edges), so
-            // the edge participants never clobber the entry; the
-            // `CalvinApplyResult::{Single,Conflict}` guard below stays as
-            // belt-and-suspenders. Results travel via this in-process sidecar
-            // only — never the sequencer Raft log.
-            let has_primary_write = self
-                .pending
-                .get(&txn_id)
-                .map(|p| p.has_primary_write)
-                .unwrap_or(false);
-            if has_primary_write {
-                use std::collections::hash_map::Entry;
-
-                use crate::control::state::CalvinApplyResult;
-
-                let key = nodedb_cluster::calvin::TxnId::new(txn_id.epoch, txn_id.position);
-                let mut results = self
-                    .shared
-                    .calvin_apply_results
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                match results.entry(key) {
-                    Entry::Vacant(slot) => {
-                        slot.insert(CalvinApplyResult::Single(response));
-                    }
-                    Entry::Occupied(mut slot) => {
-                        // A second RETURNING-bearing participant for one Calvin
-                        // txn means a cross-shard RETURNING union, which is
-                        // unsupported. Record Conflict so the coordinator fails
-                        // the statement loudly rather than returning one shard's
-                        // rows. Unreachable under collection-level sharding today.
-                        tracing::error!(
-                            epoch = txn_id.epoch,
-                            position = txn_id.position,
-                            vshard = self.vshard_id,
-                            "multiple RETURNING participants for one Calvin txn — cross-shard \
-                             RETURNING union unsupported"
-                        );
-                        slot.insert(CalvinApplyResult::Conflict);
-                    }
-                }
-            }
-            match self.shared.wal.append_calvin_applied(
-                crate::types::VShardId::new(self.vshard_id),
-                txn_id.epoch,
-                txn_id.position,
-            ) {
-                // The CalvinApplied WAL LSN is the committed write-LSN for this
-                // apply — the SAME shard-local WAL-LSN space fast-path writes and
-                // read watermarks use. Record the apply's per-key write versions
-                // at it now that it exists (it did not at dispatch time).
-                Ok(applied_lsn) => self.record_calvin_write_versions(txn_id, applied_lsn),
-                Err(e) => {
-                    tracing::error!(
-                        vshard_id = self.vshard_id,
-                        epoch = txn_id.epoch,
-                        position = txn_id.position,
-                        error = %e,
-                        "calvin: failed to write CalvinApplied WAL record"
-                    );
-                }
-            }
-            self.propose_sequencer_entry(
-                SequencerEntry::CompletionAck {
-                    epoch: txn_id.epoch,
-                    position: txn_id.position,
-                    vshard_id: self.vshard_id,
-                },
-                txn_id,
-                "completion ack",
-            );
+            self.commit_apply_tail(txn_id, response);
         } else {
             tracing::warn!(
                 vshard_id = self.vshard_id,
@@ -437,7 +369,12 @@ impl Scheduler {
     /// Logs a warning on encode failure or propose failure; never panics.
     /// `op_name` is a short human-readable label used in warning messages
     /// (e.g. `"completion ack"`, `"OLLP mismatch signal"`).
-    fn propose_sequencer_entry(&self, entry: SequencerEntry, txn_id: TxnId, op_name: &str) {
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn propose_sequencer_entry(
+        &self,
+        entry: SequencerEntry,
+        txn_id: TxnId,
+        op_name: &str,
+    ) {
         match zerompk::to_msgpack_vec(&entry) {
             Ok(bytes) => {
                 if let Err(e) = self

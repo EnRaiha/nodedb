@@ -39,6 +39,24 @@ pub(super) struct PendingTxn {
     /// cleanup participants that dual-home alongside it carry no primary write and
     /// so never clobber the entry the coordinator drains.
     pub has_primary_write: bool,
+    /// Commit-resolution state for a static-set Calvin txn.
+    ///
+    /// `Some(CommitState::Staged)` for a static txn dispatched via the
+    /// validate-and-stage path: its first executor response carries the local
+    /// commit vote and drives a flush-or-drop before the commit tail runs.
+    /// `None` for dependent/active txns, which apply directly.
+    pub commit_state: Option<CommitState>,
+}
+
+/// Commit-resolution state of a staged static Calvin transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::control::cluster::calvin::scheduler::driver) enum CommitState {
+    /// Awaiting the validate-and-stage response, whose `read_set_valid` carries
+    /// the local commit vote that drives the flush-or-drop decision.
+    Staged,
+    /// A flush (`committed = true`) or drop (`committed = false`) has been
+    /// dispatched; awaiting its response before the commit tail runs.
+    AwaitingResolve { committed: bool },
 }
 
 /// A transaction that is blocked on lock acquisition.

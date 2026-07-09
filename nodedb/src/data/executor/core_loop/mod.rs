@@ -2,6 +2,7 @@
 
 mod accessors;
 mod bitemporal_time;
+pub(in crate::data::executor) mod commit_pending;
 mod decode_stored;
 pub(in crate::data::executor) mod deferred;
 mod event_emit;

@@ -112,7 +112,12 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
     // do not normally reach the gate.
     if matches!(
         target.plan,
-        PhysicalPlan::Meta(MetaOp::CalvinExecuteStatic { .. } | MetaOp::CalvinExecuteActive { .. })
+        PhysicalPlan::Meta(
+            MetaOp::CalvinExecuteStatic { .. }
+                | MetaOp::CalvinExecuteActive { .. }
+                | MetaOp::CalvinFlush { .. }
+                | MetaOp::CalvinDrop { .. }
+        )
     ) {
         return WriteAdmission::ExemptRead;
     }

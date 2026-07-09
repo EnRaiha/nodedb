@@ -15,6 +15,7 @@ pub mod exchange;
 pub mod graph;
 pub mod kv;
 pub mod meta;
+pub mod meta_calvin;
 pub mod query;
 pub mod routing;
 pub mod spatial;

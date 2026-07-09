@@ -462,4 +462,19 @@ pub struct CoreLoop {
     /// Per-core last-write-LSN version index (per key + per collection),
     /// advanced by every committed write-apply. Type + GC in `write_index.rs`.
     pub(in crate::data::executor) write_index: super::write_index::WriteVersionIndex,
+
+    /// Staged Calvin write plans awaiting the local commit verdict, keyed by
+    /// `(epoch, position, vshard)`. `CalvinExecuteStatic` validates a
+    /// transaction and inserts its plans here WITHOUT mutating base; the
+    /// verdict-driven `CalvinFlush` replays them through
+    /// `execute_transaction_batch` to make them durable, and `CalvinDrop`
+    /// discards them. Nothing staged here is observable in the base engines
+    /// until a flush.
+    ///
+    /// The vShard is part of the key because vShards round-robin onto cores:
+    /// several vShard slices of one multi-participant transaction — which share
+    /// the same `(epoch, position)` — can land on the same core, and each must
+    /// stage and flush its own slice independently rather than clobber a peer's.
+    pub(in crate::data::executor) commit_pending:
+        HashMap<(u64, u32, u32), super::commit_pending::PendingCommit>,
 }

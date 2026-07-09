@@ -242,6 +242,14 @@ impl CoreLoop {
                 self.response_ok(task)
             }
 
+            MetaOp::CalvinFlush { epoch, position } => {
+                self.execute_calvin_flush(task, *epoch, *position)
+            }
+
+            MetaOp::CalvinDrop { epoch, position } => {
+                self.execute_calvin_drop(task, *epoch, *position)
+            }
+
             MetaOp::StageWrite { plan } => self.execute_stage_write(task, tid, plan),
 
             // Release the staging overlay once a transaction resolves (commit

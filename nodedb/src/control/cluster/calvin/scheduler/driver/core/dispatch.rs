@@ -288,6 +288,10 @@ impl Scheduler {
                 dispatch_time: dispatch_instant,
                 lock_acquired_time,
                 has_primary_write,
+                // This dispatch STAGED the txn (validate + buffer, no apply);
+                // its response carries the local commit vote that drives the
+                // subsequent flush-or-drop.
+                commit_state: Some(super::super::types::CommitState::Staged),
             },
         );
     }
@@ -419,6 +423,9 @@ impl Scheduler {
                 dispatch_time: dispatch_instant,
                 lock_acquired_time,
                 has_primary_write,
+                // The dependent-read active path applies directly (it resolves
+                // its reads via injected values, not a staged buffer).
+                commit_state: None,
             },
         );
     }

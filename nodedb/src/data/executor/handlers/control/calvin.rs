@@ -2,10 +2,15 @@
 
 //! Calvin deterministic executor handlers.
 //!
-//! Three handler entry points:
+//! Handler entry points:
 //!
 //! - [`CoreLoop::execute_calvin_execute_static`]: static-set multi-shard txn
-//!   (same semantics as `MetaOp::TransactionBatch`; the common case).
+//!   (the common case). It VALIDATES the read-set to compute the local commit
+//!   vote and STAGES the transaction's plans into the commit-pending buffer
+//!   WITHOUT mutating base or firing side effects, then returns the vote.
+//!   [`CoreLoop::execute_calvin_flush`] later replays the staged plans through
+//!   the durable apply funnel, or [`CoreLoop::execute_calvin_drop`] discards
+//!   them.
 //!
 //! - [`CoreLoop::execute_calvin_execute_passive`]: passive participant for a
 //!   dependent-read txn. Reads each declared key from the local engine and
@@ -30,8 +35,9 @@ use nodedb_cluster::calvin::types::PassiveReadKey;
 use nodedb_types::Value;
 use nodedb_types::calvin::VersionedReadEntry;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::commit_pending::PendingCommit;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
@@ -53,15 +59,18 @@ pub(in crate::data::executor) struct CalvinExecCtx {
 }
 
 impl CoreLoop {
-    /// Execute a static-set Calvin sequenced transaction batch.
+    /// Validate a static-set Calvin transaction and stage it for commit.
     ///
-    /// Sets `self.epoch_system_ms` to the epoch's deterministic timestamp
-    /// anchor before delegating to `execute_transaction_batch`, then resets
-    /// it to `None` immediately after. Engine handlers that need "current time"
-    /// read `self.epoch_system_ms` and fall back to wall clock when `None`.
-    ///
-    /// Also advances the HLC to the epoch anchor so graph `next_ordinal()`
-    /// calls produce deterministic ordinals across all replicas.
+    /// Computes the local commit vote by checking whether this participant's
+    /// slice of the transaction's LSN-versioned read-set is still current
+    /// against the per-core write versions, then STAGES the write plans into
+    /// the commit-pending buffer keyed by `(epoch, position)`. It performs NO
+    /// base mutation and fires NO side effects — nothing is observable until a
+    /// subsequent [`CoreLoop::execute_calvin_flush`] replays the staged plans
+    /// (or [`CoreLoop::execute_calvin_drop`] discards them). The response
+    /// carries the vote on `read_set_valid`; the deterministic time anchor and
+    /// leadership scope are captured with the staged plans and restored at
+    /// flush time (when the actual apply — and any time-dependent writes — run).
     pub(in crate::data::executor) fn execute_calvin_execute_static(
         &mut self,
         task: &ExecutionTask,
@@ -86,10 +95,10 @@ impl CoreLoop {
             is_group_leader,
             plan_count = plans.len(),
             read_count = versioned_reads.len(),
-            "calvin execute static"
+            "calvin stage for commit"
         );
-        let _apply_span = info_span!(
-            "executor_apply",
+        let _stage_span = info_span!(
+            "executor_stage",
             epoch,
             position,
             vshard = vshard_id,
@@ -97,20 +106,112 @@ impl CoreLoop {
             trace_id = ?task.request.trace_id,
         )
         .entered();
+
+        // Local commit vote: is this participant's slice of the read-set still
+        // current against the local write versions? Empty read-set is vacuously
+        // current. Read-only — no base mutation here.
+        let vote = self.read_set_still_current(task, tenant_id.as_u64(), versioned_reads);
+
+        // Stage the write plans for commit, keyed by this participant's vShard
+        // so co-located slices of the same multi-participant transaction (which
+        // share `(epoch, position)`) never clobber one another on a shared core.
+        // The verdict-driven flush replays them through
+        // `execute_transaction_batch`; the drop discards them.
+        self.commit_pending.insert(
+            (epoch, position, vshard_id),
+            PendingCommit {
+                plans: plans.to_vec(),
+                tenant_id: *tenant_id,
+                epoch_system_ms,
+                is_group_leader,
+            },
+        );
+
+        Response {
+            request_id: task.request_id(),
+            status: Status::Ok,
+            attempt: 1,
+            partial: false,
+            payload: Payload::empty(),
+            watermark_lsn: self.watermark,
+            error_code: None,
+            read_set_valid: Some(vote),
+        }
+    }
+
+    /// Flush a staged Calvin transaction to base storage.
+    ///
+    /// Pops the plans staged by [`CoreLoop::execute_calvin_execute_static`]
+    /// under `(epoch, position)` and replays them through the durable apply
+    /// funnel (`execute_transaction_batch`) — the same funnel the single-shard
+    /// commit and recovery use — so base mutation, side effects, and
+    /// version recording all run exactly once here. The deterministic epoch
+    /// time anchor and leadership scope captured at stage time are restored
+    /// around the apply so time-dependent writes stay identical across
+    /// replicas. An absent key (already flushed or dropped, e.g. a duplicate
+    /// dispatch) is an idempotent no-op returning `Ok`.
+    pub(in crate::data::executor) fn execute_calvin_flush(
+        &mut self,
+        task: &ExecutionTask,
+        epoch: u64,
+        position: u32,
+    ) -> Response {
+        let vshard_id = task.request.vshard_id.as_u32();
+        let Some(pending) = self.commit_pending.remove(&(epoch, position, vshard_id)) else {
+            debug!(
+                core = self.core_id,
+                epoch, position, vshard_id, "calvin flush: no staged commit (already resolved)"
+            );
+            return self.response_ok(task);
+        };
+        let _apply_span = info_span!(
+            "executor_apply",
+            epoch,
+            position,
+            vshard = vshard_id,
+            tenant_id = pending.tenant_id.as_u64(),
+            trace_id = ?task.request.trace_id,
+        )
+        .entered();
         const NANOS_PER_MS: i64 = 1_000_000;
         self.hlc
-            .update_from_remote(epoch_system_ms.saturating_mul(NANOS_PER_MS));
-        self.epoch_system_ms = Some(epoch_system_ms);
-        // Scope OLLP verification to this replica's group leadership for the
-        // batch, then restore the resting (authoritative) state so a subsequent
-        // direct single-shard dispatch still verifies.
+            .update_from_remote(pending.epoch_system_ms.saturating_mul(NANOS_PER_MS));
+        self.epoch_system_ms = Some(pending.epoch_system_ms);
+        // Scope OLLP verification to this participant's staged leadership for the
+        // batch, then restore the resting (authoritative) state.
         let prev_group_leader = self.ollp_is_group_leader;
-        self.ollp_is_group_leader = is_group_leader;
+        self.ollp_is_group_leader = pending.is_group_leader;
+        // The read-set was already validated at stage time and drives the
+        // flush/drop decision; the replay itself carries no read-set to re-check.
         let result =
-            self.execute_transaction_batch(task, tenant_id.as_u64(), plans, versioned_reads);
+            self.execute_transaction_batch(task, pending.tenant_id.as_u64(), &pending.plans, &[]);
         self.ollp_is_group_leader = prev_group_leader;
         self.epoch_system_ms = None;
         result
+    }
+
+    /// Discard a staged Calvin transaction.
+    ///
+    /// Removes the plans staged under `(epoch, position, vshard)` from the
+    /// commit-pending buffer and fires nothing — no base mutation, no side
+    /// effects. An
+    /// absent key (already flushed or dropped) is an idempotent no-op.
+    pub(in crate::data::executor) fn execute_calvin_drop(
+        &mut self,
+        task: &ExecutionTask,
+        epoch: u64,
+        position: u32,
+    ) -> Response {
+        let vshard_id = task.request.vshard_id.as_u32();
+        let existed = self
+            .commit_pending
+            .remove(&(epoch, position, vshard_id))
+            .is_some();
+        debug!(
+            core = self.core_id,
+            epoch, position, vshard_id, existed, "calvin drop: discarding staged commit"
+        );
+        self.response_ok(task)
     }
 
     /// Execute a passive-participant dependent-read Calvin txn.
