@@ -97,6 +97,9 @@ impl CoreLoop {
                     collection: collection.to_string(),
                 },
             ),
+            Err(AtomicError::Encode { detail }) => {
+                self.response_error(task, ErrorCode::Internal { detail })
+            }
         }
     }
 
@@ -172,6 +175,9 @@ impl CoreLoop {
                     collection: collection.to_string(),
                 },
             ),
+            Err(AtomicError::Encode { detail }) => {
+                self.response_error(task, ErrorCode::Internal { detail })
+            }
         }
     }
 

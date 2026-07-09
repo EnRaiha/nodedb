@@ -78,6 +78,22 @@ fn decode_msgpack_f64(bytes: &[u8]) -> Result<f64, AtomicError> {
     })
 }
 
+/// Encode an `i64` as MessagePack, wrapping the (practically unreachable, but
+/// not type-system-excluded) encode failure in [`AtomicError::Encode`] rather
+/// than panicking.
+fn encode_i64(v: i64) -> Result<Vec<u8>, AtomicError> {
+    zerompk::to_msgpack_vec(&v).map_err(|e| AtomicError::Encode {
+        detail: format!("i64 re-encode: {e}"),
+    })
+}
+
+/// Encode an `f64` as MessagePack, same rationale as [`encode_i64`].
+fn encode_f64(v: f64) -> Result<Vec<u8>, AtomicError> {
+    zerompk::to_msgpack_vec(&v).map_err(|e| AtomicError::Encode {
+        detail: format!("f64 re-encode: {e}"),
+    })
+}
+
 /// Compute the new value for `INCR`, given the current raw bytes (if
 /// any). Returns `(new_i64, new_bytes)` -- mirrors the typed-map /
 /// plain-i64 branches of [`super::engine_atomic::KvEngine::incr`] exactly.
@@ -108,13 +124,15 @@ pub fn incr(current: Option<&[u8]>, delta: i64) -> Result<(i64, Vec<u8>), Atomic
             }
         }
         if updated {
-            nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(map))
-                .unwrap_or_else(|_| zerompk::to_msgpack_vec(&new_i64).expect("i64 serializes"))
+            match nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(map)) {
+                Ok(bytes) => bytes,
+                Err(_) => encode_i64(new_i64)?,
+            }
         } else {
-            zerompk::to_msgpack_vec(&new_i64).expect("i64 always serializes")
+            encode_i64(new_i64)?
         }
     } else {
-        zerompk::to_msgpack_vec(&new_i64).expect("i64 always serializes")
+        encode_i64(new_i64)?
     };
     Ok((new_i64, new_bytes))
 }
@@ -131,7 +149,7 @@ pub fn incr_float(current: Option<&[u8]>, delta: f64) -> Result<(f64, Vec<u8>), 
     if new_f64.is_nan() || new_f64.is_infinite() {
         return Err(AtomicError::Overflow);
     }
-    let new_bytes = zerompk::to_msgpack_vec(&new_f64).expect("f64 always serializes");
+    let new_bytes = encode_f64(new_f64)?;
     Ok((new_f64, new_bytes))
 }
 

@@ -28,6 +28,8 @@ pub enum AtomicError {
     TypeMismatch { detail: String },
     /// Integer overflow on INCR/DECR.
     Overflow,
+    /// The computed new value failed to re-encode as MessagePack.
+    Encode { detail: String },
 }
 
 /// Shared key-identity context for a single-key atomic KV operation
@@ -135,21 +137,22 @@ impl KvEngine {
     /// Ensure a hash table exists for (tenant, collection), creating if needed.
     /// Returns a mutable reference to the table.
     fn ensure_table(&mut self, tkey: u64, tenant_id: u64, collection: &str) -> &mut KvHashTable {
-        if !self.tables.contains_key(&tkey) {
-            self.hash_to_tenant.entry(tkey).or_insert(tenant_id);
-            self.hash_to_collection
-                .entry(tkey)
-                .or_insert_with(|| collection.to_string());
-            self.tables.entry(tkey).or_insert_with(|| {
-                KvHashTable::new(
-                    self.default_capacity,
-                    self.load_factor_threshold,
-                    self.rehash_batch_size,
-                    self.inline_threshold,
-                )
-            });
-        }
-        self.tables.get_mut(&tkey).expect("just ensured")
+        self.hash_to_tenant.entry(tkey).or_insert(tenant_id);
+        self.hash_to_collection
+            .entry(tkey)
+            .or_insert_with(|| collection.to_string());
+        let default_capacity = self.default_capacity;
+        let load_factor_threshold = self.load_factor_threshold;
+        let rehash_batch_size = self.rehash_batch_size;
+        let inline_threshold = self.inline_threshold;
+        self.tables.entry(tkey).or_insert_with(|| {
+            KvHashTable::new(
+                default_capacity,
+                load_factor_threshold,
+                rehash_batch_size,
+                inline_threshold,
+            )
+        })
     }
 
     /// Internal helper: put a value into the hash table, handling TTL and expiry.
@@ -213,8 +216,22 @@ impl KvEngine {
                 None
             };
 
-        // Write the value.
-        let table = self.tables.get_mut(&tkey).expect("table ensured");
+        // Write the value. Callers of `atomic_put` always invoke `ensure_table`
+        // for this `tkey` earlier in the same method, so the entry is
+        // guaranteed present here; `or_insert_with` keeps that invariant
+        // encoded in the type instead of unwrapping an `Option`.
+        let default_capacity = self.default_capacity;
+        let load_factor_threshold = self.load_factor_threshold;
+        let rehash_batch_size = self.rehash_batch_size;
+        let inline_threshold = self.inline_threshold;
+        let table = self.tables.entry(tkey).or_insert_with(|| {
+            KvHashTable::new(
+                default_capacity,
+                load_factor_threshold,
+                rehash_batch_size,
+                inline_threshold,
+            )
+        });
         table.put(key, value, expire_at, surrogate);
 
         // Schedule new expiry if needed.

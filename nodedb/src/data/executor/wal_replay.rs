@@ -4,7 +4,9 @@
 //!
 //! Vector replay lives in `wal_replay_vector.rs`. The `kv_transfer` /
 //! `kv_transfer_item` delta-record replay (decode, tombstone gate, and
-//! mutation) lives in `wal_replay_kv_transfer.rs`.
+//! mutation) lives in `wal_replay_kv_transfer.rs`. The `kv_cas` /
+//! `kv_incr_float` / `kv_getset` delta-record replay lives in
+//! `wal_replay_kv_atomic.rs`.
 
 use super::core_loop::CoreLoop;
 use std::sync::Arc;
@@ -208,6 +210,22 @@ impl CoreLoop {
                 ) {
                     puts += item_puts;
                     deletes += item_deletes;
+                    continue;
+                }
+
+                // kv_cas / kv_incr_float / kv_getset (delta records, not
+                // post-images): re-run the same live computation against
+                // whatever value is present in this core's KV engine at this
+                // point in LSN order — see `wal_replay_kv_atomic.rs`.
+                if let Some(applied) = self.try_replay_kv_atomic(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
                     continue;
                 }
 

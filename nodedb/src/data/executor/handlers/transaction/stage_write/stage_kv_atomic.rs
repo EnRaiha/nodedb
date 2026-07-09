@@ -308,6 +308,9 @@ impl CoreLoop {
                     collection: collection.to_string(),
                 },
             ),
+            AtomicError::Encode { detail } => {
+                self.response_error(task, ErrorCode::Internal { detail })
+            }
         }
     }
 }

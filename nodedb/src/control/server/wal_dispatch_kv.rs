@@ -98,6 +98,65 @@ pub(crate) fn encode_kv_transfer_item(
     })
 }
 
+/// Encode a `kv_cas` WAL payload: `("kv_cas", collection, key, expected,
+/// new_value, surrogate)`.
+///
+/// This is a post-image-independent record: it carries the CAS inputs
+/// (`expected`, `new_value`), not whether the compare succeeded live.
+/// Replay re-runs the compare against whatever value is present in the KV
+/// engine at that point in LSN order; a live-failed CAS replays to the same
+/// no-op, and a live-succeeded CAS replays to the same write.
+pub(crate) fn encode_kv_cas(
+    collection: &str,
+    key: &[u8],
+    expected: &[u8],
+    new_value: &[u8],
+    surrogate: u32,
+) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(&("kv_cas", collection, key, expected, new_value, surrogate)).map_err(
+        |e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal kv cas: {e}"),
+        },
+    )
+}
+
+/// Encode a `kv_incr_float` WAL payload: `("kv_incr_float", collection, key,
+/// delta, surrogate)`.
+///
+/// Delta record: replay re-runs `incr_float` against whatever value is
+/// present at that point in LSN order rather than trusting a captured
+/// post-image.
+pub(crate) fn encode_kv_incr_float(
+    collection: &str,
+    key: &[u8],
+    delta: f64,
+    surrogate: u32,
+) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(&("kv_incr_float", collection, key, delta, surrogate)).map_err(|e| {
+        crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal kv incr_float: {e}"),
+        }
+    })
+}
+
+/// Encode a `kv_getset` WAL payload: `("kv_getset", collection, key,
+/// new_value, surrogate)`.
+pub(crate) fn encode_kv_getset(
+    collection: &str,
+    key: &[u8],
+    new_value: &[u8],
+    surrogate: u32,
+) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(&("kv_getset", collection, key, new_value, surrogate)).map_err(|e| {
+        crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal kv getset: {e}"),
+        }
+    })
+}
+
 /// Serialize a KV operation and append to the WAL.
 ///
 /// Returns the appended write's WAL LSN (`Some`) for KV writes, or `None` for
@@ -260,17 +319,7 @@ pub fn wal_append_kv_op(
             delta,
             surrogate,
         } => {
-            let entry = zerompk::to_msgpack_vec(&(
-                "kv_incr_float",
-                collection,
-                key,
-                delta,
-                surrogate.as_u32(),
-            ))
-            .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal kv incr_float: {e}"),
-            })?;
+            let entry = encode_kv_incr_float(collection, key, *delta, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Cas {
@@ -280,18 +329,7 @@ pub fn wal_append_kv_op(
             new_value,
             surrogate,
         } => {
-            let entry = zerompk::to_msgpack_vec(&(
-                "kv_cas",
-                collection,
-                key,
-                expected,
-                new_value,
-                surrogate.as_u32(),
-            ))
-            .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal kv cas: {e}"),
-            })?;
+            let entry = encode_kv_cas(collection, key, expected, new_value, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::GetSet {
@@ -300,17 +338,7 @@ pub fn wal_append_kv_op(
             new_value,
             surrogate,
         } => {
-            let entry = zerompk::to_msgpack_vec(&(
-                "kv_getset",
-                collection,
-                key,
-                new_value,
-                surrogate.as_u32(),
-            ))
-            .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal kv getset: {e}"),
-            })?;
+            let entry = encode_kv_getset(collection, key, new_value, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::RegisterSortedIndex {
@@ -413,7 +441,10 @@ pub fn wal_append_kv_op(
 
 #[cfg(test)]
 mod tests {
-    use super::{KvTransferFields, encode_kv_put, encode_kv_transfer, encode_kv_transfer_item};
+    use super::{
+        KvTransferFields, encode_kv_cas, encode_kv_getset, encode_kv_incr_float, encode_kv_put,
+        encode_kv_transfer, encode_kv_transfer_item,
+    };
 
     #[test]
     fn kv_put_without_expire_at_matches_historical_shape() {
@@ -505,5 +536,46 @@ mod tests {
         assert_eq!(item_key, b"sword_1");
         assert_eq!(dest_key, b"sword_moved");
         assert_eq!(surrogate, 42);
+    }
+
+    #[test]
+    fn kv_cas_encodes_expected_and_new_value_with_surrogate() {
+        let entry = encode_kv_cas("state", b"p1", b"idle", b"in_match", 9).unwrap();
+
+        let (disc, collection, key, expected, new_value, surrogate) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, Vec<u8>, u32)>(&entry)
+                .unwrap();
+        assert_eq!(disc, "kv_cas");
+        assert_eq!(collection, "state");
+        assert_eq!(key, b"p1");
+        assert_eq!(expected, b"idle");
+        assert_eq!(new_value, b"in_match");
+        assert_eq!(surrogate, 9);
+    }
+
+    #[test]
+    fn kv_incr_float_encodes_delta_with_surrogate() {
+        let entry = encode_kv_incr_float("scores", b"dmg", 3.125, 5).unwrap();
+
+        let (disc, collection, key, delta, surrogate) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, f64, u32)>(&entry).unwrap();
+        assert_eq!(disc, "kv_incr_float");
+        assert_eq!(collection, "scores");
+        assert_eq!(key, b"dmg");
+        assert_eq!(delta, 3.125);
+        assert_eq!(surrogate, 5);
+    }
+
+    #[test]
+    fn kv_getset_encodes_new_value_with_surrogate() {
+        let entry = encode_kv_getset("session", b"tok", b"new-token", 3).unwrap();
+
+        let (disc, collection, key, new_value, surrogate) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u32)>(&entry).unwrap();
+        assert_eq!(disc, "kv_getset");
+        assert_eq!(collection, "session");
+        assert_eq!(key, b"tok");
+        assert_eq!(new_value, b"new-token");
+        assert_eq!(surrogate, 3);
     }
 }
