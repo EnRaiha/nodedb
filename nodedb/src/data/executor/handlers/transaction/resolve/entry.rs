@@ -10,15 +10,15 @@
 //! `RecordType::TransactionRedo` record; a later install phase replays them. No
 //! base engine is touched here.
 //!
-//! Only the KV serializer exists in this module today. Every other engine that
-//! writes raises a typed error rather than being silently omitted from the redo
-//! record: dropping an op class would lose those rows on install. Later
-//! serializers (document, graph, vector, array, columnar) replace their error
-//! arm with a real per-engine module beside [`super::kv`].
+//! The KV and Document serializers exist in this module today. Every other
+//! engine that writes raises a typed error rather than being silently omitted
+//! from the redo record: dropping an op class would lose those rows on install.
+//! Later serializers (graph, vector, array, columnar) replace their error arm
+//! with a real per-engine module beside [`super::kv`] and [`super::document`].
 
 use std::collections::BTreeSet;
 
-use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
@@ -26,7 +26,7 @@ use crate::data::executor::task::ExecutionTask;
 use crate::types::{TenantId, TxnId};
 use crate::wal::{RedoRecord, RedoSubRecord};
 
-use super::kv;
+use super::{document, kv};
 
 impl CoreLoop {
     /// Resolve a committing transaction's staged writes into a [`RedoRecord`]
@@ -70,12 +70,19 @@ impl CoreLoop {
         plans: &[PhysicalPlan],
     ) -> crate::Result<Vec<RedoSubRecord>> {
         let mut kv_collections: BTreeSet<String> = BTreeSet::new();
+        let mut doc_collections: BTreeSet<String> = BTreeSet::new();
 
         for plan in plans {
             match plan {
                 // KV: overlay-backed serializer. Read ops stage nothing and are
                 // skipped; row-level writes contribute their collection.
                 PhysicalPlan::Kv(op) => classify_kv_op(op, &mut kv_collections)?,
+
+                // Document: overlay-backed serializer. Staged point/bulk writes
+                // contribute their collection; read-only ops stage nothing;
+                // RETURNING variants and join/merge DML have no overlay
+                // post-image and raise a typed error.
+                PhysicalPlan::Document(op) => classify_document_op(op, &mut doc_collections)?,
 
                 // CRDT deltas ride their own `CrdtDelta` WAL record, never redo
                 // sub-records (see `replay_transaction_redo_wal`).
@@ -92,10 +99,8 @@ impl CoreLoop {
                 // Data-bearing engines whose transaction-resolve serializer is
                 // not built yet. Erroring keeps their rows out of a silently
                 // lossy redo record; each is replaced by a real serializer in a
-                // later unit. (Even once those land, a `Document` bulk/point op
-                // carrying `RETURNING` and `Columnar::{Update, Delete}` stay
-                // typed errors — no per-row redo shape exists for them.)
-                PhysicalPlan::Document(_) => return Err(unsupported_engine("document")),
+                // later unit. (Even once those land, `Columnar::{Update, Delete}`
+                // stay typed errors — no per-row redo shape exists for them.)
                 PhysicalPlan::Graph(_) => return Err(unsupported_engine("graph")),
                 PhysicalPlan::Vector(_) => return Err(unsupported_engine("vector")),
                 PhysicalPlan::Array(_) => return Err(unsupported_engine("array")),
@@ -122,6 +127,23 @@ impl CoreLoop {
                     collection.clone(),
                 );
                 kv::serialize_kv_collection(overlay, &coll_key, collection, &mut ops)?;
+            }
+            for collection in &doc_collections {
+                let coll_key = (
+                    task.request.database_id,
+                    TenantId::new(tid),
+                    collection.clone(),
+                );
+                // Strict collections store Binary Tuples; resolve the schema
+                // once so the serializer can decode them back to MessagePack.
+                let strict_schema = self.resolve_strict_schema(tid, collection);
+                document::serialize_document_collection(
+                    overlay,
+                    &coll_key,
+                    collection,
+                    strict_schema.as_ref(),
+                    &mut ops,
+                )?;
             }
         }
         Ok(ops)
@@ -196,6 +218,95 @@ fn classify_kv_op(op: &KvOp, collections: &mut BTreeSet<String>) -> crate::Resul
     }
 }
 
+/// Classify a Document op for transaction resolve: collect the collection of a
+/// staged point/bulk write into `collections`, skip read-only ops, and reject
+/// the writes that leave no overlay post-image.
+fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> crate::Result<()> {
+    match op {
+        // Staged writes (`is_point_write`): the resolved post-image (value or
+        // tombstone) is in the overlay, keyed by the user primary key.
+        DocumentOp::PointPut { collection, .. }
+        | DocumentOp::PointInsert { collection, .. }
+        | DocumentOp::Upsert { collection, .. }
+        | DocumentOp::PointDelete {
+            collection,
+            returning: None,
+            ..
+        }
+        | DocumentOp::PointUpdate {
+            collection,
+            returning: None,
+            ..
+        }
+        | DocumentOp::BulkUpdate {
+            collection,
+            returning: None,
+            ..
+        }
+        | DocumentOp::BulkDelete {
+            collection,
+            returning: None,
+            ..
+        } => {
+            collections.insert(collection.clone());
+            Ok(())
+        }
+        // `INSERT ... SELECT` stages the copied rows into the target collection.
+        DocumentOp::InsertSelect {
+            target_collection, ..
+        } => {
+            collections.insert(target_collection.clone());
+            Ok(())
+        }
+
+        // Read-only families: scans, lookups, point-gets, and estimates carry
+        // no persisted post-image.
+        DocumentOp::PointGet { .. }
+        | DocumentOp::Scan { .. }
+        | DocumentOp::RangeScan { .. }
+        | DocumentOp::IndexLookup { .. }
+        | DocumentOp::IndexedFetch { .. }
+        | DocumentOp::EstimateCount { .. }
+        | DocumentOp::MaterializeScan { .. } => Ok(()),
+
+        // Writes carrying RETURNING are NOT staged (`is_point_write` requires
+        // `returning: None`), so the overlay holds no post-image for them; the
+        // join/merge/batch DML is likewise never staged. Rejecting keeps their
+        // rows out of a silently lossy redo record. This is permanent — the
+        // staging gate cannot capture a RETURNING projection or a multi-row
+        // join/merge as a per-surrogate post-image — not "not yet supported".
+        DocumentOp::PointDelete {
+            returning: Some(_), ..
+        }
+        | DocumentOp::PointUpdate {
+            returning: Some(_), ..
+        }
+        | DocumentOp::BulkUpdate {
+            returning: Some(_), ..
+        }
+        | DocumentOp::BulkDelete {
+            returning: Some(_), ..
+        }
+        | DocumentOp::UpdateFromJoin { .. }
+        | DocumentOp::Merge { .. }
+        | DocumentOp::BatchInsert { .. } => Err(crate::Error::PlanError {
+            detail: "document write with RETURNING or join/merge/batch DML has no staged \
+                     post-image and is not supported in transaction resolve"
+                .to_string(),
+        }),
+
+        // Index / DDL / truncate: never stageable into the overlay, so no
+        // row-level redo shape carries them.
+        DocumentOp::Register { .. }
+        | DocumentOp::DropIndex { .. }
+        | DocumentOp::BackfillIndex { .. }
+        | DocumentOp::Truncate { .. } => Err(crate::Error::PlanError {
+            detail: "document index/DDL/truncate op is not supported in transaction resolve"
+                .to_string(),
+        }),
+    }
+}
+
 /// The typed error a not-yet-supported writing engine raises during resolve.
 fn unsupported_engine(engine: &str) -> crate::Error {
     crate::Error::PlanError {
@@ -209,8 +320,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use nodedb_bridge::buffer::RingBuffer;
-    use nodedb_physical::physical_plan::{DocumentOp, KvOp, MetaOp};
+    use nodedb_physical::physical_plan::{
+        DocumentOp, KvOp, MetaOp, ReturningColumns, ReturningSpec, StorageMode,
+    };
     use nodedb_types::Surrogate;
+    use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
+    use nodedb_types::sync::wire::SyncProvenance;
+
+    use crate::data::executor::strict_format;
+    use crate::engine::document::store::{CollectionConfig, surrogate_to_doc_id};
 
     use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
     use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
@@ -499,26 +617,403 @@ mod tests {
     }
 
     #[test]
-    fn document_write_plan_yields_typed_error() {
+    fn document_write_with_returning_yields_typed_error() {
         let (core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(6);
 
-        let doc_plan = PhysicalPlan::Document(DocumentOp::PointPut {
+        // A DELETE ... RETURNING is not staged (`is_point_write` requires
+        // `returning: None`), so the overlay holds no post-image for it.
+        // Resolve must raise a typed error rather than silently drop the row.
+        let doc_plan = PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: "docs".to_string(),
             document_id: "d1".to_string(),
-            value: Vec::new(),
             surrogate: Surrogate::ZERO,
             pk_bytes: Vec::new(),
+            returning: Some(ReturningSpec {
+                columns: ReturningColumns::Star,
+            }),
         });
 
         let resp = core.execute_resolve_txn(&task, TID, txn, &[doc_plan]);
         assert_eq!(
             resp.status,
             Status::Error,
-            "a not-yet-supported writing op must raise a typed error, not be dropped"
+            "a RETURNING write has no staged post-image and must raise a typed error"
         );
         assert!(resp.error_code.is_some());
+    }
+
+    /// Register a strict collection whose first column is a non-null `_rowid`
+    /// (so `apply_point_put` reads it from the emitted MessagePack) plus a
+    /// nullable `body` column.
+    fn strict_schema() -> StrictSchema {
+        StrictSchema::new(vec![
+            ColumnDef::required("_rowid", ColumnType::Int64),
+            ColumnDef::nullable("body", ColumnType::String),
+        ])
+        .expect("strict schema")
+    }
+
+    fn register_strict(core: &mut CoreLoop, collection: &str) {
+        core.doc_configs.insert(
+            (TenantId::new(TID), collection.to_string()),
+            CollectionConfig::new(collection).with_storage_mode(StorageMode::Strict {
+                schema: strict_schema(),
+            }),
+        );
+    }
+
+    fn strict_tuple(rowid: i64, body: &str) -> Vec<u8> {
+        let mut obj = std::collections::HashMap::new();
+        obj.insert("_rowid".to_string(), nodedb_types::Value::Integer(rowid));
+        obj.insert(
+            "body".to_string(),
+            nodedb_types::Value::String(body.to_string()),
+        );
+        strict_format::value_to_binary_tuple(&nodedb_types::Value::Object(obj), &strict_schema())
+            .expect("encode binary tuple")
+    }
+
+    /// A schemaless document body in the form staging and the document store
+    /// hold it: the canonical storage encoding, not the raw `Value` encoding.
+    /// `apply_point_put` canonicalizes on write, so a body in any other shape
+    /// would not survive a byte-for-byte round-trip through replay.
+    fn schemaless_body(name: &str) -> Vec<u8> {
+        let mut obj = std::collections::HashMap::new();
+        obj.insert(
+            "name".to_string(),
+            nodedb_types::Value::String(name.to_string()),
+        );
+        let encoded =
+            zerompk::to_msgpack_vec(&nodedb_types::Value::Object(obj)).expect("encode msgpack");
+        crate::data::executor::doc_format::canonicalize_document_for_storage(&encoded)
+    }
+
+    /// A resolve plan naming `collection` as a schemaless document write.
+    fn doc_put_plan(collection: &str) -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::PointPut {
+            collection: collection.to_string(),
+            document_id: String::new(),
+            value: Vec::new(),
+            surrogate: Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+        })
+    }
+
+    /// Wrap resolved redo bytes in a `TransactionRedo` WAL record.
+    fn wrap_redo(redo: &RedoRecord) -> WalRecord {
+        WalRecord::new(WalRecordArgs {
+            record_type: RecordType::TransactionRedo as u32,
+            lsn: 1,
+            tenant_id: TID,
+            vshard_id: 0,
+            database_id: DatabaseId::DEFAULT.as_u64(),
+            payload: redo.to_bytes().expect("re-encode redo"),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("wal record")
+    }
+
+    #[test]
+    fn strict_document_put_replays_correctly() {
+        // The strict-mode regression: the overlay holds a Binary Tuple. Resolve
+        // must decode it to MessagePack so the document redo replay path (which
+        // re-encodes via `bytes_to_binary_tuple`) restores the row. Emitting the
+        // Binary Tuple verbatim would make replay's decode fail and drop the row
+        // — this test would then FAIL, which is the whole point of the unit.
+        let (mut src, _src_dir) = make_core();
+        register_strict(&mut src, "sdocs");
+        let task = make_task();
+        let txn = TxnId::new(20);
+        let surrogate = 7u32;
+        let row_key = surrogate_to_doc_id(Surrogate::new(surrogate));
+
+        src.txn_overlays.entry(txn).or_default().insert_put(
+            coll_key("sdocs"),
+            surrogate,
+            "row1",
+            strict_tuple(surrogate as i64, "elephant"),
+        );
+
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[doc_put_plan("sdocs")]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1, "one staged strict row -> one sub-record");
+        assert_eq!(redo.ops[0].record_type, RecordType::Put as u32);
+
+        // Replay into a fresh core that has the same strict schema registered.
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        register_strict(&mut dst, "sdocs");
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let stored = dst
+            .sparse
+            .get(DatabaseId::DEFAULT.as_u64(), TID, "sdocs", row_key.as_str())
+            .expect("get")
+            .expect("strict document row must be restored from redo replay");
+        let decoded = strict_format::binary_tuple_to_value(&stored, &strict_schema())
+            .expect("stored body decodes as a Binary Tuple");
+        match decoded {
+            nodedb_types::Value::Object(map) => {
+                assert_eq!(
+                    map.get("body"),
+                    Some(&nodedb_types::Value::String("elephant".into())),
+                    "restored strict document must carry the correct field value"
+                );
+            }
+            other => panic!("expected object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schemaless_document_put_replays_verbatim() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(21);
+        let surrogate = 3u32;
+        let row_key = surrogate_to_doc_id(Surrogate::new(surrogate));
+        let body = schemaless_body("alice");
+
+        src.txn_overlays.entry(txn).or_default().insert_put(
+            coll_key("notes"),
+            surrogate,
+            "userpk",
+            body.clone(),
+        );
+
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[doc_put_plan("notes")]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1);
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let stored = dst
+            .sparse
+            .get(DatabaseId::DEFAULT.as_u64(), TID, "notes", row_key.as_str())
+            .expect("get")
+            .expect("schemaless document row must replay");
+        assert_eq!(stored, body, "schemaless body round-trips verbatim");
+    }
+
+    #[test]
+    fn document_delete_resolves_with_surrogate_and_replay_removes_row() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(22);
+        let surrogate = 11u32;
+        let row_key = surrogate_to_doc_id(Surrogate::new(surrogate));
+
+        src.txn_overlays.entry(txn).or_default().insert_tombstone(
+            coll_key("notes"),
+            surrogate,
+            "gone",
+        );
+
+        let delete_plan = PhysicalPlan::Document(DocumentOp::PointDelete {
+            collection: "notes".to_string(),
+            document_id: "gone".to_string(),
+            surrogate: Surrogate::new(surrogate),
+            pk_bytes: Vec::new(),
+            returning: None,
+        });
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[delete_plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1);
+        assert_eq!(redo.ops[0].record_type, RecordType::Delete as u32);
+
+        // The delete tuple carries the surrogate as its fourth element.
+        let (collection, _doc_id, prov, got_surrogate) =
+            zerompk::from_msgpack::<(String, String, Option<SyncProvenance>, u32)>(
+                &redo.ops[0].payload,
+            )
+            .expect("decode document delete tuple");
+        assert_eq!(collection, "notes");
+        assert!(prov.is_none());
+        assert_eq!(
+            got_surrogate, surrogate,
+            "delete tuple must carry surrogate"
+        );
+
+        // Seed the row in a fresh core, then replay the delete removes it.
+        let (mut dst, _dst_dir) = make_core();
+        let seed = wrap_redo(&RedoRecord {
+            version: 1,
+            ops: {
+                let mut ops = Vec::new();
+                document_put_sub(&mut ops, "notes", surrogate, "gone", schemaless_body("x"));
+                ops
+            },
+            calvin_stamp: None,
+        });
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&seed),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        assert!(
+            dst.sparse
+                .get(DatabaseId::DEFAULT.as_u64(), TID, "notes", row_key.as_str())
+                .expect("get")
+                .is_some(),
+            "row seeded"
+        );
+
+        let del = wrap_redo(&redo);
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&del),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        assert!(
+            dst.sparse
+                .get(DatabaseId::DEFAULT.as_u64(), TID, "notes", row_key.as_str())
+                .expect("get")
+                .is_none(),
+            "redo delete must remove the document row"
+        );
+    }
+
+    /// Build a document PUT sub-record directly (test helper mirroring the
+    /// serializer's shape) for seeding rows into a replay target.
+    fn document_put_sub(
+        ops: &mut Vec<RedoSubRecord>,
+        collection: &str,
+        surrogate: u32,
+        doc_id: &str,
+        value: Vec<u8>,
+    ) {
+        let prov: Option<SyncProvenance> = None;
+        let payload = zerompk::to_msgpack_vec(&(collection, doc_id, value, prov, surrogate))
+            .expect("encode document put sub-record");
+        ops.push(RedoSubRecord {
+            record_type: RecordType::Put as u32,
+            payload,
+        });
+    }
+
+    #[test]
+    fn document_resolve_does_not_mutate_base() {
+        let (mut core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(23);
+        let surrogate = 1u32;
+        let row_key = surrogate_to_doc_id(Surrogate::new(surrogate));
+
+        // Seed a base document row, then stage a DIFFERENT body for it.
+        let seed = wrap_redo(&RedoRecord {
+            version: 1,
+            ops: {
+                let mut ops = Vec::new();
+                document_put_sub(
+                    &mut ops,
+                    "notes",
+                    surrogate,
+                    "userpk",
+                    schemaless_body("base"),
+                );
+                ops
+            },
+            calvin_stamp: None,
+        });
+        core.replay_transaction_redo_wal(
+            std::slice::from_ref(&seed),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        let before = core
+            .sparse
+            .get(DatabaseId::DEFAULT.as_u64(), TID, "notes", row_key.as_str())
+            .expect("get");
+        assert_eq!(before.as_deref(), Some(schemaless_body("base").as_slice()));
+
+        core.txn_overlays.entry(txn).or_default().insert_put(
+            coll_key("notes"),
+            surrogate,
+            "userpk",
+            schemaless_body("staged"),
+        );
+
+        let resp = core.execute_resolve_txn(&task, TID, txn, &[doc_put_plan("notes")]);
+        assert_eq!(resp.status, Status::Ok);
+
+        // Base is untouched: resolve reads the overlay only, never writes base.
+        let after = core
+            .sparse
+            .get(DatabaseId::DEFAULT.as_u64(), TID, "notes", row_key.as_str())
+            .expect("get");
+        assert_eq!(
+            after.as_deref(),
+            Some(schemaless_body("base").as_slice()),
+            "resolve must not mutate the base document engine"
+        );
+    }
+
+    #[test]
+    fn mixed_kv_and_document_resolve_into_one_record_and_both_replay() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(24);
+        let doc_surrogate = 5u32;
+        let doc_row_key = surrogate_to_doc_id(Surrogate::new(doc_surrogate));
+
+        {
+            let overlay = src.txn_overlays.entry(txn).or_default();
+            overlay.insert_put(coll_key("kvc"), 1, &hex_key(b"k"), b"V".to_vec());
+            overlay.insert_put(
+                coll_key("notes"),
+                doc_surrogate,
+                "userpk",
+                schemaless_body("bob"),
+            );
+        }
+
+        let resp = src.execute_resolve_txn(
+            &task,
+            TID,
+            txn,
+            &[kv_write_plan("kvc"), doc_put_plan("notes")],
+        );
+        let redo = decode_redo(&resp);
+        assert_eq!(
+            redo.ops.len(),
+            2,
+            "one KV row + one document row -> two sub-records in one record"
+        );
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let db = DatabaseId::DEFAULT.as_u64();
+        let now = crate::engine::kv::current_ms();
+        assert_eq!(
+            dst.kv_engine.get(db, TID, "kvc", b"k", now).as_deref(),
+            Some(b"V".as_slice()),
+            "KV sub-record must replay"
+        );
+        assert!(
+            dst.sparse
+                .get(db, TID, "notes", doc_row_key.as_str())
+                .expect("get")
+                .is_some(),
+            "document sub-record must replay"
+        );
     }
 
     #[test]
