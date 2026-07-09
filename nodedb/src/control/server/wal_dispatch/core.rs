@@ -126,20 +126,14 @@ pub fn wal_append_if_write_with_creds(
             // pre-date surrogate identity (compatibility shape only —
             // always None on this path). Provenance is appended last so
             // older 6-element decoders can still parse the leading fields.
-            let doc_id_compat: Option<String> = None;
-            let entry = zerompk::to_msgpack_vec(&(
+            let entry = super::vector::encode_vector_put_payload(
                 collection,
                 vector,
-                dim,
+                *dim,
                 field_name,
-                doc_id_compat,
-                surrogate.as_u32(),
-                provenance,
-            ))
-            .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal vector insert: {e}"),
-            })?;
+                *surrogate,
+                provenance.as_ref(),
+            )?;
             Some(wal.append_vector_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         PhysicalPlan::Vector(VectorOp::BatchInsert {
@@ -148,12 +142,7 @@ pub fn wal_append_if_write_with_creds(
             dim,
             surrogates: _,
         }) => {
-            let entry = zerompk::to_msgpack_vec(&(collection, vectors, dim)).map_err(|e| {
-                crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal vector batch insert: {e}"),
-                }
-            })?;
+            let entry = super::vector::encode_vector_batch_put_payload(collection, vectors, *dim)?;
             Some(wal.append_vector_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         PhysicalPlan::Vector(VectorOp::Delete {
@@ -163,13 +152,7 @@ pub fn wal_append_if_write_with_creds(
             // Provenance is always None for local delete-by-node-id; appended
             // as trailing element so older 2-element decoders fall back
             // gracefully via the legacy arity arm.
-            let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
-            let entry = zerompk::to_msgpack_vec(&(collection, vector_id, prov)).map_err(|e| {
-                crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal vector delete: {e}"),
-                }
-            })?;
+            let entry = super::vector::encode_vector_delete_payload(collection, *vector_id)?;
             Some(wal.append_vector_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         PhysicalPlan::Crdt(CrdtOp::Apply {
@@ -291,18 +274,12 @@ pub fn wal_append_if_write_with_creds(
             // rows in `payload`. The map shape is distinct from the legacy
             // 4-tuple array, so old on-disk records still decode via the
             // replay fallback path.
-            let record = nodedb_types::columnar::ColumnarWalRecord {
-                kind: "columnar".to_string(),
-                collection: collection.clone(),
-                payload: payload.clone(),
-                provenance: provenance.clone(),
-                surrogates: surrogates.clone(),
-            };
-            let wal_payload =
-                zerompk::to_msgpack_vec(&record).map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal columnar batch: {e}"),
-                })?;
+            let wal_payload = super::timeseries::encode_columnar_batch_payload(
+                collection,
+                payload,
+                provenance.as_ref(),
+                surrogates,
+            )?;
             Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
         }
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
@@ -328,13 +305,11 @@ pub fn wal_append_if_write_with_creds(
 
             // Provenance is appended last; older 3-element decoders ignore
             // the trailing field via their arity-fallback paths.
-            let wal_payload =
-                zerompk::to_msgpack_vec(&("timeseries", collection, payload, provenance)).map_err(
-                    |e| crate::Error::Serialization {
-                        format: "msgpack".into(),
-                        detail: format!("wal timeseries batch: {e}"),
-                    },
-                )?;
+            let wal_payload = super::timeseries::encode_timeseries_batch_payload(
+                collection,
+                payload,
+                provenance.as_ref(),
+            )?;
             Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
         }
         // KV write operations — delegated to wal_dispatch_kv.

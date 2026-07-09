@@ -10,12 +10,16 @@
 //! `RecordType::TransactionRedo` record; a later install phase replays them. No
 //! base engine is touched here.
 //!
-//! The KV, Document, and Graph serializers exist in this module today. Every
-//! other engine that writes raises a typed error rather than being silently
-//! omitted from the redo record: dropping an op class would lose those rows on
-//! install. Later serializers (vector, array, columnar) replace their error
-//! arm with a real per-engine module beside [`super::kv`], [`super::document`],
-//! and [`super::graph`].
+//! Two serializer families live in this module. The overlay-driven family (KV,
+//! Document, Graph) reads resolved per-surrogate post-images from the staging
+//! overlay. The plan-driven family (Vector, Array, Columnar, Timeseries) is not
+//! staged into any overlay — vector post-images are inexpressible and the
+//! array / columnar / timeseries batches ride the buffered-plan path, their
+//! redo replay re-running the engine-native batch payload — so they serialize
+//! directly from the plan node. Every writing op either serializes to its
+//! engine-native sub-record or raises a typed error; none is silently omitted,
+//! since dropping an op class would lose those rows on install. Spatial remains
+//! a typed error (it is overlay-driven and its serializer is not built here).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,7 +32,7 @@ use crate::types::{TenantId, TxnId};
 use crate::wal::{RedoRecord, RedoSubRecord};
 
 use super::graph::EdgeIdentityKey;
-use super::{document, graph, kv};
+use super::{array, columnar, document, graph, kv, vector};
 
 impl CoreLoop {
     /// Resolve a committing transaction's staged writes into a [`RedoRecord`]
@@ -76,6 +80,13 @@ impl CoreLoop {
         let mut graph_collections: BTreeSet<String> = BTreeSet::new();
         let mut edge_surrogates: BTreeMap<EdgeIdentityKey, (u32, u32)> = BTreeMap::new();
 
+        // Plan-driven serializers (vector / array / columnar / timeseries) emit
+        // directly from the plan node into `ops` during this walk, in plan
+        // order. Overlay-driven serializers (KV / document / graph) only
+        // collect their touched collections here and are serialized from the
+        // overlay in the second phase below. Both append to the same `ops`.
+        let mut ops: Vec<RedoSubRecord> = Vec::new();
+
         for plan in plans {
             match plan {
                 // KV: overlay-backed serializer. Read ops stage nothing and are
@@ -110,15 +121,28 @@ impl CoreLoop {
                 // maintenance ops carry no persisted post-image.
                 PhysicalPlan::Query(_) | PhysicalPlan::Meta(_) => {}
 
-                // Data-bearing engines whose transaction-resolve serializer is
-                // not built yet. Erroring keeps their rows out of a silently
-                // lossy redo record; each is replaced by a real serializer in a
-                // later unit. (Even once those land, `Columnar::{Update, Delete}`
-                // stay typed errors — no per-row redo shape exists for them.)
-                PhysicalPlan::Vector(_) => return Err(unsupported_engine("vector")),
-                PhysicalPlan::Array(_) => return Err(unsupported_engine("array")),
-                PhysicalPlan::Columnar(_) => return Err(unsupported_engine("columnar")),
-                PhysicalPlan::Timeseries(_) => return Err(unsupported_engine("timeseries")),
+                // Plan-driven serializers. These engines are not staged into a
+                // transaction overlay (vector post-images are inexpressible;
+                // array / columnar / timeseries batches ride the buffered-plan
+                // path), and their redo replay re-runs the engine-native batch
+                // payload rather than a per-row shape. So they serialize
+                // directly from the plan node in plan order. Each op either
+                // emits its engine-native sub-record, skips (reads /
+                // maintenance), or raises a typed error (writes with no redo
+                // shape — e.g. `Columnar::{Update, Delete}` predicate DML).
+                PhysicalPlan::Vector(op) => vector::serialize_vector_op(op, &mut ops)?,
+                PhysicalPlan::Array(op) => array::serialize_array_op(op, &mut ops)?,
+                PhysicalPlan::Columnar(op) => columnar::serialize_columnar_op(op, &mut ops)?,
+                PhysicalPlan::Timeseries(op) => columnar::serialize_timeseries_op(op, &mut ops)?,
+
+                // Spatial is genuinely serializable in principle (it has an
+                // autocommit encoder and a `replay_spatial_wal` path), but it
+                // is OVERLAY-driven (staged via `stage_spatial` with its own
+                // R-tree overlay merge), placing it in the overlay-driven
+                // serializer family (KV / document / graph), not the plan-driven
+                // family implemented here. Its dedicated overlay-walking
+                // serializer is out of scope for this change, so a spatial write
+                // raises a typed error rather than being silently dropped.
                 PhysicalPlan::Spatial(_) => return Err(unsupported_engine("spatial")),
 
                 // Coordinator-only op; never legal on the Data Plane.
@@ -131,7 +155,6 @@ impl CoreLoop {
             }
         }
 
-        let mut ops = Vec::new();
         if let Some(overlay) = self.txn_overlays.get(&txn_id) {
             for collection in &kv_collections {
                 let coll_key = (
@@ -437,10 +460,12 @@ fn classify_graph_op(
     }
 }
 
-/// The typed error a not-yet-supported writing engine raises during resolve.
+/// The typed error a writing engine without a resolve serializer raises. Used
+/// for the overlay-driven spatial engine, whose resolve serializer belongs to
+/// the KV / document / graph family and is not built here.
 fn unsupported_engine(engine: &str) -> crate::Error {
     crate::Error::PlanError {
-        detail: format!("{engine} writes are not yet supported in transaction resolve"),
+        detail: format!("{engine} writes are not supported in transaction resolve"),
     }
 }
 
@@ -451,7 +476,8 @@ mod tests {
 
     use nodedb_bridge::buffer::RingBuffer;
     use nodedb_physical::physical_plan::{
-        DocumentOp, GraphOp, KvOp, MetaOp, ReturningColumns, ReturningSpec, StorageMode,
+        ArrayOp, ColumnarInsertIntent, ColumnarOp, DocumentOp, GraphOp, KvOp, MetaOp,
+        ReturningColumns, ReturningSpec, StorageMode, TimeseriesOp, VectorOp,
     };
     use nodedb_types::Surrogate;
     use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
@@ -1628,6 +1654,440 @@ mod tests {
             resp1.payload.as_bytes(),
             resp2.payload.as_bytes(),
             "resolving the same overlay twice must produce byte-identical redo bytes"
+        );
+    }
+
+    // ── Plan-driven serializers (vector / array / columnar / timeseries) ──
+
+    /// A vector `Insert` plan resolves to a `VectorPut` sub-record and replays
+    /// into a FRESH engine such that the vector is present in the rebuilt HNSW
+    /// index (post-images are inexpressible; the redo logs the insert and
+    /// replay rebuilds).
+    #[test]
+    fn vector_insert_resolves_and_replays_queryable() {
+        let (src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(40);
+
+        let plan = PhysicalPlan::Vector(VectorOp::Insert {
+            collection: "emb".to_string(),
+            vector: vec![1.0, 2.0, 3.0],
+            dim: 3,
+            field_name: String::new(),
+            surrogate: Surrogate::new(9),
+            pk_bytes: None,
+            provenance: None,
+        });
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1, "one vector insert -> one sub-record");
+        assert_eq!(redo.ops[0].record_type, RecordType::VectorPut as u32);
+
+        // The 7-element autocommit shape carries the surrogate identity.
+        let (collection, vector, dim, _field, _doc, surrogate_u32, _prov) =
+            zerompk::from_msgpack::<(
+                String,
+                Vec<f32>,
+                usize,
+                String,
+                Option<String>,
+                u32,
+                Option<SyncProvenance>,
+            )>(&redo.ops[0].payload)
+            .expect("decode 7-element vector put");
+        assert_eq!(collection, "emb");
+        assert_eq!(vector, vec![1.0, 2.0, 3.0]);
+        assert_eq!(dim, 3);
+        assert_eq!(surrogate_u32, 9);
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let key = CoreLoop::vector_index_key(DatabaseId::DEFAULT.as_u64(), TID, "emb", "");
+        assert_eq!(
+            dst.vector_collections.get(&key).map(|c| c.len()),
+            Some(1),
+            "vector must be present in the rebuilt HNSW index after redo replay"
+        );
+    }
+
+    /// Resolve reads only the plan for a vector insert; it must not touch the
+    /// base vector index.
+    #[test]
+    fn vector_resolve_does_not_mutate_base() {
+        use crate::engine::vector::collection::VectorCollection;
+        use crate::engine::vector::hnsw::HnswParams;
+
+        let (mut core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(41);
+
+        // Seed a base index with one vector.
+        let key = CoreLoop::vector_index_key(DatabaseId::DEFAULT.as_u64(), TID, "emb", "");
+        let mut coll = VectorCollection::new(3, HnswParams::default());
+        coll.insert(vec![7.0, 7.0, 7.0]);
+        core.vector_collections.insert(key.clone(), coll);
+
+        let plan = PhysicalPlan::Vector(VectorOp::Insert {
+            collection: "emb".to_string(),
+            vector: vec![1.0, 2.0, 3.0],
+            dim: 3,
+            field_name: String::new(),
+            surrogate: Surrogate::new(9),
+            pk_bytes: None,
+            provenance: None,
+        });
+        let resp = core.execute_resolve_txn(&task, TID, txn, &[plan]);
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(
+            core.vector_collections.get(&key).map(|c| c.len()),
+            Some(1),
+            "resolve must not insert into the base vector index"
+        );
+    }
+
+    /// A columnar `Insert` plan resolves to a `TimeseriesBatch` sub-record whose
+    /// payload is a map-shaped `ColumnarWalRecord` (`kind: "columnar"`) and
+    /// replays into the columnar engine's memtable.
+    #[test]
+    fn columnar_insert_resolves_to_columnar_batch_and_replays() {
+        let (src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(42);
+
+        let mut row = std::collections::HashMap::new();
+        row.insert("a".to_string(), nodedb_types::Value::Integer(1));
+        row.insert("b".to_string(), nodedb_types::Value::Integer(2));
+        let payload = nodedb_types::value_to_msgpack(&nodedb_types::Value::Array(vec![
+            nodedb_types::Value::Object(row),
+        ]))
+        .expect("encode columnar payload");
+
+        let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
+            collection: "cevents".to_string(),
+            payload,
+            format: "msgpack".to_string(),
+            intent: ColumnarInsertIntent::Insert,
+            on_conflict_updates: Vec::new(),
+            surrogates: Vec::new(),
+            schema_bytes: Vec::new(),
+            provenance: None,
+            wal_lsn: None,
+        });
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1, "one columnar insert -> one sub-record");
+        assert_eq!(redo.ops[0].record_type, RecordType::TimeseriesBatch as u32);
+
+        // The payload decodes as a `ColumnarWalRecord` with kind "columnar".
+        let rec = zerompk::from_msgpack::<nodedb_types::columnar::ColumnarWalRecord>(
+            &redo.ops[0].payload,
+        )
+        .expect("decode columnar wal record");
+        assert_eq!(rec.kind, "columnar");
+        assert_eq!(rec.collection, "cevents");
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "cevents".to_string(),
+        );
+        assert_eq!(
+            dst.columnar_engines
+                .get(&key)
+                .map(|e| e.memtable().row_count()),
+            Some(1),
+            "columnar row must replay into the memtable"
+        );
+    }
+
+    /// A timeseries `Ingest` plan resolves to a `TimeseriesBatch` sub-record
+    /// tagged `"timeseries"` and replays its samples into the memtable.
+    #[test]
+    fn timeseries_ingest_resolves_and_replays() {
+        let (src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(43);
+
+        // A `TimeseriesWalBatch` is what `replay_timeseries_payload` decodes to
+        // ingest samples directly into the memtable.
+        let batch = nodedb_types::timeseries::TimeseriesWalBatch {
+            collection: "metrics".to_string(),
+            samples: vec![(11u64, 1_700_000_000_000i64, 42.0f64)],
+            provenance: None,
+        };
+        let payload = zerompk::to_msgpack_vec(&batch).expect("encode ts batch");
+
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: "metrics".to_string(),
+            payload,
+            format: "samples".to_string(),
+            wal_lsn: None,
+            surrogates: Vec::new(),
+            provenance: None,
+        });
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1, "one timeseries ingest -> one sub-record");
+        assert_eq!(redo.ops[0].record_type, RecordType::TimeseriesBatch as u32);
+
+        // The payload is the 4-element tuple tagged "timeseries" (a msgpack
+        // array), distinct from the columnar map form.
+        let (kind, collection, _payload, _prov) =
+            zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>)>(
+                &redo.ops[0].payload,
+            )
+            .expect("decode timeseries 4-tuple");
+        assert_eq!(kind, "timeseries");
+        assert_eq!(collection, "metrics");
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "metrics".to_string(),
+        );
+        assert_eq!(
+            dst.columnar_memtables.get(&key).map(|m| m.row_count()),
+            Some(1),
+            "timeseries sample must replay into the memtable"
+        );
+    }
+
+    /// `Columnar::Update` / `Columnar::Delete` are predicate DML with no per-row
+    /// columnar redo shape: resolve must raise a typed error, never silently
+    /// drop the mutation.
+    #[test]
+    fn columnar_update_and_delete_yield_typed_error() {
+        let (core, _dir) = make_core();
+        let task = make_task();
+
+        let update = PhysicalPlan::Columnar(ColumnarOp::Update {
+            collection: "cevents".to_string(),
+            filters: Vec::new(),
+            updates: vec![("a".to_string(), Vec::new())],
+        });
+        let resp = core.execute_resolve_txn(&task, TID, TxnId::new(44), &[update]);
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "columnar UPDATE has no per-row redo shape and must raise a typed error"
+        );
+        assert!(resp.error_code.is_some());
+
+        let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
+            collection: "cevents".to_string(),
+            filters: Vec::new(),
+        });
+        let resp = core.execute_resolve_txn(&task, TID, TxnId::new(45), &[delete]);
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "columnar DELETE has no per-row redo shape and must raise a typed error"
+        );
+        assert!(resp.error_code.is_some());
+    }
+
+    /// An array `Put` plan resolves to a version-tagged `ArrayPut` sub-record
+    /// (decodable by the exact function replay uses) and replays into a fresh
+    /// engine, respecting the `ArrayFlush` watermark discipline. A flushed,
+    /// non-empty put yields at least one scannable tile.
+    #[test]
+    fn array_put_resolves_and_replays() {
+        use crate::engine::array::wal::{ArrayPutCell, decode_put_with_version};
+        use nodedb_array::schema::ArraySchemaBuilder;
+        use nodedb_array::schema::attr_spec::{AttrSpec, AttrType};
+        use nodedb_array::schema::dim_spec::{DimSpec, DimType};
+        use nodedb_array::segment::mbr_index::predicate::{DimPredicate, MbrQueryPredicate};
+        use nodedb_array::types::ArrayId;
+        use nodedb_array::types::cell_value::value::CellValue;
+        use nodedb_array::types::coord::value::CoordValue;
+        use nodedb_array::types::domain::{Domain, DomainBound};
+
+        let schema = ArraySchemaBuilder::new("arr")
+            .dim(DimSpec::new(
+                "k",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .attr(AttrSpec::new("v", AttrType::Float64, true))
+            .tile_extents(vec![16])
+            .build()
+            .expect("array schema");
+        let schema_bytes = zerompk::to_msgpack_vec(&schema).expect("encode schema");
+        let schema_hash: u64 = 0xABCD_1234;
+        let aid = ArrayId::new(TenantId::new(TID), "arr");
+
+        let cells = vec![ArrayPutCell {
+            coord: vec![CoordValue::Int64(3)],
+            attrs: vec![CellValue::Float64(42.0)],
+            surrogate: Surrogate::new(5),
+            system_from_ms: 1_000,
+            valid_from_ms: 1_000,
+            valid_until_ms: i64::MAX,
+        }];
+        let cells_bytes = zerompk::to_msgpack_vec(&cells).expect("encode cells");
+
+        let (src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(46);
+        let plan = PhysicalPlan::Array(ArrayOp::Put {
+            array_id: aid.clone(),
+            cells_msgpack: cells_bytes,
+            wal_lsn: 0,
+            provenance: None,
+        });
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1, "one array put -> one sub-record");
+        assert_eq!(redo.ops[0].record_type, RecordType::ArrayPut as u32);
+
+        // The sub-record decodes via the exact version-tagged function replay
+        // uses, back to the faithful cell payload.
+        let decoded = decode_put_with_version(&redo.ops[0].payload).expect("decode array put");
+        assert_eq!(decoded.array_id, aid);
+        assert_eq!(decoded.cells, cells);
+
+        // Replay into a fresh engine that has the array registered + open.
+        let (mut dst, _dst_dir) = make_core();
+        let open_resp = dst.handle_array_open(&task, &aid, &schema_bytes, schema_hash, 8);
+        assert_eq!(
+            open_resp.status,
+            Status::Ok,
+            "array open on dst: {open_resp:?}"
+        );
+        let record = wrap_redo(&redo);
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        // Flush and scan to observe the replayed cell.
+        let flush_resp = dst.handle_array_flush(&task, &aid, 2);
+        assert_eq!(
+            flush_resp.status,
+            Status::Ok,
+            "array flush on dst: {flush_resp:?}"
+        );
+        let pred = MbrQueryPredicate::new(vec![DimPredicate { lo: None, hi: None }]);
+        let tiles = dst
+            .array_engine
+            .scan_tiles(&aid, &pred)
+            .expect("scan tiles");
+        assert!(
+            !tiles.is_empty(),
+            "the replayed + flushed array cell must yield a scannable tile"
+        );
+    }
+
+    /// A mixed transaction — a KV write, a vector insert, and a columnar insert
+    /// — resolves into ONE `RedoRecord` and every sub-record replays.
+    #[test]
+    fn mixed_kv_vector_columnar_resolve_into_one_record_and_all_replay() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(47);
+
+        // Stage the KV write into the overlay (overlay-driven serializer).
+        src.txn_overlays.entry(txn).or_default().insert_put(
+            coll_key("kvc"),
+            1,
+            &hex_key(b"k"),
+            b"V".to_vec(),
+        );
+
+        let mut row = std::collections::HashMap::new();
+        row.insert("a".to_string(), nodedb_types::Value::Integer(7));
+        let col_payload = nodedb_types::value_to_msgpack(&nodedb_types::Value::Array(vec![
+            nodedb_types::Value::Object(row),
+        ]))
+        .expect("encode columnar payload");
+
+        let plans = [
+            kv_write_plan("kvc"),
+            PhysicalPlan::Vector(VectorOp::Insert {
+                collection: "emb".to_string(),
+                vector: vec![1.0, 2.0, 3.0],
+                dim: 3,
+                field_name: String::new(),
+                surrogate: Surrogate::new(21),
+                pk_bytes: None,
+                provenance: None,
+            }),
+            PhysicalPlan::Columnar(ColumnarOp::Insert {
+                collection: "cevents".to_string(),
+                payload: col_payload,
+                format: "msgpack".to_string(),
+                intent: ColumnarInsertIntent::Insert,
+                on_conflict_updates: Vec::new(),
+                surrogates: Vec::new(),
+                schema_bytes: Vec::new(),
+                provenance: None,
+                wal_lsn: None,
+            }),
+        ];
+
+        let resp = src.execute_resolve_txn(&task, TID, txn, &plans);
+        let redo = decode_redo(&resp);
+        assert_eq!(
+            redo.ops.len(),
+            3,
+            "KV + vector + columnar -> three sub-records in one record"
+        );
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let db = DatabaseId::DEFAULT.as_u64();
+        let now = crate::engine::kv::current_ms();
+        assert_eq!(
+            dst.kv_engine.get(db, TID, "kvc", b"k", now).as_deref(),
+            Some(b"V".as_slice()),
+            "KV sub-record must replay"
+        );
+        let vkey = CoreLoop::vector_index_key(db, TID, "emb", "");
+        assert_eq!(
+            dst.vector_collections.get(&vkey).map(|c| c.len()),
+            Some(1),
+            "vector sub-record must replay"
+        );
+        let ckey = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "cevents".to_string(),
+        );
+        assert_eq!(
+            dst.columnar_engines
+                .get(&ckey)
+                .map(|e| e.memtable().row_count()),
+            Some(1),
+            "columnar sub-record must replay"
         );
     }
 }

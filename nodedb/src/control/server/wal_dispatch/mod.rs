@@ -16,6 +16,14 @@ pub use vector::{
     wal_append_vector_put,
 };
 
+// Payload encoders shared by the autocommit WAL path and transaction resolve, so
+// each engine's record shape lives in exactly one place.
+pub(crate) use timeseries::{encode_columnar_batch_payload, encode_timeseries_batch_payload};
+pub(crate) use vector::{
+    encode_vector_batch_put_payload, encode_vector_delete_by_surrogate_payload,
+    encode_vector_delete_payload, encode_vector_put_payload,
+};
+
 pub use super::wal_dispatch_fts_spatial::{
     wal_append_fts_delete, wal_append_fts_index, wal_append_spatial_delete, wal_append_spatial_put,
 };
