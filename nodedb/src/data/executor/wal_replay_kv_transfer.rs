@@ -2,7 +2,7 @@
 
 //! WAL replay for the atomic KV `Transfer` / `TransferItem` delta records.
 //!
-//! `wal_dispatch_kv.rs` logs these as DELTA records (inputs, not post-images)
+//! `wal_dispatch_kv/encode.rs` logs these as DELTA records (inputs, not post-images)
 //! because the Control Plane cannot know the post-transfer values before
 //! dispatch. Replay re-executes the same pure computation
 //! (`compute_transfer`) and the same mutation sequence the live handlers in
