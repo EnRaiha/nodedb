@@ -298,7 +298,7 @@ fn vector_insert_provenance_roundtrip() {
     let decoded_plan = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
-    let (_, _, decoded_plan) = decoded_plan;
+    let (_, _, decoded_plan, _) = decoded_plan;
     match decoded_plan {
         PhysicalPlan::Vector(VectorOp::Insert { provenance, .. }) => {
             assert_eq!(
@@ -324,7 +324,7 @@ fn vector_insert_provenance_roundtrip() {
     let entry_none = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan_none)
         .expect("VectorInsert(no provenance) should produce a ReplicatedEntry");
     let bytes_none = entry_none.to_bytes();
-    let (_, _, decoded_none) = decode::from_replicated_entry(&bytes_none, None)
+    let (_, _, decoded_none, _) = decode::from_replicated_entry(&bytes_none, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_none {
@@ -363,7 +363,7 @@ fn crdt_apply_provenance_roundtrip() {
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("CrdtApply should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
-    let (_, _, decoded_plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_plan {
@@ -399,7 +399,7 @@ fn crdt_apply_provenance_roundtrip() {
     let entry_none = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan_none)
         .expect("CrdtApply(no provenance) should produce a ReplicatedEntry");
     let bytes_none = entry_none.to_bytes();
-    let (_, _, decoded_none) = decode::from_replicated_entry(&bytes_none, None)
+    let (_, _, decoded_none, _) = decode::from_replicated_entry(&bytes_none, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_none {
@@ -448,7 +448,7 @@ fn columnar_ingest_provenance_roundtrip() {
         }
         other => panic!("expected ColumnarIngest, got {other:?}"),
     }
-    let (_, _, decoded_plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_plan {
@@ -498,7 +498,7 @@ fn timeseries_ingest_provenance_roundtrip() {
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("TimeseriesIngest should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
-    let (_, _, decoded_plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_plan {
@@ -536,7 +536,7 @@ fn fts_index_provenance_roundtrip() {
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("FtsIndex should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
-    let (_, _, decoded_plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_plan {
@@ -571,7 +571,7 @@ fn fts_delete_provenance_roundtrip() {
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("FtsDelete should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
-    let (_, _, decoded_plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_plan {
@@ -611,7 +611,7 @@ fn spatial_insert_provenance_roundtrip() {
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("SpatialInsert should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
-    let (_, _, decoded_plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_plan {
@@ -649,7 +649,7 @@ fn spatial_delete_provenance_roundtrip() {
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("SpatialDelete should produce a ReplicatedEntry");
     let bytes = entry.to_bytes();
-    let (_, _, decoded_plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_plan {
@@ -704,7 +704,7 @@ fn edge_put_surrogates_roundtrip() {
     }
 
     // Verify the decoded PhysicalPlan uses the carried (authoritative) surrogates.
-    let (_, _, decoded_plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_plan {
@@ -744,7 +744,7 @@ fn constraint_change_set_decodes_to_set_constraints() {
         },
     );
     let bytes = entry.to_bytes();
-    let (_, _, plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("ConstraintChange(Set) must decode to a plan");
     match plan {
@@ -776,7 +776,7 @@ fn constraint_change_drop_decodes_to_drop_constraints() {
         },
     );
     let bytes = entry.to_bytes();
-    let (_, _, plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("ConstraintChange(Drop) must decode to a plan");
     match plan {
@@ -817,7 +817,7 @@ fn non_default_database_id_roundtrips_through_encode_decode() {
         "database_id must survive the byte round-trip"
     );
 
-    let (_, _, decoded_plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_plan {
@@ -857,7 +857,7 @@ fn pre_database_id_entry_decodes_to_default_database() {
         "old-leader entries lacking database_id must decode to DatabaseId::DEFAULT (0)"
     );
 
-    let (_, _, decoded_plan) = decode::from_replicated_entry(&bytes, None)
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
         .expect("from_replicated_entry returned None");
     match decoded_plan {

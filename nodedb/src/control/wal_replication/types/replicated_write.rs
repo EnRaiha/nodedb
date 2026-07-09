@@ -273,6 +273,14 @@ pub enum ReplicatedWrite {
         ttl_ms: u64,
         /// Leader-assigned global surrogate (binding key = `key` raw bytes).
         surrogate: u32,
+        /// The proposal-time-resolved absolute wall-clock instant (ms since
+        /// epoch) for this write's `expire_at_ms`. Carried so every replica
+        /// -- including the proposer itself, which installs its effect only
+        /// through the Raft apply loop, never by executing the write locally
+        /// before commit -- derives a byte-identical TTL expiry instead of
+        /// each replica reading its own clock. `None` when `ttl_ms == 0`
+        /// (no expiry is derived).
+        resolved_now_ms: Option<u64>,
     },
     KvDelete {
         collection: String,
@@ -289,6 +297,8 @@ pub enum ReplicatedWrite {
         ttl_ms: u64,
         /// Leader-assigned global surrogate (binding key = `key` raw bytes).
         surrogate: u32,
+        /// See `KvPut::resolved_now_ms`.
+        resolved_now_ms: Option<u64>,
     },
     /// SQL `INSERT ... ON CONFLICT DO NOTHING` semantics. Replay re-runs the
     /// existence check deterministically on the follower, same as `KvInsert`.
@@ -298,6 +308,8 @@ pub enum ReplicatedWrite {
         value: Vec<u8>,
         ttl_ms: u64,
         surrogate: u32,
+        /// See `KvPut::resolved_now_ms`.
+        resolved_now_ms: Option<u64>,
     },
     /// SQL `INSERT ... ON CONFLICT (key) DO UPDATE SET ...` semantics.
     /// `value` is the would-be-inserted row (`EXCLUDED`), not a precomputed
@@ -310,6 +322,8 @@ pub enum ReplicatedWrite {
         ttl_ms: u64,
         updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
         surrogate: u32,
+        /// See `KvPut::resolved_now_ms`.
+        resolved_now_ms: Option<u64>,
     },
     KvBatchPut {
         collection: String,
@@ -318,11 +332,17 @@ pub enum ReplicatedWrite {
         /// Leader-assigned global surrogate per entry (binding key = entry
         /// key raw bytes), same order and length as `entries`.
         surrogates: Vec<u32>,
+        /// See `KvPut::resolved_now_ms`.
+        resolved_now_ms: Option<u64>,
     },
     KvExpire {
         collection: String,
         key: Vec<u8>,
         ttl_ms: u64,
+        /// See `KvPut::resolved_now_ms`. Always `Some` here: unlike the
+        /// `Put` family, `ttl_ms == 0` on `EXPIRE` means "expire now", not
+        /// "no TTL", so there is no "no expiry to derive" case to represent.
+        resolved_now_ms: Option<u64>,
     },
     KvPersist {
         collection: String,
@@ -334,6 +354,8 @@ pub enum ReplicatedWrite {
         delta: i64,
         ttl_ms: u64,
         surrogate: u32,
+        /// See `KvPut::resolved_now_ms`.
+        resolved_now_ms: Option<u64>,
     },
     KvIncrFloat {
         collection: String,

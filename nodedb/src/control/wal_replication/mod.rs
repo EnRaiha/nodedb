@@ -28,4 +28,6 @@ pub use crate::control::distributed_applier::{
 };
 
 #[cfg(test)]
+mod kv_ttl_tests;
+#[cfg(test)]
 mod tests;

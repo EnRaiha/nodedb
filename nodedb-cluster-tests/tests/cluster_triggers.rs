@@ -44,7 +44,7 @@ fn async_trigger_not_in_raft_log() {
 
     // The entry serializes to bytes that can be deserialized back.
     let bytes = entry.unwrap().to_bytes();
-    let (tid, vsid, restored) =
+    let (tid, vsid, restored, _resolved_now_ms) =
         nodedb::control::wal_replication::from_replicated_entry(&bytes, None)
             .unwrap()
             .unwrap();
@@ -190,7 +190,7 @@ fn replicated_entry_roundtrip_point_delete() {
     )
     .unwrap();
     let bytes = entry.to_bytes();
-    let (_, _, restored) = nodedb::control::wal_replication::from_replicated_entry(&bytes, None)
+    let (_, _, restored, _) = nodedb::control::wal_replication::from_replicated_entry(&bytes, None)
         .unwrap()
         .unwrap();
     assert!(matches!(

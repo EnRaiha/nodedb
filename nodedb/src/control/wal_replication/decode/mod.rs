@@ -3,7 +3,8 @@
 //! Convert committed ReplicatedWrite entries back to PhysicalPlan for Data Plane execution.
 //!
 //! Split by the `PhysicalPlan` family each decode helper produces:
-//! - [`entry`]: dispatcher (`from_replicated_entry`) + shared surrogate-binding helpers.
+//! - [`entry`]: dispatcher (`from_replicated_entry`).
+//! - [`ctx`]: shared `DecodeCtx` + surrogate-binding helpers.
 //! - [`document`]: `PhysicalPlan::Document` producers.
 //! - [`vector`]: `PhysicalPlan::Vector` producers.
 //! - [`graph`]: `PhysicalPlan::Graph` producers.
@@ -13,6 +14,7 @@
 
 mod columnar;
 mod crdt;
+mod ctx;
 mod document;
 mod entry;
 mod graph;

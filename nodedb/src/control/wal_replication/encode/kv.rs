@@ -6,6 +6,22 @@ use super::super::types::ReplicatedWrite;
 use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_types::Surrogate;
 
+/// Resolve the wall-clock instant for a TTL-bearing replicated KV write,
+/// exactly once, at Raft-proposal time -- the `Put` family's "no TTL"
+/// sentinel: `None` when `ttl_ms == 0`, so the write carries no instant to
+/// disagree about. Mirrors `wal_dispatch_kv::append::resolve_expiry`'s
+/// `now_ms` half; the corresponding `expire_at_ms` is computed by the Data
+/// Plane from `ttl_ms` at apply time via `CoreLoop::kv_ttl_now_ms`, using
+/// this same instant on every replica instead of one independent wall-clock
+/// read per replica per apply.
+fn resolve_now_ms(ttl_ms: u64) -> Option<u64> {
+    if ttl_ms == 0 {
+        None
+    } else {
+        Some(crate::engine::kv::current_ms())
+    }
+}
+
 pub(super) fn put(
     collection: &str,
     key: &[u8],
@@ -19,6 +35,7 @@ pub(super) fn put(
         value: value.to_vec(),
         ttl_ms,
         surrogate,
+        resolved_now_ms: resolve_now_ms(ttl_ms),
     }
 }
 
@@ -42,6 +59,7 @@ pub(super) fn insert(
         value: value.to_vec(),
         ttl_ms,
         surrogate,
+        resolved_now_ms: resolve_now_ms(ttl_ms),
     }
 }
 
@@ -58,6 +76,7 @@ pub(super) fn insert_if_absent(
         value: value.to_vec(),
         ttl_ms,
         surrogate,
+        resolved_now_ms: resolve_now_ms(ttl_ms),
     }
 }
 
@@ -76,6 +95,7 @@ pub(super) fn insert_on_conflict_update(
         ttl_ms,
         updates: updates.to_vec(),
         surrogate,
+        resolved_now_ms: resolve_now_ms(ttl_ms),
     }
 }
 
@@ -90,14 +110,19 @@ pub(super) fn batch_put(
         entries: entries.to_vec(),
         ttl_ms,
         surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
+        resolved_now_ms: resolve_now_ms(ttl_ms),
     }
 }
 
 pub(super) fn expire(collection: &str, key: &[u8], ttl_ms: u64) -> ReplicatedWrite {
+    // `EXPIRE` has no "no TTL" sentinel (`ttl_ms == 0` is a legitimate
+    // "expire now" request), so the instant is always resolved -- mirrors
+    // `wal_dispatch_kv::append::wal_append_kv_op`'s `KvOp::Expire` arm.
     ReplicatedWrite::KvExpire {
         collection: collection.to_owned(),
         key: key.to_vec(),
         ttl_ms,
+        resolved_now_ms: Some(crate::engine::kv::current_ms()),
     }
 }
 
@@ -121,6 +146,7 @@ pub(super) fn incr(
         delta,
         ttl_ms,
         surrogate,
+        resolved_now_ms: resolve_now_ms(ttl_ms),
     }
 }
 

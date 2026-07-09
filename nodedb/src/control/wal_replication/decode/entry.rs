@@ -1,23 +1,27 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Entry point: decode a committed `ReplicatedEntry` into a `PhysicalPlan`,
-//! plus the shared surrogate-binding helpers used across the per-engine
-//! decode submodules.
+//! Entry point: decode a committed `ReplicatedEntry` into a `PhysicalPlan`.
+//!
+//! The shared `DecodeCtx` + surrogate-binding helpers used across the
+//! per-engine decode submodules live in [`super::ctx`].
 
 use super::super::decode_sync_engines;
 use super::super::types::{ReplicatedEntry, ReplicatedWrite};
+use super::ctx::DecodeCtx;
 use super::{columnar, crdt, document, graph, kv, vector};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::surrogate::SurrogateAssigner;
 use crate::types::{DatabaseId, TenantId, VShardId};
 
-/// Bundles the ambient decode parameters (surrogate assigner + tenancy
-/// scope) threaded through every per-engine decode helper.
-pub(super) struct DecodeCtx<'a> {
-    pub(super) assigner: Option<&'a SurrogateAssigner>,
-    pub(super) database_id: DatabaseId,
-    pub(super) tenant_id: TenantId,
-}
+/// Decoded `(tenant, vshard, plan, resolved_now_ms)` for a committed entry.
+///
+/// `resolved_now_ms` is the wall-clock instant the proposing node resolved
+/// for a TTL-bearing KV write (see `ReplicatedWrite::KvPut::resolved_now_ms`),
+/// `None` for every non-TTL write and for writes with no TTL. The caller
+/// stamps it onto the dispatched `Request::resolved_now_ms` so every replica
+/// installs the identical `expire_at_ms` instead of reading its own wall
+/// clock at apply time.
+pub type DecodedEntry = (TenantId, VShardId, PhysicalPlan, Option<u64>);
 
 /// Returns `None` if the data is not a valid ReplicatedEntry (e.g., ConfChange or no-op).
 ///
@@ -33,7 +37,7 @@ pub(super) struct DecodeCtx<'a> {
 pub fn from_replicated_entry(
     data: &[u8],
     assigner: Option<&SurrogateAssigner>,
-) -> crate::Result<Option<(TenantId, VShardId, PhysicalPlan)>> {
+) -> crate::Result<Option<DecodedEntry>> {
     let entry = match ReplicatedEntry::from_bytes(data) {
         Some(e) => e,
         None => return Ok(None),
@@ -56,51 +60,25 @@ pub fn from_replicated_entry(
         database_id,
         tenant_id,
     };
-    let plan = to_physical_plan(&entry.write, &ctx)?;
-    Ok(Some((tenant_id, VShardId::new(entry.vshard_id), plan)))
+    let (plan, resolved_now_ms) = to_physical_plan(&entry.write, &ctx)?;
+    Ok(Some((
+        tenant_id,
+        VShardId::new(entry.vshard_id),
+        plan,
+        resolved_now_ms,
+    )))
 }
 
-pub(super) fn assign_or_zero(
+/// Convert a ReplicatedWrite back into a PhysicalPlan for Data Plane
+/// execution, alongside the TTL-bearing KV writes' `resolved_now_ms` (see
+/// [`DecodedEntry`]). `resolved_now_ms` stays `None` for every arm except the
+/// seven TTL-bearing `Kv*` variants, which stamp it from the wire field.
+fn to_physical_plan(
+    write: &ReplicatedWrite,
     ctx: &DecodeCtx,
-    collection: &str,
-    pk_bytes: &[u8],
-) -> crate::Result<nodedb_types::Surrogate> {
-    match ctx.assigner {
-        Some(a) => a.assign(ctx.database_id, ctx.tenant_id, collection, pk_bytes),
-        None => Ok(nodedb_types::Surrogate::ZERO),
-    }
-}
-
-/// Resolve `carried` for a mutating op that does NOT create rows (UPDATE /
-/// DELETE). When `carried` is authoritative (non-ZERO, from a member
-/// coordinator) the binding is installed first-wins via `bind`. When `carried`
-/// is ZERO (non-member coordinator that missed resolution) the catalog is
-/// queried READ-ONLY; ZERO is never bound, so a later INSERT of the same pk
-/// gets a freshly allocated surrogate instead of the corrupt ZERO entry.
-pub(super) fn bind_or_lookup(
-    ctx: &DecodeCtx,
-    collection: &str,
-    pk_bytes: &[u8],
-    carried: nodedb_types::Surrogate,
-) -> crate::Result<nodedb_types::Surrogate> {
-    match ctx.assigner {
-        Some(a) if carried != nodedb_types::Surrogate::ZERO => a.bind(
-            ctx.database_id,
-            ctx.tenant_id,
-            collection,
-            pk_bytes,
-            carried,
-        ),
-        Some(a) => Ok(a
-            .lookup(ctx.database_id, ctx.tenant_id, collection, pk_bytes)?
-            .unwrap_or(nodedb_types::Surrogate::ZERO)),
-        None => Ok(carried),
-    }
-}
-
-/// Convert a ReplicatedWrite back into a PhysicalPlan for Data Plane execution.
-fn to_physical_plan(write: &ReplicatedWrite, ctx: &DecodeCtx) -> crate::Result<PhysicalPlan> {
-    Ok(match write {
+) -> crate::Result<(PhysicalPlan, Option<u64>)> {
+    let mut resolved_now_ms: Option<u64> = None;
+    let plan = match write {
         ReplicatedWrite::PointPut {
             collection,
             document_id,
@@ -261,7 +239,11 @@ fn to_physical_plan(write: &ReplicatedWrite, ctx: &DecodeCtx) -> crate::Result<P
             value,
             ttl_ms,
             surrogate,
-        } => kv::put(ctx, collection, key, value, *ttl_ms, *surrogate)?,
+            resolved_now_ms: rn,
+        } => {
+            resolved_now_ms = *rn;
+            kv::put(ctx, collection, key, value, *ttl_ms, *surrogate)?
+        }
         ReplicatedWrite::KvDelete { collection, keys } => kv::delete(collection, keys),
         ReplicatedWrite::KvInsert {
             collection,
@@ -269,14 +251,22 @@ fn to_physical_plan(write: &ReplicatedWrite, ctx: &DecodeCtx) -> crate::Result<P
             value,
             ttl_ms,
             surrogate,
-        } => kv::insert(ctx, collection, key, value, *ttl_ms, *surrogate)?,
+            resolved_now_ms: rn,
+        } => {
+            resolved_now_ms = *rn;
+            kv::insert(ctx, collection, key, value, *ttl_ms, *surrogate)?
+        }
         ReplicatedWrite::KvInsertIfAbsent {
             collection,
             key,
             value,
             ttl_ms,
             surrogate,
-        } => kv::insert_if_absent(ctx, collection, key, value, *ttl_ms, *surrogate)?,
+            resolved_now_ms: rn,
+        } => {
+            resolved_now_ms = *rn;
+            kv::insert_if_absent(ctx, collection, key, value, *ttl_ms, *surrogate)?
+        }
         ReplicatedWrite::KvInsertOnConflictUpdate {
             collection,
             key,
@@ -284,20 +274,32 @@ fn to_physical_plan(write: &ReplicatedWrite, ctx: &DecodeCtx) -> crate::Result<P
             ttl_ms,
             updates,
             surrogate,
-        } => kv::insert_on_conflict_update(
-            ctx, collection, key, value, *ttl_ms, updates, *surrogate,
-        )?,
+            resolved_now_ms: rn,
+        } => {
+            resolved_now_ms = *rn;
+            kv::insert_on_conflict_update(
+                ctx, collection, key, value, *ttl_ms, updates, *surrogate,
+            )?
+        }
         ReplicatedWrite::KvBatchPut {
             collection,
             entries,
             ttl_ms,
             surrogates,
-        } => kv::batch_put(ctx, collection, entries, *ttl_ms, surrogates)?,
+            resolved_now_ms: rn,
+        } => {
+            resolved_now_ms = *rn;
+            kv::batch_put(ctx, collection, entries, *ttl_ms, surrogates)?
+        }
         ReplicatedWrite::KvExpire {
             collection,
             key,
             ttl_ms,
-        } => kv::expire(collection, key, *ttl_ms),
+            resolved_now_ms: rn,
+        } => {
+            resolved_now_ms = *rn;
+            kv::expire(collection, key, *ttl_ms)
+        }
         ReplicatedWrite::KvPersist { collection, key } => kv::persist(collection, key),
         ReplicatedWrite::KvIncr {
             collection,
@@ -305,7 +307,11 @@ fn to_physical_plan(write: &ReplicatedWrite, ctx: &DecodeCtx) -> crate::Result<P
             delta,
             ttl_ms,
             surrogate,
-        } => kv::incr(ctx, collection, key, *delta, *ttl_ms, *surrogate)?,
+            resolved_now_ms: rn,
+        } => {
+            resolved_now_ms = *rn;
+            kv::incr(ctx, collection, key, *delta, *ttl_ms, *surrogate)?
+        }
         ReplicatedWrite::KvIncrFloat {
             collection,
             key,
@@ -487,5 +493,6 @@ fn to_physical_plan(write: &ReplicatedWrite, ctx: &DecodeCtx) -> crate::Result<P
             constraint_version,
             constraints,
         } => crdt::constraint_change(collection, op, *constraint_version, constraints),
-    })
+    };
+    Ok((plan, resolved_now_ms))
 }

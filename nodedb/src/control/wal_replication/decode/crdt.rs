@@ -4,7 +4,7 @@
 
 use super::super::decode_sync_engines;
 use super::super::types::ConstraintChangeOp;
-use super::entry::{DecodeCtx, assign_or_zero};
+use super::ctx::{DecodeCtx, assign_or_zero};
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::CrdtOp;
 

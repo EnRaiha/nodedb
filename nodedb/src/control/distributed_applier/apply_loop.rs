@@ -29,11 +29,22 @@ enum DispatchOutcome {
 }
 
 /// Build a `Request` for a committed write with default deadline / priority.
+///
+/// `resolved_now_ms` is the TTL instant the proposing node resolved before
+/// proposing the entry to Raft (see `ReplicatedWrite::KvPut::resolved_now_ms`
+/// and `decode::entry::DecodedEntry`), decoded verbatim from the committed
+/// entry. Stamping it here — rather than leaving it `None` and letting
+/// `CoreLoop::kv_ttl_now_ms` fall back to a fresh wall-clock read — is what
+/// makes every replica install the byte-identical `expire_at_ms`: this apply
+/// loop is the ONLY write-apply path in cluster mode (the proposing node
+/// never executes the write locally before Raft commit either), so a `None`
+/// here would mean every replica reads its own clock independently.
 fn build_request(
     state: &Arc<SharedState>,
     tenant_id: TenantId,
     vshard_id: VShardId,
     plan: PhysicalPlan,
+    resolved_now_ms: Option<u64>,
     event_source: crate::event::EventSource,
 ) -> Request {
     Request {
@@ -53,7 +64,7 @@ fn build_request(
         statement_digest: None,
         txn_id: None,
         wal_lsn: None,
-        resolved_now_ms: None,
+        resolved_now_ms,
         admission: crate::bridge::envelope::Admission::Exempt(
             crate::bridge::envelope::ExemptReason::AlreadyOrdered,
         ),
@@ -241,7 +252,7 @@ pub async fn run_apply_loop(
 
             let decoded =
                 from_replicated_entry(&entry.data, Some(state.surrogate_assigner.as_ref()));
-            let (tenant_id, vshard_id, plan) = match decoded {
+            let (tenant_id, vshard_id, plan, resolved_now_ms) = match decoded {
                 Ok(Some(t)) => t,
                 Ok(None) => {
                     // Couldn't deserialize — might be a different format or corrupted.
@@ -277,6 +288,7 @@ pub async fn run_apply_loop(
                 tenant_id,
                 vshard_id,
                 plan,
+                resolved_now_ms,
                 crate::event::EventSource::User,
             );
 

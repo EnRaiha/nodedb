@@ -2,7 +2,7 @@
 
 //! Decode `ReplicatedWrite` variants that produce `PhysicalPlan::Graph`.
 
-use super::entry::DecodeCtx;
+use super::ctx::DecodeCtx;
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp};
 

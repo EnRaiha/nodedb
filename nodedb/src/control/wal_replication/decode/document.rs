@@ -2,7 +2,7 @@
 
 //! Decode `ReplicatedWrite` variants that produce `PhysicalPlan::Document`.
 
-use super::entry::{DecodeCtx, bind_or_lookup};
+use super::ctx::{DecodeCtx, bind_or_lookup};
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::{DocumentOp, UpdateValue};
 

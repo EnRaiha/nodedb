@@ -3,7 +3,7 @@
 //! Decode `ReplicatedWrite` variants that produce `PhysicalPlan::Vector`.
 
 use super::super::decode_sync_engines;
-use super::entry::DecodeCtx;
+use super::ctx::DecodeCtx;
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::VectorOp;
 
