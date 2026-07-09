@@ -96,5 +96,6 @@ fn payloads_to_response(payloads: Vec<Vec<u8>>) -> Response {
         payload,
         watermark_lsn: Lsn::new(0),
         error_code: None,
+        read_set_valid: None,
     }
 }

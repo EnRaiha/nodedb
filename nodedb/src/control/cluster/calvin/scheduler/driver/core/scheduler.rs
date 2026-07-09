@@ -318,6 +318,17 @@ impl Scheduler {
         }
 
         if response.status == crate::bridge::envelope::Status::Ok {
+            // Observe whether the applying participant reported its slice of the
+            // transaction's reads as no longer current against the local write
+            // versions. Observation only: the apply already committed and nothing
+            // is aborted here — the count is a node-global signal for tests and
+            // metrics. `None` means no read-set was checked (fast path / no reads).
+            if response.read_set_valid == Some(false) {
+                self.shared
+                    .read_set_validation_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
             // Deposit the FULL applied Response (affected-count + watermark +
             // any RETURNING rows) into the local sidecar BEFORE proposing the
             // replicated CompletionAck. The ack fires the coordinator's

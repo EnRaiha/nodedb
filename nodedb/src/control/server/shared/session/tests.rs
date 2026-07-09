@@ -237,6 +237,7 @@ impl TxnDataPlane for RecordingDp {
                 payload,
                 watermark_lsn: Lsn::ZERO,
                 error_code: None,
+                read_set_valid: None,
             })
         })
     }

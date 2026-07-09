@@ -21,9 +21,10 @@
 
 use std::collections::HashMap;
 
+use nodedb_types::calvin::{ReadKeyIdent, VersionedReadEntry};
 use nodedb_types::{DatabaseId, TenantId};
 
-use crate::types::Lsn;
+use crate::types::{Lsn, VShardId};
 
 use super::CoreLoop;
 
@@ -117,19 +118,52 @@ impl WriteVersionIndex {
         }
     }
 
-    /// Current per-key version, if recorded. Reading the index is not a U1
-    /// concern (the OCC validator that consumes it lands later); exposed for
-    /// the substrate's own tests only.
-    #[cfg(test)]
-    pub fn key_write_lsn(&self, key: &WriteKey) -> Option<Lsn> {
+    /// Current per-key version, if recorded.
+    pub(crate) fn key_write_lsn(&self, key: &WriteKey) -> Option<Lsn> {
         self.last_write_lsn.get(key).copied()
     }
 
-    /// Current per-collection floor version, if recorded. Test-only (see
-    /// [`Self::key_write_lsn`]).
-    #[cfg(test)]
-    pub fn collection_write_lsn(&self, key: &CollKey) -> Option<Lsn> {
+    /// Current per-collection floor version, if recorded.
+    pub(crate) fn collection_write_lsn(&self, key: &CollKey) -> Option<Lsn> {
         self.coll_write_lsn.get(key).copied()
+    }
+
+    /// Whether a previously observed read is still current against this
+    /// core's recorded write versions.
+    ///
+    /// A `Point` read is current iff no write to that exact key has been
+    /// recorded since the read (`last_write_lsn <= read_lsn`); a key with no
+    /// recorded write has never been written on this core since the read, so
+    /// it is treated as version zero and is always current. A `Predicate`
+    /// read is current iff no write to the collection has been recorded
+    /// since the read, checked the same way against the collection floor.
+    pub(crate) fn read_is_valid(
+        &self,
+        db: DatabaseId,
+        tenant: TenantId,
+        collection: &str,
+        key: &ReadKeyIdent,
+        read_lsn: Lsn,
+    ) -> bool {
+        match key {
+            ReadKeyIdent::Point(repr) => {
+                let write_key = WriteKey {
+                    db,
+                    tenant,
+                    collection: Box::from(collection),
+                    key: repr.clone(),
+                };
+                self.key_write_lsn(&write_key).unwrap_or(Lsn::ZERO) <= read_lsn
+            }
+            ReadKeyIdent::Predicate => {
+                let coll_key = CollKey {
+                    db,
+                    tenant,
+                    collection: Box::from(collection),
+                };
+                self.collection_write_lsn(&coll_key).unwrap_or(Lsn::ZERO) <= read_lsn
+            }
+        }
     }
 
     /// Horizon garbage-collect the per-key map against `watermark`.
@@ -209,6 +243,44 @@ impl CoreLoop {
         self.write_index.gc(self.watermark);
     }
 
+    /// Whether this shard's slice of a transaction's LSN-versioned read-set was
+    /// still current against the local write versions.
+    ///
+    /// Filters the read-set to the entries whose collection homes to this
+    /// request's vShard — the only reads this core holds versions for — then
+    /// checks each against the per-core write-version index via
+    /// [`WriteVersionIndex::read_is_valid`]. Short-circuits on the first entry
+    /// that is no longer current. An empty or fully-remote slice is vacuously
+    /// current (`true`). The `(database, tenant)` scope mirrors the write-version
+    /// recorder so a read validates against the same key space it was recorded
+    /// in; homing uses the same collection-in-database function the scheduler
+    /// routes plans with.
+    pub(in crate::data::executor) fn read_set_still_current(
+        &self,
+        task: &super::super::task::ExecutionTask,
+        tid: u64,
+        versioned_reads: &[VersionedReadEntry],
+    ) -> bool {
+        let db = task.request.database_id;
+        let tenant = TenantId::new(tid);
+        let local_vshard = task.request.vshard_id.as_u32();
+        versioned_reads
+            .iter()
+            .filter(|entry| {
+                VShardId::from_collection_in_database(db, &entry.collection).as_u32()
+                    == local_vshard
+            })
+            .all(|entry| {
+                self.write_index.read_is_valid(
+                    db,
+                    tenant,
+                    &entry.collection,
+                    &entry.key,
+                    entry.read_lsn,
+                )
+            })
+    }
+
     /// Record a committed document/vector write's version, keyed by the
     /// written row's cross-engine surrogate, if a WAL LSN was threaded onto
     /// `task`. Shared by every per-surrogate write chokepoint (point put,
@@ -229,5 +301,82 @@ impl CoreLoop {
                 lsn,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> DatabaseId {
+        DatabaseId::DEFAULT
+    }
+
+    fn tenant() -> TenantId {
+        TenantId::new(1)
+    }
+
+    #[test]
+    fn point_read_is_valid_when_key_never_written() {
+        let index = WriteVersionIndex::new();
+        let key = ReadKeyIdent::Point(KeyRepr::Surrogate(7));
+        assert!(index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+    }
+
+    #[test]
+    fn point_read_is_valid_when_write_at_or_before_read_lsn() {
+        let mut index = WriteVersionIndex::new();
+        index.note_write_lsn(
+            db(),
+            tenant(),
+            "orders",
+            Some(KeyRepr::Surrogate(7)),
+            Lsn::new(10),
+        );
+
+        let key = ReadKeyIdent::Point(KeyRepr::Surrogate(7));
+        assert!(index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+        assert!(index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(20)));
+    }
+
+    #[test]
+    fn point_read_is_invalid_when_write_after_read_lsn() {
+        let mut index = WriteVersionIndex::new();
+        index.note_write_lsn(
+            db(),
+            tenant(),
+            "orders",
+            Some(KeyRepr::Surrogate(7)),
+            Lsn::new(20),
+        );
+
+        let key = ReadKeyIdent::Point(KeyRepr::Surrogate(7));
+        assert!(!index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+    }
+
+    #[test]
+    fn predicate_read_is_valid_when_collection_never_written() {
+        let index = WriteVersionIndex::new();
+        let key = ReadKeyIdent::Predicate;
+        assert!(index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+    }
+
+    #[test]
+    fn predicate_read_is_valid_when_floor_at_or_before_read_lsn() {
+        let mut index = WriteVersionIndex::new();
+        index.note_write_lsn(db(), tenant(), "orders", None, Lsn::new(10));
+
+        let key = ReadKeyIdent::Predicate;
+        assert!(index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+        assert!(index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(20)));
+    }
+
+    #[test]
+    fn predicate_read_is_invalid_when_floor_after_read_lsn() {
+        let mut index = WriteVersionIndex::new();
+        index.note_write_lsn(db(), tenant(), "orders", None, Lsn::new(20));
+
+        let key = ReadKeyIdent::Predicate;
+        assert!(!index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
     }
 }

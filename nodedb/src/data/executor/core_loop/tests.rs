@@ -274,7 +274,7 @@ fn transaction_batch_records_sub_plan_versions() {
         surrogate: Surrogate::new(11),
         pk_bytes: Vec::new(),
     })];
-    let resp = core.execute_transaction_batch(&task, 1, &plans);
+    let resp = core.execute_transaction_batch(&task, 1, &plans, &[]);
     assert_eq!(resp.status, Status::Ok);
 
     assert_eq!(
@@ -567,5 +567,222 @@ fn scan_with_prefilter_returns_only_bitmap_members() {
     assert!(
         !returned_ids.contains("00000002"),
         "surrogate 2 (not in prefilter) must not appear"
+    );
+}
+
+// ── Read-set validation against the write-version index ────────────────────
+
+use nodedb_types::calvin::{EngineTag, ReadKeyIdent, VersionedReadEntry};
+
+/// An `ExecutionTask` homing to `vshard_id`, carrying no WAL LSN.
+fn task_with_vshard(vshard_id: VShardId) -> ExecutionTask {
+    ExecutionTask::new(Request {
+        vshard_id,
+        ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
+            collection: "x".into(),
+            document_id: "y".into(),
+            surrogate: Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            rls_filters: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        }))
+    })
+}
+
+/// An `ExecutionTask` carrying WAL LSN `lsn` and homing to `vshard_id`.
+fn wal_task_with_vshard(lsn: u64, vshard_id: VShardId) -> ExecutionTask {
+    ExecutionTask::with_wal_lsn(
+        Request {
+            vshard_id,
+            ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
+                collection: "x".into(),
+                document_id: "y".into(),
+                surrogate: Surrogate::ZERO,
+                pk_bytes: Vec::new(),
+                rls_filters: Vec::new(),
+                system_time: nodedb_types::SystemTimeScope::Current,
+                valid_at_ms: None,
+            }))
+        },
+        Some(Lsn::new(lsn)),
+    )
+}
+
+/// The vShard `collection` homes to in the default database — mirrors the
+/// homing `read_set_still_current` filters entries by.
+fn local_vshard(collection: &str) -> VShardId {
+    VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection)
+}
+
+/// Some vShard other than `than`, for exercising the cross-shard filter.
+fn other_vshard(than: VShardId) -> VShardId {
+    VShardId::new((than.as_u32() + 1) % VShardId::COUNT)
+}
+
+fn point_entry(collection: &str, surrogate: u32, read_lsn: u64) -> VersionedReadEntry {
+    VersionedReadEntry {
+        engine: EngineTag::Document,
+        collection: collection.to_string(),
+        key: ReadKeyIdent::Point(KeyRepr::Surrogate(surrogate)),
+        read_lsn: Lsn::new(read_lsn),
+    }
+}
+
+fn predicate_entry(collection: &str, read_lsn: u64) -> VersionedReadEntry {
+    VersionedReadEntry {
+        engine: EngineTag::Document,
+        collection: collection.to_string(),
+        key: ReadKeyIdent::Predicate,
+        read_lsn: Lsn::new(read_lsn),
+    }
+}
+
+#[test]
+fn stale_point_read_is_detected_as_not_current() {
+    let (mut core, _, _, _dir) = make_core();
+    core.note_write_lsn(
+        DatabaseId::DEFAULT,
+        TenantId::new(1),
+        "orders",
+        Some(KeyRepr::Surrogate(7)),
+        Lsn::new(20),
+    );
+
+    let task = task_with_vshard(local_vshard("orders"));
+    let reads = vec![point_entry("orders", 7, 10)];
+    assert!(!core.read_set_still_current(&task, 1, &reads));
+}
+
+#[test]
+fn fresh_point_read_is_still_current() {
+    let (mut core, _, _, _dir) = make_core();
+    core.note_write_lsn(
+        DatabaseId::DEFAULT,
+        TenantId::new(1),
+        "orders",
+        Some(KeyRepr::Surrogate(7)),
+        Lsn::new(20),
+    );
+
+    let task = task_with_vshard(local_vshard("orders"));
+    assert!(core.read_set_still_current(&task, 1, &[point_entry("orders", 7, 20)]));
+    assert!(core.read_set_still_current(&task, 1, &[point_entry("orders", 7, 30)]));
+}
+
+#[test]
+fn read_entry_homing_to_a_different_vshard_is_filtered_out() {
+    let (mut core, _, _, _dir) = make_core();
+    core.note_write_lsn(
+        DatabaseId::DEFAULT,
+        TenantId::new(1),
+        "orders",
+        Some(KeyRepr::Surrogate(7)),
+        Lsn::new(20),
+    );
+
+    let local = local_vshard("orders");
+    let remote_task = task_with_vshard(other_vshard(local));
+    // Would conflict (read_lsn 10 < write_lsn 20) if this shard owned the
+    // entry's collection; it homes elsewhere, so it is filtered out of this
+    // shard's slice and the vacuous (empty-after-filter) result is `true`.
+    let reads = vec![point_entry("orders", 7, 10)];
+    assert!(core.read_set_still_current(&remote_task, 1, &reads));
+}
+
+#[test]
+fn stale_predicate_read_is_detected_as_not_current() {
+    let (mut core, _, _, _dir) = make_core();
+    core.note_write_lsn(
+        DatabaseId::DEFAULT,
+        TenantId::new(1),
+        "orders",
+        None,
+        Lsn::new(20),
+    );
+
+    let task = task_with_vshard(local_vshard("orders"));
+    let reads = vec![predicate_entry("orders", 10)];
+    assert!(!core.read_set_still_current(&task, 1, &reads));
+}
+
+#[test]
+fn fresh_predicate_read_is_still_current() {
+    let (mut core, _, _, _dir) = make_core();
+    core.note_write_lsn(
+        DatabaseId::DEFAULT,
+        TenantId::new(1),
+        "orders",
+        None,
+        Lsn::new(20),
+    );
+
+    let task = task_with_vshard(local_vshard("orders"));
+    let reads = vec![predicate_entry("orders", 20)];
+    assert!(core.read_set_still_current(&task, 1, &reads));
+}
+
+#[test]
+fn empty_read_set_is_vacuously_current() {
+    let (core, _, _, _dir) = make_core();
+    let task = task_with_vshard(VShardId::new(0));
+    assert!(core.read_set_still_current(&task, 1, &[]));
+}
+
+#[test]
+fn conflicting_read_set_is_flagged_invalid_but_batch_still_applies() {
+    let (mut core, _, _, _dir) = make_core();
+    let vshard = local_vshard("orders");
+
+    // First batch: a write to key 7 in "orders", recording its version at
+    // LSN 10 (this is the same chokepoint a Calvin apply funnels through).
+    let write_task = wal_task_with_vshard(10, vshard);
+    let write_plans = vec![PhysicalPlan::Document(DocumentOp::PointPut {
+        collection: "orders".into(),
+        document_id: "o7".into(),
+        value: doc_value("a", "1"),
+        surrogate: Surrogate::new(7),
+        pk_bytes: Vec::new(),
+    })];
+    let write_resp = core.execute_transaction_batch(&write_task, 1, &write_plans, &[]);
+    assert_eq!(write_resp.status, Status::Ok);
+    assert_eq!(
+        write_resp.read_set_valid,
+        Some(true),
+        "empty read-set is vacuously current"
+    );
+
+    // Second batch carries a synthetic read-set observing key 7 BEFORE the
+    // write above (read_lsn = 5 < the recorded write's LSN 10), alongside its
+    // own unrelated write. Proves: (a) the first batch's write really was
+    // recorded into the version index (without it this would false-report
+    // valid), and (b) an invalid read-set does not block the batch's own
+    // apply (non-enforcing).
+    let second_task = wal_task_with_vshard(20, vshard);
+    let second_plans = vec![PhysicalPlan::Document(DocumentOp::PointPut {
+        collection: "orders".into(),
+        document_id: "o8".into(),
+        value: doc_value("a", "2"),
+        surrogate: Surrogate::new(8),
+        pk_bytes: Vec::new(),
+    })];
+    let stale_reads = vec![point_entry("orders", 7, 5)];
+    let second_resp = core.execute_transaction_batch(&second_task, 1, &second_plans, &stale_reads);
+
+    assert_eq!(
+        second_resp.status,
+        Status::Ok,
+        "apply proceeds regardless of the read-set validation outcome"
+    );
+    assert_eq!(
+        second_resp.read_set_valid,
+        Some(false),
+        "stale read against the recorded write must be detected as no longer current"
+    );
+
+    // The second batch's own write still landed despite the invalid read-set.
+    assert_eq!(
+        core.write_index.key_write_lsn(&surrogate_key("orders", 8)),
+        Some(Lsn::new(20))
     );
 }

@@ -63,6 +63,7 @@ fn synthetic_returning_response(payload_bytes: Vec<u8>) -> Response {
         payload: Payload::from_vec(payload_bytes),
         watermark_lsn: Lsn::ZERO,
         error_code: None,
+        read_set_valid: None,
     }
 }
 

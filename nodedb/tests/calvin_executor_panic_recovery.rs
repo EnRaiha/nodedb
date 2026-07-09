@@ -62,6 +62,7 @@ fn calvin_static(epoch: u64, plans: Vec<PhysicalPlan>) -> PhysicalPlan {
         plans,
         epoch_system_ms: 1_700_000_000_000,
         is_group_leader: true,
+        versioned_reads: vec![],
     })
 }
 

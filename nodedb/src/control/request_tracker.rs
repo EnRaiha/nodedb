@@ -121,6 +121,7 @@ mod tests {
             payload: Payload::empty(),
             watermark_lsn: Lsn::ZERO,
             error_code: None,
+            read_set_valid: None,
         }
     }
 
@@ -133,6 +134,7 @@ mod tests {
             payload: Payload::from_vec(data.as_bytes().to_vec()),
             watermark_lsn: Lsn::ZERO,
             error_code: None,
+            read_set_valid: None,
         }
     }
 

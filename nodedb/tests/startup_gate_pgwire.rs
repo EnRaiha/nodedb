@@ -87,6 +87,7 @@ fn spawn_fake_data_plane(mut data_side: CoreChannelDataSide) {
                         payload,
                         watermark_lsn: Lsn::ZERO,
                         error_code: None,
+                        read_set_valid: None,
                     },
                 };
 

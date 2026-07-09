@@ -103,6 +103,7 @@ pub async fn broadcast_to_all_cores_txn(
         payload: crate::bridge::envelope::Payload::from_vec(outcome.merged_array),
         watermark_lsn: outcome.watermark_lsn,
         error_code: None,
+        read_set_valid: None,
     })
 }
 
@@ -209,6 +210,7 @@ pub async fn broadcast_count_to_all_cores(
         payload: crate::bridge::envelope::Payload::from_vec(payload),
         watermark_lsn: max_lsn,
         error_code: None,
+        read_set_valid: None,
     })
 }
 

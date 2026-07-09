@@ -20,6 +20,7 @@ impl CoreLoop {
             payload: Payload::empty(),
             watermark_lsn: self.watermark,
             error_code: None,
+            read_set_valid: None,
         }
     }
 
@@ -36,6 +37,7 @@ impl CoreLoop {
             payload: Payload::from_vec(payload),
             watermark_lsn: self.watermark,
             error_code: None,
+            read_set_valid: None,
         }
     }
 
@@ -52,6 +54,7 @@ impl CoreLoop {
             payload: Payload::from_vec(payload),
             watermark_lsn: self.watermark,
             error_code: None,
+            read_set_valid: None,
         }
     }
 
@@ -68,6 +71,7 @@ impl CoreLoop {
             payload: Payload::empty(),
             watermark_lsn: self.watermark,
             error_code: Some(error_code.into()),
+            read_set_valid: None,
         }
     }
 

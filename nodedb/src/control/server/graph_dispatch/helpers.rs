@@ -22,5 +22,6 @@ pub(super) fn ok_response(payload: Vec<u8>) -> Response {
         payload: crate::bridge::envelope::Payload::from_vec(payload),
         watermark_lsn: Lsn::ZERO,
         error_code: None,
+        read_set_valid: None,
     }
 }

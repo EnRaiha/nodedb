@@ -28,6 +28,7 @@ use tracing::{debug, info_span};
 
 use nodedb_cluster::calvin::types::PassiveReadKey;
 use nodedb_types::Value;
+use nodedb_types::calvin::VersionedReadEntry;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -67,6 +68,7 @@ impl CoreLoop {
         ctx: CalvinExecCtx,
         tenant_id: &TenantId,
         plans: &[PhysicalPlan],
+        versioned_reads: &[VersionedReadEntry],
     ) -> Response {
         let CalvinExecCtx {
             epoch,
@@ -83,6 +85,7 @@ impl CoreLoop {
             vshard_id,
             is_group_leader,
             plan_count = plans.len(),
+            read_count = versioned_reads.len(),
             "calvin execute static"
         );
         let _apply_span = info_span!(
@@ -103,7 +106,8 @@ impl CoreLoop {
         // direct single-shard dispatch still verifies.
         let prev_group_leader = self.ollp_is_group_leader;
         self.ollp_is_group_leader = is_group_leader;
-        let result = self.execute_transaction_batch(task, tenant_id.as_u64(), plans);
+        let result =
+            self.execute_transaction_batch(task, tenant_id.as_u64(), plans, versioned_reads);
         self.ollp_is_group_leader = prev_group_leader;
         self.epoch_system_ms = None;
         result
@@ -226,7 +230,9 @@ impl CoreLoop {
         // direct single-shard dispatch still verifies.
         let prev_group_leader = self.ollp_is_group_leader;
         self.ollp_is_group_leader = is_group_leader;
-        let result = self.execute_transaction_batch(task, tenant_id.as_u64(), plans);
+        // The dependent-read path resolves its reads via `injected_reads`, not the
+        // LSN-versioned read-set, so no read-set is checked here.
+        let result = self.execute_transaction_batch(task, tenant_id.as_u64(), plans, &[]);
         self.ollp_is_group_leader = prev_group_leader;
         self.epoch_system_ms = None;
         result

@@ -267,6 +267,7 @@ impl NodeDbPgHandler {
             payload: payload.into(),
             watermark_lsn: Lsn::new(0),
             error_code: None,
+            read_set_valid: None,
         })
     }
 

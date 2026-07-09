@@ -136,6 +136,7 @@ mod tests {
             payload: Payload::from_vec(array_payload(n)),
             watermark_lsn: Lsn::ZERO,
             error_code: None,
+            read_set_valid: None,
         }
     }
 
@@ -148,6 +149,7 @@ mod tests {
             payload: Payload::from_vec(array_payload(n)),
             watermark_lsn: Lsn::ZERO,
             error_code: None,
+            read_set_valid: None,
         }
     }
 
@@ -160,6 +162,7 @@ mod tests {
             payload: Payload::from_vec(vec![0u8; bytes]),
             watermark_lsn: Lsn::ZERO,
             error_code: None,
+            read_set_valid: None,
         }
     }
 
@@ -172,6 +175,7 @@ mod tests {
             payload: Payload::empty(),
             watermark_lsn: Lsn::ZERO,
             error_code: Some(code),
+            read_set_valid: None,
         }
     }
 

@@ -77,6 +77,7 @@ impl CoreLoop {
                 payload: Payload::empty(),
                 watermark_lsn: self.watermark,
                 error_code: Some(ErrorCode::DeadlineExceeded),
+                read_set_valid: None,
             }
         } else {
             task.state = TaskState::Running;

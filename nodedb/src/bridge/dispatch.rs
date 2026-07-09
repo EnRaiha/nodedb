@@ -579,6 +579,7 @@ mod tests {
                     payload: Payload::from_vec(b"result".to_vec()),
                     watermark_lsn: Lsn::new(42),
                     error_code: None,
+                    read_set_valid: None,
                 },
             })
             .unwrap();
@@ -631,6 +632,7 @@ mod tests {
                     payload: Payload::empty(),
                     watermark_lsn: Lsn::ZERO,
                     error_code: None,
+                    read_set_valid: None,
                 },
             })
             .unwrap();

@@ -232,6 +232,7 @@ impl CoreLoop {
             payload: Payload::from_vec(buf),
             watermark_lsn: self.watermark,
             error_code: None,
+            read_set_valid: None,
         }
     }
 }

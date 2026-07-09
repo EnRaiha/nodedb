@@ -63,6 +63,7 @@ impl TxnDataPlane for NativeTxnDp<'_> {
                         payload: Payload::from_vec(payloads.into_iter().next().unwrap_or_default()),
                         watermark_lsn: Lsn::new(0),
                         error_code: None,
+                        read_set_valid: None,
                     })
                 }
                 None => {

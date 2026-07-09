@@ -212,6 +212,10 @@ impl Scheduler {
             plans,
             epoch_system_ms: txn.epoch_system_ms,
             is_group_leader: self.is_group_leader(),
+            // The replicated read-set travels to the apply core so each
+            // participant can check, at apply, whether its slice of the reads was
+            // still current. Empty for pure-write / autocommit transactions.
+            versioned_reads: txn.tx_class.versioned_reads.as_slice().to_vec(),
         });
 
         // no-determinism: request deadline is ephemeral, not written to WAL

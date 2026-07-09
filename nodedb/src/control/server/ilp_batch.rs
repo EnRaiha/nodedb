@@ -177,6 +177,7 @@ async fn flush_ilp_batch_inner(
                             payload,
                             watermark_lsn: Lsn::new(0),
                             error_code: None,
+                            read_set_valid: None,
                         }
                     })?
             }

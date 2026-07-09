@@ -22,7 +22,9 @@ impl CoreLoop {
 
             MetaOp::Cancel { target_request_id } => self.execute_cancel(task, *target_request_id),
 
-            MetaOp::TransactionBatch { plans } => self.execute_transaction_batch(task, tid, plans),
+            MetaOp::TransactionBatch { plans } => {
+                self.execute_transaction_batch(task, tid, plans, &[])
+            }
 
             MetaOp::CreateSnapshot => self.execute_create_snapshot(task),
             MetaOp::Compact => self.execute_compact(task),
@@ -144,6 +146,7 @@ impl CoreLoop {
                 plans,
                 epoch_system_ms,
                 is_group_leader,
+                versioned_reads,
             } => self.execute_calvin_execute_static(
                 task,
                 CalvinExecCtx {
@@ -154,6 +157,7 @@ impl CoreLoop {
                 },
                 tenant_id,
                 plans,
+                versioned_reads,
             ),
 
             MetaOp::CalvinExecutePassive {

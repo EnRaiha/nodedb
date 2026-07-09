@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use nodedb_types::calvin::PassiveReadKey;
+use nodedb_types::calvin::{PassiveReadKey, VersionedReadEntry};
 use nodedb_types::timeseries::continuous_agg::ContinuousAggregateDef;
 use nodedb_types::{TenantId, Value};
 
@@ -303,19 +303,19 @@ pub enum MetaOp {
         /// the wall clock independently. Wire-additive: defaults to 0 on decode
         /// of older entries.
         epoch_system_ms: i64,
-        /// Whether THIS node is the leader of the data-group owning this
-        /// vshard, stamped by the dispatching scheduler at dispatch time.
-        ///
-        /// OLLP determinism: the optimistic-lock verification (`actual !=
-        /// predicted`) and the resulting `OllpRetryRequired` are LEADER-ONLY.
-        /// Followers trust the leader's verified decision and apply the carried
-        /// `ollp_predicted_surrogates` set verbatim, so every replica mutates
-        /// the identical surrogate set (Calvin determinism). This flag is a
-        /// per-node, non-replicated dispatch property — the scheduler on each
-        /// node stamps its OWN role; it is never part of the replicated log.
-        /// Wire-additive: defaults to `false` on decode of older entries (safe:
-        /// a follower-style apply against the carried predicted set).
+        /// Whether THIS node is the leader of the data-group owning this vshard,
+        /// stamped by the dispatching scheduler. OLLP verification (`actual !=
+        /// predicted` → `OllpRetryRequired`) is leader-only; followers apply the
+        /// carried `ollp_predicted_surrogates` verbatim so every replica mutates
+        /// the identical set (Calvin determinism). Per-node, never replicated.
+        /// Wire-additive: defaults to `false` on decode of older entries.
         is_group_leader: bool,
+        /// The transaction's LSN-versioned read-set from the replicated `TxClass`.
+        /// Each participant checks its own vShard's reads at apply and records
+        /// whether they were still current, without gating apply. Wire-additive:
+        /// defaults to empty on decode of older entries.
+        #[serde(default)]
+        versioned_reads: Vec<VersionedReadEntry>,
     },
 
     /// Calvin dependent-read executor: passive participant reads keys and

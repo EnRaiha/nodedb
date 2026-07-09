@@ -15,6 +15,7 @@ use crate::bridge::envelope::{ErrorCode, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::PhysicalPlan;
+use nodedb_types::calvin::VersionedReadEntry;
 
 use super::undo::UndoEntry;
 
@@ -37,12 +38,20 @@ impl CoreLoop {
         task: &ExecutionTask,
         tid: u64,
         plans: &[PhysicalPlan],
+        versioned_reads: &[VersionedReadEntry],
     ) -> Response {
         debug!(
             core = self.core_id,
             plan_count = plans.len(),
             "transaction batch begin"
         );
+
+        // Check whether this participant's slice of the transaction's reads was
+        // still current against the local write versions, observed BEFORE apply.
+        // Non-gating: the outcome is reported on the response and the apply
+        // proceeds regardless. Empty read-set (pure-write / autocommit / non-Calvin
+        // fast path) is vacuously current.
+        let read_set_current = self.read_set_still_current(task, tid, versioned_reads);
 
         let undo_log: Vec<UndoEntry> = Vec::with_capacity(plans.len());
         let crdt_deltas: Vec<CrdtDelta> = Vec::new();
@@ -84,6 +93,7 @@ impl CoreLoop {
             payload: last_response.payload,
             watermark_lsn: self.watermark,
             error_code: None,
+            read_set_valid: Some(read_set_current),
         }
     }
 
@@ -187,6 +197,7 @@ impl CoreLoop {
                         payload: crate::bridge::envelope::Payload::empty(),
                         watermark_lsn: self.watermark,
                         error_code: Some(rollback_error_code),
+                        read_set_valid: None,
                     });
                 }
             }
@@ -241,6 +252,7 @@ impl CoreLoop {
                 payload: crate::bridge::envelope::Payload::empty(),
                 watermark_lsn: self.watermark,
                 error_code: Some(rollback_error_code),
+                read_set_valid: None,
             });
         }
         Ok(undo_log)
@@ -292,6 +304,7 @@ impl CoreLoop {
                                 entry_index: crdt_idx,
                                 detail: format!("CRDT delta apply failed: {e}"),
                             }),
+                            read_set_valid: None,
                         });
                     }
                 }
@@ -314,6 +327,7 @@ impl CoreLoop {
                             entry_index: crdt_idx,
                             detail: format!("CRDT engine not available: {e}"),
                         }),
+                        read_set_valid: None,
                     });
                 }
             }

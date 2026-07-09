@@ -20,6 +20,7 @@ pub(super) fn synthetic_ok_response(request_id: RequestId, watermark_lsn: Lsn) -
         payload: Vec::<u8>::new().into(),
         watermark_lsn,
         error_code: None,
+        read_set_valid: None,
     }
 }
 

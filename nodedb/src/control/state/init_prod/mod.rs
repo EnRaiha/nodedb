@@ -300,6 +300,7 @@ impl SharedState {
             calvin_lock_managers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             autocommit_lock_seq: std::sync::atomic::AtomicU32::new(0),
             calvin_write_versions_recorded: Arc::new(AtomicU64::new(0)),
+            read_set_validation_failures: Arc::new(AtomicU64::new(0)),
             presence: Arc::new(tokio::sync::RwLock::new(
                 crate::control::server::sync::presence::PresenceManager::new(
                     crate::control::server::sync::presence::PresenceConfig::default(),

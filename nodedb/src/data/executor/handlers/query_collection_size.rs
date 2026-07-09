@@ -79,6 +79,7 @@ impl CoreLoop {
             payload: Payload::from(payload),
             watermark_lsn: self.watermark,
             error_code: None,
+            read_set_valid: None,
         }
     }
 }

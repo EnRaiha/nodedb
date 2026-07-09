@@ -245,6 +245,16 @@ pub struct Response {
 
     /// Error code if status is not Ok.
     pub error_code: Option<ErrorCode>,
+
+    /// Whether this response's originating transaction found its slice of the
+    /// versioned read-set still current against the local write versions at
+    /// apply time. `Some(true)` = still current (or no reads observed for this
+    /// slice); `Some(false)` = at least one read was superseded; `None` = the
+    /// response did not carry a read-set check (reads, control ops, and every
+    /// non-transaction response). Populated only by the transaction-apply path.
+    /// Reporting only — the apply commits regardless; a `Some(false)` here does
+    /// not abort or alter the write.
+    pub read_set_valid: Option<bool>,
 }
 
 pub use nodedb_physical::physical_plan::PhysicalPlan;
@@ -480,6 +490,7 @@ mod tests {
             payload: Payload::from_vec(b"result".to_vec()),
             watermark_lsn: Lsn::new(42),
             error_code: None,
+            read_set_valid: None,
         };
         assert_eq!(resp.status, Status::Ok);
         assert_eq!(resp.watermark_lsn, Lsn::new(42));
@@ -496,6 +507,7 @@ mod tests {
             payload: Payload::empty(),
             watermark_lsn: Lsn::ZERO,
             error_code: Some(ErrorCode::DeadlineExceeded),
+            read_set_valid: None,
         };
         assert_eq!(resp.error_code, Some(ErrorCode::DeadlineExceeded));
     }

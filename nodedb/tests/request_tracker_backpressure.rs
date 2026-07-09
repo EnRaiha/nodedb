@@ -26,6 +26,7 @@ fn partial(id: u64, data: &[u8]) -> Response {
         payload: Payload::from_vec(data.to_vec()),
         watermark_lsn: Lsn::ZERO,
         error_code: None,
+        read_set_valid: None,
     }
 }
 
