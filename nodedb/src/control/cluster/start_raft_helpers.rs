@@ -9,7 +9,7 @@ use nodedb_cluster::vshard_handler::{DispatchTarget, dispatch_by_type};
 use nodedb_cluster::wire::VShardEnvelope;
 
 use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
-use crate::control::cluster::calvin::scheduler::read_last_applied_epoch;
+use crate::control::cluster::calvin::scheduler::read_applied_recovery;
 use crate::control::cluster::calvin::{
     ReadResultEvent, Scheduler, SchedulerConfig, SchedulerParams,
 };
@@ -138,7 +138,7 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             continue;
         }
 
-        let last_applied_epoch = read_last_applied_epoch(&shared.wal, vshard_id)?;
+        let recovery = read_applied_recovery(&shared.wal, vshard_id)?;
         let (sequenced_tx, sequenced_rx) =
             tokio::sync::mpsc::channel(scheduler_config.channel_capacity);
         sequencer_state_machine
@@ -171,8 +171,9 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             receiver: sequenced_rx,
             shared: Arc::clone(shared),
             multi_raft: raft_loop_handle.clone(),
-            last_applied_epoch,
-            rebuild_target_epoch: last_applied_epoch,
+            fully_applied_epoch: recovery.fully_applied_epoch,
+            applied_tail: recovery.applied_tail,
+            rebuild_target_epoch: recovery.max_applied_epoch,
             config: scheduler_config.clone(),
             metrics: SchedulerMetrics::new(),
             read_result_rx,

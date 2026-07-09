@@ -224,6 +224,9 @@ pub fn validate_batch_with_assignments(
                     // epoch_system_ms is filled in by the service tick() when the
                     // EpochBatch is constructed; 0 is a safe placeholder here.
                     epoch_system_ms: 0,
+                    // epoch_vshard_txn_count is stamped per-vShard by the state
+                    // machine at fan-out time; 0 is a safe placeholder here.
+                    epoch_vshard_txn_count: 0,
                 },
             ));
         }

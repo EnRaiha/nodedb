@@ -244,6 +244,19 @@ impl SequencerStateMachine {
                 let mut fanned_out = 0u64;
                 let mut dropped = 0u64;
 
+                // Per-vShard count of how many of this epoch's positions target
+                // each vShard. Delivered to each scheduler so it knows how many
+                // positions of the epoch it must apply before the epoch is fully
+                // applied on its vShard — the input to its per-`(epoch, position)`
+                // applied gate and fully-applied watermark. Every position of an
+                // epoch targeting a given vShard is stamped with the same count.
+                let mut vshard_txn_counts: HashMap<u32, u32> = HashMap::new();
+                for txn in &batch.txns {
+                    for vshard_id in txn.tx_class.participating_vshards() {
+                        *vshard_txn_counts.entry(vshard_id.as_u32()).or_insert(0) += 1;
+                    }
+                }
+
                 for txn in &batch.txns {
                     // Build a per-shard copy with epoch_system_ms stamped from
                     // the batch. This is the deterministic time anchor that engine
@@ -256,7 +269,12 @@ impl SequencerStateMachine {
                     for vshard_id in vshards {
                         let vshard = vshard_id.as_u32();
                         if let Some(sender) = self.vshard_senders.get(&vshard) {
-                            match sender.try_send(txn_with_ts.clone()) {
+                            // Stamp the per-vShard position count for the vShard
+                            // this copy is delivered to.
+                            let mut per_vshard = txn_with_ts.clone();
+                            per_vshard.epoch_vshard_txn_count =
+                                vshard_txn_counts.get(&vshard).copied().unwrap_or(0);
+                            match sender.try_send(per_vshard) {
                                 Ok(()) => {
                                     fanned_out += 1;
                                 }
@@ -380,6 +398,7 @@ mod tests {
                 position: 0,
                 tx_class,
                 epoch_system_ms: 1_700_000_000_000,
+                epoch_vshard_txn_count: 1,
             }],
             epoch_system_ms: 1_700_000_000_000,
         };

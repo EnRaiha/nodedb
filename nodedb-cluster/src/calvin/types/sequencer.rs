@@ -27,6 +27,7 @@ use super::transaction::TxClass;
     zerompk::ToMessagePack,
     zerompk::FromMessagePack,
 )]
+#[msgpack(map)]
 pub struct SequencedTxn {
     /// Sequencer epoch in which this transaction was admitted.
     pub epoch: u64,
@@ -42,7 +43,24 @@ pub struct SequencedTxn {
     /// reading the wall clock independently, ensuring byte-identical state
     /// across all replicas. Wire-additive: zerompk returns default (0) when
     /// decoding older entries that lack this field.
+    #[serde(default)]
+    #[msgpack(default)]
     pub epoch_system_ms: i64,
+    /// Number of positions in this epoch that target the vShard this copy is
+    /// delivered to.
+    ///
+    /// Stamped per-vShard by the sequencer state machine at fan-out time (like
+    /// `epoch_system_ms`), NOT at sequencing time — the value is `0` on the
+    /// replicated log and is filled in when the batch is fanned out to each
+    /// participating vShard's scheduler. It lets a scheduler know, without a
+    /// priori knowledge, how many positions of an epoch it must apply before
+    /// that epoch is fully applied on its vShard — the input to the scheduler's
+    /// exactly-once per-`(epoch, position)` applied gate and fully-applied
+    /// watermark. Wire-additive: zerompk returns default (0) when decoding
+    /// entries that predate this field.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub epoch_vshard_txn_count: u32,
 }
 
 // ── EpochBatch ────────────────────────────────────────────────────────────────

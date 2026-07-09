@@ -84,6 +84,7 @@ fn make_dependent_txn(passive_vshard: u32) -> SequencedTxn {
         position: 0,
         tx_class,
         epoch_system_ms: 0,
+        epoch_vshard_txn_count: 0,
     }
 }
 
@@ -185,6 +186,7 @@ fn dependent_barrier_not_complete_with_multiple_passives() {
             position: 0,
             tx_class,
             epoch_system_ms: 0,
+            epoch_vshard_txn_count: 0,
         },
         keys: BTreeSet::new(),
         lock_acquired_time: Instant::now(),

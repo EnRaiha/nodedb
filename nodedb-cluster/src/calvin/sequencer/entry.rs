@@ -100,6 +100,7 @@ mod tests {
                 position: 0,
                 tx_class,
                 epoch_system_ms: 1_700_000_000_000,
+                epoch_vshard_txn_count: 1,
             }],
             epoch_system_ms: 1_700_000_000_000,
         }

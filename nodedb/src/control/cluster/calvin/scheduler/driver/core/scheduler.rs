@@ -16,10 +16,9 @@ use super::super::barrier::{PendingDependentBarrier, ReadResultEvent};
 use super::super::config::SchedulerConfig;
 use super::super::types::{BlockedTxn, CommitState, PendingTxn};
 use crate::bridge::envelope::Response;
+use crate::control::cluster::calvin::scheduler::AppliedGate;
 use crate::control::cluster::calvin::scheduler::lock_manager::{LockManager, TxnId};
 use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
-#[allow(unused_imports)]
-use crate::control::cluster::calvin::scheduler::recovery::read_last_applied_epoch;
 use crate::control::shutdown::ShutdownReceiver;
 use crate::control::state::SharedState;
 use crate::types::RequestId;
@@ -73,9 +72,13 @@ pub struct Scheduler {
     /// per-vshard data Raft apply loop. Bounded.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) read_result_rx:
         mpsc::Receiver<ReadResultEvent>,
-    /// Highest epoch applied so far.
-    pub(in crate::control::cluster::calvin::scheduler::driver::core) last_applied_epoch: u64,
-    /// Rebuild target epoch (from initial recovery scan).
+    /// Exactly-once applied gate: the fully-applied watermark plus the set of
+    /// applied `(epoch, position)` pairs above it. Replaces a bare per-epoch
+    /// counter so a multi-position epoch is never marked applied on the strength
+    /// of its first completing position.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) applied: AppliedGate,
+    /// Rebuild target epoch (highest applied epoch from the initial recovery
+    /// scan).
     pub(in crate::control::cluster::calvin::scheduler::driver::core) rebuild_target_epoch: u64,
     /// Scheduler configuration.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) config: SchedulerConfig,
@@ -101,7 +104,10 @@ pub struct SchedulerParams {
     pub receiver: mpsc::Receiver<SequencedTxn>,
     pub shared: Arc<SharedState>,
     pub multi_raft: Arc<Mutex<MultiRaft>>,
-    pub last_applied_epoch: u64,
+    /// Fully-applied watermark seed from the recovery scan.
+    pub fully_applied_epoch: u64,
+    /// Applied `(epoch, position)` pairs seed from the recovery scan.
+    pub applied_tail: std::collections::BTreeSet<(u64, u32)>,
     pub rebuild_target_epoch: u64,
     pub config: SchedulerConfig,
     pub metrics: Arc<SchedulerMetrics>,
@@ -120,7 +126,8 @@ impl Scheduler {
             receiver,
             shared,
             multi_raft,
-            last_applied_epoch,
+            fully_applied_epoch,
+            applied_tail,
             rebuild_target_epoch,
             config,
             metrics,
@@ -143,7 +150,7 @@ impl Scheduler {
             blocked: BTreeMap::new(),
             dependent_barrier: BTreeMap::new(),
             read_result_rx,
-            last_applied_epoch,
+            applied: AppliedGate::new(fully_applied_epoch, applied_tail),
             rebuild_target_epoch,
             config,
             metrics,
@@ -154,7 +161,25 @@ impl Scheduler {
 
     /// Whether the scheduler has caught up to the rebuild target epoch.
     pub fn is_caught_up(&self) -> bool {
-        self.last_applied_epoch >= self.rebuild_target_epoch
+        self.applied.fully_applied_epoch() >= self.rebuild_target_epoch
+    }
+
+    /// Publish an advanced fully-applied watermark to the metrics gauge and the
+    /// shared cross-shard snapshot anchor.
+    ///
+    /// `BEGIN` reads `SharedState::last_applied_calvin_epoch` to anchor a
+    /// session's cross-shard snapshot version, so it MUST reflect the
+    /// FULLY-applied epoch — never an epoch that has only some of its positions
+    /// committed, which would let a session anchor on a torn epoch. `fetch_max`
+    /// keeps it monotonic across all per-vShard schedulers writing the counter.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn publish_watermark(
+        &self,
+        watermark: u64,
+    ) {
+        self.metrics.update_last_applied_epoch(watermark);
+        self.shared
+            .last_applied_calvin_epoch
+            .fetch_max(watermark, std::sync::atomic::Ordering::Release);
     }
 
     /// Spawn a bridge task that awaits a single executor response and forwards
@@ -181,7 +206,7 @@ impl Scheduler {
     pub async fn run(mut self, mut shutdown: ShutdownReceiver) {
         info!(
             vshard_id = self.vshard_id,
-            last_applied_epoch = self.last_applied_epoch,
+            fully_applied_epoch = self.applied.fully_applied_epoch(),
             rebuild_target_epoch = self.rebuild_target_epoch,
             "calvin scheduler starting"
         );

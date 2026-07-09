@@ -21,10 +21,28 @@ impl Scheduler {
     ) {
         let txn_id = TxnId::new(txn.epoch, txn.position);
 
-        if self.last_applied_epoch
-            != crate::control::cluster::calvin::scheduler::NOT_YET_APPLIED_EPOCH
-            && txn.epoch <= self.last_applied_epoch
-        {
+        // Record this delivery with the sequencer's per-`(epoch, vShard)` count.
+        // A count >= 1 is the authoritative expected total (every position of the
+        // epoch carries the same value, so this is idempotent); a count of 0
+        // marks a batch encoded before the count field existed, and the position
+        // is tracked so the epoch can fold via in-order delivery instead.
+        self.applied
+            .note_expected(txn.epoch, txn.position, txn.epoch_vshard_txn_count);
+
+        // Exact per-position skip: never re-apply a position that already
+        // committed (its CalvinApplied marker is durable), and never re-run a
+        // whole epoch that has fully folded into the watermark. Re-running an
+        // applied position would re-fire its side effects — this gate IS the
+        // exactly-once mechanism. Skipping a whole epoch on its first completing
+        // position (the previous per-epoch gate) dropped every other position of
+        // that epoch across a restart: a torn transaction.
+        if self.applied.is_applied(txn.epoch, txn.position) {
+            // Learning the count for an already-applied position may complete a
+            // historical epoch's applied set (during restart re-fan-out), folding
+            // it into the watermark and pruning its tail — bounding memory.
+            if let Some(watermark) = self.applied.advance() {
+                self.publish_watermark(watermark);
+            }
             return;
         }
 
@@ -160,19 +178,12 @@ impl Scheduler {
             self.dispatch_or_barrier(txn, waiter_id, keys, Instant::now());
         }
 
-        if self.last_applied_epoch
-            == crate::control::cluster::calvin::scheduler::NOT_YET_APPLIED_EPOCH
-            || epoch > self.last_applied_epoch
-        {
-            self.last_applied_epoch = epoch;
-            self.metrics.update_last_applied_epoch(epoch);
-            // Publish the globally-applied epoch to the shared control-plane
-            // state so `BEGIN` can anchor a session's cross-shard snapshot
-            // version. `fetch_max` keeps it monotonic across all per-vShard
-            // schedulers writing the same counter.
-            self.shared
-                .last_applied_calvin_epoch
-                .fetch_max(epoch, std::sync::atomic::Ordering::Release);
+        // Mark this EXACT position applied. The watermark folds an epoch only
+        // once ALL of its positions for this vShard have terminally completed,
+        // so any advertised watermark reflects a FULLY-applied epoch — the value
+        // `BEGIN` needs for a torn-free cross-shard snapshot anchor.
+        if let Some(watermark) = self.applied.mark_applied(epoch, txn_id.position) {
+            self.publish_watermark(watermark);
         }
 
         self.pending.remove(&txn_id);
