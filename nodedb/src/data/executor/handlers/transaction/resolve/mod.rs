@@ -2,4 +2,5 @@
 
 mod document;
 mod entry;
+mod graph;
 mod kv;

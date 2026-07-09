@@ -10,15 +10,16 @@
 //! `RecordType::TransactionRedo` record; a later install phase replays them. No
 //! base engine is touched here.
 //!
-//! The KV and Document serializers exist in this module today. Every other
-//! engine that writes raises a typed error rather than being silently omitted
-//! from the redo record: dropping an op class would lose those rows on install.
-//! Later serializers (graph, vector, array, columnar) replace their error arm
-//! with a real per-engine module beside [`super::kv`] and [`super::document`].
+//! The KV, Document, and Graph serializers exist in this module today. Every
+//! other engine that writes raises a typed error rather than being silently
+//! omitted from the redo record: dropping an op class would lose those rows on
+//! install. Later serializers (vector, array, columnar) replace their error
+//! arm with a real per-engine module beside [`super::kv`], [`super::document`],
+//! and [`super::graph`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{DocumentOp, GraphOp, KvOp, PhysicalPlan};
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
@@ -26,7 +27,8 @@ use crate::data::executor::task::ExecutionTask;
 use crate::types::{TenantId, TxnId};
 use crate::wal::{RedoRecord, RedoSubRecord};
 
-use super::{document, kv};
+use super::graph::EdgeIdentityKey;
+use super::{document, graph, kv};
 
 impl CoreLoop {
     /// Resolve a committing transaction's staged writes into a [`RedoRecord`]
@@ -71,6 +73,8 @@ impl CoreLoop {
     ) -> crate::Result<Vec<RedoSubRecord>> {
         let mut kv_collections: BTreeSet<String> = BTreeSet::new();
         let mut doc_collections: BTreeSet<String> = BTreeSet::new();
+        let mut graph_collections: BTreeSet<String> = BTreeSet::new();
+        let mut edge_surrogates: BTreeMap<EdgeIdentityKey, (u32, u32)> = BTreeMap::new();
 
         for plan in plans {
             match plan {
@@ -83,6 +87,16 @@ impl CoreLoop {
                 // RETURNING variants and join/merge DML have no overlay
                 // post-image and raise a typed error.
                 PhysicalPlan::Document(op) => classify_document_op(op, &mut doc_collections)?,
+
+                // Graph: overlay-backed serializer for edge puts/deletes. The
+                // overlay carries edge identity + properties but not the
+                // endpoint surrogates a redo put must emit, so those are
+                // collected here from the plan nodes themselves (resolved at
+                // plan-construction time) into `edge_surrogates`. Node-label
+                // deltas have no redo shape and raise a typed error.
+                PhysicalPlan::Graph(op) => {
+                    classify_graph_op(op, &mut graph_collections, &mut edge_surrogates)?
+                }
 
                 // CRDT deltas ride their own `CrdtDelta` WAL record, never redo
                 // sub-records (see `replay_transaction_redo_wal`).
@@ -101,7 +115,6 @@ impl CoreLoop {
                 // lossy redo record; each is replaced by a real serializer in a
                 // later unit. (Even once those land, `Columnar::{Update, Delete}`
                 // stay typed errors — no per-row redo shape exists for them.)
-                PhysicalPlan::Graph(_) => return Err(unsupported_engine("graph")),
                 PhysicalPlan::Vector(_) => return Err(unsupported_engine("vector")),
                 PhysicalPlan::Array(_) => return Err(unsupported_engine("array")),
                 PhysicalPlan::Columnar(_) => return Err(unsupported_engine("columnar")),
@@ -142,6 +155,22 @@ impl CoreLoop {
                     &coll_key,
                     collection,
                     strict_schema.as_ref(),
+                    &mut ops,
+                )?;
+            }
+        }
+        if let Some(graph_overlay) = self.graph_txn_overlays.get(&txn_id) {
+            for collection in &graph_collections {
+                let coll_key = (
+                    task.request.database_id,
+                    TenantId::new(tid),
+                    collection.clone(),
+                );
+                graph::serialize_graph_collection(
+                    graph_overlay,
+                    &coll_key,
+                    collection,
+                    &edge_surrogates,
                     &mut ops,
                 )?;
             }
@@ -307,6 +336,107 @@ fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> 
     }
 }
 
+/// Classify a Graph op for transaction resolve: collect the collection of a
+/// staged edge write into `collections` (so the serializer walks its
+/// overlay), collect the endpoint surrogates of every staged edge PUT into
+/// `edge_surrogates` (the overlay itself carries only identity + properties,
+/// not surrogates — see `resolve/graph.rs` module docs), skip read-only
+/// traversal/algorithm ops, and reject node-label ops that have no redo
+/// sub-record shape.
+fn classify_graph_op(
+    op: &GraphOp,
+    collections: &mut BTreeSet<String>,
+    edge_surrogates: &mut BTreeMap<EdgeIdentityKey, (u32, u32)>,
+) -> crate::Result<()> {
+    match op {
+        // Edge put: the overlay holds the resolved post-image (identity +
+        // properties); the endpoint surrogates are resolved once at
+        // construction time and only live here on the plan node.
+        GraphOp::EdgePut {
+            collection,
+            src_id,
+            label,
+            dst_id,
+            src_surrogate,
+            dst_surrogate,
+            ..
+        } => {
+            collections.insert(collection.clone());
+            edge_surrogates.insert(
+                (
+                    collection.clone(),
+                    src_id.clone(),
+                    label.clone(),
+                    dst_id.clone(),
+                ),
+                (src_surrogate.as_u32(), dst_surrogate.as_u32()),
+            );
+            Ok(())
+        }
+        GraphOp::EdgePutBatch { edges } => {
+            for edge in edges {
+                collections.insert(edge.collection.clone());
+                edge_surrogates.insert(
+                    (
+                        edge.collection.clone(),
+                        edge.src_id.clone(),
+                        edge.label.clone(),
+                        edge.dst_id.clone(),
+                    ),
+                    (edge.src_surrogate.as_u32(), edge.dst_surrogate.as_u32()),
+                );
+            }
+            Ok(())
+        }
+
+        // Edge delete: the redo delete tuple carries no surrogate, so only
+        // the collection is needed to walk the overlay's tombstone set.
+        GraphOp::EdgeDelete { collection, .. } => {
+            collections.insert(collection.clone());
+            Ok(())
+        }
+        GraphOp::EdgeDeleteBatch { edges } => {
+            for edge in edges {
+                collections.insert(edge.collection.clone());
+            }
+            Ok(())
+        }
+
+        // Read-only families: traversal, pattern matching, algorithms, and
+        // stats carry no persisted post-image.
+        GraphOp::Hop { .. }
+        | GraphOp::Neighbors { .. }
+        | GraphOp::NeighborsMulti { .. }
+        | GraphOp::Path { .. }
+        | GraphOp::Subgraph { .. }
+        | GraphOp::RagFusion { .. }
+        | GraphOp::Algo { .. }
+        | GraphOp::Match { .. }
+        | GraphOp::MatchContinuation { .. }
+        | GraphOp::MatchVarLenResume { .. }
+        | GraphOp::BspSuperstep(_)
+        | GraphOp::WccSuperstep(_)
+        | GraphOp::TemporalNeighbors { .. }
+        | GraphOp::TemporalAlgorithm { .. }
+        | GraphOp::Stats { .. } => Ok(()),
+
+        // Node-label mutations stage a delta (added/removed sets), not an
+        // absolute post-image, and no `RecordType` / redo decoder exists for
+        // a node-label WAL sub-record anywhere in the codebase (only edge
+        // Put/Delete are decoded by `wal_replay_redo_graph.rs`; the
+        // `ReplicatedWrite::SetNodeLabels` shape belongs to the unrelated
+        // Raft replication path). Silently omitting the change from the redo
+        // record would lose it on install, so this is a typed error.
+        GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. } => {
+            Err(crate::Error::PlanError {
+                detail: "graph node-label ops have no redo sub-record shape and are not \
+                         supported in transaction resolve"
+                    .to_string(),
+            })
+        }
+    }
+}
+
 /// The typed error a not-yet-supported writing engine raises during resolve.
 fn unsupported_engine(engine: &str) -> crate::Error {
     crate::Error::PlanError {
@@ -321,12 +451,13 @@ mod tests {
 
     use nodedb_bridge::buffer::RingBuffer;
     use nodedb_physical::physical_plan::{
-        DocumentOp, KvOp, MetaOp, ReturningColumns, ReturningSpec, StorageMode,
+        DocumentOp, GraphOp, KvOp, MetaOp, ReturningColumns, ReturningSpec, StorageMode,
     };
     use nodedb_types::Surrogate;
     use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
     use nodedb_types::sync::wire::SyncProvenance;
 
+    use crate::data::executor::handlers::graph::EdgePutParams;
     use crate::data::executor::strict_format;
     use crate::engine::document::store::{CollectionConfig, surrogate_to_doc_id};
 
@@ -1126,5 +1257,377 @@ mod tests {
             payload: Vec::new(),
         };
         assert_eq!(sub.record_type, RecordType::Put as u32);
+    }
+
+    /// A resolve plan carrying an `EdgePut` — the endpoint surrogates on this
+    /// plan node are the ONLY source `classify_graph_op` has for them, since
+    /// the overlay itself only staged identity + properties.
+    fn graph_edge_put_plan(
+        collection: &str,
+        src: &str,
+        label: &str,
+        dst: &str,
+        src_surrogate: u32,
+        dst_surrogate: u32,
+    ) -> PhysicalPlan {
+        PhysicalPlan::Graph(GraphOp::EdgePut {
+            collection: collection.to_string(),
+            src_id: src.to_string(),
+            label: label.to_string(),
+            dst_id: dst.to_string(),
+            properties: Vec::new(),
+            src_surrogate: Surrogate::new(src_surrogate),
+            dst_surrogate: Surrogate::new(dst_surrogate),
+        })
+    }
+
+    #[test]
+    fn graph_edge_put_resolves_with_both_surrogates_and_replays() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(30);
+
+        src.graph_txn_overlays
+            .entry(txn)
+            .or_default()
+            .stage_edge_put(coll_key("g"), "a", "knows", "b", vec![9, 9]);
+
+        let plan = graph_edge_put_plan("g", "a", "knows", "b", 10, 20);
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1, "one staged edge put -> one sub-record");
+        assert_eq!(redo.ops[0].record_type, RecordType::Put as u32);
+
+        let (collection, src_id, label, dst_id, properties, src_sur, dst_sur) =
+            zerompk::from_msgpack::<(String, String, String, String, Vec<u8>, u32, u32)>(
+                &redo.ops[0].payload,
+            )
+            .expect("decode edge put tuple");
+        assert_eq!(collection, "g");
+        assert_eq!(src_id, "a");
+        assert_eq!(label, "knows");
+        assert_eq!(dst_id, "b");
+        assert_eq!(properties, vec![9, 9]);
+        assert_eq!(src_sur, 10, "src surrogate must come from the plan node");
+        assert_eq!(dst_sur, 20, "dst surrogate must come from the plan node");
+
+        // Replay into a fresh core: the CSR node->surrogate map must be
+        // repopulated from the two trailing surrogates.
+        let record = wrap_redo(&redo);
+        let (mut dst_core, _dst_dir) = make_core();
+        dst_core.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        let edges = dst_core
+            .edge_store
+            .neighbors_out(
+                DatabaseId::DEFAULT.as_u64(),
+                TenantId::new(TID),
+                "g",
+                "a",
+                None,
+            )
+            .expect("neighbors_out");
+        assert_eq!(edges.len(), 1, "graph edge put must replay");
+        assert_eq!(edges[0].dst_id, "b");
+    }
+
+    #[test]
+    fn graph_edge_put_without_matching_plan_surrogates_yields_typed_error() {
+        // The overlay stages a put for `a-knows->b`, but the only `EdgePut`
+        // plan in this resolve names a DIFFERENT edge identity in the same
+        // collection. `graph_collections` still names "g" (so the staged
+        // `a-knows->b` post-image IS walked), but `edge_surrogates` has no
+        // entry for it: resolve must raise a typed error rather than invent a
+        // surrogate pair for an edge no plan node accounts for.
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(32);
+
+        src.graph_txn_overlays
+            .entry(txn)
+            .or_default()
+            .stage_edge_put(coll_key("g"), "a", "knows", "b", vec![]);
+
+        let plan = graph_edge_put_plan("g", "x", "other", "y", 1, 2);
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "a staged edge with no matching plan-carried surrogates must error, not invent one"
+        );
+        assert!(resp.error_code.is_some());
+    }
+
+    #[test]
+    fn graph_edge_delete_resolves_and_replay_removes_edge() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(33);
+
+        src.graph_txn_overlays
+            .entry(txn)
+            .or_default()
+            .stage_edge_delete(coll_key("g"), "a", "knows", "b");
+
+        let plan = PhysicalPlan::Graph(GraphOp::EdgeDelete {
+            collection: "g".to_string(),
+            src_id: "a".to_string(),
+            label: "knows".to_string(),
+            dst_id: "b".to_string(),
+            src_surrogate: Surrogate::ZERO,
+            dst_surrogate: Surrogate::ZERO,
+        });
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1);
+        assert_eq!(redo.ops[0].record_type, RecordType::Delete as u32);
+
+        let (collection, src_id, label, dst_id) =
+            zerompk::from_msgpack::<(String, String, String, String)>(&redo.ops[0].payload)
+                .expect("decode edge delete tuple");
+        assert_eq!(collection, "g");
+        assert_eq!(src_id, "a");
+        assert_eq!(label, "knows");
+        assert_eq!(dst_id, "b");
+
+        // Seed the edge in a fresh core, then replay the delete removes it.
+        let (mut dst_core, _dst_dir) = make_core();
+        dst_core.execute_edge_put(
+            &task,
+            EdgePutParams {
+                tid: TID,
+                collection: "g",
+                src_id: "a",
+                label: "knows",
+                dst_id: "b",
+                properties: &[],
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::new(2),
+            },
+        );
+        assert_eq!(
+            dst_core
+                .edge_store
+                .neighbors_out(
+                    DatabaseId::DEFAULT.as_u64(),
+                    TenantId::new(TID),
+                    "g",
+                    "a",
+                    None
+                )
+                .expect("neighbors_out")
+                .len(),
+            1,
+            "edge seeded"
+        );
+
+        let del = wrap_redo(&redo);
+        dst_core.replay_transaction_redo_wal(
+            std::slice::from_ref(&del),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        assert!(
+            dst_core
+                .edge_store
+                .neighbors_out(
+                    DatabaseId::DEFAULT.as_u64(),
+                    TenantId::new(TID),
+                    "g",
+                    "a",
+                    None
+                )
+                .expect("neighbors_out")
+                .is_empty(),
+            "redo delete must remove the graph edge"
+        );
+    }
+
+    #[test]
+    fn graph_resolve_does_not_mutate_base() {
+        let (mut core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(34);
+
+        // Seed a base edge, then stage a DIFFERENT properties blob for the
+        // same identity.
+        core.execute_edge_put(
+            &task,
+            EdgePutParams {
+                tid: TID,
+                collection: "g",
+                src_id: "a",
+                label: "knows",
+                dst_id: "b",
+                properties: b"base",
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::new(2),
+            },
+        );
+
+        core.graph_txn_overlays
+            .entry(txn)
+            .or_default()
+            .stage_edge_put(coll_key("g"), "a", "knows", "b", b"staged".to_vec());
+
+        let plan = graph_edge_put_plan("g", "a", "knows", "b", 1, 2);
+        let resp = core.execute_resolve_txn(&task, TID, txn, &[plan]);
+        assert_eq!(resp.status, Status::Ok);
+
+        // Base is untouched: resolve reads the overlay and plan only, never
+        // writes the edge store or CSR partition.
+        let stored = core
+            .edge_store
+            .get_edge(
+                DatabaseId::DEFAULT.as_u64(),
+                TenantId::new(TID),
+                "g",
+                "a",
+                "knows",
+                "b",
+            )
+            .expect("get_edge")
+            .expect("base edge present");
+        assert_eq!(
+            stored, b"base",
+            "resolve must not mutate the base edge store"
+        );
+    }
+
+    #[test]
+    fn mixed_document_and_graph_edge_resolve_into_one_record_and_both_replay() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(35);
+        let doc_surrogate = 6u32;
+        let doc_row_key = surrogate_to_doc_id(Surrogate::new(doc_surrogate));
+
+        {
+            let overlay = src.txn_overlays.entry(txn).or_default();
+            overlay.insert_put(
+                coll_key("notes"),
+                doc_surrogate,
+                "userpk",
+                schemaless_body("carol"),
+            );
+        }
+        src.graph_txn_overlays
+            .entry(txn)
+            .or_default()
+            .stage_edge_put(coll_key("g"), "a", "knows", "b", vec![]);
+
+        let resp = src.execute_resolve_txn(
+            &task,
+            TID,
+            txn,
+            &[
+                doc_put_plan("notes"),
+                graph_edge_put_plan("g", "a", "knows", "b", 3, 4),
+            ],
+        );
+        let redo = decode_redo(&resp);
+        assert_eq!(
+            redo.ops.len(),
+            2,
+            "one document row + one graph edge -> two sub-records in one record"
+        );
+
+        let record = wrap_redo(&redo);
+        let (mut dst_core, _dst_dir) = make_core();
+        dst_core.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let db = DatabaseId::DEFAULT.as_u64();
+        assert!(
+            dst_core
+                .sparse
+                .get(db, TID, "notes", doc_row_key.as_str())
+                .expect("get")
+                .is_some(),
+            "document sub-record must replay"
+        );
+        assert_eq!(
+            dst_core
+                .edge_store
+                .neighbors_out(db, TenantId::new(TID), "g", "a", None)
+                .expect("neighbors_out")
+                .len(),
+            1,
+            "graph sub-record must replay"
+        );
+    }
+
+    #[test]
+    fn graph_set_node_labels_has_no_redo_shape_and_yields_typed_error() {
+        let (core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(36);
+
+        // `SetNodeLabels` stages a delta, not an absolute post-image, and no
+        // redo sub-record shape exists for it: resolve must raise a typed
+        // error rather than silently drop the label change.
+        let plan = PhysicalPlan::Graph(GraphOp::SetNodeLabels {
+            node_id: "n1".to_string(),
+            labels: vec!["Person".to_string()],
+        });
+        let resp = core.execute_resolve_txn(&task, TID, txn, &[plan]);
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "node-label ops have no redo shape and must raise a typed error"
+        );
+        assert!(resp.error_code.is_some());
+    }
+
+    #[test]
+    fn graph_remove_node_labels_has_no_redo_shape_and_yields_typed_error() {
+        let (core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(37);
+
+        let plan = PhysicalPlan::Graph(GraphOp::RemoveNodeLabels {
+            node_id: "n1".to_string(),
+            labels: vec!["Person".to_string()],
+        });
+        let resp = core.execute_resolve_txn(&task, TID, txn, &[plan]);
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "node-label ops have no redo shape and must raise a typed error"
+        );
+        assert!(resp.error_code.is_some());
+    }
+
+    #[test]
+    fn graph_resolve_is_deterministic_across_two_resolves() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(38);
+
+        {
+            let overlay = src.graph_txn_overlays.entry(txn).or_default();
+            overlay.stage_edge_put(coll_key("g"), "c", "l", "z", vec![]);
+            overlay.stage_edge_put(coll_key("g"), "a", "l", "x", vec![]);
+            overlay.stage_edge_put(coll_key("g"), "b", "l", "y", vec![]);
+        }
+        let plans = [
+            graph_edge_put_plan("g", "a", "l", "x", 1, 2),
+            graph_edge_put_plan("g", "b", "l", "y", 3, 4),
+            graph_edge_put_plan("g", "c", "l", "z", 5, 6),
+        ];
+
+        let resp1 = src.execute_resolve_txn(&task, TID, txn, &plans);
+        let resp2 = src.execute_resolve_txn(&task, TID, txn, &plans);
+        assert_eq!(
+            resp1.payload.as_bytes(),
+            resp2.payload.as_bytes(),
+            "resolving the same overlay twice must produce byte-identical redo bytes"
+        );
     }
 }
