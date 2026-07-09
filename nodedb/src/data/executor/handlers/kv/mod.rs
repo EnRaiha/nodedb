@@ -11,6 +11,7 @@ mod index;
 mod materialize_scan;
 mod scan;
 mod sorted;
+pub(in crate::data::executor) mod sorted_index_compute;
 pub(in crate::data::executor) mod transfer;
 mod ttl;
 

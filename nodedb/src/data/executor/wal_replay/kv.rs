@@ -216,6 +216,18 @@ impl CoreLoop {
                     puts += applied;
                     continue;
                 }
+
+                // kv_register_sorted_index — see `wal_replay_kv_sorted_index.rs`.
+                if let Some(applied) = self.try_replay_kv_register_sorted_index(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
+                    continue;
+                }
             }
 
             if is_delete {
@@ -243,6 +255,17 @@ impl CoreLoop {
                     }
                     self.kv_engine.truncate(database_id, tenant_id, &collection);
                     deletes += 1;
+                    continue;
+                }
+
+                // kv_drop_sorted_index — see `wal_replay_kv_sorted_index.rs`.
+                // No tombstone gate here: the record carries only
+                // `index_name`, no collection to gate on. See that module's
+                // doc comment for why this is safe.
+                if let Some(applied) =
+                    self.try_replay_kv_drop_sorted_index(&record.payload, tenant_id, database_id)
+                {
+                    deletes += applied;
                 }
             }
         }

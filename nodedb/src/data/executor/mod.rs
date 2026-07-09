@@ -26,6 +26,7 @@ mod wal_replay_fts;
 mod wal_replay_kv_atomic;
 mod wal_replay_kv_field;
 mod wal_replay_kv_index;
+mod wal_replay_kv_sorted_index;
 mod wal_replay_kv_transfer;
 mod wal_replay_redo_document;
 mod wal_replay_redo_graph;

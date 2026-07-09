@@ -4,14 +4,12 @@
 
 use tracing::debug;
 
+use super::sorted_index_compute::{BuildSortedIndexDefParams, build_sorted_index_def};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::current_ms;
-use crate::engine::kv::sorted_index::key::{SortColumn, SortDirection, SortKeyEncoder};
-use crate::engine::kv::sorted_index::manager::SortedIndexDef;
-use crate::engine::kv::sorted_index::window::WindowConfig;
 
 /// Parameters for `execute_kv_register_sorted_index`.
 pub(in crate::data::executor) struct KvRegisterSortedIndexParams<'a> {
@@ -56,53 +54,18 @@ impl CoreLoop {
         } = params;
         debug!(core = self.core_id, %collection, %index_name, "kv register sorted index");
 
-        let columns: Vec<SortColumn> = sort_columns
-            .iter()
-            .map(|(name, dir)| SortColumn {
-                name: name.clone(),
-                direction: if dir.eq_ignore_ascii_case("DESC") {
-                    SortDirection::Desc
-                } else {
-                    SortDirection::Asc
-                },
-            })
-            .collect();
-
-        let window = match window_type.to_uppercase().as_str() {
-            "DAILY" => WindowConfig::daily(window_timestamp_column),
-            "WEEKLY" => WindowConfig::weekly(window_timestamp_column),
-            "MONTHLY" => WindowConfig::monthly(window_timestamp_column),
-            "CUSTOM" => {
-                WindowConfig::custom(window_timestamp_column, window_start_ms, window_end_ms)
-            }
-            _ => WindowConfig::none(),
-        };
-
-        let encoder = SortKeyEncoder::new(columns);
-
-        // Validate: if windowed, the timestamp column must be in the sort key columns.
-        if !window.is_unwindowed() {
-            let ts_col = &window.timestamp_column;
-            let has_ts = encoder.columns().iter().any(|c| c.name == *ts_col);
-            if !has_ts {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!(
-                            "WINDOW timestamp column '{}' must be included in sort columns",
-                            ts_col
-                        ),
-                    },
-                );
-            }
-        }
-
-        let def = SortedIndexDef {
-            name: index_name.to_string(),
-            collection: collection.to_string(),
-            key_column: key_column.to_string(),
-            encoder,
-            window,
+        let def = match build_sorted_index_def(BuildSortedIndexDefParams {
+            collection,
+            index_name,
+            sort_columns,
+            key_column,
+            window_type,
+            window_timestamp_column,
+            window_start_ms,
+            window_end_ms,
+        }) {
+            Ok(def) => def,
+            Err(e) => return self.response_error(task, e),
         };
 
         let backfilled = self
