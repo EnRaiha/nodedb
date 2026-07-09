@@ -237,6 +237,33 @@ pub fn wal_append_if_write_with_creds(
             )?;
             Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
         }
+        PhysicalPlan::Columnar(nodedb_physical::physical_plan::ColumnarOp::Update {
+            collection,
+            filters,
+            updates,
+        }) => {
+            // Predicate UPDATE has no row post-image at append time (the
+            // matching set is only known once the Data Plane scans current
+            // state), so the durable record carries the predicate itself;
+            // replay re-executes it through the same live handler. See
+            // `encode_columnar_dml_payload` for the record shape and the
+            // idempotence constraint on replay ordering.
+            let wal_payload =
+                super::timeseries::encode_columnar_dml_payload(collection, true, filters, updates)?;
+            Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
+        }
+        PhysicalPlan::Columnar(nodedb_physical::physical_plan::ColumnarOp::Delete {
+            collection,
+            filters,
+        }) => {
+            // Mirrors the `Update` arm above; delete is idempotent (mark +
+            // remove from PK index), so unlike update it tolerates a
+            // hypothetical double-apply, but replay still runs it exactly
+            // once by construction.
+            let wal_payload =
+                super::timeseries::encode_columnar_dml_payload(collection, false, filters, &[])?;
+            Some(wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?)
+        }
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
             collection,
             payload,

@@ -99,7 +99,11 @@ struct ColumnarReplayArgs<'a> {
 }
 
 impl CoreLoop {
-    fn replay_task(
+    /// Build a synthetic replay `ExecutionTask` embedding `plan`.
+    ///
+    /// Shared with `wal_replay_columnar_dml` — every replay handler that
+    /// re-invokes a live execute_* method needs the same minimal task shape.
+    pub(in crate::data::executor) fn replay_task(
         tenant_id: crate::types::TenantId,
         database_id: DatabaseId,
         vshard_id: crate::types::VShardId,
@@ -320,6 +324,23 @@ impl CoreLoop {
             };
             if target_core != self.core_id {
                 skipped += 1;
+                continue;
+            }
+
+            // Predicate DML (`columnar_dml`) rides the same `TimeseriesBatch`
+            // record type but a disjoint map shape from both `ColumnarWalRecord`
+            // and the legacy tuples (see `ColumnarDmlWalRecord`'s doc comment),
+            // so it must be tried BEFORE `decode_batch_record` below — that
+            // decoder's tuple fallbacks would otherwise mis-classify it as a
+            // malformed row-payload record and drop it.
+            if let Some(applied) = self.try_replay_columnar_predicate_dml(
+                &record.payload,
+                record.header.tenant_id,
+                DatabaseId::new(record.header.database_id),
+                record.header.lsn,
+                tombstones,
+            ) {
+                replayed += applied;
                 continue;
             }
 

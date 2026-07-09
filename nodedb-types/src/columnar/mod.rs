@@ -3,6 +3,7 @@
 pub mod column_def;
 pub mod column_parse;
 pub mod column_type;
+pub mod dml_wal_record;
 pub mod profile;
 pub mod schema;
 pub mod wal_record;
@@ -10,6 +11,7 @@ pub mod wal_record;
 pub use column_def::{ColumnDef, ColumnModifier};
 pub use column_parse::ColumnTypeParseError;
 pub use column_type::ColumnType;
+pub use dml_wal_record::ColumnarDmlWalRecord;
 pub use profile::{ColumnarProfile, DocumentMode};
 pub use schema::{
     BITEMPORAL_RESERVED_COLUMNS, BITEMPORAL_SYSTEM_FROM, BITEMPORAL_VALID_FROM,

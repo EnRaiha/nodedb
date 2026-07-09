@@ -87,6 +87,37 @@ pub fn wal_append_timeseries(
     Ok(Some(lsn))
 }
 
+/// Encode the payload of a `TimeseriesBatch` WAL record for a columnar
+/// predicate DML (`ColumnarOp::Update` / `ColumnarOp::Delete`).
+///
+/// Produces the map-shaped [`nodedb_types::columnar::ColumnarDmlWalRecord`]
+/// with `kind = "columnar_dml"`, carrying the predicate (filters) and, for an
+/// update, the field assignments — NOT row post-images (the matching set is
+/// only known once the Data Plane re-scans current state at apply time). The
+/// `columnar_dml` kind is disjoint from both the row-payload `"columnar"` map
+/// shape and the legacy tuple shapes (see the type's doc comment), so
+/// `decode_batch_record` cannot mis-route between them. The ONE encoder for
+/// this shape: the autocommit `ColumnarOp::Update` / `ColumnarOp::Delete` arms
+/// call it directly.
+pub(crate) fn encode_columnar_dml_payload(
+    collection: &str,
+    is_update: bool,
+    filters: &[u8],
+    updates: &[(String, Vec<u8>)],
+) -> crate::Result<Vec<u8>> {
+    let record = nodedb_types::columnar::ColumnarDmlWalRecord {
+        kind: "columnar_dml".to_string(),
+        collection: collection.to_string(),
+        is_update,
+        filters: filters.to_vec(),
+        updates: updates.to_vec(),
+    };
+    zerompk::to_msgpack_vec(&record).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal columnar dml: {e}"),
+    })
+}
+
 /// Record-level fields for a columnar WAL append.
 ///
 /// Groups the collection identity, row payload, sync provenance, and
