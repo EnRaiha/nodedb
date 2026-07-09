@@ -13,37 +13,32 @@ use nodedb_physical::physical_plan::{
 };
 
 /// Allow-list of the plans the in-transaction path stages at statement time:
-/// point writes, predicate `BulkUpdate` / `BulkDelete` (bulk predicate DML,
-/// no RETURNING), `InsertSelect` (`INSERT ... SELECT`, which has no
-/// RETURNING variant so it is always stageable), and `Upsert` (`UPSERT
-/// INTO`, also RETURNING-free). Explicit match on the exact staged
-/// variants — KV point writes and any RETURNING variant stay on the
+/// point writes, predicate `BulkUpdate` / `BulkDelete` (bulk predicate DML),
+/// `InsertSelect` (`INSERT ... SELECT`), and `Upsert` (`UPSERT INTO`).
+/// Explicit match on the exact staged variants — KV point writes stay on the
 /// buffer path. Named for the point-write case historically; also covers
 /// bulk predicate DML, `InsertSelect`, and `Upsert` now that
 /// `stage_bulk_update` / `stage_bulk_delete` / `stage_insert_select` /
 /// `stage_document_upsert` stage the matched rows the same way.
+///
+/// A `RETURNING` clause does NOT change stageability. The `stage_*` handlers
+/// stage the matched rows' resolved post-images identically whether or not a
+/// `RETURNING` projection is attached; the clause only governs the client
+/// response shape (rows vs. a command tag). Inside a transaction the staged
+/// path renders an affected-count tag and the `RETURNING` rows are not
+/// projected back to the client — the same rows the pre-existing buffer path
+/// discarded — so staging a `RETURNING` DML op is strictly an upgrade of the
+/// response tag (`OK` -> `UPDATE n`), never a regression.
 pub fn is_point_write(plan: &PhysicalPlan) -> bool {
     matches!(
         plan,
         PhysicalPlan::Document(
             DocumentOp::PointPut { .. }
                 | DocumentOp::PointInsert { .. }
-                | DocumentOp::PointDelete {
-                    returning: None,
-                    ..
-                }
-                | DocumentOp::PointUpdate {
-                    returning: None,
-                    ..
-                }
-                | DocumentOp::BulkUpdate {
-                    returning: None,
-                    ..
-                }
-                | DocumentOp::BulkDelete {
-                    returning: None,
-                    ..
-                }
+                | DocumentOp::PointDelete { .. }
+                | DocumentOp::PointUpdate { .. }
+                | DocumentOp::BulkUpdate { .. }
+                | DocumentOp::BulkDelete { .. }
                 | DocumentOp::InsertSelect { .. }
                 | DocumentOp::Upsert { .. }
         )
@@ -185,22 +180,12 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
         PhysicalPlan::Document(DocumentOp::PointPut { .. } | DocumentOp::PointInsert { .. }) => {
             StagedTagKind::Insert
         }
-        PhysicalPlan::Document(
-            DocumentOp::PointUpdate {
-                returning: None, ..
-            }
-            | DocumentOp::BulkUpdate {
-                returning: None, ..
-            },
-        ) => StagedTagKind::Update,
-        PhysicalPlan::Document(
-            DocumentOp::PointDelete {
-                returning: None, ..
-            }
-            | DocumentOp::BulkDelete {
-                returning: None, ..
-            },
-        ) => StagedTagKind::Delete,
+        PhysicalPlan::Document(DocumentOp::PointUpdate { .. } | DocumentOp::BulkUpdate { .. }) => {
+            StagedTagKind::Update
+        }
+        PhysicalPlan::Document(DocumentOp::PointDelete { .. } | DocumentOp::BulkDelete { .. }) => {
+            StagedTagKind::Delete
+        }
         PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Document(DocumentOp::Upsert { .. }) => StagedTagKind::DocUpsert,
         PhysicalPlan::Kv(op) => staged_kv_tag_kind(op, payload),
@@ -320,6 +305,62 @@ mod tests {
 
     fn kv_plan(op: KvOp) -> PhysicalPlan {
         PhysicalPlan::Kv(op)
+    }
+
+    #[test]
+    fn returning_document_writes_are_stageable_and_tagged_by_command() {
+        use nodedb_physical::physical_plan::{ReturningColumns, ReturningSpec};
+        let ret = || {
+            Some(ReturningSpec {
+                columns: ReturningColumns::Star,
+            })
+        };
+
+        // A RETURNING clause no longer forces the buffer + "OK" path: these
+        // stage like any other point/bulk write and render an affected-count
+        // command tag (UPDATE n / DELETE n), never `unreachable!`.
+        let point_update = PhysicalPlan::Document(DocumentOp::PointUpdate {
+            collection: "c".into(),
+            document_id: "d".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            updates: Vec::new(),
+            returning: ret(),
+        });
+        assert!(is_point_write(&point_update));
+        assert!(is_stageable_write(&point_update));
+        assert_eq!(staged_tag_kind(&point_update, &[]), StagedTagKind::Update);
+
+        let point_delete = PhysicalPlan::Document(DocumentOp::PointDelete {
+            collection: "c".into(),
+            document_id: "d".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            returning: ret(),
+        });
+        assert!(is_stageable_write(&point_delete));
+        assert_eq!(staged_tag_kind(&point_delete, &[]), StagedTagKind::Delete);
+
+        let bulk_update = PhysicalPlan::Document(DocumentOp::BulkUpdate {
+            collection: "c".into(),
+            filters: Vec::new(),
+            updates: Vec::new(),
+            returning: ret(),
+            ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
+        });
+        assert!(is_stageable_write(&bulk_update));
+        assert_eq!(staged_tag_kind(&bulk_update, &[]), StagedTagKind::Update);
+
+        let bulk_delete = PhysicalPlan::Document(DocumentOp::BulkDelete {
+            collection: "c".into(),
+            filters: Vec::new(),
+            returning: ret(),
+            ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
+        });
+        assert!(is_stageable_write(&bulk_delete));
+        assert_eq!(staged_tag_kind(&bulk_delete, &[]), StagedTagKind::Delete);
     }
 
     #[test]

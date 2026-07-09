@@ -363,8 +363,59 @@ async fn strict_bulk_delete_sees_row_staged_earlier_in_txn_case() {
     strict_bulk_delete_sees_row_staged_earlier_in_txn("bu_st_ov_del").await;
 }
 
-// A RETURNING bulk-update-in-transaction test (documenting the intentional
-// buffer+OK deferral) was considered but skipped: asserting the exact client
-// side parse of a bare "OK" command tag would require verifying
-// tokio_postgres behavior this change did not touch, which could not be
-// confirmed without running the suite.
+/// A predicate `UPDATE ... RETURNING` inside a transaction stages its matched
+/// rows exactly like the non-RETURNING form: the statement now reports the real
+/// `UPDATE n` tag, an upgrade from the former buffer + `OK` deferral. The
+/// RETURNING rows themselves are NOT projected back inside a transaction — a
+/// pre-existing limitation this staging change does not address, tracked
+/// separately — so the response carries only the command tag, no data rows.
+async fn bulk_update_returning_in_txn_reports_count_not_ok(engine: &str, coll: &str) {
+    let server = TestServer::start().await;
+    setup(&server, coll, engine).await;
+
+    server.exec("BEGIN").await.unwrap();
+
+    let msgs = server
+        .client
+        .simple_query(&format!(
+            "UPDATE {coll} SET n = 7 WHERE n = 1 RETURNING id, n"
+        ))
+        .await
+        .expect("in-tx RETURNING bulk update should succeed at the statement");
+    assert_eq!(
+        command_count(&msgs),
+        Some(2),
+        "{engine}: in-tx UPDATE ... RETURNING must report the real matched-row count, not OK"
+    );
+    // Rows are not projected back inside a transaction (pre-existing behavior,
+    // unchanged by this staging upgrade): only the command tag is returned.
+    let row_count = msgs
+        .iter()
+        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(
+        row_count, 0,
+        "{engine}: in-tx RETURNING rows are not projected back to the client"
+    );
+
+    // The staged change is still visible to the transaction's own scan.
+    let seen = scan_ints(&server, &format!("SELECT n FROM {coll} WHERE n = 7")).await;
+    assert_eq!(
+        seen,
+        vec![7, 7],
+        "{engine}: in-tx scan must observe the staged RETURNING update"
+    );
+
+    server.client.simple_query("COMMIT").await.unwrap();
+    let after = scan_ints(&server, &format!("SELECT n FROM {coll} WHERE n = 7")).await;
+    assert_eq!(
+        after,
+        vec![7, 7],
+        "{engine}: committed RETURNING update must persist"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_update_returning_in_txn_reports_count_not_ok_case() {
+    bulk_update_returning_in_txn_reports_count_not_ok("document_schemaless", "bu_ret_ov_upd").await;
+}

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Statement-time staging for predicate `DELETE ... WHERE <predicate>`
-//! (`DocumentOp::BulkDelete` without `RETURNING`) inside a transaction.
+//! (`DocumentOp::BulkDelete`) inside a transaction. A `RETURNING` clause does
+//! not change what is staged — the matched rows are tombstoned identically;
+//! the clause only governs the client response shape.
 //!
 //! Mirrors point `DELETE` staging in `dispatch.rs` (`stage_point_delete`):
 //! each row in the BASE ∪ OVERLAY matching set (resolved via

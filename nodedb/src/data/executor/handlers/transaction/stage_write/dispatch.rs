@@ -212,14 +212,15 @@ impl CoreLoop {
             }
             // Predicate UPDATE staged at statement time — same treatment as a
             // point update, resolved against the BASE ∪ OVERLAY matching set.
-            // The Control Plane only builds `StageWrite` for the `returning:
-            // None` variant (see `is_point_write`); a `RETURNING` bulk update
-            // stays on the pre-existing buffer + "OK" deferral.
+            // A `RETURNING` clause does not change staging: the matched rows'
+            // post-images are staged identically; the clause only governs the
+            // client response shape, which the in-transaction path renders as
+            // an affected-count tag either way.
             DocumentOp::BulkUpdate {
                 collection,
                 filters,
                 updates,
-                returning: None,
+                returning: _,
                 ollp_predicted_surrogates: _,
                 ollp_predicted_edges: _,
             } => self.stage_bulk_update(StageBulkUpdateParams {
@@ -230,16 +231,15 @@ impl CoreLoop {
                 filter_bytes: filters,
                 updates,
             }),
-            DocumentOp::BulkUpdate {
-                returning: Some(_), ..
-            } => self.stage_not_point_write(task),
 
             // Predicate DELETE staged at statement time — same treatment as a
             // point delete, resolved against the BASE ∪ OVERLAY matching set.
+            // As with `BulkUpdate`, a `RETURNING` clause does not change what
+            // is staged.
             DocumentOp::BulkDelete {
                 collection,
                 filters,
-                returning: None,
+                returning: _,
                 ollp_predicted_surrogates: _,
                 ollp_predicted_edges: _,
             } => self.stage_bulk_delete(StageBulkDeleteParams {
@@ -249,9 +249,6 @@ impl CoreLoop {
                 collection,
                 filter_bytes: filters,
             }),
-            DocumentOp::BulkDelete {
-                returning: Some(_), ..
-            } => self.stage_not_point_write(task),
 
             // `INSERT ... SELECT ... WHERE <predicate>` staged at statement
             // time — resolve the source's BASE ∪ OVERLAY matching set and

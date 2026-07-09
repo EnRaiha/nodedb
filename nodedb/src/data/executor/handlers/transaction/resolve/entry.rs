@@ -278,30 +278,20 @@ fn classify_kv_op(op: &KvOp, collections: &mut BTreeSet<String>) -> crate::Resul
 fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> crate::Result<()> {
     match op {
         // Staged writes (`is_point_write`): the resolved post-image (value or
-        // tombstone) is in the overlay, keyed by the user primary key.
+        // tombstone) is in the overlay, keyed by the user primary key. A
+        // `RETURNING` clause does not affect staging — the `stage_*` handlers
+        // record the matched rows' post-images identically whether or not one
+        // is present — so these serialize from the overlay like any other
+        // point/bulk write. The RETURNING projection itself is a
+        // response-shape concern the Control Plane already discards inside a
+        // transaction; it leaves no separate post-image to carry here.
         DocumentOp::PointPut { collection, .. }
         | DocumentOp::PointInsert { collection, .. }
         | DocumentOp::Upsert { collection, .. }
-        | DocumentOp::PointDelete {
-            collection,
-            returning: None,
-            ..
-        }
-        | DocumentOp::PointUpdate {
-            collection,
-            returning: None,
-            ..
-        }
-        | DocumentOp::BulkUpdate {
-            collection,
-            returning: None,
-            ..
-        }
-        | DocumentOp::BulkDelete {
-            collection,
-            returning: None,
-            ..
-        } => {
+        | DocumentOp::PointDelete { collection, .. }
+        | DocumentOp::PointUpdate { collection, .. }
+        | DocumentOp::BulkUpdate { collection, .. }
+        | DocumentOp::BulkDelete { collection, .. } => {
             collections.insert(collection.clone());
             Ok(())
         }
@@ -323,29 +313,17 @@ fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> 
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. } => Ok(()),
 
-        // Writes carrying RETURNING are NOT staged (`is_point_write` requires
-        // `returning: None`), so the overlay holds no post-image for them; the
-        // join/merge/batch DML is likewise never staged. Rejecting keeps their
-        // rows out of a silently lossy redo record. This is permanent — the
-        // staging gate cannot capture a RETURNING projection or a multi-row
-        // join/merge as a per-surrogate post-image — not "not yet supported".
-        DocumentOp::PointDelete {
-            returning: Some(_), ..
-        }
-        | DocumentOp::PointUpdate {
-            returning: Some(_), ..
-        }
-        | DocumentOp::BulkUpdate {
-            returning: Some(_), ..
-        }
-        | DocumentOp::BulkDelete {
-            returning: Some(_), ..
-        }
-        | DocumentOp::UpdateFromJoin { .. }
+        // Join/merge/batch DML is never staged: `UpdateFromJoin` and `Merge`
+        // resolve a multi-row cross-collection effect that has no
+        // per-surrogate absolute post-image, and `BatchInsert` rides the
+        // buffered-plan path rather than the overlay. The overlay holds no
+        // post-image for them, so rejecting keeps their rows out of a silently
+        // lossy redo record. This is permanent — not "not yet supported".
+        DocumentOp::UpdateFromJoin { .. }
         | DocumentOp::Merge { .. }
         | DocumentOp::BatchInsert { .. } => Err(crate::Error::PlanError {
-            detail: "document write with RETURNING or join/merge/batch DML has no staged \
-                     post-image and is not supported in transaction resolve"
+            detail: "document join/merge/batch DML has no staged post-image and is not \
+                     supported in transaction resolve"
                 .to_string(),
         }),
 
@@ -470,7 +448,7 @@ mod tests {
     use nodedb_bridge::buffer::RingBuffer;
     use nodedb_physical::physical_plan::{
         ArrayOp, ColumnarInsertIntent, ColumnarOp, DocumentOp, GraphOp, KvOp, MetaOp,
-        ReturningColumns, ReturningSpec, StorageMode, TimeseriesOp, VectorOp,
+        ReturningColumns, ReturningSpec, StorageMode, TimeseriesOp, UpdateValue, VectorOp,
     };
     use nodedb_types::Surrogate;
     use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
@@ -767,18 +745,27 @@ mod tests {
     }
 
     #[test]
-    fn document_write_with_returning_yields_typed_error() {
-        let (core, _dir) = make_core();
+    fn returning_delete_now_resolves_from_overlay() {
+        let (mut core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(6);
+        let surrogate = 4u32;
 
-        // A DELETE ... RETURNING is not staged (`is_point_write` requires
-        // `returning: None`), so the overlay holds no post-image for it.
-        // Resolve must raise a typed error rather than silently drop the row.
+        // A DELETE ... RETURNING is now staged like any other point delete: the
+        // overlay holds a tombstone, so resolve serializes it from the overlay
+        // instead of raising the old typed error. (The RETURNING projection is a
+        // response-shape concern the Control Plane already discards inside a
+        // transaction; it leaves no separate post-image to preserve.)
+        core.txn_overlays.entry(txn).or_default().insert_tombstone(
+            coll_key("notes"),
+            surrogate,
+            "gone",
+        );
+
         let doc_plan = PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: "docs".to_string(),
-            document_id: "d1".to_string(),
-            surrogate: Surrogate::ZERO,
+            collection: "notes".to_string(),
+            document_id: "gone".to_string(),
+            surrogate: Surrogate::new(surrogate),
             pk_bytes: Vec::new(),
             returning: Some(ReturningSpec {
                 columns: ReturningColumns::Star,
@@ -786,12 +773,301 @@ mod tests {
         });
 
         let resp = core.execute_resolve_txn(&task, TID, txn, &[doc_plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(
+            redo.ops.len(),
+            1,
+            "a staged RETURNING delete resolves to one sub-record"
+        );
+        assert_eq!(redo.ops[0].record_type, RecordType::Delete as u32);
+    }
+
+    /// A `make_task` whose request carries `txn_id`, so `execute_stage_write`
+    /// (which reads `task.request.txn_id`) can route a document point/bulk
+    /// write into the staging overlay.
+    fn make_stage_task(txn: TxnId) -> ExecutionTask {
+        let mut task = make_task();
+        task.request.txn_id = Some(txn);
+        task
+    }
+
+    /// Msgpack-encode a scalar `RETURNING`-clause SET value the same way the
+    /// planner emits `UpdateValue::Literal` bodies (decoded via
+    /// `json_from_msgpack` in `stage_apply_update`).
+    fn literal_str(s: &str) -> UpdateValue {
+        UpdateValue::Literal(
+            nodedb_types::json_to_msgpack(&serde_json::json!(s)).expect("encode literal"),
+        )
+    }
+
+    /// Read the `name` field of a staged schemaless post-image body.
+    fn staged_name(body: &[u8]) -> Option<String> {
+        crate::data::executor::doc_format::decode_document(body)?
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn point_update_with_returning_stages_resolved_post_image() {
+        let (mut core, _dir) = make_core();
+        let txn = TxnId::new(41);
+        let task = make_stage_task(txn);
+        let surrogate = 5u32;
+        let row_key = surrogate_to_doc_id(Surrogate::new(surrogate));
+
+        // Seed a base row directly into the scan-visible sparse store.
+        core.sparse
+            .put(
+                DatabaseId::DEFAULT.as_u64(),
+                TID,
+                "notes",
+                row_key.as_str(),
+                &schemaless_body("alice"),
+            )
+            .expect("seed base row");
+
+        let plan = PhysicalPlan::Document(DocumentOp::PointUpdate {
+            collection: "notes".to_string(),
+            document_id: row_key.as_str().to_string(),
+            surrogate: Surrogate::new(surrogate),
+            pk_bytes: Vec::new(),
+            updates: vec![("name".to_string(), literal_str("bob"))],
+            returning: Some(ReturningSpec {
+                columns: ReturningColumns::Star,
+            }),
+        });
+
+        let resp = core.execute_stage_write(&task, TID, &plan);
         assert_eq!(
             resp.status,
-            Status::Error,
-            "a RETURNING write has no staged post-image and must raise a typed error"
+            Status::Ok,
+            "a RETURNING point update must stage, not error: {resp:?}"
         );
-        assert!(resp.error_code.is_some());
+
+        let overlay = core.txn_overlays.get(&txn).expect("overlay present");
+        match overlay
+            .get(&coll_key("notes"), surrogate)
+            .expect("row staged")
+        {
+            Staged::Put(body) => assert_eq!(
+                staged_name(body).as_deref(),
+                Some("bob"),
+                "overlay holds the resolved post-update post-image"
+            ),
+            Staged::Tombstone => panic!("point update must stage a Put, not a tombstone"),
+        }
+    }
+
+    #[test]
+    fn bulk_update_with_returning_stages_matched_rows_per_surrogate() {
+        let (mut core, _dir) = make_core();
+        let txn = TxnId::new(42);
+        let task = make_stage_task(txn);
+
+        for s in [1u32, 2u32] {
+            let row_key = surrogate_to_doc_id(Surrogate::new(s));
+            core.sparse
+                .put(
+                    DatabaseId::DEFAULT.as_u64(),
+                    TID,
+                    "notes",
+                    row_key.as_str(),
+                    &schemaless_body("old"),
+                )
+                .expect("seed base row");
+        }
+
+        // Empty filters match every row; a RETURNING clause does not change
+        // which rows are staged.
+        let plan = PhysicalPlan::Document(DocumentOp::BulkUpdate {
+            collection: "notes".to_string(),
+            filters: Vec::new(),
+            updates: vec![("name".to_string(), literal_str("new"))],
+            returning: Some(ReturningSpec {
+                columns: ReturningColumns::Star,
+            }),
+            ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
+        });
+
+        let resp = core.execute_stage_write(&task, TID, &plan);
+        assert_eq!(
+            resp.status,
+            Status::Ok,
+            "a RETURNING bulk update must stage: {resp:?}"
+        );
+
+        let overlay = core.txn_overlays.get(&txn).expect("overlay present");
+        for s in [1u32, 2u32] {
+            match overlay
+                .get(&coll_key("notes"), s)
+                .expect("row staged per-surrogate")
+            {
+                Staged::Put(body) => assert_eq!(
+                    staged_name(body).as_deref(),
+                    Some("new"),
+                    "each matched row is staged with the applied update"
+                ),
+                Staged::Tombstone => panic!("bulk update must stage a Put"),
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_delete_with_returning_stages_tombstones_per_surrogate() {
+        let (mut core, _dir) = make_core();
+        let txn = TxnId::new(43);
+        let task = make_stage_task(txn);
+
+        for s in [1u32, 2u32] {
+            let row_key = surrogate_to_doc_id(Surrogate::new(s));
+            core.sparse
+                .put(
+                    DatabaseId::DEFAULT.as_u64(),
+                    TID,
+                    "notes",
+                    row_key.as_str(),
+                    &schemaless_body("doomed"),
+                )
+                .expect("seed base row");
+        }
+
+        let plan = PhysicalPlan::Document(DocumentOp::BulkDelete {
+            collection: "notes".to_string(),
+            filters: Vec::new(),
+            returning: Some(ReturningSpec {
+                columns: ReturningColumns::Star,
+            }),
+            ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
+        });
+
+        let resp = core.execute_stage_write(&task, TID, &plan);
+        assert_eq!(
+            resp.status,
+            Status::Ok,
+            "a RETURNING bulk delete must stage: {resp:?}"
+        );
+
+        let overlay = core.txn_overlays.get(&txn).expect("overlay present");
+        for s in [1u32, 2u32] {
+            assert!(
+                matches!(
+                    overlay
+                        .get(&coll_key("notes"), s)
+                        .expect("row staged per-surrogate"),
+                    Staged::Tombstone
+                ),
+                "each matched row is staged as a tombstone"
+            );
+        }
+    }
+
+    #[test]
+    fn returning_bulk_update_resolves_to_sub_records_and_replays() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(44);
+
+        // Two rows staged per-surrogate exactly as the bulk-update staging path
+        // leaves them; a RETURNING clause does not change the overlay contents.
+        {
+            let overlay = src.txn_overlays.entry(txn).or_default();
+            overlay.insert_put(coll_key("notes"), 1, "u1", schemaless_body("bob"));
+            overlay.insert_put(coll_key("notes"), 2, "u2", schemaless_body("bob"));
+        }
+
+        // Previously this plan raised a typed error in `classify_document_op`;
+        // now it serializes the staged post-images from the overlay.
+        let plan = PhysicalPlan::Document(DocumentOp::BulkUpdate {
+            collection: "notes".to_string(),
+            filters: Vec::new(),
+            updates: Vec::new(),
+            returning: Some(ReturningSpec {
+                columns: ReturningColumns::Star,
+            }),
+            ollp_predicted_surrogates: None,
+            ollp_predicted_edges: None,
+        });
+
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
+        let redo = decode_redo(&resp);
+        assert_eq!(
+            redo.ops.len(),
+            2,
+            "both staged rows resolve to sub-records (previously a typed error)"
+        );
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        for s in [1u32, 2u32] {
+            let row_key = surrogate_to_doc_id(Surrogate::new(s));
+            let stored = dst
+                .sparse
+                .get(DatabaseId::DEFAULT.as_u64(), TID, "notes", row_key.as_str())
+                .expect("get")
+                .expect("updated row must replay from resolve output");
+            assert_eq!(
+                stored,
+                schemaless_body("bob"),
+                "the resolved post-image round-trips through redo replay"
+            );
+        }
+    }
+
+    #[test]
+    fn join_merge_batch_dml_still_yield_typed_error() {
+        let (core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(45);
+
+        // These ops leave no per-surrogate overlay post-image (join/merge are
+        // multi-row cross-collection effects; batch insert rides the buffered
+        // plan), so resolve must still raise a typed error rather than silently
+        // drop their rows.
+        let plans = [
+            PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
+                target_collection: "t".to_string(),
+                source_collection: "s".to_string(),
+                source_alias: "s".to_string(),
+                target_join_col: "id".to_string(),
+                source_join_col: "id".to_string(),
+                updates: Vec::new(),
+                target_filters: Vec::new(),
+                returning: None,
+            }),
+            PhysicalPlan::Document(DocumentOp::Merge {
+                target_collection: "t".to_string(),
+                source_collection: "s".to_string(),
+                source_alias: "s".to_string(),
+                target_join_col: "id".to_string(),
+                source_join_col: "id".to_string(),
+                clauses: Vec::new(),
+                returning: None,
+            }),
+            PhysicalPlan::Document(DocumentOp::BatchInsert {
+                collection: "notes".to_string(),
+                documents: vec![("d1".to_string(), Vec::new())],
+                surrogates: vec![Surrogate::ZERO],
+            }),
+        ];
+
+        for plan in plans {
+            let resp = core.execute_resolve_txn(&task, TID, txn, std::slice::from_ref(&plan));
+            assert_eq!(
+                resp.status,
+                Status::Error,
+                "{plan:?} has no staged post-image and must raise a typed error"
+            );
+            assert!(resp.error_code.is_some());
+        }
     }
 
     /// Register a strict collection whose first column is a non-null `_rowid`

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Statement-time staging for predicate `UPDATE ... WHERE <predicate>`
-//! (`DocumentOp::BulkUpdate` without `RETURNING`) inside a transaction.
+//! (`DocumentOp::BulkUpdate`) inside a transaction. A `RETURNING` clause does
+//! not change what is staged — the matched rows' post-images are recorded
+//! identically; the clause only governs the client response shape.
 //!
 //! Mirrors the point-write staging in `dispatch.rs`: the matched rows are
 //! evaluated against BASE ∪ OVERLAY (via [`CoreLoop::merge_overlay_into_scan`])
