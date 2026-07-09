@@ -16,6 +16,13 @@
 //! `doc_id_to_surrogate` map first, falling back to the base KV engine's
 //! key→surrogate binding (`get_with_surrogate`).
 //!
+//! `ttl_ms` on `Put` / `Insert` / `InsertIfAbsent` / `InsertOnConflictUpdate`
+//! lives outside the value body (`KvEntry.expire_at_ms`), so a non-zero
+//! `ttl_ms` is also recorded in the overlay's KV TTL delta map via
+//! [`CoreLoop::stage_kv_ttl_side_effect`] (`stage_kv_atomic.rs`), the same
+//! helper `Incr` / `BatchPut` reuse -- so a same-transaction read observes
+//! the staged expiry instead of treating the row as persistent until COMMIT.
+//!
 //! `Incr` / `IncrFloat` / `Cas` / `GetSet` / `BatchPut` are also stageable,
 //! but their handlers live in the sibling `stage_kv_atomic.rs` (kept
 //! separate to stay under the file-size limit) -- see that module's doc for
@@ -88,42 +95,46 @@ impl CoreLoop {
                 collection,
                 key,
                 value,
+                ttl_ms,
                 surrogate,
                 ..
             } => {
                 let ctx = self.kv_stage_ctx(task, tid, txn_id, collection, key, *surrogate);
-                self.stage_kv_put(&ctx, value)
+                self.stage_kv_put(&ctx, value, *ttl_ms)
             }
             KvOp::Insert {
                 collection,
                 key,
                 value,
+                ttl_ms,
                 surrogate,
                 ..
             } => {
                 let ctx = self.kv_stage_ctx(task, tid, txn_id, collection, key, *surrogate);
-                self.stage_kv_insert(&ctx, key, value)
+                self.stage_kv_insert(&ctx, key, value, *ttl_ms)
             }
             KvOp::InsertIfAbsent {
                 collection,
                 key,
                 value,
+                ttl_ms,
                 surrogate,
                 ..
             } => {
                 let ctx = self.kv_stage_ctx(task, tid, txn_id, collection, key, *surrogate);
-                self.stage_kv_insert_if_absent(&ctx, key, value)
+                self.stage_kv_insert_if_absent(&ctx, key, value, *ttl_ms)
             }
             KvOp::InsertOnConflictUpdate {
                 collection,
                 key,
                 value,
                 updates,
+                ttl_ms,
                 surrogate,
                 ..
             } => {
                 let ctx = self.kv_stage_ctx(task, tid, txn_id, collection, key, *surrogate);
-                self.stage_kv_insert_on_conflict_update(&ctx, key, value, updates)
+                self.stage_kv_insert_on_conflict_update(&ctx, key, value, updates, *ttl_ms)
             }
             KvOp::Delete { collection, keys } => {
                 self.stage_kv_delete(task, tid, txn_id, collection, keys)
@@ -182,7 +193,8 @@ impl CoreLoop {
 
     // ── Put: upsert, no existence check ─────────────────────────────────────
 
-    fn stage_kv_put(&mut self, ctx: &StageCtx<'_>, value: &[u8]) -> Response {
+    fn stage_kv_put(&mut self, ctx: &StageCtx<'_>, value: &[u8], ttl_ms: u64) -> Response {
+        self.stage_kv_ttl_side_effect(ctx, ttl_ms);
         if let Err(e) = self.stage_put_capped(ctx, value.to_vec()) {
             return self.response_error(ctx.task, e);
         }
@@ -191,7 +203,13 @@ impl CoreLoop {
 
     // ── Insert: BASE ∪ OVERLAY uniqueness, statement-time constraint error ──
 
-    fn stage_kv_insert(&mut self, ctx: &StageCtx<'_>, key: &[u8], value: &[u8]) -> Response {
+    fn stage_kv_insert(
+        &mut self,
+        ctx: &StageCtx<'_>,
+        key: &[u8],
+        value: &[u8],
+        ttl_ms: u64,
+    ) -> Response {
         if self.stage_kv_pk_present(ctx, key) {
             let key_str = String::from_utf8_lossy(key);
             return self.response_error(
@@ -207,6 +225,7 @@ impl CoreLoop {
                 },
             );
         }
+        self.stage_kv_ttl_side_effect(ctx, ttl_ms);
         if let Err(e) = self.stage_put_capped(ctx, value.to_vec()) {
             return self.response_error(ctx.task, e);
         }
@@ -220,10 +239,12 @@ impl CoreLoop {
         ctx: &StageCtx<'_>,
         key: &[u8],
         value: &[u8],
+        ttl_ms: u64,
     ) -> Response {
         if self.stage_kv_pk_present(ctx, key) {
             return self.stage_count_response(ctx.task, 0);
         }
+        self.stage_kv_ttl_side_effect(ctx, ttl_ms);
         if let Err(e) = self.stage_put_capped(ctx, value.to_vec()) {
             return self.response_error(ctx.task, e);
         }
@@ -238,6 +259,7 @@ impl CoreLoop {
         key: &[u8],
         value: &[u8],
         updates: &[(String, UpdateValue)],
+        ttl_ms: u64,
     ) -> Response {
         let existing = self.resolve_kv_current(ctx, key);
         let (stored_bytes, op) = match &existing {
@@ -290,6 +312,11 @@ impl CoreLoop {
             }
         };
 
+        // `ttl_ms` applies unconditionally, on both the insert and the
+        // update branch above -- mirrors `execute_kv_insert_on_conflict_update`,
+        // which passes `ttl_ms` straight into `kv_engine.put(..)` regardless
+        // of whether `existing_bytes` was `None` or `Some`.
+        self.stage_kv_ttl_side_effect(ctx, ttl_ms);
         if let Err(e) = self.stage_put_capped(ctx, stored_bytes) {
             return self.response_error(ctx.task, e);
         }
@@ -419,5 +446,186 @@ impl CoreLoop {
                     .get(ctx.database_id, ctx.tid, ctx.collection, key, now_ms)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use nodedb_physical::physical_plan::DocumentOp;
+
+    use super::*;
+    use crate::bridge::envelope::{
+        Admission, ExemptReason, PhysicalPlan, Priority, Request, Status,
+    };
+    use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::data::executor::handlers::kv::crud::KvGetParams;
+    use crate::data::executor::handlers::transaction::overlay::StagedTtl;
+    use crate::data::executor::task::ExecutionTask;
+    use crate::types::*;
+
+    /// A minimal read-only `ExecutionTask`, `txn_id` set to whatever the
+    /// caller passes in -- everything else about the plan is irrelevant to
+    /// KV staging / overlay lookups, which route entirely on the explicit
+    /// `tid` / `txn_id` / `collection` / `key` arguments, not on `task.plan`.
+    fn make_task(txn_id: Option<TxnId>) -> ExecutionTask {
+        let plan = PhysicalPlan::Document(DocumentOp::PointGet {
+            collection: "x".into(),
+            document_id: "y".into(),
+            surrogate: Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            rls_filters: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        });
+        let request = Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan,
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id,
+            wal_lsn: None,
+            admission: Admission::Exempt(ExemptReason::Read),
+        };
+        ExecutionTask::new(request)
+    }
+
+    fn cache_coll_key(tid: u64) -> (DatabaseId, TenantId, String) {
+        (DatabaseId::DEFAULT, TenantId::new(tid), "cache".to_string())
+    }
+
+    #[test]
+    fn stage_put_with_ttl_stages_absolute_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        // Fixed deterministic clock -- the same one `stage_kv_ttl_side_effect`
+        // reads (`epoch_system_ms`), never a fresh wall-clock read.
+        core.epoch_system_ms = Some(1_000_000);
+
+        let task = make_task(None);
+        let txn_id = TxnId::new(1);
+        let ctx = core.kv_stage_ctx(&task, 1, txn_id, "cache", b"k1", Surrogate::new(5));
+
+        let resp = core.stage_kv_put(&ctx, b"v1", 30_000);
+        assert_eq!(resp.status, Status::Ok);
+
+        assert_eq!(
+            core.txn_overlays
+                .get(&txn_id)
+                .and_then(|o| o.get_ttl(&cache_coll_key(1), 5)),
+            Some(StagedTtl::ExpireAt(1_030_000)),
+            "a Put with ttl_ms > 0 must stage an absolute expiry instant"
+        );
+    }
+
+    #[test]
+    fn stage_put_without_ttl_stages_no_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        core.epoch_system_ms = Some(1_000_000);
+
+        let task = make_task(None);
+        let txn_id = TxnId::new(1);
+        let ctx = core.kv_stage_ctx(&task, 1, txn_id, "cache", b"k1", Surrogate::new(5));
+
+        let resp = core.stage_kv_put(&ctx, b"v1", 0);
+        assert_eq!(resp.status, Status::Ok);
+
+        assert_eq!(
+            core.txn_overlays
+                .get(&txn_id)
+                .and_then(|o| o.get_ttl(&cache_coll_key(1), 5)),
+            None,
+            "ttl_ms == 0 means persistent -- no StagedTtl entry at all"
+        );
+    }
+
+    #[test]
+    fn staged_put_ttl_is_visible_to_a_same_transaction_read() {
+        // Read-your-own-writes regression: a `Put ... WITH ttl` staged this
+        // transaction must be visible to a `Get` later in the SAME
+        // transaction, via the exact production overlay-read path
+        // (`execute_kv_get`), not a hand-rolled predicate.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        // `stage_kv_put` derives its expiry from `epoch_system_ms`; set it far
+        // in the past so the staged expiry is already behind the real
+        // wall-clock `execute_kv_get` compares against -- deterministically
+        // proving the staged TTL was recorded and is consulted, without
+        // sleeping past a real TTL.
+        core.epoch_system_ms = Some(1_000);
+
+        let txn_id = TxnId::new(1);
+        let stage_task = make_task(None);
+        let ctx = core.kv_stage_ctx(&stage_task, 1, txn_id, "cache", b"k1", Surrogate::new(5));
+        let put_resp = core.stage_kv_put(&ctx, b"v1", 5_000);
+        assert_eq!(put_resp.status, Status::Ok);
+
+        // Same-transaction read: `txn_id` set on the request so
+        // `execute_kv_get` consults the staging overlay before the base
+        // engine.
+        let read_task = make_task(Some(txn_id));
+        let resp = core.execute_kv_get(
+            &read_task,
+            KvGetParams {
+                did: DatabaseId::DEFAULT.as_u64(),
+                tid: 1,
+                collection: "cache",
+                key: b"k1",
+                rls_filters: &[],
+                surrogate_ceiling: None,
+            },
+        );
+        assert_eq!(resp.status, Status::Ok);
+        assert!(
+            resp.payload.is_empty(),
+            "the row's staged TTL (expiry far in the past relative to \
+             wall-clock `current_ms()`) must make it read as absent in the \
+             SAME transaction that staged the Put -- before the fix, no \
+             StagedTtl was ever recorded, so this read would incorrectly \
+             return the staged value forever"
+        );
+    }
+
+    #[test]
+    fn staged_put_with_no_ttl_remains_readable_same_transaction() {
+        // Sibling to the regression test above: ttl_ms == 0 must still round
+        // -trip the staged VALUE through the same-transaction read (no
+        // StagedTtl entry means "persistent", not "invisible").
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        core.epoch_system_ms = Some(1_000_000);
+
+        let txn_id = TxnId::new(1);
+        let stage_task = make_task(None);
+        let ctx = core.kv_stage_ctx(&stage_task, 1, txn_id, "cache", b"k1", Surrogate::new(5));
+        let put_resp = core.stage_kv_put(&ctx, b"v1", 0);
+        assert_eq!(put_resp.status, Status::Ok);
+
+        let read_task = make_task(Some(txn_id));
+        let resp = core.execute_kv_get(
+            &read_task,
+            KvGetParams {
+                did: DatabaseId::DEFAULT.as_u64(),
+                tid: 1,
+                collection: "cache",
+                key: b"k1",
+                rls_filters: &[],
+                surrogate_ceiling: None,
+            },
+        );
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(resp.payload.as_bytes(), b"v1");
     }
 }
