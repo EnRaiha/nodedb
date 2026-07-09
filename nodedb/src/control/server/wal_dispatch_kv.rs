@@ -34,6 +34,70 @@ pub(crate) fn encode_kv_put(
     })
 }
 
+/// Fields of a `kv_transfer` WAL payload, bundled so [`encode_kv_transfer`]
+/// stays under the `too_many_arguments` clippy threshold.
+pub(crate) struct KvTransferFields<'a> {
+    pub collection: &'a str,
+    pub source_key: &'a [u8],
+    pub dest_key: &'a [u8],
+    pub field: &'a str,
+    pub amount: f64,
+    pub debit_surrogate: u32,
+    pub credit_surrogate: u32,
+}
+
+/// Encode a `kv_transfer` delta WAL payload: `("kv_transfer", collection,
+/// source_key, dest_key, field, amount, debit_surrogate, credit_surrogate)`.
+///
+/// This is a DELTA record, not a post-image: replay re-executes
+/// `compute_transfer` against whatever source/dest values are present in the
+/// KV engine at that point in the replay's LSN order (deterministic full
+/// re-execution from empty), rather than trusting an absolute post-image
+/// captured before dispatch.
+pub(crate) fn encode_kv_transfer(f: KvTransferFields<'_>) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(&(
+        "kv_transfer",
+        f.collection,
+        f.source_key,
+        f.dest_key,
+        f.field,
+        f.amount,
+        f.debit_surrogate,
+        f.credit_surrogate,
+    ))
+    .map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal kv transfer: {e}"),
+    })
+}
+
+/// Encode a `kv_transfer_item` delta WAL payload: `("kv_transfer_item",
+/// source_collection, dest_collection, item_key, dest_key, surrogate)`.
+///
+/// Same delta-record rationale as [`encode_kv_transfer`]: replay re-verifies
+/// source ownership and re-executes the delete+insert pair rather than
+/// trusting a captured post-image.
+pub(crate) fn encode_kv_transfer_item(
+    source_collection: &str,
+    dest_collection: &str,
+    item_key: &[u8],
+    dest_key: &[u8],
+    surrogate: u32,
+) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(&(
+        "kv_transfer_item",
+        source_collection,
+        dest_collection,
+        item_key,
+        dest_key,
+        surrogate,
+    ))
+    .map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal kv transfer item: {e}"),
+    })
+}
+
 /// Serialize a KV operation and append to the WAL.
 ///
 /// Returns the appended write's WAL LSN (`Some`) for KV writes, or `None` for
@@ -295,13 +359,47 @@ pub fn wal_append_kv_op(
             })?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
+        KvOp::Transfer {
+            collection,
+            source_key,
+            dest_key,
+            field,
+            amount,
+            debit_surrogate,
+            credit_surrogate,
+        } => {
+            let entry = encode_kv_transfer(KvTransferFields {
+                collection,
+                source_key,
+                dest_key,
+                field,
+                amount: *amount,
+                debit_surrogate: debit_surrogate.as_u32(),
+                credit_surrogate: credit_surrogate.as_u32(),
+            })?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
+        }
+        KvOp::TransferItem {
+            source_collection,
+            dest_collection,
+            item_key,
+            dest_key,
+            surrogate,
+        } => {
+            let entry = encode_kv_transfer_item(
+                source_collection,
+                dest_collection,
+                item_key,
+                dest_key,
+                surrogate.as_u32(),
+            )?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
+        }
         // Read-only or non-WAL KV ops.
         KvOp::Get { .. }
         | KvOp::BatchGet { .. }
         | KvOp::Scan { .. }
         | KvOp::FieldGet { .. }
-        | KvOp::Transfer { .. }
-        | KvOp::TransferItem { .. }
         | KvOp::GetTtl { .. }
         | KvOp::SortedIndexRank { .. }
         | KvOp::SortedIndexRange { .. }
@@ -315,7 +413,7 @@ pub fn wal_append_kv_op(
 
 #[cfg(test)]
 mod tests {
-    use super::encode_kv_put;
+    use super::{KvTransferFields, encode_kv_put, encode_kv_transfer, encode_kv_transfer_item};
 
     #[test]
     fn kv_put_without_expire_at_matches_historical_shape() {
@@ -356,5 +454,56 @@ mod tests {
             zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&entry).is_err(),
             "extended payload must not decode as the five-element tuple"
         );
+    }
+
+    #[test]
+    fn kv_transfer_encodes_delta_shape_with_both_surrogates() {
+        let entry = encode_kv_transfer(KvTransferFields {
+            collection: "accounts",
+            source_key: b"alice",
+            dest_key: b"bob",
+            field: "balance",
+            amount: 30.0,
+            debit_surrogate: 7,
+            credit_surrogate: 8,
+        })
+        .unwrap();
+
+        let (
+            disc,
+            collection,
+            source_key,
+            dest_key,
+            field,
+            amount,
+            debit_surrogate,
+            credit_surrogate,
+        ) = zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, String, f64, u32, u32)>(
+            &entry,
+        )
+        .unwrap();
+        assert_eq!(disc, "kv_transfer");
+        assert_eq!(collection, "accounts");
+        assert_eq!(source_key, b"alice");
+        assert_eq!(dest_key, b"bob");
+        assert_eq!(field, "balance");
+        assert_eq!(amount, 30.0);
+        assert_eq!(debit_surrogate, 7);
+        assert_eq!(credit_surrogate, 8);
+    }
+
+    #[test]
+    fn kv_transfer_item_encodes_delta_shape_with_surrogate() {
+        let entry =
+            encode_kv_transfer_item("inventory", "trades", b"sword_1", b"sword_moved", 42).unwrap();
+
+        let (disc, source_collection, dest_collection, item_key, dest_key, surrogate) =
+            zerompk::from_msgpack::<(&str, String, String, Vec<u8>, Vec<u8>, u32)>(&entry).unwrap();
+        assert_eq!(disc, "kv_transfer_item");
+        assert_eq!(source_collection, "inventory");
+        assert_eq!(dest_collection, "trades");
+        assert_eq!(item_key, b"sword_1");
+        assert_eq!(dest_key, b"sword_moved");
+        assert_eq!(surrogate, 42);
     }
 }

@@ -2,7 +2,9 @@
 
 //! WAL replay for CoreLoop startup recovery: KV and Array engines.
 //!
-//! Vector replay lives in `wal_replay_vector.rs`.
+//! Vector replay lives in `wal_replay_vector.rs`. The `kv_transfer` /
+//! `kv_transfer_item` delta-record replay (decode, tombstone gate, and
+//! mutation) lives in `wal_replay_kv_transfer.rs`.
 
 use super::core_loop::CoreLoop;
 use std::sync::Arc;
@@ -176,10 +178,45 @@ impl CoreLoop {
                     continue;
                 }
 
+                // kv_transfer (delta record, not a post-image): re-executes
+                // `compute_transfer` against whatever source/dest values are
+                // present in this core's KV engine at this point in LSN
+                // order — see `wal_replay_kv_transfer.rs` for the full
+                // rationale and the missing-source / compute-error policy.
+                if let Some(applied) = self.try_replay_kv_transfer(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
+                    continue;
+                }
+
+                // kv_transfer_item (delta record): re-verifies source
+                // ownership and re-executes the delete+insert pair — see
+                // `wal_replay_kv_transfer.rs`.
+                if let Some((item_puts, item_deletes)) = self.try_replay_kv_transfer_item(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += item_puts;
+                    deletes += item_deletes;
+                    continue;
+                }
+
                 // kv_field_set: ("kv_field_set", collection, key, updates)
-                // Replay as a full PUT (the value is the updated document).
-                // We skip field_set replay because it requires the current value
-                // which may not exist yet. The WAL should have a kv_put after.
+                // Not replayed: resolving the merge requires the pre-update
+                // document, and (unlike kv_transfer/kv_transfer_item) there is
+                // no delta-replay path for it. This falls through and the
+                // record is silently dropped for every WAL record shape, not
+                // just the autocommit path.
             }
 
             if is_delete {
