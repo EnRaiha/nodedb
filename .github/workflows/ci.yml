@@ -1,13 +1,23 @@
-# CI — thin wrapper that calls the reusable test workflow.
+# CI — opt-in wrapper that calls the reusable test workflow.
+#
+# The suite is a ~10-minute cold compile of the whole workspace. It does not
+# run on a pull request unless the PR carries the `run-ci` label, so prose-only
+# PRs cost nothing. Nothing in the `main` ruleset requires this check, so an
+# unlabelled PR stays mergeable — labelling is the author's judgement call.
+#
+# To run it:
+#   - add the `run-ci` label to the PR (remove + re-add to force a re-run), or
+#   - Actions → CI → Run workflow, against any branch.
+#
+# While the label is on, every subsequent push to the PR re-runs the suite.
 
 name: CI
 
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [labeled, synchronize, reopened, ready_for_review]
   workflow_dispatch:
-  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -18,6 +28,12 @@ permissions:
 
 jobs:
   test:
-    if: github.event.pull_request.draft == false
     name: Test Suite
+    # A manual workflow_dispatch always runs. Pull requests run only when opted
+    # in via the label, and never while the PR is a draft. (The release path has
+    # its own gate: release-prepare.yml calls test.yml directly.)
+    if: >-
+      github.event_name != 'pull_request' ||
+      (contains(github.event.pull_request.labels.*.name, 'run-ci') &&
+       github.event.pull_request.draft != true)
     uses: ./.github/workflows/test.yml

@@ -81,6 +81,9 @@
   description: "Working as intended or out of scope"
 
 # ── cross-cutting flags ────────────────────────────────────────────────────
+- name: "run-ci"
+  color: "0e8a16"
+  description: "Opt this PR into the full test suite; re-add to force a re-run"
 - name: "regression"
   color: "b60205"
   description: "Worked on an earlier build; broke since"

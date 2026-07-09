@@ -31,7 +31,20 @@ RUN cargo chef cook --release --recipe-path recipe.json --bin nodedb
 COPY . .
 RUN cargo build --release -p nodedb
 
-# ── Stage 5: Minimal runtime (Chainguard glibc-dynamic) ──────────────────────
+# ── Stage 5: Binary handoff ──────────────────────────────────────────────────
+# The runtime pulls the binary from this stage rather than from `builder`, so
+# the whole compile can be replaced with an already-built binary:
+#
+#   docker buildx build --build-context binary=<dir holding ./nodedb> .
+#
+# A `--build-context` of the same name overrides the stage, and Buildx then
+# prunes every stage above it — the release pipeline uses this to reuse the
+# binary it already built instead of compiling the workspace again. A plain
+# `docker build .` still compiles from source exactly as before.
+FROM scratch AS binary
+COPY --from=builder /build/target/release/nodedb /nodedb
+
+# ── Stage 6: Minimal runtime (Chainguard glibc-dynamic) ──────────────────────
 # Wolfi-based, daily-rebuilt against patched packages — typically 0 CVEs.
 # Ships only glibc + libgcc + ca-certificates + tzdata. No shell, no package
 # manager, no `curl` — that's why the binary has a built-in `healthcheck`
@@ -43,7 +56,7 @@ FROM cgr.dev/chainguard/glibc-dynamic:latest AS runtime
 # out of the box without an entrypoint chown step.
 USER nonroot:nonroot
 
-COPY --from=builder --chown=nonroot:nonroot /build/target/release/nodedb /usr/local/bin/nodedb
+COPY --from=binary --chown=nonroot:nonroot /nodedb /usr/local/bin/nodedb
 
 # Bind to all interfaces (required for Docker port mapping)
 # Point data dir at the declared volume

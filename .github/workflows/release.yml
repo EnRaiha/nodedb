@@ -1,10 +1,59 @@
+# Manual distribution workflow. Push a v* tag first; `Release Prepare` runs the
+# test suite and builds the server binaries. Then run this workflow with that
+# tag and the successful prepare run ID.
+#
+# NOTHING HERE COMPILES. Every stage consumes the prepare run's artifacts, so a
+# failure in one stage is retried by re-dispatching with only that stage
+# enabled — the tests, the binaries, and the Docker image are never rebuilt to
+# fix a Discord webhook or a crates.io timeout.
+#
+# Stages, in dependency order:
+#   publish_crates  -> crates.io, 8 tiers
+#   docker          -> per-arch images + multi-arch manifest   (full releases only)
+#   github_release  -> GitHub Release with the binary tarballs
+#   notify          -> Discord announcement                    (full releases only)
+#
+# Each stage is idempotent: crates already on crates.io are skipped, image tags
+# and the release are overwritten in place. Re-running everything is safe; the
+# toggles exist to save time, not to protect against double-publishing.
+#
+# Required secrets: CARGO_REGISTRY_TOKEN, DOCKERHUB_USERNAME, DOCKERHUB_TOKEN,
+# DISCORD_RELEASE_WEBHOOK_URL.
+
 name: Release
-run-name: Release ${{ github.ref_name }}
+run-name: Release ${{ inputs.tag }}
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v0.2.0"
+        required: true
+        type: string
+      prepare_run_id:
+        description: "Successful Release Prepare run ID holding the binaries"
+        required: true
+        type: string
+      ref:
+        description: "Ref to take workflow/Dockerfile/scripts from. Defaults to the tag; override to pick up a distribution-only fix without re-tagging."
+        required: false
+        type: string
+      publish_crates:
+        description: "Publish crates to crates.io"
+        type: boolean
+        default: true
+      docker:
+        description: "Build and push Docker images"
+        type: boolean
+        default: true
+      github_release:
+        description: "Create the GitHub Release"
+        type: boolean
+        default: true
+      notify:
+        description: "Announce on Discord"
+        type: boolean
+        default: true
 
 concurrency:
   group: release
@@ -17,73 +66,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Validate tag ─────────────────────────────────────────────────────────────
+  # Always runs. Cheap, and it guarantees the dispatched tag still means what
+  # the prepare run assumed it meant.
   validate-version:
-    name: Validate Version Tag
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      is_full_release: ${{ steps.version.outputs.is_full_release }}
-    steps:
-      - uses: actions/checkout@v6
+    uses: ./.github/workflows/release-validate.yml
+    with:
+      ref: ${{ inputs.tag }}
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Validate tag against Cargo.toml
-        id: version
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          TAG_VERSION="${TAG#v}"
-
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version=1 \
-            | jq -r '.packages[] | select(.name == "nodedb-types") | .version')
-          CARGO_BASE=$(echo "$CARGO_VERSION" | grep -oP '^\d+\.\d+\.\d+')
-
-          echo "Tag version:        $TAG_VERSION"
-          echo "Cargo.toml version: $CARGO_VERSION"
-          echo "Cargo.toml base:    $CARGO_BASE"
-
-          if [[ ! "$TAG_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[a-zA-Z]+\.[0-9]+)?$ ]]; then
-            echo "::error::Invalid tag format '$TAG'. Expected: vX.Y.Z or vX.Y.Z-label.N"
-            exit 1
-          fi
-
-          TAG_BASE="${BASH_REMATCH[1]}"
-
-          if [[ "$TAG_BASE" != "$CARGO_BASE" ]]; then
-            echo "::error::Base version mismatch! Tag '$TAG_BASE' != Cargo.toml '$CARGO_BASE'"
-            exit 1
-          fi
-
-          # Full release = no hyphen suffix (v0.0.1, not v0.0.1-beta.1)
-          if [[ "$TAG_VERSION" == *-* ]]; then
-            echo "is_full_release=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_full_release=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
-
-  # ── CI gate ──────────────────────────────────────────────────────────────────
-  ci:
-    name: CI Gate
-    needs: validate-version
-    uses: ./.github/workflows/ci.yml
-
-  # ── Publish crates to crates.io ──────────────────────────────────────────────
-  # Requires secret: CARGO_REGISTRY_TOKEN
-  # All 4 tiers run in a single job with is_published checks and wait_for polling
-  # so re-running a failed publish never double-publishes an already-indexed crate.
+  # ── crates.io ────────────────────────────────────────────────────────────────
+  # All 8 tiers in one job, with is_published checks and wait_for polling, so a
+  # re-run never double-publishes an already-indexed crate and never races the
+  # index for a dependency it just pushed.
   publish-crates:
     name: Publish to crates.io
-    needs: [validate-version, ci]
+    needs: validate-version
+    if: inputs.publish_crates
     runs-on: ubuntu-latest
     environment: crates.io
-    permissions:
-      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -96,27 +99,7 @@ jobs:
             libcurl4-openssl-dev libsasl2-dev
 
       - name: Set version from tag
-        run: |
-          VERSION="${{ needs.validate-version.outputs.version }}"
-          CURRENT=$(cargo metadata --no-deps --format-version=1 \
-            | jq -r '.packages[] | select(.name == "nodedb-types") | .version')
-          if [[ "$VERSION" != "$CURRENT" ]]; then
-            sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
-
-            # For pre-release versions, pin internal dep requirements so semver
-            # "0.0.0" doesn't fail to match "0.0.0-beta.1"
-            if [[ "$VERSION" == *-* ]]; then
-              # Pin every internal nodedb* path-dep (bare `nodedb` included) to the
-              # exact prerelease version. A generic match avoids the recurring bug
-              # of forgetting to add a newly-introduced crate to an explicit list.
-              sed -i -E 's/(nodedb[a-z0-9-]* = \{ [^}]*version = )"[^"]*"/\1"='"$VERSION"'"/' Cargo.toml
-              echo "Updated internal dep versions to =$VERSION"
-            fi
-
-            echo "Updated workspace version: $CURRENT -> $VERSION"
-          else
-            echo "Version already matches, no change needed"
-          fi
+        run: bash scripts/ci/stamp_version.sh "${{ needs.validate-version.outputs.version }}"
 
       - name: Publish crates
         env:
@@ -191,112 +174,19 @@ jobs:
           publish_tier "7 (depends on tier 6)" $TIER7
           publish_tier "8 (depends on tier 7)" $TIER8
 
-  # ── Build nodedb server binary (Linux only — requires io_uring) ──────────────
-  build-server:
-    name: Build server (${{ matrix.label }})
-    needs: [validate-version, ci]
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runs-on: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            label: linux-x64
-          - runs-on: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            label: linux-arm64
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: server-${{ matrix.target }}
-
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake clang libclang-dev pkg-config protobuf-compiler perl \
-            libcurl4-openssl-dev libsasl2-dev
-
-      - name: Set version from tag
-        run: |
-          VERSION="${{ needs.validate-version.outputs.version }}"
-          CURRENT=$(cargo metadata --no-deps --format-version=1 \
-            | jq -r '.packages[] | select(.name == "nodedb-types") | .version')
-          if [[ "$VERSION" != "$CURRENT" ]]; then
-            perl -i -pe "if (!\$done && /^version = \"/) { s/^version = \".*\"/version = \"$VERSION\"/; \$done=1 }" Cargo.toml
-
-            # For pre-release versions, pin internal dep requirements so semver
-            # "0" doesn't fail to match "0.0.0-beta.3"
-            if [[ "$VERSION" == *-* ]]; then
-              # Pin every internal nodedb* path-dep (bare `nodedb` included) to the
-              # exact prerelease version. A generic match avoids the recurring bug
-              # of forgetting to add a newly-introduced crate to an explicit list.
-              sed -i -E 's/(nodedb[a-z0-9-]* = \{ [^}]*version = )"[^"]*"/\1"='"$VERSION"'"/' Cargo.toml
-              echo "Updated internal dep versions to =$VERSION"
-            fi
-
-            echo "Updated workspace version: $CURRENT -> $VERSION"
-          fi
-
-      - name: Build server binary
-        run: cargo build -p nodedb --release --target ${{ matrix.target }}
-
-      - name: Package
-        run: |
-          cd target/${{ matrix.target }}/release
-          chmod +x nodedb
-          tar czf nodedb-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.tar.gz nodedb
-          ls -lh nodedb-*.tar.gz
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: server-${{ matrix.label }}
-          path: target/${{ matrix.target }}/release/nodedb-*.tar.gz
-          retention-days: 1
-
-  # ── Create GitHub Release ─────────────────────────────────────────────────────
-  github-release:
-    name: Create GitHub Release
-    needs: [validate-version, publish-crates, build-server]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download binary artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: ./artifacts
-          pattern: "server-*"
-          merge-multiple: true
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.validate-version.outputs.version }}
-          name: NodeDB ${{ needs.validate-version.outputs.version }}
-          generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(needs.validate-version.outputs.version, '-') }}
-          files: artifacts/*
-          fail_on_unmatched_files: true
-
-  # ── Build and push Docker image (full releases only) ──────────────────────────
-  # Uses native runners per arch (no QEMU), then merges into a multi-arch manifest.
+  # ── Docker (full releases only) ──────────────────────────────────────────────
+  # Native runner per arch (no QEMU). The image is assembled from the binary the
+  # prepare run already built: `--build-context binary=` overrides the Dockerfile
+  # stage of the same name, so Buildx prunes the compile stages entirely and the
+  # build is a two-layer copy.
   docker-build:
     name: Docker build (${{ matrix.label }})
-    needs: [validate-version, ci]
-    if: needs.validate-version.outputs.is_full_release == 'true'
+    needs: validate-version
+    if: inputs.docker && needs.validate-version.outputs.is_full_release == 'true'
     runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -304,34 +194,61 @@ jobs:
           - runs-on: ubuntu-latest
             platform: linux/amd64
             label: amd64
+            binary: binary-linux-x64
           - runs-on: ubuntu-24.04-arm
             platform: linux/arm64
             label: arm64
+            binary: binary-linux-arm64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || inputs.tag }}
+
+      - name: Download prebuilt binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.binary }}
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ github.token }}
+          path: ./binctx
+
+      - name: Make binary executable
+        run: chmod +x ./binctx/nodedb
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build and push platform image
         uses: docker/build-push-action@v7
         with:
           context: .
+          build-contexts: binary=./binctx
           platforms: ${{ matrix.platform }}
           push: true
           tags: farhansyah/nodedb:${{ needs.validate-version.outputs.version }}-${{ matrix.label }}
-          cache-from: type=gha,scope=${{ matrix.label }}
-          cache-to: type=gha,scope=${{ matrix.label }},mode=max
           sbom: true
           provenance: mode=max
+
+      # The binary is now compiled on the runner (glibc 2.39) rather than inside
+      # the Debian builder stage, so the runtime base must be able to load it.
+      # Exercise the pushed per-arch tag before it can reach the multi-arch
+      # manifest: `latest` is only ever built from images that have run.
+      - name: Smoke-test pushed image
+        run: |
+          docker run --rm --pull=always \
+            farhansyah/nodedb:${{ needs.validate-version.outputs.version }}-${{ matrix.label }} \
+            --version
 
   docker-manifest:
     name: Docker manifest
     needs: [validate-version, docker-build]
-    if: needs.validate-version.outputs.is_full_release == 'true'
+    if: inputs.docker && needs.validate-version.outputs.is_full_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Log in to Docker Hub
@@ -349,15 +266,58 @@ jobs:
             farhansyah/nodedb:${VERSION}-amd64 \
             farhansyah/nodedb:${VERSION}-arm64
 
-  # ── Notify Discord ────────────────────────────────────────────────────────────
+  # ── GitHub Release ───────────────────────────────────────────────────────────
+  # Deliberately independent of publish-crates and docker: a crates.io outage
+  # must not block cutting the release, and re-running this stage alone is the
+  # fix for a bad release body.
+  github-release:
+    name: Create GitHub Release
+    needs: validate-version
+    if: inputs.github_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: "server-*"
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ github.token }}
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: NodeDB ${{ needs.validate-version.outputs.version }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ needs.validate-version.outputs.is_full_release != 'true' }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
+
+  # ── Discord (full releases only) ─────────────────────────────────────────────
   notify-discord:
     name: Notify Discord
-    needs: [validate-version, publish-crates, github-release]
-    if: needs.validate-version.outputs.is_full_release == 'true'
+    needs: [validate-version, github-release]
+    if: >-
+      always() &&
+      inputs.notify &&
+      needs.validate-version.outputs.is_full_release == 'true' &&
+      needs.github-release.result != 'failure' &&
+      needs.github-release.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Build changelog and post to Discord

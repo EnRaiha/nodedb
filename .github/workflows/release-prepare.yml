@@ -1,0 +1,129 @@
+# Tag gate for a releasable build. Pushing a v* tag validates the tag, runs the
+# full test suite, and builds the server binaries once. Nothing is published and
+# nothing leaves the repo.
+#
+# The manual `Release` workflow then consumes THIS run's binary artifacts by run
+# ID — for both the GitHub Release and the Docker image — so a failure in any
+# distribution stage can be fixed and retried without repeating the tests or the
+# compile.
+#
+# Artifacts are retained 14 days: that is the window in which a `Release` run can
+# still resume from this prepare run.
+
+name: Release Prepare
+run-name: Release Prepare ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-prepare-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate-version:
+    uses: ./.github/workflows/release-validate.yml
+    with:
+      ref: ${{ github.ref_name }}
+
+  # Full lint + fast suite + 3-node cluster suite. Calls test.yml directly
+  # rather than ci.yml, whose opt-in label gate only makes sense on a PR.
+  ci:
+    name: CI Gate
+    needs: validate-version
+    uses: ./.github/workflows/test.yml
+
+  build-server:
+    name: Build server (${{ matrix.label }})
+    needs: [validate-version, ci]
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+          - runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            label: linux-arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: server-${{ matrix.target }}
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libclang-dev pkg-config protobuf-compiler perl \
+            libcurl4-openssl-dev libsasl2-dev
+
+      - name: Set version from tag
+        run: bash scripts/ci/stamp_version.sh "${{ needs.validate-version.outputs.version }}"
+
+      - name: Build server binary
+        run: cargo build -p nodedb --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          chmod +x nodedb
+          tar czf nodedb-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.tar.gz nodedb
+          ls -lh nodedb-*.tar.gz
+
+      # Two artifacts per arch: the tarball ships in the GitHub Release, the
+      # bare binary is the Docker build context. Same bytes, different shape.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-${{ matrix.label }}
+          path: target/${{ matrix.target }}/release/nodedb-*.tar.gz
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.label }}
+          path: target/${{ matrix.target }}/release/nodedb
+          retention-days: 14
+
+  summary:
+    name: Release instructions
+    needs: [validate-version, build-server]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          {
+            echo "## Prepared v${VERSION}"
+            echo
+            echo "Tests passed and both server binaries are built. Publish with:"
+            echo
+            echo '```sh'
+            echo "gh workflow run release.yml -R ${REPO} \\"
+            echo "  -f tag=v${VERSION} \\"
+            echo "  -f prepare_run_id=${RUN_ID}"
+            echo '```'
+            echo
+            echo "If one stage fails, re-run the same command with only the"
+            echo "remaining stages enabled (\`-f publish_crates=false\`, etc.)."
+            echo "Nothing is recompiled."
+          } >> "$GITHUB_STEP_SUMMARY"
