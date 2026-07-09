@@ -141,6 +141,14 @@ pub async fn execute_plan_all_local_cores(
             MetaOp::RestoreTenantSnapshot { .. } => {
                 single_blob_gather(state, tenant_id, database_id, plan, trace_id).await
             }
+            // A `ResolveTxn` response is a single `RedoRecord` blob (msgpack
+            // map), not an array of rows — same single-blob corruption class as
+            // the snapshot ops if array-wrapped. It is a single-core, single-txn
+            // op that never actually fans across cores, but is routed through
+            // `single_blob_gather` here so its payload is returned verbatim.
+            MetaOp::ResolveTxn { .. } => {
+                single_blob_gather(state, tenant_id, database_id, plan, trace_id).await
+            }
             // Every other MetaOp either returns an array of rows / count payload
             // (→ generic gather is correct) or is a single-core control op whose
             // single-element wrap is harmless. Enumerated exhaustively (no

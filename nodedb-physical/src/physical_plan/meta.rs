@@ -486,4 +486,27 @@ pub enum MetaOp {
     /// fires nothing — no base mutation, no side effects. Absent key is an
     /// idempotent no-op.
     CalvinDrop { epoch: u64, position: u32 },
+
+    /// Resolve a committing transaction's staged writes into ONE replayable
+    /// redo record, WITHOUT mutating base.
+    ///
+    /// The Data Plane handler reads the per-transaction staging overlay
+    /// (`CoreLoop::txn_overlays`) by shared reference and, for every staged
+    /// post-image, emits the engine-native WAL sub-record shape that engine's
+    /// autocommit path already produces. The encoded `RedoRecord` bytes are
+    /// returned in the response payload; the Control Plane appends them as a
+    /// single `RecordType::TransactionRedo` WAL record and a later install phase
+    /// replays them. No base engine is touched during resolve — a crash before
+    /// install loses only an unacknowledged commit.
+    ///
+    /// `plans` is the transaction's buffered write set: it is walked to classify
+    /// every op and to discover which collections' overlay entries to serialize.
+    /// An op class whose resolve serializer is not yet built raises a typed
+    /// error rather than being silently omitted (a dropped op class would lose
+    /// those rows on install). Wire-additive: appended last so older log entries
+    /// decode unchanged.
+    ResolveTxn {
+        txn_id: nodedb_types::id::TxnId,
+        plans: Vec<super::PhysicalPlan>,
+    },
 }

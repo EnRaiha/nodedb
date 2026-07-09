@@ -27,4 +27,6 @@ pub mod sync;
 pub mod tls_reload;
 pub mod wal_dispatch;
 pub(super) mod wal_dispatch_fts_spatial;
-pub(super) mod wal_dispatch_kv;
+// `pub(crate)` (not `pub(super)`): the plane-agnostic `encode_kv_put`
+// serializer is reused by the Data Plane transaction-resolve KV serializer.
+pub(crate) mod wal_dispatch_kv;

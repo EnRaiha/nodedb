@@ -250,6 +250,13 @@ impl CoreLoop {
                 self.execute_calvin_drop(task, *epoch, *position)
             }
 
+            // Resolve a committing transaction's staged post-images into one
+            // `RedoRecord` and return its bytes. Reads the overlay by `&`; never
+            // mutates base (the redo record is installed separately).
+            MetaOp::ResolveTxn { txn_id, plans } => {
+                self.execute_resolve_txn(task, tid, *txn_id, plans)
+            }
+
             MetaOp::StageWrite { plan } => self.execute_stage_write(task, tid, plan),
 
             // Release the staging overlay once a transaction resolves (commit
