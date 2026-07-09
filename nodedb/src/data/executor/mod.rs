@@ -23,5 +23,7 @@ pub(crate) mod vector_checkpoint;
 mod wal_replay;
 mod wal_replay_document_vector;
 mod wal_replay_fts;
+mod wal_replay_redo_document;
+mod wal_replay_redo_graph;
 mod wal_replay_spatial;
 mod wal_replay_vector;

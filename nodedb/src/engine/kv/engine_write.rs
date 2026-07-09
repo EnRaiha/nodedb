@@ -32,21 +32,47 @@ impl KvEngine {
     /// `Surrogate::ZERO` from internal RMW callers that do not allocate
     /// one — existing entries preserve their bound surrogate either way.
     pub fn put(&mut self, params: KvPutParams<'_>) -> Option<Vec<u8>> {
+        let expire_at = if params.ttl_ms > 0 {
+            params.now_ms + params.ttl_ms
+        } else {
+            NO_EXPIRY
+        };
+        self.put_resolved(params, expire_at)
+    }
+
+    /// PUT installing an already-resolved absolute expiry instant.
+    ///
+    /// `expire_at_ms` is the absolute wall-clock instant (ms since epoch) the
+    /// key expires at, or [`NO_EXPIRY`] (`0`) for no TTL. Unlike [`put`], which
+    /// derives expiry as `now_ms + ttl_ms`, this installs the supplied instant
+    /// verbatim. WAL redo replay uses it so a TTL'd key recovers with the exact
+    /// expiry the original write computed — recomputing `now_ms + ttl_ms` at
+    /// recovery time would push expiry forward by the crash-to-restart delay.
+    ///
+    /// [`put`]: KvEngine::put
+    pub fn put_with_absolute_expiry(
+        &mut self,
+        params: KvPutParams<'_>,
+        expire_at_ms: u64,
+    ) -> Option<Vec<u8>> {
+        self.put_resolved(params, expire_at_ms)
+    }
+
+    /// Shared PUT body: insert/update the key with an already-resolved absolute
+    /// `expire_at` (or [`NO_EXPIRY`]), maintaining the expiry wheel and both
+    /// secondary and sorted indexes. `params.ttl_ms` is intentionally unused
+    /// here — expiry is fully determined by `expire_at`.
+    fn put_resolved(&mut self, params: KvPutParams<'_>, expire_at: u64) -> Option<Vec<u8>> {
         let KvPutParams {
             database_id,
             tenant_id,
             collection,
             key,
             value,
-            ttl_ms,
+            ttl_ms: _,
             now_ms,
             surrogate,
         } = params;
-        let expire_at = if ttl_ms > 0 {
-            now_ms + ttl_ms
-        } else {
-            NO_EXPIRY
-        };
 
         let tkey = table_key(database_id, tenant_id, collection);
 

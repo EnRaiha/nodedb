@@ -89,6 +89,41 @@ impl CoreLoop {
 
             // Try to detect KV records by discriminator prefix in the payload.
             if is_put {
+                // kv_put with absolute expiry (redo sub-record):
+                //   ("kv_put", collection, key, value, ttl_ms, expire_at_ms)
+                //
+                // zerompk enforces a strict array length, so this six-element
+                // tuple decodes ONLY the extended shape and never the historical
+                // five-element one below (and vice versa). When present, the
+                // resolved absolute instant is installed verbatim instead of
+                // recomputing `now_ms + ttl_ms`, which would drift the expiry
+                // forward by the crash-to-restart delay.
+                if let Ok((disc, collection, key, value, ttl_ms, expire_at_ms)) =
+                    zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(
+                        &record.payload,
+                    )
+                    && disc == "kv_put"
+                {
+                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+                        continue;
+                    }
+                    self.kv_engine.put_with_absolute_expiry(
+                        crate::engine::kv::KvPutParams {
+                            database_id,
+                            tenant_id,
+                            collection: &collection,
+                            key: &key,
+                            value: &value,
+                            ttl_ms,
+                            now_ms,
+                            surrogate: nodedb_types::Surrogate::ZERO,
+                        },
+                        expire_at_ms,
+                    );
+                    puts += 1;
+                    continue;
+                }
+
                 // kv_put: ("kv_put", collection, key, value, ttl_ms)
                 if let Ok((disc, collection, key, value, ttl_ms)) =
                     zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&record.payload)

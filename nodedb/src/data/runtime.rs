@@ -207,6 +207,18 @@ pub fn spawn_core(
                 core.replay_fts_wal(&wal_records, num_cores, &tombstones);
                 core.replay_spatial_wal(&wal_records, num_cores, &tombstones);
 
+                // Replay committed-transaction redo groups LAST among the
+                // engine replays: each `TransactionRedo` record is decomposed
+                // into per-op records fed back through the same per-engine
+                // replay paths above. Running last guarantees collection-level
+                // state those establish — notably the `VectorParams` a
+                // `CREATE VECTOR INDEX` wrote as a standalone record, which the
+                // vector and document arms need before rebuilding an HNSW index
+                // — is already in place. Every redo op is an absolute overwrite
+                // or a watermark-gated append, so ordering after the standalone
+                // replays (and after the checkpoint restores above) is safe.
+                core.replay_transaction_redo_wal(&wal_records, num_cores, &tombstones);
+
                 // Reconstruct sync HWM maps from SyncSeqAdvance records so
                 // post-restart deduplication is correct. Fatal on error —
                 // a partially-recovered HWM is not safe to operate with.
