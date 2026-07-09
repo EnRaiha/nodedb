@@ -201,14 +201,27 @@ pub(crate) fn encode_kv_batch_put(
     }
 }
 
-/// Encode a `kv_expire` WAL payload: `("kv_expire", collection, key,
-/// ttl_ms)`.
+/// Encode a `kv_expire` WAL payload: `("kv_expire", collection, key, ttl_ms,
+/// expire_at_ms)`.
+///
+/// Unlike `kv_put` / `kv_batch_put`, `kv_expire` has exactly one shape: `EXPIRE`
+/// has no "no TTL" sentinel value for `ttl_ms` — `ttl_ms == 0` is a legitimate,
+/// distinct request ("expire this key right now"), reachable through the
+/// native-protocol builder, not a flag meaning "skip resolving an instant". So
+/// the absolute instant is always resolved and always carried, and there was
+/// never a historical shape without it: `replay_kv_wal` had no `kv_expire`
+/// decode arm at all before this record gained one, so there is no prior
+/// on-disk shape to stay compatible with.
 pub(crate) fn encode_kv_expire(
     collection: &str,
     key: &[u8],
     ttl_ms: u64,
+    expire_at_ms: u64,
 ) -> crate::Result<Vec<u8>> {
-    encode("expire", &("kv_expire", collection, key, ttl_ms))
+    encode(
+        "expire",
+        &("kv_expire", collection, key, ttl_ms, expire_at_ms),
+    )
 }
 
 /// Encode a `kv_persist` WAL payload: `("kv_persist", collection, key)`.
@@ -313,9 +326,9 @@ pub(crate) fn encode_kv_truncate(collection: &str) -> crate::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        KvTransferFields, encode_kv_batch_put, encode_kv_cas, encode_kv_field_set,
-        encode_kv_getset, encode_kv_incr_float, encode_kv_put, encode_kv_register_index,
-        encode_kv_transfer, encode_kv_transfer_item,
+        KvTransferFields, encode_kv_batch_put, encode_kv_cas, encode_kv_expire,
+        encode_kv_field_set, encode_kv_getset, encode_kv_incr_float, encode_kv_put,
+        encode_kv_register_index, encode_kv_transfer, encode_kv_transfer_item,
     };
 
     #[test]
@@ -520,6 +533,35 @@ mod tests {
         // The two payloads must not be byte-identical: the backfill flag is
         // the only difference and it must actually change the encoded bytes.
         assert_ne!(entry_backfill_true, entry_backfill_false);
+    }
+
+    #[test]
+    fn kv_expire_always_carries_the_resolved_absolute_instant() {
+        let entry = encode_kv_expire("sessions", b"tok1", 5_000, 6_000).unwrap();
+
+        let (disc, collection, key, ttl_ms, expire_at_ms) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, u64, u64)>(&entry).unwrap();
+        assert_eq!(disc, "kv_expire");
+        assert_eq!(collection, "sessions");
+        assert_eq!(key, b"tok1");
+        assert_eq!(ttl_ms, 5_000);
+        assert_eq!(expire_at_ms, 6_000);
+    }
+
+    #[test]
+    fn kv_expire_with_zero_ttl_still_carries_an_absolute_instant() {
+        // ttl_ms == 0 is a legitimate "expire right now" request for EXPIRE,
+        // not a "no TTL" sentinel the way it is for PUT — the shape must not
+        // special-case it away.
+        let entry = encode_kv_expire("sessions", b"tok2", 0, 1_234).unwrap();
+
+        let (disc, collection, key, ttl_ms, expire_at_ms) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, u64, u64)>(&entry).unwrap();
+        assert_eq!(disc, "kv_expire");
+        assert_eq!(collection, "sessions");
+        assert_eq!(key, b"tok2");
+        assert_eq!(ttl_ms, 0);
+        assert_eq!(expire_at_ms, 1_234);
     }
 
     #[test]

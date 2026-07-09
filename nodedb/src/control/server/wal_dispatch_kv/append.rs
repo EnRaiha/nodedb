@@ -123,7 +123,15 @@ pub fn wal_append_kv_op(
             key,
             ttl_ms,
         } => {
-            let entry = encode_kv_expire(collection, key, *ttl_ms)?;
+            // Unlike `Put`/`BatchPut`, `Expire` has no "no TTL" sentinel for
+            // `ttl_ms == 0` (see `encode_kv_expire`'s doc comment) — the
+            // absolute instant is always resolved, so this deliberately does
+            // not route through `resolve_expiry`, which returns `None` on
+            // `ttl_ms == 0` for the Put family's different semantics.
+            let now_ms = crate::engine::kv::current_ms();
+            let expire_at_ms = now_ms + *ttl_ms;
+            resolved_now_ms = Some(now_ms);
+            let entry = encode_kv_expire(collection, key, *ttl_ms, expire_at_ms)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Persist { collection, key } => {

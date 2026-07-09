@@ -229,6 +229,40 @@ impl KvEngine {
         ttl_ms: u64,
         now_ms: u64,
     ) -> bool {
+        self.expire_resolved(database_id, tenant_id, collection, key, now_ms + ttl_ms)
+    }
+
+    /// EXPIRE installing an already-resolved absolute expiry instant.
+    ///
+    /// `expire_at_ms` is the absolute wall-clock instant (ms since epoch) the
+    /// key expires at. Unlike [`expire`], which derives it as
+    /// `now_ms + ttl_ms`, this installs the supplied instant verbatim. WAL
+    /// redo replay uses it so a key's expiry recovers with the exact instant
+    /// the original write computed — recomputing `now_ms + ttl_ms` at
+    /// recovery time would push expiry forward by the crash-to-restart delay.
+    ///
+    /// [`expire`]: KvEngine::expire
+    pub fn expire_with_absolute_expiry(
+        &mut self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        key: &[u8],
+        expire_at_ms: u64,
+    ) -> bool {
+        self.expire_resolved(database_id, tenant_id, collection, key, expire_at_ms)
+    }
+
+    /// Shared EXPIRE body: install an already-resolved absolute `expire_at`
+    /// on an existing key. Returns true if the key was found and TTL was set.
+    fn expire_resolved(
+        &mut self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        key: &[u8],
+        expire_at: u64,
+    ) -> bool {
         let tkey = table_key(database_id, tenant_id, collection);
         let table = match self.tables.get_mut(&tkey) {
             Some(t) => t,
@@ -243,7 +277,6 @@ impl KvEngine {
             self.expiry.cancel(&composite, meta.expire_at_ms);
         }
 
-        let expire_at = now_ms + ttl_ms;
         if table.set_expire(key, expire_at) {
             let composite = expiry_key(database_id, tenant_id, collection, key);
             self.expiry.insert(composite, expire_at);

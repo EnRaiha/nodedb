@@ -264,6 +264,30 @@ impl CoreLoop {
                     puts += applied;
                     continue;
                 }
+
+                // kv_expire — see `wal_replay_kv_expiry.rs`.
+                if let Some(applied) = self.try_replay_kv_expire(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
+                    continue;
+                }
+
+                // kv_persist — see `wal_replay_kv_expiry.rs`.
+                if let Some(applied) = self.try_replay_kv_persist(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
+                    continue;
+                }
             }
 
             if is_delete {

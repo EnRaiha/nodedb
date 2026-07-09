@@ -24,6 +24,7 @@ mod wal_replay;
 mod wal_replay_document_vector;
 mod wal_replay_fts;
 mod wal_replay_kv_atomic;
+mod wal_replay_kv_expiry;
 mod wal_replay_kv_field;
 mod wal_replay_kv_index;
 mod wal_replay_kv_sorted_index;

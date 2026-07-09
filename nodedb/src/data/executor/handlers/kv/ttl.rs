@@ -24,10 +24,12 @@ impl CoreLoop {
         ttl_ms: u64,
     ) -> Response {
         debug!(core = self.core_id, %collection, ttl_ms, "kv expire");
-        let now_ms: u64 = self
-            .epoch_system_ms
-            .map(|ms| ms as u64)
-            .unwrap_or_else(current_ms);
+        // `kv_ttl_now_ms` prefers the Control-Plane-resolved instant carried
+        // on `task` so live apply installs the exact `expire_at_ms` the
+        // durable WAL record encodes (see `wal_append_kv_op`'s `KvOp::Expire`
+        // arm); recomputing the wall clock here independently would drift
+        // the two apart by the dispatch latency.
+        let now_ms = self.kv_ttl_now_ms(task);
         if self
             .kv_engine
             .expire(did, tid, collection, key, ttl_ms, now_ms)
@@ -48,6 +50,9 @@ impl CoreLoop {
         key: &[u8],
     ) -> Response {
         debug!(core = self.core_id, %collection, "kv persist");
+        // Unlike `execute_kv_expire`, PERSIST clears a key's TTL outright and
+        // resolves no instant — `KvEngine::persist` takes no `now_ms` at all,
+        // so there is no clock to source from `task` here.
         if self.kv_engine.persist(did, tid, collection, key) {
             self.note_kv_write_lsn(task, did, tid, collection, key);
             self.response_ok(task)
