@@ -191,6 +191,62 @@ fn estimated_memory_grows_with_data() {
 }
 
 #[test]
+fn restore_to_version_produces_forward_delta() {
+    let state = CrdtState::new(1).unwrap();
+    state
+        .upsert("docs", "doc1", &[("body", LoroValue::String("v1".into()))])
+        .unwrap();
+    let vv1 = state.oplog_version_vector();
+    state
+        .upsert("docs", "doc1", &[("body", LoroValue::String("v2".into()))])
+        .unwrap();
+
+    // Snapshot the pre-restore state: a forward delta exported from `vv_before`
+    // carries only the ops after it, so it is meaningful solely to a peer that
+    // already holds everything up to that point. Replay works the same way —
+    // it imports every delta in order from empty.
+    let pre_restore = state.export_snapshot().unwrap();
+
+    let delta = state.restore_to_version("docs", "doc1", &vv1).unwrap();
+    assert!(
+        !delta.is_empty(),
+        "restoring to a genuinely earlier version must produce a non-empty forward delta"
+    );
+
+    // The live document carries the restored value.
+    assert_eq!(
+        state.read_field("docs", "doc1", "body"),
+        Some(LoroValue::String("v1".into()))
+    );
+
+    // A peer caught up to the pre-restore state converges on the restored value
+    // once it imports the delta.
+    let peer = CrdtState::new(2).unwrap();
+    peer.import(&pre_restore).unwrap();
+    peer.import(&delta).unwrap();
+    assert_eq!(
+        peer.read_field("docs", "doc1", "body"),
+        Some(LoroValue::String("v1".into()))
+    );
+}
+
+#[test]
+fn restore_to_current_version_is_empty() {
+    let state = CrdtState::new(1).unwrap();
+    state
+        .upsert("docs", "doc1", &[("body", LoroValue::String("v1".into()))])
+        .unwrap();
+    let current = state.oplog_version_vector();
+
+    let delta = state.restore_to_version("docs", "doc1", &current).unwrap();
+    assert!(
+        delta.is_empty(),
+        "restoring to the version a document is already at must return a genuinely empty delta, \
+         not a header-only export"
+    );
+}
+
+#[test]
 fn snapshot_roundtrip() {
     let state1 = CrdtState::new(1).unwrap();
     state1

@@ -81,7 +81,18 @@ impl CrdtState {
     /// that sets the current state to match the historical state. History is
     /// preserved — this is a forward operation, not a rollback.
     ///
-    /// Returns the delta bytes to be applied through the normal write path.
+    /// Short-circuits before mutating when the historical row projection
+    /// already equals the live row: `doc.export(ExportMode::updates(vv))`
+    /// always writes a small magic/checksum/mode header regardless of
+    /// whether any ops fall in range, so a caller checking
+    /// `bytes.is_empty()` on a post-write export would never see `true` for
+    /// a no-op restore. Comparing projections up front avoids emitting a
+    /// write (and the header-only export) at all.
+    ///
+    /// Returns the delta bytes to be applied through the normal write path,
+    /// or a genuinely empty `Vec` — with no row mutation performed — when
+    /// restoring would not change the live row (e.g. restoring to the
+    /// version the document is already at).
     pub fn restore_to_version(
         &self,
         collection: &str,
@@ -91,6 +102,11 @@ impl CrdtState {
         let historical = self
             .read_at_version(collection, row_id, version)?
             .ok_or_else(|| CrdtError::Loro("document did not exist at target version".into()))?;
+
+        let live = self.read_row(collection, row_id);
+        if live.as_ref() == Some(&historical) {
+            return Ok(Vec::new());
+        }
 
         let vv_before = self.doc.oplog_vv();
 
