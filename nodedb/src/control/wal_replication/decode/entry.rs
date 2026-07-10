@@ -155,6 +155,26 @@ fn to_physical_plan(
             collection,
             bytes,
         } => crdt::import_collection(*tenant_id, collection, bytes),
+        ReplicatedWrite::CrdtListInsert {
+            collection,
+            document_id,
+            list_path,
+            index,
+            fields_json,
+        } => crdt::list_insert(collection, document_id, list_path, *index, fields_json)?,
+        ReplicatedWrite::CrdtListDelete {
+            collection,
+            document_id,
+            list_path,
+            index,
+        } => crdt::list_delete(collection, document_id, list_path, *index)?,
+        ReplicatedWrite::CrdtListMove {
+            collection,
+            document_id,
+            list_path,
+            from_index,
+            to_index,
+        } => crdt::list_move(collection, document_id, list_path, *from_index, *to_index)?,
         ReplicatedWrite::EdgePut {
             collection,
             src_id,

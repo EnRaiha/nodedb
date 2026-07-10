@@ -42,6 +42,78 @@ pub(super) fn import_collection(tenant_id: u64, collection: &str, bytes: &[u8]) 
     })
 }
 
+/// Narrow a wire `u64` list position/index to the `usize` the live
+/// `execute_crdt_list_*` handlers take. `usize::try_from` (never `as`): a
+/// value that doesn't fit `usize` on this platform is a corrupt/incompatible
+/// wire payload, not a value to silently truncate and replay at the wrong
+/// position.
+fn list_index(field: &str, value: u64) -> crate::Result<usize> {
+    usize::try_from(value).map_err(|_| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("CrdtList {field}={value} does not fit usize on this platform"),
+    })
+}
+
+/// Reconstruct `CrdtOp::ListInsert` from its wire intent. No assigner call:
+/// the live dispatch handler
+/// (`data/executor/dispatch/crdt.rs::CrdtOp::ListInsert`) ignores the
+/// `surrogate` field entirely, so `Surrogate::ZERO` carries no
+/// replay-relevant information here.
+pub(super) fn list_insert(
+    collection: &str,
+    document_id: &str,
+    list_path: &str,
+    index: u64,
+    fields_json: &str,
+) -> crate::Result<PhysicalPlan> {
+    Ok(PhysicalPlan::Crdt(CrdtOp::ListInsert {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        list_path: list_path.to_owned(),
+        index: list_index("index", index)?,
+        fields_json: fields_json.to_owned(),
+        surrogate: nodedb_types::Surrogate::ZERO,
+    }))
+}
+
+/// Reconstruct `CrdtOp::ListDelete` from its wire intent. See
+/// [`list_insert`] for the surrogate note.
+pub(super) fn list_delete(
+    collection: &str,
+    document_id: &str,
+    list_path: &str,
+    index: u64,
+) -> crate::Result<PhysicalPlan> {
+    Ok(PhysicalPlan::Crdt(CrdtOp::ListDelete {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        list_path: list_path.to_owned(),
+        index: list_index("index", index)?,
+        surrogate: nodedb_types::Surrogate::ZERO,
+    }))
+}
+
+/// Reconstruct `CrdtOp::ListMove` from its wire intent. `from_index` and
+/// `to_index` are narrowed independently so a value that fits one but not
+/// the other still surfaces as a typed decode error rather than silently
+/// substituting. See [`list_insert`] for the surrogate note.
+pub(super) fn list_move(
+    collection: &str,
+    document_id: &str,
+    list_path: &str,
+    from_index: u64,
+    to_index: u64,
+) -> crate::Result<PhysicalPlan> {
+    Ok(PhysicalPlan::Crdt(CrdtOp::ListMove {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        list_path: list_path.to_owned(),
+        from_index: list_index("from_index", from_index)?,
+        to_index: list_index("to_index", to_index)?,
+        surrogate: nodedb_types::Surrogate::ZERO,
+    }))
+}
+
 pub(super) fn constraint_change(
     collection: &str,
     op: &ConstraintChangeOp,

@@ -21,17 +21,22 @@
 //!
 //! One documented set of arms is the exception:
 //! `DocumentOp::{BatchInsert, Merge, UpdateFromJoin}`,
-//! `CrdtOp::{SetConstraints, DropConstraints, RestoreToVersion, ListInsert,
-//! ListDelete, ListMove}`, and `ArrayOp::{Put, Delete}` classify `true` here
-//! even though `to_replicated_entry` has no encoder arm for any of them — a
-//! deliberate divergence from the oracle (see the equivalence test below,
-//! which pins the divergence explicitly rather than papering over it).
+//! `CrdtOp::{SetConstraints, DropConstraints, RestoreToVersion}`, and
+//! `ArrayOp::{Put, Delete}` classify `true` here even though
+//! `to_replicated_entry` has no encoder arm for any of them — a deliberate
+//! divergence from the oracle (see the equivalence test below, which pins
+//! the divergence explicitly rather than papering over it).
 //! `VectorOp::{DeleteBySurrogate, SparseInsert, SparseDelete,
 //! MultiVectorInsert, MultiVectorDelete, DirectUpsert}` used to be in this
 //! same exception list, but `to_replicated_entry` now has encoder arms for
 //! all six (see `control/wal_replication/encode/vector.rs::encode`), so they
 //! no longer diverge from the oracle and were moved to
-//! `vector_variants_match_oracle` below. Without buffering,
+//! `vector_variants_match_oracle` below.
+//! `CrdtOp::{ListInsert, ListDelete, ListMove}` similarly used to be in this
+//! exception list, but `to_replicated_entry` now has encoder arms for all
+//! three (see `control/wal_replication/encode/crdt.rs::encode`), so they no
+//! longer diverge from the oracle and were moved into
+//! `crdt_variants_match_oracle` below. Without buffering,
 //! each of these executed immediately against base state inside an explicit
 //! transaction, was visible before COMMIT, and survived ROLLBACK: a
 //! correctness bug, not a classification nuance. Closing it costs two
@@ -170,7 +175,13 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         ) => false,
 
         // ---- Crdt: encoded (buffered) ----
-        PhysicalPlan::Crdt(CrdtOp::Apply { .. } | CrdtOp::ImportSnapshot { .. }) => true,
+        PhysicalPlan::Crdt(
+            CrdtOp::Apply { .. }
+            | CrdtOp::ImportSnapshot { .. }
+            | CrdtOp::ListInsert { .. }
+            | CrdtOp::ListDelete { .. }
+            | CrdtOp::ListMove { .. },
+        ) => true,
 
         // ---- Crdt: reads, not encoded ----
         PhysicalPlan::Crdt(
@@ -196,10 +207,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         PhysicalPlan::Crdt(
             CrdtOp::SetConstraints { .. }
             | CrdtOp::DropConstraints { .. }
-            | CrdtOp::RestoreToVersion { .. }
-            | CrdtOp::ListInsert { .. }
-            | CrdtOp::ListDelete { .. }
-            | CrdtOp::ListMove { .. },
+            | CrdtOp::RestoreToVersion { .. },
         ) => true,
 
         // DDL/Alter, not encoded.
@@ -884,6 +892,29 @@ mod tests {
             PhysicalPlan::Crdt(CrdtOp::CompactAtVersion {
                 collection: "c".into(),
                 target_version_json: "{}".into(),
+            }),
+            PhysicalPlan::Crdt(CrdtOp::ListInsert {
+                collection: "c".into(),
+                document_id: "d".into(),
+                list_path: "$.l".into(),
+                index: 0,
+                fields_json: "{}".into(),
+                surrogate: Surrogate::ZERO,
+            }),
+            PhysicalPlan::Crdt(CrdtOp::ListDelete {
+                collection: "c".into(),
+                document_id: "d".into(),
+                list_path: "$.l".into(),
+                index: 0,
+                surrogate: Surrogate::ZERO,
+            }),
+            PhysicalPlan::Crdt(CrdtOp::ListMove {
+                collection: "c".into(),
+                document_id: "d".into(),
+                list_path: "$.l".into(),
+                from_index: 0,
+                to_index: 1,
+                surrogate: Surrogate::ZERO,
             }),
         ];
         for p in &plans {
@@ -1872,29 +1903,6 @@ mod tests {
                 collection: "c".into(),
                 document_id: "d".into(),
                 target_version_json: "{}".into(),
-                surrogate: Surrogate::ZERO,
-            }),
-            PhysicalPlan::Crdt(CrdtOp::ListInsert {
-                collection: "c".into(),
-                document_id: "d".into(),
-                list_path: "$.l".into(),
-                index: 0,
-                fields_json: "{}".into(),
-                surrogate: Surrogate::ZERO,
-            }),
-            PhysicalPlan::Crdt(CrdtOp::ListDelete {
-                collection: "c".into(),
-                document_id: "d".into(),
-                list_path: "$.l".into(),
-                index: 0,
-                surrogate: Surrogate::ZERO,
-            }),
-            PhysicalPlan::Crdt(CrdtOp::ListMove {
-                collection: "c".into(),
-                document_id: "d".into(),
-                list_path: "$.l".into(),
-                from_index: 0,
-                to_index: 1,
                 surrogate: Surrogate::ZERO,
             }),
             PhysicalPlan::Array(ArrayOp::Put {

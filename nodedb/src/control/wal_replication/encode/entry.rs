@@ -8,7 +8,7 @@ use super::{columnar, crdt, document, graph, kv, vector};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{
-    ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, SpatialOp, TextOp, TimeseriesOp,
+    ColumnarOp, DocumentOp, GraphOp, KvOp, SpatialOp, TextOp, TimeseriesOp,
 };
 
 /// Serialize optional sync provenance into the cross-node wire shape.
@@ -85,28 +85,12 @@ pub fn to_replicated_entry(
         // `vector::encode`, which is exhaustive over `VectorOp` and returns
         // `None` for the read/DDL variants — see that function's doc.
         PhysicalPlan::Vector(op) => vector::encode(op)?,
-        PhysicalPlan::Crdt(CrdtOp::Apply {
-            collection,
-            document_id,
-            delta,
-            peer_id,
-            mutation_id: _,
-            surrogate: _,
-            provenance,
-            constraint_version_required,
-        }) => crdt::apply(
-            collection,
-            document_id,
-            delta,
-            *peer_id,
-            encode_provenance(provenance),
-            *constraint_version_required,
-        ),
-        PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
-            tenant_id,
-            collection,
-            bytes,
-        }) => crdt::import_snapshot(*tenant_id, collection, bytes),
+        // All `CrdtOp` write variants (including the block-list `ListInsert`
+        // / `ListDelete` / `ListMove` family) are dispatched via
+        // `crdt::encode`, which is exhaustive over `CrdtOp` and returns
+        // `None` for the read / still-buffered-unencoded variants — see
+        // that function's doc.
+        PhysicalPlan::Crdt(op) => crdt::encode(op)?,
         PhysicalPlan::Graph(GraphOp::EdgePut {
             collection,
             src_id,

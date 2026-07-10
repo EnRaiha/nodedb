@@ -3,6 +3,80 @@
 //! Encode `PhysicalPlan::Crdt` variants into `ReplicatedWrite`.
 
 use super::super::types::ReplicatedWrite;
+use nodedb_physical::physical_plan::CrdtOp;
+
+/// Encode a `CrdtOp` write variant into its `ReplicatedWrite` wire shape.
+///
+/// Exhaustive over `CrdtOp` (not a catch-all): a new variant forces an
+/// explicit decision here instead of silently falling through, mirroring
+/// `vector::encode`'s exhaustiveness guarantee.
+///
+/// Returns `None` for the read-only / DDL-observability variants (`Read`,
+/// `ReadConstraints`, `SetPolicy`, `GetPolicy`, `ReadAtVersion`,
+/// `GetVersionVector`, `ExportDelta`, `CompactAtVersion`) and for
+/// `SetConstraints` / `DropConstraints` / `RestoreToVersion`, which are
+/// still buffered-but-unencoded (see `plan_requires_txn_buffering`'s module
+/// doc) — a separate, undone encoder-omission unit not addressed here.
+pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
+    Some(match op {
+        CrdtOp::Apply {
+            collection,
+            document_id,
+            delta,
+            peer_id,
+            mutation_id: _,
+            surrogate: _,
+            provenance,
+            constraint_version_required,
+        } => apply(
+            collection,
+            document_id,
+            delta,
+            *peer_id,
+            super::entry::encode_provenance(provenance),
+            *constraint_version_required,
+        ),
+        CrdtOp::ImportSnapshot {
+            tenant_id,
+            collection,
+            bytes,
+        } => import_snapshot(*tenant_id, collection, bytes),
+        CrdtOp::ListInsert {
+            collection,
+            document_id,
+            list_path,
+            index,
+            fields_json,
+            surrogate: _,
+        } => list_insert(collection, document_id, list_path, *index, fields_json),
+        CrdtOp::ListDelete {
+            collection,
+            document_id,
+            list_path,
+            index,
+            surrogate: _,
+        } => list_delete(collection, document_id, list_path, *index),
+        CrdtOp::ListMove {
+            collection,
+            document_id,
+            list_path,
+            from_index,
+            to_index,
+            surrogate: _,
+        } => list_move(collection, document_id, list_path, *from_index, *to_index),
+        CrdtOp::Read { .. }
+        | CrdtOp::ReadConstraints { .. }
+        | CrdtOp::SetPolicy { .. }
+        | CrdtOp::GetPolicy { .. }
+        | CrdtOp::ReadAtVersion { .. }
+        | CrdtOp::GetVersionVector { .. }
+        | CrdtOp::ExportDelta { .. }
+        | CrdtOp::CompactAtVersion { .. }
+        | CrdtOp::SetConstraints { .. }
+        | CrdtOp::DropConstraints { .. }
+        | CrdtOp::RestoreToVersion { .. } => return None,
+    })
+}
 
 pub(super) fn apply(
     collection: &str,
@@ -27,5 +101,56 @@ pub(super) fn import_snapshot(tenant_id: u64, collection: &str, bytes: &[u8]) ->
         tenant_id,
         collection: collection.to_owned(),
         bytes: bytes.to_vec(),
+    }
+}
+
+/// `index` is the Data Plane's `usize` list position, widened losslessly to
+/// the wire's `u64` (every supported target's `usize` fits in `u64`).
+pub(super) fn list_insert(
+    collection: &str,
+    document_id: &str,
+    list_path: &str,
+    index: usize,
+    fields_json: &str,
+) -> ReplicatedWrite {
+    ReplicatedWrite::CrdtListInsert {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        list_path: list_path.to_owned(),
+        index: index as u64,
+        fields_json: fields_json.to_owned(),
+    }
+}
+
+/// See [`list_insert`] for the `index` widening note.
+pub(super) fn list_delete(
+    collection: &str,
+    document_id: &str,
+    list_path: &str,
+    index: usize,
+) -> ReplicatedWrite {
+    ReplicatedWrite::CrdtListDelete {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        list_path: list_path.to_owned(),
+        index: index as u64,
+    }
+}
+
+/// See [`list_insert`] for the `index` widening note (applies to both
+/// `from_index` and `to_index` here).
+pub(super) fn list_move(
+    collection: &str,
+    document_id: &str,
+    list_path: &str,
+    from_index: usize,
+    to_index: usize,
+) -> ReplicatedWrite {
+    ReplicatedWrite::CrdtListMove {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        list_path: list_path.to_owned(),
+        from_index: from_index as u64,
+        to_index: to_index as u64,
     }
 }

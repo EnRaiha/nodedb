@@ -604,6 +604,46 @@ pub enum ReplicatedWrite {
         bytes: Vec<u8>,
     },
 
+    /// Insert a block (LoroMap) into a document's block list
+    /// (`CrdtOp::ListInsert`). Carries the operation's **intent** — not a
+    /// Loro delta — because the delta can only be computed by re-running the
+    /// live `execute_crdt_list_insert` handler against each replica's own
+    /// Loro state (mirrors the `CrdtListOpWalRecord` WAL payload's replay
+    /// contract). No surrogate field: the parent document's surrogate is
+    /// re-resolved from `document_id` on decode via `Surrogate::ZERO` /
+    /// assigner lookup, matching every other decode arm — the live dispatch
+    /// handler ignores the `CrdtOp::ListInsert::surrogate` field entirely, so
+    /// carrying it across the wire would be dead weight.
+    CrdtListInsert {
+        collection: String,
+        document_id: String,
+        list_path: String,
+        index: u64,
+        /// JSON-encoded field map for the inserted block.
+        fields_json: String,
+    },
+
+    /// Delete a block from a document's block list (`CrdtOp::ListDelete`).
+    /// Same intent-carrying replay contract as `CrdtListInsert`.
+    CrdtListDelete {
+        collection: String,
+        document_id: String,
+        list_path: String,
+        index: u64,
+    },
+
+    /// Move a block within a document's block list, reordering it
+    /// (`CrdtOp::ListMove`). `from_index` and `to_index` are two distinct
+    /// required fields — never an `Option<u64>` pair a truncated record
+    /// could decode with one silently defaulting to the other's value.
+    CrdtListMove {
+        collection: String,
+        document_id: String,
+        list_path: String,
+        from_index: u64,
+        to_index: u64,
+    },
+
     /// Dependent-read result broadcast for a Calvin txn.
     ///
     /// A passive participant proposes this entry to the per-vshard Raft group

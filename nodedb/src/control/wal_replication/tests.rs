@@ -415,6 +415,125 @@ fn crdt_apply_provenance_roundtrip() {
 }
 
 #[test]
+fn crdt_list_insert_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    let plan = PhysicalPlan::Crdt(CrdtOp::ListInsert {
+        collection: "notes".into(),
+        document_id: "doc-1".into(),
+        list_path: "blocks".into(),
+        index: 2,
+        fields_json: r#"{"type":"text"}"#.into(),
+        surrogate: Surrogate::ZERO,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("CrdtOp::ListInsert should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::ListInsert {
+            collection,
+            document_id,
+            list_path,
+            index,
+            fields_json,
+            ..
+        }) => {
+            assert_eq!(collection, "notes");
+            assert_eq!(document_id, "doc-1");
+            assert_eq!(list_path, "blocks");
+            assert_eq!(index, 2, "index must round-trip");
+            assert_eq!(fields_json, r#"{"type":"text"}"#);
+        }
+        other => panic!("expected CrdtOp::ListInsert, got {other:?}"),
+    }
+}
+
+#[test]
+fn crdt_list_delete_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    let plan = PhysicalPlan::Crdt(CrdtOp::ListDelete {
+        collection: "notes".into(),
+        document_id: "doc-1".into(),
+        list_path: "blocks".into(),
+        index: 5,
+        surrogate: Surrogate::ZERO,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("CrdtOp::ListDelete should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::ListDelete {
+            collection,
+            document_id,
+            list_path,
+            index,
+            ..
+        }) => {
+            assert_eq!(collection, "notes");
+            assert_eq!(document_id, "doc-1");
+            assert_eq!(list_path, "blocks");
+            assert_eq!(index, 5, "index must round-trip");
+        }
+        other => panic!("expected CrdtOp::ListDelete, got {other:?}"),
+    }
+}
+
+/// Also proves the fix motivating `CrdtListOpWalRecord`'s design: `from_index`
+/// and `to_index` are two distinct required wire fields, not one `Option<u64>`
+/// slot each — they round-trip distinctly and never collapse to the same
+/// value or to zero.
+#[test]
+fn crdt_list_move_roundtrip_distinct_indices() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    let plan = PhysicalPlan::Crdt(CrdtOp::ListMove {
+        collection: "notes".into(),
+        document_id: "doc-1".into(),
+        list_path: "blocks".into(),
+        from_index: 3,
+        to_index: 1,
+        surrogate: Surrogate::ZERO,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("CrdtOp::ListMove should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::ListMove {
+            collection,
+            document_id,
+            list_path,
+            from_index,
+            to_index,
+            ..
+        }) => {
+            assert_eq!(collection, "notes");
+            assert_eq!(document_id, "doc-1");
+            assert_eq!(list_path, "blocks");
+            assert_eq!(from_index, 3, "from_index must survive the round trip");
+            assert_eq!(to_index, 1, "to_index must survive the round trip");
+            assert_ne!(
+                from_index, to_index,
+                "distinct indices must never collapse to the same value"
+            );
+        }
+        other => panic!("expected CrdtOp::ListMove, got {other:?}"),
+    }
+}
+
+#[test]
 fn columnar_ingest_provenance_roundtrip() {
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
