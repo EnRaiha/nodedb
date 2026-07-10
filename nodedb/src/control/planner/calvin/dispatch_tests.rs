@@ -11,6 +11,26 @@ use crate::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::{ColumnarOp, CrdtOp, DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+fn crdt_apply_task(vshard: u32) -> PhysicalTask {
+    PhysicalTask {
+        tenant_id: TenantId::new(1),
+        vshard_id: VShardId::new(vshard),
+        database_id: crate::types::DatabaseId::DEFAULT,
+        plan: PhysicalPlan::Crdt(CrdtOp::Apply {
+            collection: format!("col_{vshard}"),
+            document_id: "id1".to_owned(),
+            delta: vec![],
+            peer_id: 0,
+            mutation_id: 0,
+            surrogate: nodedb_types::Surrogate::new(1),
+            provenance: None,
+            constraint_version_required: 0,
+        }),
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    }
+}
+
 fn doc_insert_task(vshard: u32) -> PhysicalTask {
     PhysicalTask {
         tenant_id: TenantId::new(1),
@@ -138,6 +158,27 @@ fn is_write_plan_classifies_columnar_update_and_delete() {
         is_write_plan(&delete),
         "ColumnarOp::Delete should be a write"
     );
+}
+
+#[test]
+fn classify_dispatch_multi_shard_counts_newly_widened_crdt_apply_write() {
+    // Before the `is_write_plan` widening, `CrdtOp::Apply` was misclassified
+    // as a read: `classify_dispatch` would have counted zero write vshards
+    // for this pair and returned `SingleShard`, silently dropping Calvin's
+    // cross-shard atomicity for a real two-vshard CRDT write.
+    let tasks = vec![crdt_apply_task(3), crdt_apply_task(7)];
+    let class = classify_dispatch(&tasks);
+    match class {
+        DispatchClass::MultiShard { vshards } => {
+            let v: Vec<u32> = vshards.into_iter().collect();
+            assert_eq!(
+                v,
+                vec![3, 7],
+                "CrdtOp::Apply must be counted as a write vshard"
+            );
+        }
+        other => panic!("expected MultiShard for two CrdtOp::Apply writes, got {other:?}"),
+    }
 }
 
 #[test]

@@ -36,94 +36,11 @@ use crate::control::planner::calvin::tx_class::build_static_tx_class;
 use crate::control::planner::calvin::types::{DispatchClass, DispatchOutcome};
 use crate::control::server::shared::session::TransactionState;
 use crate::types::VShardId;
-use nodedb_physical::physical_plan::{
-    DocumentOp, GraphOp, KvOp, PhysicalPlan, TimeseriesOp, VectorOp,
-};
+use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 
 pub use crate::control::planner::calvin::predicate::predicate_class;
-
-// ── is_write_plan ─────────────────────────────────────────────────────────────
-
-/// Returns `true` if the plan is a write operation.
-///
-/// Centralizing this avoids scattered `match` arms when new write variants
-/// are added. Reads, scans, and query operators return `false`.
-pub fn is_write_plan(plan: &PhysicalPlan) -> bool {
-    match plan {
-        // Document writes
-        PhysicalPlan::Document(op) => matches!(
-            op,
-            DocumentOp::PointPut { .. }
-                | DocumentOp::PointInsert { .. }
-                | DocumentOp::PointDelete { .. }
-                | DocumentOp::PointUpdate { .. }
-                | DocumentOp::BatchInsert { .. }
-                | DocumentOp::InsertSelect { .. }
-                | DocumentOp::Upsert { .. }
-                | DocumentOp::BulkUpdate { .. }
-                | DocumentOp::BulkDelete { .. }
-                | DocumentOp::UpdateFromJoin { .. }
-        ),
-        // KV writes
-        PhysicalPlan::Kv(op) => matches!(
-            op,
-            KvOp::Put { .. }
-                | KvOp::Insert { .. }
-                | KvOp::InsertIfAbsent { .. }
-                | KvOp::InsertOnConflictUpdate { .. }
-                | KvOp::Delete { .. }
-                | KvOp::BatchPut { .. }
-        ),
-        // Vector writes
-        PhysicalPlan::Vector(op) => matches!(
-            op,
-            VectorOp::Insert { .. }
-                | VectorOp::BatchInsert { .. }
-                | VectorOp::Delete { .. }
-                | VectorOp::DeleteBySurrogate { .. }
-                | VectorOp::SparseInsert { .. }
-                | VectorOp::SparseDelete { .. }
-                | VectorOp::MultiVectorInsert { .. }
-        ),
-        // Graph writes
-        PhysicalPlan::Graph(op) => {
-            matches!(op, GraphOp::EdgePut { .. } | GraphOp::EdgeDelete { .. })
-        }
-        // Timeseries writes
-        PhysicalPlan::Timeseries(op) => matches!(op, TimeseriesOp::Ingest { .. }),
-        // Columnar writes
-        PhysicalPlan::Columnar(op) => {
-            use nodedb_physical::physical_plan::ColumnarOp;
-            matches!(
-                op,
-                ColumnarOp::Insert { .. } | ColumnarOp::Update { .. } | ColumnarOp::Delete { .. }
-            )
-        }
-        // CRDT writes
-        PhysicalPlan::Crdt(op) => {
-            use nodedb_physical::physical_plan::CrdtOp;
-            matches!(
-                op,
-                CrdtOp::ListInsert { .. } | CrdtOp::ListDelete { .. } | CrdtOp::ListMove { .. }
-            )
-        }
-        // Array writes
-        PhysicalPlan::Array(op) => {
-            use nodedb_physical::physical_plan::ArrayOp;
-            matches!(
-                op,
-                ArrayOp::Put { .. } | ArrayOp::Delete { .. } | ArrayOp::Flush { .. }
-            )
-        }
-        // Everything else: reads, scans, queries, meta, spatial, text
-        PhysicalPlan::Spatial(_)
-        | PhysicalPlan::Text(_)
-        | PhysicalPlan::Query(_)
-        | PhysicalPlan::Meta(_)
-        | PhysicalPlan::ClusterArray(_) => false,
-    }
-}
+pub use crate::control::planner::calvin::write_class::is_write_plan;
 
 // ── is_dependent_predicate ────────────────────────────────────────────────────
 

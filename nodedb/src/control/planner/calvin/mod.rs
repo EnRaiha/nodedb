@@ -11,6 +11,7 @@ pub mod retry_loop;
 pub mod submit;
 pub mod tx_class;
 pub mod types;
+pub mod write_class;
 
 pub use cross_shard_mode::CrossShardTxnMode;
 pub use dependent_recon::{
