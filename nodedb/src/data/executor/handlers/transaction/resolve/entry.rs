@@ -424,12 +424,13 @@ fn classify_graph_op(
         | GraphOp::Stats { .. } => Ok(()),
 
         // Node-label mutations stage a delta (added/removed sets), not an
-        // absolute post-image, and no `RecordType` / redo decoder exists for
-        // a node-label WAL sub-record anywhere in the codebase (only edge
-        // Put/Delete are decoded by `wal_replay_redo_graph.rs`; the
-        // `ReplicatedWrite::SetNodeLabels` shape belongs to the unrelated
-        // Raft replication path). Silently omitting the change from the redo
-        // record would lose it on install, so this is a typed error.
+        // absolute post-image. `RecordType::GraphNodeLabelSet` /
+        // `GraphNodeLabelRemove` exist for the autocommit path
+        // (`wal_replay_graph_labels.rs`), but no `RedoSubRecord` shape or
+        // decoder exists yet for a delta-shaped node-label mutation staged
+        // inside a transaction (see `resolve/graph.rs`'s module doc).
+        // Silently omitting the change from the redo record would lose it on
+        // install, so this is a typed error.
         GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. } => {
             Err(crate::Error::PlanError {
                 detail: "graph node-label ops have no redo sub-record shape and are not \

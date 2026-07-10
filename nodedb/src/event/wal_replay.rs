@@ -163,6 +163,11 @@ fn record_to_event(record: &WalRecord, sequence: &mut u64) -> Option<WriteEvent>
         | RecordType::FtsDelete
         | RecordType::SpatialPut
         | RecordType::SpatialDelete
+        // GraphNodeLabelSet/Remove: not document/KV row mutations — replay is
+        // wired in `data::executor::wal_replay_graph_labels`, not the Event
+        // Plane's WriteEvent stream.
+        | RecordType::GraphNodeLabelSet
+        | RecordType::GraphNodeLabelRemove
         | RecordType::Noop => None,
     }
 }

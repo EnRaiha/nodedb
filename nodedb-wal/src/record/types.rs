@@ -229,6 +229,27 @@ pub enum RecordType {
     ///
     /// Required: skipping on replay would leave stale entries in the R-tree.
     SpatialDelete = 57 | 0x8000,
+
+    /// Graph engine: set one or more node labels on the bitset-based label
+    /// index (up to 64 distinct labels per partition).
+    ///
+    /// A dedicated type rather than riding `Put` with a boolean set/remove
+    /// flag or a trial-decoded arity: the payload is `(node_id, labels)`, an
+    /// arity that happens not to collide with any current `Put` tuple, but
+    /// aliasing a durability record on coincidental arity is exactly the
+    /// silent-corruption risk `wal_replay_redo_graph.rs` documents for the
+    /// edge `Put`/`Delete` disambiguation. Set/Remove get their own
+    /// discriminators instead — the same shape as the `VectorPut`/
+    /// `VectorDelete` and `SpatialPut`/`SpatialDelete` pairs above.
+    ///
+    /// Required: the node-label bitset (`CsrIndex::node_label_bits`) has no
+    /// other durable backing — unlike edges, which are rebuilt from the
+    /// `EdgeStore` (redb) at startup, labels exist only in memory until this
+    /// record is replayed.
+    GraphNodeLabelSet = 59 | 0x8000,
+
+    /// Graph engine: remove one or more node labels. See `GraphNodeLabelSet`.
+    GraphNodeLabelRemove = 60 | 0x8000,
 }
 
 impl RecordType {
@@ -271,6 +292,8 @@ impl RecordType {
             x if x == 55 | 0x8000 => Some(Self::FtsDelete),
             x if x == 56 | 0x8000 => Some(Self::SpatialPut),
             x if x == 57 | 0x8000 => Some(Self::SpatialDelete),
+            x if x == 59 | 0x8000 => Some(Self::GraphNodeLabelSet),
+            x if x == 60 | 0x8000 => Some(Self::GraphNodeLabelRemove),
             _ => None,
         }
     }
@@ -296,6 +319,12 @@ mod tests {
         assert!(RecordType::is_required(RecordType::SpatialPut as u32));
         assert!(RecordType::is_required(RecordType::SpatialDelete as u32));
         assert!(RecordType::is_required(RecordType::TransactionRedo as u32));
+        assert!(RecordType::is_required(
+            RecordType::GraphNodeLabelSet as u32
+        ));
+        assert!(RecordType::is_required(
+            RecordType::GraphNodeLabelRemove as u32
+        ));
     }
 
     #[test]
@@ -332,6 +361,8 @@ mod tests {
             RecordType::FtsDelete,
             RecordType::SpatialPut,
             RecordType::SpatialDelete,
+            RecordType::GraphNodeLabelSet,
+            RecordType::GraphNodeLabelRemove,
         ] {
             assert_eq!(RecordType::from_raw(ty as u32), Some(ty));
         }

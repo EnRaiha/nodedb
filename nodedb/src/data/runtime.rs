@@ -211,6 +211,11 @@ pub fn spawn_core(
                 core.replay_crdt_wal(&wal_records, num_cores, &tombstones);
                 core.replay_fts_wal(&wal_records, num_cores, &tombstones);
                 core.replay_spatial_wal(&wal_records, num_cores, &tombstones);
+                // Graph node labels have no redb-backed durability (unlike
+                // edges, rebuilt into the CSR from the `EdgeStore` before this
+                // replay sequence runs) — a WAL record is their only durable
+                // backing, so they get their own standalone replay pass here.
+                core.replay_graph_node_label_wal(&wal_records, num_cores);
 
                 // Replay committed-transaction redo groups LAST among the
                 // engine replays: each `TransactionRedo` record is decomposed

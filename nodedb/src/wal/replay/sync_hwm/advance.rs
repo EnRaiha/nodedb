@@ -112,7 +112,9 @@ pub fn replay_sync_hwm_records(
             | RecordType::FtsIndex
             | RecordType::FtsDelete
             | RecordType::SpatialPut
-            | RecordType::SpatialDelete => {}
+            | RecordType::SpatialDelete
+            | RecordType::GraphNodeLabelSet
+            | RecordType::GraphNodeLabelRemove => {}
         }
     }
 

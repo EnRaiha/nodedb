@@ -422,10 +422,28 @@ pub async fn set_node_labels(
 
     // A node label is single-keyed on `node_id`, so it is SINGLE-HOME: route the
     // write to the node's home vShard `from_key(node_id)` and replicate via Raft,
-    // exactly like the edge F1a single-home fast path. `dispatch_sync_response`
-    // provides WAL durability + Raft replication internally, so no separate
-    // `wal_append_if_write` is needed (and adding one would double-append the WAL
-    // record). Calvin is not involved — there is only one home vShard.
+    // exactly like the edge F1a single-home fast path. Calvin is not involved —
+    // there is only one home vShard.
+    //
+    // The node-label bitset has no redb-backed durability of its own (unlike
+    // edges, which survive via redb's synchronous commit at apply time and are
+    // rebuilt from there at startup) — a WAL record is its only durable
+    // backing. `dispatch_sync_response`'s single-node fallback dispatches
+    // straight to the Data Plane with no WAL append of its own, so this write
+    // is appended to the local WAL here, unconditionally and before dispatch —
+    // mirroring the spatial/FTS sync handlers' pattern of always appending
+    // locally even when a Raft proposer is wired: Raft replication and this
+    // node's own crash-recovery replay are independent concerns, and the local
+    // WAL is what the graph node-label replay pass reads on restart.
+    crate::control::server::wal_dispatch::wal_append_if_write(
+        &state.wal,
+        tenant_id,
+        vshard_id,
+        DatabaseId::DEFAULT,
+        &plan,
+    )
+    .map_err(|e| ddl_err("XX000", e.to_string()))?;
+
     crate::control::server::sync::raft_dispatch::dispatch_sync_response(
         state,
         tenant_id,

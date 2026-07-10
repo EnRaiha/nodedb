@@ -212,6 +212,14 @@ pub fn wal_append_if_write_with_creds(
                 })?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
+        PhysicalPlan::Graph(GraphOp::SetNodeLabels { node_id, labels }) => {
+            let entry = super::encode_graph_node_label_payload(node_id, labels)?;
+            Some(wal.append_graph_node_label_set(tenant_id, vshard_id, database_id, &entry)?)
+        }
+        PhysicalPlan::Graph(GraphOp::RemoveNodeLabels { node_id, labels }) => {
+            let entry = super::encode_graph_node_label_payload(node_id, labels)?;
+            Some(wal.append_graph_node_label_remove(tenant_id, vshard_id, database_id, &entry)?)
+        }
         PhysicalPlan::Columnar(nodedb_physical::physical_plan::ColumnarOp::Insert {
             collection,
             payload,

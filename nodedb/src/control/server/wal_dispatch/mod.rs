@@ -6,6 +6,7 @@
 //! WAL record type. Read operations are no-ops.
 
 mod core;
+mod graph_labels;
 mod timeseries;
 mod vector;
 
@@ -18,6 +19,7 @@ pub use vector::{
 
 // Payload encoders shared by the autocommit WAL path and transaction resolve, so
 // each engine's record shape lives in exactly one place.
+pub(crate) use graph_labels::encode_graph_node_label_payload;
 pub(crate) use timeseries::{encode_columnar_batch_payload, encode_timeseries_batch_payload};
 pub(crate) use vector::{
     encode_vector_batch_put_payload, encode_vector_delete_by_surrogate_payload,

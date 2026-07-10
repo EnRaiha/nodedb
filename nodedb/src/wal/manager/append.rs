@@ -412,6 +412,30 @@ impl WalManager {
         self.append_record(RecordType::SpatialDelete, tid, vs, db, p)
     }
 
+    /// Append a `GraphNodeLabelSet` record. Payload is produced by
+    /// `encode_graph_node_label_payload`.
+    pub fn append_graph_node_label_set(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        p: &[u8],
+    ) -> crate::Result<Lsn> {
+        self.append_record(RecordType::GraphNodeLabelSet, tid, vs, db, p)
+    }
+
+    /// Append a `GraphNodeLabelRemove` record. Payload is produced by
+    /// `encode_graph_node_label_payload`.
+    pub fn append_graph_node_label_remove(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        p: &[u8],
+    ) -> crate::Result<Lsn> {
+        self.append_record(RecordType::GraphNodeLabelRemove, tid, vs, db, p)
+    }
+
     pub fn append_collection_tombstone(
         &self,
         tid: TenantId,

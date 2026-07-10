@@ -71,7 +71,9 @@ pub fn replay_surrogate_records(
             | RecordType::FtsIndex
             | RecordType::FtsDelete
             | RecordType::SpatialPut
-            | RecordType::SpatialDelete => {}
+            | RecordType::SpatialDelete
+            | RecordType::GraphNodeLabelSet
+            | RecordType::GraphNodeLabelRemove => {}
         }
     }
     Ok(stats)

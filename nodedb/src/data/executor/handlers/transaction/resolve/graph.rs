@@ -34,13 +34,14 @@
 //! ## Node-label ops
 //!
 //! `SetNodeLabels` / `RemoveNodeLabels` stage a delta (`NodeLabelDelta`:
-//! added/removed sets), not an absolute post-image, and no `RecordType`
-//! variant or redo decoder exists for a node-label WAL sub-record anywhere in
-//! the codebase (`wal_replay_redo_graph.rs` decodes only edge Put/Delete; the
-//! `ReplicatedWrite::SetNodeLabels` shape belongs to the unrelated Raft
-//! replication encode/decode path, not the `RedoSubRecord` family transaction
-//! resolve produces). `entry.rs` therefore raises a typed error for both
-//! rather than silently dropping the label change from the redo record.
+//! added/removed sets), not an absolute post-image. `RecordType::GraphNodeLabelSet`
+//! / `GraphNodeLabelRemove` now exist for the AUTOCOMMIT path
+//! (`wal_replay_graph_labels.rs`), but no `RedoSubRecord` shape or decoder
+//! exists yet for a node-label mutation staged inside a transaction — that
+//! would need a delta-shaped sub-record distinct from the autocommit
+//! set/remove payload, which carries a flat label list, not an added/removed
+//! delta. `entry.rs` therefore still raises a typed error for both rather
+//! than silently dropping the staged label change from the redo record.
 //!
 //! ## Determinism
 //!
