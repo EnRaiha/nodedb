@@ -1,8 +1,71 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+//! WAL append dispatch + payload encoders for the columnar-family engines
+//! (`PhysicalPlan::Timeseries` and the columnar batch/DML records).
+
+#![deny(clippy::wildcard_enum_match_arm)]
+
+use nodedb_physical::physical_plan::TimeseriesOp;
+
 use crate::control::security::credential::CredentialStore;
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::manager::WalManager;
+
+/// Append the WAL record for a single `TimeseriesOp`, returning the allocated
+/// LSN for the ingest write (`Some`), `None` for `Scan`, and `None` when the
+/// collection is configured `wal=false` (WAL bypass).
+///
+/// The match over [`TimeseriesOp`] is **exhaustive** (`wildcard_enum_match_arm`
+/// is denied), so a future write variant cannot silently become non-durable.
+///
+/// `credentials` is threaded through solely for the per-collection WAL-bypass
+/// check on `Ingest`; it is `None` on paths that never bypass.
+pub(super) fn wal_append_timeseries_op(
+    wal: &WalManager,
+    tenant_id: TenantId,
+    vshard_id: VShardId,
+    database_id: DatabaseId,
+    op: &TimeseriesOp,
+    credentials: Option<&CredentialStore>,
+) -> crate::Result<Option<Lsn>> {
+    let appended = match op {
+        TimeseriesOp::Ingest {
+            collection,
+            payload,
+            format: _,
+            provenance,
+            ..
+        } => {
+            // WAL bypass: skip WAL if collection has wal=false in timeseries_config.
+            if let Some(creds) = credentials
+                && let Ok(Some(coll)) = creds.catalog().get_collection(
+                    DatabaseId::DEFAULT,
+                    tenant_id.as_u64(),
+                    collection,
+                )
+                && let Some(config) = coll.get_timeseries_config()
+                && config.get("wal").and_then(|v| v.as_str()) == Some("false")
+            {
+                // WAL bypassed — acceptable data loss of last flush interval on crash.
+                None
+            } else {
+                // Provenance is appended last; older 3-element decoders ignore
+                // the trailing field via their arity-fallback paths.
+                let wal_payload =
+                    encode_timeseries_batch_payload(collection, payload, provenance.as_ref())?;
+                Some(wal.append_timeseries_batch(
+                    tenant_id,
+                    vshard_id,
+                    database_id,
+                    &wal_payload,
+                )?)
+            }
+        }
+        // NotAWrite — reads / query ops / DDL that produces no engine mutation here
+        TimeseriesOp::Scan { .. } => None,
+    };
+    Ok(appended)
+}
 
 /// Encode the payload of a `TimeseriesBatch` WAL record for a timeseries
 /// ingest.
@@ -159,4 +222,81 @@ pub fn wal_append_columnar(
     let wal_payload = encode_columnar_batch_payload(collection, payload, provenance, surrogates)?;
     let lsn = wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?;
     Ok(Some(lsn))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_physical::physical_plan::PhysicalPlan;
+
+    fn open_wal(dir: &std::path::Path) -> WalManager {
+        WalManager::open_for_testing(&dir.join("test.wal")).expect("open wal")
+    }
+
+    fn has_record_of_type(wal: &WalManager, record_type: nodedb_wal::record::RecordType) -> bool {
+        wal.sync().expect("sync wal");
+        wal.replay().expect("read wal").into_iter().any(|r| {
+            nodedb_wal::record::RecordType::from_raw(r.logical_record_type()) == Some(record_type)
+        })
+    }
+
+    #[test]
+    fn ingest_appends_timeseries_batch_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: "metrics".to_string(),
+            payload: vec![1, 2, 3],
+            format: "samples".to_string(),
+            wal_lsn: None,
+            surrogates: vec![],
+            provenance: None,
+        });
+
+        // No credentials => no WAL bypass; the ingest must produce a record.
+        let outcome = super::super::wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        )
+        .expect("append");
+        assert!(outcome.lsn.is_some(), "Ingest must produce a durable LSN");
+        assert!(has_record_of_type(
+            &wal,
+            nodedb_wal::record::RecordType::TimeseriesBatch
+        ));
+    }
+
+    #[test]
+    fn scan_appends_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Scan {
+            collection: "metrics".to_string(),
+            time_range: (0, i64::MAX),
+            projection: vec![],
+            limit: 10,
+            filters: vec![],
+            bucket_interval_ms: 0,
+            group_by: vec![],
+            aggregates: vec![],
+            gap_fill: String::new(),
+            computed_columns: vec![],
+            rls_filters: vec![],
+            system_time: Default::default(),
+            valid_at_ms: None,
+        });
+
+        let outcome = super::super::wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        )
+        .expect("append");
+        assert!(outcome.lsn.is_none(), "Scan must produce no durable LSN");
+    }
 }

@@ -5,7 +5,11 @@
 //! Serializes write plans as MessagePack and appends to the appropriate
 //! WAL record type. Read operations are no-ops.
 
+mod array;
+mod columnar;
 mod core;
+mod crdt;
+mod document;
 mod graph;
 mod graph_labels;
 mod spatial;
