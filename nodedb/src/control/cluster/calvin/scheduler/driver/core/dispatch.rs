@@ -8,81 +8,13 @@ use tracing::error;
 
 use nodedb_cluster::calvin::types::SequencedTxn;
 
+use super::routing::{PlanRouting, plan_vshard};
 use super::scheduler::Scheduler;
 use crate::bridge::envelope::{Priority, Request};
 use crate::control::cluster::calvin::scheduler::lock_manager::{LockKey, TxnId};
 use crate::types::{DatabaseId, ReadConsistency, VShardId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::MetaOp;
-use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, GraphOp, KvOp, TimeseriesOp, VectorOp};
-
-/// Returns the vShards a plan participates in. Most plans are collection-homed
-/// (a single vShard). Graph edge plans are dual-homed: they participate in BOTH
-/// `from_key(src)` and `from_key(dst)` (deduped if equal). An empty vec means
-/// the plan is not routable.
-pub(crate) fn plan_vshard(plan: &PhysicalPlan) -> Vec<VShardId> {
-    let collection = match plan {
-        PhysicalPlan::Document(
-            DocumentOp::PointPut { collection, .. }
-            | DocumentOp::PointInsert { collection, .. }
-            | DocumentOp::PointDelete { collection, .. }
-            | DocumentOp::PointUpdate { collection, .. }
-            | DocumentOp::BatchInsert { collection, .. }
-            | DocumentOp::InsertSelect {
-                target_collection: collection,
-                ..
-            }
-            | DocumentOp::Upsert { collection, .. }
-            | DocumentOp::BulkUpdate { collection, .. }
-            | DocumentOp::BulkDelete { collection, .. },
-        ) => collection.as_str(),
-        PhysicalPlan::Kv(
-            KvOp::Put { collection, .. }
-            | KvOp::Insert { collection, .. }
-            | KvOp::InsertIfAbsent { collection, .. }
-            | KvOp::InsertOnConflictUpdate { collection, .. }
-            | KvOp::Delete { collection, .. }
-            | KvOp::BatchPut { collection, .. },
-        ) => collection.as_str(),
-        PhysicalPlan::Vector(
-            VectorOp::Insert { collection, .. }
-            | VectorOp::BatchInsert { collection, .. }
-            | VectorOp::Delete { collection, .. }
-            | VectorOp::DeleteBySurrogate { collection, .. }
-            | VectorOp::SparseInsert { collection, .. }
-            | VectorOp::SparseDelete { collection, .. }
-            | VectorOp::MultiVectorInsert { collection, .. },
-        ) => collection.as_str(),
-        // Edge plans are key-homed (dual-homed across endpoints),
-        // not collection-homed: route to from_key(src) ∪ from_key(dst).
-        PhysicalPlan::Graph(
-            GraphOp::EdgePut { src_id, dst_id, .. } | GraphOp::EdgeDelete { src_id, dst_id, .. },
-        ) => {
-            let src_vshard = VShardId::from_key(src_id.as_bytes());
-            let dst_vshard = VShardId::from_key(dst_id.as_bytes());
-            if src_vshard.as_u32() == dst_vshard.as_u32() {
-                return vec![src_vshard];
-            }
-            return vec![src_vshard, dst_vshard];
-        }
-        PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. }) => collection.as_str(),
-        PhysicalPlan::Columnar(nodedb_physical::physical_plan::ColumnarOp::Insert {
-            collection,
-            ..
-        }) => collection.as_str(),
-        PhysicalPlan::Crdt(
-            CrdtOp::Apply { collection, .. }
-            | CrdtOp::ListInsert { collection, .. }
-            | CrdtOp::ListDelete { collection, .. }
-            | CrdtOp::ListMove { collection, .. },
-        ) => collection.as_str(),
-        _ => return Vec::new(),
-    };
-    vec![VShardId::from_collection_in_database(
-        DatabaseId::DEFAULT,
-        collection,
-    )]
-}
 
 /// Whether this vShard's slice carries a PRIMARY user data write — the write
 /// whose applied `Response` (affected-count + any RETURNING rows) the
@@ -137,17 +69,41 @@ impl Scheduler {
     ) -> crate::Result<Vec<PhysicalPlan>> {
         let mut local = Vec::new();
         for plan in plans {
-            let plan_vshards = plan_vshard(&plan);
-            if plan_vshards.is_empty() {
-                return Err(crate::Error::Internal {
-                    detail: format!(
-                        "calvin txn {epoch}/{position} contains non-routable plan for vshard {}",
-                        self.vshard_id
-                    ),
-                });
-            }
-            if plan_vshards.iter().any(|v| v.as_u32() == self.vshard_id) {
-                local.push(plan);
+            match plan_vshard(&plan) {
+                PlanRouting::Vshards(vshards) => {
+                    if vshards.iter().any(|v| v.as_u32() == self.vshard_id) {
+                        local.push(plan);
+                    }
+                }
+                PlanRouting::ControlPlaneOnly => {
+                    return Err(crate::Error::Internal {
+                        detail: format!(
+                            "calvin txn {epoch}/{position} for vshard {} carries a \
+                             control-plane-only plan that must never reach the Data \
+                             Plane: {plan:?}",
+                            self.vshard_id
+                        ),
+                    });
+                }
+                PlanRouting::Unroutable(reason) => {
+                    return Err(crate::Error::Internal {
+                        detail: format!(
+                            "calvin txn {epoch}/{position} for vshard {} contains an \
+                             unroutable plan ({reason}): {plan:?}",
+                            self.vshard_id
+                        ),
+                    });
+                }
+                PlanRouting::NotAWrite => {
+                    return Err(crate::Error::Internal {
+                        detail: format!(
+                            "calvin txn {epoch}/{position} for vshard {} contains a \
+                             non-write (read/DDL) plan inside a Calvin write \
+                             transaction: {plan:?}",
+                            self.vshard_id
+                        ),
+                    });
+                }
             }
         }
 
@@ -435,112 +391,5 @@ impl Scheduler {
                 commit_state: None,
             },
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::plan_vshard;
-    use nodedb_physical::physical_plan::{CrdtOp, GraphOp, PhysicalPlan};
-    use nodedb_types::Surrogate;
-    use nodedb_types::id::VShardId;
-
-    /// Find two distinct string keys whose `from_key` vShards differ.
-    fn two_distinct_key_vshards() -> (String, String, u32, u32) {
-        let mut first: Option<(String, u32)> = None;
-        for i in 0u32..2048 {
-            let key = format!("node_{i}");
-            let v = VShardId::from_key(key.as_bytes()).as_u32();
-            if let Some((ref fkey, fv)) = first {
-                if fv != v {
-                    return (fkey.clone(), key, fv, v);
-                }
-            } else {
-                first = Some((key, v));
-            }
-        }
-        panic!("could not find two distinct-vshard keys in 2048 tries");
-    }
-
-    #[test]
-    fn plan_vshard_routes_edge_to_both_endpoints() {
-        let (src_id, dst_id, src_v, dst_v) = two_distinct_key_vshards();
-        assert_ne!(src_v, dst_v);
-
-        let plan = PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "follows".to_owned(),
-            src_id: src_id.clone(),
-            label: "knows".to_owned(),
-            dst_id: dst_id.clone(),
-            properties: Vec::new(),
-            src_surrogate: Surrogate::new(1),
-            dst_surrogate: Surrogate::new(2),
-        });
-
-        let mut got: Vec<u32> = plan_vshard(&plan).iter().map(|v| v.as_u32()).collect();
-        got.sort();
-        let mut want = vec![src_v, dst_v];
-        want.sort();
-        assert_eq!(got, want, "edge plan routes to both from_key endpoints");
-    }
-
-    #[test]
-    fn plan_vshard_single_when_endpoints_collide() {
-        // src == dst → a single deduped vShard.
-        let key = "self".to_owned();
-        let v = VShardId::from_key(key.as_bytes()).as_u32();
-        let plan = PhysicalPlan::Graph(GraphOp::EdgePut {
-            collection: "follows".to_owned(),
-            src_id: key.clone(),
-            label: "knows".to_owned(),
-            dst_id: key,
-            properties: Vec::new(),
-            src_surrogate: Surrogate::new(1),
-            dst_surrogate: Surrogate::new(1),
-        });
-        let got: Vec<u32> = plan_vshard(&plan).iter().map(|v| v.as_u32()).collect();
-        assert_eq!(got, vec![v]);
-    }
-
-    #[test]
-    fn plan_vshard_routes_crdt_list_ops_to_collection_vshard() {
-        let list_ops = [
-            (
-                "ListInsert",
-                PhysicalPlan::Crdt(CrdtOp::ListInsert {
-                    collection: "docs".to_owned(),
-                    document_id: "id1".to_owned(),
-                    list_path: "blocks".to_owned(),
-                    index: 0,
-                    fields_json: "{}".to_owned(),
-                    surrogate: Surrogate::new(1),
-                }),
-            ),
-            (
-                "ListDelete",
-                PhysicalPlan::Crdt(CrdtOp::ListDelete {
-                    collection: "docs".to_owned(),
-                    document_id: "id1".to_owned(),
-                    list_path: "blocks".to_owned(),
-                    index: 0,
-                    surrogate: Surrogate::new(1),
-                }),
-            ),
-            (
-                "ListMove",
-                PhysicalPlan::Crdt(CrdtOp::ListMove {
-                    collection: "docs".to_owned(),
-                    document_id: "id1".to_owned(),
-                    list_path: "blocks".to_owned(),
-                    from_index: 0,
-                    to_index: 1,
-                    surrogate: Surrogate::new(1),
-                }),
-            ),
-        ];
-
-        for (name, plan) in &list_ops {
-            assert!(!plan_vshard(plan).is_empty(), "{name} must be routable");
-        }
     }
 }

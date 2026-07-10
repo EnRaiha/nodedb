@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::cluster::calvin::scheduler::driver::core::dispatch::plan_vshard;
+use crate::control::cluster::calvin::scheduler::driver::core::routing::{PlanRouting, plan_vshard};
 use crate::control::cluster::calvin::scheduler::lock_manager::{LockManager, TxnId};
 use crate::control::planner::calvin::is_dependent_predicate;
 use crate::control::state::SharedState;
@@ -137,9 +137,14 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
     let is_predicate = is_dependent_predicate(target.plan);
     let vshard = match &point_keys {
         Some((v, _)) => *v,
-        None if is_predicate => match plan_vshard(target.plan).as_slice() {
-            [v] => *v,
-            _ => return WriteAdmission::FastPath { guard: None },
+        None if is_predicate => match plan_vshard(target.plan) {
+            PlanRouting::Vshards(v) => match v.as_slice() {
+                [v] => *v,
+                _ => return WriteAdmission::FastPath { guard: None },
+            },
+            PlanRouting::ControlPlaneOnly | PlanRouting::NotAWrite | PlanRouting::Unroutable(_) => {
+                return WriteAdmission::FastPath { guard: None };
+            }
         },
         None => return WriteAdmission::FastPath { guard: None },
     };

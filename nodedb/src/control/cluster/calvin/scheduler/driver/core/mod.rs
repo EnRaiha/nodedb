@@ -13,6 +13,8 @@
 //! - [`process`] — new-txn processing, dependent-read barrier setup,
 //!   txn-completion bookkeeping.
 //! - [`dispatch`] — static / active dispatch to the Data Plane executor.
+//! - [`routing`] — exhaustive `PhysicalPlan` → vshard routing oracle used by
+//!   `dispatch`'s local-plan filtering.
 //! - [`commit_resolve`] — verdict-driven flush-or-drop of a staged static
 //!   transaction, plus the shared commit tail.
 //! - [`read_result`] — `CalvinReadResult` handling and barrier timeouts.
@@ -38,6 +40,7 @@ pub mod dispatch;
 pub mod process;
 pub mod propose;
 pub mod read_result;
+pub mod routing;
 pub mod scheduler;
 pub mod write_version_record;
 

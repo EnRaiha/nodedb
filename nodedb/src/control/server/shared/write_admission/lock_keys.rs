@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::cluster::calvin::scheduler::driver::core::dispatch::plan_vshard;
+use crate::control::cluster::calvin::scheduler::driver::core::routing::{PlanRouting, plan_vshard};
 use crate::control::cluster::calvin::scheduler::lock_manager::LockKey;
 use crate::types::VShardId;
 use nodedb_physical::physical_plan::{DocumentOp, GraphOp, KvOp, VectorOp};
@@ -31,10 +31,17 @@ use nodedb_physical::physical_plan::{DocumentOp, GraphOp, KvOp, VectorOp};
 pub(crate) fn plan_lock_keys(plan: &PhysicalPlan) -> Option<(VShardId, BTreeSet<LockKey>)> {
     // Point writes home to exactly one vShard. `plan_vshard` returns two vShards
     // for a cross-home graph edge; such an edge has no single `(vShard, keys)`
-    // representation, so it is ineligible for the fast path.
-    let vshard = match plan_vshard(plan).as_slice() {
-        [v] => *v,
-        _ => return None,
+    // representation, so it is ineligible for the fast path. Any non-`Vshards`
+    // routing (control-plane-only, non-write, or a known-unroutable gap) is
+    // likewise ineligible — the scheduler / gate above this handles those.
+    let vshard = match plan_vshard(plan) {
+        PlanRouting::Vshards(v) => match v.as_slice() {
+            [v] => *v,
+            _ => return None,
+        },
+        PlanRouting::ControlPlaneOnly | PlanRouting::NotAWrite | PlanRouting::Unroutable(_) => {
+            return None;
+        }
     };
     let key = point_lock_key(plan)?;
     let mut keys = BTreeSet::new();
