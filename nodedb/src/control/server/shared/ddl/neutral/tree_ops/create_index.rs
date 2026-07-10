@@ -18,12 +18,16 @@
 //! 3. **schema_version gated**: `state.schema_version.bump()` runs only
 //!    on success so consumers observing catalog version do not see a
 //!    half-built index.
-//! 4. **WAL-backed + replicated**: each batch is dispatched via
-//!    `dispatch_sync_response`, which proposes the write through the
-//!    destination shard's Raft group. The committed log entry is the
-//!    durable record (so a mid-build crash replays the edges) and it
-//!    reaches every replica under RF>1 — no separate WAL append, and no
-//!    local-only dispatch that would strand the index on one node.
+//! 4. **WAL-backed + replicated**: each batch is first appended to the
+//!    local WAL via `wal_append_if_write` (one `Put`/`Delete` record per
+//!    edge — see `wal_dispatch/graph.rs`), which is what makes the write
+//!    durable on a single-node deployment. It is then dispatched via
+//!    `dispatch_sync_response`, which additionally proposes the write
+//!    through the destination shard's Raft group under RF>1 so every
+//!    replica receives it — the local WAL append and the Raft-replicated
+//!    log entry are two independent durability mechanisms, exactly like
+//!    every other sync-style ingest path (FTS, spatial, vector) in this
+//!    codebase, not a duplicate of the same record.
 //! 5. **Broadcast scan**: documents live on hash-of-doc-id vshards, not
 //!    the collection-name vshard. The scan uses `broadcast_to_all_cores`
 //!    to see every document, then partitions the resulting edges by
@@ -188,11 +192,20 @@ pub async fn create_graph_index(
         let plan = PhysicalPlan::Graph(GraphOp::EdgePutBatch {
             edges: edges.clone(),
         });
-        // Route the batch to its destination vShard and replicate via Raft.
-        // `dispatch_sync_response` provides WAL durability + Raft replication
-        // internally (the proposed log entry IS the durable record), so no
-        // separate `wal_append_if_write` is needed — and under RF>1 the index
-        // edges now reach every follower instead of landing local-only.
+        // Append locally first so the batch is durable even on a single-node
+        // deployment with no Raft proposer configured (see the module doc
+        // comment, point 4). `dispatch_sync_response` below additionally
+        // replicates via Raft under RF>1 — a second, independent durability
+        // mechanism, not a duplicate WAL record.
+        crate::control::server::wal_dispatch::wal_append_if_write(
+            &state.wal,
+            tenant_id,
+            shard,
+            DatabaseId::DEFAULT,
+            &plan,
+        )
+        .map_err(|e| ddl_err("XX000", format!("edge-insert WAL append failed: {e}")))?;
+
         match crate::control::server::sync::raft_dispatch::dispatch_sync_response(
             state,
             tenant_id,
@@ -259,11 +272,21 @@ async fn surface_failure(
         });
         let shard = *shard;
         async move {
+            // Same local-WAL-then-Raft-dispatch discipline as the forward
+            // path above: append locally first so the rollback tombstones
+            // are durable on single-node, then dispatch (which additionally
+            // replicates via Raft under RF>1).
+            if let Err(e) = crate::control::server::wal_dispatch::wal_append_if_write(
+                &state.wal,
+                tenant_id,
+                shard,
+                DatabaseId::DEFAULT,
+                &plan,
+            ) {
+                return (shard, Err(e));
+            }
             (
                 shard,
-                // Same Raft-proposing path as the forward dispatch:
-                // `dispatch_sync_response` carries WAL durability + replication
-                // internally, so the rollback tombstones reach every replica.
                 crate::control::server::sync::raft_dispatch::dispatch_sync_response(
                     state,
                     tenant_id,

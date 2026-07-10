@@ -6,7 +6,10 @@
 //! WAL record type. Read operations are no-ops.
 
 mod core;
+mod graph;
 mod graph_labels;
+mod spatial;
+mod text;
 mod timeseries;
 mod vector;
 

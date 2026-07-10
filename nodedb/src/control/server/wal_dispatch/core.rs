@@ -276,6 +276,29 @@ pub fn wal_append_if_write_with_creds(
             let entry = super::encode_graph_node_label_payload(node_id, labels)?;
             Some(wal.append_graph_node_label_remove(tenant_id, vshard_id, database_id, &entry)?)
         }
+        // Batched edge writes (`CREATE GRAPH INDEX` build / rollback). Each
+        // edge is appended as its own single-edge `Put`/`Delete` record,
+        // byte-identical in shape to the non-batch `EdgePut`/`EdgeDelete`
+        // arms above — see `wal_dispatch/graph.rs` for the encoding and the
+        // documented last-LSN-as-watermark / explicit-empty-batch contract.
+        PhysicalPlan::Graph(GraphOp::EdgePutBatch { edges }) => {
+            super::graph::wal_append_graph_edge_put_batch(
+                wal,
+                tenant_id,
+                vshard_id,
+                database_id,
+                edges,
+            )?
+        }
+        PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch { edges }) => {
+            super::graph::wal_append_graph_edge_delete_batch(
+                wal,
+                tenant_id,
+                vshard_id,
+                database_id,
+                edges,
+            )?
+        }
         PhysicalPlan::Columnar(nodedb_physical::physical_plan::ColumnarOp::Insert {
             collection,
             payload,
@@ -418,12 +441,22 @@ pub fn wal_append_if_write_with_creds(
                 })?;
             Some(wal.append_array_delete(tenant_id, vshard_id, database_id, &bytes)?)
         }
+        // All Text-engine ops route through one match over `TextOp` (mirrors
+        // `PhysicalPlan::Vector(op)` above) so a future write variant cannot
+        // silently become non-durable.
+        PhysicalPlan::Text(op) => {
+            super::text::wal_append_text_op(wal, tenant_id, vshard_id, database_id, op)?
+        }
+        // Likewise for Spatial.
+        PhysicalPlan::Spatial(op) => {
+            super::spatial::wal_append_spatial_op(wal, tenant_id, vshard_id, database_id, op)?
+        }
         // Non-vector reads and control commands: no WAL needed. Every vector
         // write is handled above by the exhaustive `wal_append_vector_op`, so
         // this arm covers only non-vector read/scan ops, the non-write sub-ops
-        // of Document / Graph / Kv / Columnar / Timeseries, and the Text /
-        // Spatial / Query / Meta / ClusterArray plans (whose durable writes,
-        // where any, are logged on their own dedicated paths).
+        // of Document / Graph / Kv / Columnar / Timeseries, and the Query /
+        // Meta / ClusterArray plans (whose durable writes, where any, are
+        // logged on their own dedicated paths).
         _ => None,
     };
     Ok(WalAppendOutcome {
@@ -440,4 +473,165 @@ fn encode_crdt_list_op_payload(payload: crate::wal::CrdtListOpWalRecord) -> crat
         format: "msgpack".into(),
         detail: format!("wal crdt list op: {e}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_physical::physical_plan::{SpatialOp, TextOp};
+    use nodedb_types::Surrogate;
+    use nodedb_types::geometry::Geometry;
+
+    fn open_wal(dir: &std::path::Path) -> WalManager {
+        WalManager::open_for_testing(&dir.join("test.wal")).expect("open wal")
+    }
+
+    fn last_record_of_type(
+        wal: &WalManager,
+        record_type: nodedb_wal::record::RecordType,
+    ) -> nodedb_wal::WalRecord {
+        wal.sync().expect("sync wal");
+        wal.replay()
+            .expect("read wal")
+            .into_iter()
+            .rfind(|r| {
+                nodedb_wal::record::RecordType::from_raw(r.logical_record_type())
+                    == Some(record_type)
+            })
+            .expect("expected record of this type")
+    }
+
+    #[test]
+    fn fts_index_doc_appends_and_decodes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let plan = PhysicalPlan::Text(TextOp::FtsIndexDoc {
+            collection: "docs".to_string(),
+            surrogate: Surrogate::new(7),
+            text: "hello world".to_string(),
+            provenance: None,
+        });
+
+        let outcome = wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        )
+        .expect("append");
+        assert!(
+            outcome.lsn.is_some(),
+            "FtsIndexDoc must produce a durable LSN"
+        );
+
+        let record = last_record_of_type(&wal, nodedb_wal::record::RecordType::FtsIndex);
+        let decoded =
+            nodedb_wal::record::FtsIndexPayload::from_bytes(&record.payload).expect("decode");
+        assert_eq!(decoded.collection, "docs");
+        assert_eq!(decoded.text, "hello world");
+        assert_eq!(
+            decoded.doc_id,
+            crate::engine::document::store::surrogate_to_doc_id(Surrogate::new(7))
+        );
+    }
+
+    #[test]
+    fn fts_delete_doc_appends_and_decodes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let plan = PhysicalPlan::Text(TextOp::FtsDeleteDoc {
+            collection: "docs".to_string(),
+            surrogate: Surrogate::new(7),
+            provenance: None,
+        });
+
+        let outcome = wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        )
+        .expect("append");
+        assert!(
+            outcome.lsn.is_some(),
+            "FtsDeleteDoc must produce a durable LSN"
+        );
+
+        let record = last_record_of_type(&wal, nodedb_wal::record::RecordType::FtsDelete);
+        let decoded =
+            nodedb_wal::record::FtsDeletePayload::from_bytes(&record.payload).expect("decode");
+        assert_eq!(decoded.collection, "docs");
+        assert_eq!(
+            decoded.doc_id,
+            crate::engine::document::store::surrogate_to_doc_id(Surrogate::new(7))
+        );
+    }
+
+    #[test]
+    fn spatial_insert_appends_and_decodes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let plan = PhysicalPlan::Spatial(SpatialOp::Insert {
+            collection: "places".to_string(),
+            field: "loc".to_string(),
+            surrogate: Surrogate::new(9),
+            geometry: Geometry::point(10.0, 20.0),
+            provenance: None,
+        });
+
+        let outcome = wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        )
+        .expect("append");
+        assert!(
+            outcome.lsn.is_some(),
+            "SpatialOp::Insert must produce a durable LSN"
+        );
+
+        let record = last_record_of_type(&wal, nodedb_wal::record::RecordType::SpatialPut);
+        let decoded =
+            nodedb_wal::record::SpatialPutPayload::from_bytes(&record.payload).expect("decode");
+        assert_eq!(decoded.collection, "places");
+        assert_eq!(decoded.field, "loc");
+        let geometry: Geometry =
+            zerompk::from_msgpack(&decoded.geometry_bytes).expect("decode geometry");
+        assert_eq!(geometry, Geometry::point(10.0, 20.0));
+    }
+
+    #[test]
+    fn spatial_delete_appends_and_decodes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let plan = PhysicalPlan::Spatial(SpatialOp::Delete {
+            collection: "places".to_string(),
+            field: "loc".to_string(),
+            surrogate: Surrogate::new(9),
+            provenance: None,
+        });
+
+        let outcome = wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        )
+        .expect("append");
+        assert!(
+            outcome.lsn.is_some(),
+            "SpatialOp::Delete must produce a durable LSN"
+        );
+
+        let record = last_record_of_type(&wal, nodedb_wal::record::RecordType::SpatialDelete);
+        let decoded =
+            nodedb_wal::record::SpatialDeletePayload::from_bytes(&record.payload).expect("decode");
+        assert_eq!(decoded.collection, "places");
+        assert_eq!(decoded.field, "loc");
+    }
 }
