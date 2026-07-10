@@ -22,12 +22,16 @@
 //! One documented set of arms is the exception:
 //! `DocumentOp::{BatchInsert, Merge, UpdateFromJoin}`,
 //! `CrdtOp::{SetConstraints, DropConstraints, RestoreToVersion, ListInsert,
-//! ListDelete, ListMove}`, `VectorOp::{DeleteBySurrogate, SparseInsert,
-//! SparseDelete, MultiVectorInsert, MultiVectorDelete, DirectUpsert}`, and
-//! `ArrayOp::{Put, Delete}` classify `true` here even though
-//! `to_replicated_entry` has no encoder arm for any of them — a deliberate
-//! divergence from the oracle (see the equivalence test below, which pins the
-//! divergence explicitly rather than papering over it). Without buffering,
+//! ListDelete, ListMove}`, and `ArrayOp::{Put, Delete}` classify `true` here
+//! even though `to_replicated_entry` has no encoder arm for any of them — a
+//! deliberate divergence from the oracle (see the equivalence test below,
+//! which pins the divergence explicitly rather than papering over it).
+//! `VectorOp::{DeleteBySurrogate, SparseInsert, SparseDelete,
+//! MultiVectorInsert, MultiVectorDelete, DirectUpsert}` used to be in this
+//! same exception list, but `to_replicated_entry` now has encoder arms for
+//! all six (see `control/wal_replication/encode/vector.rs::encode`), so they
+//! no longer diverge from the oracle and were moved to
+//! `vector_variants_match_oracle` below. Without buffering,
 //! each of these executed immediately against base state inside an explicit
 //! transaction, was visible before COMMIT, and survived ROLLBACK: a
 //! correctness bug, not a classification nuance. Closing it costs two
@@ -145,13 +149,12 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | VectorOp::MultiVectorScoreSearch { .. },
         ) => false,
 
-        // Buffered: `to_replicated_entry` has no encoder arm for these (a
-        // deliberate divergence from the oracle, see module doc), but each
-        // reaches `exec_tx_passthrough`
-        // (`data/executor/handlers/transaction/sub_plan.rs:206`) at COMMIT
-        // with no reject arm. Buffering closes the prior atomicity gap
-        // (statement used to execute immediately and survive ROLLBACK) at
-        // the cost of RYOW loss + the no-undo gap (module doc).
+        // Buffered AND now encoded: `to_replicated_entry` used to have no
+        // encoder arm for these (the same divergence pattern documented for
+        // the remaining flipped variants in the module doc), but it now
+        // encodes all six (`control/wal_replication/encode/vector.rs`), so
+        // this is a plain oracle-matching write classification, not a
+        // divergence — see `vector_variants_match_oracle` below.
         PhysicalPlan::Vector(
             VectorOp::DeleteBySurrogate { .. }
             | VectorOp::SparseInsert { .. }
@@ -783,6 +786,50 @@ mod tests {
                 top_k: 0,
                 ef_search: 0,
                 mode: String::new(),
+            }),
+            // These six used to have no `to_replicated_entry` encoder arm
+            // (pinned separately by `flipped_variants_are_buffered_and_unencoded`);
+            // now that the encoder covers them, predicate `true` and encoder
+            // `Some` agree again, so they belong in the oracle-matching set.
+            PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
+                collection: "c".into(),
+                surrogate: Surrogate::ZERO,
+                field_name: String::new(),
+                provenance: None,
+            }),
+            PhysicalPlan::Vector(VectorOp::SparseInsert {
+                collection: "c".into(),
+                field_name: String::new(),
+                doc_id: "d".into(),
+                entries: Vec::new(),
+            }),
+            PhysicalPlan::Vector(VectorOp::SparseDelete {
+                collection: "c".into(),
+                field_name: String::new(),
+                doc_id: "d".into(),
+            }),
+            PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
+                collection: "c".into(),
+                field_name: String::new(),
+                document_surrogate: Surrogate::ZERO,
+                vectors: Vec::new(),
+                count: 0,
+                dim: 0,
+            }),
+            PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
+                collection: "c".into(),
+                field_name: String::new(),
+                document_surrogate: Surrogate::ZERO,
+            }),
+            PhysicalPlan::Vector(VectorOp::DirectUpsert {
+                collection: "c".into(),
+                field: String::new(),
+                surrogate: Surrogate::ZERO,
+                vector: Vec::new(),
+                payload: Vec::new(),
+                quantization: Default::default(),
+                storage_dtype: Default::default(),
+                payload_indexes: Vec::new(),
             }),
         ];
         for p in &plans {
@@ -1777,11 +1824,13 @@ mod tests {
         }
     }
 
-    /// Pin the deliberate oracle divergence (module doc) for every flipped
-    /// variant across all four affected engines: each classifies `true`
-    /// (buffered — closes the atomicity gap) while `to_replicated_entry`
-    /// still has no encoder arm and returns `None` (a separate, undone
-    /// encoder-omission unit).
+    /// Pin the deliberate oracle divergence (module doc) for every remaining
+    /// flipped variant across the three still-affected engines (Document,
+    /// Crdt, Array): each classifies `true` (buffered — closes the
+    /// atomicity gap) while `to_replicated_entry` still has no encoder arm
+    /// and returns `None` (a separate, undone encoder-omission unit).
+    /// `VectorOp`'s six formerly-flipped variants are no longer here — see
+    /// `vector_variants_match_oracle`.
     #[test]
     fn flipped_variants_are_buffered_and_unencoded() {
         let array_id = ArrayId::new(tenant(), "a");
@@ -1809,46 +1858,6 @@ mod tests {
                 updates: Vec::new(),
                 target_filters: Vec::new(),
                 returning: None,
-            }),
-            PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
-                collection: "c".into(),
-                surrogate: Surrogate::ZERO,
-                field_name: String::new(),
-                provenance: None,
-            }),
-            PhysicalPlan::Vector(VectorOp::SparseInsert {
-                collection: "c".into(),
-                field_name: String::new(),
-                doc_id: "d".into(),
-                entries: Vec::new(),
-            }),
-            PhysicalPlan::Vector(VectorOp::SparseDelete {
-                collection: "c".into(),
-                field_name: String::new(),
-                doc_id: "d".into(),
-            }),
-            PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-                collection: "c".into(),
-                field_name: String::new(),
-                document_surrogate: Surrogate::ZERO,
-                vectors: Vec::new(),
-                count: 0,
-                dim: 0,
-            }),
-            PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-                collection: "c".into(),
-                field_name: String::new(),
-                document_surrogate: Surrogate::ZERO,
-            }),
-            PhysicalPlan::Vector(VectorOp::DirectUpsert {
-                collection: "c".into(),
-                field: String::new(),
-                surrogate: Surrogate::ZERO,
-                vector: Vec::new(),
-                payload: Vec::new(),
-                quantization: Default::default(),
-                storage_dtype: Default::default(),
-                payload_indexes: Vec::new(),
             }),
             PhysicalPlan::Crdt(CrdtOp::SetConstraints {
                 collection: "c".into(),

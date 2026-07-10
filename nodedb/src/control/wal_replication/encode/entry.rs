@@ -8,7 +8,7 @@ use super::{columnar, crdt, document, graph, kv, vector};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{
-    ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, SpatialOp, TextOp, TimeseriesOp, VectorOp,
+    ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, SpatialOp, TextOp, TimeseriesOp,
 };
 
 /// Serialize optional sync provenance into the cross-node wire shape.
@@ -80,54 +80,11 @@ pub fn to_replicated_entry(
             on_conflict_updates,
             surrogate.as_u32(),
         ),
-        PhysicalPlan::Vector(VectorOp::Insert {
-            collection,
-            vector,
-            dim,
-            field_name,
-            surrogate,
-            pk_bytes,
-            provenance,
-        }) => vector::insert(
-            collection,
-            vector,
-            *dim,
-            field_name,
-            surrogate.as_u32(),
-            pk_bytes,
-            encode_provenance(provenance),
-        ),
-        PhysicalPlan::Vector(VectorOp::BatchInsert {
-            collection,
-            vectors,
-            dim,
-            surrogates,
-        }) => vector::batch_insert(collection, vectors, *dim, surrogates),
-        PhysicalPlan::Vector(VectorOp::Delete {
-            collection,
-            vector_id,
-        }) => vector::delete(collection, *vector_id),
-        PhysicalPlan::Vector(VectorOp::SetParams {
-            collection,
-            field_name,
-            m,
-            ef_construction,
-            metric,
-            index_type,
-            pq_m,
-            ivf_cells,
-            ivf_nprobe,
-        }) => vector::set_params(vector::SetParamsFields {
-            collection,
-            field_name,
-            m: *m,
-            ef_construction: *ef_construction,
-            metric,
-            index_type,
-            pq_m: *pq_m,
-            ivf_cells: *ivf_cells,
-            ivf_nprobe: *ivf_nprobe,
-        }),
+        // All `VectorOp` write variants (including the sparse / multi-vector /
+        // direct-upsert / delete-by-surrogate family) are dispatched via
+        // `vector::encode`, which is exhaustive over `VectorOp` and returns
+        // `None` for the read/DDL variants — see that function's doc.
+        PhysicalPlan::Vector(op) => vector::encode(op)?,
         PhysicalPlan::Crdt(CrdtOp::Apply {
             collection,
             document_id,

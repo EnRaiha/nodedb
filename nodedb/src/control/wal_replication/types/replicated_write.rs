@@ -6,6 +6,7 @@
 
 use super::aliases::{default_ivf_cells, default_ivf_nprobe, default_pq_m};
 use super::wire_shapes::{ConstraintChangeOp, ReplicatedBatchEdge};
+use nodedb_types::{PayloadIndexKind, VectorQuantization, VectorStorageDtype};
 
 /// A write operation serialized for Raft replication.
 ///
@@ -112,6 +113,78 @@ pub enum ReplicatedWrite {
         ivf_cells: usize,
         #[serde(default = "default_ivf_nprobe")]
         ivf_nprobe: usize,
+    },
+    /// Insert a document into a sparse vector's inverted index. Keyed by
+    /// `doc_id` (not a surrogate) — the sparse inverted index is a separate
+    /// structure from the HNSW/surrogate identity space, so there is no
+    /// surrogate to carry. No WAL LSN field: nothing here is a per-node
+    /// watermark.
+    SparseInsert {
+        collection: String,
+        field_name: String,
+        doc_id: String,
+        entries: Vec<(u32, f32)>,
+    },
+    /// Remove a document from a sparse vector's inverted index. Same
+    /// doc_id-keyed identity as `SparseInsert`; no surrogate, no WAL LSN.
+    SparseDelete {
+        collection: String,
+        field_name: String,
+        doc_id: String,
+    },
+    /// Insert N vectors for one document (ColBERT-style), all bound to a
+    /// single shared surrogate. `document_surrogate` is the leader-assigned
+    /// global identity, carried verbatim so every replica binds the SAME
+    /// surrogate to all `count` vectors instead of each re-allocating its
+    /// own. No WAL LSN field.
+    MultiVectorInsert {
+        collection: String,
+        field_name: String,
+        document_surrogate: u32,
+        /// Flat vector data: `count` * `dim` f32 values.
+        vectors: Vec<f32>,
+        count: usize,
+        dim: usize,
+    },
+    /// Tombstone all vectors for a document from the multi-vector index.
+    /// `document_surrogate` is the leader-assigned identity of the document
+    /// being deleted, carried verbatim so every replica resolves the exact
+    /// same set of vectors. No WAL LSN field.
+    MultiVectorDelete {
+        collection: String,
+        field_name: String,
+        document_surrogate: u32,
+    },
+    /// Soft-delete a vector by surrogate (sync inbound path / in-transaction
+    /// delete). `surrogate` is carried verbatim — it identifies an
+    /// already-bound HNSW node, so no re-binding is needed on apply. No WAL
+    /// LSN field.
+    DeleteBySurrogate {
+        collection: String,
+        surrogate: u32,
+        field_name: String,
+        /// Sync provenance encoded as zerompk bytes.
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
+    },
+    /// Direct vector upsert for vector-primary collections (`WITH
+    /// (primary='vector')`) — the SQL DML path bypassing MessagePack document
+    /// encoding. `surrogate` is the leader-assigned global identity, carried
+    /// verbatim so every replica binds the same identity instead of
+    /// re-allocating. `payload` / `quantization` / `storage_dtype` /
+    /// `payload_indexes` are carried in full so a follower's HNSW insert +
+    /// payload bitmap update reproduce the leader's write byte-for-byte. No
+    /// WAL LSN field.
+    DirectUpsert {
+        collection: String,
+        field: String,
+        surrogate: u32,
+        vector: Vec<f32>,
+        /// Pre-encoded MessagePack of only the payload-indexed fields.
+        payload: Vec<u8>,
+        quantization: VectorQuantization,
+        storage_dtype: VectorStorageDtype,
+        payload_indexes: Vec<(String, PayloadIndexKind)>,
     },
     CrdtApply {
         collection: String,

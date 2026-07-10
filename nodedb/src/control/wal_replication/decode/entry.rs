@@ -117,57 +117,23 @@ fn to_physical_plan(
             on_conflict_updates,
             *surrogate,
         )?,
-        ReplicatedWrite::VectorInsert {
-            collection,
-            vector,
-            dim,
-            field_name,
-            surrogate,
-            pk_bytes,
-            provenance,
-        } => vector::insert(
-            ctx,
-            vector::InsertFields {
-                collection,
-                vector,
-                dim: *dim,
-                field_name,
-                surrogate: *surrogate,
-                pk_bytes,
-                provenance,
-            },
-        )?,
-        ReplicatedWrite::VectorBatchInsert {
-            collection,
-            vectors,
-            dim,
-            surrogates,
-        } => vector::batch_insert(ctx, collection, vectors, *dim, surrogates)?,
-        ReplicatedWrite::VectorDelete {
-            collection,
-            vector_id,
-        } => vector::delete(collection, *vector_id),
-        ReplicatedWrite::SetVectorParams {
-            collection,
-            field_name,
-            m,
-            ef_construction,
-            metric,
-            index_type,
-            pq_m,
-            ivf_cells,
-            ivf_nprobe,
-        } => vector::set_params(vector::SetParamsFields {
-            collection,
-            field_name,
-            m: *m,
-            ef_construction: *ef_construction,
-            metric,
-            index_type,
-            pq_m: *pq_m,
-            ivf_cells: *ivf_cells,
-            ivf_nprobe: *ivf_nprobe,
-        }),
+        // The full `Vector*` variant family (original four write shapes plus
+        // the sparse / multi-vector / direct-upsert / delete-by-surrogate
+        // additions) is dispatched to a single helper — see
+        // `vector::decode_arm`'s doc for why this stays one grouped arm
+        // (keeps this dispatcher under the file size limit; splitting it
+        // into 10 individually-destructured arms here pushes this file
+        // over 500 lines).
+        ReplicatedWrite::VectorInsert { .. }
+        | ReplicatedWrite::VectorBatchInsert { .. }
+        | ReplicatedWrite::VectorDelete { .. }
+        | ReplicatedWrite::SetVectorParams { .. }
+        | ReplicatedWrite::SparseInsert { .. }
+        | ReplicatedWrite::SparseDelete { .. }
+        | ReplicatedWrite::MultiVectorInsert { .. }
+        | ReplicatedWrite::MultiVectorDelete { .. }
+        | ReplicatedWrite::DeleteBySurrogate { .. }
+        | ReplicatedWrite::DirectUpsert { .. } => vector::decode_arm(ctx, write)?,
         ReplicatedWrite::CrdtApply {
             collection,
             document_id,
