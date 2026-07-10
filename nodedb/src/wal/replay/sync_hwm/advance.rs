@@ -95,6 +95,9 @@ pub fn replay_sync_hwm_records(
             | RecordType::MultiVectorPut
             | RecordType::MultiVectorDelete
             | RecordType::CrdtDelta
+            // CrdtListOp carries no sync HWM data; not relevant to this
+            // idempotency replay pass.
+            | RecordType::CrdtListOp
             | RecordType::TimeseriesBatch
             | RecordType::LogBatch
             | RecordType::ArrayPut

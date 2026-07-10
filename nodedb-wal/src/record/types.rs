@@ -74,6 +74,25 @@ pub enum RecordType {
     /// CRDT engine: delta application.
     CrdtDelta = 20 | 0x8000,
 
+    /// CRDT engine: block-list intent op (`ListInsert` / `ListDelete` /
+    /// `ListMove`) on a nested `LoroMovableList`.
+    ///
+    /// These ops mutate Data-Plane-only Loro state and the Control Plane has
+    /// no `LoroDoc` to compute a delta from, so the record carries the
+    /// **intent** (collection, document, list path, operation kind, and
+    /// position(s)) rather than a Loro delta; replay re-executes the exact
+    /// same live handler that ran on first application.
+    ///
+    /// Deliberately NOT `CrdtDelta`: that record type's replay contract is
+    /// idempotent, commutative Loro import with no LSN gate. List ops are
+    /// position-based and re-applying one is not idempotent, so mixing them
+    /// into `CrdtDelta`'s replay path would violate that contract.
+    ///
+    /// Required: skipping this record on replay silently drops an
+    /// acknowledged list mutation, diverging list order/content from what
+    /// was acknowledged to the client.
+    CrdtListOp = 21 | 0x8000,
+
     /// Timeseries engine: metric sample batch.
     TimeseriesBatch = 30,
 
@@ -273,6 +292,7 @@ impl RecordType {
             x if x == 16 | 0x8000 => Some(Self::MultiVectorPut),
             x if x == 17 | 0x8000 => Some(Self::MultiVectorDelete),
             x if x == 20 | 0x8000 => Some(Self::CrdtDelta),
+            x if x == 21 | 0x8000 => Some(Self::CrdtListOp),
             x if x == 50 | 0x8000 => Some(Self::Transaction),
             x if x == 58 | 0x8000 => Some(Self::TransactionRedo),
             x if x == 51 | 0x8000 => Some(Self::SurrogateAlloc),
@@ -325,6 +345,7 @@ mod tests {
         assert!(RecordType::is_required(
             RecordType::GraphNodeLabelRemove as u32
         ));
+        assert!(RecordType::is_required(RecordType::CrdtListOp as u32));
     }
 
     #[test]
@@ -342,6 +363,7 @@ mod tests {
             RecordType::MultiVectorPut,
             RecordType::MultiVectorDelete,
             RecordType::CrdtDelta,
+            RecordType::CrdtListOp,
             RecordType::TimeseriesBatch,
             RecordType::LogBatch,
             RecordType::ArrayPut,

@@ -11,8 +11,10 @@
 //! secondary-index replay lives in `wal_replay_kv_index.rs`.
 //!
 //! Split by engine concern: `kv` (`replay_kv_wal`), `crdt` (`replay_crdt_wal`),
-//! `array` (`ensure_array_open_for_replay` + `replay_array_wal`).
+//! `crdt_list` (`replay_crdt_list_wal`, for the position-based block-list
+//! intent ops), `array` (`ensure_array_open_for_replay` + `replay_array_wal`).
 
 mod array;
 mod crdt;
+mod crdt_list;
 mod kv;

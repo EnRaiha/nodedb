@@ -141,6 +141,10 @@ fn record_to_event(record: &WalRecord, sequence: &mut u64) -> Option<WriteEvent>
         | RecordType::MultiVectorPut
         | RecordType::MultiVectorDelete
         | RecordType::CrdtDelta
+        // CrdtListOp: position-based list-op intent, replayed by
+        // `data::executor::wal_replay::crdt_list`, not the Event Plane's
+        // WriteEvent stream.
+        | RecordType::CrdtListOp
         | RecordType::TimeseriesBatch
         | RecordType::LogBatch
         | RecordType::ArrayPut

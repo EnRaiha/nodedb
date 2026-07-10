@@ -179,6 +179,62 @@ pub fn wal_append_if_write_with_creds(
                 })?;
             Some(wal.append_crdt_delta(tenant_id, vshard_id, database_id, &crdt_payload)?)
         }
+        PhysicalPlan::Crdt(CrdtOp::ListInsert {
+            collection,
+            document_id,
+            list_path,
+            index,
+            fields_json,
+            surrogate: _,
+        }) => {
+            // The Data Plane never appends to the WAL and the Control Plane
+            // has no `LoroDoc` to compute a delta from, so the intent is
+            // logged here and re-executed deterministically at replay
+            // (see `CrdtListOpWalRecord`'s doc comment).
+            let payload = crate::wal::CrdtListOpWalRecord::Insert {
+                collection: collection.clone(),
+                document_id: document_id.clone(),
+                list_path: list_path.clone(),
+                index: *index as u64,
+                fields_json: fields_json.clone(),
+            };
+            let bytes = encode_crdt_list_op_payload(payload)?;
+            Some(wal.append_crdt_list_op(tenant_id, vshard_id, database_id, &bytes)?)
+        }
+        PhysicalPlan::Crdt(CrdtOp::ListDelete {
+            collection,
+            document_id,
+            list_path,
+            index,
+            surrogate: _,
+        }) => {
+            let payload = crate::wal::CrdtListOpWalRecord::Delete {
+                collection: collection.clone(),
+                document_id: document_id.clone(),
+                list_path: list_path.clone(),
+                index: *index as u64,
+            };
+            let bytes = encode_crdt_list_op_payload(payload)?;
+            Some(wal.append_crdt_list_op(tenant_id, vshard_id, database_id, &bytes)?)
+        }
+        PhysicalPlan::Crdt(CrdtOp::ListMove {
+            collection,
+            document_id,
+            list_path,
+            from_index,
+            to_index,
+            surrogate: _,
+        }) => {
+            let payload = crate::wal::CrdtListOpWalRecord::Move {
+                collection: collection.clone(),
+                document_id: document_id.clone(),
+                list_path: list_path.clone(),
+                from_index: *from_index as u64,
+                to_index: *to_index as u64,
+            };
+            let bytes = encode_crdt_list_op_payload(payload)?;
+            Some(wal.append_crdt_list_op(tenant_id, vshard_id, database_id, &bytes)?)
+        }
         PhysicalPlan::Graph(GraphOp::EdgePut {
             collection,
             src_id,
@@ -373,5 +429,15 @@ pub fn wal_append_if_write_with_creds(
     Ok(WalAppendOutcome {
         lsn: appended,
         resolved_now_ms,
+    })
+}
+
+/// Encode a `CrdtListOpWalRecord` for a `CrdtOp::ListInsert` / `ListDelete` /
+/// `ListMove` append. Shared by all three arms above so the msgpack encode +
+/// error-mapping logic is written once (mirrors `encode_graph_node_label_payload`).
+fn encode_crdt_list_op_payload(payload: crate::wal::CrdtListOpWalRecord) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(&payload).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal crdt list op: {e}"),
     })
 }

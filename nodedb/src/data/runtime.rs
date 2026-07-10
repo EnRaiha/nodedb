@@ -229,6 +229,14 @@ pub fn spawn_core(
                 // replays (and after the checkpoint restores above) is safe.
                 core.replay_transaction_redo_wal(&wal_records, num_cores, &tombstones);
 
+                // CRDT list-op intent replay runs last among the per-engine
+                // engine replays: it re-executes position-based
+                // insert/delete/move ops through the same live handlers, so
+                // it must run after `replay_crdt_wal` has restored the
+                // collection's underlying Loro document state (snapshot /
+                // delta import) that the list containers live inside.
+                core.replay_crdt_list_wal(&wal_records, num_cores, &tombstones);
+
                 // Reconstruct sync HWM maps from SyncSeqAdvance records so
                 // post-restart deduplication is correct. Fatal on error —
                 // a partially-recovered HWM is not safe to operate with.
