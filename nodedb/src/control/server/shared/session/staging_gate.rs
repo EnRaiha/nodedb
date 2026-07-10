@@ -23,6 +23,7 @@ use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::server::shared::sql::staging_predicates::{
     extract_affected_count, is_stageable_write, staged_tag_kind,
 };
+use crate::control::server::shared::write_admission::plan_requires_txn_buffering;
 use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -147,13 +148,7 @@ where
         return Ok(InTxnRoute::Read(Box::new(task)));
     }
 
-    let is_write = crate::control::wal_replication::to_replicated_entry(
-        task.tenant_id,
-        task.database_id,
-        task.vshard_id,
-        &task.plan,
-    )
-    .is_some();
+    let is_write = plan_requires_txn_buffering(&task.plan);
 
     if !is_write {
         // Not a write: an in-transaction read. Stamp the active transaction
