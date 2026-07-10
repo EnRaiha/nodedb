@@ -29,6 +29,22 @@ pub enum CrdtError {
     #[error("unknown collection: {0}")]
     UnknownCollection(String),
 
+    /// A scalar field write targets a key already held by a nested CRDT
+    /// container (e.g. a row's block list).
+    ///
+    /// Overwriting would destroy the container's identity and every
+    /// concurrent edit converging on it; skipping would silently discard the
+    /// caller's write. Neither is acceptable, so the write is rejected.
+    #[error(
+        "field `{field}` on row `{row_id}` in collection `{collection}` is a nested CRDT container \
+         and cannot be overwritten by a scalar value"
+    )]
+    ScalarFieldShadowsContainer {
+        collection: String,
+        row_id: String,
+        field: String,
+    },
+
     /// Auth context has expired — agent must re-authenticate before syncing.
     #[error("auth expired: user {user_id} must re-authenticate (expired at {expired_at})")]
     AuthExpired { user_id: u64, expired_at: u64 },

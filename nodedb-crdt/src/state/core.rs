@@ -2,6 +2,8 @@
 
 //! CrdtState core: document handle, row CRUD, uniqueness probes.
 
+use std::collections::HashSet;
+
 use loro::{LoroDoc, LoroMap, LoroValue, ValueOrContainer};
 
 use crate::error::{CrdtError, Result};
@@ -19,6 +21,14 @@ fn row_is_live(row: &LoroMap) -> bool {
         Some(ValueOrContainer::Value(LoroValue::I64(n))) => n == VALID_UNTIL_OPEN,
         _ => true,
     }
+}
+
+/// True when `key` currently holds a container (map/list/text/etc.) value
+/// on `row`, rather than a plain scalar. Shared by `upsert`'s delete-set
+/// filter and its scalar-write guard so both use one definition of
+/// "container-valued key".
+fn key_is_container(row: &LoroMap, key: &str) -> bool {
+    matches!(row.get(key), Some(ValueOrContainer::Container(_)))
 }
 
 /// A CRDT state for a single collection — owns one `LoroDoc`.
@@ -41,6 +51,15 @@ impl CrdtState {
     }
 
     /// Insert or update a row in a collection.
+    ///
+    /// This is a REPLACE for scalar fields — every caller passes the
+    /// complete scalar projection, and any current scalar key absent from
+    /// `fields` is deleted. It reuses the row's existing `LoroMap` rather
+    /// than destroying and recreating it, because container-valued keys
+    /// (e.g. the Notion-style block list in `list_ops.rs`, stored as a
+    /// container-valued key inside this same row map) cannot be expressed in
+    /// `fields: &[(&str, LoroValue)]` at all — they are structurally out of
+    /// scope for this replace and must survive across every call.
     pub fn upsert(
         &self,
         collection: &str,
@@ -48,10 +67,45 @@ impl CrdtState {
         fields: &[(&str, LoroValue)],
     ) -> Result<()> {
         let coll = self.doc.get_map(collection);
-        let row_container = coll
-            .insert_container(row_id, LoroMap::new())
-            .map_err(|e| CrdtError::Loro(e.to_string()))?;
+        let row_container = match coll.get(row_id) {
+            Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
+            _ => coll
+                .insert_container(row_id, LoroMap::new())
+                .map_err(|e| CrdtError::Loro(e.to_string()))?,
+        };
+
+        let incoming_keys: HashSet<&str> = fields.iter().map(|(field, _)| *field).collect();
+
+        // Full-projection replace, computed from the row's current live
+        // keys on every call — never assumed from caller discipline.
+        // Container-valued keys are excluded: they are never part of the
+        // scalar projection callers pass, so deleting them here would
+        // silently discard nested CRDT state (e.g. a row's block list).
+        let keys_to_delete: Vec<String> = row_container
+            .keys()
+            .filter(|key| {
+                !incoming_keys.contains(key.as_ref()) && !key_is_container(&row_container, key)
+            })
+            .map(|key| key.to_string())
+            .collect();
+        for key in &keys_to_delete {
+            row_container
+                .delete(key)
+                .map_err(|e| CrdtError::Loro(e.to_string()))?;
+        }
+
         for (field, value) in fields {
+            // A container-valued key can never legitimately appear in the
+            // incoming scalar projection. Overwriting one would destroy the
+            // nested container; skipping it would silently discard the
+            // caller's write. Reject instead of doing either.
+            if key_is_container(&row_container, field) {
+                return Err(CrdtError::ScalarFieldShadowsContainer {
+                    collection: collection.to_string(),
+                    row_id: row_id.to_string(),
+                    field: (*field).to_string(),
+                });
+            }
             row_container
                 .insert(field, value.clone())
                 .map_err(|e| CrdtError::Loro(e.to_string()))?;

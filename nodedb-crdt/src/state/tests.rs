@@ -246,6 +246,147 @@ fn restore_to_current_version_is_empty() {
     );
 }
 
+/// Attach a nested `blocks` `LoroMovableList` directly onto an existing row,
+/// mirroring how `list_ops.rs` stores a Notion-style block list as a
+/// container-valued key inside the row `LoroMap`. Returns the single block's
+/// id so callers can assert it survived.
+fn attach_nested_block_list(state: &CrdtState, collection: &str, row_id: &str) {
+    let coll = state.doc().get_map(collection);
+    let row = match coll.get(row_id) {
+        Some(loro::ValueOrContainer::Container(loro::Container::Map(m))) => m,
+        _ => panic!("expected row '{row_id}' to already exist as a map"),
+    };
+    let blocks = row
+        .insert_container("blocks", loro::LoroMovableList::new())
+        .unwrap();
+    let blk0 = blocks.insert_container(0, loro::LoroMap::new()).unwrap();
+    blk0.insert("id", LoroValue::String("blk-0".into()))
+        .unwrap();
+}
+
+#[test]
+fn upsert_preserves_nested_movable_list_across_disjoint_scalar_upsert() {
+    let state = CrdtState::new(1).unwrap();
+    state
+        .upsert(
+            "pages",
+            "doc-1",
+            &[("title", LoroValue::String("Draft".into()))],
+        )
+        .unwrap();
+
+    attach_nested_block_list(&state, "pages", "doc-1");
+
+    // A later upsert with a completely disjoint scalar field set must not
+    // destroy the nested "blocks" container.
+    state
+        .upsert(
+            "pages",
+            "doc-1",
+            &[("status", LoroValue::String("published".into()))],
+        )
+        .unwrap();
+
+    let len = crate::list_ops::list_length(state.doc(), "pages", "doc-1", "blocks").unwrap();
+    assert_eq!(len, 1, "nested block list must survive an unrelated upsert");
+
+    let val = crate::list_ops::list_get(state.doc(), "pages", "doc-1", "blocks", 0)
+        .unwrap()
+        .unwrap();
+    if let LoroValue::Map(map) = val {
+        assert_eq!(map.get("id"), Some(&LoroValue::String("blk-0".into())));
+    } else {
+        panic!("expected block map with fields intact, got {val:?}");
+    }
+}
+
+#[test]
+fn upsert_still_replaces_absent_scalar_fields() {
+    let state = CrdtState::new(1).unwrap();
+    state
+        .upsert(
+            "users",
+            "u1",
+            &[
+                ("name", LoroValue::String("Alice".into())),
+                ("email", LoroValue::String("alice@example.com".into())),
+            ],
+        )
+        .unwrap();
+
+    // Second upsert omits "email" — the row must end up WITHOUT it. This
+    // pins that reusing the row's LoroMap (instead of destroying and
+    // recreating it) did not turn `upsert` into a merge.
+    state
+        .upsert(
+            "users",
+            "u1",
+            &[("name", LoroValue::String("Alice Updated".into()))],
+        )
+        .unwrap();
+
+    assert_eq!(
+        state.read_field("users", "u1", "name"),
+        Some(LoroValue::String("Alice Updated".into()))
+    );
+    assert_eq!(
+        state.read_field("users", "u1", "email"),
+        None,
+        "a field absent from the latest upsert must be gone, not merged"
+    );
+}
+
+#[test]
+fn restore_to_version_preserves_nested_movable_list_as_live_container() {
+    let state = CrdtState::new(1).unwrap();
+    state
+        .upsert(
+            "pages",
+            "doc-1",
+            &[("title", LoroValue::String("v1".into()))],
+        )
+        .unwrap();
+
+    attach_nested_block_list(&state, "pages", "doc-1");
+    let vv_with_blocks = state.oplog_version_vector();
+
+    // Move the row forward — Fix 1 keeps "blocks" alive across this upsert.
+    state
+        .upsert(
+            "pages",
+            "doc-1",
+            &[("title", LoroValue::String("v2".into()))],
+        )
+        .unwrap();
+
+    let delta = state
+        .restore_to_version("pages", "doc-1", &vv_with_blocks)
+        .unwrap();
+    assert!(
+        !delta.is_empty(),
+        "restoring to a genuinely earlier version must produce a forward delta"
+    );
+
+    assert_eq!(
+        state.read_field("pages", "doc-1", "title"),
+        Some(LoroValue::String("v1".into()))
+    );
+
+    // The restored block list must be a live, queryable CRDT container —
+    // not a flattened/dangling value produced by routing the historical
+    // container through the scalar `insert` path.
+    let len = crate::list_ops::list_length(state.doc(), "pages", "doc-1", "blocks").unwrap();
+    assert_eq!(len, 1);
+    let val = crate::list_ops::list_get(state.doc(), "pages", "doc-1", "blocks", 0)
+        .unwrap()
+        .unwrap();
+    if let LoroValue::Map(map) = val {
+        assert_eq!(map.get("id"), Some(&LoroValue::String("blk-0".into())));
+    } else {
+        panic!("expected block map with container identity preserved, got {val:?}");
+    }
+}
+
 #[test]
 fn snapshot_roundtrip() {
     let state1 = CrdtState::new(1).unwrap();

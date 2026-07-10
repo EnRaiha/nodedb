@@ -2,11 +2,14 @@
 
 //! Version-history operations: version vectors, time-travel reads, targeted compaction, restore.
 
-use loro::{LoroDoc, LoroValue, ValueOrContainer};
+use std::collections::HashSet;
+
+use loro::{LoroDoc, LoroMap, LoroValue, ValueOrContainer};
 
 use crate::error::{CrdtError, Result};
 
 use super::core::CrdtState;
+use super::restore_containers;
 
 impl CrdtState {
     /// Get the current oplog version vector.
@@ -93,28 +96,75 @@ impl CrdtState {
     /// or a genuinely empty `Vec` — with no row mutation performed — when
     /// restoring would not change the live row (e.g. restoring to the
     /// version the document is already at).
+    ///
+    /// Historical fields are inspected on the *live* forked container (via
+    /// `LoroMap::get` → `ValueOrContainer`), not the flattened
+    /// `read_at_version` projection: scalar entries are replaced the same
+    /// way `upsert` replaces them, but container-shaped entries (e.g. a
+    /// Notion-style block list) are rebuilt structurally via
+    /// `insert_container` plus recursive repopulation — see
+    /// `restore_containers` — so restoring a row never collapses its nested
+    /// CRDT containers into plain flattened values.
     pub fn restore_to_version(
         &self,
         collection: &str,
         row_id: &str,
         version: &loro::VersionVector,
     ) -> Result<Vec<u8>> {
-        let historical = self
-            .read_at_version(collection, row_id, version)?
-            .ok_or_else(|| CrdtError::Loro("document did not exist at target version".into()))?;
+        let frontiers = self.doc.vv_to_frontiers(version);
+        let forked = self
+            .doc
+            .fork_at(&frontiers)
+            .map_err(|e| CrdtError::Loro(format!("fork at version: {e}")))?;
+        let forked_coll = forked.get_map(collection);
+        let historical_row = match forked_coll.get(row_id) {
+            Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
+            Some(_) => return Err(CrdtError::Loro("historical state is not a map".into())),
+            None => {
+                return Err(CrdtError::Loro(
+                    "document did not exist at target version".into(),
+                ));
+            }
+        };
+        let historical_value = historical_row.get_value();
 
         let live = self.read_row(collection, row_id);
-        if live.as_ref() == Some(&historical) {
+        if live.as_ref() == Some(&historical_value) {
             return Ok(Vec::new());
         }
 
         let vv_before = self.doc.oplog_vv();
 
-        let fields: Vec<(&str, LoroValue)> = match &historical {
-            LoroValue::Map(map) => map.iter().map(|(k, v)| (k.as_ref(), v.clone())).collect(),
-            _ => return Err(CrdtError::Loro("historical state is not a map".into())),
+        let coll = self.doc.get_map(collection);
+        let live_row = match coll.get(row_id) {
+            Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
+            _ => coll
+                .insert_container(row_id, LoroMap::new())
+                .map_err(|e| CrdtError::Loro(e.to_string()))?,
         };
-        self.upsert(collection, row_id, &fields)?;
+
+        // Full-projection replace against the historical row's own key set —
+        // restoring is authoritative: any key live but absent historically
+        // is dropped, matching the pre-fix destroy-and-recreate behavior for
+        // every field the old flattening path could express.
+        let historical_keys: HashSet<String> =
+            historical_row.keys().map(|k| k.to_string()).collect();
+        let keys_to_delete: Vec<String> = live_row
+            .keys()
+            .filter(|key| !historical_keys.contains(key.as_ref()))
+            .map(|key| key.to_string())
+            .collect();
+        for key in &keys_to_delete {
+            live_row
+                .delete(key)
+                .map_err(|e| CrdtError::Loro(e.to_string()))?;
+        }
+
+        for key in historical_row.keys() {
+            if let Some(value) = historical_row.get(&key) {
+                restore_containers::rebuild_map_field(&live_row, &key, value)?;
+            }
+        }
 
         self.doc
             .export(loro::ExportMode::updates(&vv_before))
