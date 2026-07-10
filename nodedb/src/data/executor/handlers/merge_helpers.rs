@@ -42,6 +42,11 @@ pub(super) struct ApplyActionParams<'a> {
     pub source_alias: &'a str,
     pub clause: &'a MergeClauseOp,
     pub strict_schema: &'a Option<nodedb_types::columnar::StrictSchema>,
+    /// Whether the target collection has a secondary vector index. Gated once
+    /// by the caller so a non-vector collection pays nothing; when set, the
+    /// UPDATE / DELETE branches maintain the row's HNSW vectors (the merge path
+    /// otherwise never touches the vector index).
+    pub has_vectors: bool,
 }
 
 /// Apply a MATCHED / NOT MATCHED BY SOURCE arm (UPDATE or DELETE) to a target row.
@@ -60,6 +65,7 @@ pub(super) fn apply_action(
         source_alias,
         clause,
         strict_schema,
+        has_vectors,
     } = params;
     match &clause.action {
         MergeActionOp::DoNothing => Ok(false),
@@ -70,6 +76,12 @@ pub(super) fn apply_action(
                     engine: "sparse".into(),
                     detail: format!("merge delete {doc_id}: {e}"),
                 })?;
+            // Soft-delete the row's HNSW vectors + drop the reverse-map entry,
+            // or the leaked node keeps scoring in KNN search. No-op unless the
+            // collection has a vector field (gated by the caller).
+            if has_vectors {
+                core.remove_document_vector_indexes(database_id, tid, collection, doc_id);
+            }
             Ok(true)
         }
         MergeActionOp::Update { updates } => {
@@ -108,6 +120,26 @@ pub(super) fn apply_action(
                 })?;
             core.doc_cache
                 .put(database_id, tid, collection, doc_id, &updated_bytes);
+            // Re-index the merged row's vectors (soft-delete the old HNSW node +
+            // insert the new one, keyed by the stable surrogate), or KNN search
+            // keeps returning the pre-merge embedding. No-op unless the
+            // collection has a vector field (gated by the caller).
+            if has_vectors
+                && let Some(surrogate) = crate::engine::document::store::doc_id_to_surrogate(doc_id)
+            {
+                core.update_reindex_vector_indexes(
+                    crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex {
+                        database_id,
+                        tid,
+                        collection,
+                        row_key: doc_id,
+                        surrogate,
+                        new_body: &updated_bytes,
+                        is_strict: strict_schema.is_some(),
+                        has_vectors,
+                    },
+                );
+            }
             Ok(true)
         }
         MergeActionOp::Insert { .. } => {

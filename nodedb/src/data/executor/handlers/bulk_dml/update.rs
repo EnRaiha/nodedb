@@ -6,6 +6,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
@@ -168,6 +169,15 @@ impl CoreLoop {
             }
         });
 
+        // Gate secondary-vector maintenance once for the whole statement so a
+        // collection with no vector field pays nothing. When a vector field is
+        // present, an UPDATE that rewrites an embedding must re-index the row's
+        // HNSW vectors — the btree/FTS/graph reconciliation this handler already
+        // does never touches the vector index, so KNN search would keep scoring
+        // the stale pre-update embedding in the same process.
+        let database_id = task.request.database_id.as_u64();
+        let has_vectors = self.collection_has_vectors(database_id, tid, collection);
+
         // Apply updates to each matching document.
         let mut affected = 0u64;
         let mut returned_docs: Vec<serde_json::Value> = if returning.is_some() {
@@ -286,6 +296,22 @@ impl CoreLoop {
                                 collection,
                                 surrogate.as_u32(),
                             );
+                            // Re-index the row's vectors from the new body
+                            // (soft-delete the old HNSW node + insert the new
+                            // one, keyed by the stable surrogate). No-op unless
+                            // the collection has a vector field (gated above).
+                            if has_vectors {
+                                self.update_reindex_vector_indexes(UpdateVectorReindex {
+                                    database_id,
+                                    tid,
+                                    collection,
+                                    row_key: doc_id,
+                                    surrogate,
+                                    new_body: &updated_bytes,
+                                    is_strict: strict_schema.is_some(),
+                                    has_vectors,
+                                });
+                            }
                         }
                         affected += 1;
                         if returning.is_some() {

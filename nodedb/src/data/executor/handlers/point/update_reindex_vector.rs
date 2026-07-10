@@ -39,6 +39,12 @@ pub(in crate::data::executor) struct UpdateVectorReindex<'a> {
     /// standard MessagePack `apply_point_put_vector_indexes` expects, so that
     /// case skips the round trip and reuses the bytes directly.
     pub is_strict: bool,
+    /// Whether `collection` has a vector index, computed ONCE by the caller via
+    /// `collection_has_vectors`. Recomputing per row would make a statement cost
+    /// `rows * vector_params` rather than `rows + vector_params`, because the
+    /// schemaless half scans `vector_params` unindexed. `false` short-circuits
+    /// this call to a no-op.
+    pub has_vectors: bool,
 }
 
 impl CoreLoop {
@@ -51,13 +57,11 @@ impl CoreLoop {
         &mut self,
         p: UpdateVectorReindex<'_>,
     ) {
-        // Gate: skip all vector work unless this collection has a vector index,
-        // mirroring how `apply_point_put_vector_indexes` scopes its work.
-        let has_vectors = !self.strict_vector_fields(p.tid, p.collection).is_empty()
-            || !self
-                .schemaless_vector_field_names(p.database_id, p.tid, p.collection)
-                .is_empty();
-        if !has_vectors {
+        // Gate: skip all vector work unless this collection has a vector index.
+        // Trusts the caller's precomputed `has_vectors` instead of recomputing
+        // it here, so a caller looping over N rows pays for the (unindexed,
+        // `vector_params`-scanning) schemaless check once, not once per row.
+        if !p.has_vectors {
             return;
         }
 

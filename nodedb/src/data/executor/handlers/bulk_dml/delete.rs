@@ -132,6 +132,14 @@ impl CoreLoop {
             }
         }
 
+        // Gate secondary-vector maintenance once for the whole statement so a
+        // collection with no vector field pays nothing. When a vector field is
+        // present, each delete must also soft-delete the row's HNSW nodes and
+        // drop its reverse-map entry — this handler cascades FTS, secondary
+        // indexes, and graph edges but never the vector index, so a bulk delete
+        // would otherwise leak vector nodes that keep scoring in KNN search.
+        let has_vectors = self.collection_has_vectors(database_id, tid, collection);
+
         // Delete each matching document with full cascade.
         let mut affected = 0u64;
         let mut returned_docs: Vec<serde_json::Value> = if returning.is_some() {
@@ -204,6 +212,13 @@ impl CoreLoop {
                     warn!(core = self.core_id, %doc_id, error = %e, "bulk delete: edge cascade failed");
                 }
                 self.mark_node_deleted(database_id, tid, doc_id);
+                // Cascade: secondary HNSW vector index. The put path indexed
+                // this row's vectors under its surrogate; the delete must
+                // soft-delete those nodes and drop the reverse-map entry, or the
+                // leaked vector keeps scoring in KNN search in the same process.
+                if has_vectors {
+                    self.remove_document_vector_indexes(database_id, tid, collection, doc_id);
+                }
                 self.doc_cache.invalidate(
                     task.request.database_id.as_u64(),
                     tid,

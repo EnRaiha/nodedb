@@ -97,6 +97,12 @@ impl CoreLoop {
             }
         });
 
+        // Gate secondary-vector maintenance once for the whole statement so a
+        // non-vector target collection pays nothing; the per-row UPDATE / DELETE
+        // arms maintain the HNSW index only when this is set.
+        let has_vectors =
+            self.collection_has_vectors(task.request.database_id.as_u64(), tid, target_collection);
+
         // Collect all target doc IDs and their documents.
         let prefix = crate::engine::sparse::btree::coll_prefix(
             task.request.database_id.as_u64(),
@@ -197,6 +203,7 @@ impl CoreLoop {
                             source_alias,
                             clause: arm,
                             strict_schema: &strict_schema,
+                            has_vectors,
                         },
                     ) {
                         Ok(true) => affected += 1,
@@ -229,6 +236,7 @@ impl CoreLoop {
                             source_alias,
                             clause: arm,
                             strict_schema: &strict_schema,
+                            has_vectors,
                         },
                     ) {
                         Ok(true) => affected += 1,

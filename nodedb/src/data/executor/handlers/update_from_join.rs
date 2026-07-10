@@ -15,6 +15,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::response_codec::encode_json;
 use crate::data::executor::task::ExecutionTask;
@@ -122,6 +123,13 @@ impl CoreLoop {
                 None
             }
         });
+
+        // Gate secondary-vector maintenance once for the whole statement so a
+        // non-vector target collection pays nothing. When a vector field is
+        // present, a joined UPDATE that rewrites an embedding must re-index the
+        // row's HNSW vectors, or KNN search keeps scoring the stale embedding.
+        let database_id = task.request.database_id.as_u64();
+        let has_vectors = self.collection_has_vectors(database_id, tid, target_collection);
 
         // Scan target documents and apply updates for those that match.
         let prefix = crate::engine::sparse::btree::coll_prefix(
@@ -319,6 +327,24 @@ impl CoreLoop {
                     doc_id,
                     &updated_bytes,
                 );
+                // Re-index the row's vectors from the new body (soft-delete the
+                // old HNSW node + insert the new one, keyed by the stable
+                // surrogate). No-op unless the collection has a vector field.
+                if has_vectors
+                    && let Some(surrogate) =
+                        crate::engine::document::store::doc_id_to_surrogate(doc_id)
+                {
+                    self.update_reindex_vector_indexes(UpdateVectorReindex {
+                        database_id,
+                        tid,
+                        collection: target_collection,
+                        row_key: doc_id,
+                        surrogate,
+                        new_body: &updated_bytes,
+                        is_strict: strict_schema.is_some(),
+                        has_vectors,
+                    });
+                }
                 affected += 1;
                 if returning.is_some() {
                     if let Some(obj) = target_doc.as_object_mut() {

@@ -183,6 +183,26 @@ impl CoreLoop {
         names
     }
 
+    /// Whether `collection` has any vector fields — strict-schema `Vector(dim)`
+    /// columns OR schemaless fields registered via `vector_params`. Combines
+    /// `strict_vector_fields` + `schemaless_vector_field_names` into the single
+    /// gate check callers need before deciding whether to pay for HNSW
+    /// maintenance at all. Callers that loop over many rows (bulk update/
+    /// delete, merge, update-from-join) must call this ONCE before the loop
+    /// and thread the resulting bool through, rather than recomputing it per
+    /// row — the schemaless half is an unindexed scan of `vector_params`.
+    pub(in crate::data::executor) fn collection_has_vectors(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> bool {
+        !self.strict_vector_fields(tid, collection).is_empty()
+            || !self
+                .schemaless_vector_field_names(database_id, tid, collection)
+                .is_empty()
+    }
+
     /// HNSW vector indexing side-effect: index declared strict-schema
     /// `Vector(dim)` columns, or (schemaless) fields matched by registered
     /// `vector_params`, into the corresponding `VectorCollection`.

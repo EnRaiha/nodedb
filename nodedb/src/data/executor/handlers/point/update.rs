@@ -320,6 +320,7 @@ impl CoreLoop {
                         // surrogate's vectors from the new body so KNN search
                         // reflects an embedding change in the same process.
                         // No-op when the collection has no vector index.
+                        let has_vectors = self.collection_has_vectors(database_id, tid, collection);
                         self.update_reindex_vector_indexes(
                             super::update_reindex_vector::UpdateVectorReindex {
                                 database_id,
@@ -329,6 +330,7 @@ impl CoreLoop {
                                 surrogate,
                                 new_body: &updated_bytes,
                                 is_strict,
+                                has_vectors,
                             },
                         );
 
