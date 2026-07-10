@@ -95,7 +95,10 @@ pub fn is_write_plan(plan: &PhysicalPlan) -> bool {
         // Columnar writes
         PhysicalPlan::Columnar(op) => {
             use nodedb_physical::physical_plan::ColumnarOp;
-            matches!(op, ColumnarOp::Insert { .. })
+            matches!(
+                op,
+                ColumnarOp::Insert { .. } | ColumnarOp::Update { .. } | ColumnarOp::Delete { .. }
+            )
         }
         // CRDT writes
         PhysicalPlan::Crdt(op) => {

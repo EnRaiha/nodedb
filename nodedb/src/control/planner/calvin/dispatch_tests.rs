@@ -8,7 +8,7 @@ use crate::control::planner::calvin::cross_shard_mode::CrossShardTxnMode;
 use crate::control::planner::calvin::types::{DispatchClass, DispatchOutcome};
 use crate::control::server::shared::session::TransactionState;
 use crate::types::{TenantId, VShardId};
-use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{ColumnarOp, CrdtOp, DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 fn doc_insert_task(vshard: u32) -> PhysicalTask {
@@ -117,6 +117,27 @@ fn is_write_plan_classifies_crdt_list_ops() {
     for (name, plan) in &list_ops {
         assert!(is_write_plan(plan), "{name} should classify as a write");
     }
+}
+
+#[test]
+fn is_write_plan_classifies_columnar_update_and_delete() {
+    let update = PhysicalPlan::Columnar(ColumnarOp::Update {
+        collection: "metrics".to_owned(),
+        filters: vec![],
+        updates: vec![],
+    });
+    let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
+        collection: "metrics".to_owned(),
+        filters: vec![],
+    });
+    assert!(
+        is_write_plan(&update),
+        "ColumnarOp::Update should be a write"
+    );
+    assert!(
+        is_write_plan(&delete),
+        "ColumnarOp::Delete should be a write"
+    );
 }
 
 #[test]
