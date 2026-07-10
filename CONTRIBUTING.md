@@ -56,6 +56,8 @@ Before writing any Data Plane or engine code, read `nodedb/CLAUDE.md` in full. I
 - Raft or replication changes
 - Security-relevant changes
 
+A wire or storage **version bump** in particular needs discussion before you open the PR — it forces a coordinated upgrade, so we decide together when it lands. Don't bump ahead of the code that reads the new field; sequence the bump with its consumer so one upgrade delivers a real capability.
+
 ## What We Don't Accept
 
 - Cosmetic changes (whitespace, comment reformatting) without functional change
@@ -63,6 +65,7 @@ Before writing any Data Plane or engine code, read `nodedb/CLAUDE.md` in full. I
 - Changes that break the plane separation model
 - `_ =>` catch-alls on `EngineType`, `CollectionType`, or `PhysicalPlan`
 - New `Arc<Mutex<T>>` used as cross-plane communication
+- Roadmap markers in source or test names — phase/unit/wave labels, or comments that reference an internal planning doc a reader can't open. Comments explain _behavior_; test names state _what they assert_.
 
 ---
 
