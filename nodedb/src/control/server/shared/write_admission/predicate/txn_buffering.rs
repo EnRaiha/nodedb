@@ -13,11 +13,37 @@
 //! `plan_requires_txn_buffering` reproduces `to_replicated_entry(..).is_some()`
 //! variant-for-variant as a compile-time-exhaustive match, so a new
 //! `PhysicalPlan` variant forces an explicit staging decision instead of
-//! silently inheriting a wrong default. This is a behavior-preserving
-//! reclassification, not a bug fix: every `false` arm below that is
-//! semantically a write (`required_permission` says `Write`) carries a
-//! comment stating that fact about TODAY's behavior. Fixing any of those is a
-//! separate, later change.
+//! silently inheriting a wrong default. For most arms this is a
+//! behavior-preserving reclassification, not a bug fix: every remaining
+//! `false` arm below that is semantically a write (`required_permission` says
+//! `Write`) carries a comment stating that fact about TODAY's behavior, and
+//! fixing those is a separate, later change.
+//!
+//! One documented set of arms is the exception:
+//! `DocumentOp::{BatchInsert, Merge, UpdateFromJoin}`,
+//! `CrdtOp::{SetConstraints, DropConstraints, RestoreToVersion, ListInsert,
+//! ListDelete, ListMove}`, `VectorOp::{DeleteBySurrogate, SparseInsert,
+//! SparseDelete, MultiVectorInsert, MultiVectorDelete, DirectUpsert}`, and
+//! `ArrayOp::{Put, Delete}` classify `true` here even though
+//! `to_replicated_entry` has no encoder arm for any of them — a deliberate
+//! divergence from the oracle (see the equivalence test below, which pins the
+//! divergence explicitly rather than papering over it). Without buffering,
+//! each of these executed immediately against base state inside an explicit
+//! transaction, was visible before COMMIT, and survived ROLLBACK: a
+//! correctness bug, not a classification nuance. Closing it costs two
+//! deliberate, documented trade-offs:
+//!
+//! 1. RYOW LOSS: a `Buffered` plan does not stage into the per-transaction
+//!    overlay, so a read later in the SAME transaction does not observe the
+//!    write until COMMIT. This matches how bulk Document DML already behaved
+//!    in a transaction before it was staged.
+//! 2. NO-UNDO GAP (pre-existing, not fixed here): every flipped variant
+//!    reaches `exec_tx_passthrough`
+//!    (`data/executor/handlers/transaction/sub_plan_write.rs`) at COMMIT,
+//!    which pushes no `UndoEntry`. If a sibling sub-plan fails later in the
+//!    same COMMIT batch, these writes cannot be reversed by
+//!    `rollback_undo_log`. Spatial, Text, and bulk Document writes already
+//!    ride this exact path.
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
@@ -35,7 +61,9 @@ use nodedb_physical::physical_plan::{
 /// (`control/wal_replication/encode/entry.rs`) variant-for-variant —
 /// including the two payload-conditional `DocumentOp` bulk variants, whose
 /// OLLP-predicted-surrogate/edge fields the WAL encoder inspects before
-/// deciding whether to encode.
+/// deciding whether to encode — EXCEPT for the documented set of
+/// write-but-was-unbuffered variants flipped to `true` below (see module
+/// doc): those return `true` here even though the oracle returns `false`.
 pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
     match plan {
         // ---- Document: encoded (buffered) ----
@@ -80,15 +108,24 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::MaterializeScan { .. },
         ) => false,
 
-        // Write-but-unbuffered: these require Write permission but
-        // `to_replicated_entry` has no encoder arm for them, so today a
-        // ROLLBACK inside an explicit transaction does not undo them.
+        // Buffered: `to_replicated_entry` has no encoder arm for these (a
+        // deliberate divergence from the oracle, see module doc), but each
+        // reaches `exec_tx_passthrough`
+        // (`data/executor/handlers/transaction/sub_plan.rs:165`) at COMMIT
+        // with no reject arm. Buffering closes the prior atomicity gap
+        // (statement used to execute immediately and survive ROLLBACK) at
+        // the cost of RYOW loss + the no-undo gap (module doc).
         PhysicalPlan::Document(
             DocumentOp::BatchInsert { .. }
-            | DocumentOp::Truncate { .. }
             | DocumentOp::Merge { .. }
             | DocumentOp::UpdateFromJoin { .. },
-        ) => false,
+        ) => true,
+
+        // `Truncate` stays write-but-unbuffered: it is unverified whether
+        // `exec_tx_document`'s passthrough executes it correctly at COMMIT
+        // replay time, so a ROLLBACK inside an explicit transaction still
+        // does not undo it today. Not flipped in this change.
+        PhysicalPlan::Document(DocumentOp::Truncate { .. }) => false,
 
         // ---- Vector: encoded (buffered) ----
         PhysicalPlan::Vector(
@@ -108,7 +145,13 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | VectorOp::MultiVectorScoreSearch { .. },
         ) => false,
 
-        // Write-but-unbuffered: Write permission, no encoder arm today.
+        // Buffered: `to_replicated_entry` has no encoder arm for these (a
+        // deliberate divergence from the oracle, see module doc), but each
+        // reaches `exec_tx_passthrough`
+        // (`data/executor/handlers/transaction/sub_plan.rs:206`) at COMMIT
+        // with no reject arm. Buffering closes the prior atomicity gap
+        // (statement used to execute immediately and survive ROLLBACK) at
+        // the cost of RYOW loss + the no-undo gap (module doc).
         PhysicalPlan::Vector(
             VectorOp::DeleteBySurrogate { .. }
             | VectorOp::SparseInsert { .. }
@@ -116,7 +159,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | VectorOp::MultiVectorInsert { .. }
             | VectorOp::MultiVectorDelete { .. }
             | VectorOp::DirectUpsert { .. },
-        ) => false,
+        ) => true,
 
         // DDL/Alter, not encoded.
         PhysicalPlan::Vector(
@@ -136,7 +179,17 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | CrdtOp::ExportDelta { .. },
         ) => false,
 
-        // Write-but-unbuffered: Write permission, no encoder arm today.
+        // Buffered: `to_replicated_entry` has no encoder arm for these (a
+        // deliberate divergence from the oracle, see module doc), but each
+        // reaches `exec_tx_passthrough`
+        // (`data/executor/handlers/transaction/sub_plan.rs:286`) at COMMIT
+        // with no reject arm. Buffering closes the prior atomicity gap
+        // (statement used to execute immediately and survive ROLLBACK) at
+        // the cost of RYOW loss + the no-undo gap (module doc). For
+        // `SetConstraints` / `DropConstraints` specifically, RYOW loss is
+        // more than cosmetic: a same-transaction `CrdtOp::Apply` validated
+        // against `constraint_version_required` now validates against the
+        // OLD installed constraint version until COMMIT installs the new one.
         PhysicalPlan::Crdt(
             CrdtOp::SetConstraints { .. }
             | CrdtOp::DropConstraints { .. }
@@ -144,7 +197,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | CrdtOp::ListInsert { .. }
             | CrdtOp::ListDelete { .. }
             | CrdtOp::ListMove { .. },
-        ) => false,
+        ) => true,
 
         // DDL/Alter, not encoded.
         PhysicalPlan::Crdt(CrdtOp::SetPolicy { .. } | CrdtOp::CompactAtVersion { .. }) => false,
@@ -346,16 +399,30 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | ArrayOp::SurrogateBitmapScan { .. }
             | ArrayOp::DropArray { .. },
         ) => false,
-        // Write-but-unbuffered: Write permission, but no encoder arm exists
-        // (`ArrayOp` is unreachable from `to_replicated_entry` entirely).
-        PhysicalPlan::Array(ArrayOp::Put { .. } | ArrayOp::Delete { .. }) => false,
+        // Buffered: `ArrayOp` is unreachable from `to_replicated_entry`
+        // entirely (a deliberate divergence from the oracle, see module
+        // doc), but both reach `exec_tx_passthrough`
+        // (`data/executor/handlers/transaction/sub_plan.rs:55-60`) at COMMIT
+        // with no reject arm. Buffering closes the prior atomicity gap
+        // (statement used to execute immediately and survive ROLLBACK) at
+        // the cost of RYOW loss + the no-undo gap (module doc).
+        PhysicalPlan::Array(ArrayOp::Put { .. } | ArrayOp::Delete { .. }) => true,
 
         // ---- ClusterArray: coordinator-only, never dispatched to the Data
         // Plane and never touched by `to_replicated_entry`.
         PhysicalPlan::ClusterArray(ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. }) => {
             false
         }
-        // Write-but-unbuffered: Write permission, but no encoder arm exists.
+        // Write-but-unbuffered: Write permission, no encoder arm today, and
+        // NOT flipped in this change. Unlike `ArrayOp`, `ClusterArrayOp` is a
+        // Control-Plane-only construct (`control/cluster/array_cluster_exec/
+        // executor.rs` RPC-fans-out to per-shard `ArrayOp`); the Data Plane's
+        // `DataPlaneVisitor::cluster_array`
+        // (`data/executor/dispatch/visitor.rs:82-84`) is a hard
+        // `unreachable!()`. Buffering these would route them through
+        // `MetaOp::TransactionBatch` -> `exec_tx_passthrough` ->
+        // `self.execute(..)` at COMMIT, which reaches that `unreachable!()`
+        // and panics. Left `false` deliberately.
         PhysicalPlan::ClusterArray(ClusterArrayOp::Put { .. } | ClusterArrayOp::Delete { .. }) => {
             false
         }
@@ -364,8 +431,11 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
 
 /// Equivalence regression: `plan_requires_txn_buffering` must return exactly
 /// what `to_replicated_entry(..).is_some()` returns, for a representative
-/// instance of every leaf op variant across every engine. This is the entire
-/// safety net for retiring the ad-hoc oracle — if a future edit to either
+/// instance of every leaf op variant across every engine EXCEPT the flipped
+/// set documented in the module doc (those are pinned separately by
+/// `flipped_variants_are_buffered_and_unencoded` below, via
+/// `assert_buffered_but_unencoded`). This is the safety net for retiring the
+/// ad-hoc oracle over the remaining variants — if a future edit to either
 /// this predicate or the WAL encoder drifts the two apart, one of these
 /// assertions fails.
 #[cfg(test)]
@@ -417,6 +487,23 @@ mod tests {
         assert_eq!(
             actual, expected,
             "plan_requires_txn_buffering disagrees with to_replicated_entry for {plan:?}"
+        );
+    }
+
+    /// Pin the deliberate divergence for a flipped variant (module doc): the
+    /// predicate now classifies it `true` (buffered — the atomicity fix),
+    /// while `to_replicated_entry` still has no encoder arm for it and
+    /// returns `None` (a separate, documented encoder omission, not fixed
+    /// here). Asserting both makes the divergence from `assert_matches_oracle`
+    /// intentional and visible instead of a silent drift.
+    fn assert_buffered_but_unencoded(plan: &PhysicalPlan) {
+        assert!(
+            plan_requires_txn_buffering(plan),
+            "expected {plan:?} to require txn buffering"
+        );
+        assert!(
+            to_replicated_entry(tenant(), db(), vshard(), plan).is_none(),
+            "expected {plan:?} to still have no WAL encoder arm (encoder omission is a separate, undone unit)"
         );
     }
 
@@ -474,11 +561,6 @@ mod tests {
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
                 prefilter: None,
-            }),
-            PhysicalPlan::Document(DocumentOp::BatchInsert {
-                collection: "c".into(),
-                documents: Vec::new(),
-                surrogates: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::RangeScan {
                 collection: "c".into(),
@@ -542,16 +624,6 @@ mod tests {
                 on_conflict_updates: Vec::new(),
                 surrogate: Surrogate::ZERO,
             }),
-            PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-                target_collection: "t".into(),
-                source_collection: "s".into(),
-                source_alias: "s".into(),
-                target_join_col: "id".into(),
-                source_join_col: "id".into(),
-                updates: Vec::new(),
-                target_filters: Vec::new(),
-                returning: None,
-            }),
             // BulkUpdate / BulkDelete: non-OLLP (both None) — the buffered case.
             PhysicalPlan::Document(DocumentOp::BulkUpdate {
                 collection: "c".into(),
@@ -612,15 +684,6 @@ mod tests {
                     label: None,
                 }]),
             }),
-            PhysicalPlan::Document(DocumentOp::Merge {
-                target_collection: "t".into(),
-                source_collection: "s".into(),
-                source_alias: "s".into(),
-                target_join_col: "id".into(),
-                source_join_col: "id".into(),
-                clauses: Vec::new(),
-                returning: None,
-            }),
             PhysicalPlan::Document(DocumentOp::MaterializeScan {
                 collection: "c".into(),
                 cursor: Vec::new(),
@@ -677,12 +740,6 @@ mod tests {
                 collection: "c".into(),
                 vector_id: 0,
             }),
-            PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
-                collection: "c".into(),
-                surrogate: Surrogate::ZERO,
-                field_name: String::new(),
-                provenance: None,
-            }),
             PhysicalPlan::Vector(VectorOp::SetParams {
                 collection: "c".into(),
                 field_name: String::new(),
@@ -713,35 +770,11 @@ mod tests {
                 m0: 0,
                 ef_construction: 0,
             }),
-            PhysicalPlan::Vector(VectorOp::SparseInsert {
-                collection: "c".into(),
-                field_name: String::new(),
-                doc_id: "d".into(),
-                entries: Vec::new(),
-            }),
             PhysicalPlan::Vector(VectorOp::SparseSearch {
                 collection: "c".into(),
                 field_name: String::new(),
                 query_entries: Vec::new(),
                 top_k: 0,
-            }),
-            PhysicalPlan::Vector(VectorOp::SparseDelete {
-                collection: "c".into(),
-                field_name: String::new(),
-                doc_id: "d".into(),
-            }),
-            PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-                collection: "c".into(),
-                field_name: String::new(),
-                document_surrogate: Surrogate::ZERO,
-                vectors: Vec::new(),
-                count: 0,
-                dim: 0,
-            }),
-            PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
-                collection: "c".into(),
-                field_name: String::new(),
-                document_surrogate: Surrogate::ZERO,
             }),
             PhysicalPlan::Vector(VectorOp::MultiVectorScoreSearch {
                 collection: "c".into(),
@@ -750,16 +783,6 @@ mod tests {
                 top_k: 0,
                 ef_search: 0,
                 mode: String::new(),
-            }),
-            PhysicalPlan::Vector(VectorOp::DirectUpsert {
-                collection: "c".into(),
-                field: String::new(),
-                surrogate: Surrogate::ZERO,
-                vector: Vec::new(),
-                payload: Vec::new(),
-                quantization: Default::default(),
-                storage_dtype: Default::default(),
-                payload_indexes: Vec::new(),
             }),
         ];
         for p in &plans {
@@ -789,15 +812,6 @@ mod tests {
                 collection: "c".into(),
                 bytes: Vec::new(),
             }),
-            PhysicalPlan::Crdt(CrdtOp::SetConstraints {
-                collection: "c".into(),
-                constraint_version: 0,
-                constraints: Vec::new(),
-            }),
-            PhysicalPlan::Crdt(CrdtOp::DropConstraints {
-                collection: "c".into(),
-                constraint_version: 0,
-            }),
             PhysicalPlan::Crdt(CrdtOp::ReadConstraints {
                 collection: "c".into(),
             }),
@@ -820,38 +834,9 @@ mod tests {
                 collection: "c".into(),
                 from_version_json: "{}".into(),
             }),
-            PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
-                collection: "c".into(),
-                document_id: "d".into(),
-                target_version_json: "{}".into(),
-                surrogate: Surrogate::ZERO,
-            }),
             PhysicalPlan::Crdt(CrdtOp::CompactAtVersion {
                 collection: "c".into(),
                 target_version_json: "{}".into(),
-            }),
-            PhysicalPlan::Crdt(CrdtOp::ListInsert {
-                collection: "c".into(),
-                document_id: "d".into(),
-                list_path: "$.l".into(),
-                index: 0,
-                fields_json: "{}".into(),
-                surrogate: Surrogate::ZERO,
-            }),
-            PhysicalPlan::Crdt(CrdtOp::ListDelete {
-                collection: "c".into(),
-                document_id: "d".into(),
-                list_path: "$.l".into(),
-                index: 0,
-                surrogate: Surrogate::ZERO,
-            }),
-            PhysicalPlan::Crdt(CrdtOp::ListMove {
-                collection: "c".into(),
-                document_id: "d".into(),
-                list_path: "$.l".into(),
-                from_index: 0,
-                to_index: 1,
-                surrogate: Surrogate::ZERO,
             }),
         ];
         for p in &plans {
@@ -1701,18 +1686,6 @@ mod tests {
                 schema_hash: 0,
                 prefix_bits: 0,
             }),
-            PhysicalPlan::Array(ArrayOp::Put {
-                array_id: array_id.clone(),
-                cells_msgpack: Vec::new(),
-                wal_lsn: 0,
-                provenance: None,
-            }),
-            PhysicalPlan::Array(ArrayOp::Delete {
-                array_id: array_id.clone(),
-                coords_msgpack: Vec::new(),
-                wal_lsn: 0,
-                provenance: None,
-            }),
             PhysicalPlan::Array(ArrayOp::Slice {
                 array_id: array_id.clone(),
                 slice_msgpack: Vec::new(),
@@ -1780,6 +1753,10 @@ mod tests {
                 system_as_of: None,
                 valid_at_ms: None,
             }),
+            // `ClusterArrayOp::Put` / `Delete` are NOT flipped (see their arm
+            // above): buffering them would panic at COMMIT via
+            // `DataPlaneVisitor::cluster_array`'s `unreachable!()`. They stay
+            // in the equivalence set, both sides `false`.
             PhysicalPlan::ClusterArray(ClusterArrayOp::Put {
                 array_id: array_id.clone(),
                 array_id_msgpack: Vec::new(),
@@ -1797,6 +1774,135 @@ mod tests {
         ];
         for p in &plans {
             assert_matches_oracle(p);
+        }
+    }
+
+    /// Pin the deliberate oracle divergence (module doc) for every flipped
+    /// variant across all four affected engines: each classifies `true`
+    /// (buffered — closes the atomicity gap) while `to_replicated_entry`
+    /// still has no encoder arm and returns `None` (a separate, undone
+    /// encoder-omission unit).
+    #[test]
+    fn flipped_variants_are_buffered_and_unencoded() {
+        let array_id = ArrayId::new(tenant(), "a");
+        let plans = vec![
+            PhysicalPlan::Document(DocumentOp::BatchInsert {
+                collection: "c".into(),
+                documents: Vec::new(),
+                surrogates: Vec::new(),
+            }),
+            PhysicalPlan::Document(DocumentOp::Merge {
+                target_collection: "t".into(),
+                source_collection: "s".into(),
+                source_alias: "s".into(),
+                target_join_col: "id".into(),
+                source_join_col: "id".into(),
+                clauses: Vec::new(),
+                returning: None,
+            }),
+            PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
+                target_collection: "t".into(),
+                source_collection: "s".into(),
+                source_alias: "s".into(),
+                target_join_col: "id".into(),
+                source_join_col: "id".into(),
+                updates: Vec::new(),
+                target_filters: Vec::new(),
+                returning: None,
+            }),
+            PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
+                collection: "c".into(),
+                surrogate: Surrogate::ZERO,
+                field_name: String::new(),
+                provenance: None,
+            }),
+            PhysicalPlan::Vector(VectorOp::SparseInsert {
+                collection: "c".into(),
+                field_name: String::new(),
+                doc_id: "d".into(),
+                entries: Vec::new(),
+            }),
+            PhysicalPlan::Vector(VectorOp::SparseDelete {
+                collection: "c".into(),
+                field_name: String::new(),
+                doc_id: "d".into(),
+            }),
+            PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
+                collection: "c".into(),
+                field_name: String::new(),
+                document_surrogate: Surrogate::ZERO,
+                vectors: Vec::new(),
+                count: 0,
+                dim: 0,
+            }),
+            PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
+                collection: "c".into(),
+                field_name: String::new(),
+                document_surrogate: Surrogate::ZERO,
+            }),
+            PhysicalPlan::Vector(VectorOp::DirectUpsert {
+                collection: "c".into(),
+                field: String::new(),
+                surrogate: Surrogate::ZERO,
+                vector: Vec::new(),
+                payload: Vec::new(),
+                quantization: Default::default(),
+                storage_dtype: Default::default(),
+                payload_indexes: Vec::new(),
+            }),
+            PhysicalPlan::Crdt(CrdtOp::SetConstraints {
+                collection: "c".into(),
+                constraint_version: 0,
+                constraints: Vec::new(),
+            }),
+            PhysicalPlan::Crdt(CrdtOp::DropConstraints {
+                collection: "c".into(),
+                constraint_version: 0,
+            }),
+            PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
+                collection: "c".into(),
+                document_id: "d".into(),
+                target_version_json: "{}".into(),
+                surrogate: Surrogate::ZERO,
+            }),
+            PhysicalPlan::Crdt(CrdtOp::ListInsert {
+                collection: "c".into(),
+                document_id: "d".into(),
+                list_path: "$.l".into(),
+                index: 0,
+                fields_json: "{}".into(),
+                surrogate: Surrogate::ZERO,
+            }),
+            PhysicalPlan::Crdt(CrdtOp::ListDelete {
+                collection: "c".into(),
+                document_id: "d".into(),
+                list_path: "$.l".into(),
+                index: 0,
+                surrogate: Surrogate::ZERO,
+            }),
+            PhysicalPlan::Crdt(CrdtOp::ListMove {
+                collection: "c".into(),
+                document_id: "d".into(),
+                list_path: "$.l".into(),
+                from_index: 0,
+                to_index: 1,
+                surrogate: Surrogate::ZERO,
+            }),
+            PhysicalPlan::Array(ArrayOp::Put {
+                array_id: array_id.clone(),
+                cells_msgpack: Vec::new(),
+                wal_lsn: 0,
+                provenance: None,
+            }),
+            PhysicalPlan::Array(ArrayOp::Delete {
+                array_id: array_id.clone(),
+                coords_msgpack: Vec::new(),
+                wal_lsn: 0,
+                provenance: None,
+            }),
+        ];
+        for p in &plans {
+            assert_buffered_but_unencoded(p);
         }
     }
 }
