@@ -24,7 +24,7 @@ pub fn list_insert(
     index: usize,
     value: LoroValue,
 ) -> Result<()> {
-    let list = get_movable_list(doc, collection, row_id, list_path)?;
+    let list = get_or_create_movable_list(doc, collection, row_id, list_path)?;
     let idx = index.min(list.len());
     list.insert(idx, value)
         .map_err(|e| CrdtError::Loro(format!("list insert at {idx}: {e}")))?;
@@ -41,7 +41,7 @@ pub fn list_insert_container(
     list_path: &str,
     index: usize,
 ) -> Result<LoroMap> {
-    let list = get_movable_list(doc, collection, row_id, list_path)?;
+    let list = get_or_create_movable_list(doc, collection, row_id, list_path)?;
     let idx = index.min(list.len());
     list.insert_container(idx, LoroMap::new())
         .map_err(|e| CrdtError::Loro(format!("list insert container at {idx}: {e}")))
@@ -175,6 +175,86 @@ fn get_movable_list(
                 )));
             }
         }
+    }
+
+    Err(CrdtError::Loro(format!(
+        "path '{list_path}' did not resolve to a movable list"
+    )))
+}
+
+/// Navigate to a LoroMovableList at `collection/row_id/list_path`, creating
+/// it (and any missing intermediate LoroMaps along `list_path`) if absent.
+///
+/// The row itself must already exist — this function never creates rows,
+/// only the containers along the path within an existing row. Auto-vivify
+/// happens only on the insert path: inserting the first block into a fresh
+/// row bootstraps the list, without requiring a separate "create container"
+/// step that no caller in either repo could otherwise reach.
+///
+/// A segment occupied by the wrong type (a scalar, or a `Container::List`
+/// at the last segment) is never silently replaced — it returns the same
+/// typed error `get_movable_list` returns for that case.
+///
+/// Deterministic under replay: this walks the same containers in the same
+/// order for the same op sequence, so replaying at the same LSN on the same
+/// peer_id reconstructs identical structure.
+fn get_or_create_movable_list(
+    doc: &LoroDoc,
+    collection: &str,
+    row_id: &str,
+    list_path: &str,
+) -> Result<LoroMovableList> {
+    let coll = doc.get_map(collection);
+    let row = match coll.get(row_id) {
+        Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
+        _ => {
+            return Err(CrdtError::Loro(format!(
+                "row '{row_id}' not found or not a map in '{collection}'"
+            )));
+        }
+    };
+
+    let segments: Vec<&str> = list_path.split('.').collect();
+    let mut current_map = row;
+
+    for (i, segment) in segments.iter().enumerate() {
+        let is_last = i == segments.len() - 1;
+
+        if is_last {
+            return match current_map.get(segment) {
+                Some(ValueOrContainer::Container(loro::Container::MovableList(l))) => Ok(l),
+                Some(ValueOrContainer::Container(loro::Container::List(_))) => {
+                    Err(CrdtError::Loro(format!(
+                        "path '{list_path}' resolved to LoroList, not LoroMovableList. \
+                         Use LoroMovableList for block containers that support reordering."
+                    )))
+                }
+                None => current_map
+                    .insert_container(segment, LoroMovableList::new())
+                    .map_err(|e| {
+                        CrdtError::Loro(format!("create movable list at '{list_path}': {e}"))
+                    }),
+                Some(_) => Err(CrdtError::Loro(format!(
+                    "path '{list_path}' segment '{segment}' not found or wrong type"
+                ))),
+            };
+        }
+
+        current_map = match current_map.get(segment) {
+            Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
+            None => current_map
+                .insert_container(segment, LoroMap::new())
+                .map_err(|e| {
+                    CrdtError::Loro(format!(
+                        "create intermediate map at '{list_path}' segment '{segment}': {e}"
+                    ))
+                })?,
+            Some(_) => {
+                return Err(CrdtError::Loro(format!(
+                    "path '{list_path}' segment '{segment}' not found or wrong type"
+                )));
+            }
+        };
     }
 
     Err(CrdtError::Loro(format!(
@@ -330,6 +410,110 @@ mod tests {
     fn get_list_wrong_path_errors() {
         let state = setup_doc_with_blocks();
         let err = list_length(state.doc(), "pages", "doc-1", "nonexistent");
+        assert!(err.is_err());
+    }
+
+    /// A row with no list at `list_path` yet — the setup previous agents
+    /// couldn't reach without `get_or_create_movable_list`.
+    fn setup_bare_row(row_id: &str) -> CrdtState {
+        let state = CrdtState::new(1).unwrap();
+        let coll = state.doc().get_map("pages");
+        let row = coll.insert_container(row_id, LoroMap::new()).unwrap();
+        row.insert("title", LoroValue::String("Bare".into()))
+            .unwrap();
+        state
+    }
+
+    #[test]
+    fn list_insert_auto_vivifies_missing_list() {
+        let state = setup_bare_row("doc-2");
+        list_insert(
+            state.doc(),
+            "pages",
+            "doc-2",
+            "blocks",
+            0,
+            LoroValue::String("first".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            list_length(state.doc(), "pages", "doc-2", "blocks").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn list_insert_container_auto_vivifies_missing_list() {
+        let state = setup_bare_row("doc-2");
+        let block = list_insert_container(state.doc(), "pages", "doc-2", "blocks", 0).unwrap();
+        block
+            .insert("id", LoroValue::String("blk-0".into()))
+            .unwrap();
+        assert_eq!(
+            list_length(state.doc(), "pages", "doc-2", "blocks").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn list_insert_auto_vivifies_nested_intermediate_maps() {
+        let state = setup_bare_row("doc-2");
+        // Neither "content" nor "content.blocks" exists yet.
+        list_insert(
+            state.doc(),
+            "pages",
+            "doc-2",
+            "content.blocks",
+            0,
+            LoroValue::String("first".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            list_length(state.doc(), "pages", "doc-2", "content.blocks").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn list_insert_scalar_segment_errors_instead_of_replacing() {
+        let state = setup_bare_row("doc-2");
+        let coll = state.doc().get_map("pages");
+        let row = match coll.get("doc-2") {
+            Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
+            _ => panic!("expected row map"),
+        };
+        row.insert("blocks", LoroValue::String("not-a-list".into()))
+            .unwrap();
+
+        let err = list_insert(
+            state.doc(),
+            "pages",
+            "doc-2",
+            "blocks",
+            0,
+            LoroValue::String("x".into()),
+        );
+        assert!(err.is_err());
+        // The scalar must survive untouched — no silent replacement.
+        match row.get("blocks") {
+            Some(ValueOrContainer::Value(v)) => {
+                assert_eq!(v, LoroValue::String("not-a-list".into()));
+            }
+            other => panic!("expected untouched scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_delete_on_missing_list_still_errors() {
+        let state = setup_bare_row("doc-2");
+        let err = list_delete(state.doc(), "pages", "doc-2", "blocks", 0);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn list_move_on_missing_list_still_errors() {
+        let state = setup_bare_row("doc-2");
+        let err = list_move(state.doc(), "pages", "doc-2", "blocks", 0, 1);
         assert!(err.is_err());
     }
 }

@@ -139,6 +139,55 @@ impl NodeDb for NodeDbRemote {
             .await
     }
 
+    // CRDT movable-list operations (`list_insert` / `list_delete` /
+    // `list_move`) are native-wire-only: Origin's SQL/DSL grammar has no
+    // movable-list syntax, only the `OpCode::CrdtList*` native opcodes
+    // exist (see `NativeClient`). Building one here would mean growing a
+    // pgwire/SQL surface for these ops, which is explicitly out of scope —
+    // so this stateless pgwire client reports the capability gap instead
+    // of faking it through a query that doesn't exist.
+
+    async fn list_insert(
+        &self,
+        _collection: &str,
+        _document_id: &str,
+        _list_path: &str,
+        _index: usize,
+        _fields: &Value,
+    ) -> NodeDbResult<()> {
+        Err(nodedb_types::error::NodeDbError::bad_request(
+            "list_insert is not supported over pgwire — Origin's SQL/DSL grammar has no \
+             movable-list syntax; use a native-wire client (NativeClient) or NodeDbLite",
+        ))
+    }
+
+    async fn list_delete(
+        &self,
+        _collection: &str,
+        _document_id: &str,
+        _list_path: &str,
+        _index: usize,
+    ) -> NodeDbResult<()> {
+        Err(nodedb_types::error::NodeDbError::bad_request(
+            "list_delete is not supported over pgwire — Origin's SQL/DSL grammar has no \
+             movable-list syntax; use a native-wire client (NativeClient) or NodeDbLite",
+        ))
+    }
+
+    async fn list_move(
+        &self,
+        _collection: &str,
+        _document_id: &str,
+        _list_path: &str,
+        _from_index: usize,
+        _to_index: usize,
+    ) -> NodeDbResult<()> {
+        Err(nodedb_types::error::NodeDbError::bad_request(
+            "list_move is not supported over pgwire — Origin's SQL/DSL grammar has no \
+             movable-list syntax; use a native-wire client (NativeClient) or NodeDbLite",
+        ))
+    }
+
     async fn document_get(&self, collection: &str, id: &str) -> NodeDbResult<Option<Document>> {
         self.document_get_impl(collection, id).await
     }

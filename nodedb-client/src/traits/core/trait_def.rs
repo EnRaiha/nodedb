@@ -270,6 +270,63 @@ pub trait NodeDb: NodeDbMarker {
         )
     }
 
+    // ─── CRDT List Operations (Movable List) ───────────────────────────
+
+    /// Insert a new block into a document's movable-list container at `index`.
+    ///
+    /// `list_path` addresses the movable list within the document (dot-path
+    /// for nested containers). `fields` supplies the new block's contents —
+    /// must be `Value::Object(..)`; each key becomes a field on the new
+    /// LoroMap block inserted at `index`. `index` is unconditionally
+    /// required: a missing position is a data-corruption risk, never a
+    /// silent-default insert point.
+    ///
+    /// On Lite: appends to the local Loro movable list via
+    /// `nodedb_crdt::list_ops::list_insert_container` + emits a CRDT delta.
+    /// On Remote: encodes `OpCode::CrdtListInsert` (0x99) over the native
+    /// wire with `list_path` / `list_index` / `list_fields_json` set.
+    async fn list_insert(
+        &self,
+        collection: &str,
+        document_id: &str,
+        list_path: &str,
+        index: usize,
+        fields: &Value,
+    ) -> NodeDbResult<()>;
+
+    /// Delete the block at `index` from a document's movable-list container.
+    ///
+    /// On Lite: removes the entry from the local Loro movable list + emits
+    /// a CRDT tombstone delta.
+    /// On Remote: encodes `OpCode::CrdtListDelete` (0x9A) over the native
+    /// wire with `list_path` / `list_index` set.
+    async fn list_delete(
+        &self,
+        collection: &str,
+        document_id: &str,
+        list_path: &str,
+        index: usize,
+    ) -> NodeDbResult<()>;
+
+    /// Move the block at `from_index` to `to_index` within a document's
+    /// movable-list container.
+    ///
+    /// `from_index` and `to_index` are distinct wire fields — never conflate
+    /// them; swapping them silently reorders the list to the wrong shape.
+    ///
+    /// On Lite: repositions the entry in the local Loro movable list + emits
+    /// a CRDT delta.
+    /// On Remote: encodes `OpCode::CrdtListMove` (0x9B) over the native wire
+    /// with `list_path` / `list_from_index` / `list_to_index` set.
+    async fn list_move(
+        &self,
+        collection: &str,
+        document_id: &str,
+        list_path: &str,
+        from_index: usize,
+        to_index: usize,
+    ) -> NodeDbResult<()>;
+
     // ─── Named Vector Fields ──────────────────────────────────────────
 
     /// Insert a vector into a named field within a collection.
@@ -592,6 +649,38 @@ mod tests {
         }
 
         async fn document_delete(&self, _collection: &str, _id: &str) -> NodeDbResult<()> {
+            Ok(())
+        }
+
+        async fn list_insert(
+            &self,
+            _collection: &str,
+            _document_id: &str,
+            _list_path: &str,
+            _index: usize,
+            _fields: &Value,
+        ) -> NodeDbResult<()> {
+            Ok(())
+        }
+
+        async fn list_delete(
+            &self,
+            _collection: &str,
+            _document_id: &str,
+            _list_path: &str,
+            _index: usize,
+        ) -> NodeDbResult<()> {
+            Ok(())
+        }
+
+        async fn list_move(
+            &self,
+            _collection: &str,
+            _document_id: &str,
+            _list_path: &str,
+            _from_index: usize,
+            _to_index: usize,
+        ) -> NodeDbResult<()> {
             Ok(())
         }
 
