@@ -149,6 +149,11 @@ pub enum OpCode {
     KvSortedIndexRange = 0x96,
     KvSortedIndexCount = 0x97,
     KvSortedIndexScore = 0x98,
+
+    // ── CRDT list operations ─────────────────────────────────────
+    CrdtListInsert = 0x99,
+    CrdtListDelete = 0x9A,
+    CrdtListMove = 0x9B,
 }
 
 impl OpCode {
@@ -190,6 +195,9 @@ impl OpCode {
                 | OpCode::KvGetSet
                 | OpCode::KvRegisterSortedIndex
                 | OpCode::KvDropSortedIndex
+                | OpCode::CrdtListInsert
+                | OpCode::CrdtListDelete
+                | OpCode::CrdtListMove
         )
     }
 }
@@ -286,6 +294,9 @@ impl TryFrom<u8> for OpCode {
             0x96 => Ok(OpCode::KvSortedIndexRange),
             0x97 => Ok(OpCode::KvSortedIndexCount),
             0x98 => Ok(OpCode::KvSortedIndexScore),
+            0x99 => Ok(OpCode::CrdtListInsert),
+            0x9A => Ok(OpCode::CrdtListDelete),
+            0x9B => Ok(OpCode::CrdtListMove),
             other => Err(UnknownOpCode(other)),
         }
     }
@@ -318,4 +329,27 @@ pub enum ResponseStatus {
     Partial = 1,
     /// Request failed — see `error` field.
     Error = 2,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crdt_list_opcodes_try_from_u8_roundtrip() {
+        assert_eq!(OpCode::try_from(0x99), Ok(OpCode::CrdtListInsert));
+        assert_eq!(OpCode::try_from(0x9A), Ok(OpCode::CrdtListDelete));
+        assert_eq!(OpCode::try_from(0x9B), Ok(OpCode::CrdtListMove));
+
+        assert_eq!(u8::from(OpCode::CrdtListInsert), 0x99);
+        assert_eq!(u8::from(OpCode::CrdtListDelete), 0x9A);
+        assert_eq!(u8::from(OpCode::CrdtListMove), 0x9B);
+    }
+
+    #[test]
+    fn crdt_list_opcodes_are_writes() {
+        assert!(OpCode::CrdtListInsert.is_write());
+        assert!(OpCode::CrdtListDelete.is_write());
+        assert!(OpCode::CrdtListMove.is_write());
+    }
 }

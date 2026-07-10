@@ -257,7 +257,10 @@ impl NativeSession {
             | OpCode::KvSortedIndexTopK
             | OpCode::KvSortedIndexRange
             | OpCode::KvSortedIndexCount
-            | OpCode::KvSortedIndexScore => dispatch::handle_direct_op(&ctx, seq, op, fields).await,
+            | OpCode::KvSortedIndexScore
+            | OpCode::CrdtListInsert
+            | OpCode::CrdtListDelete
+            | OpCode::CrdtListMove => dispatch::handle_direct_op(&ctx, seq, op, fields).await,
 
             // MATCH: dedicated path that unwraps the DP `{rows, frontier}`
             // envelope into the bare rows array the native row decoder expects.

@@ -130,6 +130,11 @@ impl zerompk::ToMessagePack for TextFields {
         write_opt_field!(writer, FID_INDEX_TYPE, self.index_type);
         write_opt_field!(writer, FID_DATABASE, self.database);
         write_opt_field!(writer, FID_SQL_PARAMS, self.sql_params);
+        write_opt_field!(writer, FID_LIST_PATH, self.list_path);
+        write_opt_field!(writer, FID_LIST_INDEX, self.list_index);
+        write_opt_field!(writer, FID_LIST_FROM_INDEX, self.list_from_index);
+        write_opt_field!(writer, FID_LIST_TO_INDEX, self.list_to_index);
+        write_opt_field!(writer, FID_LIST_FIELDS_JSON, self.list_fields_json);
 
         Ok(())
     }

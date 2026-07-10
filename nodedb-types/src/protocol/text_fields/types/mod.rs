@@ -97,6 +97,11 @@
 //! 82  index_type
 //! 83  database
 //! 84  sql_params
+//! 85  list_path
+//! 86  list_index
+//! 87  list_from_index
+//! 88  list_to_index
+//! 89  list_fields_json
 //! ```
 
 mod field_count;
@@ -408,4 +413,27 @@ pub struct TextFields {
     /// field is added to close.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql_params: Option<Vec<crate::value::Value>>,
+
+    // ── CRDT list operations ─────────────────────────────────
+    /// Dot-addressed path to the movable list container within the
+    /// document (for `CrdtListInsert` / `CrdtListDelete` / `CrdtListMove`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_path: Option<String>,
+    /// Target index for `CrdtListInsert` / `CrdtListDelete`. Wire type is
+    /// `u64`; the server narrows to `usize` and rejects out-of-range
+    /// values with a typed error rather than defaulting to `0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_index: Option<u64>,
+    /// Source index for `CrdtListMove`. Distinct from `list_to_index` —
+    /// the two must never be conflated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_from_index: Option<u64>,
+    /// Destination index for `CrdtListMove`. Distinct from
+    /// `list_from_index` — the two must never be conflated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_to_index: Option<u64>,
+    /// JSON object of block fields to insert as a new list element (for
+    /// `CrdtListInsert`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_fields_json: Option<String>,
 }

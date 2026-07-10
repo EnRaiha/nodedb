@@ -261,6 +261,21 @@ impl TextFields {
         if self.sql_params.is_some() {
             n += 1;
         }
+        if self.list_path.is_some() {
+            n += 1;
+        }
+        if self.list_index.is_some() {
+            n += 1;
+        }
+        if self.list_from_index.is_some() {
+            n += 1;
+        }
+        if self.list_to_index.is_some() {
+            n += 1;
+        }
+        if self.list_fields_json.is_some() {
+            n += 1;
+        }
         n
     }
 }

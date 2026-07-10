@@ -69,6 +69,9 @@ pub(crate) fn build_plan(
         OpCode::CrdtRead => crdt::build_read(fields, collection),
         OpCode::CrdtApply => crdt::build_apply(ctx, fields, collection),
         OpCode::AlterCollectionPolicy => crdt::build_alter_policy(fields, collection),
+        OpCode::CrdtListInsert => crdt::build_list_insert(ctx, fields, collection),
+        OpCode::CrdtListDelete => crdt::build_list_delete(ctx, fields, collection),
+        OpCode::CrdtListMove => crdt::build_list_move(ctx, fields, collection),
         // Text/Search.
         OpCode::TextSearch => text::build_search(fields, collection),
         OpCode::HybridSearch => text::build_hybrid_search(fields, collection),

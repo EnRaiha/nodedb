@@ -326,6 +326,21 @@ impl<'a> zerompk::FromMessagePack<'a> for TextFields {
                 FID_SQL_PARAMS => {
                     out.sql_params = Some(Vec::<crate::value::Value>::read(reader)?);
                 }
+                FID_LIST_PATH => {
+                    out.list_path = Some(reader.read_string()?.into_owned());
+                }
+                FID_LIST_INDEX => {
+                    out.list_index = Some(reader.read_u64()?);
+                }
+                FID_LIST_FROM_INDEX => {
+                    out.list_from_index = Some(reader.read_u64()?);
+                }
+                FID_LIST_TO_INDEX => {
+                    out.list_to_index = Some(reader.read_u64()?);
+                }
+                FID_LIST_FIELDS_JSON => {
+                    out.list_fields_json = Some(reader.read_string()?.into_owned());
+                }
                 // Unknown field ID — skip value for forward compatibility.
                 _ => {
                     skip_msgpack_value(reader)?;
@@ -414,6 +429,29 @@ mod tests {
         assert_eq!(decoded.ef_search, Some(u32::MAX));
         assert_eq!(decoded.m, Some(u16::MAX));
         assert_eq!(decoded.ef_construction, Some(u16::MAX));
+    }
+
+    #[test]
+    fn crdt_list_fields_roundtrip() {
+        let tf = TextFields {
+            list_path: Some("items".into()),
+            list_index: Some(3),
+            list_from_index: Some(1),
+            list_to_index: Some(5),
+            list_fields_json: Some(r#"{"title":"hello"}"#.into()),
+            ..Default::default()
+        };
+        let decoded = roundtrip(&tf);
+        assert_eq!(decoded.list_path.as_deref(), Some("items"));
+        assert_eq!(decoded.list_index, Some(3));
+        assert_eq!(decoded.list_from_index, Some(1));
+        assert_eq!(decoded.list_to_index, Some(5));
+        // from_index and to_index must stay distinct through the wire.
+        assert_ne!(decoded.list_from_index, decoded.list_to_index);
+        assert_eq!(
+            decoded.list_fields_json.as_deref(),
+            Some(r#"{"title":"hello"}"#)
+        );
     }
 
     #[test]
