@@ -177,6 +177,38 @@ pub(in crate::data::executor) enum UndoEntry {
         source_prior: Vec<u8>,
         dest_prior: Option<Vec<u8>>,
     },
+    /// Undo a KV `Expire`/`Persist` by restoring the key's prior TTL state.
+    ///
+    /// `prior_expiry == None` means the key had no TTL (persistent) before
+    /// the forward op; undo calls `KvEngine::persist`. `prior_expiry ==
+    /// Some(expire_at_ms)` means the key had a TTL expiring at that exact
+    /// absolute instant; undo calls `KvEngine::expire_with_absolute_expiry`
+    /// with it verbatim (not a freshly-derived `now_ms + ttl_ms`, which
+    /// would drift from the original instant by the elapsed time).
+    KvTtl {
+        collection: String,
+        key: Vec<u8>,
+        prior_expiry: Option<u64>,
+    },
+    /// Undo a KV `RegisterSortedIndex`/`DropSortedIndex` by restoring the
+    /// index name's prior definition state.
+    ///
+    /// `prior_def == None` means no index existed under this name before
+    /// the forward op (a fresh `RegisterSortedIndex`); undo drops it.
+    /// `prior_def == Some(def)` means an index existed under this name
+    /// before the forward op (either overwritten by `RegisterSortedIndex`,
+    /// or removed by `DropSortedIndex`); undo re-registers `def`, which
+    /// rebuilds the order-statistic tree by backfilling from the KV
+    /// collection's CURRENT contents at undo time -- correct regardless of
+    /// undo-log ordering relative to sibling KV-write undos, since
+    /// `SortedIndexManager::register` always derives the tree fresh from
+    /// live table state rather than from a point-in-time snapshot.
+    SortedIndexDdl {
+        database_id: u64,
+        tenant_id: u64,
+        index_name: String,
+        prior_def: Option<crate::engine::kv::sorted_index::manager::SortedIndexDef>,
+    },
     /// Undo a `mark_node_deleted` by removing the node from the in-memory
     /// deleted-nodes set (edge referential-integrity tracker).
     ///

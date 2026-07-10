@@ -9,7 +9,6 @@
 use tracing::error;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::engine::kv::current_ms;
 
 use super::UndoEntry;
 
@@ -103,7 +102,10 @@ impl CoreLoop {
                     Err((entry_index, detail))
                 }
             },
-            _ => unreachable!("apply_undo_vector called with non-vector entry"),
+            _ => Err((
+                entry_index,
+                "apply_undo_vector called with non-vector entry".to_string(),
+            )),
         }
     }
 
@@ -222,169 +224,10 @@ impl CoreLoop {
                     (entry_index, detail)
                 })
             }
-            _ => unreachable!("apply_undo_edge called with non-edge entry"),
-        }
-    }
-
-    // ── KV ───────────────────────────────────────────────────────────────────
-
-    pub(super) fn apply_undo_kv(
-        &mut self,
-        did: u64,
-        tid: u64,
-        _entry_index: usize,
-        entry: UndoEntry,
-    ) -> Result<(), (usize, String)> {
-        match entry {
-            UndoEntry::KvPut {
-                collection,
-                key,
-                prior_value,
-            } => {
-                let now_ms = current_ms();
-                if let Some(old) = prior_value {
-                    self.kv_engine.put(crate::engine::kv::KvPutParams {
-                        database_id: did,
-                        tenant_id: tid,
-                        collection: &collection,
-                        key: &key,
-                        value: &old,
-                        ttl_ms: 0,
-                        now_ms,
-                        surrogate: nodedb_types::Surrogate::ZERO,
-                    });
-                } else {
-                    self.kv_engine.delete(
-                        did,
-                        tid,
-                        &collection,
-                        std::slice::from_ref(&key),
-                        now_ms,
-                    );
-                }
-                Ok(())
-            }
-            UndoEntry::KvDelete {
-                collection,
-                key,
-                prior_value,
-            } => {
-                let now_ms = current_ms();
-                self.kv_engine.put(crate::engine::kv::KvPutParams {
-                    database_id: did,
-                    tenant_id: tid,
-                    collection: &collection,
-                    key: &key,
-                    value: &prior_value,
-                    ttl_ms: 0,
-                    now_ms,
-                    surrogate: nodedb_types::Surrogate::ZERO,
-                });
-                Ok(())
-            }
-            UndoEntry::KvBatchPut {
-                collection,
-                entries,
-            } => {
-                let now_ms = current_ms();
-                for (key, prior_value) in entries {
-                    if let Some(old) = prior_value {
-                        self.kv_engine.put(crate::engine::kv::KvPutParams {
-                            database_id: did,
-                            tenant_id: tid,
-                            collection: &collection,
-                            key: &key,
-                            value: &old,
-                            ttl_ms: 0,
-                            now_ms,
-                            surrogate: nodedb_types::Surrogate::ZERO,
-                        });
-                    } else {
-                        self.kv_engine.delete(did, tid, &collection, &[key], now_ms);
-                    }
-                }
-                Ok(())
-            }
-            UndoEntry::KvTransfer {
-                collection,
-                source_key,
-                source_prior,
-                dest_key,
-                dest_prior,
-            } => {
-                let now_ms = current_ms();
-                self.kv_engine.put(crate::engine::kv::KvPutParams {
-                    database_id: did,
-                    tenant_id: tid,
-                    collection: &collection,
-                    key: &source_key,
-                    value: &source_prior,
-                    ttl_ms: 0,
-                    now_ms,
-                    surrogate: nodedb_types::Surrogate::ZERO,
-                });
-                if let Some(old) = dest_prior {
-                    self.kv_engine.put(crate::engine::kv::KvPutParams {
-                        database_id: did,
-                        tenant_id: tid,
-                        collection: &collection,
-                        key: &dest_key,
-                        value: &old,
-                        ttl_ms: 0,
-                        now_ms,
-                        surrogate: nodedb_types::Surrogate::ZERO,
-                    });
-                } else {
-                    self.kv_engine
-                        .delete(did, tid, &collection, &[dest_key], now_ms);
-                }
-                Ok(())
-            }
-            UndoEntry::KvTransferItem {
-                source_collection,
-                dest_collection,
-                item_key,
-                dest_key,
-                source_prior,
-                dest_prior,
-            } => {
-                let now_ms = current_ms();
-                // Cross-collection move: the forward op deleted `item_key` from
-                // `source_collection` and wrote to `dest_key` in `dest_collection`
-                // (e.g. inventory → archive). Reverse both halves: re-insert the
-                // source row, then undo the destination write below. `source_prior`
-                // is always Some because the forward op required the source to
-                // exist; `dest_prior` is None when the dest key was a new insert
-                // and Some(old) when it overwrote an existing row.
-                self.kv_engine.put(crate::engine::kv::KvPutParams {
-                    database_id: did,
-                    tenant_id: tid,
-                    collection: &source_collection,
-                    key: &item_key,
-                    value: &source_prior,
-                    ttl_ms: 0,
-                    now_ms,
-                    surrogate: nodedb_types::Surrogate::ZERO,
-                });
-                // Undo the dest write.
-                if let Some(old) = dest_prior {
-                    self.kv_engine.put(crate::engine::kv::KvPutParams {
-                        database_id: did,
-                        tenant_id: tid,
-                        collection: &dest_collection,
-                        key: &dest_key,
-                        value: &old,
-                        ttl_ms: 0,
-                        now_ms,
-                        surrogate: nodedb_types::Surrogate::ZERO,
-                    });
-                } else {
-                    self.kv_engine
-                        .delete(did, tid, &dest_collection, &[dest_key], now_ms);
-                }
-                Ok(())
-            }
-            _ => unreachable!("apply_undo_kv called with non-kv entry"),
+            _ => Err((
+                entry_index,
+                "apply_undo_edge called with non-edge entry".to_string(),
+            )),
         }
     }
 
@@ -392,7 +235,7 @@ impl CoreLoop {
 
     pub(super) fn apply_undo_columnar(
         &mut self,
-        _entry_index: usize,
+        entry_index: usize,
         entry: UndoEntry,
     ) -> Result<(), (usize, String)> {
         match entry {
@@ -444,7 +287,10 @@ impl CoreLoop {
                 // Engine absent: no in-memory state to roll back.
                 Ok(())
             }
-            _ => unreachable!("apply_undo_columnar called with non-columnar entry"),
+            _ => Err((
+                entry_index,
+                "apply_undo_columnar called with non-columnar entry".to_string(),
+            )),
         }
     }
 
@@ -452,7 +298,7 @@ impl CoreLoop {
 
     pub(super) fn apply_undo_timeseries(
         &mut self,
-        _entry_index: usize,
+        entry_index: usize,
         entry: UndoEntry,
     ) -> Result<(), (usize, String)> {
         match entry {
@@ -466,7 +312,10 @@ impl CoreLoop {
                 // If memtable is absent, no rows were ingested — nothing to undo.
                 Ok(())
             }
-            _ => unreachable!("apply_undo_timeseries called with non-timeseries entry"),
+            _ => Err((
+                entry_index,
+                "apply_undo_timeseries called with non-timeseries entry".to_string(),
+            )),
         }
     }
 }

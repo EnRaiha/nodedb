@@ -18,7 +18,7 @@ use super::batch_put::KvBatchPutParams;
 use super::engine_helpers::{expiry_prefix, table_key};
 use super::engine_write::KvPutParams;
 use super::expiry_wheel::ExpiryWheel;
-use super::hash_table::KvHashTable;
+use super::hash_table::{EntryMeta, KvHashTable};
 use super::index::KvIndexSet;
 
 /// Result of a KV SCAN operation: `(entries, next_cursor_bytes)`.
@@ -250,6 +250,26 @@ impl KvEngine {
             let remaining = meta.expire_at_ms.saturating_sub(now_ms);
             Some(remaining as i64)
         }
+    }
+
+    /// Return the current TTL metadata for a key, or `None` if the key does
+    /// not exist in this collection.
+    ///
+    /// Unlike [`KvEngine::get_ttl_ms`], this does not resolve against
+    /// `now_ms` or check expiry -- it returns the raw `(has_ttl,
+    /// expire_at_ms)` pair verbatim. Used to capture a key's exact prior TTL
+    /// state before `Expire`/`Persist` mutate it, so a transaction rollback
+    /// can restore the precise absolute instant rather than an
+    /// approximation derived from elapsed wall-clock time.
+    pub fn get_ttl_meta(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        key: &[u8],
+    ) -> Option<EntryMeta> {
+        let tkey = table_key(database_id, tenant_id, collection);
+        self.tables.get(&tkey)?.get_entry_meta(key)
     }
 
     /// BATCH GET: fetch multiple keys. Returns values in order (None for missing).

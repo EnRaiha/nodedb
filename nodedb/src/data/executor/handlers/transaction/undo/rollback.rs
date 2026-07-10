@@ -59,7 +59,9 @@ impl CoreLoop {
             | UndoEntry::KvDelete { .. }
             | UndoEntry::KvBatchPut { .. }
             | UndoEntry::KvTransfer { .. }
-            | UndoEntry::KvTransferItem { .. } => self.apply_undo_kv(did, tid, entry_index, entry),
+            | UndoEntry::KvTransferItem { .. }
+            | UndoEntry::KvTtl { .. }
+            | UndoEntry::SortedIndexDdl { .. } => self.apply_undo_kv(did, tid, entry_index, entry),
             UndoEntry::ColumnarInsert { .. }
             | UndoEntry::ColumnarUpdate { .. }
             | UndoEntry::ColumnarDelete { .. } => self.apply_undo_columnar(entry_index, entry),
