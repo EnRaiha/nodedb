@@ -106,6 +106,15 @@ where
             // Return the completed txn's id so the caller can drain the applied
             // Response (RETURNING rows) the scheduler deposited before the ack.
             AttemptOutcome::Completed => return Ok(txn_id),
+            // Terminal, NON-retryable: the scheduler rejected the transaction's
+            // local plan routing and broadcast `TxnRoutingFailed`. A fresh
+            // reconnaissance can never fix a routing rejection, so surface it
+            // to the caller immediately instead of burning retries.
+            AttemptOutcome::Failed { detail } => {
+                return Err(Error::Internal {
+                    detail: format!("calvin transaction routing failed: {detail}"),
+                });
+            }
             AttemptOutcome::Mismatch => {
                 // POST-EXEC predicate drift. The scheduler already released the
                 // aborted attempt's locks before signalling the registry, so a

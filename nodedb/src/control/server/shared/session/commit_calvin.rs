@@ -20,6 +20,28 @@ use super::commit::classify_batch_dispatch;
 use super::outcome::{AbortReason, TxnDataPlane};
 use super::store::SessionStore;
 
+/// Map a Calvin completion-registry outcome that is neither the happy path
+/// (`Completed`) nor a fresh-attempt retry decision into a terminal abort, or
+/// `None` if the caller should proceed with `Completed`.
+///
+/// `Failed` (a scheduler-side routing rejection, never retried) and
+/// `Mismatch` (an OLLP predicate-drift signal, unreachable on this
+/// non-dependent path today but kept as a typed abort rather than a panic)
+/// both surface here as `AbortReason::Dispatch`. Split out from
+/// `run_commit_calvin` so the mapping is unit-testable without a live
+/// `SharedState` / sequencer / registry.
+fn calvin_outcome_to_abort(outcome: &AttemptOutcome) -> Option<AbortReason> {
+    match outcome {
+        AttemptOutcome::Completed => None,
+        AttemptOutcome::Failed { detail } => Some(AbortReason::Dispatch(crate::Error::Internal {
+            detail: format!("calvin transaction routing failed: {detail}"),
+        })),
+        AttemptOutcome::Mismatch => Some(AbortReason::Dispatch(crate::Error::Internal {
+            detail: "OLLP mismatch outcome on non-dependent Calvin path".to_owned(),
+        })),
+    }
+}
+
 /// Dispatch a multi-shard transaction batch through Calvin (or best-effort
 /// per-vShard). Returns `Some(reason)` on failure, `None` on success.
 pub(super) async fn run_commit_calvin(
@@ -74,16 +96,16 @@ pub(super) async fn run_commit_calvin(
                 Ok(Err(_)) => return Some(AbortReason::CalvinCancelled),
                 Err(_) => return Some(AbortReason::CalvinTimeout),
             };
-            // The static (non-dependent) Calvin path never produces an OLLP
-            // mismatch — `note_ollp_mismatch` only fires on the
-            // dependent-predicate retry path — so this branch is unreachable at
-            // runtime today. It is kept as a typed abort (never a panic) so any
-            // future mismatch signal surfaces deterministically instead of
-            // crashing.
-            if outcome == AttemptOutcome::Mismatch {
-                return Some(AbortReason::Dispatch(crate::Error::Internal {
-                    detail: "OLLP mismatch outcome on non-dependent Calvin path".to_owned(),
-                }));
+            // A terminal routing failure (`Failed`) is never retried on this
+            // path — the scheduler broadcast `TxnRoutingFailed` via the
+            // sequencer Raft so every replica's completion waiter wakes
+            // immediately with the reason, instead of burning the full
+            // deadline and reporting a generic `CalvinTimeout`. A `Mismatch`
+            // is unreachable here today (OLLP mismatch only fires on the
+            // dependent-predicate retry path) but is kept as a typed abort
+            // rather than a panic. See `calvin_outcome_to_abort`.
+            if let Some(reason) = calvin_outcome_to_abort(&outcome) {
+                return Some(reason);
             }
             None
         }
@@ -120,5 +142,41 @@ pub(super) async fn run_commit_calvin(
             }
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_outcome_maps_to_no_abort() {
+        assert!(calvin_outcome_to_abort(&AttemptOutcome::Completed).is_none());
+    }
+
+    #[test]
+    fn failed_outcome_maps_to_typed_dispatch_abort_carrying_detail() {
+        let outcome = AttemptOutcome::Failed {
+            detail: "calvin txn 7/2 for vshard 3 contains an unroutable plan".to_owned(),
+        };
+        let reason =
+            calvin_outcome_to_abort(&outcome).expect("Failed must map to a terminal abort");
+        match reason {
+            AbortReason::Dispatch(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("calvin txn 7/2 for vshard 3 contains an unroutable plan"),
+                    "abort message must carry the routing-failure detail verbatim, got: {message}"
+                );
+            }
+            _ => panic!("Failed outcome must map to AbortReason::Dispatch"),
+        }
+    }
+
+    #[test]
+    fn mismatch_outcome_maps_to_typed_dispatch_abort() {
+        let reason = calvin_outcome_to_abort(&AttemptOutcome::Mismatch)
+            .expect("Mismatch must map to a terminal abort");
+        assert!(matches!(reason, AbortReason::Dispatch(_)));
     }
 }

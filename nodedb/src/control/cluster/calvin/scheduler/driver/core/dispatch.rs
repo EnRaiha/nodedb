@@ -61,6 +61,31 @@ impl Scheduler {
         mr.vshard_role_is_leader(self.vshard_id)
     }
 
+    /// Broadcast a terminal, NON-retryable routing-failure signal via the
+    /// sequencer-group Raft so every replica's `CalvinCompletionRegistry`
+    /// fires `note_routing_failed`, waking the coordinator's completion
+    /// waiter immediately with the reason instead of leaving it to burn the
+    /// full deadline and report a generic timeout. Mirrors the OllpMismatch
+    /// broadcast in `handle_executor_response`. Shared by `dispatch_txn` and
+    /// `dispatch_active_txn`.
+    fn propose_routing_failure(
+        &self,
+        epoch: u64,
+        position: u32,
+        txn_id: TxnId,
+        err: &crate::Error,
+    ) {
+        self.propose_sequencer_entry(
+            nodedb_cluster::calvin::SequencerEntry::TxnRoutingFailed {
+                epoch,
+                position,
+                detail: err.to_string(),
+            },
+            txn_id,
+            "txn routing-failure signal",
+        );
+    }
+
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn local_calvin_plans(
         &self,
         plans: Vec<PhysicalPlan>,
@@ -157,6 +182,7 @@ impl Scheduler {
                     error = %e,
                     "calvin scheduler: static txn routing failed; releasing locks"
                 );
+                self.propose_routing_failure(epoch, position, txn_id, &e);
                 self.on_txn_complete(txn_id);
                 return;
             }
@@ -298,6 +324,7 @@ impl Scheduler {
                     error = %e,
                     "calvin scheduler: active txn routing failed; releasing locks"
                 );
+                self.propose_routing_failure(epoch, position, txn_id, &e);
                 self.on_txn_complete(txn_id);
                 return;
             }

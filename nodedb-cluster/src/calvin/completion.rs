@@ -25,12 +25,15 @@ impl TxnId {
 /// Terminal outcome of a single Calvin transaction attempt.
 ///
 /// Exactly one of these fires per attempt on the unified completion channel:
-/// either all expected vshards acked (`Completed`), or the executor reported an
-/// OLLP prediction mismatch that forces a retry (`Mismatch`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// all expected vshards acked (`Completed`), the executor reported an OLLP
+/// prediction mismatch that forces a retry (`Mismatch`), or the scheduler
+/// rejected the transaction's routing as terminally broken (`Failed`) — this
+/// last case is NEVER retried, unlike `Mismatch`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttemptOutcome {
     Completed,
     Mismatch,
+    Failed { detail: String },
 }
 
 struct PendingCompletion {
@@ -41,6 +44,11 @@ struct PendingCompletion {
     /// its waiter, so the outcome is not lost across registration order (mirrors
     /// how `acked_vshards` persists ack state regardless of registration order).
     mismatched: bool,
+    /// Set when a terminal routing failure is observed before the coordinator
+    /// registers its waiter, mirroring `mismatched`. Takes precedence over both
+    /// `mismatched` and completion: a routing failure is never retried and never
+    /// falsely reported as success.
+    routing_failed: Option<String>,
 }
 
 impl PendingCompletion {
@@ -50,6 +58,7 @@ impl PendingCompletion {
             acked_vshards: BTreeSet::new(),
             completion_tx: None,
             mismatched: false,
+            routing_failed: None,
         }
     }
 
@@ -130,9 +139,19 @@ impl CalvinCompletionRegistry {
             .entry(txn)
             .or_insert_with(|| PendingCompletion::new(expected_participants));
         entry.expected_participants = entry.expected_participants.max(expected_participants);
-        // Mismatch takes precedence over completion: a mismatched attempt must
-        // retry, never falsely report success.
-        if entry.mismatched {
+        // Routing failure takes precedence over everything else: it is terminal
+        // and must never be masked by a later ack or mismatch signal.
+        if let Some(detail) = entry.routing_failed.take() {
+            inner.completions.remove(&txn);
+            if tx.send(AttemptOutcome::Failed { detail }).is_err() {
+                tracing::warn!(
+                    epoch = txn.epoch,
+                    position = txn.position,
+                    "calvin completion receiver dropped before routing-failure signal; \
+                     client likely timed out on completion wait"
+                );
+            }
+        } else if entry.mismatched {
             inner.completions.remove(&txn);
             if tx.send(AttemptOutcome::Mismatch).is_err() {
                 tracing::warn!(
@@ -203,6 +222,36 @@ impl CalvinCompletionRegistry {
                     epoch = txn.epoch,
                     position = txn.position,
                     "calvin completion receiver dropped before OLLP-mismatch signal; \
+                     client likely timed out on completion wait"
+                );
+            }
+        }
+    }
+
+    /// Record a terminal, NON-retryable routing failure for `txn` — the
+    /// scheduler rejected the transaction's local plan routing as
+    /// `Unroutable`, `ControlPlaneOnly`, or `NotAWrite`. Takes precedence over
+    /// completion AND over an OLLP mismatch: a routing failure can never
+    /// converge via retry, so it must never be masked by a later ack or
+    /// mismatch signal.
+    ///
+    /// If the coordinator's waiter is already registered, fire `Failed` and
+    /// evict the entry. Otherwise leave the `routing_failed` detail set so a
+    /// later `register_completion` fires it (mirrors `mismatched` persistence).
+    pub fn note_routing_failed(&self, txn: TxnId, detail: String) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = inner
+            .completions
+            .entry(txn)
+            .or_insert_with(|| PendingCompletion::new(0));
+        entry.routing_failed = Some(detail.clone());
+        if let Some(tx) = entry.completion_tx.take() {
+            inner.completions.remove(&txn);
+            if tx.send(AttemptOutcome::Failed { detail }).is_err() {
+                tracing::warn!(
+                    epoch = txn.epoch,
+                    position = txn.position,
+                    "calvin completion receiver dropped before routing-failure signal; \
                      client likely timed out on completion wait"
                 );
             }
@@ -339,6 +388,84 @@ mod tests {
         let outcome = rx.await.expect("completion fires once participants seeded");
         assert_eq!(outcome, AttemptOutcome::Completed);
         assert_eq!(reg.pending_completions_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn routing_failed_arriving_before_register_fires_failed() {
+        let reg = CalvinCompletionRegistry::new();
+        let txn = TxnId::new(14, 1);
+        reg.note_assigned(1, txn, 2);
+        // Routing failure observed before the coordinator registers its
+        // waiter: the detail must persist so a later register_completion
+        // fires it.
+        reg.note_routing_failed(txn, "unroutable plan".to_owned());
+        assert_eq!(reg.pending_completions_len(), 1);
+        let rx = reg.register_completion(txn, 2);
+        let outcome = rx.await.expect("routing failure fires");
+        assert_eq!(
+            outcome,
+            AttemptOutcome::Failed {
+                detail: "unroutable plan".to_owned()
+            }
+        );
+        assert_eq!(
+            reg.pending_completions_len(),
+            0,
+            "entry must be evicted once routing failure is signalled"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_before_routing_failed_fires_failed() {
+        let reg = CalvinCompletionRegistry::new();
+        let txn = TxnId::new(15, 4);
+        reg.note_assigned(1, txn, 2);
+        let rx = reg.register_completion(txn, 2);
+        assert_eq!(reg.pending_completions_len(), 1);
+        // Waiter already stored; the routing failure must wake it directly.
+        reg.note_routing_failed(txn, "control-plane-only plan".to_owned());
+        let outcome = rx.await.expect("routing failure fires");
+        assert_eq!(
+            outcome,
+            AttemptOutcome::Failed {
+                detail: "control-plane-only plan".to_owned()
+            }
+        );
+        assert_eq!(
+            reg.pending_completions_len(),
+            0,
+            "entry must be evicted once routing failure is signalled"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_failed_takes_precedence_over_pending_acks_and_mismatch() {
+        let reg = CalvinCompletionRegistry::new();
+        let txn = TxnId::new(16, 0);
+        reg.note_assigned(1, txn, 2);
+        // No waiter registered yet: an ack and a mismatch both persist onto
+        // the entry without firing anything.
+        reg.note_completion_ack(txn, 10);
+        reg.note_ollp_mismatch(txn);
+        assert_eq!(reg.pending_completions_len(), 1);
+        // The routing failure also persists (still no waiter)...
+        reg.note_routing_failed(txn, "non-write plan".to_owned());
+        // ...and when the coordinator finally registers, it must observe the
+        // routing failure, not the mismatch or the ack — routing failure is
+        // terminal and must never be masked by either.
+        let rx = reg.register_completion(txn, 2);
+        let outcome = rx.await.expect("routing failure fires");
+        assert_eq!(
+            outcome,
+            AttemptOutcome::Failed {
+                detail: "non-write plan".to_owned()
+            }
+        );
+        assert_eq!(
+            reg.pending_completions_len(),
+            0,
+            "entry must be evicted once routing failure is signalled"
+        );
     }
 
     #[tokio::test]

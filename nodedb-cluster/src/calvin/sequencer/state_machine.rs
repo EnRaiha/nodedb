@@ -194,6 +194,9 @@ impl SequencerStateMachine {
                 // Mismatch signals are coordinator-side notifications only; they
                 // carry no txn data to replay for a vshard.
                 SequencerEntry::OllpMismatch { .. } => {}
+                // Routing-failure signals are coordinator-side notifications
+                // only, like `OllpMismatch`; they carry no txn data to replay.
+                SequencerEntry::TxnRoutingFailed { .. } => {}
             }
         }
 
@@ -326,6 +329,17 @@ impl SequencerStateMachine {
             SequencerEntry::OllpMismatch { epoch, position } => {
                 self.completion_registry
                     .note_ollp_mismatch(crate::calvin::TxnId::new(epoch, position));
+            }
+            // Broadcast the terminal routing-failure signal to ALL replicas so
+            // the coordinator's registry fires wherever it lives (including
+            // remote nodes), mirroring `OllpMismatch`.
+            SequencerEntry::TxnRoutingFailed {
+                epoch,
+                position,
+                detail,
+            } => {
+                self.completion_registry
+                    .note_routing_failed(crate::calvin::TxnId::new(epoch, position), detail);
             }
         }
     }
@@ -525,5 +539,32 @@ mod tests {
         sm.apply(&data);
 
         assert_eq!(sm.next_epoch(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_txn_routing_failed_dispatches_to_completion_registry() {
+        let registry = CalvinCompletionRegistry::new();
+        let mut sm = SequencerStateMachine::new(HashMap::new(), Arc::clone(&registry));
+
+        let data = encode_entry(&SequencerEntry::TxnRoutingFailed {
+            epoch: 5,
+            position: 2,
+            detail: "unroutable plan".to_owned(),
+        });
+        sm.apply(&data);
+
+        // The registry's waiter (registered AFTER apply) must still observe
+        // the failure — `note_routing_failed` persists it on the entry.
+        let rx = registry.register_completion(crate::calvin::TxnId::new(5, 2), 1);
+        let outcome = rx.await.expect("routing failure fires");
+        assert_eq!(
+            outcome,
+            crate::calvin::AttemptOutcome::Failed {
+                detail: "unroutable plan".to_owned()
+            }
+        );
+        // TxnRoutingFailed is not an EpochBatch, so it must not perturb the
+        // epoch counter (mirrors OllpMismatch's non-effect on last_applied_epoch).
+        assert_eq!(sm.last_applied_epoch(), None);
     }
 }

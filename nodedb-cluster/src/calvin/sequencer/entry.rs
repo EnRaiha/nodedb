@@ -44,6 +44,19 @@ pub enum SequencerEntry {
     /// nodes). Mirrors `CompletionAck` — no `vshard_id` because mismatch is keyed
     /// only by `(epoch, position)` like the registry's `TxnId`.
     OllpMismatch { epoch: u64, position: u32 },
+    /// Local-routing failure signal. Proposed by the per-vShard scheduler when
+    /// `local_calvin_plans` rejects a plan as `Unroutable`, `ControlPlaneOnly`,
+    /// or `NotAWrite` — a scheduler-side bug or malformed plan, never a normal
+    /// retry condition. Applied on ALL sequencer-group replicas so every node's
+    /// `CalvinCompletionRegistry` fires `note_routing_failed`, waking the
+    /// coordinator's completion waiter wherever it is with the terminal,
+    /// NON-retryable `AttemptOutcome::Failed` outcome. Mirrors `OllpMismatch` —
+    /// no `vshard_id` because the failure is keyed only by `(epoch, position)`.
+    TxnRoutingFailed {
+        epoch: u64,
+        position: u32,
+        detail: String,
+    },
 }
 
 #[cfg(test)]
@@ -134,5 +147,27 @@ mod tests {
         };
         assert_eq!(batch.txns.len(), 1);
         assert_eq!(batch.epoch, 7);
+    }
+
+    #[test]
+    fn txn_routing_failed_msgpack_roundtrip() {
+        let entry = SequencerEntry::TxnRoutingFailed {
+            epoch: 42,
+            position: 3,
+            detail: "unroutable plan: Vector".to_owned(),
+        };
+        let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
+        let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
+        let SequencerEntry::TxnRoutingFailed {
+            epoch,
+            position,
+            detail,
+        } = decoded
+        else {
+            panic!("decoded wrong sequencer entry variant");
+        };
+        assert_eq!(epoch, 42);
+        assert_eq!(position, 3);
+        assert_eq!(detail, "unroutable plan: Vector");
     }
 }

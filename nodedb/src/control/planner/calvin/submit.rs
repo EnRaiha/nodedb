@@ -125,6 +125,15 @@ pub async fn submit_and_await_calvin_with_timeout(
         .map_err(|_| Error::Internal {
             detail: "Calvin completion channel closed".to_owned(),
         })?;
+    // Terminal, NON-retryable: the scheduler rejected the transaction's local
+    // plan routing and broadcast `TxnRoutingFailed`. Surface it immediately —
+    // falling through to the RETURNING-drain below would silently report
+    // `Ok(None)` for a transaction that never applied.
+    if let AttemptOutcome::Failed { detail } = &outcome {
+        return Err(Error::Internal {
+            detail: format!("calvin transaction routing failed: {detail}"),
+        });
+    }
     // The static (non-dependent) Calvin path never produces an OLLP mismatch —
     // `note_ollp_mismatch` only fires on the dependent-predicate retry path — so
     // this branch is unreachable at runtime today. It is kept as a typed error
