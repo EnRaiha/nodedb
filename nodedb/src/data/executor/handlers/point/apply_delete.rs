@@ -382,39 +382,9 @@ impl CoreLoop {
         // The candidate fields are known from the same schema/vector_params
         // enumeration the put path uses, so each `vector_doc_map` entry is
         // looked up by its exact key rather than scanning the whole map on
-        // every delete.
-        let db_id = nodedb_types::DatabaseId::new(database_id);
-        let tid_id = crate::types::TenantId::new(tid);
-        let strict_fields = self.strict_vector_fields(tid, collection);
-        let candidate_fields: Vec<String> = if !strict_fields.is_empty() {
-            strict_fields.into_iter().map(|(name, _dim)| name).collect()
-        } else {
-            self.schemaless_vector_field_names(database_id, tid, collection)
-        };
-        let mut vector_deletes = Vec::with_capacity(candidate_fields.len());
-        for field in candidate_fields {
-            let doc_key = (
-                db_id,
-                tid_id,
-                collection.to_string(),
-                field.clone(),
-                row_key.to_string(),
-            );
-            let Some(vector_id) = self.vector_doc_map.remove(&doc_key) else {
-                continue;
-            };
-            let index_key = Self::vector_index_key(database_id, tid, collection, &field);
-            if let Some(coll) = self.vector_collections.get_mut(&index_key) {
-                coll.delete(vector_id);
-            }
-            vector_deletes.push(VectorIndexDelta {
-                index_key,
-                vector_id,
-                collection: collection.to_string(),
-                field,
-                doc_id: row_key.to_string(),
-            });
-        }
+        // every delete. Shared with the PointUpdate re-index path.
+        let vector_deletes =
+            self.remove_document_vector_indexes(database_id, tid, collection, row_key);
 
         // Invalidate document cache.
         self.doc_cache

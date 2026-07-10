@@ -313,6 +313,25 @@ impl CoreLoop {
                             &updated_bytes,
                         );
 
+                        // Maintain the secondary HNSW vector index. The body
+                        // rewrite above (sparse.put / bitemporal_update_reindex)
+                        // reconciled storage + the secondary btree/FTS/graph
+                        // overlays, but never the vector index — re-index the
+                        // surrogate's vectors from the new body so KNN search
+                        // reflects an embedding change in the same process.
+                        // No-op when the collection has no vector index.
+                        self.update_reindex_vector_indexes(
+                            super::update_reindex_vector::UpdateVectorReindex {
+                                database_id,
+                                tid,
+                                collection,
+                                row_key,
+                                surrogate,
+                                new_body: &updated_bytes,
+                                is_strict,
+                            },
+                        );
+
                         // Emit update event to Event Plane. `current_bytes`
                         // is the pre-update row already read above; the
                         // helper derives `WriteOp::Update` from the Some

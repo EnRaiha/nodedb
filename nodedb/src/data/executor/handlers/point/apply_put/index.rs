@@ -8,12 +8,6 @@
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 
-/// Capture of a single HNSW vector index mutation (insert or soft-delete),
-/// carrying everything needed to both key the `VectorCollection` (`index_key`,
-/// `vector_id`) AND reverse the paired `vector_doc_map` entry on rollback
-/// (`collection`, `field`, `doc_id`). Replaces a raw `(index_key, vector_id)`
-/// tuple so undo can restore/remove the reverse-lookup map symmetrically with
-/// the R-tree's `SpatialInsert`/`SpatialDelete` undo pattern.
 /// Inputs to `apply_point_put_vector_indexes` for one document write.
 ///
 /// `wal_lsn` is the WAL LSN of the document write driving this indexing (`0`
@@ -29,6 +23,12 @@ pub(in crate::data::executor) struct VectorIndexPutParams<'a> {
     pub wal_lsn: u64,
 }
 
+/// Capture of a single HNSW vector index mutation (insert or soft-delete),
+/// carrying everything needed to both key the `VectorCollection` (`index_key`,
+/// `vector_id`) AND reverse the paired `vector_doc_map` entry on rollback
+/// (`collection`, `field`, `doc_id`). Replaces a raw `(index_key, vector_id)`
+/// tuple so undo can restore/remove the reverse-lookup map symmetrically with
+/// the R-tree's `SpatialInsert`/`SpatialDelete` undo pattern.
 pub(in crate::data::executor) struct VectorIndexDelta {
     pub index_key: (nodedb_types::DatabaseId, crate::types::TenantId, String),
     pub vector_id: u32,
@@ -388,5 +388,59 @@ impl CoreLoop {
         }
 
         inserts
+    }
+
+    /// Soft-delete every HNSW vector entry a document produced, keyed by its
+    /// hex-surrogate storage `row_key`, and drop the paired `vector_doc_map`
+    /// reverse entries. Shared by the PointDelete cascade (which orphans the
+    /// vectors of a removed row) and the PointUpdate re-index (which must clear
+    /// the surrogate's old embedding before inserting the new one, since
+    /// `insert_with_surrogate` appends rather than replaces).
+    ///
+    /// Candidate fields come from the same strict-schema / `vector_params`
+    /// enumeration the put path uses, so each `vector_doc_map` entry is looked
+    /// up by its exact key instead of scanning the whole map. Returns the
+    /// removed `(index_key, vector_id)` deltas so a transactional caller can
+    /// push `UndoEntry::DeleteVector` reversals.
+    pub(in crate::data::executor) fn remove_document_vector_indexes(
+        &mut self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        row_key: &str,
+    ) -> Vec<VectorIndexDelta> {
+        let db_id = nodedb_types::DatabaseId::new(database_id);
+        let tid_id = crate::types::TenantId::new(tid);
+        let strict_fields = self.strict_vector_fields(tid, collection);
+        let candidate_fields: Vec<String> = if !strict_fields.is_empty() {
+            strict_fields.into_iter().map(|(name, _dim)| name).collect()
+        } else {
+            self.schemaless_vector_field_names(database_id, tid, collection)
+        };
+        let mut vector_deletes = Vec::with_capacity(candidate_fields.len());
+        for field in candidate_fields {
+            let doc_key = (
+                db_id,
+                tid_id,
+                collection.to_string(),
+                field.clone(),
+                row_key.to_string(),
+            );
+            let Some(vector_id) = self.vector_doc_map.remove(&doc_key) else {
+                continue;
+            };
+            let index_key = Self::vector_index_key(database_id, tid, collection, &field);
+            if let Some(coll) = self.vector_collections.get_mut(&index_key) {
+                coll.delete(vector_id);
+            }
+            vector_deletes.push(VectorIndexDelta {
+                index_key,
+                vector_id,
+                collection: collection.to_string(),
+                field,
+                doc_id: row_key.to_string(),
+            });
+        }
+        vector_deletes
     }
 }
