@@ -73,7 +73,8 @@ pub(crate) fn plan_vshard(plan: &PhysicalPlan) -> Vec<VShardId> {
         PhysicalPlan::Crdt(
             CrdtOp::Apply { collection, .. }
             | CrdtOp::ListInsert { collection, .. }
-            | CrdtOp::ListDelete { collection, .. },
+            | CrdtOp::ListDelete { collection, .. }
+            | CrdtOp::ListMove { collection, .. },
         ) => collection.as_str(),
         _ => return Vec::new(),
     };
@@ -440,7 +441,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::plan_vshard;
-    use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
+    use nodedb_physical::physical_plan::{CrdtOp, GraphOp, PhysicalPlan};
     use nodedb_types::Surrogate;
     use nodedb_types::id::VShardId;
 
@@ -499,5 +500,47 @@ mod tests {
         });
         let got: Vec<u32> = plan_vshard(&plan).iter().map(|v| v.as_u32()).collect();
         assert_eq!(got, vec![v]);
+    }
+
+    #[test]
+    fn plan_vshard_routes_crdt_list_ops_to_collection_vshard() {
+        let list_ops = [
+            (
+                "ListInsert",
+                PhysicalPlan::Crdt(CrdtOp::ListInsert {
+                    collection: "docs".to_owned(),
+                    document_id: "id1".to_owned(),
+                    list_path: "blocks".to_owned(),
+                    index: 0,
+                    fields_json: "{}".to_owned(),
+                    surrogate: Surrogate::new(1),
+                }),
+            ),
+            (
+                "ListDelete",
+                PhysicalPlan::Crdt(CrdtOp::ListDelete {
+                    collection: "docs".to_owned(),
+                    document_id: "id1".to_owned(),
+                    list_path: "blocks".to_owned(),
+                    index: 0,
+                    surrogate: Surrogate::new(1),
+                }),
+            ),
+            (
+                "ListMove",
+                PhysicalPlan::Crdt(CrdtOp::ListMove {
+                    collection: "docs".to_owned(),
+                    document_id: "id1".to_owned(),
+                    list_path: "blocks".to_owned(),
+                    from_index: 0,
+                    to_index: 1,
+                    surrogate: Surrogate::new(1),
+                }),
+            ),
+        ];
+
+        for (name, plan) in &list_ops {
+            assert!(!plan_vshard(plan).is_empty(), "{name} must be routable");
+        }
     }
 }

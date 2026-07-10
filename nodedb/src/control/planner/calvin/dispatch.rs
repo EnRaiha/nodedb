@@ -100,7 +100,10 @@ pub fn is_write_plan(plan: &PhysicalPlan) -> bool {
         // CRDT writes
         PhysicalPlan::Crdt(op) => {
             use nodedb_physical::physical_plan::CrdtOp;
-            matches!(op, CrdtOp::ListInsert { .. } | CrdtOp::ListDelete { .. })
+            matches!(
+                op,
+                CrdtOp::ListInsert { .. } | CrdtOp::ListDelete { .. } | CrdtOp::ListMove { .. }
+            )
         }
         // Array writes
         PhysicalPlan::Array(op) => {

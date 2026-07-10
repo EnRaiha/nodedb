@@ -8,7 +8,7 @@ use crate::control::planner::calvin::cross_shard_mode::CrossShardTxnMode;
 use crate::control::planner::calvin::types::{DispatchClass, DispatchOutcome};
 use crate::control::server::shared::session::TransactionState;
 use crate::types::{TenantId, VShardId};
-use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 fn doc_insert_task(vshard: u32) -> PhysicalTask {
@@ -76,6 +76,47 @@ fn is_write_plan_classifies_correctly() {
     let read = scan_task(0).plan;
     assert!(is_write_plan(&write));
     assert!(!is_write_plan(&read));
+}
+
+#[test]
+fn is_write_plan_classifies_crdt_list_ops() {
+    let list_ops = [
+        (
+            "ListInsert",
+            PhysicalPlan::Crdt(CrdtOp::ListInsert {
+                collection: "docs".to_owned(),
+                document_id: "id1".to_owned(),
+                list_path: "blocks".to_owned(),
+                index: 0,
+                fields_json: "{}".to_owned(),
+                surrogate: nodedb_types::Surrogate::new(1),
+            }),
+        ),
+        (
+            "ListDelete",
+            PhysicalPlan::Crdt(CrdtOp::ListDelete {
+                collection: "docs".to_owned(),
+                document_id: "id1".to_owned(),
+                list_path: "blocks".to_owned(),
+                index: 0,
+                surrogate: nodedb_types::Surrogate::new(1),
+            }),
+        ),
+        (
+            "ListMove",
+            PhysicalPlan::Crdt(CrdtOp::ListMove {
+                collection: "docs".to_owned(),
+                document_id: "id1".to_owned(),
+                list_path: "blocks".to_owned(),
+                from_index: 0,
+                to_index: 1,
+                surrogate: nodedb_types::Surrogate::new(1),
+            }),
+        ),
+    ];
+    for (name, plan) in &list_ops {
+        assert!(is_write_plan(plan), "{name} should classify as a write");
+    }
 }
 
 #[test]
