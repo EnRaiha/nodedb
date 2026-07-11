@@ -85,6 +85,7 @@ pub async fn execute_sql(
                 returning: _,
                 resolve_only: false,
                 resolved_inserts: None,
+                source_rows: _,
             },
         ) = &task.plan
         {

@@ -1493,6 +1493,7 @@ fn known_write_gaps_are_not_replicated() {
                 returning: None,
                 resolve_only: false,
                 resolved_inserts: None,
+                source_rows: None,
             }),
         ),
         (

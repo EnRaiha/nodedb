@@ -1055,6 +1055,7 @@ mod tests {
                 returning: None,
                 resolve_only: false,
                 resolved_inserts: None,
+                source_rows: None,
             }),
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: "notes".to_string(),

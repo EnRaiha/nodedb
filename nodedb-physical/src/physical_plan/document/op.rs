@@ -3,44 +3,8 @@
 use nodedb_types::{Surrogate, SurrogateBitmap, SystemTimeScope};
 
 use super::merge_types::MergeClauseOp;
+use super::ollp_edge::OllpPredictedEdge;
 use super::types::{EnforcementOptions, RegisteredIndex, ReturningSpec, StorageMode, UpdateValue};
-
-/// One predicted implicit graph edge carried in an OLLP `BulkDelete` plan.
-///
-/// The Control Plane recon scan surfaces, for every matched edge document
-/// (a schemaless doc carrying `_from`/`_to`), the tuple
-/// `(surrogate, _from, _to, _type)`. The data plane recomputes the SAME tuple
-/// from the actual stored docs at execution time and compares the sorted sets;
-/// any divergence (a matched doc's `_from`/`_to`/`_type` concurrently changed,
-/// or an edge appeared/disappeared among the matched docs between recon and
-/// execution) yields `OllpRetryRequired` before any write — closing the
-/// recon→execute content TOCTOU that the surrogate-set check alone misses.
-///
-/// `label` is the raw `_type` exactly as stored (or `None` when absent); the
-/// default-label substitution is NOT applied here so both sides compare the
-/// raw stored value.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-    zerompk::ToMessagePack,
-    zerompk::FromMessagePack,
-)]
-pub struct OllpPredictedEdge {
-    // Field order is the canonical sort order (derived `Ord`): both the
-    // control-plane injector and the data-plane verifier sort by
-    // `(surrogate, from, to, label)` via `sort_unstable`, so the two sides
-    // produce identical orderings and the set comparison is well-defined.
-    pub surrogate: u32,
-    pub from: String,
-    pub to: String,
-    pub label: Option<String>,
-}
 
 /// Document engine physical operations (schemaless + strict + DML).
 #[derive(
@@ -429,6 +393,23 @@ pub enum DocumentOp {
         /// replay, whose own surrogate limitation is tracked separately.
         #[serde(default)]
         resolved_inserts: Option<Vec<(String, u32)>>,
+        /// Control-Plane-shipped source rows for cross-core MERGE. When `Some`,
+        /// the handler builds the source join-map from these pre-scanned
+        /// `(source_doc_id, raw_stored_source_bytes)` rows INSTEAD of reading
+        /// the source collection from local storage. On a multi-core node the
+        /// source and target collections can map to different Data-Plane cores;
+        /// the source no longer lives in the target core's local store, so the
+        /// orchestrator scans the source on its OWN core (via the source-scan
+        /// primitive) and ships the rows in here. Each body is the RAW stored
+        /// source document (a Binary Tuple for a strict source, MessagePack for
+        /// a schemaless source), exactly as the local scan would read it; the
+        /// handler decodes it with the same schema-aware logic (the source's
+        /// strict schema is present on every core because `Register` is
+        /// broadcast), so the resulting join-map is byte-for-byte identical to
+        /// the local-read path. `None` = legacy local-read path (co-resident /
+        /// in-transaction buffered replay).
+        #[serde(default)]
+        source_rows: Option<Vec<(String, Vec<u8>)>>,
     },
 
     /// Cursor-paginated raw scan for the clone materializer.

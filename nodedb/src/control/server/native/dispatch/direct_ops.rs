@@ -96,6 +96,7 @@ pub(crate) async fn handle_direct_op(
         returning: _,
         resolve_only: false,
         resolved_inserts: None,
+        source_rows: _,
     }) = &plan
     {
         ctx.state.tenant_request_start(tenant_id);

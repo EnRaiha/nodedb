@@ -86,6 +86,9 @@ pub(in super::super) fn convert_merge(
             // in-transaction buffered replay, which runs the legacy per-row path.
             resolve_only: false,
             resolved_inserts: None,
+            // The source rows are shipped in by the Control-Plane orchestrator
+            // (cross-core source-ship); the neutral plan carries none.
+            source_rows: None,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

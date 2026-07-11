@@ -561,6 +561,7 @@ mod tests {
             returning: None,
             resolve_only: false,
             resolved_inserts: None,
+            source_rows: None,
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
     }

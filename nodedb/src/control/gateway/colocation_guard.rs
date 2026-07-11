@@ -2,23 +2,28 @@
 
 //! Fail-closed co-location guard for cross-collection write ops.
 //!
-//! Three write ops read a SOURCE collection and write a TARGET collection from a
-//! single Data-Plane handler: `DocumentOp::Merge`, `DocumentOp::UpdateFromJoin`,
-//! and `KvOp::TransferItem`. The handler reads the source from the LOCAL core's
+//! Two write ops read a SOURCE collection and write a TARGET collection from a
+//! single Data-Plane handler: `DocumentOp::UpdateFromJoin` and
+//! `KvOp::TransferItem`. The handler reads the source from the LOCAL core's
 //! store, assuming source and target are co-resident on ONE core. But every
 //! collection name hashes to its own vShard independently, and on a multi-core
 //! node two vShards can map to DIFFERENT Data-Plane cores. When they do, the
 //! source read hits an empty store on the target's core and the op returns a
 //! silently wrong (empty) result.
 //!
-//! Until cross-core source-shipping lands, these ops are refused with a loud,
-//! typed error whenever source and target resolve to different cores. On a
+//! Until cross-core source-shipping lands for these ops, they are refused with a
+//! loud, typed error whenever source and target resolve to different cores. On a
 //! single-core node every vShard maps to core 0, so co-location always holds and
 //! the guard never fires. This is a safety FLOOR, not the final fix.
 //!
-//! This guards only the three cross-collection WRITE ops. Cross-collection READ
-//! joins are untouched — they scan each side independently and never assume
-//! co-residence.
+//! `MERGE` is NOT guarded: it already ships its source across cores. Autocommit
+//! MERGE is driven by `control::merge_orchestrator`, which scans the source on
+//! its own core and ships the rows into the plan; in-transaction MERGE is
+//! rejected at COMMIT resolve. So no raw `DocumentOp::Merge` reaches this guard.
+//!
+//! This guards only the two remaining cross-collection WRITE ops.
+//! Cross-collection READ joins are untouched — they scan each side independently
+//! and never assume co-residence.
 
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_types::DatabaseId;
@@ -113,20 +118,13 @@ pub(crate) fn guard_cross_collection_write(
             source_collection,
             target_collection,
         ),
-        // Autocommit MERGE is driven by the merge orchestrator (guarded there);
-        // this arm covers a MERGE that reaches the router directly (e.g. inside
-        // an explicit transaction).
-        PhysicalPlan::Document(DocumentOp::Merge {
-            target_collection,
-            source_collection,
-            ..
-        }) => ensure_cross_collection_colocated(
-            state,
-            database_id,
-            "MERGE",
-            source_collection,
-            target_collection,
-        ),
+        // MERGE is NOT guarded here: it works cross-core. Autocommit MERGE is
+        // intercepted at every dispatch entry point and driven by the merge
+        // orchestrator (`control::merge_orchestrator`), which scans the source
+        // on its own core and ships the rows into the plan — so a raw
+        // `DocumentOp::Merge` never reaches this router. In-transaction MERGE is
+        // buffered and rejected at COMMIT resolve (no staged post-image), so it
+        // never routes here either.
         PhysicalPlan::Kv(KvOp::TransferItem {
             source_collection,
             dest_collection,

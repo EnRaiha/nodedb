@@ -10,6 +10,13 @@
 //! Plane never touches the catalog, so autocommit MERGE runs as a
 //! Control-Plane-driven, TOCTOU-safe, atomic round trip:
 //!
+//! 0. **Source-ship**: the source collection's vShard can map to a DIFFERENT
+//!    Data-Plane core than the target's, so the resolve/apply dispatches (which
+//!    target the target core) cannot read the source from local storage. The
+//!    Control Plane scans the source on its OWN core via the shared
+//!    `MaterializeScan` primitive and ships the RAW stored rows into the plan's
+//!    `source_rows`; the Data Plane builds the join-map from these instead of a
+//!    local read. This is what makes cross-core MERGE correct.
 //! 1. **Resolve** (`DocumentOp::Merge { resolve_only: true }`): the Data Plane
 //!    classifies the merge against a point-in-time snapshot and returns the
 //!    NOT-MATCHED insert rows as `Vec<(join_key, body)>` WITHOUT writing.
@@ -37,7 +44,7 @@ use nodedb_types::columnar::DocumentMode;
 use nodedb_types::{CollectionType, DatabaseId, Surrogate, TenantId, Value};
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
-use crate::control::maintenance::clone_materializer::dispatch_local;
+use crate::control::maintenance::clone_materializer::{dispatch_local, scan_source_page};
 use crate::control::security::catalog::StoredCollection;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::DocumentOp;
@@ -79,18 +86,6 @@ pub struct MergeArgs<'a> {
 /// Returns a `{"affected": N}` response mirroring the shape the Data Plane
 /// merge handler produces, so the dispatch loops render the same command tag.
 pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Result<Response> {
-    // Fail-closed safety floor: the resolve/apply dispatch reads the SOURCE from
-    // the TARGET core's local store, so refuse when source and target are not
-    // co-resident on one Data-Plane core (silent-wrong-result otherwise). On a
-    // single-core node all vShards map to core 0, so this never fires.
-    crate::control::gateway::colocation_guard::ensure_cross_collection_colocated(
-        state,
-        args.database_id,
-        "MERGE",
-        args.source_collection,
-        args.target_collection,
-    )?;
-
     let catalog = state.credentials.catalog();
     let target_bare = bare_collection_name(args.database_id, args.target_collection);
     let target = catalog
@@ -103,8 +98,24 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
 
     let mut attempt: u32 = 0;
     loop {
+        // Phase 0: read the SOURCE where it lives. The source collection's
+        // vShard can map to a DIFFERENT Data-Plane core than the target's, so
+        // the resolve/apply dispatches (which target the target core) cannot
+        // read it from local storage. Scan it on its OWN core via the shared
+        // source-scan primitive (which routes by the source collection's
+        // vShard) and ship the RAW stored rows into the plan. A fresh read per
+        // attempt keeps each attempt's resolve and apply on one consistent
+        // source snapshot; a retry picks up concurrent source mutation.
+        let source_rows = read_source_rows(
+            state,
+            args.tenant_id,
+            args.database_id,
+            args.source_collection,
+        )
+        .await?;
+
         // Phase 1: resolve the NOT-MATCHED insert rows (read-only snapshot).
-        let resolve_plan = merge_plan(&args, true, None);
+        let resolve_plan = merge_plan(&args, true, None, Some(source_rows.clone()));
         let resolve_resp = dispatch_local(
             state,
             args.tenant_id,
@@ -133,7 +144,9 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
         }
 
         // Phase 3: atomic apply with the pre-assigned surrogates + drift verify.
-        let apply_plan = merge_plan(&args, false, Some(resolved));
+        // The apply reuses THIS attempt's source snapshot so the DP re-derives
+        // the classification from the same source the resolve saw.
+        let apply_plan = merge_plan(&args, false, Some(resolved), Some(source_rows));
         let apply_resp = dispatch_local(
             state,
             args.tenant_id,
@@ -161,10 +174,15 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
 }
 
 /// Build a `DocumentOp::Merge` physical plan for one orchestrator pass.
+///
+/// `source_rows` carries the RAW stored source rows scanned on the source's own
+/// core (phase 0) so the Data Plane builds the join-map from the shipped bytes
+/// rather than reading the source from the target core's local store.
 fn merge_plan(
     args: &MergeArgs<'_>,
     resolve_only: bool,
     resolved_inserts: Option<Vec<(String, u32)>>,
+    source_rows: Option<Vec<(String, Vec<u8>)>>,
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::Merge {
         target_collection: args.target_collection.to_string(),
@@ -176,7 +194,48 @@ fn merge_plan(
         returning: None,
         resolve_only,
         resolved_inserts,
+        source_rows,
     })
+}
+
+/// Scan the SOURCE collection to completion on its OWN Data-Plane core and
+/// collect every row as `(source_doc_id, raw_stored_bytes)`.
+///
+/// Uses the same cursor-paginated `MaterializeScan` primitive the clone
+/// materializer and `INSERT ... SELECT` use; `scan_source_page` routes by the
+/// source collection's vShard, so the read lands on whichever core owns the
+/// source — the whole point of source-shipping. The raw stored bytes (a Binary
+/// Tuple for a strict source, MessagePack for a schemaless source) are shipped
+/// unchanged; the Data Plane decodes them with the source's strict schema
+/// (present on every core because `Register` is broadcast). `MERGE` has no
+/// source `WHERE`/`LIMIT`, so the full source is joined.
+async fn read_source_rows(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    source_collection: &str,
+) -> crate::Result<Vec<(String, Vec<u8>)>> {
+    let mut cursor: Vec<u8> = Vec::new();
+    let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
+    loop {
+        let (entries, next_cursor) = scan_source_page(
+            state,
+            tenant_id,
+            database_id,
+            source_collection,
+            &cursor,
+            None,
+        )
+        .await?;
+        for (doc_id, _source_surrogate, value) in entries {
+            rows.push((doc_id, value));
+        }
+        if next_cursor.is_empty() {
+            break;
+        }
+        cursor = next_cursor;
+    }
+    Ok(rows)
 }
 
 /// Decode the RESOLVE pass payload into `(join_key, body_msgpack)` insert rows.
