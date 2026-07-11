@@ -191,6 +191,17 @@ pub(super) fn bulk_dml(
     }
 }
 
+/// Reconstruct a `Truncate` plan. `DocumentOp::Truncate` is autocommit-only
+/// and clearing a collection is idempotent + deterministic, so every replica
+/// safely re-executes the same clear on apply. No surrogate binding: there is
+/// no per-row identity, just a whole-collection clear.
+pub(super) fn truncate(collection: &str, restart_identity: bool) -> PhysicalPlan {
+    PhysicalPlan::Document(DocumentOp::Truncate {
+        collection: collection.to_owned(),
+        restart_identity,
+    })
+}
+
 pub(super) fn insert_select(
     target_collection: &str,
     source_collection: &str,

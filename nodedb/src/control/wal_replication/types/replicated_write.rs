@@ -689,6 +689,25 @@ pub enum ReplicatedWrite {
         values: Vec<u8>,
     },
 
+    /// `DocumentOp::Truncate` — clear every document in a collection.
+    /// Autocommit-only (in-transaction `TRUNCATE` is rejected with a
+    /// `PlanError`, so no interleaved-write ordering to preserve), and
+    /// clearing a collection is idempotent + deterministic: replaying this
+    /// entry re-executes the same clear on the follower, safe under
+    /// exactly-once, LSN-ordered Raft apply (clearing an already-cleared /
+    /// empty collection is a no-op). No surrogate is carried — there is no
+    /// per-row identity to bind, only a whole-collection clear.
+    DocTruncate {
+        collection: String,
+        restart_identity: bool,
+    },
+
+    /// `KvOp::Truncate` — clear every entry in a KV collection. Same
+    /// autocommit-only, idempotent-replay contract as `DocTruncate`.
+    KvTruncate {
+        collection: String,
+    },
+
     /// Carries a collection's constraint set onto the per-vshard data Raft
     /// log so every replica installs the same constraints deterministically.
     ///

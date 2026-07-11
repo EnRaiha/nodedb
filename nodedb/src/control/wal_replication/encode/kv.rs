@@ -261,6 +261,14 @@ pub(super) fn transfer(
     }
 }
 
+/// `KvOp::Truncate` replicates as a plain `KvTruncate` entry: same
+/// autocommit-only, idempotent-replay contract as `document::truncate`.
+pub(super) fn truncate(collection: &str) -> ReplicatedWrite {
+    ReplicatedWrite::KvTruncate {
+        collection: collection.to_owned(),
+    }
+}
+
 pub(super) fn transfer_item(
     source_collection: &str,
     dest_collection: &str,

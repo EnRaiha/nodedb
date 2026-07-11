@@ -499,6 +499,56 @@ fn doc_batch_insert_roundtrip() {
 }
 
 #[test]
+fn doc_truncate_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    let plan = PhysicalPlan::Document(DocumentOp::Truncate {
+        collection: "docs".into(),
+        restart_identity: true,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("DocumentOp::Truncate should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Document(DocumentOp::Truncate {
+            collection,
+            restart_identity,
+        }) => {
+            assert_eq!(collection, "docs");
+            assert!(restart_identity, "restart_identity must round-trip");
+        }
+        other => panic!("expected Document(Truncate), got {other:?}"),
+    }
+}
+
+#[test]
+fn kv_truncate_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    use nodedb_physical::physical_plan::KvOp;
+    let plan = PhysicalPlan::Kv(KvOp::Truncate {
+        collection: "kv".into(),
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("KvOp::Truncate should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Kv(KvOp::Truncate { collection }) => {
+            assert_eq!(collection, "kv");
+        }
+        other => panic!("expected Kv(Truncate), got {other:?}"),
+    }
+}
+
+#[test]
 fn crdt_list_delete_roundtrip() {
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
@@ -1324,7 +1374,7 @@ fn pre_database_id_entry_decodes_to_default_database() {
 #[test]
 fn known_write_gaps_are_not_replicated() {
     use nodedb_array::types::ArrayId;
-    use nodedb_physical::physical_plan::{ArrayOp, KvOp};
+    use nodedb_physical::physical_plan::ArrayOp;
 
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
@@ -1356,19 +1406,6 @@ fn known_write_gaps_are_not_replicated() {
                 updates: Vec::new(),
                 target_filters: Vec::new(),
                 returning: None,
-            }),
-        ),
-        (
-            "Document::Truncate",
-            PhysicalPlan::Document(DocumentOp::Truncate {
-                collection: "docs".into(),
-                restart_identity: false,
-            }),
-        ),
-        (
-            "Kv::Truncate",
-            PhysicalPlan::Kv(KvOp::Truncate {
-                collection: "kv".into(),
             }),
         ),
         (

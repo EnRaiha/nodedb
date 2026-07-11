@@ -294,6 +294,14 @@ pub(super) fn transfer(ctx: &DecodeCtx, f: TransferFields) -> crate::Result<Phys
     }))
 }
 
+/// Reconstruct a `Truncate` plan. Same idempotent-replay contract as
+/// `document::truncate` — no surrogate binding, whole-collection clear.
+pub(super) fn truncate(collection: &str) -> PhysicalPlan {
+    PhysicalPlan::Kv(KvOp::Truncate {
+        collection: collection.to_owned(),
+    })
+}
+
 pub(super) fn transfer_item(
     ctx: &DecodeCtx,
     source_collection: &str,

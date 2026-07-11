@@ -122,6 +122,11 @@ fn to_physical_plan(
             documents,
             surrogates,
         } => document::batch_insert(ctx, collection, documents, surrogates)?,
+        ReplicatedWrite::DocTruncate {
+            collection,
+            restart_identity,
+        } => document::truncate(collection, *restart_identity),
+        ReplicatedWrite::KvTruncate { collection } => kv::truncate(collection),
         // The full `Vector*` variant family (original four write shapes plus
         // the sparse / multi-vector / direct-upsert / delete-by-surrogate
         // additions) is dispatched to a single helper — see

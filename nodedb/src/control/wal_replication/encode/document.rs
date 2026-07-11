@@ -86,6 +86,17 @@ pub(super) fn batch_insert(
     }
 }
 
+/// `DocumentOp::Truncate` replicates as a plain `DocTruncate` entry: it is
+/// autocommit-only and clearing a collection is idempotent + deterministic,
+/// so every replica safely re-executes the clear on apply. No surrogate to
+/// carry — the whole collection is cleared, not a single row.
+pub(super) fn truncate(collection: &str, restart_identity: bool) -> ReplicatedWrite {
+    ReplicatedWrite::DocTruncate {
+        collection: collection.to_owned(),
+        restart_identity,
+    }
+}
+
 /// Single-shard bulk predicate writes replicate as a plain `BulkDml` entry:
 /// each replica re-scans local state at the committed log position and
 /// applies the predicate deterministically (Raft log order ⇒ identical prior

@@ -147,11 +147,7 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             surrogate.as_u32(),
         ),
 
-        // Known replication gap: a genuine write not yet wired to a
-        // `ReplicatedWrite`. The data still lands via the leader's own
-        // redb/WAL; only cross-node Raft replication of this op is missing.
-        // `Truncate` — collection-clear has no ReplicatedWrite shape yet.
-        KvOp::Truncate { .. } => return None,
+        KvOp::Truncate { collection } => kv::truncate(collection),
 
         // Not a write — reads / scans / sorted-index queries / index
         // DDL-metadata registration (not key-value state).

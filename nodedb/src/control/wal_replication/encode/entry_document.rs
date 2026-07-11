@@ -101,8 +101,10 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
         // source/target co-location is not enforced (`Unroutable` in
         // `plan_vshard`); no ReplicatedWrite shape yet.
         DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => return None,
-        // `Truncate` — collection-clear has no ReplicatedWrite shape yet.
-        DocumentOp::Truncate { .. } => return None,
+        DocumentOp::Truncate {
+            collection,
+            restart_identity,
+        } => document::truncate(collection, *restart_identity),
         // OLLP-prepared bulk plans carrying predicted surrogates/edges route
         // via the cross-shard Calvin path, not single-shard Raft proposal, so
         // they are intentionally not encoded here.
