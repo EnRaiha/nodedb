@@ -156,12 +156,16 @@ pub struct TxClass {
 }
 
 impl TxClass {
-    /// Construct a validated transaction class.
+    /// Construct a validated **multi-vshard** transaction class.
     ///
     /// Rejects:
     /// - An empty write set (nothing to commit).
-    /// - A write set that resolves to a single vshard (must use the single-
-    ///   shard fast path instead).
+    /// - A write set that resolves to a single vshard — a `>=2`-intended
+    ///   construction that collapses to one participant is a routing bug, so
+    ///   it is rejected here. A transaction that is *legitimately* single-vshard
+    ///   (a contended point write that must sequence to join the shared
+    ///   per-vShard lock domain) must opt in explicitly via
+    ///   [`TxClass::new_single_vshard`].
     ///
     /// Pass `dependent_reads: None` for static-set transactions (the common
     /// case).  Pass `Some(spec)` for dependent-read (OLLP) transactions.
@@ -177,11 +181,70 @@ impl TxClass {
         dependent_reads: Option<DependentReadSpec>,
         versioned_reads: VersionedReadSet,
     ) -> Result<Self, CalvinError> {
+        Self::new_checked(
+            read_set,
+            write_set,
+            plans,
+            tenant_id,
+            dependent_reads,
+            versioned_reads,
+            false,
+        )
+    }
+
+    /// Construct a validated transaction class that is permitted to resolve to a
+    /// **single vshard**.
+    ///
+    /// This is the explicit opt-in for a contended single-vshard point write:
+    /// the write-admission gate returned `RouteToCalvin` because a pending commit
+    /// already holds the write's key, so the write must be sequenced through the
+    /// deterministic scheduler to serialize on the SAME shared per-vShard
+    /// `LockManager` the scheduler uses for multi-vshard transactions. Everything
+    /// downstream of construction (sequencer inbox
+    /// fan-out bound, per-vshard scheduler acquire/dispatch/commit, staged 2-phase
+    /// commit) already tolerates a single participant — the `< 2` reject on
+    /// [`TxClass::new`] was the only structural block.
+    ///
+    /// An empty write set is still rejected (nothing to commit), and a write set
+    /// that resolves to *zero* participating vshards is rejected as unroutable.
+    /// Signature mirrors [`TxClass::new`].
+    pub fn new_single_vshard(
+        read_set: ReadWriteSet,
+        write_set: ReadWriteSet,
+        plans: Vec<u8>,
+        tenant_id: TenantId,
+        dependent_reads: Option<DependentReadSpec>,
+        versioned_reads: VersionedReadSet,
+    ) -> Result<Self, CalvinError> {
+        Self::new_checked(
+            read_set,
+            write_set,
+            plans,
+            tenant_id,
+            dependent_reads,
+            versioned_reads,
+            true,
+        )
+    }
+
+    /// Shared construction body. `allow_single_vshard` relaxes the participant
+    /// floor from 2 (multi-vshard) to 1 (single-vshard opt-in); an empty write
+    /// set and a zero-participant write set are rejected on both paths.
+    fn new_checked(
+        read_set: ReadWriteSet,
+        write_set: ReadWriteSet,
+        plans: Vec<u8>,
+        tenant_id: TenantId,
+        dependent_reads: Option<DependentReadSpec>,
+        versioned_reads: VersionedReadSet,
+        allow_single_vshard: bool,
+    ) -> Result<Self, CalvinError> {
         if write_set.is_empty() {
             return Err(CalvinError::EmptyWriteSet);
         }
         let mut participating_vshards = write_set.participating_vshards();
-        if participating_vshards.len() < 2 {
+        let min_participants = if allow_single_vshard { 1 } else { 2 };
+        if participating_vshards.len() < min_participants {
             let vshard = participating_vshards
                 .first()
                 .map(|v| v.as_u32())
@@ -416,6 +479,56 @@ mod tests {
         // Sanity: the keys we hashed actually produce these homes.
         assert_eq!(VShardId::from_key(src_key.as_bytes()).as_u32(), src_v);
         assert_eq!(VShardId::from_key(dst_key.as_bytes()).as_u32(), dst_v);
+    }
+
+    #[test]
+    fn new_single_vshard_accepts_one_participant_write_set() {
+        // A single Document collection resolves to exactly one vshard. `new`
+        // rejects it; `new_single_vshard` accepts it and caches the one home.
+        let ws = ReadWriteSet::new(vec![EngineKeySet::Document {
+            collection: "users".to_owned(),
+            surrogates: SortedVec::new(vec![7u32]),
+        }]);
+        let want_vshard =
+            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "users").as_u32();
+
+        // Strict path still rejects.
+        let strict = TxClass::new(
+            ReadWriteSet::new(vec![]),
+            ws.clone(),
+            vec![0x01],
+            TenantId::new(1),
+            None,
+            VersionedReadSet::default(),
+        );
+        assert!(matches!(strict, Err(CalvinError::SingleVshardTxn { .. })));
+
+        // Opt-in path accepts and produces a single participating vshard.
+        let tx = TxClass::new_single_vshard(
+            ReadWriteSet::new(vec![]),
+            ws,
+            vec![0x01],
+            TenantId::new(1),
+            None,
+            VersionedReadSet::default(),
+        )
+        .expect("single-vshard TxClass accepted");
+        assert_eq!(tx.participating_vshards().len(), 1);
+        assert_eq!(tx.participating_vshards()[0].as_u32(), want_vshard);
+    }
+
+    #[test]
+    fn new_single_vshard_still_rejects_empty_write_set() {
+        let err = TxClass::new_single_vshard(
+            ReadWriteSet::new(vec![]),
+            ReadWriteSet::new(vec![]),
+            vec![],
+            TenantId::new(1),
+            None,
+            VersionedReadSet::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CalvinError::EmptyWriteSet));
     }
 
     #[test]

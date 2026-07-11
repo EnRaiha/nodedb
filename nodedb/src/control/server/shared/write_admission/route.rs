@@ -8,8 +8,10 @@
 //! for it:
 //!
 //! - A **point write** whose key a pending commit holds (Document / KV / Vector /
-//!   single-home edge): submitted as a static [`build_static_tx_class`] +
-//!   [`submit_calvin_routed`]. The scheduler acquires its key on the SAME lock
+//!   single-home edge): submitted as a single-vshard
+//!   [`build_single_vshard_tx_class`] + [`submit_calvin_routed`]. Because it
+//!   targets one vshard, it uses the single-vshard opt-in rather than the strict
+//!   multi-vshard builder. The scheduler acquires its key on the SAME lock
 //!   table the gate probed, queues FIFO behind the holder, and applies it once
 //!   released.
 //! - A **predicate write** (`BulkUpdate` / `BulkDelete`): its write set is not
@@ -34,7 +36,7 @@ use std::pin::Pin;
 
 use crate::bridge::envelope::Response;
 use crate::control::planner::calvin::{
-    build_static_tx_class, dispatch_dependent_edge_recon, is_dependent_predicate,
+    build_single_vshard_tx_class, dispatch_dependent_edge_recon, is_dependent_predicate,
     submit_calvin_routed,
 };
 use crate::control::state::SharedState;
@@ -91,7 +93,14 @@ pub fn route_write_to_calvin<'a>(
         }
 
         // Point write: its key is known, so build a static TxClass and submit it.
-        let tx_class = build_static_tx_class(std::slice::from_ref(&task), tenant_id, &[])?;
+        //
+        // This write reaches here ONLY because `admit` returned `RouteToCalvin`:
+        // a pending commit already holds its key. A point write targets a single
+        // vshard, so it must be built with the single-vshard opt-in — it sequences
+        // through the scheduler to serialize on the SAME shared per-vShard
+        // `LockManager` the holder is on, rather than being rejected as a
+        // (spuriously) single-vshard multi-shard dispatch.
+        let tx_class = build_single_vshard_tx_class(std::slice::from_ref(&task), tenant_id, &[])?;
         submit_calvin_routed(shared, tx_class).await
     })
 }

@@ -55,12 +55,15 @@ fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
     )
 }
 
-/// Build a `TxClass` from a static write task slice.
+/// Build a **multi-vshard** `TxClass` from a static write task slice.
 ///
 /// Extracts each write task's deterministic identity into the matching
 /// `EngineKeySet` (document / vector surrogates, KV raw keys, graph-edge
 /// pairs), constructs the `ReadWriteSet`, msgpack-encodes plans into `Vec<u8>`,
-/// and calls `TxClass::new`.
+/// and calls `TxClass::new`. A write set that collapses to a single vshard is
+/// rejected (`SingleVshardTxn`) — that shape indicates a misrouted multi-shard
+/// dispatch. For the legitimate contended-single-vshard point-write path, use
+/// [`build_single_vshard_tx_class`].
 ///
 /// `reads` is the neutral session read-set captured during the transaction;
 /// it is projected onto the `TxClass`'s LSN-versioned `versioned_reads` field.
@@ -71,6 +74,35 @@ pub fn build_static_tx_class(
     tasks: &[PhysicalTask],
     tenant_id: TenantId,
     reads: &[ReadSetEntry],
+) -> crate::Result<TxClass> {
+    build_static_tx_class_impl(tasks, tenant_id, reads, false)
+}
+
+/// Build a `TxClass` from a static write task slice that is permitted to resolve
+/// to a **single vshard**.
+///
+/// Used only by the contended point-write routing path
+/// (`route_write_to_calvin`): the write-admission gate returned
+/// `RouteToCalvin` because a pending commit holds the write's
+/// key, so the write must sequence through the deterministic scheduler to
+/// serialize on the SAME shared per-vShard `LockManager`. Identical extraction
+/// to [`build_static_tx_class`]; only the participant floor differs.
+pub fn build_single_vshard_tx_class(
+    tasks: &[PhysicalTask],
+    tenant_id: TenantId,
+    reads: &[ReadSetEntry],
+) -> crate::Result<TxClass> {
+    build_static_tx_class_impl(tasks, tenant_id, reads, true)
+}
+
+/// Shared body for the static builders. `allow_single_vshard` selects between
+/// [`TxClass::new`] (multi-vshard, `>=2` floor) and
+/// [`TxClass::new_single_vshard`] (single-vshard opt-in).
+fn build_static_tx_class_impl(
+    tasks: &[PhysicalTask],
+    tenant_id: TenantId,
+    reads: &[ReadSetEntry],
+    allow_single_vshard: bool,
 ) -> crate::Result<TxClass> {
     use std::collections::HashMap;
 
@@ -206,15 +238,26 @@ pub fn build_static_tx_class(
 
     let versioned_reads = versioned_reads_from(reads);
 
-    TxClass::new(
-        read_set,
-        write_set,
-        plans_bytes,
-        tenant_id,
-        None,
-        versioned_reads,
-    )
-    .map_err(|e| Error::BadRequest {
+    let result = if allow_single_vshard {
+        TxClass::new_single_vshard(
+            read_set,
+            write_set,
+            plans_bytes,
+            tenant_id,
+            None,
+            versioned_reads,
+        )
+    } else {
+        TxClass::new(
+            read_set,
+            write_set,
+            plans_bytes,
+            tenant_id,
+            None,
+            versioned_reads,
+        )
+    };
+    result.map_err(|e| Error::BadRequest {
         detail: format!("invalid TxClass: {e}"),
     })
 }
@@ -548,5 +591,27 @@ mod tests {
         let tx = build_static_tx_class(&tasks, TenantId::new(1), &[])
             .expect("valid multi-vShard TxClass");
         assert!(tx.versioned_reads.is_empty());
+    }
+
+    #[test]
+    fn single_point_write_strict_rejects_but_single_vshard_builder_accepts() {
+        // One point-write task → one collection → one vshard. This is exactly the
+        // shape the contended point-write routing path builds.
+        let tasks = vec![point_insert_task("users", 7)];
+        let want_vshard =
+            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "users").as_u32();
+
+        // Strict builder rejects the single-vshard write set.
+        let strict = build_static_tx_class(&tasks, TenantId::new(1), &[]);
+        assert!(
+            matches!(strict, Err(crate::Error::BadRequest { .. })),
+            "strict builder must reject single-vshard write set"
+        );
+
+        // Single-vshard builder accepts it, with exactly one participating vshard.
+        let tx = build_single_vshard_tx_class(&tasks, TenantId::new(1), &[])
+            .expect("single-vshard TxClass accepted");
+        assert_eq!(tx.participating_vshards().len(), 1);
+        assert_eq!(tx.participating_vshards()[0].as_u32(), want_vshard);
     }
 }
