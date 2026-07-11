@@ -2,21 +2,30 @@
 
 //! Convert committed ReplicatedWrite entries back to PhysicalPlan for Data Plane execution.
 //!
-//! Split by the `PhysicalPlan` family each decode helper produces:
-//! - [`entry`]: dispatcher (`from_replicated_entry`).
+//! Split by the `PhysicalPlan` family each decode helper produces. The
+//! `entry_*` modules hold the per-engine grouped match arm (variant →
+//! per-op helper); the sibling modules hold the per-op decoders they call
+//! into:
+//! - [`entry`]: thin top-level dispatcher (`from_replicated_entry`).
 //! - [`ctx`]: shared `DecodeCtx` + surrogate-binding helpers.
-//! - [`document`]: `PhysicalPlan::Document` producers.
-//! - [`vector`]: `PhysicalPlan::Vector` producers.
-//! - [`graph`]: `PhysicalPlan::Graph` producers.
-//! - [`kv`]: `PhysicalPlan::Kv` producers.
-//! - [`crdt`]: `PhysicalPlan::Crdt` producers.
-//! - [`columnar`]: `PhysicalPlan::Columnar` producers.
+//! - [`entry_document`] / [`document`]: `PhysicalPlan::Document`.
+//! - [`entry_kv`] / [`kv`]: `PhysicalPlan::Kv`.
+//! - [`entry_graph`] / [`graph`]: `PhysicalPlan::Graph`.
+//! - [`entry_crdt`] / [`crdt`]: `PhysicalPlan::Crdt`.
+//! - [`entry_columnar_family`] / [`columnar`]: `PhysicalPlan::Columnar` /
+//!   `Timeseries` / `Text` / `Spatial`.
+//! - [`vector`]: `PhysicalPlan::Vector` (grouped `decode_arm`).
 
 mod columnar;
 mod crdt;
 mod ctx;
 mod document;
 mod entry;
+mod entry_columnar_family;
+mod entry_crdt;
+mod entry_document;
+mod entry_graph;
+mod entry_kv;
 mod graph;
 mod kv;
 mod vector;

@@ -1,126 +1,23 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Concrete `ArrayLocalExecutor` implementation for the shard-side array handler.
-//!
-//! `DataPlaneArrayExecutor` implements the `ArrayLocalExecutor` trait defined in
-//! `nodedb-cluster`. It bridges incoming distributed array RPC requests into the
-//! local Data Plane via the SPSC bridge, awaits the response, and converts the
-//! Data Plane response format into the zerompk-encoded shapes the cluster handler
-//! expects.
-//!
-//! # Slice rows
-//! The Data Plane encodes slice results as a flat msgpack array (one element per
-//! row). This executor parses the array header and uses `skip_value` to extract
-//! per-row byte slices, returning them as `Vec<Vec<u8>>`.
-//!
-//! # Surrogate bitmap scan
-//! The Data Plane encodes surrogate scan results as a msgpack array of
-//! `{"id": "<hex_surrogate>", "data": <empty_map>}` document rows. This executor
-//! collects the hex surrogate strings, builds a `SurrogateBitmap`, and
-//! zerompk-serializes it as the response.
+//! Read/scan handlers for [`DataPlaneArrayExecutor`] — slice, aggregate, and
+//! surrogate-bitmap scan — plus the Data-Plane response-row parsers they use.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use async_trait::async_trait;
 use nodedb_array::types::ArrayId;
 use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
-use nodedb_cluster::distributed_array::wire::{ArrayShardAggReq, ArrayShardPutReq};
-use nodedb_cluster::distributed_array::{ArrayAggExec, ArrayLocalExecutor, ArraySliceExec};
+use nodedb_cluster::distributed_array::wire::ArrayShardAggReq;
+use nodedb_cluster::distributed_array::{ArrayAggExec, ArraySliceExec};
 use nodedb_cluster::error::{ClusterError, Result};
 use nodedb_query::msgpack_scan;
 use nodedb_types::Surrogate;
 use nodedb_types::SurrogateBitmap;
-use zerompk;
 
-use crate::bridge::envelope::{Priority, Request};
-use crate::control::state::SharedState;
+use super::executor::DataPlaneArrayExecutor;
 use crate::data::executor::response_codec::ArraySliceResponse;
-use crate::event::types::EventSource;
-use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{ArrayOp, ArrayReducer, PhysicalPlan};
 
-/// Timeout for a single shard-side array operation dispatched through the
-/// local SPSC bridge. This bounds how long the cluster handler waits for the
-/// Data Plane to respond before returning an error to the coordinator.
-const LOCAL_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Concrete implementation of `ArrayLocalExecutor` backed by the local Data Plane.
-///
-/// Holds a reference to `SharedState` so it can dispatch `PhysicalPlan::Array`
-/// variants through the SPSC bridge and await their responses via the
-/// `RequestTracker`.
-pub struct DataPlaneArrayExecutor {
-    state: Arc<SharedState>,
-}
-
 impl DataPlaneArrayExecutor {
-    /// Construct an executor backed by the given shared state.
-    pub fn new(state: Arc<SharedState>) -> Self {
-        Self { state }
-    }
-
-    /// Dispatch a `PhysicalPlan` through the local SPSC bridge and await the
-    /// single (non-streaming) response.
-    async fn dispatch_and_await(
-        &self,
-        plan: PhysicalPlan,
-    ) -> Result<crate::bridge::envelope::Response> {
-        let request_id = self.state.next_request_id();
-
-        let request = Request {
-            request_id,
-            tenant_id: TenantId::new(0),
-            database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::new(0),
-            plan,
-            deadline: Instant::now() + LOCAL_DISPATCH_TIMEOUT,
-            priority: Priority::Normal,
-            trace_id: TraceId::generate(),
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-            txn_id: None,
-            wal_lsn: None,
-            resolved_now_ms: None,
-            admission: crate::bridge::envelope::Admission::Exempt(
-                crate::bridge::envelope::ExemptReason::AlreadyOrdered,
-            ),
-        };
-
-        let mut rx = self.state.tracker.register(request_id);
-
-        let dispatch_result = match self.state.dispatcher.lock() {
-            Ok(mut d) => d.dispatch(request),
-            Err(poisoned) => poisoned.into_inner().dispatch(request),
-        };
-
-        if let Err(e) = dispatch_result {
-            return Err(ClusterError::Storage {
-                detail: format!("array executor dispatch: {e}"),
-            });
-        }
-
-        match tokio::time::timeout(LOCAL_DISPATCH_TIMEOUT, async { rx.recv().await.ok_or(()) })
-            .await
-        {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(_)) => Err(ClusterError::Storage {
-                detail: "array executor: response channel closed".into(),
-            }),
-            Err(_) => Err(ClusterError::Storage {
-                detail: "array executor: local dispatch timed out".into(),
-            }),
-        }
-    }
-}
-
-#[async_trait]
-impl ArrayLocalExecutor for DataPlaneArrayExecutor {
-    async fn exec_slice(
+    pub(super) async fn slice(
         &self,
         req: &nodedb_cluster::distributed_array::wire::ArrayShardSliceReq,
     ) -> Result<ArraySliceExec> {
@@ -181,7 +78,7 @@ impl ArrayLocalExecutor for DataPlaneArrayExecutor {
         })
     }
 
-    async fn exec_agg(&self, req: &ArrayShardAggReq) -> Result<ArrayAggExec> {
+    pub(super) async fn agg(&self, req: &ArrayShardAggReq) -> Result<ArrayAggExec> {
         let array_id: ArrayId =
             zerompk::from_msgpack(&req.array_id_msgpack).map_err(|e| ClusterError::Codec {
                 detail: format!("array_id decode in exec_agg: {e}"),
@@ -250,92 +147,7 @@ impl ArrayLocalExecutor for DataPlaneArrayExecutor {
         })
     }
 
-    async fn exec_put(&self, req: &ArrayShardPutReq) -> Result<u64> {
-        let array_id: ArrayId =
-            zerompk::from_msgpack(&req.array_id_msgpack).map_err(|e| ClusterError::Codec {
-                detail: format!("array_id decode in exec_put: {e}"),
-            })?;
-
-        // The coordinator encodes cells as `Vec<Vec<u8>>` (a blob-vec where
-        // each inner bytes is a separately-encoded `ArrayPutCell`). The Data
-        // Plane handler expects `Vec<ArrayPutCell>` encoded as a flat msgpack
-        // array. Decode the outer blob-vec, parse each blob, and re-encode.
-        let cell_blobs: Vec<Vec<u8>> =
-            zerompk::from_msgpack(&req.cells_msgpack).map_err(|e| ClusterError::Codec {
-                detail: format!("cell blob-vec decode in exec_put: {e}"),
-            })?;
-
-        let cells: Vec<crate::engine::array::wal::ArrayPutCell> = cell_blobs
-            .iter()
-            .map(|blob| {
-                zerompk::from_msgpack(blob).map_err(|e| ClusterError::Codec {
-                    detail: format!("ArrayPutCell decode in exec_put: {e}"),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let cells_msgpack = zerompk::to_msgpack_vec(&cells).map_err(|e| ClusterError::Codec {
-            detail: format!("cells re-encode in exec_put: {e}"),
-        })?;
-
-        let plan = PhysicalPlan::Array(ArrayOp::Put {
-            array_id,
-            cells_msgpack,
-            wal_lsn: req.wal_lsn,
-            provenance: None,
-        });
-
-        let resp = self.dispatch_and_await(plan).await?;
-
-        if resp.status == crate::bridge::envelope::Status::Error {
-            let detail = resp
-                .error_code
-                .as_ref()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_else(|| "unknown Data Plane error".into());
-            return Err(ClusterError::Storage {
-                detail: format!("array put Data Plane error: {detail}"),
-            });
-        }
-
-        Ok(req.wal_lsn)
-    }
-
-    async fn exec_delete(
-        &self,
-        array_id_msgpack: &[u8],
-        coords_msgpack: &[u8],
-        wal_lsn: u64,
-    ) -> Result<u64> {
-        let array_id: ArrayId =
-            zerompk::from_msgpack(array_id_msgpack).map_err(|e| ClusterError::Codec {
-                detail: format!("array_id decode in exec_delete: {e}"),
-            })?;
-
-        let plan = PhysicalPlan::Array(ArrayOp::Delete {
-            array_id,
-            coords_msgpack: coords_msgpack.to_vec(),
-            wal_lsn,
-            provenance: None,
-        });
-
-        let resp = self.dispatch_and_await(plan).await?;
-
-        if resp.status == crate::bridge::envelope::Status::Error {
-            let detail = resp
-                .error_code
-                .as_ref()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_else(|| "unknown Data Plane error".into());
-            return Err(ClusterError::Storage {
-                detail: format!("array delete Data Plane error: {detail}"),
-            });
-        }
-
-        Ok(wal_lsn)
-    }
-
-    async fn exec_surrogate_bitmap_scan(
+    pub(super) async fn surrogate_bitmap_scan(
         &self,
         array_id_msgpack: &[u8],
         slice_msgpack: &[u8],

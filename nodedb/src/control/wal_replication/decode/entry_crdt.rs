@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Grouped decode arm for `ReplicatedWrite` variants that produce
+//! `PhysicalPlan::Crdt`.
+//!
+//! Delegated from `decode/entry.rs`'s single grouped match arm. `write` is
+//! guaranteed by the caller to already be one of these variants — see
+//! `entry_document::decode_arm` for the trailing-arm contract.
+
+use super::super::types::ReplicatedWrite;
+use super::crdt;
+use super::ctx::DecodeCtx;
+use crate::bridge::envelope::PhysicalPlan;
+
+pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Result<PhysicalPlan> {
+    match write {
+        ReplicatedWrite::CrdtApply {
+            collection,
+            document_id,
+            delta,
+            peer_id,
+            provenance,
+            constraint_version_required,
+        } => crdt::apply(
+            ctx,
+            collection,
+            document_id,
+            delta,
+            *peer_id,
+            provenance,
+            *constraint_version_required,
+        ),
+        ReplicatedWrite::CrdtImportCollection {
+            tenant_id,
+            collection,
+            bytes,
+        } => Ok(crdt::import_collection(*tenant_id, collection, bytes)),
+        ReplicatedWrite::CrdtListInsert {
+            collection,
+            document_id,
+            list_path,
+            index,
+            fields_json,
+        } => crdt::list_insert(collection, document_id, list_path, *index, fields_json),
+        ReplicatedWrite::CrdtListDelete {
+            collection,
+            document_id,
+            list_path,
+            index,
+        } => crdt::list_delete(collection, document_id, list_path, *index),
+        ReplicatedWrite::CrdtListMove {
+            collection,
+            document_id,
+            list_path,
+            from_index,
+            to_index,
+        } => crdt::list_move(collection, document_id, list_path, *from_index, *to_index),
+        ReplicatedWrite::ConstraintChange {
+            collection,
+            op,
+            constraint_version,
+            constraints,
+        } => Ok(crdt::constraint_change(
+            collection,
+            op,
+            *constraint_version,
+            constraints,
+        )),
+        _ => Err(crate::Error::Internal {
+            detail: "entry_crdt::decode_arm called with a non-Crdt ReplicatedWrite variant \
+                (dispatch bug in decode/entry.rs's grouped Crdt match arm)"
+                .into(),
+        }),
+    }
+}
