@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 pub mod cache_miss;
+pub mod colocation_guard;
 pub mod core;
 pub mod dispatcher;
 pub mod error_map;

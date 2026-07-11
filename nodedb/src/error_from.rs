@@ -168,6 +168,9 @@ impl From<Error> for NodeDbError {
                 shards_touched,
                 limit,
             } => NodeDbError::fan_out_exceeded(shards_touched, limit),
+            err @ Error::CrossCollectionNotColocated { .. } => {
+                NodeDbError::bad_request(err.to_string())
+            }
 
             // Client input
             Error::BadRequest { detail } => NodeDbError::bad_request(detail),

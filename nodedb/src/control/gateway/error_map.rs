@@ -42,6 +42,9 @@ impl GatewayErrorMap {
             }
             Error::Internal { .. } => (sqlstate::INTERNAL_ERROR, err.to_string()),
             Error::NoLeader { .. } => (sqlstate::LOCK_NOT_AVAILABLE, err.to_string()),
+            Error::CrossCollectionNotColocated { .. } => {
+                (sqlstate::FEATURE_NOT_SUPPORTED, err.to_string())
+            }
             _ => (sqlstate::INTERNAL_ERROR, err.to_string()),
         }
     }
@@ -76,6 +79,9 @@ impl GatewayErrorMap {
             Error::NoLeader { .. } => (503, err.to_string()),
             Error::Serialization { .. } | Error::Codec { .. } => (500, err.to_string()),
             Error::Internal { .. } => (500, err.to_string()),
+            // 501 Not Implemented: a valid op refused because cross-core
+            // source-shipping is not yet supported (fail-closed safety floor).
+            Error::CrossCollectionNotColocated { .. } => (501, err.to_string()),
             _ => (500, err.to_string()),
         }
     }
@@ -138,6 +144,7 @@ impl GatewayErrorMap {
                 (CODE_BAD_REQUEST, detail.clone())
             }
             Error::RejectedConstraint { detail, .. } => (CODE_CONSTRAINT, detail.clone()),
+            Error::CrossCollectionNotColocated { .. } => (CODE_BAD_REQUEST, err.to_string()),
             _ => (CODE_INTERNAL, err.to_string()),
         }
     }

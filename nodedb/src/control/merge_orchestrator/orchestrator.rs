@@ -79,6 +79,18 @@ pub struct MergeArgs<'a> {
 /// Returns a `{"affected": N}` response mirroring the shape the Data Plane
 /// merge handler produces, so the dispatch loops render the same command tag.
 pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Result<Response> {
+    // Fail-closed safety floor: the resolve/apply dispatch reads the SOURCE from
+    // the TARGET core's local store, so refuse when source and target are not
+    // co-resident on one Data-Plane core (silent-wrong-result otherwise). On a
+    // single-core node all vShards map to core 0, so this never fires.
+    crate::control::gateway::colocation_guard::ensure_cross_collection_colocated(
+        state,
+        args.database_id,
+        "MERGE",
+        args.source_collection,
+        args.target_collection,
+    )?;
+
     let catalog = state.credentials.catalog();
     let target_bare = bare_collection_name(args.database_id, args.target_collection);
     let target = catalog

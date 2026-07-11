@@ -75,6 +75,12 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::FanOutExceeded { .. } => {
             ("ERROR", sqlstate::STATEMENT_TOO_COMPLEX, err.to_string())
         }
+        // A cross-collection write refused because source and target are not
+        // co-resident is a not-yet-supported operation, NOT a transient/internal
+        // fault — surface FEATURE_NOT_SUPPORTED (0A000) so clients do not retry.
+        crate::Error::CrossCollectionNotColocated { .. } => {
+            ("ERROR", sqlstate::FEATURE_NOT_SUPPORTED, err.to_string())
+        }
         crate::Error::NoLeader { .. } => ("ERROR", sqlstate::LOCK_NOT_AVAILABLE, err.to_string()),
         // DATABASE_DROPPED (57P04) — the closest Postgres canonical code for
         // "try again later, different node". Client libraries that recognise

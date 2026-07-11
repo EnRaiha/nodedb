@@ -336,6 +336,17 @@ impl Gateway {
         plan: PhysicalPlan,
         ctx: &QueryContext,
     ) -> Result<Vec<TaskRoute>, Error> {
+        // Fail-closed safety floor: refuse a cross-collection write whose source
+        // and target are not co-resident on one Data-Plane core. This runs in
+        // BOTH single-node and cluster mode — the single-node early-return in
+        // `route_plan` bypasses `route_single_collection`, which is exactly the
+        // multi-core scenario that triggers the silent-wrong-result bug.
+        super::colocation_guard::guard_cross_collection_write(
+            &self.shared,
+            ctx.database_id,
+            &plan,
+        )?;
+
         let routing_guard = self
             .shared
             .cluster_routing

@@ -138,6 +138,28 @@ pub enum Error {
     #[error("query fan-out exceeded: {shards_touched} shards > limit {limit}")]
     FanOutExceeded { shards_touched: u16, limit: u16 },
 
+    /// A cross-collection write op (`MERGE`, `UPDATE ... FROM`, KV
+    /// `TransferItem`) reads a SOURCE collection and writes a TARGET collection
+    /// in a single Data-Plane handler that reads the source from the target
+    /// core's LOCAL store. Each collection name hashes to its own vShard
+    /// independently, so on a multi-core node source and target can land on
+    /// DIFFERENT cores; the source read would then hit an empty store and
+    /// return a silently wrong (empty) result. Until cross-core source-shipping
+    /// lands, the op is refused rather than run. On a single-core node every
+    /// vShard maps to core 0, so this never fires (the op is genuinely
+    /// co-resident).
+    #[error(
+        "cross-collection {op} requires source '{source_collection}' and target \
+         '{target_collection}' on the same core; they map to different cores \
+         (co-location/source-shipping not yet supported) — refusing to run rather \
+         than return a silently wrong result"
+    )]
+    CrossCollectionNotColocated {
+        op: &'static str,
+        source_collection: String,
+        target_collection: String,
+    },
+
     /// Database is temporarily frozen because a clone materializer is reading
     /// from it as the source.  The write must be retried after the materializer
     /// sweep completes.  Maps to SQLSTATE `40001` (serialization_failure) so
