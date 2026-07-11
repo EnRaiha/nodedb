@@ -381,6 +381,8 @@ impl CoreLoop {
                 source_join_col,
                 clauses,
                 returning: _,
+                resolve_only,
+                resolved_inserts,
             } => self.execute_merge(
                 task,
                 tid,
@@ -391,6 +393,8 @@ impl CoreLoop {
                     target_join_col,
                     source_join_col,
                     clauses,
+                    resolve_only: *resolve_only,
+                    resolved_inserts: resolved_inserts.as_deref(),
                 },
             ),
 

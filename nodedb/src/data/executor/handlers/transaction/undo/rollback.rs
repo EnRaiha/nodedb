@@ -15,7 +15,7 @@ impl CoreLoop {
     /// entry (before reversal). On failure the caller **must** return a
     /// `RollbackFailed` error to the client; the shard state is unknown
     /// and requires a restart to restore consistency via WAL replay.
-    pub(in crate::data::executor::handlers::transaction) fn rollback_undo_log(
+    pub(in crate::data::executor::handlers) fn rollback_undo_log(
         &mut self,
         did: u64,
         tid: u64,

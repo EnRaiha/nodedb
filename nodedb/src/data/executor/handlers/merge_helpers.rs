@@ -85,20 +85,7 @@ pub(super) fn apply_action(
             Ok(true)
         }
         MergeActionOp::Update { updates } => {
-            let merged = build_merged(target_doc, source_doc, source_alias);
-            let merged_ndb: nodedb_types::Value = merged.clone().into();
-            let mut updated = target_doc.clone();
-
-            if let Some(obj) = updated.as_object_mut() {
-                for (field, update_val) in updates {
-                    let val: serde_json::Value = match update_val {
-                        UpdateValue::Literal(bytes) => nodedb_types::json_from_msgpack(bytes)
-                            .unwrap_or(serde_json::Value::Null),
-                        UpdateValue::Expr(expr) => expr.eval(&merged_ndb).into(),
-                    };
-                    obj.insert(field.clone(), val);
-                }
-            }
+            let updated = build_update_doc(target_doc, source_doc, source_alias, updates);
 
             let updated_bytes = if let Some(schema) = strict_schema {
                 let ndb_val: nodedb_types::Value = updated.clone().into();
@@ -179,24 +166,7 @@ pub(super) fn apply_insert_action(
             Ok(false)
         }
         MergeActionOp::Insert { columns, values } => {
-            let mut new_doc = serde_json::Map::new();
-
-            if columns.is_empty() {
-                // No column list: copy all source columns.
-                if let Some(obj) = source_doc.as_object() {
-                    for (k, v) in obj {
-                        new_doc.insert(k.clone(), v.clone());
-                    }
-                }
-            } else {
-                // Explicit column list: resolve each value.
-                for (col, val_bytes) in columns.iter().zip(values.iter()) {
-                    let val = resolve_insert_value(val_bytes, source_doc, col);
-                    new_doc.insert(col.clone(), val);
-                }
-            }
-
-            let json_doc = serde_json::Value::Object(new_doc);
+            let json_doc = build_insert_doc(columns, values, source_doc);
             let doc_id = json_doc
                 .get("id")
                 .map(json_to_str)
@@ -223,6 +193,60 @@ pub(super) fn apply_insert_action(
             Ok(true)
         }
     }
+}
+
+/// Build the JSON document a NOT-MATCHED `INSERT` arm produces from a source
+/// row. Empty `columns` copies all source fields; an explicit column list
+/// resolves each value via [`resolve_insert_value`]. Shared by the legacy
+/// per-row insert path and the orchestrated resolve/apply passes so both derive
+/// byte-identical bodies.
+pub(in crate::data::executor) fn build_insert_doc(
+    columns: &[String],
+    values: &[Vec<u8>],
+    source_doc: &serde_json::Value,
+) -> serde_json::Value {
+    let mut new_doc = serde_json::Map::new();
+    if columns.is_empty() {
+        if let Some(obj) = source_doc.as_object() {
+            for (k, v) in obj {
+                new_doc.insert(k.clone(), v.clone());
+            }
+        }
+    } else {
+        for (col, val_bytes) in columns.iter().zip(values.iter()) {
+            let val = resolve_insert_value(val_bytes, source_doc, col);
+            new_doc.insert(col.clone(), val);
+        }
+    }
+    serde_json::Value::Object(new_doc)
+}
+
+/// Build the post-update JSON document a MATCHED / NOT-MATCHED-BY-SOURCE
+/// `UPDATE` arm produces. Assignment expressions evaluate against the merged
+/// document (target fields at top level, source fields as `<alias>.<field>`),
+/// then overwrite fields on a clone of the target. Shared by the legacy per-row
+/// update path and the orchestrated resolve/apply passes.
+pub(in crate::data::executor) fn build_update_doc(
+    target_doc: &serde_json::Value,
+    source_doc: &serde_json::Value,
+    source_alias: &str,
+    updates: &[(String, UpdateValue)],
+) -> serde_json::Value {
+    let merged = build_merged(target_doc, source_doc, source_alias);
+    let merged_ndb: nodedb_types::Value = merged.into();
+    let mut updated = target_doc.clone();
+    if let Some(obj) = updated.as_object_mut() {
+        for (field, update_val) in updates {
+            let val: serde_json::Value = match update_val {
+                UpdateValue::Literal(bytes) => {
+                    nodedb_types::json_from_msgpack(bytes).unwrap_or(serde_json::Value::Null)
+                }
+                UpdateValue::Expr(expr) => expr.eval(&merged_ndb).into(),
+            };
+            obj.insert(field.clone(), val);
+        }
+    }
+    updated
 }
 
 /// Resolve an INSERT value: either a pre-encoded literal or a source column lookup.

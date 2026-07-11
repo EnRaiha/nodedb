@@ -177,6 +177,42 @@ impl NodeDbPgHandler {
             .await;
         }
 
+        // Autocommit `MERGE` is orchestrated on the Control Plane
+        // (`control::merge_orchestrator`): the source is scanned, each
+        // NOT-MATCHED insert row is assigned its OWN fresh, registered
+        // surrogate, and all arms apply atomically. In-transaction MERGE is
+        // buffered for COMMIT replay (`dispatch_task_no_wal`) and never reaches
+        // this method, so this intercept fires only for autocommit.
+        if let crate::bridge::envelope::PhysicalPlan::Document(
+            nodedb_physical::physical_plan::DocumentOp::Merge {
+                target_collection,
+                source_collection,
+                source_alias,
+                target_join_col,
+                source_join_col,
+                clauses,
+                returning: _,
+                resolve_only: false,
+                resolved_inserts: None,
+            },
+        ) = &task.plan
+        {
+            return crate::control::merge_orchestrator::run_merge(
+                &self.state,
+                crate::control::merge_orchestrator::MergeArgs {
+                    tenant_id: task.tenant_id,
+                    database_id: task.database_id,
+                    target_collection,
+                    source_collection,
+                    source_alias,
+                    target_join_col,
+                    source_join_col,
+                    clauses,
+                },
+            )
+            .await;
+        }
+
         // `DROP ARRAY` must reach every Data-Plane core so each can release
         // its per-core store and remove the on-disk segment dir; otherwise
         // a follow-up `CREATE ARRAY` of the same name carries stale state.

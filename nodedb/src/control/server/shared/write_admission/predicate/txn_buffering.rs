@@ -1879,6 +1879,8 @@ mod tests {
                 source_join_col: "id".into(),
                 clauses: Vec::new(),
                 returning: None,
+                resolve_only: false,
+                resolved_inserts: None,
             }),
             PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
                 target_collection: "t".into(),

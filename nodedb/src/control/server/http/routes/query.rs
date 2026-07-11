@@ -242,6 +242,73 @@ pub async fn query(
                 continue;
             }
 
+            // Autocommit `MERGE` is orchestrated on the Control Plane: each
+            // NOT-MATCHED insert row gets its OWN fresh, registered surrogate
+            // and all arms apply atomically. The orchestrator issues its own
+            // writes, so the per-task WAL append below is skipped for it.
+            if let crate::bridge::envelope::PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::Merge {
+                    target_collection,
+                    source_collection,
+                    source_alias,
+                    target_join_col,
+                    source_join_col,
+                    clauses,
+                    returning: _,
+                    resolve_only: false,
+                    resolved_inserts: None,
+                },
+            ) = &task.plan
+            {
+                let plan_kind = describe_plan(&task.plan);
+                let plan_for_shape = task.plan.clone();
+                let resp = crate::control::merge_orchestrator::run_merge(
+                    &state.shared,
+                    crate::control::merge_orchestrator::MergeArgs {
+                        tenant_id: task.tenant_id,
+                        database_id: task.database_id,
+                        target_collection,
+                        source_collection,
+                        source_alias,
+                        target_join_col,
+                        source_join_col,
+                        clauses,
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    let (status, msg) = GatewayErrorMap::to_http(&e);
+                    ApiError::HttpStatus(status, msg)
+                })?;
+                if resp.status != Status::Ok {
+                    let detail = resp
+                        .error_code
+                        .as_ref()
+                        .map(|c| format!("{c:?}"))
+                        .unwrap_or_else(|| "unknown error".into());
+                    return Err(ApiError::Internal(detail));
+                }
+                let payload = resp.payload.to_vec();
+                if !payload.is_empty() {
+                    match shape_http_payload(
+                        &payload,
+                        &plan_for_shape,
+                        plan_kind,
+                        Some(&output_schema),
+                        &state.shared,
+                        database_id,
+                        tenant_id,
+                    ) {
+                        Ok(HttpShaped::Rows(rows)) => result_rows.extend(rows),
+                        Ok(HttpShaped::Passthrough) => {
+                            result_rows.push(passthrough_json_row(&payload));
+                        }
+                        Err(e) => return Err(ApiError::Internal(e.message().to_string())),
+                    }
+                }
+                continue;
+            }
+
             // WAL append for write operations. The allocated LSN (and, for a
             // TTL-bearing KV write, the resolved instant) is stamped onto the
             // local-dispatch write below so the Data Plane records the

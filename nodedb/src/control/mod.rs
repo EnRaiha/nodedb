@@ -21,6 +21,7 @@ pub mod insert_select;
 pub mod lease;
 pub mod lock_utils;
 pub mod maintenance;
+pub mod merge_orchestrator;
 pub mod metadata_proposer;
 pub mod metrics;
 pub mod mirror;

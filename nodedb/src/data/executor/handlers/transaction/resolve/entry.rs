@@ -1053,6 +1053,8 @@ mod tests {
                 source_join_col: "id".to_string(),
                 clauses: Vec::new(),
                 returning: None,
+                resolve_only: false,
+                resolved_inserts: None,
             }),
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: "notes".to_string(),

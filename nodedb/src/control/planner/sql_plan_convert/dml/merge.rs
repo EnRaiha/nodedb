@@ -79,6 +79,13 @@ pub(in super::super) fn convert_merge(
             source_join_col: source_join_col.into(),
             clauses: clause_ops,
             returning: None,
+            // Autocommit MERGE is intercepted at the dispatch entry points and
+            // driven by the Control-Plane orchestrator (`control::merge_orchestrator`),
+            // which re-issues this op with `resolve_only` / `resolved_inserts`
+            // set. The plan produced here is the neutral form: it also serves
+            // in-transaction buffered replay, which runs the legacy per-row path.
+            resolve_only: false,
+            resolved_inserts: None,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

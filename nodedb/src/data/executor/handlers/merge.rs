@@ -38,11 +38,44 @@ pub(in crate::data::executor) struct MergeParams<'a> {
     pub target_join_col: &'a str,
     pub source_join_col: &'a str,
     pub clauses: &'a [MergeClauseOp],
+    /// RESOLVE-ONLY read pass (orchestrator phase 1): classify without writing
+    /// and return the NOT-MATCHED insert rows.
+    pub resolve_only: bool,
+    /// Control-Plane-pre-assigned surrogates for the NOT-MATCHED insert rows,
+    /// keyed by source join value (orchestrator phase 3). `Some` selects the
+    /// atomic verify-and-apply path; `None` (with `resolve_only == false`)
+    /// selects the legacy per-row path used by in-transaction buffered replay.
+    pub resolved_inserts: Option<&'a [(String, u32)]>,
 }
 
 impl CoreLoop {
     /// Execute a MERGE statement.
+    ///
+    /// Three modes, selected by [`MergeParams`]:
+    /// - `resolve_only` → [`Self::execute_merge_resolve`]: a read pass that
+    ///   returns the NOT-MATCHED insert rows for Control-Plane surrogate
+    ///   assignment (no writes).
+    /// - `resolved_inserts.is_some()` → [`Self::execute_merge_apply`]: the
+    ///   atomic apply with CP-assigned surrogates + resolve→apply drift verify.
+    /// - otherwise → `execute_merge_legacy`: the per-row path retained for
+    ///   in-transaction buffered replay.
     pub(in crate::data::executor) fn execute_merge(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        params: MergeParams<'_>,
+    ) -> Response {
+        if params.resolve_only {
+            return self.execute_merge_resolve(task, tid, params);
+        }
+        if params.resolved_inserts.is_some() {
+            return self.execute_merge_apply(task, tid, params);
+        }
+        self.execute_merge_legacy(task, tid, params)
+    }
+
+    /// Legacy per-row MERGE execution (in-transaction buffered replay).
+    fn execute_merge_legacy(
         &mut self,
         task: &ExecutionTask,
         tid: u64,
@@ -55,6 +88,8 @@ impl CoreLoop {
             target_join_col,
             source_join_col,
             clauses,
+            resolve_only: _,
+            resolved_inserts: _,
         } = params;
 
         debug!(
@@ -72,14 +107,7 @@ impl CoreLoop {
             source_join_col,
         ) {
             Ok(m) => m,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
+            Err(e) => return self.response_error(task, e),
         };
 
         // Check strict schema for target.
@@ -104,60 +132,13 @@ impl CoreLoop {
             self.collection_has_vectors(task.request.database_id.as_u64(), tid, target_collection);
 
         // Collect all target doc IDs and their documents.
-        let prefix = crate::engine::sparse::btree::coll_prefix(
+        let target_docs: Vec<(String, Vec<u8>)> = match self.collect_target_docs(
             task.request.database_id.as_u64(),
             tid,
             target_collection,
-        );
-        let end = format!("{prefix}\u{ffff}");
-
-        let target_docs: Vec<(String, Vec<u8>)> = {
-            let read_txn = match self
-                .sparse
-                .db()
-                .begin_read()
-                .map_err(|e| crate::Error::Storage {
-                    engine: "sparse".into(),
-                    detail: format!("read txn: {e}"),
-                }) {
-                Ok(t) => t,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
-                }
-            };
-            let table = match read_txn
-                .open_table(crate::engine::sparse::btree::DOCUMENTS)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "sparse".into(),
-                    detail: format!("open table: {e}"),
-                }) {
-                Ok(t) => t,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
-                }
-            };
-
-            let mut docs = Vec::new();
-            if let Ok(range) = table.range(prefix.as_str()..end.as_str()) {
-                for entry in range.flatten() {
-                    let key = entry.0.value();
-                    let bytes = entry.1.value().to_vec();
-                    if let Some(doc_id) = key.strip_prefix(&prefix) {
-                        docs.push((doc_id.to_string(), bytes));
-                    }
-                }
-            }
-            docs
+        ) {
+            Ok(docs) => docs,
+            Err(e) => return self.response_error(task, e),
         };
 
         let mut affected = 0u64;
@@ -208,14 +189,7 @@ impl CoreLoop {
                     ) {
                         Ok(true) => affected += 1,
                         Ok(false) => {}
-                        Err(e) => {
-                            return self.response_error(
-                                task,
-                                ErrorCode::Internal {
-                                    detail: e.to_string(),
-                                },
-                            );
-                        }
+                        Err(e) => return self.response_error(task, e),
                     }
                 }
             } else {
@@ -241,14 +215,7 @@ impl CoreLoop {
                     ) {
                         Ok(true) => affected += 1,
                         Ok(false) => {}
-                        Err(e) => {
-                            return self.response_error(
-                                task,
-                                ErrorCode::Internal {
-                                    detail: e.to_string(),
-                                },
-                            );
-                        }
+                        Err(e) => return self.response_error(task, e),
                     }
                 }
             }
@@ -273,14 +240,7 @@ impl CoreLoop {
                 ) {
                     Ok(true) => affected += 1,
                     Ok(false) => {}
-                    Err(e) => {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: e.to_string(),
-                            },
-                        );
-                    }
+                    Err(e) => return self.response_error(task, e),
                 }
             }
         }
@@ -297,8 +257,67 @@ impl CoreLoop {
         }
     }
 
+    /// Resolve a collection's strict Binary-Tuple schema, if it is a strict
+    /// document collection. `None` for schemaless collections.
+    pub(in crate::data::executor) fn merge_strict_schema(
+        &self,
+        tid: u64,
+        collection: &str,
+    ) -> Option<nodedb_types::columnar::StrictSchema> {
+        let config_key = (crate::types::TenantId::new(tid), collection.to_string());
+        self.doc_configs.get(&config_key).and_then(|c| {
+            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
+                c.storage_mode
+            {
+                Some(schema.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Collect every target row as `(doc_id, stored_bytes)` from a consistent
+    /// read snapshot. Shared by the legacy walk and the orchestrated
+    /// resolve/apply classification so both see the same target set.
+    pub(in crate::data::executor) fn collect_target_docs(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        let prefix = crate::engine::sparse::btree::coll_prefix(database_id, tid, collection);
+        let end = format!("{prefix}\u{ffff}");
+
+        let read_txn = self
+            .sparse
+            .db()
+            .begin_read()
+            .map_err(|e| crate::Error::Storage {
+                engine: "sparse".into(),
+                detail: format!("read txn: {e}"),
+            })?;
+        let table = read_txn
+            .open_table(crate::engine::sparse::btree::DOCUMENTS)
+            .map_err(|e| crate::Error::Storage {
+                engine: "sparse".into(),
+                detail: format!("open table: {e}"),
+            })?;
+
+        let mut docs = Vec::new();
+        if let Ok(range) = table.range(prefix.as_str()..end.as_str()) {
+            for entry in range.flatten() {
+                let key = entry.0.value();
+                let bytes = entry.1.value().to_vec();
+                if let Some(doc_id) = key.strip_prefix(&prefix) {
+                    docs.push((doc_id.to_string(), bytes));
+                }
+            }
+        }
+        Ok(docs)
+    }
+
     /// Scan source collection and build join map: `join_val → document`.
-    fn build_merge_source_map(
+    pub(in crate::data::executor) fn build_merge_source_map(
         &self,
         database_id: u64,
         tid: u64,

@@ -270,6 +270,40 @@ async fn dispatch_task(
         return Ok((resp, Vec::new()));
     }
 
+    // Autocommit `MERGE` is orchestrated on the Control Plane
+    // (`control::merge_orchestrator`): each NOT-MATCHED insert row gets its OWN
+    // fresh, registered surrogate and all arms apply atomically.
+    if let crate::bridge::envelope::PhysicalPlan::Document(
+        nodedb_physical::physical_plan::DocumentOp::Merge {
+            target_collection,
+            source_collection,
+            source_alias,
+            target_join_col,
+            source_join_col,
+            clauses,
+            returning: _,
+            resolve_only: false,
+            resolved_inserts: None,
+        },
+    ) = &task.plan
+    {
+        let resp = crate::control::merge_orchestrator::run_merge(
+            ctx.state,
+            crate::control::merge_orchestrator::MergeArgs {
+                tenant_id: task.tenant_id,
+                database_id: task.database_id,
+                target_collection,
+                source_collection,
+                source_alias,
+                target_join_col,
+                source_join_col,
+                clauses,
+            },
+        )
+        .await?;
+        return Ok((resp, Vec::new()));
+    }
+
     // `DROP ARRAY` fans out to every core so per-core stores are released.
     if matches!(
         task.plan,

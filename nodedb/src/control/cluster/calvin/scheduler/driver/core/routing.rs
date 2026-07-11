@@ -559,6 +559,8 @@ mod tests {
             source_join_col: "id".to_owned(),
             clauses: Vec::new(),
             returning: None,
+            resolve_only: false,
+            resolved_inserts: None,
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
     }

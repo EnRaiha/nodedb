@@ -409,6 +409,26 @@ pub enum DocumentOp {
         clauses: Vec<MergeClauseOp>,
         #[serde(default)]
         returning: Option<ReturningSpec>,
+        /// RESOLVE-ONLY read pass (Control-Plane orchestrator, phase 1). When
+        /// `true` the handler classifies the merge WITHOUT writing and returns
+        /// the NOT-MATCHED insert rows as msgpack `Vec<(join_key, body)>` so the
+        /// orchestrator can allocate a fresh, registered surrogate per inserted
+        /// row (surrogate registration is Control-Plane-only). No storage
+        /// mutation happens on this pass.
+        #[serde(default)]
+        resolve_only: bool,
+        /// Control-Plane-pre-assigned surrogates for the NOT-MATCHED insert
+        /// rows, keyed by source join value (orchestrator phase 3). When
+        /// `Some`, the handler runs the ATOMIC apply: it re-derives the insert
+        /// set, verifies its join-key set equals these keys — returning
+        /// `ErrorCode::OllpRetryRequired` WITHOUT writing on drift (closing the
+        /// resolve→apply TOCTOU) — and applies every arm's writes with these
+        /// surrogates in ONE redb transaction (matched UPDATE + NOT-MATCHED
+        /// INSERT share the txn; a UNIQUE violation rolls back the whole set).
+        /// `None` = the legacy per-row path used by in-transaction buffered
+        /// replay, whose own surrogate limitation is tracked separately.
+        #[serde(default)]
+        resolved_inserts: Option<Vec<(String, u32)>>,
     },
 
     /// Cursor-paginated raw scan for the clone materializer.
