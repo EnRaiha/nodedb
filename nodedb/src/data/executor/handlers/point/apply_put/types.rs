@@ -72,7 +72,7 @@ pub(in crate::data::executor) struct PointPutOutcome {
     /// can push `UndoEntry::InsertVector` reversals (which also undo the
     /// paired `vector_doc_map` entry). Empty when the document had no vector
     /// fields. Autocommit callers ignore it.
-    pub vector_inserts: Vec<super::index::VectorIndexDelta>,
+    pub vector_inserts: Vec<super::vector::VectorIndexDelta>,
     /// `(spatial_index_key, entry_id)` pairs this put inserted into per-field
     /// spatial R-trees, so a transactional caller can push
     /// `UndoEntry::SpatialInsert` reversals. Empty when the document had no
