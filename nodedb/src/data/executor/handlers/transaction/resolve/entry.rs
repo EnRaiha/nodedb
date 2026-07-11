@@ -1044,6 +1044,7 @@ mod tests {
                 updates: Vec::new(),
                 target_filters: Vec::new(),
                 returning: None,
+                source_rows: None,
             }),
             PhysicalPlan::Document(DocumentOp::Merge {
                 target_collection: "t".to_string(),

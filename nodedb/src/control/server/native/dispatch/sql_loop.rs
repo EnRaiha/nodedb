@@ -305,6 +305,44 @@ async fn dispatch_task(
         return Ok((resp, Vec::new()));
     }
 
+    // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control Plane
+    // (`control::update_from_join_orchestrator`): the source is scanned on its
+    // OWN core and shipped into the plan so the target-core handler joins
+    // against it instead of a local read (the source's vShard can live on a
+    // different core).
+    if let crate::bridge::envelope::PhysicalPlan::Document(
+        nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
+            target_collection,
+            source_collection,
+            source_alias,
+            target_join_col,
+            source_join_col,
+            updates,
+            target_filters,
+            returning,
+            source_rows: None,
+        },
+    ) = &task.plan
+    {
+        let resp = crate::control::update_from_join_orchestrator::run_update_from_join(
+            ctx.state,
+            crate::control::update_from_join_orchestrator::UpdateFromJoinArgs {
+                tenant_id: task.tenant_id,
+                database_id: task.database_id,
+                target_collection,
+                source_collection,
+                source_alias,
+                target_join_col,
+                source_join_col,
+                updates,
+                target_filters,
+                returning: returning.as_ref(),
+            },
+        )
+        .await?;
+        return Ok((resp, Vec::new()));
+    }
+
     // `DROP ARRAY` fans out to every core so per-core stores are released.
     if matches!(
         task.plan,

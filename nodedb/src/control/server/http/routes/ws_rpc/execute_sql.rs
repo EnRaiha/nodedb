@@ -123,6 +123,60 @@ pub async fn execute_sql(
             continue;
         }
 
+        // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control
+        // Plane (source scanned on its own core + shipped into the plan), never
+        // dispatched to the Data Plane as a single op reading a possibly-
+        // non-resident source.
+        if let crate::bridge::envelope::PhysicalPlan::Document(
+            nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
+                target_collection,
+                source_collection,
+                source_alias,
+                target_join_col,
+                source_join_col,
+                updates,
+                target_filters,
+                returning,
+                source_rows: None,
+            },
+        ) = &task.plan
+        {
+            match crate::control::update_from_join_orchestrator::run_update_from_join(
+                shared,
+                crate::control::update_from_join_orchestrator::UpdateFromJoinArgs {
+                    tenant_id: task.tenant_id,
+                    database_id: task.database_id,
+                    target_collection,
+                    source_collection,
+                    source_alias,
+                    target_join_col,
+                    source_join_col,
+                    updates,
+                    target_filters,
+                    returning: returning.as_ref(),
+                },
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let payload = resp.payload.to_vec();
+                    if !payload.is_empty() {
+                        let json =
+                            crate::data::executor::response_codec::decode_payload_to_json(&payload);
+                        match sonic_rs::from_str::<serde_json::Value>(&json) {
+                            Ok(v) => results.push(v),
+                            Err(_) => results.push(serde_json::Value::String(json)),
+                        }
+                    }
+                }
+                Err(e) => {
+                    shared.tenant_request_end(tenant_id);
+                    return Err(e);
+                }
+            }
+            continue;
+        }
+
         let payloads: crate::Result<Vec<Vec<u8>>> = match shared.gateway.as_ref() {
             Some(gw) => {
                 let gw_ctx = QueryContext {

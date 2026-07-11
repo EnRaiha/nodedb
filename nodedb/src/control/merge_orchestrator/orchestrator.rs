@@ -44,7 +44,7 @@ use nodedb_types::columnar::DocumentMode;
 use nodedb_types::{CollectionType, DatabaseId, Surrogate, TenantId, Value};
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
-use crate::control::maintenance::clone_materializer::{dispatch_local, scan_source_page};
+use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
 use crate::control::security::catalog::StoredCollection;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::DocumentOp;
@@ -106,7 +106,7 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
         // vShard) and ship the RAW stored rows into the plan. A fresh read per
         // attempt keeps each attempt's resolve and apply on one consistent
         // source snapshot; a retry picks up concurrent source mutation.
-        let source_rows = read_source_rows(
+        let source_rows = read_all_source_rows(
             state,
             args.tenant_id,
             args.database_id,
@@ -196,46 +196,6 @@ fn merge_plan(
         resolved_inserts,
         source_rows,
     })
-}
-
-/// Scan the SOURCE collection to completion on its OWN Data-Plane core and
-/// collect every row as `(source_doc_id, raw_stored_bytes)`.
-///
-/// Uses the same cursor-paginated `MaterializeScan` primitive the clone
-/// materializer and `INSERT ... SELECT` use; `scan_source_page` routes by the
-/// source collection's vShard, so the read lands on whichever core owns the
-/// source — the whole point of source-shipping. The raw stored bytes (a Binary
-/// Tuple for a strict source, MessagePack for a schemaless source) are shipped
-/// unchanged; the Data Plane decodes them with the source's strict schema
-/// (present on every core because `Register` is broadcast). `MERGE` has no
-/// source `WHERE`/`LIMIT`, so the full source is joined.
-async fn read_source_rows(
-    state: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    source_collection: &str,
-) -> crate::Result<Vec<(String, Vec<u8>)>> {
-    let mut cursor: Vec<u8> = Vec::new();
-    let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
-    loop {
-        let (entries, next_cursor) = scan_source_page(
-            state,
-            tenant_id,
-            database_id,
-            source_collection,
-            &cursor,
-            None,
-        )
-        .await?;
-        for (doc_id, _source_surrogate, value) in entries {
-            rows.push((doc_id, value));
-        }
-        if next_cursor.is_empty() {
-            break;
-        }
-        cursor = next_cursor;
-    }
-    Ok(rows)
 }
 
 /// Decode the RESOLVE pass payload into `(join_key, body_msgpack)` insert rows.

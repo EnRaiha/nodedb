@@ -214,6 +214,45 @@ impl NodeDbPgHandler {
             .await;
         }
 
+        // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control
+        // Plane (`control::update_from_join_orchestrator`): the source is scanned
+        // on its OWN core and the raw rows are shipped into the plan so the
+        // target-core handler joins against them instead of a local read (the
+        // source's vShard can live on a different core). In-transaction
+        // `UPDATE ... FROM` is buffered for COMMIT replay and never reaches this
+        // method, so this intercept fires only for autocommit.
+        if let crate::bridge::envelope::PhysicalPlan::Document(
+            nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
+                target_collection,
+                source_collection,
+                source_alias,
+                target_join_col,
+                source_join_col,
+                updates,
+                target_filters,
+                returning,
+                source_rows: None,
+            },
+        ) = &task.plan
+        {
+            return crate::control::update_from_join_orchestrator::run_update_from_join(
+                &self.state,
+                crate::control::update_from_join_orchestrator::UpdateFromJoinArgs {
+                    tenant_id: task.tenant_id,
+                    database_id: task.database_id,
+                    target_collection,
+                    source_collection,
+                    source_alias,
+                    target_join_col,
+                    source_join_col,
+                    updates,
+                    target_filters,
+                    returning: returning.as_ref(),
+                },
+            )
+            .await;
+        }
+
         // `DROP ARRAY` must reach every Data-Plane core so each can release
         // its per-core store and remove the on-disk segment dir; otherwise
         // a follow-up `CREATE ARRAY` of the same name carries stale state.

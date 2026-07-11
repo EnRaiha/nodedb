@@ -47,6 +47,7 @@ pub mod synonym;
 pub mod trace_context;
 pub mod trace_export;
 pub mod trigger;
+pub mod update_from_join_orchestrator;
 pub mod wal_catchup;
 pub mod wal_replication;
 

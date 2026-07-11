@@ -588,6 +588,7 @@ mod tests {
             updates: Vec::new(),
             target_filters: Vec::new(),
             returning: None,
+            source_rows: None,
         });
         assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
     }

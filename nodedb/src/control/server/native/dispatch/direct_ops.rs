@@ -121,6 +121,45 @@ pub(crate) async fn handle_direct_op(
         };
     }
 
+    // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control Plane
+    // (source scanned on its own core + shipped into the plan); it never reaches
+    // the Data Plane as a single op reading a possibly-non-resident source.
+    if let PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
+        target_collection,
+        source_collection,
+        source_alias,
+        target_join_col,
+        source_join_col,
+        updates,
+        target_filters,
+        returning,
+        source_rows: None,
+    }) = &plan
+    {
+        ctx.state.tenant_request_start(tenant_id);
+        let result = crate::control::update_from_join_orchestrator::run_update_from_join(
+            ctx.state,
+            crate::control::update_from_join_orchestrator::UpdateFromJoinArgs {
+                tenant_id,
+                database_id: ctx.database_id(),
+                target_collection,
+                source_collection,
+                source_alias,
+                target_join_col,
+                source_join_col,
+                updates,
+                target_filters,
+                returning: returning.as_ref(),
+            },
+        )
+        .await;
+        ctx.state.tenant_request_end(tenant_id);
+        return match result {
+            Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
+            Err(e) => error_to_native(seq, &e),
+        };
+    }
+
     // Inject RLS filters from auth context (same as pgwire planner).
     if let Err(e) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
         tenant_id.as_u64(),

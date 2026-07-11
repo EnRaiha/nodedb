@@ -297,6 +297,23 @@ pub enum DocumentOp {
         target_filters: Vec<u8>,
         #[serde(default)]
         returning: Option<ReturningSpec>,
+        /// Control-Plane-shipped source rows for cross-core `UPDATE ... FROM`.
+        /// When `Some`, the handler builds the source join-map from these
+        /// pre-scanned `(source_doc_id, raw_stored_source_bytes)` rows INSTEAD
+        /// of reading the source collection from local storage. On a multi-core
+        /// node the source and target collections can map to different
+        /// Data-Plane cores; the source no longer lives in the target core's
+        /// local store, so the orchestrator scans the source on its OWN core
+        /// (via the source-scan primitive) and ships the rows in here. Each body
+        /// is the RAW stored source document (a Binary Tuple for a strict
+        /// source, MessagePack for a schemaless source), decoded by the handler
+        /// with the same schema-aware logic the local scan uses (the source's
+        /// strict schema is present on every core because `Register` is
+        /// broadcast), so the resulting join-map is byte-for-byte identical to
+        /// the local-read path. `None` = legacy local-read path (co-resident /
+        /// in-transaction buffered replay).
+        #[serde(default)]
+        source_rows: Option<Vec<(String, Vec<u8>)>>,
     },
 
     /// Bulk update: scan + apply field updates to all matches.

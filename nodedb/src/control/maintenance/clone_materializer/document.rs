@@ -264,6 +264,45 @@ pub(crate) async fn scan_source_page(
     parse_materialize_scan_payload(resp.payload.as_ref())
 }
 
+/// Scan a source collection to completion on its OWN Data-Plane core and
+/// collect every row as `(source_doc_id, raw_stored_bytes)`.
+///
+/// Drives the cursor-paginated [`scan_source_page`] primitive (which routes by
+/// the source collection's vShard, so the read lands on whichever core owns the
+/// source — the whole point of source-shipping) to the end. Shared by the
+/// `MERGE` and `UPDATE ... FROM` Control-Plane orchestrators: both ship the RAW
+/// stored source rows (a Binary Tuple for a strict source, MessagePack for a
+/// schemaless source) into their plan so the Data Plane builds the join-map from
+/// the shipped bytes instead of a local read of a possibly-non-resident source.
+pub(crate) async fn read_all_source_rows(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    source_collection: &str,
+) -> crate::Result<Vec<(String, Vec<u8>)>> {
+    let mut cursor: Vec<u8> = Vec::new();
+    let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
+    loop {
+        let (entries, next_cursor) = scan_source_page(
+            state,
+            tenant_id,
+            database_id,
+            source_collection,
+            &cursor,
+            None,
+        )
+        .await?;
+        for (doc_id, _source_surrogate, value) in entries {
+            rows.push((doc_id, value));
+        }
+        if next_cursor.is_empty() {
+            break;
+        }
+        cursor = next_cursor;
+    }
+    Ok(rows)
+}
+
 /// Parse the msgpack payload emitted by `execute_document_materialize_scan`:
 ///   `[next_cursor: bin, entries: [[doc_id: str, surrogate: u32, value_bytes: bin], ...]]`.
 fn parse_materialize_scan_payload(payload: &[u8]) -> crate::Result<ScanPage> {

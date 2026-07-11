@@ -17,6 +17,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
 use crate::data::executor::handlers::returning_rows;
+use crate::data::executor::handlers::update_from_join_source_map::json_value_to_string;
 use crate::data::executor::response_codec::encode_json;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
@@ -31,6 +32,13 @@ pub(in crate::data::executor) struct UpdateFromJoinParams<'a> {
     pub updates: &'a [(String, UpdateValue)],
     pub target_filter_bytes: &'a [u8],
     pub returning: Option<&'a ReturningSpec>,
+    /// Control-Plane-shipped source rows for cross-core `UPDATE ... FROM`. When
+    /// `Some`, the source join-map is built from these pre-scanned
+    /// `(source_doc_id, raw_stored_source_bytes)` rows instead of a local read
+    /// of the source collection (whose vShard may live on a different core).
+    /// `None` selects the legacy local-storage read (co-resident / in-txn
+    /// buffered replay).
+    pub source_rows: Option<&'a [(String, Vec<u8>)]>,
 }
 
 impl CoreLoop {
@@ -50,6 +58,7 @@ impl CoreLoop {
             updates,
             target_filter_bytes,
             returning,
+            source_rows,
         } = params;
 
         debug!(
@@ -66,6 +75,7 @@ impl CoreLoop {
             tid,
             source_collection,
             source_join_col,
+            source_rows,
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -377,81 +387,5 @@ impl CoreLoop {
                 ),
             }
         }
-    }
-
-    /// Scan the source collection and build a `HashMap<join_key_string, document>`.
-    fn build_source_join_map(
-        &self,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        join_col: &str,
-    ) -> crate::Result<std::collections::HashMap<String, serde_json::Value>> {
-        let prefix = crate::engine::sparse::btree::coll_prefix(database_id, tid, collection);
-        let end = format!("{prefix}\u{ffff}");
-
-        let read_txn = self
-            .sparse
-            .db()
-            .begin_read()
-            .map_err(|e| crate::Error::Storage {
-                engine: "sparse".into(),
-                detail: format!("read txn for source: {e}"),
-            })?;
-        let table = read_txn
-            .open_table(crate::engine::sparse::btree::DOCUMENTS)
-            .map_err(|e| crate::Error::Storage {
-                engine: "sparse".into(),
-                detail: format!("open source table: {e}"),
-            })?;
-
-        // Check if the source collection is strict-mode.
-        let config_key = (crate::types::TenantId::new(tid), collection.to_string());
-        let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
-            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                c.storage_mode
-            {
-                Some(schema.clone())
-            } else {
-                None
-            }
-        });
-
-        let mut map = std::collections::HashMap::new();
-        if let Ok(range) = table.range(prefix.as_str()..end.as_str()) {
-            for entry in range.flatten() {
-                let value_bytes = entry.1.value();
-                let doc = if let Some(ref schema) = strict_schema {
-                    match super::super::strict_format::binary_tuple_to_json(value_bytes, schema) {
-                        Some(v) => v,
-                        None => continue,
-                    }
-                } else {
-                    match doc_format::decode_document(value_bytes) {
-                        Some(v) => v,
-                        None => continue,
-                    }
-                };
-                let key = doc
-                    .get(join_col)
-                    .map(json_value_to_string)
-                    .unwrap_or_default();
-                if !key.is_empty() {
-                    map.insert(key, doc);
-                }
-            }
-        }
-        Ok(map)
-    }
-}
-
-/// Convert a `serde_json::Value` to a string for join-key comparison.
-fn json_value_to_string(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
     }
 }

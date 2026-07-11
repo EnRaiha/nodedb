@@ -2,8 +2,8 @@
 
 //! Fail-closed co-location guard for cross-collection write ops.
 //!
-//! Two write ops read a SOURCE collection and write a TARGET collection from a
-//! single Data-Plane handler: `DocumentOp::UpdateFromJoin` and
+//! One write op still reads a SOURCE collection and writes a TARGET collection
+//! from a single Data-Plane handler that assumes co-residence:
 //! `KvOp::TransferItem`. The handler reads the source from the LOCAL core's
 //! store, assuming source and target are co-resident on ONE core. But every
 //! collection name hashes to its own vShard independently, and on a multi-core
@@ -11,17 +11,20 @@
 //! source read hits an empty store on the target's core and the op returns a
 //! silently wrong (empty) result.
 //!
-//! Until cross-core source-shipping lands for these ops, they are refused with a
+//! Until cross-core source-shipping lands for that op, it is refused with a
 //! loud, typed error whenever source and target resolve to different cores. On a
 //! single-core node every vShard maps to core 0, so co-location always holds and
 //! the guard never fires. This is a safety FLOOR, not the final fix.
 //!
-//! `MERGE` is NOT guarded: it already ships its source across cores. Autocommit
-//! MERGE is driven by `control::merge_orchestrator`, which scans the source on
-//! its own core and ships the rows into the plan; in-transaction MERGE is
-//! rejected at COMMIT resolve. So no raw `DocumentOp::Merge` reaches this guard.
+//! `MERGE` and `UPDATE ... FROM` are NOT guarded: they already ship their source
+//! across cores. Autocommit `MERGE` is driven by `control::merge_orchestrator`
+//! and autocommit `UPDATE ... FROM` by `control::update_from_join_orchestrator`;
+//! each scans the source on its own core and ships the rows into the plan, so no
+//! raw `DocumentOp::Merge` / `DocumentOp::UpdateFromJoin` reaches this guard.
+//! Their in-transaction forms are buffered and rejected at COMMIT resolve (no
+//! staged post-image), so they never route here either.
 //!
-//! This guards only the two remaining cross-collection WRITE ops.
+//! This guards only the one remaining cross-collection WRITE op.
 //! Cross-collection READ joins are untouched — they scan each side independently
 //! and never assume co-residence.
 
@@ -96,35 +99,25 @@ pub(crate) fn ensure_cross_collection_colocated(
     Ok(())
 }
 
-/// Apply the co-location guard to a plan before routing. Only the three
-/// cross-collection WRITE ops are guarded; every other plan — including
+/// Apply the co-location guard to a plan before routing. Only the one remaining
+/// cross-collection WRITE op is guarded; every other plan — including
 /// cross-collection READ joins — passes through untouched.
 pub(crate) fn guard_cross_collection_write(
     state: &SharedState,
     database_id: DatabaseId,
     plan: &PhysicalPlan,
 ) -> crate::Result<()> {
-    use nodedb_physical::physical_plan::{DocumentOp, KvOp};
+    use nodedb_physical::physical_plan::KvOp;
 
     match plan {
-        PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-            target_collection,
-            source_collection,
-            ..
-        }) => ensure_cross_collection_colocated(
-            state,
-            database_id,
-            "UPDATE ... FROM",
-            source_collection,
-            target_collection,
-        ),
-        // MERGE is NOT guarded here: it works cross-core. Autocommit MERGE is
-        // intercepted at every dispatch entry point and driven by the merge
-        // orchestrator (`control::merge_orchestrator`), which scans the source
-        // on its own core and ships the rows into the plan — so a raw
-        // `DocumentOp::Merge` never reaches this router. In-transaction MERGE is
-        // buffered and rejected at COMMIT resolve (no staged post-image), so it
-        // never routes here either.
+        // `MERGE` and `UPDATE ... FROM` are NOT guarded here: they work
+        // cross-core. Autocommit forms are intercepted at every dispatch entry
+        // point and driven by their orchestrators (`control::merge_orchestrator`
+        // / `control::update_from_join_orchestrator`), which scan the source on
+        // its own core and ship the rows into the plan — so a raw
+        // `DocumentOp::Merge` / `DocumentOp::UpdateFromJoin` never reaches this
+        // router. In-transaction forms are buffered and rejected at COMMIT
+        // resolve (no staged post-image), so they never route here either.
         PhysicalPlan::Kv(KvOp::TransferItem {
             source_collection,
             dest_collection,

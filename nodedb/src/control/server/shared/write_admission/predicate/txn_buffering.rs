@@ -1963,6 +1963,7 @@ mod tests {
                 updates: Vec::new(),
                 target_filters: Vec::new(),
                 returning: None,
+                source_rows: None,
             }),
             PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
                 collection: "c".into(),

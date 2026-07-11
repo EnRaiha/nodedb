@@ -60,6 +60,7 @@ pub mod truncate;
 pub mod unregister_collection;
 pub mod unregister_materialized_view;
 pub mod update_from_join;
+pub(super) mod update_from_join_source_map;
 pub mod upsert;
 pub mod vector;
 pub mod vector_lifecycle;
