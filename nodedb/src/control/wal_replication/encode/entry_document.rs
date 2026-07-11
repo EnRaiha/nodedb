@@ -88,11 +88,15 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             *source_limit,
         ),
 
+        DocumentOp::BatchInsert {
+            collection,
+            documents,
+            surrogates,
+        } => document::batch_insert(collection, documents, surrogates),
+
         // Known replication gaps: genuine writes not yet wired to a
         // `ReplicatedWrite`. The data still lands via the leader's own
         // redb/WAL; only cross-node Raft replication of these ops is missing.
-        // `BatchInsert` — multi-document insert has no ReplicatedWrite shape yet.
-        DocumentOp::BatchInsert { .. } => return None,
         // `Merge` / `UpdateFromJoin` — cross-collection writes whose
         // source/target co-location is not enforced (`Unroutable` in
         // `plan_vshard`); no ReplicatedWrite shape yet.

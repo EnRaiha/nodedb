@@ -121,6 +121,42 @@ pub(super) fn doc_upsert(
     }))
 }
 
+/// Reconstruct a `BatchInsert` plan, binding each row's carried surrogate to
+/// its `document_id` on this replica (mirrors `kv::batch_put`). On apply the
+/// existing `execute_document_batch_insert` handler lands each row via
+/// `apply_point_put` keyed by the bound surrogate, so a replayed entry
+/// overwrites the identical rows — idempotent under exactly-once, LSN-ordered
+/// Raft apply.
+pub(super) fn batch_insert(
+    ctx: &DecodeCtx,
+    collection: &str,
+    documents: &[(String, Vec<u8>)],
+    surrogates: &[u32],
+) -> crate::Result<PhysicalPlan> {
+    let resolved = documents
+        .iter()
+        .zip(surrogates.iter())
+        .map(|((document_id, _value), carried)| {
+            let carried = nodedb_types::Surrogate::new(*carried);
+            match ctx.assigner {
+                Some(a) => a.bind(
+                    ctx.database_id,
+                    ctx.tenant_id,
+                    collection,
+                    document_id.as_bytes(),
+                    carried,
+                ),
+                None => Ok(carried),
+            }
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(PhysicalPlan::Document(DocumentOp::BatchInsert {
+        collection: collection.to_owned(),
+        documents: documents.to_vec(),
+        surrogates: resolved,
+    }))
+}
+
 /// Reconstruct the bulk plan in its plain (non-OLLP) form. The apply
 /// re-scans local state at this committed log position and mutates the
 /// predicate matches; `ollp_predicted_surrogates = None` selects the

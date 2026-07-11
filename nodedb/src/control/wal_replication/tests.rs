@@ -453,6 +453,52 @@ fn crdt_list_insert_roundtrip() {
 }
 
 #[test]
+fn doc_batch_insert_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    let documents = vec![
+        ("d1".to_string(), vec![1u8, 2, 3]),
+        ("d2".to_string(), vec![4u8, 5]),
+        ("d3".to_string(), vec![6u8, 7, 8, 9]),
+    ];
+    let surrogates = vec![Surrogate::new(11), Surrogate::new(22), Surrogate::new(33)];
+
+    let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
+        collection: "docs".into(),
+        documents: documents.clone(),
+        surrogates: surrogates.clone(),
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("DocumentOp::BatchInsert should produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    // Decode with no assigner: carried surrogates fall through verbatim, so we
+    // can assert every (doc_id, body) pair and every surrogate round-trips
+    // exactly — none dropped or reordered.
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Document(DocumentOp::BatchInsert {
+            collection,
+            documents: decoded_docs,
+            surrogates: decoded_surrogates,
+        }) => {
+            assert_eq!(collection, "docs");
+            assert_eq!(
+                decoded_docs, documents,
+                "every (doc_id, body) pair must round-trip"
+            );
+            assert_eq!(
+                decoded_surrogates, surrogates,
+                "every surrogate must round-trip in order, none dropped"
+            );
+        }
+        other => panic!("expected Document(BatchInsert), got {other:?}"),
+    }
+}
+
+#[test]
 fn crdt_list_delete_roundtrip() {
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
@@ -1285,14 +1331,6 @@ fn known_write_gaps_are_not_replicated() {
     let array_id = ArrayId::new(tenant, "genome");
 
     let gaps: Vec<(&str, PhysicalPlan)> = vec![
-        (
-            "Document::BatchInsert",
-            PhysicalPlan::Document(DocumentOp::BatchInsert {
-                collection: "docs".into(),
-                documents: vec![("d1".into(), vec![1, 2, 3])],
-                surrogates: vec![Surrogate::new(1)],
-            }),
-        ),
         (
             "Document::Merge",
             PhysicalPlan::Document(DocumentOp::Merge {

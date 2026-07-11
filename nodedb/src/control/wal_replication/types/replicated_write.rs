@@ -65,6 +65,24 @@ pub enum ReplicatedWrite {
         /// Leader-assigned global surrogate (binding key = `document_id`).
         surrogate: u32,
     },
+    /// Multi-document batch insert (`DocumentOp::BatchInsert`) — the shape the
+    /// autocommit `INSERT ... SELECT` orchestrator emits for the copied rows.
+    ///
+    /// `documents` are the `(document_id, value_bytes)` pairs to insert;
+    /// `surrogates` are the leader-assigned global identities parallel to
+    /// `documents` (same order and length), carried verbatim so every replica
+    /// binds the same identity to each `document_id` instead of re-allocating,
+    /// exactly like `KvBatchPut`. No `ttl_ms` / `resolved_now_ms`: documents
+    /// carry no TTL. Re-applying this entry is idempotent under exactly-once,
+    /// LSN-ordered Raft apply: each row lands via `apply_point_put` keyed by its
+    /// carried surrogate, so a replayed batch overwrites the identical rows.
+    DocBatchInsert {
+        collection: String,
+        documents: Vec<(String, Vec<u8>)>,
+        /// Leader-assigned global surrogate per document (binding key =
+        /// `document_id` bytes), same order and length as `documents`.
+        surrogates: Vec<u32>,
+    },
     VectorInsert {
         collection: String,
         vector: Vec<f32>,

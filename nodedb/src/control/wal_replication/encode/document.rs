@@ -4,6 +4,7 @@
 
 use super::super::types::ReplicatedWrite;
 use nodedb_physical::physical_plan::UpdateValue;
+use nodedb_types::Surrogate;
 
 pub(super) fn point_put(
     collection: &str,
@@ -70,6 +71,18 @@ pub(super) fn upsert(
         value: value.to_vec(),
         on_conflict_updates: on_conflict_updates.to_vec(),
         surrogate,
+    }
+}
+
+pub(super) fn batch_insert(
+    collection: &str,
+    documents: &[(String, Vec<u8>)],
+    surrogates: &[Surrogate],
+) -> ReplicatedWrite {
+    ReplicatedWrite::DocBatchInsert {
+        collection: collection.to_owned(),
+        documents: documents.to_vec(),
+        surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
     }
 }
 
