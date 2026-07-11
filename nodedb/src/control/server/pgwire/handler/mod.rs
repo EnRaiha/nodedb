@@ -23,6 +23,7 @@ mod sql_exec;
 mod sql_prepared;
 mod sql_split;
 mod stream_response;
+mod submit;
 mod transaction_cmds;
 mod transaction_savepoint;
 mod trust_auth;

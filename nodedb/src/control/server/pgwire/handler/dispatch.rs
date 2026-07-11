@@ -3,31 +3,15 @@
 //! Core dispatch mechanics: single-task dispatch, Raft replication, and local Data Plane submission.
 
 use std::sync::Arc;
-use std::time::Instant;
 
-use crate::bridge::envelope::{Priority, Request, Response};
+use crate::bridge::envelope::Response;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::exchange::resolve::{Resolved, resolve_and_materialize};
-use crate::types::{DatabaseId, Lsn, ReadConsistency, TraceId, VShardId};
+use crate::types::{Lsn, ReadConsistency, TraceId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::core::NodeDbPgHandler;
-
-/// Inputs for [`NodeDbPgHandler::submit_to_data_plane`]: the request identity,
-/// the plan, and the optional transaction id + committed write LSN.
-struct SubmitArgs {
-    tenant_id: crate::types::TenantId,
-    vshard_id: crate::types::VShardId,
-    database_id: DatabaseId,
-    plan: crate::bridge::envelope::PhysicalPlan,
-    user_id: Option<Arc<str>>,
-    txn_id: Option<crate::types::TxnId>,
-    wal_lsn: Option<Lsn>,
-    /// Wall-clock instant the Control Plane resolved for a TTL-bearing KV
-    /// write, stamped onto the `Request` alongside `wal_lsn` — see
-    /// `dispatch_utils::WriteDispatch::resolved_now_ms`.
-    resolved_now_ms: Option<u64>,
-}
+use super::submit::SubmitArgs;
 
 impl NodeDbPgHandler {
     /// Dispatch a single physical task and wait for the response.
@@ -357,17 +341,16 @@ impl NodeDbPgHandler {
 
     /// Dispatch a task directly to the local Data Plane (single-node or reads).
     ///
-    /// For write operations, the WAL is appended **before** dispatching to the
-    /// Data Plane. This ensures durability: if the process crashes after WAL
-    /// append but before Data Plane execution, the write is replayed on recovery.
-    /// Reads bypass the WAL entirely.
+    /// For write operations the WAL append is performed inside
+    /// `submit_to_data_plane` (`append_wal: true`), under the write-admission
+    /// guard and immediately before the enqueue, so the minted LSN order equals
+    /// the Data-Plane apply order per key. Reads bypass the WAL entirely (the
+    /// append helper is a no-op for non-write plans).
     async fn dispatch_local(
         &self,
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
     ) -> crate::Result<Response> {
-        let outcome =
-            self.wal_append_if_write(task.tenant_id, task.vshard_id, task.database_id, &task.plan)?;
         let txn_id = task.txn_id;
         self.submit_to_data_plane(SubmitArgs {
             tenant_id: task.tenant_id,
@@ -376,8 +359,10 @@ impl NodeDbPgHandler {
             plan: task.plan,
             user_id,
             txn_id,
-            wal_lsn: outcome.lsn,
-            resolved_now_ms: outcome.resolved_now_ms,
+            // The core mints these under the admission guard just before enqueue.
+            wal_lsn: None,
+            resolved_now_ms: None,
+            append_wal: true,
         })
         .await
     }
@@ -429,120 +414,11 @@ impl NodeDbPgHandler {
             // a TTL-bearing KV write inside a multi-task COMMIT batch falls back
             // to `epoch_system_ms` / the wall clock at apply time.
             resolved_now_ms: None,
+            // Durability was recorded at COMMIT under a single `Transaction`
+            // record whose LSN is `wal_lsn`; the core must not append again.
+            append_wal: false,
         })
         .await
-    }
-
-    /// Build a `Request`, register with the tracker, dispatch to the Data Plane,
-    /// and await the response. Shared by `dispatch_local` and `dispatch_task_no_wal`.
-    async fn submit_to_data_plane(&self, args: SubmitArgs) -> crate::Result<Response> {
-        let SubmitArgs {
-            tenant_id,
-            vshard_id,
-            database_id,
-            plan,
-            user_id,
-            txn_id,
-            wal_lsn,
-            resolved_now_ms,
-        } = args;
-        // Write-admission gate. This path builds its own `Request` and enqueues
-        // directly (it does not flow through the autocommit funnel). An
-        // uncontended point write takes the fast path holding its per-vShard
-        // deterministic locks (guard held across enqueue + response); a contended
-        // or bulk write is submitted through the deterministic scheduler and its
-        // applied response is surfaced; reads / control ops are `Exempt`.
-        use crate::control::server::shared::write_admission::{
-            WriteAdmission, WriteTarget, admit, bare_ok_response, route_write_to_calvin,
-        };
-        let (admission, _admission_guard) = match admit(
-            &self.state,
-            &WriteTarget {
-                tenant_id,
-                database_id,
-                vshard_id,
-                plan: &plan,
-            },
-        ) {
-            WriteAdmission::ExemptRead => (
-                crate::bridge::envelope::Admission::Exempt(
-                    crate::bridge::envelope::ExemptReason::Read,
-                ),
-                None,
-            ),
-            WriteAdmission::FastPath { guard } => {
-                (crate::bridge::envelope::Admission::Admitted, guard)
-            }
-            WriteAdmission::RouteToCalvin => {
-                let routed =
-                    route_write_to_calvin(&self.state, tenant_id, database_id, vshard_id, plan)
-                        .await?;
-                return Ok(
-                    routed.unwrap_or_else(|| bare_ok_response(crate::types::RequestId::new(0)))
-                );
-            }
-        };
-        let request_id = self.next_request_id();
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id,
-            vshard_id,
-            plan,
-            deadline: Instant::now()
-                + std::time::Duration::from_secs(self.state.tuning.network.default_deadline_secs),
-            priority: Priority::Normal,
-            trace_id: TraceId::generate(),
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id,
-            statement_digest: None,
-            txn_id,
-            wal_lsn,
-            resolved_now_ms,
-            admission,
-        };
-
-        let mut rx = self.state.tracker.register(request_id);
-
-        match self.state.dispatcher.lock() {
-            Ok(mut d) => d.dispatch(request)?,
-            Err(poisoned) => poisoned.into_inner().dispatch(request)?,
-        };
-
-        // A scan result wider than `stream_chunk_size` is emitted as several
-        // `Partial` frames followed by a terminal frame. Drain and concatenate
-        // every frame (bounded by `max_query_result_bytes`) rather than taking
-        // only the first chunk — consuming one frame would silently truncate the
-        // result to `stream_chunk_size` rows and orphan the request's tracker
-        // entry. Mirrors `dispatch_to_data_plane_with_source`.
-        use crate::control::server::dispatch_utils::{
-            DispatchCollectError, collect_bounded_response,
-        };
-        let max_result_bytes = self.state.tuning.network.max_query_result_bytes as usize;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(self.state.tuning.network.default_deadline_secs),
-            collect_bounded_response(&mut rx, max_result_bytes),
-        )
-        .await
-        .map_err(|_| crate::Error::DeadlineExceeded { request_id })?
-        {
-            Ok(resp) => Ok(resp),
-            Err(DispatchCollectError::OverBudget { bytes }) => {
-                self.state.tracker.cancel(&request_id);
-                Err(crate::Error::ExecutionLimitExceeded {
-                    detail: format!(
-                        "query result exceeded max_query_result_bytes \
-                         ({bytes} > {max_result_bytes} bytes)"
-                    ),
-                })
-            }
-            Err(DispatchCollectError::ChannelClosed) => Err(crate::Error::Dispatch {
-                detail: "response channel closed".into(),
-            }),
-        }
     }
 }
 
