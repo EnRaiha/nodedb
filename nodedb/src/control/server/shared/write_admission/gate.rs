@@ -4,12 +4,16 @@
 //!
 //! Every write-class `PhysicalPlan` — regardless of transport or path — passes
 //! through [`admit`] before it is enqueued to a Data-Plane core. The gate
-//! decides one of three outcomes per write:
+//! decides one of four outcomes per write:
 //!
 //! - [`WriteAdmission::FastPath`] — an uncontended POINT write whose exact
 //!   deterministic lock keys were acquired here. It carries a RAII
 //!   [`WriteAdmissionGuard`] the caller holds across the enqueue + response; the
 //!   guard releases the keys on drop. This is the normal autocommit path.
+//! - [`WriteAdmission::FastPathBlocking`] — a single-node POINT write for a
+//!   vShard with no Calvin scheduler. There is no lock table to fence against,
+//!   so the caller awaits a FIFO-fair per-key async order-lock before the WAL
+//!   append + enqueue, serializing concurrent same-key writes in arrival order.
 //! - [`WriteAdmission::RouteToCalvin`] — a point write whose keys are currently
 //!   held by a pending commit (acquire returned `Blocked`), OR any predicate /
 //!   bulk / multi-home write. The caller submits it through the deterministic
@@ -25,12 +29,13 @@
 //!
 //! [`SharedState::calvin_lock_managers`]: crate::control::state::SharedState::calvin_lock_managers
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::cluster::calvin::scheduler::driver::core::routing::{PlanRouting, plan_vshard};
-use crate::control::cluster::calvin::scheduler::lock_manager::{LockManager, TxnId};
+use crate::control::cluster::calvin::scheduler::lock_manager::{LockKey, LockManager, TxnId};
 use crate::control::planner::calvin::is_dependent_predicate;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, VShardId};
@@ -38,6 +43,7 @@ use nodedb_physical::physical_plan::MetaOp;
 
 use super::lock_keys::plan_lock_keys;
 use super::predicate::plan_is_write;
+use super::write_order_lock::KeyedWriteOrderLock;
 
 /// Count of writes the gate routed to the deterministic scheduler instead of
 /// the fast path (either a `Blocked` point write or a non-point write). Read by
@@ -66,9 +72,22 @@ pub struct WriteTarget<'a> {
 pub enum WriteAdmission {
     /// Uncontended point write admitted to the fast path. `guard` is `Some` when
     /// real keys were acquired (a scheduler is active for the vShard) and `None`
-    /// when no lock manager is registered (single-node / no-Calvin — nothing to
-    /// fence against). Either way the caller holds it across enqueue + response.
+    /// when no lock manager is registered and the write carries no single point
+    /// key to serialize on (predicate / bulk / uncovered shapes — left unordered
+    /// for now). Either way the caller holds it across enqueue + response.
     FastPath { guard: Option<WriteAdmissionGuard> },
+    /// Single-node (no Calvin scheduler for this vShard) POINT write. There is no
+    /// lock table to fence against, but concurrent same-key writes must still
+    /// serialize so WAL-LSN order equals apply order per key. The caller awaits
+    /// `keyed_lock.lock_owned(key)` — a FIFO-fair per-key async lock — BEFORE the
+    /// WAL append + enqueue, and holds the returned guard across exactly that
+    /// window (the same window as the Calvin-mode `FastPath` guard).
+    FastPathBlocking {
+        /// The single deterministic point key this write serializes on.
+        key: LockKey,
+        /// The global keyed order-lock (from `SharedState::write_order_locks`).
+        keyed_lock: Arc<KeyedWriteOrderLock>,
+    },
     /// Submit the write through the deterministic Calvin scheduler.
     RouteToCalvin,
     /// A non-write, or an already-locked Calvin apply — no fence needed.
@@ -102,10 +121,12 @@ impl Drop for WriteAdmissionGuard {
 
 /// Admit a plan destined for a Data-Plane core.
 ///
-/// Synchronous: never awaits and never parks. `RouteToCalvin` is returned ONLY
-/// when a deterministic scheduler is actually registered for the write's vShard;
-/// with no scheduler (single-node / no-Calvin — the common case) every write
-/// fast-paths exactly as it did before the fence existed.
+/// Synchronous: never awaits and never parks — it only *chooses* the outcome;
+/// any per-key await happens in the caller. `RouteToCalvin` is returned ONLY
+/// when a deterministic scheduler is actually registered for the write's vShard.
+/// With no scheduler (single-node / no-Calvin — the common case) a point write
+/// returns `FastPathBlocking` carrying the global keyed order-lock so concurrent
+/// same-key writes still serialize; every other shape fast-paths unfenced.
 pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
     // A Calvin-scheduled apply already holds its locks (acquired by the
     // scheduler); it must never re-acquire at the gate. Defensive — these ops
@@ -150,9 +171,12 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
     };
 
     // Availability gate: with no scheduler registered for this vShard there is no
-    // fence to serialize against — admit on the fast path with no lock held.
-    // This makes the no-Calvin path byte-for-byte identical to pre-fence
-    // behavior for point AND predicate writes.
+    // Calvin lock table to fence against. A POINT write still needs per-key
+    // arrival-order serialization so WAL-LSN order equals Data-Plane apply order
+    // per key — hand it the global keyed order-lock, on which concurrent same-key
+    // writers queue FIFO while distinct keys never contend. A predicate write has
+    // no single static point key here, so it stays unordered on the fast path
+    // (widening that coverage is a later unit).
     let Some(lock_manager) = shared
         .calvin_lock_managers
         .lock()
@@ -160,7 +184,13 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
         .get(&vshard.as_u32())
         .map(Arc::clone)
     else {
-        return WriteAdmission::FastPath { guard: None };
+        return match point_keys.and_then(|(_v, keys)| single_point_key(keys)) {
+            Some(key) => WriteAdmission::FastPathBlocking {
+                key,
+                keyed_lock: Arc::clone(&shared.write_order_locks),
+            },
+            None => WriteAdmission::FastPath { guard: None },
+        };
     };
 
     // Calvin IS running for this vShard. A predicate write has no static point
@@ -192,5 +222,17 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
         // it via the scheduler. Nothing was acquired or enqueued here.
         ROUTED_TO_CALVIN.fetch_add(1, Ordering::Relaxed);
         WriteAdmission::RouteToCalvin
+    }
+}
+
+/// The single point key of an eligible fast-path write, or `None` if the set is
+/// not exactly one key. [`plan_lock_keys`] always yields a one-key set for a
+/// point write; anything else is not a single-identity write and stays
+/// unordered on the single-node fast path.
+fn single_point_key(keys: BTreeSet<LockKey>) -> Option<LockKey> {
+    let mut it = keys.into_iter();
+    match (it.next(), it.next()) {
+        (Some(key), None) => Some(key),
+        _ => None,
     }
 }

@@ -300,6 +300,9 @@ impl SharedState {
             last_applied_calvin_epoch: Arc::new(AtomicU64::new(0)),
             calvin_apply_results: Arc::new(Mutex::new(std::collections::HashMap::new())),
             calvin_lock_managers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            write_order_locks: Arc::new(
+                crate::control::server::shared::write_admission::KeyedWriteOrderLock::new(),
+            ),
             autocommit_lock_seq: std::sync::atomic::AtomicU32::new(0),
             calvin_counters: crate::control::state::CalvinCounters {
                 write_versions_recorded: Arc::new(AtomicU64::new(0)),

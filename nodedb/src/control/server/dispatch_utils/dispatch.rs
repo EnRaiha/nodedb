@@ -270,7 +270,7 @@ async fn dispatch_to_data_plane_inner(
     use crate::control::server::shared::write_admission::{
         WriteAdmission, WriteTarget, admit, bare_ok_response, route_write_to_calvin,
     };
-    let (admission, admission_guard) = match admit(
+    let (admission, admission_guard, order_guard) = match admit(
         shared,
         &WriteTarget {
             tenant_id,
@@ -282,8 +282,25 @@ async fn dispatch_to_data_plane_inner(
         WriteAdmission::ExemptRead => (
             crate::bridge::envelope::Admission::Exempt(crate::bridge::envelope::ExemptReason::Read),
             None,
+            None,
         ),
-        WriteAdmission::FastPath { guard } => (crate::bridge::envelope::Admission::Admitted, guard),
+        WriteAdmission::FastPath { guard } => {
+            (crate::bridge::envelope::Admission::Admitted, guard, None)
+        }
+        WriteAdmission::FastPathBlocking { key, keyed_lock } => {
+            // Single-node serialization point: acquire the per-key FIFO order-lock
+            // FIRST, before the WAL append and enqueue below. `tokio::sync::Mutex`
+            // is fair, so concurrent same-key writers are admitted in arrival
+            // order — the WAL append + enqueue then happen in that order, giving
+            // WAL-LSN order == enqueue order == apply order per key. Distinct keys
+            // use distinct per-key mutexes and never contend.
+            let order_guard = keyed_lock.lock_owned(key).await;
+            (
+                crate::bridge::envelope::Admission::Admitted,
+                None,
+                Some(order_guard),
+            )
+        }
         WriteAdmission::RouteToCalvin => {
             // The deterministic scheduler applies the write (emitting its own
             // WriteEvents) and returns the applied response; a plain write with
@@ -357,6 +374,10 @@ async fn dispatch_to_data_plane_inner(
     // holding the guard across the response await would only serialize same-key
     // throughput needlessly. (`None` when no lock manager was registered.)
     drop(admission_guard);
+    // Release the single-node per-key order-lock at the SAME point — held across
+    // exactly [WAL append -> enqueue], never across the response await. (`None`
+    // for Calvin-mode / exempt / unordered writes.)
+    drop(order_guard);
 
     // Collect response(s). For non-streaming queries, exactly one arrives.
     // For streaming queries, multiple partial chunks arrive before the final.

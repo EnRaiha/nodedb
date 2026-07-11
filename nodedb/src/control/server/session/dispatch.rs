@@ -327,7 +327,7 @@ impl Session {
         use crate::control::server::shared::write_admission::{
             WriteAdmission, WriteTarget, admit, bare_ok_response, route_write_to_calvin,
         };
-        let (admission, _admission_guard) = match admit(
+        let (admission, _admission_guard, _order_guard) = match admit(
             &self.state,
             &WriteTarget {
                 tenant_id,
@@ -341,9 +341,25 @@ impl Session {
                     crate::bridge::envelope::ExemptReason::Read,
                 ),
                 None,
+                None,
             ),
             WriteAdmission::FastPath { guard } => {
-                (crate::bridge::envelope::Admission::Admitted, guard)
+                (crate::bridge::envelope::Admission::Admitted, guard, None)
+            }
+            WriteAdmission::FastPathBlocking { key, keyed_lock } => {
+                // Single-node serialization point: acquire the per-key FIFO
+                // order-lock FIRST, before the enqueue below, so concurrent
+                // same-key writers enqueue in arrival order. This path shares the
+                // one global keyed lock with the autocommit cores, so a native
+                // write and an autocommit write to the same key serialize too.
+                // The guard is held to end of function, mirroring the fast-path
+                // admission guard on this path.
+                let order_guard = keyed_lock.lock_owned(key).await;
+                (
+                    crate::bridge::envelope::Admission::Admitted,
+                    None,
+                    Some(order_guard),
+                )
             }
             WriteAdmission::RouteToCalvin => {
                 let routed =

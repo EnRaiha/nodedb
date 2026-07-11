@@ -64,7 +64,7 @@ impl NodeDbPgHandler {
         use crate::control::server::shared::write_admission::{
             WriteAdmission, WriteTarget, admit, bare_ok_response, route_write_to_calvin,
         };
-        let (admission, admission_guard) = match admit(
+        let (admission, admission_guard, order_guard) = match admit(
             &self.state,
             &WriteTarget {
                 tenant_id,
@@ -78,9 +78,22 @@ impl NodeDbPgHandler {
                     crate::bridge::envelope::ExemptReason::Read,
                 ),
                 None,
+                None,
             ),
             WriteAdmission::FastPath { guard } => {
-                (crate::bridge::envelope::Admission::Admitted, guard)
+                (crate::bridge::envelope::Admission::Admitted, guard, None)
+            }
+            WriteAdmission::FastPathBlocking { key, keyed_lock } => {
+                // Single-node serialization point: acquire the per-key FIFO
+                // order-lock FIRST, before the WAL append + enqueue below. Fair
+                // acquisition == arrival order, so WAL-LSN order == enqueue order
+                // == apply order per key; distinct keys never contend.
+                let order_guard = keyed_lock.lock_owned(key).await;
+                (
+                    crate::bridge::envelope::Admission::Admitted,
+                    None,
+                    Some(order_guard),
+                )
             }
             WriteAdmission::RouteToCalvin => {
                 // The deterministic scheduler applies the write (emitting its own
@@ -144,6 +157,10 @@ impl NodeDbPgHandler {
         // same-key throughput needlessly. (`None` when no lock manager was
         // registered / for the exempt-read case.)
         drop(admission_guard);
+        // Release the single-node per-key order-lock at the SAME point — held
+        // across exactly [WAL append -> enqueue], never across the response
+        // await. (`None` for Calvin-mode / exempt / unordered writes.)
+        drop(order_guard);
 
         // A scan result wider than `stream_chunk_size` is emitted as several
         // `Partial` frames followed by a terminal frame. Drain and concatenate

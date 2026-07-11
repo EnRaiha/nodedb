@@ -161,3 +161,102 @@ async fn two_concurrent_same_key_point_writes_serialize() {
         _ => panic!("after the first write releases, the key must fast-path again"),
     }
 }
+
+/// Single-node (NO Calvin lock manager registered for the vShard): a point write
+/// is admitted with the global keyed order-lock and its own point key, so
+/// concurrent same-key writes can serialize even with no lock table to fence
+/// against. This is the UA2 hole the keyed lock closes.
+#[tokio::test]
+async fn single_node_point_write_uses_global_keyed_order_lock() {
+    let (shared, _dir) = build_shared();
+    let coll = "single_node_coll";
+    // Deliberately DO NOT register a lock manager — the single-node path.
+    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, coll);
+    let plan = kv_put(coll, b"K");
+
+    let lock = match admit(&shared, &target(vshard, &plan)) {
+        WriteAdmission::FastPathBlocking { key, keyed_lock } => {
+            assert_eq!(
+                key,
+                kv_lock_key(coll, b"K"),
+                "the admission must carry the write's exact point key"
+            );
+            keyed_lock
+        }
+        _ => panic!("a single-node point write must return FastPathBlocking"),
+    };
+    assert!(
+        Arc::ptr_eq(&lock, &shared.write_order_locks),
+        "the gate must hand out the one global SharedState keyed order-lock"
+    );
+}
+
+/// Single-node concurrent same-key writes serialize in FIFO arrival order via the
+/// keyed order-lock the gate hands out. Deterministic under the current-thread
+/// test runtime: each spawned waiter is polled to its park point before the next.
+#[tokio::test]
+async fn single_node_same_key_serializes_fifo() {
+    let (shared, _dir) = build_shared();
+    let coll = "single_node_fifo";
+    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, coll);
+    let plan = kv_put(coll, b"K");
+
+    let (key, lock) = match admit(&shared, &target(vshard, &plan)) {
+        WriteAdmission::FastPathBlocking { key, keyed_lock } => (key, keyed_lock),
+        _ => panic!("single-node point write must return FastPathBlocking"),
+    };
+
+    let order = Arc::new(Mutex::new(Vec::<u32>::new()));
+    // The holder acquires first, parking the two waiters behind it.
+    let held = lock.lock_owned(key.clone()).await;
+
+    let mut handles = Vec::new();
+    for id in [1u32, 2u32] {
+        let lock = Arc::clone(&lock);
+        let order = Arc::clone(&order);
+        let key = key.clone();
+        handles.push(tokio::spawn(async move {
+            let _g = lock.lock_owned(key).await;
+            order.lock().expect("order").push(id);
+        }));
+        // Poll the waiter to its park point, fixing its FIFO queue position.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        order.lock().expect("order").is_empty(),
+        "same-key waiters must block while the holder is live"
+    );
+
+    drop(held);
+    for h in handles {
+        h.await.expect("waiter task");
+    }
+    assert_eq!(
+        *order.lock().expect("order"),
+        vec![1, 2],
+        "concurrent same-key writes must acquire in FIFO arrival order"
+    );
+}
+
+/// Single-node writes to DISTINCT keys never block each other — both order-lock
+/// guards are held simultaneously.
+#[tokio::test]
+async fn single_node_distinct_keys_do_not_block() {
+    let (shared, _dir) = build_shared();
+    let coll = "single_node_distinct";
+    let lock = Arc::clone(&shared.write_order_locks);
+
+    let g_a = lock.lock_owned(kv_lock_key(coll, b"A")).await;
+    let g_b = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        lock.lock_owned(kv_lock_key(coll, b"B")),
+    )
+    .await
+    .expect("a distinct key must not block on a held key");
+
+    // Both alive at once — proof the keys map to independent mutexes.
+    drop(g_b);
+    drop(g_a);
+}

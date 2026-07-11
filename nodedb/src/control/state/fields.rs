@@ -427,6 +427,15 @@ pub struct SharedState {
     ///
     /// [`TxnId::AUTOCOMMIT_EPOCH`]: crate::control::cluster::calvin::scheduler::lock_manager::TxnId::AUTOCOMMIT_EPOCH
     pub autocommit_lock_seq: std::sync::atomic::AtomicU32,
+    /// Single-node per-key write-ordering lock. When NO Calvin scheduler is
+    /// registered for a write's vShard there is no lock table to fence against,
+    /// yet two concurrent same-key autocommit writes must still serialize so
+    /// WAL-LSN order equals Data-Plane apply order per key. This global keyed
+    /// lock hands out one FIFO-fair async mutex per lock key: same-key writers
+    /// acquire in arrival order across [WAL append -> enqueue]; distinct keys
+    /// never contend. Idle keys are reaped, so it never grows unbounded.
+    pub write_order_locks:
+        Arc<crate::control::server::shared::write_admission::KeyedWriteOrderLock>,
     /// Presence/Awareness manager: ephemeral user state broadcast channels.
     pub presence: Arc<tokio::sync::RwLock<crate::control::server::sync::presence::PresenceManager>>,
     /// Permission tree cache: in-memory resource hierarchy + permission grants.
