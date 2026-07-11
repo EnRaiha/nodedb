@@ -945,6 +945,110 @@ fn edge_put_surrogates_roundtrip() {
 }
 
 #[test]
+fn array_cell_put_roundtrips_and_carries_surrogate() {
+    use crate::engine::array::wal::ArrayPutCell;
+    use nodedb_array::types::ArrayId;
+    use nodedb_array::types::cell_value::value::CellValue;
+    use nodedb_array::types::coord::value::CoordValue;
+    use nodedb_physical::physical_plan::ArrayOp;
+
+    let tenant = TenantId::new(3);
+    let vshard = VShardId::new(7);
+    let array_id = ArrayId::new(tenant, "genome");
+
+    // A cell carrying a real surrogate — the losslessness subject.
+    let cell = ArrayPutCell {
+        coord: vec![CoordValue::Int64(5), CoordValue::Int64(7)],
+        attrs: vec![CellValue::Float64(42.0)],
+        surrogate: Surrogate::new(9999),
+        system_from_ms: 1,
+        valid_from_ms: 1,
+        valid_until_ms: i64::MAX,
+    };
+    let cells_msgpack = zerompk::to_msgpack_vec(&vec![cell]).unwrap();
+
+    let plan = PhysicalPlan::Array(ArrayOp::Put {
+        array_id: array_id.clone(),
+        cells_msgpack: cells_msgpack.clone(),
+        wal_lsn: 123,
+        provenance: None,
+    });
+
+    // Must encode (no longer a replication gap).
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("ArrayOp::Put must encode to a ReplicatedWrite");
+    let bytes = entry.to_bytes();
+
+    // Decode with no assigner (surrogate binding is a no-op) — the cells (and
+    // thus the carried surrogate) must survive verbatim, wal_lsn resets to 0.
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("ArrayCellPut must decode to a plan");
+    match decoded_plan {
+        PhysicalPlan::Array(ArrayOp::Put {
+            array_id: decoded_id,
+            cells_msgpack: decoded_cells,
+            wal_lsn,
+            provenance,
+        }) => {
+            assert_eq!(
+                decoded_id, array_id,
+                "array id reconstructed from header tenant + name"
+            );
+            assert_eq!(
+                decoded_cells, cells_msgpack,
+                "cells (with surrogate) carried verbatim"
+            );
+            assert_eq!(wal_lsn, 0, "follower allocates its own wal_lsn at apply");
+            assert!(provenance.is_none());
+        }
+        other => panic!("expected Array(Put), got {other:?}"),
+    }
+}
+
+#[test]
+fn array_cell_delete_roundtrips_verbatim() {
+    use nodedb_array::types::ArrayId;
+    use nodedb_array::types::coord::value::CoordValue;
+    use nodedb_physical::physical_plan::ArrayOp;
+
+    let tenant = TenantId::new(2);
+    let vshard = VShardId::new(4);
+    let array_id = ArrayId::new(tenant, "genome");
+
+    let coords = vec![vec![CoordValue::Int64(1), CoordValue::Int64(2)]];
+    let coords_msgpack = zerompk::to_msgpack_vec(&coords).unwrap();
+
+    let plan = PhysicalPlan::Array(ArrayOp::Delete {
+        array_id: array_id.clone(),
+        coords_msgpack: coords_msgpack.clone(),
+        wal_lsn: 55,
+        provenance: None,
+    });
+
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("ArrayOp::Delete must encode to a ReplicatedWrite");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("ArrayCellDelete must decode to a plan");
+    match decoded_plan {
+        PhysicalPlan::Array(ArrayOp::Delete {
+            array_id: decoded_id,
+            coords_msgpack: decoded_coords,
+            wal_lsn,
+            provenance,
+        }) => {
+            assert_eq!(decoded_id, array_id);
+            assert_eq!(decoded_coords, coords_msgpack, "coords carried verbatim");
+            assert_eq!(wal_lsn, 0);
+            assert!(provenance.is_none());
+        }
+        other => panic!("expected Array(Delete), got {other:?}"),
+    }
+}
+
+#[test]
 fn constraint_change_set_decodes_to_set_constraints() {
     // Decode layer keeps constraint blobs opaque, so raw bytes are sufficient
     // and avoid coupling this test to the constraint wire layout.
@@ -1373,12 +1477,8 @@ fn pre_database_id_entry_decodes_to_default_database() {
 
 #[test]
 fn known_write_gaps_are_not_replicated() {
-    use nodedb_array::types::ArrayId;
-    use nodedb_physical::physical_plan::ArrayOp;
-
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
-    let array_id = ArrayId::new(tenant, "genome");
 
     let gaps: Vec<(&str, PhysicalPlan)> = vec![
         (
@@ -1415,24 +1515,6 @@ fn known_write_gaps_are_not_replicated() {
                 document_id: "id1".into(),
                 target_version_json: "{}".into(),
                 surrogate: Surrogate::new(1),
-            }),
-        ),
-        (
-            "Array::Put",
-            PhysicalPlan::Array(ArrayOp::Put {
-                array_id: array_id.clone(),
-                cells_msgpack: Vec::new(),
-                wal_lsn: 0,
-                provenance: None,
-            }),
-        ),
-        (
-            "Array::Delete",
-            PhysicalPlan::Array(ArrayOp::Delete {
-                array_id,
-                coords_msgpack: Vec::new(),
-                wal_lsn: 0,
-                provenance: None,
             }),
         ),
     ];

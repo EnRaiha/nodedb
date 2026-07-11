@@ -20,11 +20,17 @@
 //! fixing those is a separate, later change.
 //!
 //! One documented set of arms is the exception:
-//! `DocumentOp::{Merge, UpdateFromJoin}`, `CrdtOp::RestoreToVersion`, and
-//! `ArrayOp::{Put, Delete}` classify `true` here even though
-//! `to_replicated_entry` has no encoder arm for any of them — a deliberate
-//! divergence from the oracle (see the equivalence test below, which pins
-//! the divergence explicitly rather than papering over it).
+//! `DocumentOp::{Merge, UpdateFromJoin}` and `CrdtOp::RestoreToVersion`
+//! classify `true` here even though `to_replicated_entry` has no encoder arm
+//! for any of them — a deliberate divergence from the oracle (see the
+//! equivalence test below, which pins the divergence explicitly rather than
+//! papering over it).
+//! `ArrayOp::{Put, Delete}` used to be in this same exception list, but
+//! `to_replicated_entry` now has encoder arms for both (see
+//! `control/wal_replication/encode/entry_array.rs::array_write`, which emits
+//! the Raft-native `ArrayCellPut` / `ArrayCellDelete` cluster-write variants),
+//! so they no longer diverge from the oracle and were moved into
+//! `array_and_cluster_array_variants_match_oracle` below.
 //! `VectorOp::{DeleteBySurrogate, SparseInsert, SparseDelete,
 //! MultiVectorInsert, MultiVectorDelete, DirectUpsert}` used to be in this
 //! same exception list, but `to_replicated_entry` now has encoder arms for
@@ -417,8 +423,9 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | MetaOp::ResolveTxn { .. },
         ) => false,
 
-        // ---- Array: never touched by `to_replicated_entry` (`ArrayOp` is
-        // not even imported in `entry.rs`), so every variant is a read here.
+        // ---- Array reads / DDL / Flush: `to_replicated_entry` returns `None`
+        // for these (not a write), so they classify `false` — matching the
+        // oracle.
         PhysicalPlan::Array(
             ArrayOp::OpenArray { .. }
             | ArrayOp::Slice { .. }
@@ -430,13 +437,12 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | ArrayOp::SurrogateBitmapScan { .. }
             | ArrayOp::DropArray { .. },
         ) => false,
-        // Buffered: `ArrayOp` is unreachable from `to_replicated_entry`
-        // entirely (a deliberate divergence from the oracle, see module
-        // doc), but both reach `exec_tx_passthrough`
-        // (`data/executor/handlers/transaction/sub_plan.rs:55-60`) at COMMIT
-        // with no reject arm. Buffering closes the prior atomicity gap
-        // (statement used to execute immediately and survive ROLLBACK) at
-        // the cost of RYOW loss + the no-undo gap (module doc).
+        // Buffered AND encoded — matches the oracle. `to_replicated_entry` now
+        // emits the Raft-native `ArrayCellPut` / `ArrayCellDelete` for these
+        // (`encode/entry_array.rs`), so they replicate to the shard's data
+        // group. Buffering also closes the in-transaction atomicity gap
+        // (statement used to execute immediately and survive ROLLBACK) at the
+        // cost of RYOW loss + the no-undo gap (module doc).
         PhysicalPlan::Array(ArrayOp::Put { .. } | ArrayOp::Delete { .. }) => true,
 
         // ---- ClusterArray: coordinator-only, never dispatched to the Data
@@ -1863,6 +1869,23 @@ mod tests {
             PhysicalPlan::Array(ArrayOp::DropArray {
                 array_id: array_id.clone(),
             }),
+            // `ArrayOp::Put` / `Delete` now MATCH the oracle: both are buffered
+            // (`plan_requires_txn_buffering == true`, the atomicity fix) AND
+            // encoded (`to_replicated_entry` returns `Some` — the Raft-native
+            // `ArrayCellPut` / `ArrayCellDelete` cluster-write path), so they
+            // belong here rather than in `flipped_variants_are_buffered_and_unencoded`.
+            PhysicalPlan::Array(ArrayOp::Put {
+                array_id: array_id.clone(),
+                cells_msgpack: Vec::new(),
+                wal_lsn: 0,
+                provenance: None,
+            }),
+            PhysicalPlan::Array(ArrayOp::Delete {
+                array_id: array_id.clone(),
+                coords_msgpack: Vec::new(),
+                wal_lsn: 0,
+                provenance: None,
+            }),
             PhysicalPlan::ClusterArray(ClusterArrayOp::Slice {
                 array_id: array_id.clone(),
                 slice_msgpack: Vec::new(),
@@ -1918,7 +1941,6 @@ mod tests {
     /// — see `document_variants_match_oracle` / `crdt_variants_match_oracle`.
     #[test]
     fn flipped_variants_are_buffered_and_unencoded() {
-        let array_id = ArrayId::new(tenant(), "a");
         let plans = vec![
             PhysicalPlan::Document(DocumentOp::Merge {
                 target_collection: "t".into(),
@@ -1946,18 +1968,6 @@ mod tests {
                 document_id: "d".into(),
                 target_version_json: "{}".into(),
                 surrogate: Surrogate::ZERO,
-            }),
-            PhysicalPlan::Array(ArrayOp::Put {
-                array_id: array_id.clone(),
-                cells_msgpack: Vec::new(),
-                wal_lsn: 0,
-                provenance: None,
-            }),
-            PhysicalPlan::Array(ArrayOp::Delete {
-                array_id: array_id.clone(),
-                coords_msgpack: Vec::new(),
-                wal_lsn: 0,
-                provenance: None,
             }),
         ];
         for p in &plans {

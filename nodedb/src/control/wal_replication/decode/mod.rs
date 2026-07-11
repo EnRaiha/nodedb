@@ -9,6 +9,7 @@
 //! - [`entry`]: thin top-level dispatcher (`from_replicated_entry`).
 //! - [`ctx`]: shared `DecodeCtx` + surrogate-binding helpers.
 //! - [`entry_document`] / [`document`]: `PhysicalPlan::Document`.
+//! - [`entry_array`]: Raft-native array cell writes → `PhysicalPlan::Array`.
 //! - [`entry_kv`] / [`kv`]: `PhysicalPlan::Kv`.
 //! - [`entry_graph`] / [`graph`]: `PhysicalPlan::Graph`.
 //! - [`entry_crdt`] / [`crdt`]: `PhysicalPlan::Crdt`.
@@ -21,6 +22,7 @@ mod crdt;
 mod ctx;
 mod document;
 mod entry;
+mod entry_array;
 mod entry_columnar_family;
 mod entry_crdt;
 mod entry_document;

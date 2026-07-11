@@ -13,7 +13,8 @@
 //! - [`entry_graph`] / [`graph`]: `PhysicalPlan::Graph`.
 //! - [`entry_columnar_family`] / [`columnar`]: `PhysicalPlan::Columnar` /
 //!   `Timeseries` / `Text` / `Spatial`.
-//! - [`entry_array`]: `PhysicalPlan::Array` (no variant replicated yet).
+//! - [`entry_array`]: `PhysicalPlan::Array` — `Put` / `Delete` replicate as the
+//!   Raft-native `ArrayCellPut` / `ArrayCellDelete`; `Flush` / reads / DDL don't.
 //! - [`vector`]: `PhysicalPlan::Vector` (exhaustive `encode`).
 //! - [`crdt`]: `PhysicalPlan::Crdt` (exhaustive `encode`).
 

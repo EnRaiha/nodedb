@@ -8,7 +8,9 @@
 //! handlers in [`super::write`]).
 
 use async_trait::async_trait;
-use nodedb_cluster::distributed_array::wire::{ArrayShardAggReq, ArrayShardPutReq};
+use nodedb_cluster::distributed_array::wire::{
+    ArrayShardAggReq, ArrayShardDeleteReq, ArrayShardPutReq,
+};
 use nodedb_cluster::distributed_array::{ArrayAggExec, ArrayLocalExecutor, ArraySliceExec};
 use nodedb_cluster::error::Result;
 
@@ -31,13 +33,8 @@ impl ArrayLocalExecutor for DataPlaneArrayExecutor {
         self.put(req).await
     }
 
-    async fn exec_delete(
-        &self,
-        array_id_msgpack: &[u8],
-        coords_msgpack: &[u8],
-        wal_lsn: u64,
-    ) -> Result<u64> {
-        self.delete(array_id_msgpack, coords_msgpack, wal_lsn).await
+    async fn exec_delete(&self, req: &ArrayShardDeleteReq) -> Result<u64> {
+        self.delete(req).await
     }
 
     async fn exec_surrogate_bitmap_scan(

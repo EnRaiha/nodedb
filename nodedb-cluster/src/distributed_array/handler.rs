@@ -139,9 +139,7 @@ async fn handle_delete(
 
     validate_delete_routing(&req, local_vshard_id)?;
 
-    let applied_lsn = executor
-        .exec_delete(&req.array_id_msgpack, &req.coords_msgpack, req.wal_lsn)
-        .await?;
+    let applied_lsn = executor.exec_delete(&req).await?;
     let resp = ArrayShardDeleteResp {
         shard_id: local_vshard_id,
         applied_lsn,
@@ -247,7 +245,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::distributed_array::merge::ArrayAggPartial;
-    use crate::distributed_array::wire::{ArrayShardAggReq, ArrayShardPutReq};
+    use crate::distributed_array::wire::{ArrayShardAggReq, ArrayShardDeleteReq, ArrayShardPutReq};
     use crate::error::Result;
 
     use super::super::local_executor::{ArrayAggExec, ArrayLocalExecutor, ArraySliceExec};
@@ -302,13 +300,8 @@ mod tests {
             Ok(req.wal_lsn)
         }
 
-        async fn exec_delete(
-            &self,
-            _array_id_msgpack: &[u8],
-            _coords_msgpack: &[u8],
-            wal_lsn: u64,
-        ) -> Result<u64> {
-            Ok(wal_lsn)
+        async fn exec_delete(&self, req: &ArrayShardDeleteReq) -> Result<u64> {
+            Ok(req.wal_lsn)
         }
     }
 

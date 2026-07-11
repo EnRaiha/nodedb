@@ -14,7 +14,9 @@
 
 use super::super::types::{ReplicatedEntry, ReplicatedWrite};
 use super::ctx::DecodeCtx;
-use super::{entry_columnar_family, entry_crdt, entry_document, entry_graph, entry_kv, vector};
+use super::{
+    entry_array, entry_columnar_family, entry_crdt, entry_document, entry_graph, entry_kv, vector,
+};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::surrogate::SurrogateAssigner;
 use crate::types::{DatabaseId, TenantId, VShardId};
@@ -158,6 +160,14 @@ fn to_physical_plan(
         | ReplicatedWrite::SpatialDelete { .. }
         | ReplicatedWrite::ColumnarBulkDml { .. } => {
             Ok((entry_columnar_family::decode_arm(write)?, None))
+        }
+        // Raft-native array cell writes (`PhysicalPlan::Array`) — the cluster
+        // SQL DML array path. Distinct from the Lite-sync `ArrayOp` CRDT variant
+        // below, which is intercepted by the distributed applier and never
+        // reaches this dispatcher. The applier routes the plan these produce
+        // through the array-open bootstrap rather than the plain dispatch path.
+        ReplicatedWrite::ArrayCellPut { .. } | ReplicatedWrite::ArrayCellDelete { .. } => {
+            Ok((entry_array::decode_arm(ctx, write)?, None))
         }
         // The following variants are intercepted upstream (Array CRDT ops by
         // `from_replicated_entry`, CalvinReadResult by the apply loop) and never

@@ -731,4 +731,61 @@ pub enum ReplicatedWrite {
         constraint_version: u64,
         constraints: Vec<Vec<u8>>,
     },
+
+    /// A local array cell PUT (`ArrayOp::Put`) replicated to the shard's data
+    /// Raft group so every replica re-executes it.
+    ///
+    /// This is the Raft-native array-write path, distinct from [`Self::ArrayOp`]
+    /// (which carries a single Lite-sync CRDT op — surrogate-less, HLC-keyed,
+    /// single-cell). Here the write originates from cluster SQL DML on the shard
+    /// owner: the leader has already allocated a global surrogate PER CELL at
+    /// plan time (`array_convert/dml.rs`), and those surrogates ride verbatim
+    /// INSIDE `cells_msgpack` — each
+    /// `nodedb::engine::array::wal::ArrayPutCell` carries its own `surrogate`
+    /// field. Followers reconstruct `ArrayOp::Put` byte-for-byte and bind each
+    /// cell's carried surrogate to its coord tuple, so the same `(array, coord)`
+    /// resolves to the same global identity on every node — never re-allocated.
+    ///
+    /// `array` is the array's user-visible name; the `ArrayId` is reconstructed
+    /// on decode from the entry header's `tenant_id` + this name. No `wal_lsn`:
+    /// followers allocate their own WAL LSN at apply time (like
+    /// `ColumnarIngest` / `TimeseriesIngest`).
+    ///
+    /// Idempotent-replay contract: array cells are keyed by coord, and a Put
+    /// overwrites the cell at that coord with the carried value + surrogate.
+    /// Under exactly-once, log-ordered Raft apply, re-applying this entry
+    /// (leader-change re-proposal, snapshot replay) re-writes the identical
+    /// cells — a deterministic no-op relative to the committed state.
+    ArrayCellPut {
+        array: String,
+        /// zerompk `Vec<nodedb::engine::array::wal::ArrayPutCell>` — carries
+        /// each cell's coord, attrs, and leader-assigned global surrogate
+        /// verbatim (the losslessness guarantee).
+        cells_msgpack: Vec<u8>,
+        /// Sync provenance encoded as zerompk bytes; `None` for locally
+        /// originated cluster writes (the common case).
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
+    },
+
+    /// A local array cell DELETE (`ArrayOp::Delete`) replicated to the shard's
+    /// data Raft group. The Raft-native sibling of [`Self::ArrayCellPut`].
+    ///
+    /// `coords_msgpack` is the exact zerompk encoding the owner's Data Plane
+    /// delete handler already consumes; it carries no surrogate (deletes are
+    /// keyed by exact coordinate). Followers reconstruct `ArrayOp::Delete`
+    /// byte-for-byte. `array` reconstructs the `ArrayId` from the header tenant
+    /// on decode, exactly as [`Self::ArrayCellPut`]. No `wal_lsn` (follower
+    /// allocates its own at apply).
+    ///
+    /// Idempotent-replay contract: deleting an already-absent coord is a no-op,
+    /// so re-applying under exactly-once, log-ordered Raft apply is safe.
+    ArrayCellDelete {
+        array: String,
+        /// zerompk-encoded coordinate batch (the same bytes the owner's
+        /// `ArrayOp::Delete` handler decodes).
+        coords_msgpack: Vec<u8>,
+        #[serde(default)]
+        provenance: Option<Vec<u8>>,
+    },
 }

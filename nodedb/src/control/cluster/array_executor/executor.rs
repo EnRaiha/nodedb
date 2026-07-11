@@ -24,7 +24,7 @@ const LOCAL_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// variants through the SPSC bridge and await their responses via the
 /// `RequestTracker`.
 pub struct DataPlaneArrayExecutor {
-    state: Arc<SharedState>,
+    pub(super) state: Arc<SharedState>,
 }
 
 impl DataPlaneArrayExecutor {

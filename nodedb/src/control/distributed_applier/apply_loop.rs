@@ -11,11 +11,14 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
-use crate::control::array_sync::raft_apply::{AppliedPosition, apply_array_op, apply_array_schema};
+use crate::control::array_sync::raft_apply::{
+    AppliedPosition, apply_array_cell_write, apply_array_op, apply_array_schema,
+};
 use crate::control::cluster::calvin::ReadResultEvent;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{ReplicatedEntry, ReplicatedWrite, from_replicated_entry};
 use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
+use nodedb_physical::physical_plan::ArrayOp;
 
 use super::applier::ApplyBatch;
 use super::propose_tracker::ProposeTracker;
@@ -282,6 +285,36 @@ pub async fn run_apply_loop(
                     continue;
                 }
             };
+
+            // Raft-native array cell writes (`ArrayCellPut` / `ArrayCellDelete`)
+            // decode to `PhysicalPlan::Array(Put | Delete)`. A follower must
+            // OPEN the array on the Data Plane before applying, so these route
+            // through the array-open bootstrap rather than the plain
+            // build_request → dispatch path below. No other `ReplicatedWrite`
+            // variant decodes to a `PhysicalPlan::Array`, so this match is
+            // exact.
+            if matches!(
+                plan,
+                PhysicalPlan::Array(ArrayOp::Put { .. } | ArrayOp::Delete { .. })
+            ) {
+                let applied_ok = apply_array_cell_write(
+                    &state,
+                    &tracker,
+                    AppliedPosition {
+                        group_id: batch.group_id,
+                        log_index: entry.index,
+                        applied_key,
+                    },
+                    tenant_id,
+                    vshard_id,
+                    plan,
+                )
+                .await;
+                if applied_ok {
+                    maybe_compact_log(&state, batch.group_id, entry.index);
+                }
+                continue;
+            }
 
             let request = build_request(
                 &state,

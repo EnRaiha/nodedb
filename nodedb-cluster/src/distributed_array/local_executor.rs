@@ -13,7 +13,9 @@
 //! `nodedb` while still producing real results from the Data Plane.
 
 use crate::distributed_array::merge::ArrayAggPartial;
-use crate::distributed_array::wire::{ArrayShardAggReq, ArrayShardPutReq, ArrayShardSliceReq};
+use crate::distributed_array::wire::{
+    ArrayShardAggReq, ArrayShardDeleteReq, ArrayShardPutReq, ArrayShardSliceReq,
+};
 use crate::error::Result;
 
 /// Result of a local shard slice: the per-row bytes plus the bitemporal
@@ -91,15 +93,12 @@ pub trait ArrayLocalExecutor: Send + Sync + 'static {
 
     /// Delete cells by exact coordinates from the local array engine.
     ///
-    /// `array_id_msgpack` — zerompk encoding of `nodedb_array::types::ArrayId`.
-    /// `coords_msgpack` — zerompk encoding of `Vec<Vec<CoordValue>>`.
-    /// `wal_lsn` — WAL sequence number allocated by the Control Plane.
+    /// Takes the full `ArrayShardDeleteReq` (not just the coord bytes) because
+    /// the implementor needs the request's Hilbert routing metadata
+    /// (`representative_hilbert_prefix` / `prefix_bits`) to derive the owning
+    /// vShard when it replicates the delete to that shard's data Raft group,
+    /// mirroring [`Self::exec_put`].
     ///
-    /// Returns the `applied_lsn` (equal to `wal_lsn` on success).
-    async fn exec_delete(
-        &self,
-        array_id_msgpack: &[u8],
-        coords_msgpack: &[u8],
-        wal_lsn: u64,
-    ) -> Result<u64>;
+    /// Returns the `applied_lsn` (equal to `req.wal_lsn` on success).
+    async fn exec_delete(&self, req: &ArrayShardDeleteReq) -> Result<u64>;
 }
