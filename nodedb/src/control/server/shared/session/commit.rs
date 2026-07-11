@@ -85,6 +85,26 @@ pub async fn run_commit(
         }
     };
 
+    // Expand any staged `INSERT ... SELECT` into concrete, fresh-surrogate
+    // `PointInsert` writes BEFORE dispatch classification, so the transaction
+    // commits concrete writes (surrogate registration is Control-Plane-only;
+    // undo-tracked and replicated as concrete writes rather than a re-scanned
+    // InsertSelect that would bind the copied rows to the source's surrogate).
+    let buffered = match crate::control::insert_select::expand_staged::expand_staged_insert_selects(
+        state,
+        identity.tenant_id,
+        buffered,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            return CommitOutcome::Aborted {
+                reason: AbortReason::Dispatch(e),
+            };
+        }
+    };
+
     if !buffered.is_empty() {
         let tenant_id = identity.tenant_id;
 

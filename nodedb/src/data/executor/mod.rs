@@ -16,7 +16,7 @@ mod snapshot;
 mod sparse_vector_checkpoint;
 mod spatial_checkpoint;
 mod spatial_key;
-pub(super) mod strict_format;
+pub(crate) mod strict_format;
 pub(in crate::data) mod sync_gate;
 pub mod task;
 pub(crate) mod vector_checkpoint;

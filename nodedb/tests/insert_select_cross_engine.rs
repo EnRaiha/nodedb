@@ -238,3 +238,72 @@ async fn insert_select_constraint_violation_is_atomic() {
         "a violating INSERT ... SELECT must leave the target unchanged; got {ids:?}"
     );
 }
+
+/// An autocommit `INSERT ... SELECT` whose SOURCE is a STRICT document
+/// collection must normalize each scanned Binary Tuple to msgpack before the
+/// copy: rows persist and resolve through the target's vector index to their own
+/// PKs. Without normalization the strict source's raw tuple bytes are copied
+/// through unchanged and PK extraction / vector indexing both fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_select_from_strict_source_normalizes_and_resolves() {
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION iss_ac_source \
+             (id STRING NOT NULL PRIMARY KEY, embedding VECTOR(4)) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    for (id, v) in [
+        ("alpha", [1.0f32, 0.0, 0.0, 0.0]),
+        ("beta", [0.0, 0.0, 0.0, 1.0]),
+    ] {
+        server
+            .exec(&format!(
+                "INSERT INTO iss_ac_source (id, embedding) VALUES \
+                 ('{id}', ARRAY[{},{},{},{}])",
+                v[0], v[1], v[2], v[3]
+            ))
+            .await
+            .unwrap();
+    }
+
+    server
+        .exec("CREATE COLLECTION iss_ac_target")
+        .await
+        .unwrap();
+    server
+        .exec("CREATE VECTOR INDEX idx_iss_ac_target_emb ON iss_ac_target METRIC cosine DIM 4")
+        .await
+        .unwrap();
+
+    server
+        .exec("INSERT INTO iss_ac_target SELECT * FROM iss_ac_source")
+        .await
+        .unwrap();
+
+    let scanned = server
+        .query_text("SELECT id FROM iss_ac_target ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        scanned,
+        vec!["alpha".to_string(), "beta".to_string()],
+        "autocommit copy from a strict source must persist both rows; got {scanned:?}"
+    );
+
+    let near_e1 = server
+        .query_text(
+            "SELECT id FROM iss_ac_target \
+             WHERE embedding <-> ARRAY[1.0, 0.0, 0.0, 0.0] LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        near_e1.first().map(String::as_str),
+        Some("alpha"),
+        "vector search must resolve the copied strict-source 'alpha'; got {near_e1:?}"
+    );
+}

@@ -42,11 +42,9 @@
 use nodedb_types::{DatabaseId, Lsn, Surrogate, TenantId};
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
-use crate::bridge::scan_filter::ScanFilter;
-use crate::control::insert_select::target_identity::{assign_target_surrogate, resolve_target_pk};
+use crate::control::insert_select::copy_rows::{assign_page_rows, resolve_copy_spec};
 use crate::control::maintenance::clone_materializer::{dispatch_local, scan_source_page};
 use crate::control::state::SharedState;
-use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_physical::physical_plan::DocumentOp;
 
 /// Drive an `INSERT ... SELECT` from `source_collection` into `target_collection`.
@@ -67,24 +65,14 @@ pub async fn run_insert_select(
     source_filters: &[u8],
     source_limit: usize,
 ) -> crate::Result<Response> {
-    let catalog = state.credentials.catalog();
-    let target_bare = bare_collection_name(database_id, target_collection);
-    let target = catalog
-        .get_collection(database_id, tenant_id.as_u64(), &target_bare)?
-        .ok_or_else(|| crate::Error::CollectionNotFound {
-            tenant_id,
-            collection: target_collection.to_string(),
-        })?;
-    let target_pk = resolve_target_pk(&target)?;
-
-    let filters: Vec<ScanFilter> = if source_filters.is_empty() {
-        Vec::new()
-    } else {
-        zerompk::from_msgpack(source_filters).map_err(|e| crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("insert-select source filters: {e}"),
-        })?
-    };
+    let spec = resolve_copy_spec(
+        state,
+        tenant_id,
+        database_id,
+        target_collection,
+        source_collection,
+        source_filters,
+    )?;
 
     let mut cursor: Vec<u8> = Vec::new();
     let mut remaining = source_limit;
@@ -103,32 +91,27 @@ pub async fn run_insert_select(
         )
         .await?;
 
-        // Phase 2: filter surviving rows and assign fresh target surrogates.
-        let mut documents: Vec<(String, Vec<u8>)> = Vec::with_capacity(entries.len());
-        let mut surrogates: Vec<Surrogate> = Vec::with_capacity(entries.len());
-        for (_source_doc_id, _source_surrogate, value) in entries {
-            if remaining == 0 {
-                break;
-            }
-            if !filters.is_empty() && !filters.iter().all(|f| f.matches_binary(&value)) {
-                continue;
-            }
-            let surrogate = assign_target_surrogate(
-                state,
-                database_id,
-                tenant_id,
-                target_collection,
-                &target_pk,
-                &value,
-            )?;
-            documents.push((surrogate_to_doc_id(surrogate), value));
-            surrogates.push(surrogate);
-            remaining -= 1;
-        }
+        // Phase 2: normalize (strict → msgpack), filter surviving rows, and
+        // assign fresh target surrogates via the shared copy pipeline.
+        let rows = assign_page_rows(
+            state,
+            tenant_id,
+            database_id,
+            target_collection,
+            &spec,
+            entries,
+            &mut remaining,
+        )?;
 
         // Phase 3: one atomic batch write for this page.
-        if !documents.is_empty() {
-            let page_len = documents.len();
+        if !rows.is_empty() {
+            let page_len = rows.len();
+            let mut documents: Vec<(String, Vec<u8>)> = Vec::with_capacity(page_len);
+            let mut surrogates: Vec<Surrogate> = Vec::with_capacity(page_len);
+            for (document_id, value, surrogate) in rows {
+                documents.push((document_id, value));
+                surrogates.push(surrogate);
+            }
             let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: target_collection.to_string(),
                 documents,
@@ -169,20 +152,6 @@ pub async fn run_insert_select(
         error_code: None,
         read_set_valid: None,
     })
-}
-
-/// Strip the `{database_id}/` qualifier from a db-qualified collection name to
-/// recover the bare name the catalog keys collections by (the DEFAULT database
-/// uses the bare name unqualified).
-fn bare_collection_name(database_id: DatabaseId, qualified: &str) -> String {
-    if database_id == DatabaseId::DEFAULT {
-        return qualified.to_string();
-    }
-    let prefix = format!("{}/", database_id.as_u64());
-    qualified
-        .strip_prefix(&prefix)
-        .unwrap_or(qualified)
-        .to_string()
 }
 
 /// Read the `"inserted"` count from a `BatchInsert` response payload.
