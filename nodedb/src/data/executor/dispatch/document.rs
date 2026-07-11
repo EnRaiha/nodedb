@@ -297,27 +297,24 @@ impl CoreLoop {
                 self.execute_estimate_count(task, tid, collection, field)
             }
 
-            DocumentOp::InsertSelect {
-                target_collection,
-                source_collection,
-                source_filters,
-                source_limit,
-            } => {
-                // Autocommit `INSERT ... SELECT` is orchestrated on the Control
-                // Plane (`control::insert_select`): the source is scanned, each
-                // target row is assigned its OWN fresh, registered surrogate, and
-                // the rows land via an atomic `BatchInsert`. That path never
-                // reaches here. This handler serves only the buffered replay of a
-                // transactional `INSERT ... SELECT` at COMMIT, which copies rows
-                // under the source surrogate via the overlay — the in-transaction
-                // surrogate-registration fix is tracked separately.
-                self.execute_insert_select(
+            DocumentOp::InsertSelect { .. } => {
+                // `INSERT ... SELECT` is resolved entirely on the Control Plane and
+                // never dispatched to the Data Plane as an `InsertSelect`: the
+                // autocommit path runs the `control::insert_select` orchestrator
+                // (scan → fresh registered surrogate per row → atomic `BatchInsert`),
+                // the in-transaction statement stages rows into the overlay
+                // (`stage_insert_select`), and its COMMIT expands the staged plan
+                // into concrete `PointInsert` tasks before dispatch. Reaching this
+                // arm means an `InsertSelect` plan bypassed all three — a routing
+                // bug, surfaced loudly rather than silently mis-copied.
+                self.response_error(
                     task,
-                    tid,
-                    target_collection,
-                    source_collection,
-                    source_filters,
-                    *source_limit,
+                    crate::bridge::envelope::ErrorCode::Internal {
+                        detail: "InsertSelect must be resolved on the Control Plane \
+                                 (orchestrator / staging / commit-time expansion); \
+                                 it must never reach Data-Plane dispatch"
+                            .into(),
+                    },
                 )
             }
 

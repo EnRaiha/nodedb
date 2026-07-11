@@ -28,7 +28,6 @@ pub mod graph_temporal;
 pub mod graph_wcc;
 pub(super) mod grouping_sets_exec;
 pub mod hybrid_overlay;
-pub mod insert_select;
 pub mod join;
 pub mod kv;
 pub mod merge;
