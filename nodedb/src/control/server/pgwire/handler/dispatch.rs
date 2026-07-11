@@ -336,6 +336,7 @@ impl NodeDbPgHandler {
             watermark_lsn: Lsn::new(0),
             error_code: None,
             read_set_valid: None,
+            write_set: Vec::new(),
         })
     }
 

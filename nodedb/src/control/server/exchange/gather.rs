@@ -450,5 +450,6 @@ pub(super) fn outcome_to_response(merged_array: Vec<u8>, watermark_lsn: Lsn) -> 
         watermark_lsn,
         error_code: None,
         read_set_valid: None,
+        write_set: Vec::new(),
     }
 }

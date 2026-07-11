@@ -21,6 +21,7 @@ impl CoreLoop {
             watermark_lsn: self.watermark,
             error_code: None,
             read_set_valid: None,
+            write_set: Vec::new(),
         }
     }
 
@@ -38,6 +39,7 @@ impl CoreLoop {
             watermark_lsn: self.watermark,
             error_code: None,
             read_set_valid: None,
+            write_set: Vec::new(),
         }
     }
 
@@ -55,6 +57,7 @@ impl CoreLoop {
             watermark_lsn: self.watermark,
             error_code: None,
             read_set_valid: None,
+            write_set: Vec::new(),
         }
     }
 
@@ -72,6 +75,7 @@ impl CoreLoop {
             watermark_lsn: self.watermark,
             error_code: Some(error_code.into()),
             read_set_valid: None,
+            write_set: Vec::new(),
         }
     }
 

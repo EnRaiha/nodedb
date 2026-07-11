@@ -436,6 +436,7 @@ async fn dispatch_single_task(
                 watermark_lsn: Lsn::new(0),
                 error_code: None,
                 read_set_valid: None,
+                write_set: Vec::new(),
             };
             return data_plane_response_to_native(ctx, seq, &plan_for_staged_response, &synthetic);
         }
@@ -558,6 +559,7 @@ fn gateway_payloads_to_response(payloads: Vec<Vec<u8>>) -> Response {
         watermark_lsn: Lsn::new(0),
         error_code: None,
         read_set_valid: None,
+        write_set: Vec::new(),
     }
 }
 

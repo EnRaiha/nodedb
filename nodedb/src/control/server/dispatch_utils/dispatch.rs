@@ -254,6 +254,14 @@ async fn dispatch_to_data_plane_inner(
     );
     let change_meta = extract_write_metadata(&plan, tenant_id);
 
+    // Post-apply redo classification, computed before `plan` is moved into the
+    // `Request`. For a write whose autocommit WAL path mints no redo of its own
+    // but whose effect must survive a WAL-only restart (a document PointUpdate
+    // on a collection carrying a secondary vector index), the durable redo is
+    // minted AFTER apply from the surrogate + post-image the Data Plane returns
+    // in `Response::write_set`. `Some(collection)` for such a write, else `None`.
+    let post_apply = crate::control::server::wal_dispatch::plan_post_apply_redo(&plan);
+
     // Write-admission gate: every write-class plan on this near-universal
     // autocommit / internal funnel passes here. An uncontended point write takes
     // the fast path holding its per-vShard deterministic locks; a contended or
@@ -368,16 +376,27 @@ async fn dispatch_to_data_plane_inner(
         Err(poisoned) => poisoned.into_inner().dispatch(request)?,
     };
 
-    // Release the write-admission guard immediately after the enqueue, before the
-    // Data-Plane round-trip. The per-database WFQ is strict FIFO, so once LSN
+    // Release the write-admission guards immediately after the enqueue, before
+    // the Data-Plane round-trip. The per-database WFQ is strict FIFO, so once LSN
     // order equals enqueue order the apply order follows from the queue alone;
-    // holding the guard across the response await would only serialize same-key
-    // throughput needlessly. (`None` when no lock manager was registered.)
-    drop(admission_guard);
-    // Release the single-node per-key order-lock at the SAME point — held across
-    // exactly [WAL append -> enqueue], never across the response await. (`None`
-    // for Calvin-mode / exempt / unordered writes.)
-    drop(order_guard);
+    // holding the guards across the response await would only serialize same-key
+    // throughput needlessly.
+    //
+    // EXCEPTION — a post-apply-redo write (`post_apply.is_some()`) mints its
+    // durable redo AFTER apply, from the write-set on the response; the guards
+    // MUST stay held across the response collect + that append so two concurrent
+    // same-surrogate writes cannot reorder their redo appends. Both guard types
+    // are `Send`, so holding them across the `.await` is sound. Moved into an
+    // `Option` so the release is a single, unconditional `drop` below regardless
+    // of which path took it. (`None` guard slots when no lock manager was
+    // registered / for the exempt-read / Calvin / unordered cases.)
+    let deferred_guards = if post_apply.is_some() {
+        Some((admission_guard, order_guard))
+    } else {
+        drop(admission_guard);
+        drop(order_guard);
+        None
+    };
 
     // Collect response(s). For non-streaming queries, exactly one arrives.
     // For streaming queries, multiple partial chunks arrive before the final.
@@ -420,6 +439,26 @@ async fn dispatch_to_data_plane_inner(
             });
         }
     };
+
+    // Mint the post-apply redo record while the guards are still held, then
+    // release them. A PointUpdate whose collection carries a secondary vector
+    // index returns its surrogate + post-image in `write_set`; without this
+    // durable `Put` a WAL-only restart rebuilds the HNSW from the pre-update body
+    // and resurrects the old embedding.
+    if let Some(collection) = &post_apply
+        && append_wal
+        && response.status == crate::bridge::envelope::Status::Ok
+    {
+        crate::control::server::wal_dispatch::append_write_set_redo(
+            &shared.wal,
+            tenant_id,
+            vshard_id,
+            database_id,
+            collection,
+            &response.write_set,
+        )?;
+    }
+    drop(deferred_guards);
 
     // Publish change events for successful writes.
     if response.status == crate::bridge::envelope::Status::Ok

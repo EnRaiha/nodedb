@@ -151,6 +151,7 @@ pub async fn run_insert_select(
         watermark_lsn: max_lsn,
         error_code: None,
         read_set_valid: None,
+        write_set: Vec::new(),
     })
 }
 

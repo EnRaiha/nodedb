@@ -78,6 +78,7 @@ impl CoreLoop {
                 watermark_lsn: self.watermark,
                 error_code: Some(ErrorCode::DeadlineExceeded),
                 read_set_valid: None,
+                write_set: Vec::new(),
             }
         } else {
             task.state = TaskState::Running;

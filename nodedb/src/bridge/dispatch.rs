@@ -582,6 +582,7 @@ mod tests {
                     watermark_lsn: Lsn::new(42),
                     error_code: None,
                     read_set_valid: None,
+                    write_set: Vec::new(),
                 },
             })
             .unwrap();
@@ -635,6 +636,7 @@ mod tests {
                     watermark_lsn: Lsn::ZERO,
                     error_code: None,
                     read_set_valid: None,
+                    write_set: Vec::new(),
                 },
             })
             .unwrap();

@@ -9,6 +9,52 @@ use nodedb_physical::physical_plan::DocumentOp;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::manager::WalManager;
 
+/// Encode a document PUT redo record.
+///
+/// Shape: `(collection, document_id, value, Option<SyncProvenance>, surrogate)`.
+/// The trailing `surrogate` carries the row's global identity so startup replay
+/// can rebuild any secondary vector index bound to this document with its real
+/// cross-engine identity. This is an arity-cascade extension of the legacy
+/// `(collection, document_id, value, provenance)` shape that older decoders
+/// still parse, and it is **byte-identical** to what the redo replay decoder
+/// expects (`data::executor::wal_replay_redo_document`). Producer (`PointPut` /
+/// `PointInsert` autocommit) and the post-apply write-set redo helper share this
+/// one encoder so the shape lives in exactly one place.
+pub(crate) fn encode_document_put_record(
+    collection: &str,
+    document_id: &str,
+    value: &[u8],
+    surrogate: u32,
+) -> crate::Result<Vec<u8>> {
+    let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
+    zerompk::to_msgpack_vec(&(collection, document_id, value, prov, surrogate)).map_err(|e| {
+        crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal document put: {e}"),
+        }
+    })
+}
+
+/// Encode a document DELETE redo record.
+///
+/// Shape: `(collection, document_id, Option<SyncProvenance>, surrogate)` — the
+/// four-element redo shape the replay decoder expects (the autocommit
+/// `PointDelete` three-element shape omits the surrogate, which replay needs to
+/// key the redb storage row). Used by the post-apply write-set redo helper.
+pub(crate) fn encode_document_delete_record(
+    collection: &str,
+    document_id: &str,
+    surrogate: u32,
+) -> crate::Result<Vec<u8>> {
+    let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
+    zerompk::to_msgpack_vec(&(collection, document_id, prov, surrogate)).map_err(|e| {
+        crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal document delete: {e}"),
+        }
+    })
+}
+
 /// Append the WAL record for a single `DocumentOp`, returning the allocated
 /// LSN for the point-write variants (`Some`) or `None` for every read / bulk /
 /// DDL variant that carries no durable per-write effect on THIS path.
@@ -31,25 +77,8 @@ pub(super) fn wal_append_document_op(
             surrogate,
             pk_bytes: _,
         } => {
-            // The row's global surrogate is appended as a trailing element so
-            // startup replay can rebuild any secondary vector index bound to
-            // this document with its real cross-engine identity (headless
-            // local ids otherwise leak into vector-search projections after a
-            // restart). Appending keeps the record an arity-cascade extension
-            // of the legacy `(collection, document_id, value, provenance)`
-            // shape, which older decoders still parse.
-            let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
-            let entry = zerompk::to_msgpack_vec(&(
-                collection,
-                document_id,
-                value,
-                prov,
-                surrogate.as_u32(),
-            ))
-            .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal point put: {e}"),
-            })?;
+            let entry =
+                encode_document_put_record(collection, document_id, value, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         DocumentOp::PointInsert {
@@ -59,20 +88,8 @@ pub(super) fn wal_append_document_op(
             if_absent: _,
             surrogate,
         } => {
-            // Trailing surrogate element (see `PointPut` above) — carries the
-            // row's global identity for restart-time vector-index rebuild.
-            let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
-            let entry = zerompk::to_msgpack_vec(&(
-                collection,
-                document_id,
-                value,
-                prov,
-                surrogate.as_u32(),
-            ))
-            .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal point insert: {e}"),
-            })?;
+            let entry =
+                encode_document_put_record(collection, document_id, value, surrogate.as_u32())?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         DocumentOp::PointDelete {

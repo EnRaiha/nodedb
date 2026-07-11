@@ -94,6 +94,7 @@ impl CoreLoop {
             watermark_lsn: self.watermark,
             error_code: None,
             read_set_valid: Some(read_set_current),
+            write_set: Vec::new(),
         }
     }
 
@@ -198,6 +199,7 @@ impl CoreLoop {
                         watermark_lsn: self.watermark,
                         error_code: Some(rollback_error_code),
                         read_set_valid: None,
+                        write_set: Vec::new(),
                     });
                 }
             }
@@ -253,6 +255,7 @@ impl CoreLoop {
                 watermark_lsn: self.watermark,
                 error_code: Some(rollback_error_code),
                 read_set_valid: None,
+                write_set: Vec::new(),
             });
         }
         Ok(undo_log)
@@ -305,6 +308,7 @@ impl CoreLoop {
                                 detail: format!("CRDT delta apply failed: {e}"),
                             }),
                             read_set_valid: None,
+                            write_set: Vec::new(),
                         });
                     }
                 }
@@ -328,6 +332,7 @@ impl CoreLoop {
                             detail: format!("CRDT engine not available: {e}"),
                         }),
                         read_set_valid: None,
+                        write_set: Vec::new(),
                     });
                 }
             }

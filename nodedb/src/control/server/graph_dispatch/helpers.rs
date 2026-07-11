@@ -23,5 +23,6 @@ pub(super) fn ok_response(payload: Vec<u8>) -> Response {
         watermark_lsn: Lsn::ZERO,
         error_code: None,
         read_set_valid: None,
+        write_set: Vec::new(),
     }
 }

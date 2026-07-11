@@ -9,7 +9,7 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::returning_rows;
@@ -348,7 +348,16 @@ impl CoreLoop {
                             Some(&current_bytes),
                         );
 
-                        if let Some(spec) = returning {
+                        // Build the response for both the RETURNING and
+                        // non-RETURNING branches first, then — only when the
+                        // collection carries a secondary vector index — carry the
+                        // surrogate + post-image back in the write-set so the
+                        // Control Plane can mint a post-apply `Put` redo record.
+                        // The autocommit WAL path mints none for a PointUpdate, so
+                        // without this a WAL-only restart rebuilds the HNSW from the
+                        // pre-update body and resurrects the old embedding.
+                        // `updated_bytes` is moved in as its last use.
+                        let mut response = if let Some(spec) = returning {
                             // Build the post-update document with id injected.
                             let with_id = nodedb_query::msgpack_scan::inject_str_field(
                                 &updated_bytes,
@@ -361,19 +370,29 @@ impl CoreLoop {
                             };
                             match returning_rows::build_rows_payload(spec, &[doc]) {
                                 Ok(payload) => self.response_with_payload(task, payload),
-                                Err(e) => self.response_error(
-                                    task,
-                                    ErrorCode::Internal {
-                                        detail: format!("RETURNING encode: {e}"),
-                                    },
-                                ),
+                                Err(e) => {
+                                    return self.response_error(
+                                        task,
+                                        ErrorCode::Internal {
+                                            detail: format!("RETURNING encode: {e}"),
+                                        },
+                                    );
+                                }
                             }
                         } else {
                             let mut payload = Vec::with_capacity(16);
                             nodedb_query::msgpack_scan::write_map_header(&mut payload, 1);
                             nodedb_query::msgpack_scan::write_kv_i64(&mut payload, "affected", 1);
                             self.response_with_payload(task, payload)
+                        };
+                        if has_vectors {
+                            response.write_set = vec![WriteSetEntry {
+                                surrogate: surrogate.as_u32(),
+                                is_delete: false,
+                                value: updated_bytes,
+                            }];
                         }
+                        response
                     }
                     Err(e) => self.response_error(
                         task,

@@ -233,6 +233,25 @@ impl Admission {
     }
 }
 
+/// One row-level effect of an applied write, carried back from the Data Plane
+/// so the Control Plane can mint a durable redo record *after* apply.
+///
+/// Populated only by write handlers whose autocommit path mints no WAL redo of
+/// its own but whose effect must still survive a WAL-only restart — today, a
+/// `PointUpdate` on a document collection carrying a secondary vector (HNSW)
+/// index (see `data::executor::handlers::point::update`). `value` is the
+/// post-image body for a put; empty and ignored when `is_delete`.
+#[derive(Debug, Clone)]
+pub struct WriteSetEntry {
+    /// The row's stable global surrogate.
+    pub surrogate: u32,
+    /// `true` for a delete effect (no body), `false` for a put (post-image in
+    /// `value`).
+    pub is_delete: bool,
+    /// Post-image body for a put; empty for a delete.
+    pub value: Vec<u8>,
+}
+
 /// Response envelope: Data Plane -> Control Plane.
 ///
 /// Every field is mandatory.
@@ -271,6 +290,12 @@ pub struct Response {
     /// transaction it is the LOCAL COMMIT VOTE: the scheduler flushes the staged
     /// buffer to base on `Some(true)` and drops it on `Some(false)`.
     pub read_set_valid: Option<bool>,
+
+    /// Row-level effects the Control Plane must turn into durable redo records
+    /// *after* the Data Plane applied them. Empty for every response that owns
+    /// its durability on the pre-dispatch WAL path (the common case); non-empty
+    /// only for post-apply-redo writes (see [`WriteSetEntry`]).
+    pub write_set: Vec<WriteSetEntry>,
 }
 
 pub use nodedb_physical::physical_plan::PhysicalPlan;
@@ -508,6 +533,7 @@ mod tests {
             watermark_lsn: Lsn::new(42),
             error_code: None,
             read_set_valid: None,
+            write_set: Vec::new(),
         };
         assert_eq!(resp.status, Status::Ok);
         assert_eq!(resp.watermark_lsn, Lsn::new(42));
@@ -525,6 +551,7 @@ mod tests {
             watermark_lsn: Lsn::ZERO,
             error_code: Some(ErrorCode::DeadlineExceeded),
             read_set_valid: None,
+            write_set: Vec::new(),
         };
         assert_eq!(resp.error_code, Some(ErrorCode::DeadlineExceeded));
     }

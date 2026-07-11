@@ -51,6 +51,14 @@ impl NodeDbPgHandler {
             resolved_now_ms,
             append_wal,
         } = args;
+        // Post-apply redo classification, computed before `plan` can be moved
+        // (the RouteToCalvin admit arm moves it). For a write whose autocommit
+        // WAL path mints no redo of its own but whose effect must survive a
+        // WAL-only restart (a document PointUpdate on a collection carrying a
+        // secondary vector index), the durable redo is minted AFTER apply from
+        // the surrogate + post-image the Data Plane returns in
+        // `Response::write_set`. `Some(collection)` for such a write, else `None`.
+        let post_apply = crate::control::server::wal_dispatch::plan_post_apply_redo(&plan);
         // Write-admission gate. This path builds its own `Request` and enqueues
         // directly (it does not flow through the autocommit funnel). The guard is
         // acquired FIRST; for an autocommit write that owns its durability
@@ -150,17 +158,26 @@ impl NodeDbPgHandler {
             Err(poisoned) => poisoned.into_inner().dispatch(request)?,
         };
 
-        // Release the write-admission guard immediately after the enqueue, before
+        // Release the write-admission guards immediately after the enqueue, before
         // the Data-Plane round-trip. The per-database WFQ is strict FIFO, so once
         // LSN order equals enqueue order the apply order follows from the queue
-        // alone; holding the guard across the response await would only serialize
-        // same-key throughput needlessly. (`None` when no lock manager was
-        // registered / for the exempt-read case.)
-        drop(admission_guard);
-        // Release the single-node per-key order-lock at the SAME point — held
-        // across exactly [WAL append -> enqueue], never across the response
-        // await. (`None` for Calvin-mode / exempt / unordered writes.)
-        drop(order_guard);
+        // alone; holding the guards across the response await would only serialize
+        // same-key throughput needlessly.
+        //
+        // EXCEPTION — a post-apply-redo write (`post_apply.is_some()`) mints its
+        // durable redo AFTER apply, from the write-set on the response; the guards
+        // MUST stay held across the response collect + that append so two
+        // concurrent same-surrogate writes cannot reorder their redo appends. Both
+        // guard types are `Send`, so holding them across the `.await` is sound.
+        // Moved into an `Option` so the release is a single, unconditional `drop`
+        // below regardless of which path took it.
+        let deferred_guards = if post_apply.is_some() {
+            Some((admission_guard, order_guard))
+        } else {
+            drop(admission_guard);
+            drop(order_guard);
+            None
+        };
 
         // A scan result wider than `stream_chunk_size` is emitted as several
         // `Partial` frames followed by a terminal frame. Drain and concatenate
@@ -179,7 +196,29 @@ impl NodeDbPgHandler {
         .await
         .map_err(|_| crate::Error::DeadlineExceeded { request_id })?
         {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                // Mint the post-apply redo record while the guards are still
+                // held, then release them. A PointUpdate whose collection carries
+                // a secondary vector index returns its surrogate + post-image in
+                // `write_set`; without this durable `Put` a WAL-only restart
+                // rebuilds the HNSW from the pre-update body and resurrects the
+                // old embedding.
+                if let Some(collection) = &post_apply
+                    && append_wal
+                    && resp.status == crate::bridge::envelope::Status::Ok
+                {
+                    crate::control::server::wal_dispatch::append_write_set_redo(
+                        &self.state.wal,
+                        tenant_id,
+                        vshard_id,
+                        database_id,
+                        collection,
+                        &resp.write_set,
+                    )?;
+                }
+                drop(deferred_guards);
+                Ok(resp)
+            }
             Err(DispatchCollectError::OverBudget { bytes }) => {
                 self.state.tracker.cancel(&request_id);
                 Err(crate::Error::ExecutionLimitExceeded {

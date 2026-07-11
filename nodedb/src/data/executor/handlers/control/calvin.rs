@@ -136,6 +136,7 @@ impl CoreLoop {
             watermark_lsn: self.watermark,
             error_code: None,
             read_set_valid: Some(vote),
+            write_set: Vec::new(),
         }
     }
 

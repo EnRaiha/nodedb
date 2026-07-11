@@ -16,6 +16,7 @@ mod spatial;
 mod text;
 mod timeseries;
 mod vector;
+mod write_set_redo;
 
 pub use core::{WalAppendOutcome, wal_append_if_write, wal_append_if_write_with_creds};
 pub use timeseries::{ColumnarWalAppendArgs, wal_append_columnar, wal_append_timeseries};
@@ -23,6 +24,7 @@ pub use vector::{
     VectorDeleteWalArgs, VectorPutWalArgs, wal_append_vector_delete_by_surrogate,
     wal_append_vector_put,
 };
+pub use write_set_redo::{append_write_set_redo, plan_post_apply_redo};
 
 // Payload encoders shared by the autocommit WAL path and transaction resolve, so
 // each engine's record shape lives in exactly one place.

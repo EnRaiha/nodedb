@@ -21,6 +21,7 @@ pub(super) fn synthetic_ok_response(request_id: RequestId, watermark_lsn: Lsn) -
         watermark_lsn,
         error_code: None,
         read_set_valid: None,
+        write_set: Vec::new(),
     }
 }
 
