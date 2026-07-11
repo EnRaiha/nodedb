@@ -1334,21 +1334,6 @@ fn known_write_gaps_are_not_replicated() {
             }),
         ),
         (
-            "Crdt::SetConstraints",
-            PhysicalPlan::Crdt(CrdtOp::SetConstraints {
-                collection: "docs".into(),
-                constraint_version: 1,
-                constraints: Vec::new(),
-            }),
-        ),
-        (
-            "Crdt::DropConstraints",
-            PhysicalPlan::Crdt(CrdtOp::DropConstraints {
-                collection: "docs".into(),
-                constraint_version: 1,
-            }),
-        ),
-        (
             "Crdt::RestoreToVersion",
             PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
                 collection: "docs".into(),
@@ -1383,6 +1368,63 @@ fn known_write_gaps_are_not_replicated() {
             "{name} is a known replication gap; wiring is a tracked follow-up — \
              this test fails loudly if someone wires it so they update the tracking"
         );
+    }
+}
+
+#[test]
+fn crdt_set_constraints_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    let plan = PhysicalPlan::Crdt(CrdtOp::SetConstraints {
+        collection: "accounts".into(),
+        constraint_version: 7,
+        constraints: vec![vec![1, 2, 3], vec![4, 5]],
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("CrdtOp::SetConstraints should replicate as a ConstraintChange");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::SetConstraints {
+            collection,
+            constraint_version,
+            constraints,
+        }) => {
+            assert_eq!(collection, "accounts");
+            assert_eq!(constraint_version, 7, "version fence must round-trip");
+            assert_eq!(constraints, vec![vec![1, 2, 3], vec![4, 5]]);
+        }
+        other => panic!("expected CrdtOp::SetConstraints, got {other:?}"),
+    }
+}
+
+#[test]
+fn crdt_drop_constraints_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    let plan = PhysicalPlan::Crdt(CrdtOp::DropConstraints {
+        collection: "accounts".into(),
+        constraint_version: 9,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("CrdtOp::DropConstraints should replicate as a ConstraintChange");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Crdt(CrdtOp::DropConstraints {
+            collection,
+            constraint_version,
+        }) => {
+            assert_eq!(collection, "accounts");
+            assert_eq!(constraint_version, 9, "version fence must round-trip");
+        }
+        other => panic!("expected CrdtOp::DropConstraints, got {other:?}"),
     }
 }
 

@@ -2,7 +2,7 @@
 
 //! Encode `PhysicalPlan::Crdt` variants into `ReplicatedWrite`.
 
-use super::super::types::ReplicatedWrite;
+use super::super::types::{ConstraintChangeOp, ReplicatedWrite};
 use nodedb_physical::physical_plan::CrdtOp;
 
 /// Encode a `CrdtOp` write variant into its `ReplicatedWrite` wire shape.
@@ -11,12 +11,18 @@ use nodedb_physical::physical_plan::CrdtOp;
 /// explicit decision here instead of silently falling through, mirroring
 /// `vector::encode`'s exhaustiveness guarantee.
 ///
+/// `SetConstraints` / `DropConstraints` encode to `ReplicatedWrite::
+/// ConstraintChange` so a constraint change installs on every follower's CRDT
+/// validator immediately on the write, closing the window in which the leader
+/// enforces a constraint its followers do not. The `constraint_reconcile`
+/// bootstrap path stays the catch-up safety net for a lagging/new replica;
+/// both are fenced idempotent by the monotonic `constraint_version`.
+///
 /// Returns `None` for the read-only / DDL-observability variants (`Read`,
 /// `ReadConstraints`, `SetPolicy`, `GetPolicy`, `ReadAtVersion`,
 /// `GetVersionVector`, `ExportDelta`, `CompactAtVersion`) and for
-/// `SetConstraints` / `DropConstraints` / `RestoreToVersion`, which are
-/// still buffered-but-unencoded (see `plan_requires_txn_buffering`'s module
-/// doc) — a separate, undone encoder-omission unit not addressed here.
+/// `RestoreToVersion`, still buffered-but-unencoded (a separate, undone
+/// encoder-omission unit not addressed here).
 pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
     Some(match op {
         CrdtOp::Apply {
@@ -64,6 +70,15 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             to_index,
             surrogate: _,
         } => list_move(collection, document_id, list_path, *from_index, *to_index),
+        CrdtOp::SetConstraints {
+            collection,
+            constraint_version,
+            constraints,
+        } => set_constraints(collection, *constraint_version, constraints),
+        CrdtOp::DropConstraints {
+            collection,
+            constraint_version,
+        } => drop_constraints(collection, *constraint_version),
         CrdtOp::Read { .. }
         | CrdtOp::ReadConstraints { .. }
         | CrdtOp::SetPolicy { .. }
@@ -72,10 +87,34 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
         | CrdtOp::GetVersionVector { .. }
         | CrdtOp::ExportDelta { .. }
         | CrdtOp::CompactAtVersion { .. }
-        | CrdtOp::SetConstraints { .. }
-        | CrdtOp::DropConstraints { .. }
         | CrdtOp::RestoreToVersion { .. } => return None,
     })
+}
+
+/// Encode `SetConstraints` as a `ConstraintChange` install. The full constraint
+/// blob set is carried verbatim; the apply path fences on `constraint_version`.
+pub(super) fn set_constraints(
+    collection: &str,
+    constraint_version: u64,
+    constraints: &[Vec<u8>],
+) -> ReplicatedWrite {
+    ReplicatedWrite::ConstraintChange {
+        collection: collection.to_owned(),
+        op: ConstraintChangeOp::Set,
+        constraint_version,
+        constraints: constraints.to_vec(),
+    }
+}
+
+/// Encode `DropConstraints` as a `ConstraintChange` removal — no blobs, fenced
+/// by `constraint_version` exactly as the install is.
+pub(super) fn drop_constraints(collection: &str, constraint_version: u64) -> ReplicatedWrite {
+    ReplicatedWrite::ConstraintChange {
+        collection: collection.to_owned(),
+        op: ConstraintChangeOp::Drop,
+        constraint_version,
+        constraints: Vec::new(),
+    }
 }
 
 pub(super) fn apply(
