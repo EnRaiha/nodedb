@@ -148,17 +148,26 @@ impl NodeDbPgHandler {
         // write (if any). `tasks` is cloned into the recon call so the original
         // list survives to shape the per-task responses afterwards: a RETURNING
         // task emits its rows, every other task its command tag.
-        let outcome =
-            dispatch_dependent_edge_recon(&self.state, tasks.clone(), tenant_id, database_id)
-                .await
-                .map_err(|e| {
-                    let (severity, code, message) = error_to_sqlstate(&e);
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        severity.to_owned(),
-                        code.to_owned(),
-                        message,
-                    )))
-                })?;
+        // Normal multi-shard OLLP dispatch (NOT the contended single-shard
+        // route from `route_write_to_calvin`), so it stays on the strict
+        // multi-vshard dependent `TxClass` builder (`allow_single_vshard:
+        // false`).
+        let outcome = dispatch_dependent_edge_recon(
+            &self.state,
+            tasks.clone(),
+            tenant_id,
+            database_id,
+            false,
+        )
+        .await
+        .map_err(|e| {
+            let (severity, code, message) = error_to_sqlstate(&e);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            )))
+        })?;
 
         let mut calvin_responses: Vec<Response> = Vec::with_capacity(tasks.len());
         for task in &tasks {

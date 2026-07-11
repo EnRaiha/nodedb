@@ -23,8 +23,9 @@ use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::planner::calvin::preexec::{PreexecScan, run_preexec_scan};
 use crate::control::planner::calvin::tx_class::collection_name_from_plan;
 use crate::control::planner::calvin::{
-    DependentRetryArgs, build_dependent_tx_class, is_dependent_predicate,
-    predicate_class_for_filters, run_dependent_with_retry, submit_calvin_routed_assign,
+    DependentRetryArgs, build_dependent_tx_class, build_single_vshard_dependent_tx_class,
+    is_dependent_predicate, predicate_class_for_filters, run_dependent_with_retry,
+    submit_calvin_routed_assign,
 };
 use crate::control::planner::implicit_edges::{
     EdgeFieldOverrides, EdgeUpdateCtx, append_implicit_edge_delete_tasks,
@@ -235,11 +236,24 @@ pub fn plan_needs_implicit_edge_recon(
 ///
 /// `database_id` is supplied by the caller (it comes from the detection gate,
 /// [`plan_needs_implicit_edge_recon`]) so it does not have to be re-derived.
+///
+/// `allow_single_vshard` selects the participant floor of the `TxClass` this
+/// builds: `false` (the normal multi-shard OLLP callers — the pgwire and
+/// native predicate-dispatch gates) uses the strict
+/// [`build_dependent_tx_class`], which rejects a write set that collapses to
+/// one vshard. `true` is the explicit opt-in used ONLY by the contended
+/// single-collection predicate-write routing path
+/// (`route_write_to_calvin`'s dependent-predicate branch, reached when the
+/// write-admission gate returns `RouteToCalvin`): it uses
+/// [`build_single_vshard_dependent_tx_class`] so a single-collection
+/// `BulkUpdate`/`BulkDelete` that legitimately resolves to one vshard
+/// sequences through the scheduler instead of being rejected.
 pub async fn dispatch_dependent_edge_recon(
     state: &SharedState,
     tasks: Vec<PhysicalTask>,
     tenant_id: TenantId,
     database_id: DatabaseId,
+    allow_single_vshard: bool,
 ) -> crate::Result<DependentReconOutcome> {
     let orchestrator = state.ollp_orchestrator.get();
     let registry = state
@@ -414,14 +428,24 @@ pub async fn dispatch_dependent_edge_recon(
                     // invoked more than once, so the edge tasks must survive
                     // a rebuild.
                     modified_tasks.extend(edge_tasks.iter().cloned());
-                    build_dependent_tx_class(
-                        &modified_tasks,
-                        tenant_id,
-                        dep_collection,
-                        &surrogates,
-                        &[],
-                    )
-                    .map_err(|_| {
+                    let built = if allow_single_vshard {
+                        build_single_vshard_dependent_tx_class(
+                            &modified_tasks,
+                            tenant_id,
+                            dep_collection,
+                            &surrogates,
+                            &[],
+                        )
+                    } else {
+                        build_dependent_tx_class(
+                            &modified_tasks,
+                            tenant_id,
+                            dep_collection,
+                            &surrogates,
+                            &[],
+                        )
+                    };
+                    built.map_err(|_| {
                         nodedb_cluster::error::CalvinError::Sequencer(SequencerError::Unavailable)
                     })
                 },

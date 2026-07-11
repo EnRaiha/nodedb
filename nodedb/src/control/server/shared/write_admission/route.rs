@@ -14,10 +14,14 @@
 //!   multi-vshard builder. The scheduler acquires its key on the SAME lock
 //!   table the gate probed, queues FIFO behind the holder, and applies it once
 //!   released.
-//! - A **predicate write** (`BulkUpdate` / `BulkDelete`): its write set is not
-//!   statically known, so it goes through [`dispatch_dependent_edge_recon`],
-//!   which runs the pre-exec reconnaissance scan to discover the affected
-//!   surrogates and commits the dependent Calvin transaction.
+//! - A **predicate write** (`BulkUpdate` / `BulkDelete` on a SINGLE
+//!   collection): its write set is not statically known, so it goes through
+//!   [`dispatch_dependent_edge_recon`] with the single-vshard opt-in, which
+//!   runs the pre-exec reconnaissance scan to discover the affected
+//!   surrogates and commits the dependent Calvin transaction. A single
+//!   collection resolves to one vshard, so — exactly like the point-write
+//!   case above — the strict multi-vshard dependent builder would reject it;
+//!   the opt-in lets it sequence through the scheduler instead.
 //!
 //! Either way the applied [`Response`] (carrying any RETURNING rows) is returned
 //! so the caller surfaces it in place of a fast dispatch.
@@ -86,9 +90,17 @@ pub fn route_write_to_calvin<'a>(
 
         // Predicate writes have no statically-known write set: discover it via the
         // dependent reconnaissance path, which builds a valid dependent TxClass.
+        //
+        // This write reaches here ONLY because `admit` returned `RouteToCalvin`:
+        // a pending commit already holds a key in the predicate's range. A
+        // single-collection predicate targets a single vshard, so the recon
+        // dispatch must opt in to the single-vshard-allowed dependent builder
+        // (`allow_single_vshard: true`) — otherwise the strict multi-vshard
+        // floor rejects the legitimately single-vshard write.
         if is_dependent_predicate(&task.plan) {
             let recon =
-                dispatch_dependent_edge_recon(shared, vec![task], tenant_id, database_id).await?;
+                dispatch_dependent_edge_recon(shared, vec![task], tenant_id, database_id, true)
+                    .await?;
             return Ok(recon.apply_result);
         }
 

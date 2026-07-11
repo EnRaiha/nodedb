@@ -80,9 +80,12 @@ pub(super) async fn try_edge_recon_dispatch(
         })
         .map(|t| t.plan.clone());
 
-    // All three guards passed — run the OLLP/Calvin coordinator.
+    // All three guards passed — run the OLLP/Calvin coordinator. This is the
+    // normal multi-shard OLLP path (NOT the contended single-shard route from
+    // `route_write_to_calvin`), so it stays on the strict multi-vshard
+    // dependent `TxClass` builder (`allow_single_vshard: false`).
     let outcome =
-        dispatch_dependent_edge_recon(ctx.state, tasks, ctx.tenant_id(), database_id).await;
+        dispatch_dependent_edge_recon(ctx.state, tasks, ctx.tenant_id(), database_id, false).await;
 
     EdgeReconResult::Outcome(match outcome {
         Ok(recon) => {

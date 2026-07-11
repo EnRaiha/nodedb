@@ -1,59 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `TxClass` construction for Calvin dispatch.
-//!
-//! Builds the replicated transaction descriptor (`TxClass`) from a physical
-//! task slice: the per-engine write set (`EngineKeySet` — document / vector
-//! surrogates, KV raw keys, graph-edge identity + routing homes) plus the
-//! msgpack-encoded plans. Two builders:
-//!
-//! - [`build_static_tx_class`] — every write key is known upfront.
-//! - [`build_dependent_tx_class`] — the OLLP collection's write set comes from
-//!   reconnaissance-predicted surrogates; all other tasks use static extraction.
+//! `TxClass` construction for a static write task slice (every write key
+//! known upfront).
 
 use crate::Error;
 use crate::control::planner::calvin::dispatch::is_write_plan;
-use crate::control::server::shared::session::read_set::{ReadKey, ReadSetEntry};
+use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::types::VShardId;
-use nodedb_cluster::calvin::types::{
-    EngineKeySet, ReadKeyIdent, ReadWriteSet, SortedVec, TxClass, VersionedReadEntry,
-    VersionedReadSet,
-};
-use nodedb_physical::physical_plan::{
-    DocumentOp, GraphOp, KvOp, PhysicalPlan, TimeseriesOp, VectorOp,
-};
+use nodedb_cluster::calvin::types::{EngineKeySet, ReadWriteSet, SortedVec, TxClass};
+use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::TenantId;
 
-/// Map the neutral session read-set into the replicated, LSN-versioned
-/// [`VersionedReadSet`] carried on the `TxClass`.
-///
-/// Each [`ReadSetEntry`] becomes one [`VersionedReadEntry`], preserving the
-/// engine, collection, per-shard `read_lsn`, and the point/predicate
-/// distinction. The entry's `(database_id, tenant_id)` scope is not re-carried
-/// per entry: the enclosing `TxClass` already scopes the tenant.
-///
-/// Own-overlay (read-your-own-write) exclusion is a capture-time concern (a
-/// read satisfied by the txn's own staged writes is never recorded, and a
-/// mixed committed-base + staged read records only the committed portion) — it
-/// cannot be reconstructed here from key identity alone, so this mapping is a
-/// faithful 1:1 projection of whatever the session captured.
-fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
-    VersionedReadSet::new(
-        reads
-            .iter()
-            .map(|entry| VersionedReadEntry {
-                engine: entry.engine,
-                collection: entry.collection.clone(),
-                key: match &entry.key {
-                    ReadKey::Point { repr } => ReadKeyIdent::Point(repr.clone()),
-                    ReadKey::Predicate => ReadKeyIdent::Predicate,
-                },
-                read_lsn: entry.read_lsn,
-            })
-            .collect(),
-    )
-}
+use super::shared::{
+    collection_name_from_plan, kv_write_keys, surrogate_from_plan, vector_write_surrogates,
+    versioned_reads_from,
+};
 
 /// Build a **multi-vshard** `TxClass` from a static write task slice.
 ///
@@ -262,241 +224,18 @@ fn build_static_tx_class_impl(
     })
 }
 
-/// Extract `(collection, raw byte keys)` from a KV write plan, or `None` for a
-/// KV op with no statically-known point keys (e.g. `BatchPut`).
-fn kv_write_keys(op: &KvOp) -> Option<(String, Vec<Vec<u8>>)> {
-    match op {
-        KvOp::Put {
-            collection, key, ..
-        }
-        | KvOp::Insert {
-            collection, key, ..
-        }
-        | KvOp::InsertIfAbsent {
-            collection, key, ..
-        }
-        | KvOp::InsertOnConflictUpdate {
-            collection, key, ..
-        } => Some((collection.clone(), vec![key.clone()])),
-        KvOp::Delete { collection, keys } => Some((collection.clone(), keys.clone())),
-        _ => None,
-    }
-}
-
-/// Extract `(collection, surrogates)` from a Vector write plan, or `None` for a
-/// Vector op with no statically-known surrogate identity (e.g. node-id delete).
-fn vector_write_surrogates(op: &VectorOp) -> Option<(String, Vec<u32>)> {
-    match op {
-        VectorOp::Insert {
-            collection,
-            surrogate,
-            ..
-        }
-        | VectorOp::DeleteBySurrogate {
-            collection,
-            surrogate,
-            ..
-        } => Some((collection.clone(), vec![surrogate.as_u32()])),
-        VectorOp::BatchInsert {
-            collection,
-            surrogates,
-            ..
-        } => Some((
-            collection.clone(),
-            surrogates.iter().map(|s| s.as_u32()).collect(),
-        )),
-        _ => None,
-    }
-}
-
-/// Build a `TxClass` for a dependent-read (OLLP) transaction.
-///
-/// For `BulkUpdate`/`BulkDelete` plans that have `ollp_predicted_surrogates`
-/// set, the OLLP collection's write set is built from `predicted_surrogates`.
-/// All other tasks in the batch are included using static surrogate extraction,
-/// exactly as `build_static_tx_class` does. This ensures multi-shard Calvin
-/// txns that contain an OLLP bulk operation alongside static-key writes still
-/// produce a valid multi-vshard `TxClass`.
-///
-/// `reads` is the neutral session read-set, projected onto the `TxClass`'s
-/// LSN-versioned `versioned_reads` field; autocommit paths pass an empty slice.
-///
-/// Returns `Err` if encoding fails or the resulting TxClass is invalid.
-pub fn build_dependent_tx_class(
-    tasks: &[PhysicalTask],
-    tenant_id: TenantId,
-    collection: &str,
-    predicted_surrogates: &[u32],
-    reads: &[ReadSetEntry],
-) -> crate::Result<TxClass> {
-    use std::collections::BTreeMap;
-
-    // Accumulate per-collection surrogate sets. The OLLP collection uses the
-    // predicted surrogates; all other tasks use static key extraction.
-    let mut doc_surrogates: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-    // Graph edges (appended implicit-edge deletes) route by from_key(src)/
-    // from_key(dst), NOT by collection — mirror `build_static_tx_class`'s edge
-    // handling so an `EdgeDelete` appended to a dependent txn is classified as
-    // an `EngineKeySet::Edge` (and dual-homed/locked) rather than misrouted as a
-    // document write via `surrogate_from_plan`.
-    let mut edge_pairs: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
-    let mut edge_homes: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-
-    // Seed with the OLLP collection's predicted surrogates.
-    doc_surrogates
-        .entry(collection.to_owned())
-        .or_default()
-        .extend_from_slice(predicted_surrogates);
-
-    // Add static surrogates for all non-OLLP tasks.
-    for task in tasks {
-        // Edges first: collect surrogate-pair identity + from_key routing homes,
-        // then skip the doc-surrogate path. EdgePut/EdgeDelete share identity
-        // fields so both produce an `EngineKeySet::Edge`.
-        if let PhysicalPlan::Graph(
-            GraphOp::EdgePut {
-                collection: edge_coll,
-                src_id,
-                dst_id,
-                src_surrogate,
-                dst_surrogate,
-                ..
-            }
-            | GraphOp::EdgeDelete {
-                collection: edge_coll,
-                src_id,
-                dst_id,
-                src_surrogate,
-                dst_surrogate,
-                ..
-            },
-        ) = &task.plan
-        {
-            edge_pairs
-                .entry(edge_coll.clone())
-                .or_default()
-                .push((src_surrogate.as_u32(), dst_surrogate.as_u32()));
-            let homes = edge_homes.entry(edge_coll.clone()).or_default();
-            homes.push(VShardId::from_key(src_id.as_bytes()).as_u32());
-            homes.push(VShardId::from_key(dst_id.as_bytes()).as_u32());
-            continue;
-        }
-
-        let coll = collection_name_from_plan(&task.plan);
-        if coll.is_empty() || coll == collection {
-            continue;
-        }
-        let surrogate = surrogate_from_plan(&task.plan);
-        doc_surrogates.entry(coll).or_default().push(surrogate);
-    }
-
-    let mut write_sets: Vec<EngineKeySet> = doc_surrogates
-        .into_iter()
-        .map(|(coll, surrogates)| EngineKeySet::Document {
-            collection: coll,
-            surrogates: SortedVec::new(surrogates),
-        })
-        .collect();
-    // Emit one Edge keyset per edge collection, with the SAME missing-homes-is-
-    // hard-error guard `build_static_tx_class` uses: `edge_pairs` and
-    // `edge_homes` are populated in lockstep, so a missing homes entry is an
-    // invariant violation, not an empty-participant write.
-    for (edge_coll, pairs) in edge_pairs {
-        let homes = edge_homes.remove(&edge_coll).ok_or_else(|| Error::Internal {
-            detail: format!(
-                "build_dependent_tx_class invariant violated: no edge_homes for collection {edge_coll}"
-            ),
-        })?;
-        write_sets.push(EngineKeySet::Edge {
-            collection: edge_coll,
-            edges: SortedVec::new(pairs),
-            home_vshards: SortedVec::new(homes),
-        });
-    }
-    write_sets.sort_by(|a, b| a.collection().cmp(b.collection()));
-
-    let write_set = ReadWriteSet::new(write_sets);
-    let read_set = ReadWriteSet::new(vec![]);
-
-    let plans: Vec<&PhysicalPlan> = tasks.iter().map(|t| &t.plan).collect();
-    let plans_bytes = zerompk::to_msgpack_vec(&plans).map_err(|e| Error::Serialization {
-        format: "msgpack".to_owned(),
-        detail: format!("failed to encode PhysicalPlan vec for Calvin dependent TxClass: {e}"),
-    })?;
-
-    let versioned_reads = versioned_reads_from(reads);
-
-    TxClass::new(
-        read_set,
-        write_set,
-        plans_bytes,
-        tenant_id,
-        None,
-        versioned_reads,
-    )
-    .map_err(|e| Error::BadRequest {
-        detail: format!("invalid dependent TxClass: {e}"),
-    })
-}
-
-/// Extract the collection name from a write plan.
-pub(crate) fn collection_name_from_plan(plan: &PhysicalPlan) -> String {
-    match plan {
-        PhysicalPlan::Document(
-            DocumentOp::PointPut { collection, .. }
-            | DocumentOp::PointInsert { collection, .. }
-            | DocumentOp::PointDelete { collection, .. }
-            | DocumentOp::PointUpdate { collection, .. }
-            | DocumentOp::BatchInsert { collection, .. }
-            | DocumentOp::Upsert { collection, .. }
-            | DocumentOp::BulkUpdate { collection, .. }
-            | DocumentOp::BulkDelete { collection, .. },
-        ) => collection.clone(),
-        PhysicalPlan::Kv(
-            KvOp::Put { collection, .. }
-            | KvOp::Insert { collection, .. }
-            | KvOp::InsertIfAbsent { collection, .. }
-            | KvOp::InsertOnConflictUpdate { collection, .. }
-            | KvOp::Delete { collection, .. }
-            | KvOp::BatchPut { collection, .. },
-        ) => collection.clone(),
-        PhysicalPlan::Vector(
-            VectorOp::Insert { collection, .. }
-            | VectorOp::BatchInsert { collection, .. }
-            | VectorOp::Delete { collection, .. }
-            | VectorOp::DeleteBySurrogate { collection, .. },
-        ) => collection.clone(),
-        PhysicalPlan::Graph(
-            GraphOp::EdgePut { collection, .. } | GraphOp::EdgeDelete { collection, .. },
-        ) => collection.clone(),
-        PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. }) => collection.clone(),
-        _ => String::new(),
-    }
-}
-
-/// Extract a surrogate from a write plan (returns 0 when unavailable).
-fn surrogate_from_plan(plan: &PhysicalPlan) -> u32 {
-    match plan {
-        PhysicalPlan::Document(
-            DocumentOp::PointPut { surrogate, .. }
-            | DocumentOp::PointInsert { surrogate, .. }
-            | DocumentOp::PointDelete { surrogate, .. }
-            | DocumentOp::PointUpdate { surrogate, .. },
-        ) => surrogate.as_u32(),
-        _ => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::server::shared::session::read_set::EngineTag;
+    use crate::control::server::shared::session::read_set::{EngineTag, ReadKey};
     use crate::types::{DatabaseId, KeyRepr, Lsn};
+    use nodedb_cluster::calvin::types::ReadKeyIdent;
+    use nodedb_physical::physical_plan::DocumentOp;
     use nodedb_types::Surrogate;
 
     /// Find two collection names whose default-database vShards differ, so the
     /// built `TxClass` spans ≥2 vShards (required by `TxClass::new`).
-    fn two_distinct_collections() -> (String, String) {
+    pub(super) fn two_distinct_collections() -> (String, String) {
         let mut first: Option<(String, u32)> = None;
         for i in 0u32..1024 {
             let name = format!("coll_{i}");
@@ -510,7 +249,7 @@ mod tests {
         panic!("could not find two distinct-vShard collections in 1024 tries");
     }
 
-    fn point_insert_task(collection: &str, surrogate: u32) -> PhysicalTask {
+    pub(super) fn point_insert_task(collection: &str, surrogate: u32) -> PhysicalTask {
         PhysicalTask {
             tenant_id: TenantId::new(1),
             vshard_id: VShardId::new(0),

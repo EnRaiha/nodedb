@@ -29,5 +29,8 @@ pub use submit::{
     RoutedAssignment, submit_and_await_calvin, submit_and_await_calvin_with_timeout,
     submit_calvin_routed, submit_calvin_routed_assign,
 };
-pub use tx_class::{build_dependent_tx_class, build_single_vshard_tx_class, build_static_tx_class};
+pub use tx_class::{
+    build_dependent_tx_class, build_single_vshard_dependent_tx_class, build_single_vshard_tx_class,
+    build_static_tx_class,
+};
 pub use types::{DispatchClass, DispatchOutcome};
