@@ -361,6 +361,12 @@ pub struct SharedState {
     pub scheduler_config: crate::config::server::SchedulerConfig,
     /// On-disk data directory for host-side appliers (CA-trust, audit segments, etc.).
     pub data_dir: std::path::PathBuf,
+    /// Test-only drop guard: owns the auto-cleaning temp directory the test
+    /// constructor roots its CDC-offset / job-history / MV-persistence stores
+    /// under, so those directories are removed when the state drops instead of
+    /// leaking thousands of `/tmp/nodedb-test-*` dirs across a test session.
+    /// `None` in production (those stores live under real on-disk paths).
+    pub _test_state_dir: Option<tempfile::TempDir>,
     /// Schema version counter — bumped on CREATE/DROP/ALTER DDL.
     pub schema_version: crate::control::server::shared::session::plan_cache::SchemaVersion,
     /// In-memory sequence registry (nextval/currval/setval).

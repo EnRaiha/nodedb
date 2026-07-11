@@ -84,6 +84,12 @@ impl SharedState {
         // StartupSequencer after calling `SharedState::open`.
         let startup_gate = crate::control::startup::StartupGate::pre_fired();
         let test_id = Self::unique_test_id();
+        // One auto-cleaning temp directory that roots the test constructor's
+        // on-disk stores (CDC offsets, job history, MV persistence). Held in the
+        // `_test_state_dir` field below so it — and every store under it — is
+        // removed when the state drops, instead of leaking `/tmp/nodedb-test-*`.
+        let test_state_dir =
+            tempfile::tempdir().expect("failed to create test state temp directory");
         let test_credentials = Arc::new(CredentialStore::new()?);
         let test_surrogate_registry: crate::control::surrogate::SurrogateRegistryHandle = Arc::new(
             std::sync::RwLock::new(crate::control::surrogate::SurrogateRegistry::new()),
@@ -253,10 +259,7 @@ impl SharedState {
             ))),
             group_registry: crate::event::cdc::GroupRegistry::new(),
             offset_store: {
-                let dir = std::env::temp_dir().join(format!(
-                    "nodedb-test-offsets-{}-{test_id}",
-                    std::process::id(),
-                ));
+                let dir = test_state_dir.path().join("offsets");
                 Arc::new(
                     crate::event::cdc::OffsetStore::open(&dir)
                         .expect("failed to open test offset store"),
@@ -274,10 +277,7 @@ impl SharedState {
             synonym_registry: Arc::new(crate::control::synonym::SynonymRegistry::new()),
             custom_type_registry: Arc::new(crate::control::custom_type::CustomTypeRegistry::new()),
             job_history: {
-                let dir = std::env::temp_dir().join(format!(
-                    "nodedb-test-history-{}-{test_id}",
-                    std::process::id(),
-                ));
+                let dir = test_state_dir.path().join("history");
                 Arc::new(
                     crate::event::scheduler::JobHistoryStore::open(&dir)
                         .expect("failed to open test job history"),
@@ -300,15 +300,15 @@ impl SharedState {
             crdt_sync_delivery: Arc::new(crate::event::crdt_sync::CrdtSyncDelivery::new()),
             delta_packager: Arc::new(crate::event::crdt_sync::DeltaPackager::new()),
             mv_persistence: {
-                let dir = std::env::temp_dir().join(format!(
-                    "nodedb-test-mvstate-{}-{test_id}",
-                    std::process::id(),
-                ));
+                let dir = test_state_dir.path().join("mvstate");
                 Arc::new(
                     crate::event::streaming_mv::MvPersistence::open(&dir)
                         .expect("failed to open test MV persistence"),
                 )
             },
+            // Owns the temp dir the three stores above live under; dropping the
+            // state removes it (and them) instead of leaking under `/tmp`.
+            _test_state_dir: Some(test_state_dir),
             connections_rejected: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             raft_propose_leader_change_retries: AtomicU64::new(0),
