@@ -166,6 +166,20 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             .unwrap_or_else(|p| p.into_inner())
             .insert(vshard_id, Arc::clone(&lock_manager));
 
+        // Promotion channel: when a Control-Plane fast-path write-admission guard
+        // drops and `release` promotes a waiter this scheduler enqueued behind the
+        // fast-path key, the guard forwards the promoted `TxnId`s over this
+        // unbounded sender. Register the sender for the SAME vShard so the gate can
+        // find it, and hand the receiver to the scheduler's run loop. Unbounded is
+        // safe: promotions are bounded by in-flight txns and the send runs from a
+        // synchronous `Drop` that must not block.
+        let (promotion_tx, promotion_rx) = tokio::sync::mpsc::unbounded_channel();
+        shared
+            .calvin_promotion_senders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(vshard_id, promotion_tx);
+
         let scheduler = Scheduler::new(SchedulerParams {
             vshard_id,
             receiver: sequenced_rx,
@@ -178,6 +192,7 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             metrics: SchedulerMetrics::new(),
             read_result_rx,
             lock_manager,
+            promotion_rx,
         });
         let shutdown = shared.shutdown.subscribe();
         tokio::spawn(async move {

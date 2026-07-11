@@ -126,12 +126,10 @@ pub struct SharedState {
     pub raft_proposer: OnceLock<Arc<crate::control::wal_replication::RaftProposer>>,
     /// Async Raft propose with transparent leader forwarding (for array sync inbound handlers).
     pub async_raft_proposer: OnceLock<Arc<crate::control::wal_replication::AsyncRaftProposer>>,
-    /// Raft log-compaction trigger. Set by `start_raft`; absent in
-    /// single-node mode. Invoked by `run_apply_loop` after a committed
-    /// entry has been durably applied to the Data Plane, so compaction is
-    /// gated on the data-plane applied watermark — never raft's commit
-    /// index. A no-op when the group's `log_compaction_threshold` is
-    /// `None`.
+    /// Raft log-compaction trigger. Set by `start_raft`; absent in single-node
+    /// mode. Invoked by `run_apply_loop` after a committed entry has been
+    /// durably applied to the Data Plane (gated on the applied watermark, not
+    /// raft's commit index). No-op when `log_compaction_threshold` is `None`.
     pub raft_compactor: OnceLock<Arc<crate::control::wal_replication::RaftCompactor>>,
     /// Query Raft group statuses for observability (unset in single-node mode).
     pub raft_status_fn:
@@ -193,12 +191,10 @@ pub struct SharedState {
     /// Cross-shard merger registry for HLC-ordered multi-shard delivery.
     pub array_merger_registry: std::sync::Arc<crate::control::array_sync::MergerRegistry>,
     /// Registry of active cross-cluster observer links for mirror databases.
-    ///
-    /// Each mirror database that is actively following a source cluster has
-    /// one entry here. The registry is consulted by `ALTER DATABASE PROMOTE`
-    /// to tear down the source link before the catalog mutation lands. Entries
-    /// are added when a mirror is created or resumes after a restart and
-    /// removed on promotion or `DROP DATABASE`.
+    /// One entry per mirror actively following a source cluster; consulted by
+    /// `ALTER DATABASE PROMOTE` to tear down the source link before the catalog
+    /// mutation lands. Added on mirror creation/restart-resume, removed on
+    /// promotion or `DROP DATABASE`.
     pub mirror_link_registry: Arc<crate::control::mirror::MirrorLinkRegistry>,
     /// Database-id allocator. Threadsafe via internal atomics.
     /// Authoritative allocation is proposed through Raft metadata group 0;
@@ -278,10 +274,9 @@ pub struct SharedState {
     pub request_id_counter: AtomicU64,
     /// Per-node monotonic distributed-shuffle ID allocator. Starts at 1 (0 is
     /// a sentinel). Each coordinator-driven shuffle join (`ExchangeMode::Shuffle`)
-    /// allocates one `shuffle_id` here; it scopes the producer fan-out inboxes
-    /// and the consumer barriers on every part-owner node. Kept distinct from
-    /// `request_id_counter` so the shuffle keyspace never collides with the
-    /// SPSC request keyspace.
+    /// allocates one `shuffle_id` here, scoping producer fan-out inboxes and
+    /// consumer barriers on every part-owner node. Kept distinct from
+    /// `request_id_counter` so the shuffle keyspace never collides with SPSC.
     pub shuffle_id_counter: AtomicU64,
     /// System-wide metrics (Prometheus format).
     pub system_metrics: Option<Arc<crate::control::metrics::SystemMetrics>>,
@@ -289,21 +284,17 @@ pub struct SharedState {
     pub database_metrics: Arc<crate::control::metrics::DatabaseMetricsRegistry>,
     /// Global per-cluster quota ceiling enforced when database quotas are
     /// written. Populated at startup from `[server]` config (`memory_limit`,
-    /// `max_connections`); a zero on any dimension means "no ceiling for that
-    /// dimension". Read by `ALTER DATABASE … SET QUOTA` to validate that the
-    /// sum of all configured database quotas stays within the cluster's
-    /// physical resources. Wrapped in `RwLock` so a future `ALTER SYSTEM` path
-    /// can mutate it without restarting.
+    /// `max_connections`); zero on a dimension means no ceiling there. Read by
+    /// `ALTER DATABASE … SET QUOTA` to validate configured quotas stay within
+    /// cluster resources. `RwLock`-wrapped for a future `ALTER SYSTEM` mutator.
     pub quota_ceiling: Arc<RwLock<crate::control::security::catalog::GlobalQuotaCeiling>>,
     /// Live retention settings. RwLock-wrapped for runtime ALTER SYSTEM mutation.
     pub retention_settings: Arc<std::sync::RwLock<crate::config::server::RetentionSettings>>,
     /// Memory governor for per-engine budget enforcement.
     pub governor: Option<Arc<nodedb_mem::MemoryGovernor>>,
-    /// Per-database maintenance CPU budget tracker.
-    ///
-    /// Shared with every Data Plane `CoreLoop` so all maintenance tasks
-    /// on all cores draw from the same per-database window. Populated with
-    /// caps from `ALTER DATABASE … SET QUOTA (maintenance_cpu_pct = N)`.
+    /// Per-database maintenance CPU budget tracker. Shared with every Data
+    /// Plane `CoreLoop` so all cores draw from the same per-database window.
+    /// Populated from `ALTER DATABASE … SET QUOTA (maintenance_cpu_pct = N)`.
     pub maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
     /// Durable producer registry for Lite client fencing.  `None` when the
     /// system catalog is unavailable (in-memory / test configurations).
@@ -363,9 +354,8 @@ pub struct SharedState {
     pub data_dir: std::path::PathBuf,
     /// Test-only drop guard: owns the auto-cleaning temp directory the test
     /// constructor roots its CDC-offset / job-history / MV-persistence stores
-    /// under, so those directories are removed when the state drops instead of
-    /// leaking thousands of `/tmp/nodedb-test-*` dirs across a test session.
-    /// `None` in production (those stores live under real on-disk paths).
+    /// under, so they're removed on drop instead of leaking `/tmp/nodedb-test-*`
+    /// dirs across a test session. `None` in production.
     pub _test_state_dir: Option<tempfile::TempDir>,
     /// Schema version counter — bumped on CREATE/DROP/ALTER DDL.
     pub schema_version: crate::control::server::shared::session::plan_cache::SchemaVersion,
@@ -379,8 +369,8 @@ pub struct SharedState {
     /// Last globally-applied Calvin epoch, advanced by the per-vShard
     /// deterministic schedulers as they apply epochs. Read at `BEGIN` to anchor
     /// a session's cross-shard snapshot version (`tx_snapshot_epoch`). `Arc` so
-    /// the schedulers (which hold `Arc<SharedState>`) advance the same counter
-    /// the session reads. 0 in single-node / no-Calvin deployments.
+    /// schedulers (holding `Arc<SharedState>`) advance the same counter the
+    /// session reads. 0 in single-node / no-Calvin deployments.
     pub last_applied_calvin_epoch: Arc<AtomicU64>,
     /// Node-global Calvin observability counters (write versions recorded,
     /// read-set validation failures, commits flushed/dropped).
@@ -398,10 +388,10 @@ pub struct SharedState {
     /// never clobbered by a sibling participant's row-less ack. Cross-node, the
     /// rows travel via the non-Raft routed-submit RPC response instead.
     ///
-    /// The value is a [`CalvinApplyResult`](super::CalvinApplyResult): `Single`
-    /// for the one RETURNING-bearing participant, or `Conflict` if two ever
-    /// deposit for the same `TxnId` (drained as a loud error, never a silent
-    /// partial). [`Response`](crate::bridge::envelope::Response) is Control-Plane
+    /// Value is [`CalvinApplyResult`](super::CalvinApplyResult): `Single` for the
+    /// one RETURNING-bearing participant, or `Conflict` if two ever deposit for
+    /// the same `TxnId` (drained as a loud error, never a silent partial).
+    /// [`Response`](crate::bridge::envelope::Response) is Control-Plane
     /// `Send + Sync`; it never touches Raft.
     pub calvin_apply_results: Arc<
         Mutex<std::collections::HashMap<nodedb_cluster::calvin::TxnId, super::CalvinApplyResult>>,
@@ -410,14 +400,39 @@ pub struct SharedState {
     /// `Scheduler` so the Control-Plane write-admission gate shares the SAME
     /// `Arc<Mutex<LockManager>>` the scheduler holds. A fast-path uncontended
     /// point write and a Calvin transaction's lock validation then contend on
-    /// one OS mutex — whoever takes it first wins, with no time-of-check /
-    /// time-of-use gap. Keyed by vShard id. Empty in single-node / no-Calvin
+    /// one OS mutex — whoever takes it first wins, no time-of-check /
+    /// time-of-use gap. Keyed by vShard id; empty in single-node / no-Calvin
     /// deployments (the gate then admits point writes without a fence).
     pub calvin_lock_managers: Arc<
         Mutex<
             std::collections::BTreeMap<
                 u32,
                 Arc<Mutex<crate::control::cluster::calvin::scheduler::lock_manager::LockManager>>,
+            >,
+        >,
+    >,
+    /// Per-vShard promotion channels, parallel to [`calvin_lock_managers`]. When a
+    /// fast-path [`WriteAdmissionGuard`] releases an uncontended key on drop, the
+    /// deterministic [`LockManager::release`] may promote a multi-vShard scheduler
+    /// transaction queued behind that key to holder. The guard runs on the
+    /// Control Plane, not inside the owning vShard's scheduler task, so it cannot
+    /// dispatch the promoted txn itself — it sends the promoted `TxnId`s over
+    /// this channel to the scheduler, which runs its normal promotion -> dispatch
+    /// path. Unbounded: promotions are low-volume (bounded by in-flight txns) and
+    /// the send happens from a synchronous `Drop` that must never block or await.
+    /// Keyed by vShard id; empty in single-node / no-Calvin deployments (the gate
+    /// then has no sender and the drop is a no-op).
+    ///
+    /// [`calvin_lock_managers`]: Self::calvin_lock_managers
+    /// [`WriteAdmissionGuard`]: crate::control::server::shared::write_admission::WriteAdmissionGuard
+    /// [`LockManager::release`]: crate::control::cluster::calvin::scheduler::lock_manager::LockManager::release
+    pub calvin_promotion_senders: Arc<
+        Mutex<
+            std::collections::BTreeMap<
+                u32,
+                tokio::sync::mpsc::UnboundedSender<
+                    Vec<crate::control::cluster::calvin::scheduler::lock_manager::TxnId>,
+                >,
             >,
         >,
     >,
@@ -429,11 +444,11 @@ pub struct SharedState {
     pub autocommit_lock_seq: std::sync::atomic::AtomicU32,
     /// Single-node per-key write-ordering lock. When NO Calvin scheduler is
     /// registered for a write's vShard there is no lock table to fence against,
-    /// yet two concurrent same-key autocommit writes must still serialize so
-    /// WAL-LSN order equals Data-Plane apply order per key. This global keyed
-    /// lock hands out one FIFO-fair async mutex per lock key: same-key writers
-    /// acquire in arrival order across [WAL append -> enqueue]; distinct keys
-    /// never contend. Idle keys are reaped, so it never grows unbounded.
+    /// yet concurrent same-key autocommit writes must still serialize so
+    /// WAL-LSN order equals Data-Plane apply order per key. Hands out one
+    /// FIFO-fair async mutex per lock key: same-key writers acquire in arrival
+    /// order across [WAL append -> enqueue]; distinct keys never contend. Idle
+    /// keys are reaped, so it never grows unbounded.
     pub write_order_locks:
         Arc<crate::control::server::shared::write_admission::KeyedWriteOrderLock>,
     /// Presence/Awareness manager: ephemeral user state broadcast channels.
@@ -468,17 +483,16 @@ pub struct SharedState {
     /// Wrapped in `Mutex` because the Control Plane is `Send + Sync`.
     pub lsn_ms_map: Arc<Mutex<nodedb_types::temporal::LsnMsMap>>,
     /// Set of database ids temporarily frozen against new user writes because
-    /// a clone materializer is reading from them as the source.  Populated by
-    /// `clone_materializer::walker` for the duration of one sweep over a
-    /// dependent clone; concurrent materializers on different clones of the
-    /// same source nest correctly via an internal reference count.
+    /// a clone materializer is reading from them as the source. Populated by
+    /// `clone_materializer::walker` for one sweep over a dependent clone;
+    /// concurrent materializers on different clones of the same source nest
+    /// correctly via an internal reference count.
     pub materialize_freeze: Arc<crate::control::clone::MaterializeFreezeRegistry>,
-    /// Cross-node streaming-shuffle receiver registry (E1).
-    ///
-    /// Holds one bounded inbox per `(shuffle_id, part, side)` with a per-part
-    /// build barrier. Fed by the cluster `ShufflePush` transport read-loop via
-    /// `RegistryShuffleReceiver` and drained by the Data Plane (E3). `Send +
-    /// Sync`; the inbox itself uses std primitives only (no Tokio) so the
-    /// `!Send` Data Plane can consume it.
+    /// Cross-node streaming-shuffle receiver registry. Holds one bounded
+    /// inbox per `(shuffle_id, part, side)` with a per-part build barrier. Fed
+    /// by the cluster `ShufflePush` transport read-loop via
+    /// `RegistryShuffleReceiver` and drained by the Data Plane. `Send + Sync`;
+    /// the inbox uses std primitives only (no Tokio) so the `!Send` Data
+    /// Plane can consume it.
     pub shuffle_registry: Arc<crate::control::server::shuffle::ShuffleReceiverRegistry>,
 }

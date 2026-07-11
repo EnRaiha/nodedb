@@ -61,6 +61,22 @@ fn register_lock_manager(
     (lm, vshard)
 }
 
+/// Register a promotion channel for `vshard` and return the receiver. The gate
+/// clones the sender into any fast-path guard it builds for this vShard, so the
+/// guard's drop delivers promoted scheduler waiters here.
+fn register_promotion_channel(
+    shared: &SharedState,
+    vshard: VShardId,
+) -> tokio::sync::mpsc::UnboundedReceiver<Vec<TxnId>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    shared
+        .calvin_promotion_senders
+        .lock()
+        .expect("promotion senders")
+        .insert(vshard.as_u32(), tx);
+    rx
+}
+
 /// A single-key KV point write to `collection` / `key`.
 fn kv_put(collection: &str, key: &[u8]) -> PhysicalPlan {
     PhysicalPlan::Kv(KvOp::Put {
@@ -237,6 +253,65 @@ async fn single_node_same_key_serializes_fifo() {
         *order.lock().expect("order"),
         vec![1, 2],
         "concurrent same-key writes must acquire in FIFO arrival order"
+    );
+}
+
+/// A fast-path point write that promotes a blocked multi-vShard scheduler txn on
+/// drop MUST hand the promoted `TxnId` to the scheduler over the promotion
+/// channel — never discard it.
+///
+/// Regression for the Calvin lock-leak: a scheduler transaction that queued
+/// behind an uncontended fast-path key was promoted to holder by `release` when
+/// the fast-path guard dropped, but the promoted id was thrown away (`let _ =
+/// ...`). The scheduler never learned to dispatch it, so it sat in `blocked`
+/// forever holding the key — every later txn on that key stalled behind a zombie
+/// holder. The guard now forwards the promoted ids to the owning scheduler.
+#[tokio::test]
+async fn fast_path_drop_delivers_promoted_scheduler_txn() {
+    let (shared, _dir) = build_shared();
+    let coll = "promotion_coll";
+    let (lm, vshard) = register_lock_manager(&shared, coll);
+    let mut promotion_rx = register_promotion_channel(&shared, vshard);
+
+    // A fast-path point write on K takes the fence via its RAII guard (an
+    // autocommit-band holder). K was uncontended at acquire time.
+    let plan = kv_put(coll, b"K");
+    let guard = match admit(&shared, &target(vshard, &plan)) {
+        WriteAdmission::FastPath { guard: Some(g) } => g,
+        _ => panic!("uncontended point write must fast-path with a real lock guard"),
+    };
+
+    // AFTER the fast path acquired K, a multi-vShard Calvin scheduler txn T needs
+    // K and queues behind the fast-path holder (Blocked) — the exact contention
+    // the old "fast-path keys are never contended" assumption ignored.
+    let scheduler_txn = TxnId::new(7, 0);
+    let want: BTreeSet<LockKey> = [kv_lock_key(coll, b"K")].into();
+    assert_eq!(
+        lm.lock().expect("lm").acquire(scheduler_txn, want.clone()),
+        AcquireOutcome::Blocked,
+        "the scheduler txn must block behind the fast-path holder"
+    );
+    assert!(
+        promotion_rx.try_recv().is_err(),
+        "no promotion may be delivered while the fast-path holder is live"
+    );
+
+    // The fast-path write completes: the guard drops, `release` promotes T to
+    // holder of K and returns [T], and the guard forwards it to the scheduler.
+    drop(guard);
+
+    let promoted = promotion_rx
+        .try_recv()
+        .expect("the promoted scheduler txn must be delivered over the promotion channel");
+    assert!(
+        promoted.contains(&scheduler_txn),
+        "the delivered promotion set must name the unblocked scheduler txn"
+    );
+    // The promotion is real: T is now holder of K in the shared lock table, ready
+    // for the scheduler to dispatch — not stranded in `blocked`.
+    assert!(
+        lm.lock().expect("lm").is_ready(scheduler_txn, &want),
+        "release must have installed the scheduler txn as holder of the freed key"
     );
 }
 

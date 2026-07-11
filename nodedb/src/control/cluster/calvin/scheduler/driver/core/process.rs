@@ -138,45 +138,18 @@ impl Scheduler {
     ) {
         let epoch = txn_id.epoch;
 
-        // Release this txn's locks, promote any newly-unblocked waiters, and
-        // collect the ones ready to dispatch — all under ONE guard so the
-        // release and the promoted re-acquire are atomic against a concurrent
-        // gate probe. Dispatch happens AFTER the guard drops: `dispatch_or_barrier`
-        // does not touch the lock table, but holding the guard across it would
-        // deadlock if it ever did, so the collect-then-dispatch split keeps the
-        // critical section minimal and re-entrancy-safe.
-        let lm = Arc::clone(&self.lock_manager);
-        let mut to_dispatch: Vec<(SequencedTxn, TxnId, std::collections::BTreeSet<LockKey>)> =
-            Vec::new();
-        {
+        // Release this txn's locks. `release` promotes any waiter queued behind
+        // each freed key to holder (moving it pending -> held) and returns the
+        // fully-promoted ids. Those ids are already holders in the table the
+        // moment `release` returns, so a concurrent gate probe on the same key
+        // sees the promoted holder and cannot steal it — the subsequent dispatch
+        // is safe outside this critical section.
+        let newly_unblocked = {
+            let lm = Arc::clone(&self.lock_manager);
             let mut guard = lm.lock().unwrap_or_else(|p| p.into_inner());
-            let newly_unblocked = guard.release(txn_id);
-
-            for waiter_id in newly_unblocked {
-                if let Some(blocked) = self.blocked.get(&waiter_id)
-                    && guard.is_ready(waiter_id, &blocked.keys)
-                {
-                    let keys = blocked.keys.clone();
-                    let outcome = guard.acquire(waiter_id, keys.clone());
-                    debug_assert_eq!(
-                        outcome,
-                        AcquireOutcome::Ready,
-                        "is_ready returned true but acquire returned Blocked"
-                    );
-
-                    if let Some(blocked_txn) = self.blocked.remove(&waiter_id) {
-                        let wait_ms = blocked_txn.blocked_at.elapsed().as_millis() as u64;
-                        self.metrics.record_lock_wait_ms(wait_ms);
-                        to_dispatch.push((blocked_txn.txn, waiter_id, keys));
-                    }
-                }
-            }
-        }
-
-        for (txn, waiter_id, keys) in to_dispatch {
-            // no-determinism: lock_acquired_time for unblocked txn is scheduler observability, not Calvin WAL data
-            self.dispatch_or_barrier(txn, waiter_id, keys, Instant::now());
-        }
+            guard.release(txn_id)
+        };
+        self.dispatch_promoted(newly_unblocked);
 
         // Mark this EXACT position applied. The watermark folds an epoch only
         // once ALL of its positions for this vShard have terminally completed,
@@ -187,5 +160,75 @@ impl Scheduler {
         }
 
         self.pending.remove(&txn_id);
+    }
+
+    /// Dispatch transactions that a `LockManager::release` promoted to holder.
+    ///
+    /// Shared by both promotion entry points:
+    /// - `on_txn_complete`, where THIS scheduler released a completed txn's locks;
+    /// - the `promotion_rx` `select!` arm, where a Control-Plane fast-path
+    ///   [`WriteAdmissionGuard`] drop released an uncontended key that one of this
+    ///   scheduler's blocked txns had queued behind.
+    ///
+    /// In both cases `release` has already installed each promoted txn as holder
+    /// on all its keys and moved it into `held_locks`. This method confirms
+    /// readiness (an idempotent re-acquire — a no-op that also guards against a
+    /// promoted id that is somehow not yet ready), clears the `blocked` entry,
+    /// records the wait, and routes the txn to static dispatch or a dependent
+    /// barrier. Collect-under-guard then dispatch-after-drop keeps the lock-table
+    /// critical section minimal and re-entrancy-safe (`dispatch_or_barrier` does
+    /// not touch the lock table).
+    ///
+    /// [`WriteAdmissionGuard`]: crate::control::server::shared::write_admission::WriteAdmissionGuard
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn dispatch_promoted(
+        &mut self,
+        promoted: Vec<TxnId>,
+    ) {
+        if promoted.is_empty() {
+            return;
+        }
+
+        let lm = Arc::clone(&self.lock_manager);
+        let mut to_dispatch: Vec<(SequencedTxn, TxnId, std::collections::BTreeSet<LockKey>)> =
+            Vec::new();
+        {
+            let mut guard = lm.lock().unwrap_or_else(|p| p.into_inner());
+            for waiter_id in promoted {
+                let Some(blocked) = self.blocked.get(&waiter_id) else {
+                    // A promotion can only name a waiter this scheduler enqueued
+                    // (its key set lives in `blocked`), so a miss should not
+                    // happen. Skip defensively rather than panic — the txn holds
+                    // no dispatch state here to act on.
+                    tracing::debug!(
+                        vshard = self.vshard_id,
+                        epoch = waiter_id.epoch,
+                        position = waiter_id.position,
+                        "calvin: promoted txn absent from blocked map; skipping dispatch"
+                    );
+                    continue;
+                };
+                if !guard.is_ready(waiter_id, &blocked.keys) {
+                    continue;
+                }
+                let keys = blocked.keys.clone();
+                let outcome = guard.acquire(waiter_id, keys.clone());
+                debug_assert_eq!(
+                    outcome,
+                    AcquireOutcome::Ready,
+                    "is_ready returned true but acquire returned Blocked"
+                );
+
+                if let Some(blocked_txn) = self.blocked.remove(&waiter_id) {
+                    let wait_ms = blocked_txn.blocked_at.elapsed().as_millis() as u64;
+                    self.metrics.record_lock_wait_ms(wait_ms);
+                    to_dispatch.push((blocked_txn.txn, waiter_id, keys));
+                }
+            }
+        }
+
+        for (txn, waiter_id, keys) in to_dispatch {
+            // no-determinism: lock_acquired_time for unblocked txn is scheduler observability, not Calvin WAL data
+            self.dispatch_or_barrier(txn, waiter_id, keys, Instant::now());
+        }
     }
 }

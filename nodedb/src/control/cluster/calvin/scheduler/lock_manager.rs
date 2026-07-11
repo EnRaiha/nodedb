@@ -382,6 +382,39 @@ mod tests {
     }
 
     #[test]
+    fn autocommit_holder_release_promotes_and_returns_scheduler_waiter() {
+        // Mirrors the write-admission fast path: an autocommit-band holder takes
+        // an uncontended key, a normal-band scheduler txn then blocks behind it,
+        // and the holder's release promotes that scheduler txn AND returns its id
+        // — the value the fast-path guard forwards to the scheduler on drop
+        // (previously discarded, stranding the promoted txn as a zombie holder).
+        let mut lm = LockManager::new();
+        let autocommit = txn(TxnId::AUTOCOMMIT_EPOCH, 0);
+        let scheduler_txn = txn(9, 0);
+
+        assert!(
+            lm.try_acquire(autocommit, keyset(&["k"])),
+            "the fast-path holder takes the uncontended key"
+        );
+        assert_eq!(
+            lm.acquire(scheduler_txn, keyset(&["k"])),
+            AcquireOutcome::Blocked,
+            "the scheduler txn queues behind the fast-path holder"
+        );
+
+        let promoted = lm.release(autocommit);
+        assert_eq!(
+            promoted,
+            vec![scheduler_txn],
+            "release must return the promoted scheduler waiter"
+        );
+        assert!(
+            lm.is_ready(scheduler_txn, &keyset(&["k"])),
+            "the promoted scheduler txn is now holder of the freed key"
+        );
+    }
+
+    #[test]
     fn release_preserves_fifo_waiter_order() {
         let mut lm = LockManager::new();
         let t1 = txn(1, 0);

@@ -33,6 +33,8 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::mpsc::UnboundedSender;
+
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::cluster::calvin::scheduler::driver::core::routing::{PlanRouting, plan_vshard};
 use crate::control::cluster::calvin::scheduler::lock_manager::{LockKey, LockManager, TxnId};
@@ -98,24 +100,56 @@ pub enum WriteAdmission {
 ///
 /// Holds the shared lock table and the reserved autocommit holder id. `Drop`
 /// releases every key held by that holder under a short guard (the lock table
-/// tracks the key set by holder, so the guard needs only the id). No waiter
-/// notification is needed: the fast path only ever holds UNCONTENDED keys, so no
-/// Calvin waiter is ever queued behind it — the scheduler wakes its own waiters.
+/// tracks the key set by holder, so the guard needs only the id).
+///
+/// The fast path acquires a key only when it is uncontended AT ACQUIRE TIME, but
+/// a multi-vShard Calvin scheduler transaction can still queue behind that key
+/// AFTERWARDS (it calls `acquire` on the same shared table, is `Blocked`, and
+/// waits). When this guard drops, [`LockManager::release`] promotes that waiter
+/// to holder and returns its `TxnId`. The guard runs on the Control Plane, not
+/// inside the owning vShard's scheduler task, so it forwards the promoted ids
+/// over `promotion_sender` to the scheduler, which runs its normal
+/// promotion -> dispatch path. Without this hand-off a promoted scheduler txn
+/// would sit in the scheduler's `blocked` map forever, holding the key and
+/// stalling every later txn behind a zombie holder.
+///
+/// [`LockManager::release`]: crate::control::cluster::calvin::scheduler::lock_manager::LockManager::release
 pub struct WriteAdmissionGuard {
     lock_manager: Arc<Mutex<LockManager>>,
     txn: TxnId,
+    /// Promotion channel to the owning vShard's scheduler. `Some` when a Calvin
+    /// scheduler is registered for this vShard (the only case in which a waiter
+    /// can queue behind a fast-path key); `None` in single-node / no-Calvin
+    /// deployments, where `release` never promotes anything.
+    promotion_sender: Option<UnboundedSender<Vec<TxnId>>>,
 }
 
 impl Drop for WriteAdmissionGuard {
     fn drop(&mut self) {
-        // Release under a short guard. `release` returns any promoted waiters;
-        // the fast path holds only uncontended keys so this set is always empty,
-        // and there is nothing for the Control Plane to dispatch.
-        let _ = self
+        // Ordering is load-bearing: take the lock-manager mutex, release the
+        // holder (promoting any waiter queued behind it), DROP the mutex guard,
+        // and only THEN send. `release`'s temporary `MutexGuard` is dropped at the
+        // end of this `let` statement, so the send below never holds it.
+        let promoted = self
             .lock_manager
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .release(self.txn);
+
+        // Hand promoted scheduler waiters to their scheduler for dispatch. The
+        // send is synchronous and non-blocking (unbounded channel), safe from a
+        // `Drop`. A send error means the scheduler task is gone (shutdown); log
+        // and continue — never unwrap or panic in `Drop`.
+        if !promoted.is_empty()
+            && let Some(sender) = &self.promotion_sender
+            && let Err(e) = sender.send(promoted)
+        {
+            tracing::warn!(
+                error = %e,
+                "write-admission gate: could not deliver promoted Calvin waiters to \
+                 the scheduler (receiver gone); those transactions may stall"
+            );
+        }
     }
 }
 
@@ -214,8 +248,23 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
         lm.try_acquire(txn, keys)
     };
     if acquired {
+        // Look up this vShard's promotion channel so the guard can hand any
+        // scheduler waiter it promotes on drop back to the scheduler for
+        // dispatch. `None` only if no scheduler is registered — but a registered
+        // lock manager without a promotion sender should not happen, since both
+        // are inserted together per vShard.
+        let promotion_sender = shared
+            .calvin_promotion_senders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&vshard.as_u32())
+            .cloned();
         WriteAdmission::FastPath {
-            guard: Some(WriteAdmissionGuard { lock_manager, txn }),
+            guard: Some(WriteAdmissionGuard {
+                lock_manager,
+                txn,
+                promotion_sender,
+            }),
         }
     } else {
         // A pending commit (or another fast-path write) holds a key: route behind

@@ -96,6 +96,17 @@ pub struct Scheduler {
     /// Sender half of the completion fan-in channel, cloned per dispatch.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) completion_tx:
         mpsc::Sender<CompletionItem>,
+    /// Receiver for lock promotions performed by a Control-Plane fast-path
+    /// [`WriteAdmissionGuard`] drop. When a fast-path write releases an
+    /// uncontended key that one of THIS scheduler's transactions had since queued
+    /// behind, `LockManager::release` promotes that txn to holder but cannot
+    /// dispatch it (the release runs off-task, on the Control Plane). The guard
+    /// forwards the promoted `TxnId`s here; the `select!` loop drains them and
+    /// runs the same promotion -> dispatch path `on_txn_complete` uses.
+    ///
+    /// [`WriteAdmissionGuard`]: crate::control::server::shared::write_admission::WriteAdmissionGuard
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) promotion_rx:
+        mpsc::UnboundedReceiver<Vec<TxnId>>,
 }
 
 /// Parameters for [`Scheduler::new`].
@@ -116,6 +127,11 @@ pub struct SchedulerParams {
     /// `reconcile_vshard_schedulers` and registered in
     /// `SharedState.calvin_lock_managers` under the SAME `Arc` passed here.
     pub lock_manager: Arc<Mutex<LockManager>>,
+    /// Receiver for gate-side lock promotions. Constructed by
+    /// `reconcile_vshard_schedulers`; its `UnboundedSender` is registered in
+    /// `SharedState.calvin_promotion_senders` for this same vShard so a fast-path
+    /// guard drop can hand promoted waiters back to this scheduler.
+    pub promotion_rx: mpsc::UnboundedReceiver<Vec<TxnId>>,
 }
 
 impl Scheduler {
@@ -133,6 +149,7 @@ impl Scheduler {
             metrics,
             read_result_rx,
             lock_manager,
+            promotion_rx,
         } = params;
 
         // Capacity: at most one completion per inflight txn. Use the incoming
@@ -156,6 +173,7 @@ impl Scheduler {
             metrics,
             completion_rx,
             completion_tx,
+            promotion_rx,
         }
     }
 
@@ -231,6 +249,17 @@ impl Scheduler {
                 maybe_event = self.read_result_rx.recv() => {
                     if let Some(event) = maybe_event {
                         self.handle_read_result(event);
+                    }
+                }
+
+                maybe_promoted = self.promotion_rx.recv() => {
+                    if let Some(promoted) = maybe_promoted {
+                        // A fast-path write-admission guard released an uncontended
+                        // key that one of this scheduler's txns had queued behind;
+                        // `release` already promoted it to holder. Run the normal
+                        // promotion -> dispatch path so it stops being a stalled
+                        // holder in `blocked` and actually executes.
+                        self.dispatch_promoted(promoted);
                     }
                 }
 
