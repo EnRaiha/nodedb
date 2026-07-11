@@ -20,8 +20,7 @@
 //! fixing those is a separate, later change.
 //!
 //! One documented set of arms is the exception:
-//! `DocumentOp::{BatchInsert, Merge, UpdateFromJoin}`,
-//! `CrdtOp::{SetConstraints, DropConstraints, RestoreToVersion}`, and
+//! `DocumentOp::{Merge, UpdateFromJoin}`, `CrdtOp::RestoreToVersion`, and
 //! `ArrayOp::{Put, Delete}` classify `true` here even though
 //! `to_replicated_entry` has no encoder arm for any of them — a deliberate
 //! divergence from the oracle (see the equivalence test below, which pins
@@ -36,7 +35,14 @@
 //! exception list, but `to_replicated_entry` now has encoder arms for all
 //! three (see `control/wal_replication/encode/crdt.rs::encode`), so they no
 //! longer diverge from the oracle and were moved into
-//! `crdt_variants_match_oracle` below. Without buffering,
+//! `crdt_variants_match_oracle` below.
+//! `DocumentOp::BatchInsert` and `CrdtOp::{SetConstraints, DropConstraints}`
+//! were also in this exception list, but `to_replicated_entry` now has
+//! encoder arms for all three (see
+//! `control/wal_replication/encode/document.rs::encode` and
+//! `control/wal_replication/encode/crdt.rs::encode`), so they too no longer
+//! diverge from the oracle and were moved into `document_variants_match_oracle`
+//! / `crdt_variants_match_oracle` below. Without buffering,
 //! each of these executed immediately against base state inside an explicit
 //! transaction, was visible before COMMIT, and survived ROLLBACK: a
 //! correctness bug, not a classification nuance. Closing it costs two
@@ -53,6 +59,20 @@
 //!    same COMMIT batch, these writes cannot be reversed by
 //!    `rollback_undo_log`. Spatial, Text, and bulk Document writes already
 //!    ride this exact path.
+//!
+//! A second, inverse divergence exists in the opposite direction:
+//! `DocumentOp::Truncate` and `KvOp::Truncate` classify `false` here
+//! (not buffered) even though `to_replicated_entry` now has an encoder arm
+//! for both and returns `Some`. This is not a bug in either function: both
+//! ops are autocommit-only — `resolve/entry.rs` (`data/executor/handlers/
+//! transaction/resolve/entry.rs:335` for Document, `:269` for Kv) rejects
+//! them with `PlanError` when they appear inside an explicit transaction, so
+//! they are never routed through `plan_requires_txn_buffering` for staging
+//! in practice. They only ever reach `to_replicated_entry` via the
+//! autocommit path, where they replicate normally. Pinned by
+//! `truncate_variants_are_encoded_but_not_buffered` below via
+//! `assert_encoded_but_not_buffered` — the inverse of
+//! `assert_buffered_but_unencoded`.
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
@@ -518,6 +538,24 @@ mod tests {
         );
     }
 
+    /// Pin the inverse divergence (module doc) for an autocommit-only
+    /// Truncate variant: the predicate classifies it `false` (not
+    /// buffered) because it is rejected inside an explicit transaction
+    /// (`resolve/entry.rs`) and so never reaches this predicate for staging
+    /// in practice, while `to_replicated_entry` returns `Some` because it
+    /// replicates normally when executed autocommit. The inverse of
+    /// `assert_buffered_but_unencoded`.
+    fn assert_encoded_but_not_buffered(plan: &PhysicalPlan) {
+        assert!(
+            !plan_requires_txn_buffering(plan),
+            "expected {plan:?} to not require txn buffering (autocommit-only)"
+        );
+        assert!(
+            to_replicated_entry(tenant(), db(), vshard(), plan).is_some(),
+            "expected {plan:?} to have a WAL encoder arm"
+        );
+    }
+
     #[test]
     fn document_variants_match_oracle() {
         let plans = vec![
@@ -614,10 +652,6 @@ mod tests {
                 case_insensitive: false,
                 predicate: None,
             }),
-            PhysicalPlan::Document(DocumentOp::Truncate {
-                collection: "c".into(),
-                restart_identity: false,
-            }),
             PhysicalPlan::Document(DocumentOp::EstimateCount {
                 collection: "c".into(),
                 field: "f".into(),
@@ -700,6 +734,14 @@ mod tests {
                 cursor: Vec::new(),
                 count: 0,
                 system_as_of_ms: None,
+            }),
+            // `to_replicated_entry` now has an encoder arm for `BatchInsert`
+            // (used to be in the flipped/unencoded exception list, see module
+            // doc), so predicate `true` and encoder `Some` agree here.
+            PhysicalPlan::Document(DocumentOp::BatchInsert {
+                collection: "c".into(),
+                documents: Vec::new(),
+                surrogates: Vec::new(),
             }),
         ];
         for p in &plans {
@@ -915,6 +957,19 @@ mod tests {
                 from_index: 0,
                 to_index: 1,
                 surrogate: Surrogate::ZERO,
+            }),
+            // `to_replicated_entry` now has encoder arms for `SetConstraints`
+            // / `DropConstraints` (used to be in the flipped/unencoded
+            // exception list, see module doc), so predicate `true` and
+            // encoder `Some` agree here.
+            PhysicalPlan::Crdt(CrdtOp::SetConstraints {
+                collection: "c".into(),
+                constraint_version: 0,
+                constraints: Vec::new(),
+            }),
+            PhysicalPlan::Crdt(CrdtOp::DropConstraints {
+                collection: "c".into(),
+                constraint_version: 0,
             }),
         ];
         for p in &plans {
@@ -1162,9 +1217,6 @@ mod tests {
                 key: Vec::new(),
                 updates: Vec::new(),
                 surrogate: Surrogate::ZERO,
-            }),
-            PhysicalPlan::Kv(KvOp::Truncate {
-                collection: "c".into(),
             }),
             PhysicalPlan::Kv(KvOp::Incr {
                 collection: "c".into(),
@@ -1861,16 +1913,13 @@ mod tests {
     /// atomicity gap) while `to_replicated_entry` still has no encoder arm
     /// and returns `None` (a separate, undone encoder-omission unit).
     /// `VectorOp`'s six formerly-flipped variants are no longer here — see
-    /// `vector_variants_match_oracle`.
+    /// `vector_variants_match_oracle`. `DocumentOp::BatchInsert` and
+    /// `CrdtOp::{SetConstraints, DropConstraints}` are no longer here either
+    /// — see `document_variants_match_oracle` / `crdt_variants_match_oracle`.
     #[test]
     fn flipped_variants_are_buffered_and_unencoded() {
         let array_id = ArrayId::new(tenant(), "a");
         let plans = vec![
-            PhysicalPlan::Document(DocumentOp::BatchInsert {
-                collection: "c".into(),
-                documents: Vec::new(),
-                surrogates: Vec::new(),
-            }),
             PhysicalPlan::Document(DocumentOp::Merge {
                 target_collection: "t".into(),
                 source_collection: "s".into(),
@@ -1891,15 +1940,6 @@ mod tests {
                 updates: Vec::new(),
                 target_filters: Vec::new(),
                 returning: None,
-            }),
-            PhysicalPlan::Crdt(CrdtOp::SetConstraints {
-                collection: "c".into(),
-                constraint_version: 0,
-                constraints: Vec::new(),
-            }),
-            PhysicalPlan::Crdt(CrdtOp::DropConstraints {
-                collection: "c".into(),
-                constraint_version: 0,
             }),
             PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
                 collection: "c".into(),
@@ -1922,6 +1962,29 @@ mod tests {
         ];
         for p in &plans {
             assert_buffered_but_unencoded(p);
+        }
+    }
+
+    /// Pin the inverse divergence (module doc): `DocumentOp::Truncate` and
+    /// `KvOp::Truncate` are autocommit-only — rejected in a transaction
+    /// (`data/executor/handlers/transaction/resolve/entry.rs:335` and
+    /// `:269` respectively), so `plan_requires_txn_buffering` never needs to
+    /// buffer them — and `to_replicated_entry` now encodes both, since they
+    /// replicate normally when executed autocommit. The inverse of
+    /// `flipped_variants_are_buffered_and_unencoded`.
+    #[test]
+    fn truncate_variants_are_encoded_but_not_buffered() {
+        let plans = vec![
+            PhysicalPlan::Document(DocumentOp::Truncate {
+                collection: "c".into(),
+                restart_identity: false,
+            }),
+            PhysicalPlan::Kv(KvOp::Truncate {
+                collection: "c".into(),
+            }),
+        ];
+        for p in &plans {
+            assert_encoded_but_not_buffered(p);
         }
     }
 }
