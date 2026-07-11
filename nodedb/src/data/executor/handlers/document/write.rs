@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Document write handlers: PointPut, BatchInsert, Upsert, Register, DropIndex.
-//! Secondary-index lookup / fetch handlers live in `index_fetch`.
+//! Document write handlers: PointPut, BatchInsert, Upsert, Register.
+//! Secondary-index lookup / fetch handlers live in `index_fetch`; index
+//! backfill / drop handlers live in `index_maintenance`.
 
 use tracing::{debug, warn};
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
+use crate::engine::document::store::surrogate_to_doc_id;
 
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_document_batch_insert(
@@ -19,6 +22,22 @@ impl CoreLoop {
         surrogates: &[nodedb_types::Surrogate],
     ) -> Response {
         debug!(core = self.core_id, %collection, count = documents.len(), "document batch insert");
+
+        // When per-row surrogates are parallel to the documents, run the batch
+        // as ONE atomic, fully cross-engine-indexed insert: each row is applied
+        // via `apply_point_put` (document store + FTS + vector + spatial +
+        // secondary indexes) inside a single redb transaction, keyed by the
+        // row's stable surrogate. A search hit from any cross-engine index then
+        // resolves back to the row's identity, and the whole page lands or none
+        // of it does (any per-row error rolls the transaction back). The legacy
+        // raw `batch_put` path below is kept only for callers that do not supply
+        // parallel surrogates (no cross-engine identity available).
+        if !documents.is_empty() && surrogates.len() == documents.len() {
+            return self.execute_document_batch_insert_indexed(
+                task, tid, collection, documents, surrogates,
+            );
+        }
+
         let converted: Vec<(String, Vec<u8>)> = documents
             .iter()
             .map(|(id, val)| {
@@ -121,6 +140,87 @@ impl CoreLoop {
             ),
         }
     }
+
+    /// Atomic, fully-indexed batch insert (surrogates parallel to documents).
+    ///
+    /// Applies every row through [`CoreLoop::apply_point_put`] under ONE redb
+    /// write transaction so the document store, FTS inverted index, HNSW vector
+    /// index, spatial R-tree, and secondary indexes are all maintained and keyed
+    /// by each row's stable surrogate. Any per-row error (including a UNIQUE
+    /// constraint violation) drops the transaction, leaving the whole page
+    /// unchanged. On success the transaction commits once and one Insert write
+    /// event is emitted per row.
+    fn execute_document_batch_insert_indexed(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        collection: &str,
+        documents: &[(String, Vec<u8>)],
+        surrogates: &[nodedb_types::Surrogate],
+    ) -> Response {
+        let database_id = task.request.database_id.as_u64();
+        let txn = match self.sparse.begin_write() {
+            Ok(t) => t,
+            Err(e) => return self.response_error(task, e),
+        };
+
+        // Row key for post-commit event emission, captured as each row applies
+        // successfully; the value bytes are re-borrowed from `documents` after
+        // commit rather than cloned here. On any error we return early
+        // (dropping `txn`, which rolls back every row applied so far).
+        let mut applied: Vec<String> = Vec::with_capacity(documents.len());
+        for (i, (_document_id, value)) in documents.iter().enumerate() {
+            let surrogate = surrogates[i];
+            let row_key = surrogate_to_doc_id(surrogate);
+            if let Err(e) = self.apply_point_put(
+                &txn,
+                PointPutParams {
+                    database_id,
+                    tid,
+                    collection,
+                    document_id: &row_key,
+                    surrogate,
+                    value,
+                    index_text: true,
+                    user_roles: &task.request.user_roles,
+                    enforce: true,
+                    wal_lsn: task.wal_lsn(),
+                },
+            ) {
+                return self.response_error(task, e);
+            }
+            applied.push(row_key);
+        }
+
+        if let Err(e) = txn.commit() {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("batch insert commit: {e}"),
+                },
+            );
+        }
+
+        self.checkpoint_coordinator
+            .mark_dirty("sparse", documents.len());
+        if let Some(ref m) = self.metrics {
+            m.record_document_insert();
+        }
+
+        for (i, row_key) in applied.iter().enumerate() {
+            self.emit_put_event(task, tid, collection, row_key, &documents[i].1, None);
+        }
+
+        match super::super::super::response_codec::encode_count("inserted", documents.len()) {
+            Ok(bytes) => self.response_with_payload(task, bytes),
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: e.to_string(),
+                },
+            ),
+        }
+    }
 }
 
 /// Parameters for [`CoreLoop::execute_register_document_collection`].
@@ -184,226 +284,5 @@ impl CoreLoop {
         self.doc_configs.insert(config_key, config);
 
         self.response_ok(task)
-    }
-}
-
-/// Parameters for [`CoreLoop::execute_backfill_index`].
-pub(in crate::data::executor) struct BackfillIndexParams<'a> {
-    pub tid: u64,
-    pub collection: &'a str,
-    pub path: &'a str,
-    pub is_array: bool,
-    pub unique: bool,
-    pub case_insensitive: bool,
-    pub predicate: Option<&'a str>,
-}
-
-impl CoreLoop {
-    /// Backfill an index: scan every document in the collection and
-    /// populate sparse-index entries for the given field. Atomic — one
-    /// write transaction covers the whole backfill and UNIQUE
-    /// violations abort it, leaving the index empty (the caller's
-    /// Building→Ready flip is skipped, so readers never see a
-    /// partial-index view).
-    pub(in crate::data::executor) fn execute_backfill_index(
-        &mut self,
-        task: &ExecutionTask,
-        params: BackfillIndexParams<'_>,
-    ) -> Response {
-        let BackfillIndexParams {
-            tid,
-            collection,
-            path,
-            is_array,
-            unique,
-            case_insensitive,
-            predicate,
-        } = params;
-        debug!(
-            core = self.core_id,
-            %collection,
-            %path,
-            unique,
-            case_insensitive,
-            partial = predicate.is_some(),
-            "backfill index"
-        );
-        if let Some(ref m) = self.metrics {
-            m.record_document_index_backfill();
-        }
-
-        // Parse the partial-index predicate once, up front. An
-        // unparsable predicate is a catalog-level bug — the DDL layer
-        // already validates the text at CREATE INDEX time, so a
-        // failure here means the stored entry drifted from what the
-        // grammar accepts. Refuse the backfill rather than silently
-        // over-populating a "partial" index.
-        let parsed_predicate = match predicate {
-            Some(text) => match crate::engine::document::predicate::IndexPredicate::parse(text) {
-                Some(p) => Some(p),
-                None => {
-                    return self.response_error(
-                        task,
-                        crate::bridge::envelope::ErrorCode::Internal {
-                            detail: format!(
-                                "backfill: partial-index predicate failed to parse: {text}"
-                            ),
-                        },
-                    );
-                }
-            },
-            None => None,
-        };
-
-        // Snapshot existing documents outside the write txn. 1,000,000
-        // cap matches the Data Plane's other collection-wide scans; rows
-        // beyond this are handled by a future chunked backfill (see
-        // `scan_documents_chunked`).
-        let docs = match self.sparse.scan_documents(
-            task.request.database_id.as_u64(),
-            tid,
-            collection,
-            1_000_000,
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    crate::bridge::envelope::ErrorCode::Internal {
-                        detail: format!("backfill scan: {e}"),
-                    },
-                );
-            }
-        };
-
-        // Deduplicate-unique-as-we-go: track `(normalized_value → doc_id)`
-        // so a dup within the existing set is flagged before we ever
-        // touch the index table.
-        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-
-        let txn = match self.sparse.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    crate::bridge::envelope::ErrorCode::Internal {
-                        detail: format!("backfill txn: {e}"),
-                    },
-                );
-            }
-        };
-
-        for (doc_id, bytes) in &docs {
-            let Some(doc) = super::super::super::doc_format::decode_document(bytes) else {
-                continue;
-            };
-            // Partial-index predicate: skip rows that don't satisfy
-            // the `WHERE` clause. `evaluate` treats NULL / non-bool as
-            // false (Postgres partial-index semantics), so only rows
-            // for which the predicate is explicitly true are indexed.
-            if let Some(ref p) = parsed_predicate
-                && !p.evaluate_json(&doc)
-            {
-                continue;
-            }
-            let values = crate::engine::document::store::extract_index_values(&doc, path, is_array);
-            for raw in values {
-                let stored = if case_insensitive {
-                    raw.to_lowercase()
-                } else {
-                    raw
-                };
-                if unique
-                    && let Some(prev) = seen.get(&stored)
-                    && prev != doc_id
-                {
-                    return self.response_error(
-                        task,
-                        crate::bridge::envelope::ErrorCode::Internal {
-                            detail: format!(
-                                "unique index backfill: duplicate value '{stored}' on '{path}' \
-                                 (existing '{prev}', new '{doc_id}')"
-                            ),
-                        },
-                    );
-                }
-                if unique {
-                    seen.insert(stored.clone(), doc_id.clone());
-                }
-                if let Err(e) = self.sparse.index_put_in_txn(
-                    &txn,
-                    crate::engine::sparse::btree_index::IndexEntryTxn {
-                        database_id: task.request.database_id.as_u64(),
-                        tenant_id: tid,
-                        collection,
-                        field: path,
-                        value: &stored,
-                        document_id: doc_id,
-                    },
-                ) {
-                    return self.response_error(
-                        task,
-                        crate::bridge::envelope::ErrorCode::Internal {
-                            detail: format!("backfill index_put: {e}"),
-                        },
-                    );
-                }
-            }
-        }
-
-        if let Err(e) = txn.commit() {
-            return self.response_error(
-                task,
-                crate::bridge::envelope::ErrorCode::Internal {
-                    detail: format!("backfill commit: {e}"),
-                },
-            );
-        }
-
-        self.response_ok(task)
-    }
-
-    /// Drop all secondary index entries for a field across the entire collection.
-    ///
-    /// Calls `SparseEngine::delete_index_entries_for_field` directly.
-    /// Returns `{"removed": N}` as the response payload.
-    pub(in crate::data::executor) fn execute_drop_document_index(
-        &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        field: &str,
-    ) -> Response {
-        debug!(
-            core = self.core_id,
-            %collection,
-            %field,
-            "drop document index"
-        );
-
-        match self.sparse.delete_index_entries_for_field(
-            task.request.database_id.as_u64(),
-            tid,
-            collection,
-            field,
-        ) {
-            Ok(removed) => {
-                match super::super::super::response_codec::encode_count("removed", removed) {
-                    Ok(bytes) => self.response_with_payload(task, bytes),
-                    Err(e) => self.response_error(
-                        task,
-                        crate::bridge::envelope::ErrorCode::Internal {
-                            detail: format!("drop index encode: {e}"),
-                        },
-                    ),
-                }
-            }
-            Err(e) => self.response_error(
-                task,
-                crate::bridge::envelope::ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
-        }
     }
 }

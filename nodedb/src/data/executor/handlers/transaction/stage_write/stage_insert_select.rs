@@ -37,8 +37,8 @@ impl CoreLoop {
     /// collection's current BASE ∪ OVERLAY matching set, truncate to the
     /// SELECT's limit, and copy each matched row into the TARGET collection's
     /// overlay under the source row's own surrogate/doc_id. Returns
-    /// `{"inserted": N}` in the same shape `execute_insert_select` returns
-    /// for the autocommit path.
+    /// `{"inserted": N}` in the same shape the Control-Plane `INSERT ... SELECT`
+    /// orchestrator returns for the autocommit path.
     pub(in crate::data::executor) fn stage_insert_select(
         &mut self,
         params: StageInsertSelectParams<'_>,

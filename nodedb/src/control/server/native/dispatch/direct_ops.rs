@@ -55,6 +55,34 @@ pub(crate) async fn handle_direct_op(
         Err(e) => return NativeResponse::error(seq, "42601", e.to_string()),
     };
 
+    // `INSERT ... SELECT` is orchestrated on the Control Plane (fresh, registered
+    // surrogate per target row + atomic `BatchInsert`); it never reaches the
+    // Data Plane as a single op.
+    if let PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::InsertSelect {
+        target_collection,
+        source_collection,
+        source_filters,
+        source_limit,
+    }) = &plan
+    {
+        ctx.state.tenant_request_start(tenant_id);
+        let result = crate::control::insert_select::run_insert_select(
+            ctx.state,
+            tenant_id,
+            ctx.database_id(),
+            target_collection,
+            source_collection,
+            source_filters,
+            *source_limit,
+        )
+        .await;
+        ctx.state.tenant_request_end(tenant_id);
+        return match result {
+            Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
+            Err(e) => error_to_native(seq, &e),
+        };
+    }
+
     // Inject RLS filters from auth context (same as pgwire planner).
     if let Err(e) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
         tenant_id.as_u64(),

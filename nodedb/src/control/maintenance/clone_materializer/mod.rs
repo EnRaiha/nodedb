@@ -13,3 +13,8 @@ pub use progress::CloneMaterializerHandle;
 pub use walker::{
     MaterializeParams, force_materialize_blocking, materialize_database, run_scheduled_sweep,
 };
+
+// Shared with the `INSERT ... SELECT` orchestrator, which reuses the same
+// local-dispatch primitive and source-scan cursor decode.
+pub(crate) use dispatch::dispatch_local;
+pub(crate) use document::scan_source_page;

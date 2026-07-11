@@ -29,6 +29,48 @@ pub async fn execute_sql(
 
     let mut results = Vec::new();
     for task in tasks {
+        // `INSERT ... SELECT` is orchestrated on the Control Plane (fresh,
+        // registered surrogate per target row + atomic `BatchInsert`), never
+        // dispatched to the Data Plane as a single op.
+        if let crate::bridge::envelope::PhysicalPlan::Document(
+            nodedb_physical::physical_plan::DocumentOp::InsertSelect {
+                target_collection,
+                source_collection,
+                source_filters,
+                source_limit,
+            },
+        ) = &task.plan
+        {
+            match crate::control::insert_select::run_insert_select(
+                shared,
+                task.tenant_id,
+                task.database_id,
+                target_collection,
+                source_collection,
+                source_filters,
+                *source_limit,
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let payload = resp.payload.to_vec();
+                    if !payload.is_empty() {
+                        let json =
+                            crate::data::executor::response_codec::decode_payload_to_json(&payload);
+                        match sonic_rs::from_str::<serde_json::Value>(&json) {
+                            Ok(v) => results.push(v),
+                            Err(_) => results.push(serde_json::Value::String(json)),
+                        }
+                    }
+                }
+                Err(e) => {
+                    shared.tenant_request_end(tenant_id);
+                    return Err(e);
+                }
+            }
+            continue;
+        }
+
         let payloads: crate::Result<Vec<Vec<u8>>> = match shared.gateway.as_ref() {
             Some(gw) => {
                 let gw_ctx = QueryContext {

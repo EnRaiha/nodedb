@@ -28,7 +28,7 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 /// scans and target-side writes — both target the local node directly because
 /// every shard the materializer touches is owned locally (vshard-affinity is
 /// preserved by `VShardId::from_collection_in_database`).
-pub(super) async fn dispatch_local(
+pub(crate) async fn dispatch_local(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,

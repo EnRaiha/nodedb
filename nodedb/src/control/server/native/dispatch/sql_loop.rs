@@ -234,9 +234,11 @@ pub(super) async fn run_dispatch_loop(
 
 /// Dispatch a single PhysicalTask.
 ///
-/// Broadcast plans (scans, InsertSelect) are handled locally; all other tasks
-/// flow through `dispatch_task_via_gateway` which routes via the gateway when
-/// available, or falls back to the local SPSC path on single-node boot.
+/// `INSERT ... SELECT` is intercepted here and run by the Control-Plane
+/// orchestrator (`control::insert_select`); `DROP ARRAY` fans out to every
+/// core. All other tasks flow through `dispatch_task_via_gateway` which routes
+/// via the gateway when available, or falls back to the local SPSC path on
+/// single-node boot.
 /// Dispatch a single PhysicalTask, returning the response plus the per-shard
 /// watermark LSNs a single-node fan gather observed (one `(vshard, watermark)`
 /// per responding core). The list is empty for a non-gathered dispatch; the
@@ -246,19 +248,23 @@ async fn dispatch_task(
     ctx: &DispatchCtx<'_>,
     mut task: PhysicalTask,
 ) -> crate::Result<(Response, Vec<(VShardId, Lsn)>)> {
-    if matches!(
-        task.plan,
-        crate::bridge::envelope::PhysicalPlan::Document(
-            nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. }
-        )
-    ) {
-        let resp = broadcast_count_to_all_cores(
+    if let crate::bridge::envelope::PhysicalPlan::Document(
+        nodedb_physical::physical_plan::DocumentOp::InsertSelect {
+            target_collection,
+            source_collection,
+            source_filters,
+            source_limit,
+        },
+    ) = &task.plan
+    {
+        let resp = crate::control::insert_select::run_insert_select(
             ctx.state,
             task.tenant_id,
             task.database_id,
-            task.plan,
-            TraceId::ZERO,
-            "inserted",
+            target_collection,
+            source_collection,
+            source_filters,
+            *source_limit,
         )
         .await?;
         return Ok((resp, Vec::new()));

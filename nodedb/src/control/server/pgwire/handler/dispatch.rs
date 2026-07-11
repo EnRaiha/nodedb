@@ -156,19 +156,23 @@ impl NodeDbPgHandler {
             }
         }
 
-        if matches!(
-            task.plan,
-            crate::bridge::envelope::PhysicalPlan::Document(
-                nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. }
-            )
-        ) {
-            return crate::control::server::broadcast::broadcast_count_to_all_cores(
+        if let crate::bridge::envelope::PhysicalPlan::Document(
+            nodedb_physical::physical_plan::DocumentOp::InsertSelect {
+                target_collection,
+                source_collection,
+                source_filters,
+                source_limit,
+            },
+        ) = &task.plan
+        {
+            return crate::control::insert_select::run_insert_select(
                 &self.state,
                 task.tenant_id,
                 task.database_id,
-                task.plan,
-                TraceId::ZERO,
-                "inserted",
+                target_collection,
+                source_collection,
+                source_filters,
+                *source_limit,
             )
             .await;
         }

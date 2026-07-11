@@ -234,10 +234,10 @@ fn checkpoint_progress(
 }
 
 /// `(doc_id_hex, source_surrogate_u32, value_bytes)` returned by one scan page.
-type ScanPage = (Vec<(String, u32, Vec<u8>)>, Vec<u8>);
+pub(crate) type ScanPage = (Vec<(String, u32, Vec<u8>)>, Vec<u8>);
 
 /// Run one source-side `MaterializeScan` round-trip.
-async fn scan_source_page(
+pub(crate) async fn scan_source_page(
     state: &SharedState,
     tenant_id: TenantId,
     source_db_id: DatabaseId,

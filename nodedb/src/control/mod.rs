@@ -17,6 +17,7 @@ pub mod distributed_applier;
 pub mod event_trigger;
 pub mod exec_receiver;
 pub mod gateway;
+pub mod insert_select;
 pub mod lease;
 pub mod lock_utils;
 pub mod maintenance;

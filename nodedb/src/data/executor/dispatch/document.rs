@@ -302,14 +302,24 @@ impl CoreLoop {
                 source_collection,
                 source_filters,
                 source_limit,
-            } => self.execute_insert_select(
-                task,
-                tid,
-                target_collection,
-                source_collection,
-                source_filters,
-                *source_limit,
-            ),
+            } => {
+                // Autocommit `INSERT ... SELECT` is orchestrated on the Control
+                // Plane (`control::insert_select`): the source is scanned, each
+                // target row is assigned its OWN fresh, registered surrogate, and
+                // the rows land via an atomic `BatchInsert`. That path never
+                // reaches here. This handler serves only the buffered replay of a
+                // transactional `INSERT ... SELECT` at COMMIT, which copies rows
+                // under the source surrogate via the overlay — the in-transaction
+                // surrogate-registration fix is tracked separately.
+                self.execute_insert_select(
+                    task,
+                    tid,
+                    target_collection,
+                    source_collection,
+                    source_filters,
+                    *source_limit,
+                )
+            }
 
             DocumentOp::Register {
                 collection,
@@ -393,7 +403,7 @@ impl CoreLoop {
                 predicate,
             } => self.execute_backfill_index(
                 task,
-                super::super::handlers::document::write::BackfillIndexParams {
+                super::super::handlers::document::index_maintenance::BackfillIndexParams {
                     tid,
                     collection,
                     path,
