@@ -1265,3 +1265,157 @@ fn pre_database_id_entry_decodes_to_default_database() {
         other => panic!("expected Document(PointPut), got {other:?}"),
     }
 }
+
+// ---- Pinned replication gaps: writes that `to_replicated_entry` classifies
+// as `None` today because they have no `ReplicatedWrite` shape yet. The data
+// still lands via the leader's own redb/WAL; only cross-node Raft replication
+// of these ops is missing. Each assertion is a tripwire: it fails loudly if
+// someone wires one of these, forcing them to update the tracking (and move
+// the variant out of this list). The exhaustive `#![deny(wildcard...)]` match
+// in `encode/entry*.rs` guarantees a NEW write variant cannot slip through as
+// a silent `None` — these tests pin the KNOWN gaps that are `None` on purpose.
+
+#[test]
+fn known_write_gaps_are_not_replicated() {
+    use nodedb_array::types::ArrayId;
+    use nodedb_physical::physical_plan::{ArrayOp, KvOp};
+
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+    let array_id = ArrayId::new(tenant, "genome");
+
+    let gaps: Vec<(&str, PhysicalPlan)> = vec![
+        (
+            "Document::BatchInsert",
+            PhysicalPlan::Document(DocumentOp::BatchInsert {
+                collection: "docs".into(),
+                documents: vec![("d1".into(), vec![1, 2, 3])],
+                surrogates: vec![Surrogate::new(1)],
+            }),
+        ),
+        (
+            "Document::Merge",
+            PhysicalPlan::Document(DocumentOp::Merge {
+                target_collection: "docs".into(),
+                source_collection: "staging".into(),
+                source_alias: "s".into(),
+                target_join_col: "id".into(),
+                source_join_col: "id".into(),
+                clauses: Vec::new(),
+                returning: None,
+                resolve_only: false,
+                resolved_inserts: None,
+            }),
+        ),
+        (
+            "Document::UpdateFromJoin",
+            PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
+                target_collection: "docs".into(),
+                source_collection: "staging".into(),
+                source_alias: "s".into(),
+                target_join_col: "id".into(),
+                source_join_col: "id".into(),
+                updates: Vec::new(),
+                target_filters: Vec::new(),
+                returning: None,
+            }),
+        ),
+        (
+            "Document::Truncate",
+            PhysicalPlan::Document(DocumentOp::Truncate {
+                collection: "docs".into(),
+                restart_identity: false,
+            }),
+        ),
+        (
+            "Kv::Truncate",
+            PhysicalPlan::Kv(KvOp::Truncate {
+                collection: "kv".into(),
+            }),
+        ),
+        (
+            "Crdt::SetConstraints",
+            PhysicalPlan::Crdt(CrdtOp::SetConstraints {
+                collection: "docs".into(),
+                constraint_version: 1,
+                constraints: Vec::new(),
+            }),
+        ),
+        (
+            "Crdt::DropConstraints",
+            PhysicalPlan::Crdt(CrdtOp::DropConstraints {
+                collection: "docs".into(),
+                constraint_version: 1,
+            }),
+        ),
+        (
+            "Crdt::RestoreToVersion",
+            PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
+                collection: "docs".into(),
+                document_id: "id1".into(),
+                target_version_json: "{}".into(),
+                surrogate: Surrogate::new(1),
+            }),
+        ),
+        (
+            "Array::Put",
+            PhysicalPlan::Array(ArrayOp::Put {
+                array_id: array_id.clone(),
+                cells_msgpack: Vec::new(),
+                wal_lsn: 0,
+                provenance: None,
+            }),
+        ),
+        (
+            "Array::Delete",
+            PhysicalPlan::Array(ArrayOp::Delete {
+                array_id,
+                coords_msgpack: Vec::new(),
+                wal_lsn: 0,
+                provenance: None,
+            }),
+        ),
+    ];
+
+    for (name, plan) in &gaps {
+        assert!(
+            to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, plan).is_none(),
+            "{name} is a known replication gap; wiring is a tracked follow-up — \
+             this test fails loudly if someone wires it so they update the tracking"
+        );
+    }
+}
+
+#[test]
+fn representative_handled_writes_still_replicate() {
+    use nodedb_physical::physical_plan::KvOp;
+
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    // A live document write and a live KV write must still return `Some` — a
+    // guard that the exhaustive-match refactor did not drop a handled arm.
+    let point_put = PhysicalPlan::Document(DocumentOp::PointPut {
+        collection: "docs".into(),
+        document_id: "d1".into(),
+        value: vec![1, 2, 3],
+        surrogate: Surrogate::ZERO,
+        pk_bytes: Vec::new(),
+    });
+    assert!(
+        to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &point_put).is_some(),
+        "Document::PointPut must still replicate"
+    );
+
+    let kv_put = PhysicalPlan::Kv(KvOp::Put {
+        collection: "kv".into(),
+        key: vec![1],
+        value: vec![2],
+        ttl_ms: 0,
+        surrogate: Surrogate::new(7),
+    });
+    assert!(
+        to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &kv_put).is_some(),
+        "Kv::Put must still replicate"
+    );
+}
