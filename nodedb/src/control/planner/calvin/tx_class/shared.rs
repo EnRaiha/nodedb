@@ -40,7 +40,10 @@ pub(super) fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
 }
 
 /// Extract `(collection, raw byte keys)` from a KV write plan, or `None` for a
-/// KV op with no statically-known point keys (e.g. `BatchPut`).
+/// KV op with no statically-known point keys (e.g. `BatchPut`). Single-key
+/// read-modify-write ops (`Incr`/`IncrFloat`/`Cas`/`GetSet`/`FieldSet`) key on
+/// the same `(collection, key)` pair as `Put`/`Insert`, so they sequence
+/// identically to the write-admission gate's `kv_point_key`.
 pub(super) fn kv_write_keys(op: &KvOp) -> Option<(String, Vec<Vec<u8>>)> {
     match op {
         KvOp::Put {
@@ -53,6 +56,21 @@ pub(super) fn kv_write_keys(op: &KvOp) -> Option<(String, Vec<Vec<u8>>)> {
             collection, key, ..
         }
         | KvOp::InsertOnConflictUpdate {
+            collection, key, ..
+        }
+        | KvOp::Incr {
+            collection, key, ..
+        }
+        | KvOp::IncrFloat {
+            collection, key, ..
+        }
+        | KvOp::Cas {
+            collection, key, ..
+        }
+        | KvOp::GetSet {
+            collection, key, ..
+        }
+        | KvOp::FieldSet {
             collection, key, ..
         } => Some((collection.clone(), vec![key.clone()])),
         KvOp::Delete { collection, keys } => Some((collection.clone(), keys.clone())),
@@ -105,7 +123,12 @@ pub(crate) fn collection_name_from_plan(plan: &PhysicalPlan) -> String {
             | KvOp::InsertIfAbsent { collection, .. }
             | KvOp::InsertOnConflictUpdate { collection, .. }
             | KvOp::Delete { collection, .. }
-            | KvOp::BatchPut { collection, .. },
+            | KvOp::BatchPut { collection, .. }
+            | KvOp::Incr { collection, .. }
+            | KvOp::IncrFloat { collection, .. }
+            | KvOp::Cas { collection, .. }
+            | KvOp::GetSet { collection, .. }
+            | KvOp::FieldSet { collection, .. },
         ) => collection.clone(),
         PhysicalPlan::Vector(
             VectorOp::Insert { collection, .. }
@@ -128,8 +151,140 @@ pub(super) fn surrogate_from_plan(plan: &PhysicalPlan) -> u32 {
             DocumentOp::PointPut { surrogate, .. }
             | DocumentOp::PointInsert { surrogate, .. }
             | DocumentOp::PointDelete { surrogate, .. }
-            | DocumentOp::PointUpdate { surrogate, .. },
+            | DocumentOp::PointUpdate { surrogate, .. }
+            | DocumentOp::Upsert { surrogate, .. },
         ) => surrogate.as_u32(),
         _ => 0,
+    }
+}
+
+/// Lockstep proof that the write-admission gate and the Calvin scheduler
+/// derive IDENTICAL lock keys for the same op. `plan_lock_keys` (gate side)
+/// and `kv_write_keys`/`surrogate_from_plan` -> `EngineKeySet` (scheduler
+/// side, via `build_single_vshard_tx_class`) must never diverge — if they
+/// did, a gate-fenced write and a sequenced txn would lock different keys
+/// and the write-ordering fix this module exists for would be void.
+#[cfg(test)]
+mod lockstep_tests {
+    use super::*;
+    use crate::control::cluster::calvin::scheduler::lock_manager::LockKey;
+    use crate::control::planner::calvin::tx_class::static_builder::build_single_vshard_tx_class;
+    use crate::control::server::shared::write_admission::lock_keys::plan_lock_keys;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_cluster::calvin::types::EngineKeySet;
+    use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+    use nodedb_types::Surrogate;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    fn task(plan: PhysicalPlan) -> PhysicalTask {
+        PhysicalTask {
+            tenant_id: TenantId::new(1),
+            vshard_id: VShardId::new(0),
+            database_id: DatabaseId::DEFAULT,
+            plan,
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        }
+    }
+
+    /// Mirrors the scheduler driver's `expand_rw_set` `EngineKeySet` ->
+    /// `LockKey` mapping. This half is fixed, engine-tag-driven translation
+    /// that does not vary per op; the property under test is whether the
+    /// extractor threads the SAME `(collection, key/surrogate)` the gate's
+    /// `plan_lock_keys` uses, not this mapping itself.
+    fn scheduler_lock_keys(sets: &[EngineKeySet]) -> BTreeSet<LockKey> {
+        let mut keys = BTreeSet::new();
+        for ks in sets {
+            match ks {
+                EngineKeySet::Document {
+                    collection,
+                    surrogates,
+                }
+                | EngineKeySet::Vector {
+                    collection,
+                    surrogates,
+                } => {
+                    let coll: Arc<str> = Arc::from(collection.as_str());
+                    for &surrogate in surrogates.iter() {
+                        keys.insert(LockKey::Surrogate {
+                            collection: Arc::clone(&coll),
+                            surrogate,
+                        });
+                    }
+                }
+                EngineKeySet::Kv {
+                    collection,
+                    keys: kv_keys,
+                } => {
+                    let coll: Arc<str> = Arc::from(collection.as_str());
+                    for k in kv_keys.iter() {
+                        keys.insert(LockKey::Kv {
+                            collection: Arc::clone(&coll),
+                            key: Arc::from(k.as_slice()),
+                        });
+                    }
+                }
+                EngineKeySet::Edge {
+                    collection, edges, ..
+                } => {
+                    let coll: Arc<str> = Arc::from(collection.as_str());
+                    for &(src, dst) in edges.iter() {
+                        keys.insert(LockKey::Edge {
+                            collection: Arc::clone(&coll),
+                            src,
+                            dst,
+                        });
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    fn assert_gate_matches_scheduler(plan: PhysicalPlan) {
+        let t = task(plan);
+        let (_, gate_keys) =
+            plan_lock_keys(&t.plan).expect("op must be fast-path eligible for this test");
+        let tx = build_single_vshard_tx_class(&[t], TenantId::new(1), &[])
+            .expect("valid single-vshard TxClass");
+        let scheduler_keys = scheduler_lock_keys(&tx.write_set.0);
+        assert_eq!(
+            gate_keys, scheduler_keys,
+            "gate and scheduler must lock the identical key set"
+        );
+    }
+
+    #[test]
+    fn kv_incr_gate_key_matches_scheduler_key() {
+        assert_gate_matches_scheduler(PhysicalPlan::Kv(KvOp::Incr {
+            collection: "counters".to_owned(),
+            key: b"ctr".to_vec(),
+            delta: 1,
+            ttl_ms: 0,
+            surrogate: Surrogate::new(3),
+        }));
+    }
+
+    #[test]
+    fn kv_cas_gate_key_matches_scheduler_key() {
+        assert_gate_matches_scheduler(PhysicalPlan::Kv(KvOp::Cas {
+            collection: "counters".to_owned(),
+            key: b"ctr".to_vec(),
+            expected: vec![],
+            new_value: vec![],
+            surrogate: Surrogate::new(3),
+        }));
+    }
+
+    #[test]
+    fn document_upsert_gate_key_matches_scheduler_key() {
+        assert_gate_matches_scheduler(PhysicalPlan::Document(DocumentOp::Upsert {
+            collection: "docs".to_owned(),
+            document_id: "d1".to_owned(),
+            value: vec![],
+            on_conflict_updates: vec![],
+            surrogate: Surrogate::new(9),
+        }));
     }
 }

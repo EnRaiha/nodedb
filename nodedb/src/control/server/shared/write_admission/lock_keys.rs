@@ -75,8 +75,10 @@ fn point_lock_key(plan: &PhysicalPlan) -> Option<LockKey> {
     }
 }
 
-/// Document-engine point-write key: the row surrogate. Predicate / multi-row
-/// document writes have no single point identity and route to the scheduler.
+/// Document-engine point-write key: the row surrogate. `Upsert` carries a
+/// pre-assigned single-row surrogate just like the `Point*` ops, so it locks
+/// identically. Predicate / multi-row document writes have no single point
+/// identity and route to the scheduler.
 fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
     match op {
         DocumentOp::PointPut {
@@ -98,13 +100,17 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
             collection,
             surrogate,
             ..
+        }
+        | DocumentOp::Upsert {
+            collection,
+            surrogate,
+            ..
         } => Some(LockKey::Surrogate {
             collection: Arc::from(collection.as_str()),
             surrogate: surrogate.as_u32(),
         }),
         DocumentOp::BatchInsert { .. }
         | DocumentOp::InsertSelect { .. }
-        | DocumentOp::Upsert { .. }
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::UpdateFromJoin { .. } => None,
@@ -112,8 +118,12 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
     }
 }
 
-/// KV-engine point-write key: the single raw byte key. A single-key delete is a
-/// point write; multi-key delete and batch put have no single identity.
+/// KV-engine point-write key: the single raw byte key. Covers plain writes
+/// (`Put`/`Insert`/`InsertIfAbsent`/`InsertOnConflictUpdate`), single-key
+/// `Delete`, and single-key read-modify-write ops (`Incr`/`IncrFloat`/`Cas`/
+/// `GetSet`/`FieldSet`) — all of them mutate exactly one row identified by
+/// `(collection, key)`. Multi-key delete and batch put have no single
+/// identity.
 fn kv_point_key(op: &KvOp) -> Option<LockKey> {
     match op {
         KvOp::Put {
@@ -126,6 +136,21 @@ fn kv_point_key(op: &KvOp) -> Option<LockKey> {
             collection, key, ..
         }
         | KvOp::InsertOnConflictUpdate {
+            collection, key, ..
+        }
+        | KvOp::Incr {
+            collection, key, ..
+        }
+        | KvOp::IncrFloat {
+            collection, key, ..
+        }
+        | KvOp::Cas {
+            collection, key, ..
+        }
+        | KvOp::GetSet {
+            collection, key, ..
+        }
+        | KvOp::FieldSet {
             collection, key, ..
         } => Some(LockKey::Kv {
             collection: Arc::from(collection.as_str()),
@@ -190,5 +215,138 @@ fn graph_point_key(op: &GraphOp) -> Option<LockKey> {
             dst: dst_surrogate.as_u32(),
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_types::Surrogate;
+
+    fn kv_key(op: KvOp) -> LockKey {
+        kv_point_key(&op).expect("expected a lock key for this KV op")
+    }
+
+    #[test]
+    fn kv_incr_yields_kv_lock_key() {
+        assert_eq!(
+            kv_key(KvOp::Incr {
+                collection: "counters".to_owned(),
+                key: b"k1".to_vec(),
+                delta: 1,
+                ttl_ms: 0,
+                surrogate: Surrogate::new(1),
+            }),
+            LockKey::Kv {
+                collection: Arc::from("counters"),
+                key: Arc::from(b"k1".as_slice()),
+            }
+        );
+    }
+
+    #[test]
+    fn kv_incr_float_yields_kv_lock_key() {
+        assert_eq!(
+            kv_key(KvOp::IncrFloat {
+                collection: "counters".to_owned(),
+                key: b"k1".to_vec(),
+                delta: 1.5,
+                surrogate: Surrogate::new(1),
+            }),
+            LockKey::Kv {
+                collection: Arc::from("counters"),
+                key: Arc::from(b"k1".as_slice()),
+            }
+        );
+    }
+
+    #[test]
+    fn kv_cas_yields_kv_lock_key() {
+        assert_eq!(
+            kv_key(KvOp::Cas {
+                collection: "counters".to_owned(),
+                key: b"k1".to_vec(),
+                expected: vec![],
+                new_value: vec![],
+                surrogate: Surrogate::new(1),
+            }),
+            LockKey::Kv {
+                collection: Arc::from("counters"),
+                key: Arc::from(b"k1".as_slice()),
+            }
+        );
+    }
+
+    #[test]
+    fn kv_get_set_yields_kv_lock_key() {
+        assert_eq!(
+            kv_key(KvOp::GetSet {
+                collection: "counters".to_owned(),
+                key: b"k1".to_vec(),
+                new_value: vec![],
+                surrogate: Surrogate::new(1),
+            }),
+            LockKey::Kv {
+                collection: Arc::from("counters"),
+                key: Arc::from(b"k1".as_slice()),
+            }
+        );
+    }
+
+    #[test]
+    fn kv_field_set_yields_kv_lock_key() {
+        assert_eq!(
+            kv_key(KvOp::FieldSet {
+                collection: "counters".to_owned(),
+                key: b"k1".to_vec(),
+                updates: vec![],
+                surrogate: Surrogate::new(1),
+            }),
+            LockKey::Kv {
+                collection: Arc::from("counters"),
+                key: Arc::from(b"k1".as_slice()),
+            }
+        );
+    }
+
+    #[test]
+    fn kv_batch_put_stays_unfenced() {
+        assert_eq!(
+            kv_point_key(&KvOp::BatchPut {
+                collection: "counters".to_owned(),
+                entries: vec![(b"k1".to_vec(), vec![]), (b"k2".to_vec(), vec![])],
+                ttl_ms: 0,
+                surrogates: vec![],
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn kv_multi_key_delete_stays_unfenced() {
+        assert_eq!(
+            kv_point_key(&KvOp::Delete {
+                collection: "counters".to_owned(),
+                keys: vec![b"k1".to_vec(), b"k2".to_vec()],
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn document_upsert_yields_surrogate_lock_key() {
+        assert_eq!(
+            document_point_key(&DocumentOp::Upsert {
+                collection: "docs".to_owned(),
+                document_id: "d1".to_owned(),
+                value: vec![],
+                on_conflict_updates: vec![],
+                surrogate: Surrogate::new(7),
+            }),
+            Some(LockKey::Surrogate {
+                collection: Arc::from("docs"),
+                surrogate: 7,
+            })
+        );
     }
 }
