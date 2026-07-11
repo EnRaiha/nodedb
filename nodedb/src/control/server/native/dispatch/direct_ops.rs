@@ -19,8 +19,6 @@ use crate::control::server::shared::session::staging_gate::{
 use crate::types::{Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use crate::control::server::wal_dispatch;
-
 use super::super::super::dispatch_utils;
 use super::{DispatchCtx, error_to_native, shape_error_to_native, to_native_columns_rows};
 
@@ -519,22 +517,17 @@ async fn dispatch_single_task_raw(
         None => {
             // Local SPSC path (single-node boot, before the gateway is wired):
             // the gateway would otherwise own WAL durability on the target node,
-            // so we must append locally before dispatching. Doing it here covers
+            // so the write must be appended locally. The append is performed
+            // inside the dispatch core, under the write-admission guard and just
+            // before the enqueue, so LSN order matches apply order. This covers
             // every local dispatch — the no-edge fast path AND each task of a
             // single-shard edge bundle — so an implicit edge written on the boot
             // path is durable. (Cross-shard bundles route via Calvin, which owns
             // its own replicated durability and never reaches this branch.)
-            let wal_outcome = wal_dispatch::wal_append_if_write(
-                &ctx.state.wal,
-                tenant_id,
-                vshard_id,
-                ctx.database_id(),
-                &plan,
-            )?;
             let database_id = ctx.database_id();
-            dispatch_utils::dispatch_write_to_data_plane(
+            dispatch_utils::dispatch_autocommit_write(
                 ctx.state,
-                dispatch_utils::WriteDispatch {
+                dispatch_utils::AutocommitWrite {
                     tenant_id,
                     database_id,
                     vshard_id,
@@ -542,8 +535,6 @@ async fn dispatch_single_task_raw(
                     trace_id: TraceId::ZERO,
                     event_source: crate::event::EventSource::User,
                     txn_id,
-                    wal_lsn: wal_outcome.lsn,
-                    resolved_now_ms: wal_outcome.resolved_now_ms,
                 },
             )
             .await

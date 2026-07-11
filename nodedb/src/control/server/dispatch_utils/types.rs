@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Request-identity types passed into the dispatch core: the write's target
+//! coordinates plus its WAL-durability handling.
+
+use crate::bridge::envelope::PhysicalPlan;
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+
+/// Identity of a single autocommit write whose WAL append the core owns. Unlike
+/// [`WriteDispatch`] it carries no `wal_lsn` / `resolved_now_ms`: those are
+/// minted inside `dispatch_to_data_plane_inner`, under the write-admission
+/// guard, so LSN-allocation order matches dispatcher-enqueue order per key.
+pub(crate) struct AutocommitWrite {
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub vshard_id: VShardId,
+    pub plan: PhysicalPlan,
+    pub trace_id: TraceId,
+    pub event_source: crate::event::EventSource,
+    pub txn_id: Option<crate::types::TxnId>,
+}
+
+/// Identity + WAL LSN of a single autocommit write dispatched to the Data
+/// Plane. Bundles the fields so `dispatch_write_to_data_plane` avoids a long
+/// positional argument list.
+pub(crate) struct WriteDispatch {
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub vshard_id: VShardId,
+    pub plan: PhysicalPlan,
+    pub trace_id: TraceId,
+    pub event_source: crate::event::EventSource,
+    pub txn_id: Option<crate::types::TxnId>,
+    pub wal_lsn: Option<crate::types::Lsn>,
+    /// Wall-clock instant (ms since epoch) the Control Plane resolved at
+    /// WAL-append time for a TTL-bearing KV write's `expire_at_ms`. Stamped
+    /// onto the `Request` (same as `wal_lsn`) so the Data Plane installs the
+    /// SAME instant the durable WAL record carries instead of re-reading the
+    /// clock at apply time. `None` for reads, non-TTL writes, and writes whose
+    /// resolved instant is not (yet) threaded.
+    pub resolved_now_ms: Option<u64>,
+}
+
+/// Inputs for `dispatch_to_data_plane_inner`: the Data Plane request identity
+/// plus the write's event source and optional owning transaction.
+pub(super) struct DataPlaneDispatch {
+    pub(super) tenant_id: TenantId,
+    pub(super) database_id: DatabaseId,
+    pub(super) vshard_id: VShardId,
+    pub(super) plan: PhysicalPlan,
+    pub(super) trace_id: TraceId,
+    pub(super) event_source: crate::event::EventSource,
+    pub(super) txn_id: Option<crate::types::TxnId>,
+    /// WAL LSN allocated for this write (from `wal_append_if_write`), stamped
+    /// onto the `Request` so the Data Plane records the committed write
+    /// version. `None` for reads and control ops.
+    pub(super) wal_lsn: Option<crate::types::Lsn>,
+    /// Resolved TTL instant, stamped onto the `Request` alongside `wal_lsn` —
+    /// see [`WriteDispatch::resolved_now_ms`].
+    pub(super) resolved_now_ms: Option<u64>,
+    /// When `true`, the core appends this write to the WAL itself — under the
+    /// write-admission guard, immediately before the dispatcher enqueue — and
+    /// stamps the minted LSN (and any resolved TTL instant) onto the `Request`,
+    /// ignoring `wal_lsn` / `resolved_now_ms`. This is what keeps WAL-LSN order
+    /// equal to Data-Plane apply order per key. When `false`, the caller already
+    /// appended (or the write's durability lives elsewhere) and the core stamps
+    /// the caller-supplied `wal_lsn` / `resolved_now_ms` unchanged.
+    pub(super) append_wal: bool,
+}

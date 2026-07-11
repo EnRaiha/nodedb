@@ -380,19 +380,17 @@ pub async fn query(
                 continue;
             }
 
-            // WAL append for write operations. The allocated LSN (and, for a
-            // TTL-bearing KV write, the resolved instant) is stamped onto the
-            // local-dispatch write below so the Data Plane records the
-            // committed write version and installs the same TTL instant.
-            let wal_outcome = wal_append_if_write(&state, &task)?;
-
             // Captured before dispatch moves `task.plan` — needed by the
             // protocol-neutral shaping core below.
             let plan_kind = describe_plan(&task.plan);
             let plan_for_shape = task.plan.clone();
 
-            // Dispatch: prefer gateway when available (cluster-aware routing),
-            // fall back to direct local SPSC dispatch on single-node boot.
+            // Dispatch: prefer gateway when available (cluster-aware routing —
+            // the gateway owns WAL durability on the target node), fall back to
+            // direct local SPSC dispatch on single-node boot. On the local path
+            // the WAL append is performed inside the dispatch core, under the
+            // write-admission guard and just before the enqueue, so LSN order
+            // matches apply order.
             let payloads = match state.shared.gateway.as_ref() {
                 Some(gw) => {
                     let gw_ctx = QueryContext {
@@ -408,9 +406,9 @@ pub async fn query(
                 None => {
                     // Single-node boot: gateway not yet initialised — dispatch locally.
                     let response =
-                        crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
+                        crate::control::server::dispatch_utils::dispatch_autocommit_write(
                             &state.shared,
-                            crate::control::server::dispatch_utils::WriteDispatch {
+                            crate::control::server::dispatch_utils::AutocommitWrite {
                                 tenant_id: task.tenant_id,
                                 database_id: task.database_id,
                                 vshard_id: task.vshard_id,
@@ -418,8 +416,6 @@ pub async fn query(
                                 trace_id,
                                 event_source: crate::event::EventSource::User,
                                 txn_id: None,
-                                wal_lsn: wal_outcome.lsn,
-                                resolved_now_ms: wal_outcome.resolved_now_ms,
                             },
                         )
                         .await
@@ -467,21 +463,6 @@ pub async fn query(
 
     state.shared.tenant_request_end(tenant_id);
     result
-}
-
-/// Append write operations to WAL before dispatch (single-node durability).
-fn wal_append_if_write(
-    state: &AppState,
-    task: &nodedb_physical::physical_task::PhysicalTask,
-) -> Result<crate::control::server::wal_dispatch::WalAppendOutcome, ApiError> {
-    crate::control::server::wal_dispatch::wal_append_if_write(
-        &state.shared.wal,
-        task.tenant_id,
-        task.vshard_id,
-        task.database_id,
-        &task.plan,
-    )
-    .map_err(|e| ApiError::Internal(format!("WAL append: {e}")))
 }
 
 /// POST /v1/query/stream — execute SQL and return results as NDJSON (newline-delimited JSON).

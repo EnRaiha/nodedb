@@ -13,7 +13,6 @@ use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::server::dispatch_utils;
-use crate::control::server::wal_dispatch;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, RequestId, TraceId, VShardId};
 
@@ -63,23 +62,19 @@ pub(super) async fn dispatch_kv(
     }
 }
 
-/// Dispatch a KV write operation: WAL append first, then gateway or Data Plane.
+/// Dispatch a KV write operation through the gateway or the local Data Plane.
 ///
-/// Routes through the gateway when available (cluster-aware routing), falling
-/// back to direct local SPSC dispatch on single-node boot.
+/// Routes through the gateway when available (cluster-aware routing) — where the
+/// gateway owns WAL durability on the target node — falling back to direct local
+/// SPSC dispatch on single-node boot. On the local path the WAL append is
+/// performed inside the dispatch core, under the write-admission guard and just
+/// before the enqueue, so LSN order matches apply order.
 pub(super) async fn dispatch_kv_write(
     state: &SharedState,
     session: &RespSession,
     plan: PhysicalPlan,
 ) -> crate::Result<Response> {
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &session.collection);
-    let wal_outcome = wal_dispatch::wal_append_if_write(
-        &state.wal,
-        session.tenant_id,
-        vshard,
-        DatabaseId::DEFAULT,
-        &plan,
-    )?;
     match state.gateway.as_ref() {
         Some(gw) => {
             let gw_ctx = QueryContext {
@@ -94,9 +89,9 @@ pub(super) async fn dispatch_kv_write(
                 })
                 .map(gateway_payloads_to_response)
         }
-        None => dispatch_utils::dispatch_write_to_data_plane(
+        None => dispatch_utils::dispatch_autocommit_write(
             state,
-            dispatch_utils::WriteDispatch {
+            dispatch_utils::AutocommitWrite {
                 tenant_id: session.tenant_id,
                 database_id: DatabaseId::DEFAULT,
                 vshard_id: vshard,
@@ -104,8 +99,6 @@ pub(super) async fn dispatch_kv_write(
                 trace_id: TraceId::ZERO,
                 event_source: crate::event::EventSource::User,
                 txn_id: None,
-                wal_lsn: wal_outcome.lsn,
-                resolved_now_ms: wal_outcome.resolved_now_ms,
             },
         )
         .await

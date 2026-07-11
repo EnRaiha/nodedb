@@ -237,19 +237,12 @@ pub(super) async fn dispatch_plan(
     vshard_id: crate::types::VShardId,
     plan: crate::bridge::envelope::PhysicalPlan,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
-    let wal_outcome = match crate::control::server::wal_dispatch::wal_append_if_write(
-        &state.wal,
-        tenant_id,
-        vshard_id,
-        crate::types::DatabaseId::DEFAULT,
-        &plan,
-    ) {
-        Ok(outcome) => outcome,
-        Err(e) => return Some(Err(ddl_err("XX000", e.to_string()))),
-    };
-    if let Err(e) = crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
+    // The WAL append is performed inside the dispatch core, under the
+    // write-admission guard and just before the enqueue, so LSN order matches
+    // apply order.
+    if let Err(e) = crate::control::server::dispatch_utils::dispatch_autocommit_write(
         state,
-        crate::control::server::dispatch_utils::WriteDispatch {
+        crate::control::server::dispatch_utils::AutocommitWrite {
             tenant_id,
             database_id: crate::types::DatabaseId::DEFAULT,
             vshard_id,
@@ -257,8 +250,6 @@ pub(super) async fn dispatch_plan(
             trace_id: TraceId::ZERO,
             event_source: crate::event::EventSource::User,
             txn_id: None,
-            wal_lsn: wal_outcome.lsn,
-            resolved_now_ms: wal_outcome.resolved_now_ms,
         },
     )
     .await
@@ -431,19 +422,13 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             }
         };
 
-        // Not in a transaction block (or a read): reproduce today's
-        // immediate autocommit path exactly — WAL append then dispatch.
-        let wal_outcome = crate::control::server::wal_dispatch::wal_append_if_write(
-            &state.wal,
-            tenant_id,
-            task_vshard_id,
-            task_database_id,
-            &task.plan,
-        )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
-        let response = crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
+        // Not in a transaction block (or a read): the immediate autocommit path.
+        // The WAL append is performed inside the dispatch core, under the
+        // write-admission guard and just before the enqueue, so LSN order matches
+        // apply order.
+        let response = crate::control::server::dispatch_utils::dispatch_autocommit_write(
             state,
-            crate::control::server::dispatch_utils::WriteDispatch {
+            crate::control::server::dispatch_utils::AutocommitWrite {
                 tenant_id,
                 database_id: task_database_id,
                 vshard_id: task_vshard_id,
@@ -451,8 +436,6 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
                 trace_id: TraceId::ZERO,
                 event_source: crate::event::EventSource::User,
                 txn_id: None,
-                wal_lsn: wal_outcome.lsn,
-                resolved_now_ms: wal_outcome.resolved_now_ms,
             },
         )
         .await
