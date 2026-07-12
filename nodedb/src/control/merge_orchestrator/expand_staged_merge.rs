@@ -26,7 +26,7 @@
 //! Mirrors [`crate::control::insert_select::expand_staged`]; see its module doc
 //! for why concrete `PointInsert` (not `BatchInsert`) is emitted.
 
-use nodedb_types::{Surrogate, TenantId};
+use nodedb_types::TenantId;
 
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
@@ -37,7 +37,7 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::target_surrogate::{
     ResolvedMergeArms, TargetPk, assign_target_surrogate, bare_collection_name, decode_resolve,
-    derive_document_id, resolve_target_pk,
+    derive_document_id, require_surrogate, resolve_target_pk,
 };
 
 /// Expand every staged `DocumentOp::Merge` in `buffered` into concrete,
@@ -203,7 +203,7 @@ fn emit_arms(
     }
 
     for (doc_id, surrogate_u32, body) in arms.updates {
-        let surrogate = require_surrogate(surrogate_u32, &doc_id)?;
+        let surrogate = require_surrogate(surrogate_u32, &doc_id, "MERGE")?;
         let document_id = derive_document_id(target_pk, &body, surrogate);
         let pk_bytes = document_id.clone().into_bytes();
         out.push(point_task(
@@ -220,7 +220,7 @@ fn emit_arms(
     }
 
     for (doc_id, surrogate_u32, body) in arms.deletes {
-        let surrogate = require_surrogate(surrogate_u32, &doc_id)?;
+        let surrogate = require_surrogate(surrogate_u32, &doc_id, "MERGE")?;
         let document_id = derive_document_id(target_pk, &body, surrogate);
         let pk_bytes = document_id.clone().into_bytes();
         out.push(point_task(
@@ -236,21 +236,6 @@ fn emit_arms(
         ));
     }
     Ok(())
-}
-
-/// A resolved UPDATE/DELETE arm must carry the target row's registered
-/// surrogate. `None` means a non-surrogate-keyed row — unreachable for every
-/// current (and every vector-indexed) collection — so fail the commit loudly
-/// rather than emit a degraded, unindexed, unreplicated write.
-fn require_surrogate(surrogate_u32: Option<u32>, doc_id: &str) -> crate::Result<Surrogate> {
-    match surrogate_u32 {
-        Some(s) => Ok(Surrogate::new(s)),
-        None => Err(crate::Error::PlanError {
-            detail: format!(
-                "MERGE target row '{doc_id}' lacks a surrogate; collection is not surrogate-keyed"
-            ),
-        }),
-    }
 }
 
 /// Build a concrete point-write task carrying the staged transaction's identity

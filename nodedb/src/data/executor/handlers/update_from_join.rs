@@ -6,21 +6,45 @@
 //! Phase 1: scan the source collection to build a lookup map keyed by the
 //!          equi-join value (`source[source_join_col]`).
 //! Phase 2: scan the target collection; for each row whose join-column value
-//!          matches a source row, build a merged document, evaluate the
-//!          assignments, and write the updated row back.
+//!          matches a source row, build a merged document and evaluate the
+//!          assignments to produce the post-image (shared classifier in
+//!          `update_from_join_collect::collect_update_from_join_rows`).
+//! Phase 3: either write each post-image back (`resolve_only == false`) or, on
+//!          the COMMIT-time RESOLVE pass (`resolve_only == true`), return the
+//!          matched rows as `(doc_id, Option<surrogate>, post_image_body)` for
+//!          the expander to rewrite into concrete `PointPut` ops — WITHOUT
+//!          writing, re-indexing, accumulating a write-set, or emitting events.
 
+use nodedb_types::Surrogate;
 use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::doc_format;
 use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
 use crate::data::executor::handlers::returning_rows;
-use crate::data::executor::handlers::update_from_join_source_map::json_value_to_string;
 use crate::data::executor::response_codec::encode_json;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
+
+/// One target row matched by the join, with its post-image resolved but not yet
+/// written. Produced by [`CoreLoop::collect_update_from_join_rows`] and consumed
+/// by BOTH the write pass (below) and the RESOLVE pass — the single shared
+/// classifier so the two cannot diverge on which rows match or what post-image
+/// each carries.
+pub(in crate::data::executor) struct ResolvedUpdateRow {
+    /// Target storage key (hex-encoded surrogate on a surrogate-keyed row).
+    pub doc_id: String,
+    /// The row's registered surrogate, parsed from `doc_id`. `None` for a
+    /// legacy non-surrogate-keyed row.
+    pub surrogate: Option<Surrogate>,
+    /// Post-image body: strict Binary Tuple for a strict target, MessagePack
+    /// for a schemaless target.
+    pub body: Vec<u8>,
+    /// Post-image decoded to JSON (generated columns applied), reused by the
+    /// write pass to build `RETURNING` rows without re-decoding `body`.
+    pub doc: serde_json::Value,
+}
 
 /// Parameters for `execute_update_from_join`.
 pub(in crate::data::executor) struct UpdateFromJoinParams<'a> {
@@ -32,6 +56,13 @@ pub(in crate::data::executor) struct UpdateFromJoinParams<'a> {
     pub updates: &'a [(String, UpdateValue)],
     pub target_filter_bytes: &'a [u8],
     pub returning: Option<&'a ReturningSpec>,
+    /// RESOLVE-ONLY read pass (Control-Plane COMMIT expander). When `true`, the
+    /// handler runs the identical scan/join/assignment/encode pipeline as the
+    /// write path but writes NOTHING — no `sparse.put`, no vector re-index, no
+    /// write-set, no events — and returns the matched rows as msgpack
+    /// `Vec<(doc_id, Option<surrogate_u32>, post_image_body)>` for the expander
+    /// to rewrite into concrete `PointPut` ops. `false` = the normal write path.
+    pub resolve_only: bool,
     /// Control-Plane-shipped source rows for cross-core `UPDATE ... FROM`. When
     /// `Some`, the source join-map is built from these pre-scanned
     /// `(source_doc_id, raw_stored_source_bytes)` rows instead of a local read
@@ -58,6 +89,7 @@ impl CoreLoop {
             updates,
             target_filter_bytes,
             returning,
+            resolve_only,
             source_rows,
         } = params;
 
@@ -65,6 +97,7 @@ impl CoreLoop {
             core = self.core_id,
             target = %target_collection,
             source = %source_collection,
+            resolve_only,
             "update from join"
         );
 
@@ -88,8 +121,27 @@ impl CoreLoop {
             }
         };
 
+        // Check for strict storage mode on the target.
+        let config_key = (
+            crate::types::TenantId::new(tid),
+            target_collection.to_string(),
+        );
+        let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
+            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
+                c.storage_mode
+            {
+                Some(schema.clone())
+            } else {
+                None
+            }
+        });
+
         if source_map.is_empty() {
-            // No source rows — nothing to update.
+            // No source rows — nothing matches. The RESOLVE pass returns an
+            // empty match set; the write path reports zero affected.
+            if resolve_only {
+                return self.encode_resolved_update_rows(task, Vec::new());
+            }
             let result = serde_json::json!({ "affected": 0u64 });
             return match encode_json(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
@@ -119,20 +171,40 @@ impl CoreLoop {
             }
         };
 
-        // Check for strict storage mode on the target.
-        let config_key = (
-            crate::types::TenantId::new(tid),
-            target_collection.to_string(),
-        );
-        let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
-            if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                c.storage_mode
-            {
-                Some(schema.clone())
-            } else {
-                None
+        // Phase 3: Scan the target, join each row against the source, evaluate
+        // the SET assignments, and encode the post-image — WITHOUT writing. This
+        // classification is shared verbatim by both the RESOLVE pass and the
+        // write path so the two cannot diverge on match set or post-image.
+        let rows = match self.collect_update_from_join_rows(
+            super::update_from_join_collect::CollectUpdateRows {
+                task,
+                tid,
+                target_collection,
+                source_alias,
+                target_join_col,
+                updates,
+                source_map: &source_map,
+                target_filters: &target_filters,
+                strict_schema: strict_schema.as_ref(),
+                config_key: &config_key,
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
             }
-        });
+        };
+
+        // RESOLVE pass: hand the matched rows back for COMMIT-time expansion.
+        // No `sparse.put`, no vector re-index, no write-set, no events.
+        if resolve_only {
+            return self.encode_resolved_update_rows(task, rows);
+        }
 
         // Gate secondary-vector maintenance once for the whole statement so a
         // non-vector target collection pays nothing. When a vector field is
@@ -141,78 +213,9 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let has_vectors = self.collection_has_vectors(database_id, tid, target_collection);
 
-        // Scan target documents and apply updates for those that match.
-        let prefix = crate::engine::sparse::btree::coll_prefix(
-            task.request.database_id.as_u64(),
-            tid,
-            target_collection,
-        );
-        let end = format!("{prefix}\u{ffff}");
-
-        let target_doc_ids: Vec<String> = {
-            let read_txn = match self
-                .sparse
-                .db()
-                .begin_read()
-                .map_err(|e| crate::Error::Storage {
-                    engine: "sparse".into(),
-                    detail: format!("read txn: {e}"),
-                }) {
-                Ok(t) => t,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
-                }
-            };
-            let table = match read_txn
-                .open_table(crate::engine::sparse::btree::DOCUMENTS)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "sparse".into(),
-                    detail: format!("open table: {e}"),
-                }) {
-                Ok(t) => t,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
-                }
-            };
-
-            let mut ids = Vec::new();
-            if let Ok(range) = table.range(prefix.as_str()..end.as_str()) {
-                for entry in range.flatten() {
-                    let key = entry.0.value();
-                    let value_bytes = entry.1.value();
-                    let matches = if let Some(ref schema) = strict_schema {
-                        match super::super::strict_format::binary_tuple_to_json(value_bytes, schema)
-                        {
-                            Some(doc) => {
-                                let msgpack = doc_format::encode_to_msgpack(&doc);
-                                target_filters.iter().all(|f| f.matches_binary(&msgpack))
-                            }
-                            None => false,
-                        }
-                    } else {
-                        target_filters.iter().all(|f| f.matches_binary(value_bytes))
-                    };
-                    if matches && let Some(doc_id) = key.strip_prefix(&prefix) {
-                        ids.push(doc_id.to_string());
-                    }
-                }
-            }
-            ids
-        };
-
         let mut affected = 0u64;
         // One post-apply `Put` redo entry per updated row on a vector collection.
-        // Each row's `sparse.put` above reconciled storage + the btree/FTS/graph
+        // Each row's `sparse.put` below reconciled storage + the btree/FTS/graph
         // overlays but minted no WAL redo carrying the new body, so a WAL-only
         // restart would rebuild the HNSW from the pre-update `Put` records and
         // resurrect the stale embeddings. Carrying the surrogate + post-image back
@@ -220,112 +223,18 @@ impl CoreLoop {
         // when the collection has a vector index.
         let mut write_set: Vec<WriteSetEntry> = Vec::new();
         let mut returned_docs: Vec<serde_json::Value> = if returning.is_some() {
-            Vec::with_capacity(target_doc_ids.len())
+            Vec::with_capacity(rows.len())
         } else {
             Vec::new()
         };
 
-        for doc_id in &target_doc_ids {
-            let current_bytes = match self.sparse.get(
-                task.request.database_id.as_u64(),
-                tid,
-                target_collection,
+        for row in rows {
+            let ResolvedUpdateRow {
                 doc_id,
-            ) {
-                Ok(Some(b)) => b,
-                Ok(None) => continue,
-                Err(_) => continue,
-            };
-
-            let mut target_doc = if let Some(ref schema) = strict_schema {
-                match super::super::strict_format::binary_tuple_to_json(&current_bytes, schema) {
-                    Some(v) => v,
-                    None => continue,
-                }
-            } else {
-                match doc_format::decode_document(&current_bytes) {
-                    Some(v) => v,
-                    None => continue,
-                }
-            };
-
-            // Extract the join key from the target document.
-            let join_val = target_doc
-                .get(target_join_col)
-                .map(json_value_to_string)
-                .unwrap_or_default();
-
-            // Look up the matching source row.
-            let source_doc = match source_map.get(&join_val) {
-                Some(s) => s,
-                None => continue, // No matching source row — skip this target row.
-            };
-
-            // Build a merged document for expression evaluation:
-            // target fields are bare; source fields are qualified as "alias.field".
-            let mut merged = target_doc.clone();
-            if let (Some(merged_obj), Some(src_obj)) =
-                (merged.as_object_mut(), source_doc.as_object())
-            {
-                for (k, v) in src_obj {
-                    merged_obj.insert(format!("{source_alias}.{k}"), v.clone());
-                }
-            }
-            let merged_ndb: nodedb_types::Value = merged.clone().into();
-
-            // Apply SET assignments evaluated against the merged document.
-            if let Some(target_obj) = target_doc.as_object_mut() {
-                for (field, update_val) in updates {
-                    let val: serde_json::Value = match update_val {
-                        UpdateValue::Literal(bytes) => {
-                            match nodedb_types::json_from_msgpack(bytes) {
-                                Ok(v) => v,
-                                Err(_) => continue,
-                            }
-                        }
-                        UpdateValue::Expr(expr) => expr.eval(&merged_ndb).into(),
-                    };
-                    target_obj.insert(field.clone(), val);
-                }
-            }
-
-            // Recompute generated columns if any dependency changed.
-            if let Some(config) = self.doc_configs.get(&config_key)
-                && !config.enforcement.generated_columns.is_empty()
-                && super::generated::needs_recomputation(
-                    updates,
-                    &config.enforcement.generated_columns,
-                )
-                && let Err(e) = super::generated::evaluate_generated_columns(
-                    &mut target_doc,
-                    &config.enforcement.generated_columns,
-                )
-            {
-                tracing::warn!(
-                    %doc_id,
-                    error = ?e,
-                    "generated column recomputation failed during UpdateFromJoin, skipping"
-                );
-                continue;
-            }
-
-            // Re-encode and write back.
-            let updated_bytes = if let Some(ref schema) = strict_schema {
-                let ndb_val: nodedb_types::Value = target_doc.clone().into();
-                match super::super::strict_format::value_to_binary_tuple(&ndb_val, schema) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!(
-                            %doc_id,
-                            error = %e,
-                            "strict re-encode failed during UpdateFromJoin, skipping"
-                        );
-                        continue;
-                    }
-                }
-            } else {
-                doc_format::encode_to_msgpack(&target_doc)
-            };
+                surrogate: row_surrogate,
+                body: updated_bytes,
+                mut doc,
+            } = row;
 
             if self
                 .sparse
@@ -333,7 +242,7 @@ impl CoreLoop {
                     task.request.database_id.as_u64(),
                     tid,
                     target_collection,
-                    doc_id,
+                    &doc_id,
                     &updated_bytes,
                 )
                 .is_ok()
@@ -342,13 +251,9 @@ impl CoreLoop {
                     task.request.database_id.as_u64(),
                     tid,
                     target_collection,
-                    doc_id,
+                    &doc_id,
                     &updated_bytes,
                 );
-                // Parsed once and reused below for both the reindex and the
-                // write-set entry (the row's doc_id is the hex-encoded
-                // surrogate storage key).
-                let row_surrogate = crate::engine::document::store::doc_id_to_surrogate(doc_id);
                 // Re-index the row's vectors from the new body (soft-delete the
                 // old HNSW node + insert the new one, keyed by the stable
                 // surrogate), then carry the surrogate + post-image back for a
@@ -360,7 +265,7 @@ impl CoreLoop {
                         database_id,
                         tid,
                         collection: target_collection,
-                        row_key: doc_id,
+                        row_key: &doc_id,
                         surrogate,
                         new_body: &updated_bytes,
                         is_strict: strict_schema.is_some(),
@@ -374,10 +279,10 @@ impl CoreLoop {
                 }
                 affected += 1;
                 if returning.is_some() {
-                    if let Some(obj) = target_doc.as_object_mut() {
+                    if let Some(obj) = doc.as_object_mut() {
                         obj.insert("id".to_string(), serde_json::Value::String(doc_id.clone()));
                     }
-                    returned_docs.push(target_doc);
+                    returned_docs.push(doc);
                 }
             }
         }
@@ -408,5 +313,29 @@ impl CoreLoop {
             response.write_set = write_set;
         }
         response
+    }
+
+    /// Encode the RESOLVE pass payload: a msgpack `Vec<(doc_id,
+    /// Option<surrogate_u32>, post_image_body)>` the COMMIT expander decodes and
+    /// rewrites into concrete `PointPut` ops (see
+    /// `control::update_from_join_orchestrator::expand_staged_update_from_joins`).
+    fn encode_resolved_update_rows(
+        &self,
+        task: &ExecutionTask,
+        rows: Vec<ResolvedUpdateRow>,
+    ) -> Response {
+        let wire: Vec<(String, Option<u32>, Vec<u8>)> = rows
+            .into_iter()
+            .map(|r| (r.doc_id, r.surrogate.map(|s| s.as_u32()), r.body))
+            .collect();
+        match zerompk::to_msgpack_vec(&wire) {
+            Ok(payload) => self.response_with_payload(task, payload),
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("update-from-join resolve encode: {e}"),
+                },
+            ),
+        }
     }
 }

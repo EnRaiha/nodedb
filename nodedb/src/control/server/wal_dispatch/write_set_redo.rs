@@ -194,6 +194,7 @@ mod tests {
             updates: Vec::new(),
             target_filters: Vec::new(),
             returning: None::<ReturningSpec>,
+            resolve_only: false,
             source_rows: None,
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));

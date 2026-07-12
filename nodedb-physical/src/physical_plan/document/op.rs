@@ -297,6 +297,17 @@ pub enum DocumentOp {
         target_filters: Vec<u8>,
         #[serde(default)]
         returning: Option<ReturningSpec>,
+        /// RESOLVE-ONLY read pass (Control-Plane COMMIT expander). When `true`
+        /// the handler runs the same target-scan, join-match, assignment-eval,
+        /// and strict-encode logic that produces each matched row's post-image,
+        /// but WITHOUT writing, re-indexing, accumulating a write-set, or
+        /// emitting events. It returns the matched rows as msgpack
+        /// `Vec<(doc_id, Option<surrogate_u32>, post_image_body)>` so the
+        /// in-transaction expander can rewrite them into concrete `PointPut`
+        /// ops carrying each target row's existing surrogate. `false` is the
+        /// normal write path (autocommit / co-resident replay).
+        #[serde(default)]
+        resolve_only: bool,
         /// Control-Plane-shipped source rows for cross-core `UPDATE ... FROM`.
         /// When `Some`, the handler builds the source join-map from these
         /// pre-scanned `(source_doc_id, raw_stored_source_bytes)` rows INSTEAD

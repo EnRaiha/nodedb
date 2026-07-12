@@ -126,6 +126,29 @@ pub async fn run_commit(
         }
     };
 
+    // Expand any staged in-transaction `UPDATE ... FROM <source>` into concrete,
+    // surrogate-carrying `PointPut` writes BEFORE dispatch, so the transaction
+    // commits indexed, replicated, undo-tracked point ops rather than replaying a
+    // raw `UpdateFromJoin` through the legacy passthrough (which writes outside
+    // the COMMIT batch's undo log — not atomic with siblings / ROLLBACK). Runs
+    // after the MERGE expansion; the three expansions are independent and
+    // order-insensitive.
+    let buffered =
+        match crate::control::update_from_join_orchestrator::expand_staged_update_from_joins(
+            state,
+            identity.tenant_id,
+            buffered,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                return CommitOutcome::Aborted {
+                    reason: AbortReason::Dispatch(e),
+                };
+            }
+        };
+
     if !buffered.is_empty() {
         let tenant_id = identity.tenant_id;
 

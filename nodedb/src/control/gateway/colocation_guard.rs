@@ -25,7 +25,8 @@
 //! through this guard: in-transaction `MERGE` is expanded at COMMIT into
 //! concrete point ops (which target the target's own vShard) by
 //! `control::merge_orchestrator::expand_staged_merges`, and in-transaction
-//! `UPDATE ... FROM` is buffered for COMMIT replay.
+//! `UPDATE ... FROM` likewise by
+//! `control::update_from_join_orchestrator::expand_staged_update_from_joins`.
 //!
 //! This guards only the one remaining cross-collection WRITE op.
 //! Cross-collection READ joins are untouched — they scan each side independently
@@ -119,8 +120,8 @@ pub(crate) fn guard_cross_collection_write(
         // / `control::update_from_join_orchestrator`), which scan the source on
         // its own core and ship the rows into the plan — so a raw
         // `DocumentOp::Merge` / `DocumentOp::UpdateFromJoin` never reaches this
-        // router. In-transaction forms are buffered and rejected at COMMIT
-        // resolve (no staged post-image), so they never route here either.
+        // router. In-transaction forms are buffered and expanded at COMMIT into
+        // concrete point ops by their expanders, so they never route here either.
         PhysicalPlan::Kv(KvOp::TransferItem {
             source_collection,
             dest_collection,

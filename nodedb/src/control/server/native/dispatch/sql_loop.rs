@@ -320,6 +320,7 @@ async fn dispatch_task(
             updates,
             target_filters,
             returning,
+            resolve_only: false,
             source_rows: None,
         },
     ) = &task.plan

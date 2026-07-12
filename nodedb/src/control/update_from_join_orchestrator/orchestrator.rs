@@ -22,12 +22,12 @@
 //!    `dispatch_local`. The Data Plane builds the join-map from the shipped rows
 //!    instead of a local read, so cross-core `UPDATE ... FROM` is correct.
 //!
-//! In-transaction `UPDATE ... FROM` never reaches here: it is buffered for
-//! COMMIT replay. In-transaction `MERGE`, by contrast, is now expanded at
-//! COMMIT into concrete point ops by
-//! `control::merge_orchestrator::expand_staged_merges`; the analogous
-//! COMMIT-time expansion for `UPDATE ... FROM` is not yet wired, so its
-//! in-transaction form still replays the buffered `UpdateFromJoin` plan.
+//! In-transaction `UPDATE ... FROM` never reaches this autocommit orchestrator:
+//! it is buffered at statement time and expanded at COMMIT into concrete
+//! `PointPut` ops by
+//! [`super::expand_staged_update_from_join::expand_staged_update_from_joins`]
+//! (mirroring `control::merge_orchestrator::expand_staged_merges`), so its writes
+//! commit atomically with sibling ops and index into every cross-engine index.
 
 use nodedb_types::{DatabaseId, TenantId};
 
@@ -82,6 +82,7 @@ pub async fn run_update_from_join(
         updates: args.updates.to_vec(),
         target_filters: args.target_filters.to_vec(),
         returning: args.returning.cloned(),
+        resolve_only: false,
         source_rows: Some(source_rows),
     });
 

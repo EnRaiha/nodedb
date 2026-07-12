@@ -325,6 +325,7 @@ pub async fn query(
                     updates,
                     target_filters,
                     returning,
+                    resolve_only: false,
                     source_rows: None,
                 },
             ) = &task.plan

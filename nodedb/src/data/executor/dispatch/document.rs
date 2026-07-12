@@ -220,6 +220,7 @@ impl CoreLoop {
                 updates,
                 target_filters,
                 returning,
+                resolve_only,
                 source_rows,
             } => self.execute_update_from_join(
                 task,
@@ -233,6 +234,7 @@ impl CoreLoop {
                     updates,
                     target_filter_bytes: target_filters,
                     returning: returning.as_ref(),
+                    resolve_only: *resolve_only,
                     source_rows: source_rows.as_deref(),
                 },
             ),

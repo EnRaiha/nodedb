@@ -131,6 +131,7 @@ pub(crate) async fn handle_direct_op(
         updates,
         target_filters,
         returning,
+        resolve_only: false,
         source_rows: None,
     }) = &plan
     {

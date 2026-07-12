@@ -1507,6 +1507,7 @@ fn known_write_gaps_are_not_replicated() {
                 updates: Vec::new(),
                 target_filters: Vec::new(),
                 returning: None,
+                resolve_only: false,
                 source_rows: None,
             }),
         ),

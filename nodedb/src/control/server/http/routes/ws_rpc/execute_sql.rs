@@ -137,6 +137,7 @@ pub async fn execute_sql(
                 updates,
                 target_filters,
                 returning,
+                resolve_only: false,
                 source_rows: None,
             },
         ) = &task.plan

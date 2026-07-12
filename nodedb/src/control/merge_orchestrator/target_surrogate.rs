@@ -160,6 +160,28 @@ fn value_to_pk_string(v: &Value) -> Option<String> {
     }
 }
 
+/// A resolved UPDATE/DELETE arm must carry the target row's registered
+/// surrogate. `None` means a non-surrogate-keyed row — unreachable for every
+/// current (and every vector-indexed) collection — so fail the commit loudly
+/// rather than emit a degraded, unindexed, unreplicated write. Shared by the
+/// MERGE and `UPDATE ... FROM` expanders; `op_label` (e.g. `"MERGE"`,
+/// `"UPDATE ... FROM"`) customizes the error message per caller.
+pub(crate) fn require_surrogate(
+    surrogate_u32: Option<u32>,
+    doc_id: &str,
+    op_label: &str,
+) -> crate::Result<Surrogate> {
+    match surrogate_u32 {
+        Some(s) => Ok(Surrogate::new(s)),
+        None => Err(crate::Error::PlanError {
+            detail: format!(
+                "{op_label} target row '{doc_id}' lacks a surrogate; \
+                 collection is not surrogate-keyed"
+            ),
+        }),
+    }
+}
+
 /// Strip the `{database_id}/` qualifier from a db-qualified collection name to
 /// recover the bare name the catalog keys collections by.
 pub(crate) fn bare_collection_name(database_id: DatabaseId, qualified: &str) -> String {

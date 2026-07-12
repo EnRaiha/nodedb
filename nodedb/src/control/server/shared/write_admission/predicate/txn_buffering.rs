@@ -143,18 +143,21 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::MaterializeScan { .. },
         ) => false,
 
-        // Buffered. `Merge` is rewritten at COMMIT into concrete
-        // `PointInsert` / `PointPut` / `PointDelete` ops by
-        // `control::merge_orchestrator::expand_staged_merges` BEFORE dispatch,
-        // so it commits indexed, replicated, undo-tracked point writes (not the
-        // passthrough). `BatchInsert` / `UpdateFromJoin` still replay through
+        // Buffered. `Merge` and `UpdateFromJoin` are rewritten at COMMIT into
+        // concrete point ops BEFORE dispatch — `Merge` into
+        // `PointInsert` / `PointPut` / `PointDelete` by
+        // `control::merge_orchestrator::expand_staged_merges`, `UpdateFromJoin`
+        // into `PointPut` by
+        // `control::update_from_join_orchestrator::expand_staged_update_from_joins`
+        // — so both commit indexed, replicated, undo-tracked point writes (not
+        // the passthrough). `BatchInsert` still replays through
         // `exec_tx_passthrough`
         // (`data/executor/handlers/transaction/sub_plan.rs:165`) at COMMIT with
-        // no reject arm: `to_replicated_entry` has no encoder arm for them (a
+        // no reject arm: `to_replicated_entry` has no encoder arm for it (a
         // deliberate divergence from the oracle, see module doc). Buffering
         // closes the prior atomicity gap (statement used to execute immediately
         // and survive ROLLBACK) at the cost of RYOW loss + the no-undo gap
-        // (module doc) for those two.
+        // (module doc) for `BatchInsert`.
         PhysicalPlan::Document(
             DocumentOp::BatchInsert { .. }
             | DocumentOp::Merge { .. }
@@ -1968,6 +1971,7 @@ mod tests {
                 updates: Vec::new(),
                 target_filters: Vec::new(),
                 returning: None,
+                resolve_only: false,
                 source_rows: None,
             }),
             PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
