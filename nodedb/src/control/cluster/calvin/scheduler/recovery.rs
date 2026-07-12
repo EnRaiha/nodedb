@@ -3,9 +3,12 @@
 //! Calvin scheduler WAL recovery.
 //!
 //! Provides [`read_applied_recovery`] which scans the WAL for
-//! `RecordType::CalvinApplied` records and returns, for a given vShard, the set
-//! of applied `(epoch, position)` pairs together with a fully-applied watermark.
-//! The scheduler uses this on startup to seed its exactly-once applied gate
+//! `RecordType::CalvinApplied` records AND `RecordType::TransactionRedo`
+//! records carrying a `calvin_stamp` (write-bearing Calvin transactions
+//! journal the redo record as their applied-marker instead of a standalone
+//! `CalvinApplied` marker), returning for a given vShard the union of applied
+//! `(epoch, position)` pairs together with a fully-applied watermark. The
+//! scheduler uses this on startup to seed its exactly-once applied gate
 //! (see [`super::applied_gate::AppliedGate`]).
 //!
 //! Each `CalvinApplied` marker is per `(epoch, position, vShard)` — one per
@@ -29,6 +32,7 @@ use nodedb_wal::record::RecordType;
 use nodedb_wal::{CalvinAppliedPayload, WalRecord};
 use tracing::warn;
 
+use crate::wal::RedoRecord;
 use crate::wal::manager::WalManager;
 
 /// Sentinel used when no Calvin epoch has ever been fully applied / no marker
@@ -62,26 +66,51 @@ pub fn read_applied_recovery(wal: &WalManager, vshard_id: u32) -> crate::Result<
     let mut max_applied_epoch = NOT_YET_APPLIED_EPOCH;
 
     for record in &records {
-        if !is_calvin_applied_record(record) {
-            continue;
-        }
-        match CalvinAppliedPayload::from_bytes(&record.payload) {
-            Ok(p) if p.vshard_id == vshard_id => {
-                applied_tail.insert((p.epoch, p.position));
-                if max_applied_epoch == NOT_YET_APPLIED_EPOCH || p.epoch > max_applied_epoch {
-                    max_applied_epoch = p.epoch;
+        match record_type_of(record) {
+            Some(RecordType::CalvinApplied) => {
+                match CalvinAppliedPayload::from_bytes(&record.payload) {
+                    Ok(p) if p.vshard_id == vshard_id => {
+                        accumulate(
+                            &mut applied_tail,
+                            &mut max_applied_epoch,
+                            p.epoch,
+                            p.position,
+                        );
+                    }
+                    Ok(_) => {
+                        // Different vshard — skip.
+                    }
+                    Err(e) => {
+                        warn!(
+                            lsn = record.header.lsn,
+                            error = %e,
+                            "calvin recovery: failed to decode CalvinApplied payload; skipping"
+                        );
+                    }
                 }
             }
-            Ok(_) => {
-                // Different vshard — skip.
-            }
-            Err(e) => {
-                warn!(
-                    lsn = record.header.lsn,
-                    error = %e,
-                    "calvin recovery: failed to decode CalvinApplied payload; skipping"
-                );
-            }
+            Some(RecordType::TransactionRedo) => match RedoRecord::from_bytes(&record.payload) {
+                Ok(redo) => {
+                    if let Some(stamp) = redo.calvin_stamp
+                        && stamp.vshard_id == vshard_id
+                    {
+                        accumulate(
+                            &mut applied_tail,
+                            &mut max_applied_epoch,
+                            stamp.epoch,
+                            stamp.position,
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        lsn = record.header.lsn,
+                        error = %e,
+                        "calvin recovery: failed to decode TransactionRedo payload; skipping"
+                    );
+                }
+            },
+            _ => continue,
         }
     }
 
@@ -94,13 +123,26 @@ pub fn read_applied_recovery(wal: &WalManager, vshard_id: u32) -> crate::Result<
     })
 }
 
-fn is_calvin_applied_record(record: &WalRecord) -> bool {
-    // Strip the encryption flag (bit 31) before comparing record type.
+/// Decode a WAL record's logical [`RecordType`], stripping the encryption
+/// flag (bit 31) before comparing.
+fn record_type_of(record: &WalRecord) -> Option<RecordType> {
     let raw_type = record.header.record_type & !nodedb_wal::record::ENCRYPTED_FLAG;
-    matches!(
-        RecordType::from_raw(raw_type),
-        Some(RecordType::CalvinApplied)
-    )
+    RecordType::from_raw(raw_type)
+}
+
+/// Feed one applied `(epoch, position)` pair into the shared tail / watermark
+/// accumulation, used by both the `CalvinApplied` and `TransactionRedo`
+/// (`calvin_stamp`) marker sources so the two unify into one applied set.
+fn accumulate(
+    applied_tail: &mut BTreeSet<(u64, u32)>,
+    max_applied_epoch: &mut u64,
+    epoch: u64,
+    position: u32,
+) {
+    applied_tail.insert((epoch, position));
+    if *max_applied_epoch == NOT_YET_APPLIED_EPOCH || epoch > *max_applied_epoch {
+        *max_applied_epoch = epoch;
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +216,74 @@ mod tests {
             "position 1 of epoch 7 must be reported as NOT applied so it is \
              re-applied on restart rather than lost"
         );
+    }
+
+    #[test]
+    fn transaction_redo_calvin_stamp_unions_with_calvin_applied() {
+        use crate::types::{DatabaseId, TenantId, VShardId};
+        use crate::wal::{CalvinStamp, RedoRecord, RedoSubRecord};
+
+        let dir = TempDir::new().unwrap();
+        let wal = open_wal(&dir);
+        let vshard = 4u32;
+
+        // A pure-read/empty-ops txn still writes a standalone CalvinApplied
+        // marker at (epoch 1, position 0).
+        wal.append_calvin_applied(VShardId::new(vshard), 1, 0)
+            .unwrap();
+
+        // A write-bearing Calvin txn journals its applied-marker as a
+        // TransactionRedo record carrying a calvin_stamp at (epoch 1, position 1).
+        let write_bearing = RedoRecord {
+            version: 1,
+            ops: vec![RedoSubRecord {
+                record_type: nodedb_wal::record::RecordType::Put as u32,
+                payload: vec![1, 2, 3],
+            }],
+            calvin_stamp: Some(CalvinStamp {
+                epoch: 1,
+                position: 1,
+                vshard_id: vshard,
+            }),
+        };
+        wal.append_transaction_redo(
+            TenantId::new(0),
+            VShardId::new(vshard),
+            DatabaseId::DEFAULT,
+            &write_bearing,
+        )
+        .unwrap();
+
+        // A single-shard TransactionRedo (calvin_stamp: None) must be ignored
+        // by Calvin recovery.
+        let single_shard = RedoRecord {
+            version: 1,
+            ops: vec![RedoSubRecord {
+                record_type: nodedb_wal::record::RecordType::Put as u32,
+                payload: vec![9, 9, 9],
+            }],
+            calvin_stamp: None,
+        };
+        wal.append_transaction_redo(
+            TenantId::new(0),
+            VShardId::new(vshard),
+            DatabaseId::DEFAULT,
+            &single_shard,
+        )
+        .unwrap();
+
+        wal.sync().unwrap();
+
+        let rec = read_applied_recovery(&wal, vshard).unwrap();
+        assert!(
+            rec.applied_tail.contains(&(1, 0)),
+            "CalvinApplied marker still contributes"
+        );
+        assert!(
+            rec.applied_tail.contains(&(1, 1)),
+            "TransactionRedo calvin_stamp contributes its (epoch, position) too"
+        );
+        assert_eq!(rec.applied_tail.len(), 2);
+        assert_eq!(rec.max_applied_epoch, 1);
     }
 }
