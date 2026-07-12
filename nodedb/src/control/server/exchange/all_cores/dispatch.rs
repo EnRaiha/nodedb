@@ -149,6 +149,12 @@ pub async fn execute_plan_all_local_cores(
             MetaOp::ResolveTxn { .. } => {
                 single_blob_gather(state, tenant_id, database_id, plan, trace_id).await
             }
+            // `CalvinResolve` returns the same single `RedoRecord` blob shape as
+            // `ResolveTxn` (it reuses `execute_resolve_txn` internally) — same
+            // single-blob corruption class if array-wrapped.
+            MetaOp::CalvinResolve { .. } => {
+                single_blob_gather(state, tenant_id, database_id, plan, trace_id).await
+            }
             // Every other MetaOp either returns an array of rows / count payload
             // (→ generic gather is correct) or is a single-core control op whose
             // single-element wrap is harmless. Enumerated exhaustively (no

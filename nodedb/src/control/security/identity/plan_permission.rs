@@ -224,6 +224,11 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | MetaOp::ResolveTxn { .. },
         ) => Permission::Write,
 
+        // Calvin's resolve mirrors `ResolveTxn`: dispatched internally by the
+        // Calvin scheduler's commit path and treated as Write, even though it
+        // does not itself mutate base state.
+        PhysicalPlan::Meta(MetaOp::CalvinResolve { .. }) => Permission::Write,
+
         // KV engine: read operations.
         PhysicalPlan::Kv(
             KvOp::Get { .. }

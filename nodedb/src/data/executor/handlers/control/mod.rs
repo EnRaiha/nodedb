@@ -4,6 +4,7 @@
 
 pub mod calvin;
 mod calvin_overlay_stage;
+mod calvin_resolve;
 mod calvin_txn_id;
 pub mod convert;
 pub mod crdt;

@@ -172,6 +172,7 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
                 | MetaOp::CalvinExecuteActive { .. }
                 | MetaOp::CalvinFlush { .. }
                 | MetaOp::CalvinDrop { .. }
+                | MetaOp::CalvinResolve { .. }
         )
     ) {
         return WriteAdmission::ExemptRead;

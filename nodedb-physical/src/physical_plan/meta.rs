@@ -509,4 +509,19 @@ pub enum MetaOp {
         txn_id: nodedb_types::id::TxnId,
         plans: Vec<super::PhysicalPlan>,
     },
+
+    /// Resolve a staged Calvin transaction's write plans into ONE replayable
+    /// redo record, WITHOUT mutating base.
+    ///
+    /// Mirrors `ResolveTxn` exactly, but reads Calvin's own staging state
+    /// instead of a session transaction's: the plans buffered in the core's
+    /// `commit_pending` under `(epoch, position, vshard)` and the per-core
+    /// staging overlay written under the corresponding synthetic `TxnId`
+    /// (see `calvin_synthetic_txn_id`). Dispatched by the scheduler once the
+    /// local commit vote resolves to commit, in place of (or ahead of)
+    /// `CalvinFlush` — the flush path mutates base directly, while resolve
+    /// produces a durable redo record for a later install phase instead. No
+    /// base engine is touched during resolve. Wire-additive: appended last
+    /// so older log entries decode unchanged.
+    CalvinResolve { epoch: u64, position: u32 },
 }

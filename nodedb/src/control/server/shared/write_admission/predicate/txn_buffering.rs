@@ -379,8 +379,8 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         // so every `MetaOp` is a read here — including the ones that require
         // Write permission (`WalAppend`, `TransactionBatch`, `PurgeTenant`,
         // `StageWrite`, `MarkSavepoint`, `RollbackToSavepoint`, `ResolveTxn`,
-        // the `CalvinExecute*` / `CalvinFlush` / `CalvinDrop` family, and
-        // `RecordCalvinWriteVersions`). None of these ever appear as a
+        // the `CalvinExecute*` / `CalvinFlush` / `CalvinDrop` / `CalvinResolve`
+        // family, and `RecordCalvinWriteVersions`). None of these ever appear as a
         // client statement's `task.plan` at this call site — they are
         // internal orchestration plans the Calvin scheduler and the COMMIT
         // path dispatch directly — so this is today's behavior, not a gap
@@ -427,6 +427,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | MetaOp::RecordCalvinWriteVersions { .. }
             | MetaOp::CalvinFlush { .. }
             | MetaOp::CalvinDrop { .. }
+            | MetaOp::CalvinResolve { .. }
             | MetaOp::ResolveTxn { .. },
         ) => false,
 

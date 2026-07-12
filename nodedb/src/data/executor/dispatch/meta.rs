@@ -257,6 +257,13 @@ impl CoreLoop {
                 self.execute_resolve_txn(task, tid, *txn_id, plans)
             }
 
+            // Same shape as `ResolveTxn` above, but sourced from Calvin's own
+            // staging state (`commit_pending` + the synthetic-`TxnId` overlay)
+            // instead of a session transaction's.
+            MetaOp::CalvinResolve { epoch, position } => {
+                self.execute_calvin_resolve(task, *epoch, *position)
+            }
+
             MetaOp::StageWrite { plan } => self.execute_stage_write(task, tid, plan),
 
             // Release the staging overlay once a transaction resolves (commit
