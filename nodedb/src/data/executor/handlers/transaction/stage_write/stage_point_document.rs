@@ -29,7 +29,7 @@ use crate::engine::document::store::surrogate_to_doc_id;
 use crate::types::TenantId;
 
 impl CoreLoop {
-    pub(super) fn stage_point_insert(
+    pub(in crate::data::executor) fn stage_point_insert(
         &mut self,
         ctx: &StageCtx<'_>,
         value: &[u8],
@@ -73,7 +73,11 @@ impl CoreLoop {
         self.stage_encode_and_commit(ctx, value)
     }
 
-    pub(super) fn stage_point_put(&mut self, ctx: &StageCtx<'_>, value: &[u8]) -> Response {
+    pub(in crate::data::executor) fn stage_point_put(
+        &mut self,
+        ctx: &StageCtx<'_>,
+        value: &[u8],
+    ) -> Response {
         // Upsert semantics: no primary-key existence check (overwrite allowed);
         // UNIQUE indexes still apply against a DIFFERENT row.
         if let Err(e) = self.stage_check_unique(ctx, value) {
@@ -82,7 +86,7 @@ impl CoreLoop {
         self.stage_encode_and_commit(ctx, value)
     }
 
-    pub(super) fn stage_point_delete(&mut self, ctx: &StageCtx<'_>) -> Response {
+    pub(in crate::data::executor) fn stage_point_delete(&mut self, ctx: &StageCtx<'_>) -> Response {
         self.txn_overlays
             .entry(ctx.txn_id)
             .or_default()
@@ -90,7 +94,7 @@ impl CoreLoop {
         self.stage_count_response(ctx.task, 1)
     }
 
-    pub(super) fn stage_point_update(
+    pub(in crate::data::executor) fn stage_point_update(
         &mut self,
         ctx: &StageCtx<'_>,
         updates: &[(String, UpdateValue)],

@@ -30,6 +30,7 @@ mod stage_spatial;
 mod stage_timeseries;
 mod stage_upsert;
 
+pub(in crate::data::executor) use context::StageCtx;
 pub(in crate::data::executor) use stage_bulk_delete::StageBulkDeleteParams;
 pub(in crate::data::executor) use stage_bulk_update::StageBulkUpdateParams;
 pub(in crate::data::executor) use stage_columnar::StageColumnarInsertParams;

@@ -20,7 +20,7 @@ pub(super) type CollKey = (DatabaseId, TenantId, String);
 /// owns the [`hex_key`](super::stage_kv::hex_key)-encoded KV key instead --
 /// `Cow` lets both engines share this one context type without allocating
 /// on the Document path or leaking on the KV path.
-pub(super) struct StageCtx<'a> {
+pub(in crate::data::executor) struct StageCtx<'a> {
     pub task: &'a ExecutionTask,
     pub tid: u64,
     pub database_id: u64,
@@ -32,7 +32,7 @@ pub(super) struct StageCtx<'a> {
 }
 
 impl<'a> StageCtx<'a> {
-    pub(super) fn new(
+    pub(in crate::data::executor) fn new(
         task: &'a ExecutionTask,
         tid: u64,
         txn_id: TxnId,

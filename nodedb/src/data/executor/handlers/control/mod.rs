@@ -3,6 +3,8 @@
 //! Control operation handlers — module root.
 
 pub mod calvin;
+mod calvin_overlay_stage;
+mod calvin_txn_id;
 pub mod convert;
 pub mod crdt;
 pub mod crdt_constraints;

@@ -41,6 +41,8 @@ use crate::data::executor::core_loop::commit_pending::PendingCommit;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
+
+use super::calvin_txn_id::calvin_synthetic_txn_id;
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::PassiveReadKeyId;
 
@@ -127,6 +129,19 @@ impl CoreLoop {
             },
         );
 
+        // Also stage each write plan into `txn_overlays` under a synthetic
+        // `TxnId` (producer side for a future `CalvinResolve`); additive to
+        // `commit_pending` above, which stays the sole durable apply.
+        let synthetic_txn_id = match calvin_synthetic_txn_id(epoch, position, vshard_id) {
+            Ok(id) => id,
+            Err(e) => return self.response_error(task, e),
+        };
+        for plan in plans {
+            if let Err(e) = self.stage_calvin_overlay(task, synthetic_txn_id, *tenant_id, plan) {
+                return self.response_error(task, e);
+            }
+        }
+
         Response {
             request_id: task.request_id(),
             status: Status::Ok,
@@ -158,6 +173,10 @@ impl CoreLoop {
         position: u32,
     ) -> Response {
         let vshard_id = task.request.vshard_id.as_u32();
+        // Drop the synthetic overlay entry staged by
+        // `execute_calvin_execute_static` unconditionally, before the apply
+        // below: idempotent no-op on a duplicate dispatch.
+        self.drop_calvin_synthetic_overlay(epoch, position, vshard_id);
         let Some(pending) = self.commit_pending.remove(&(epoch, position, vshard_id)) else {
             debug!(
                 core = self.core_id,
@@ -208,6 +227,9 @@ impl CoreLoop {
             .commit_pending
             .remove(&(epoch, position, vshard_id))
             .is_some();
+        // Discard the synthetic overlay entry alongside the raw plan buffer;
+        // idempotent no-op if it was never staged or already removed.
+        self.drop_calvin_synthetic_overlay(epoch, position, vshard_id);
         debug!(
             core = self.core_id,
             epoch, position, vshard_id, existed, "calvin drop: discarding staged commit"
@@ -469,4 +491,172 @@ fn stable_edge_hash(src: u32, dst: u32) -> u32 {
     // Combine src and dst with a deterministic mix.
     let combined: u64 = (u64::from(src) << 32) | u64::from(dst);
     stable_kv_hash(&combined.to_le_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use nodedb_physical::physical_plan::DocumentOp;
+    use nodedb_types::Surrogate;
+
+    use super::*;
+    use crate::bridge::envelope::{Admission, ExemptReason, Priority, Request};
+    use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::data::executor::doc_format;
+    use crate::data::executor::handlers::transaction::overlay::Staged;
+    use crate::types::{DatabaseId, RequestId, TraceId, VShardId};
+
+    /// A minimal `ExecutionTask` homing to vShard 0, tenant 1, database
+    /// DEFAULT -- everything a Calvin static-execute handler needs beyond
+    /// its explicit `CalvinExecCtx` / `tenant_id` / `plans` arguments.
+    fn make_task() -> ExecutionTask {
+        let plan = PhysicalPlan::Document(DocumentOp::PointGet {
+            collection: "x".into(),
+            document_id: "y".into(),
+            surrogate: Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            rls_filters: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        });
+        let request = Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan,
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: crate::types::ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: None,
+            resolved_now_ms: None,
+            admission: Admission::Exempt(ExemptReason::Read),
+        };
+        ExecutionTask::new(request)
+    }
+
+    fn doc_value(field: &str, val: &str) -> Vec<u8> {
+        let mut obj = std::collections::HashMap::new();
+        obj.insert(field.to_string(), Value::String(val.into()));
+        zerompk::to_msgpack_vec(&Value::Object(obj)).unwrap()
+    }
+
+    fn point_insert_plan(collection: &str, document_id: &str, surrogate: u32) -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::PointInsert {
+            collection: collection.to_string(),
+            document_id: document_id.to_string(),
+            value: doc_value("a", "1"),
+            if_absent: false,
+            surrogate: Surrogate::new(surrogate),
+        })
+    }
+
+    #[test]
+    fn calvin_execute_static_stages_point_insert_into_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let task = make_task();
+        let tenant_id = TenantId::new(1);
+        let plans = vec![point_insert_plan("orders", "o1", 7)];
+        let ctx = CalvinExecCtx {
+            epoch: 1,
+            position: 0,
+            epoch_system_ms: 0,
+            is_group_leader: true,
+        };
+
+        let resp = core.execute_calvin_execute_static(&task, ctx, &tenant_id, &plans, &[]);
+        assert_eq!(resp.status, Status::Ok);
+
+        let vshard_id = task.request.vshard_id.as_u32();
+
+        // `commit_pending` is unchanged -- it still holds the raw plans that
+        // drive the base install at flush time.
+        assert!(
+            core.commit_pending.contains_key(&(1, 0, vshard_id)),
+            "commit_pending must still be populated exactly as before this unit"
+        );
+
+        // The synthetic overlay entry additionally holds the resolved
+        // post-image for the concrete point-write plan.
+        let synthetic = calvin_synthetic_txn_id(1, 0, vshard_id).unwrap();
+        let coll_key = (DatabaseId::DEFAULT, tenant_id, "orders".to_string());
+        let expected_body = doc_format::canonicalize_document_for_storage(&doc_value("a", "1"));
+        assert_eq!(
+            core.txn_overlays
+                .get(&synthetic)
+                .and_then(|o| o.get(&coll_key, 7)),
+            Some(&Staged::Put(expected_body)),
+            "the Calvin write plan must be staged into the synthetic-TxnId overlay"
+        );
+    }
+
+    #[test]
+    fn calvin_flush_drops_synthetic_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let task = make_task();
+        let tenant_id = TenantId::new(1);
+        let plans = vec![point_insert_plan("orders", "o1", 7)];
+        let ctx = CalvinExecCtx {
+            epoch: 1,
+            position: 0,
+            epoch_system_ms: 0,
+            is_group_leader: true,
+        };
+        let resp = core.execute_calvin_execute_static(&task, ctx, &tenant_id, &plans, &[]);
+        assert_eq!(resp.status, Status::Ok);
+
+        let vshard_id = task.request.vshard_id.as_u32();
+        let synthetic = calvin_synthetic_txn_id(1, 0, vshard_id).unwrap();
+        assert!(core.txn_overlays.contains_key(&synthetic));
+
+        let flush_resp = core.execute_calvin_flush(&task, 1, 0);
+        assert_eq!(flush_resp.status, Status::Ok);
+
+        assert!(
+            !core.txn_overlays.contains_key(&synthetic),
+            "flush must drop the synthetic overlay entry alongside commit_pending"
+        );
+    }
+
+    #[test]
+    fn calvin_drop_discards_synthetic_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let task = make_task();
+        let tenant_id = TenantId::new(1);
+        let plans = vec![point_insert_plan("orders", "o1", 7)];
+        let ctx = CalvinExecCtx {
+            epoch: 1,
+            position: 0,
+            epoch_system_ms: 0,
+            is_group_leader: true,
+        };
+        let resp = core.execute_calvin_execute_static(&task, ctx, &tenant_id, &plans, &[]);
+        assert_eq!(resp.status, Status::Ok);
+
+        let vshard_id = task.request.vshard_id.as_u32();
+        let synthetic = calvin_synthetic_txn_id(1, 0, vshard_id).unwrap();
+        assert!(core.txn_overlays.contains_key(&synthetic));
+
+        let drop_resp = core.execute_calvin_drop(&task, 1, 0);
+        assert_eq!(drop_resp.status, Status::Ok);
+
+        assert!(
+            !core.txn_overlays.contains_key(&synthetic),
+            "drop must discard the synthetic overlay entry alongside commit_pending"
+        );
+    }
 }

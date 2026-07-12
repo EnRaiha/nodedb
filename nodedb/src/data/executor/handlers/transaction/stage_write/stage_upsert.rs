@@ -27,7 +27,7 @@ use crate::types::TenantId;
 
 impl CoreLoop {
     /// Stage a `DocumentOp::Upsert` into the per-transaction overlay.
-    pub(super) fn stage_document_upsert(
+    pub(in crate::data::executor) fn stage_document_upsert(
         &mut self,
         ctx: &StageCtx<'_>,
         value: &[u8],
