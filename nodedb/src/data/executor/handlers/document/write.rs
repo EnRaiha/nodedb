@@ -6,7 +6,7 @@
 
 use tracing::{debug, warn};
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
@@ -164,11 +164,24 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, e),
         };
 
+        // Gate post-apply write-set accumulation once for the whole batch so a
+        // collection with no vector field pays nothing. Each row's
+        // `apply_point_put` above reconciles storage + the btree/FTS/graph/HNSW
+        // overlays, but `wal_append_document_op` mints no redo for `BatchInsert`
+        // (row durability is redb-synchronous). On a WAL-only restart the HNSW
+        // is rebuilt only from redo `Put` records, so a vector-indexed batch
+        // insert that journals nothing would lose its rows' vectors. Carrying
+        // the surrogate + post-image back per row lets the Control Plane mint a
+        // durable `Put` redo for each (see `plan_post_apply_redo` /
+        // `append_write_set_redo`).
+        let has_vectors = self.collection_has_vectors(database_id, tid, collection);
+
         // Row key for post-commit event emission, captured as each row applies
         // successfully; the value bytes are re-borrowed from `documents` after
         // commit rather than cloned here. On any error we return early
         // (dropping `txn`, which rolls back every row applied so far).
         let mut applied: Vec<String> = Vec::with_capacity(documents.len());
+        let mut write_set: Vec<WriteSetEntry> = Vec::new();
         for (i, (_document_id, value)) in documents.iter().enumerate() {
             let surrogate = surrogates[i];
             let row_key = surrogate_to_doc_id(surrogate);
@@ -188,6 +201,13 @@ impl CoreLoop {
                 },
             ) {
                 return self.response_error(task, e);
+            }
+            if has_vectors {
+                write_set.push(WriteSetEntry {
+                    surrogate: surrogate.as_u32(),
+                    is_delete: false,
+                    value: value.clone(),
+                });
             }
             applied.push(row_key);
         }
@@ -211,15 +231,22 @@ impl CoreLoop {
             self.emit_put_event(task, tid, collection, row_key, &documents[i].1, None);
         }
 
-        match super::super::super::response_codec::encode_count("inserted", documents.len()) {
-            Ok(bytes) => self.response_with_payload(task, bytes),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+        let mut response =
+            match super::super::super::response_codec::encode_count("inserted", documents.len()) {
+                Ok(bytes) => self.response_with_payload(task, bytes),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    );
+                }
+            };
+        if !write_set.is_empty() {
+            response.write_set = write_set;
         }
+        response
     }
 }
 

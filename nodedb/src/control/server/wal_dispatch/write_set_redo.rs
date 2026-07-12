@@ -34,15 +34,20 @@ use super::document::{encode_document_delete_record, encode_document_put_record}
 /// rather than on the pre-dispatch autocommit WAL path. Returns `None` for every
 /// other plan (its durability is owned on the WAL-append path or elsewhere).
 ///
-/// Today `DocumentOp::PointUpdate`, `DocumentOp::Upsert`, `DocumentOp::BulkUpdate`
-/// and `DocumentOp::BulkDelete` qualify. `BulkUpdate` carries one `Put` write-set
-/// entry per updated row (post-image); `BulkDelete` carries one `Delete` entry per
-/// removed row (surrogate only) — the shared `Delete` redo replays through
-/// `apply_point_delete`, whose cascade soft-deletes the row's HNSW nodes, so a
-/// deleted vector does not resurrect on a WAL-only restart. Additional post-apply
-/// redo variants (`Merge`) will extend this as their post-apply redo is built — do
-/// not add them until that handler support exists, or a write would be admitted
-/// with its guard held for a redo that is never appended.
+/// Today `DocumentOp::PointUpdate`, `DocumentOp::Upsert`, `DocumentOp::BulkUpdate`,
+/// `DocumentOp::BulkDelete`, and `DocumentOp::BatchInsert` qualify. `BulkUpdate`
+/// carries one `Put` write-set entry per updated row (post-image); `BulkDelete`
+/// carries one `Delete` entry per removed row (surrogate only) — the shared
+/// `Delete` redo replays through `apply_point_delete`, whose cascade soft-deletes
+/// the row's HNSW nodes, so a deleted vector does not resurrect on a WAL-only
+/// restart. `BatchInsert` carries one `Put` entry per inserted row on a
+/// vector-indexed collection — `wal_append_document_op` returns `None` for
+/// `BatchInsert` (row durability is redb-synchronous), so without this the HNSW
+/// rebuild on restart would silently drop every batch-inserted row's vector.
+/// Additional post-apply redo variants (`Merge`) will extend this as their
+/// post-apply redo is built — do not add them until that handler support exists,
+/// or a write would be admitted with its guard held for a redo that is never
+/// appended.
 pub fn plan_post_apply_redo(plan: &PhysicalPlan) -> Option<String> {
     if let PhysicalPlan::Document(DocumentOp::PointUpdate { collection, .. }) = plan {
         Some(collection.clone())
@@ -51,6 +56,8 @@ pub fn plan_post_apply_redo(plan: &PhysicalPlan) -> Option<String> {
     } else if let PhysicalPlan::Document(DocumentOp::BulkUpdate { collection, .. }) = plan {
         Some(collection.clone())
     } else if let PhysicalPlan::Document(DocumentOp::BulkDelete { collection, .. }) = plan {
+        Some(collection.clone())
+    } else if let PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. }) = plan {
         Some(collection.clone())
     } else {
         None
@@ -148,6 +155,16 @@ mod tests {
             returning: None::<ReturningSpec>,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+        });
+        assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
+    }
+
+    #[test]
+    fn batch_insert_is_post_apply_redo() {
+        let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
+            collection: "docs".to_string(),
+            documents: Vec::new(),
+            surrogates: Vec::new(),
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }

@@ -124,6 +124,27 @@ pub async fn run_insert_select(
                 // rows did not land. Surface the DP error verbatim.
                 return Ok(resp);
             }
+            // `dispatch_local` bypasses the pgwire autocommit funnel's post-apply
+            // redo minting (`submit_to_data_plane`), so a page landing on a
+            // vector-indexed target carries its per-row `Put` write-set back here
+            // unconsumed. Mint it now: without this durable redo, a WAL-only
+            // restart rebuilds the HNSW from nothing for these rows (BatchInsert's
+            // own WAL path mints no redo — row durability is redb-synchronous) and
+            // the page's vectors are lost, not just stale.
+            if !resp.write_set.is_empty() {
+                let vshard_id = crate::types::VShardId::from_collection_in_database(
+                    database_id,
+                    target_collection,
+                );
+                crate::control::server::wal_dispatch::append_write_set_redo(
+                    &state.wal,
+                    tenant_id,
+                    vshard_id,
+                    database_id,
+                    target_collection,
+                    &resp.write_set,
+                )?;
+            }
             total_inserted += decode_inserted(&resp.payload).unwrap_or(page_len);
             if resp.watermark_lsn > max_lsn {
                 max_lsn = resp.watermark_lsn;
