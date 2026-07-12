@@ -8,10 +8,10 @@
 //! never matches. Every caller that re-checks a scan predicate against a
 //! stored body — the base document scan, the bulk DML base scan, and the
 //! in-transaction predicate staging handlers (`stage_bulk_update`,
-//! `stage_bulk_delete`, `stage_insert_select`) — must decode Binary Tuple
-//! bodies to MessagePack first. This is the single, shared implementation of
-//! that decode-then-match step so the three staging handlers (and, ideally,
-//! the two base-scan call sites) evaluate strict predicates identically.
+//! `stage_bulk_delete`) — must decode Binary Tuple bodies to MessagePack
+//! first. This is the single, shared implementation of that decode-then-match
+//! step so the staging handlers (and, ideally, the two base-scan call sites)
+//! evaluate strict predicates identically.
 
 use nodedb_types::columnar::StrictSchema;
 

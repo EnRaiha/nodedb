@@ -306,16 +306,16 @@ impl CoreLoop {
                 // never dispatched to the Data Plane as an `InsertSelect`: the
                 // autocommit path runs the `control::insert_select` orchestrator
                 // (scan → fresh registered surrogate per row → atomic `BatchInsert`),
-                // the in-transaction statement stages rows into the overlay
-                // (`stage_insert_select`), and its COMMIT expands the staged plan
-                // into concrete `PointInsert` tasks before dispatch. Reaching this
-                // arm means an `InsertSelect` plan bypassed all three — a routing
-                // bug, surfaced loudly rather than silently mis-copied.
+                // and the in-transaction statement is resolved + staged at STATEMENT
+                // time (`session::expander_stage` → `resolve_and_emit_insert_select_ops`)
+                // into concrete fresh-surrogate `PointInsert` tasks. Reaching this
+                // arm means an `InsertSelect` plan bypassed both — a routing bug,
+                // surfaced loudly rather than silently mis-copied.
                 self.response_error(
                     task,
                     crate::bridge::envelope::ErrorCode::Internal {
                         detail: "InsertSelect must be resolved on the Control Plane \
-                                 (orchestrator / staging / commit-time expansion); \
+                                 (autocommit orchestrator / statement-time expander); \
                                  it must never reach Data-Plane dispatch"
                             .into(),
                     },

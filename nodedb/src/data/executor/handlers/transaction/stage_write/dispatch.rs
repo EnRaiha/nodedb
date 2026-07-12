@@ -9,8 +9,8 @@ use super::constraint::OverlayPk;
 use super::context::StageCtx;
 use super::{
     StageBulkDeleteParams, StageBulkUpdateParams, StageColumnarDeleteParams,
-    StageColumnarInsertParams, StageColumnarUpdateParams, StageInsertSelectParams,
-    StageSpatialInsertParams, StageTimeseriesInsertParams,
+    StageColumnarInsertParams, StageColumnarUpdateParams, StageSpatialInsertParams,
+    StageTimeseriesInsertParams,
 };
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -250,26 +250,6 @@ impl CoreLoop {
                 filter_bytes: filters,
             }),
 
-            // `INSERT ... SELECT ... WHERE <predicate>` staged at statement
-            // time — resolve the source's BASE ∪ OVERLAY matching set and
-            // copy each matched row into the target overlay under its own
-            // surrogate/doc_id. `InsertSelect` has no `RETURNING` variant, so
-            // it is always stageable (see `is_point_write`).
-            DocumentOp::InsertSelect {
-                target_collection,
-                source_collection,
-                source_filters,
-                source_limit,
-            } => self.stage_insert_select(StageInsertSelectParams {
-                task,
-                tid,
-                txn_id,
-                target_collection,
-                source_collection,
-                filter_bytes: source_filters,
-                source_limit: *source_limit,
-            }),
-
             // `UPSERT INTO` staged at statement time -- resolve the current
             // body under BASE ∪ OVERLAY and either insert or merge/apply
             // `ON CONFLICT DO UPDATE SET`, mirroring the autocommit
@@ -286,7 +266,13 @@ impl CoreLoop {
                 self.stage_document_upsert(&ctx, value, on_conflict_updates)
             }
 
-            DocumentOp::PointGet { .. }
+            // `INSERT ... SELECT` is resolved + staged as concrete
+            // fresh-surrogate `PointInsert` ops at STATEMENT time on the
+            // Control Plane (`session::expander_stage` →
+            // `resolve_and_emit_insert_select_ops`); a raw `InsertSelect`
+            // plan never reaches `StageWrite`, so it is not a point write here.
+            DocumentOp::InsertSelect { .. }
+            | DocumentOp::PointGet { .. }
             | DocumentOp::Scan { .. }
             | DocumentOp::BatchInsert { .. }
             | DocumentOp::RangeScan { .. }

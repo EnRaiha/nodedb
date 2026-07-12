@@ -1,30 +1,39 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! COMMIT-time expansion of a staged `INSERT ... SELECT`.
+//! Resolve + emit the concrete point ops for one in-transaction
+//! `INSERT ... SELECT`.
 //!
-//! A transactional `BEGIN; INSERT ... SELECT ...; COMMIT` buffers the copy as a
-//! single `DocumentOp::InsertSelect` plan. Left intact, COMMIT's buffered-plan
-//! replay re-scans the source on the Data Plane and writes each target row under
-//! the SOURCE row's surrogate — which has no `(target_collection, surrogate)→pk`
-//! catalog binding, so cross-engine (vector / FTS) hits on the target can never
-//! resolve back to the target row's own primary key.
+//! Autocommit `INSERT ... SELECT` is intercepted before the transaction path
+//! and driven by [`crate::control::insert_select::run_insert_select`] (scan →
+//! fresh registered surrogate per row → atomic `BatchInsert`); only an
+//! `INSERT ... SELECT` executed INSIDE an explicit transaction block reaches
+//! here. For those, the raw `DocumentOp::InsertSelect` plan is NOT buffered for
+//! COMMIT-time replay. Instead it is resolved NOW — the source is scanned
+//! against base ∪ overlay (so it folds rows this transaction staged in earlier
+//! statements), and each copied row is assigned its OWN fresh, catalog-REGISTERED
+//! surrogate. The concrete `DocumentOp::PointInsert` ops it expands to are staged
+//! into the transaction's overlay (and buffered for COMMIT) through the exact
+//! same statement-time staging path a plain in-transaction point write uses
+//! ([`stage_write`](crate::control::server::shared::session::staging_gate::
+//! stage_write)).
 //!
-//! This expander rewrites every staged `InsertSelect` into concrete, per-row
-//! `DocumentOp::PointInsert` writes BEFORE dispatch, exactly as the autocommit
-//! orchestrator does: it scans the source, normalizes each row to msgpack, and
-//! assigns each target row its OWN fresh, catalog-REGISTERED surrogate
-//! (surrogate registration is Control-Plane-only, under the registry lock and
-//! WAL-durable). Because the concrete writes replace the `InsertSelect` in the
-//! buffered list, they commit atomically with sibling ops, ride the undo-tracked
-//! transactional `PointInsert` path (so rollback of any sibling still unwinds
-//! them), and replicate as concrete writes — replicas never re-derive the copy
-//! and so cannot diverge on surrogate assignment.
+//! Doing this at statement time (rather than at COMMIT) gives read-your-own-
+//! writes: an in-transaction `SELECT` after the `INSERT ... SELECT` reads the
+//! copied rows, and a LATER statement in the same transaction resolves against an
+//! overlay that already holds them. Assigning each copied row a fresh registered
+//! surrogate (surrogate registration is Control-Plane-only, under the registry
+//! lock and WAL-durable) is what gives the target rows their OWN
+//! `(target_collection, surrogate)→pk` catalog binding, so cross-engine (vector /
+//! FTS) hits on the target resolve back to the target row's own primary key —
+//! fixing the stale-source-surrogate copy the COMMIT-time expander produced.
 //!
 //! `PointInsert` (not `BatchInsert`) is emitted deliberately: only `PointPut` /
 //! `PointInsert` / `PointDelete` have an undo-tracked arm in the transactional
-//! `exec_tx_document` replay path; `BatchInsert` there falls through to the
-//! passthrough handler with no undo capture, which would survive an
-//! atomic-rollback of a sibling op (partial commit).
+//! replay path; a `BatchInsert` there falls through to the passthrough handler
+//! with no undo capture, which would survive an atomic-rollback of a sibling op
+//! (partial commit). Mirrors
+//! [`crate::control::merge_orchestrator::expand_staged_merge`] and
+//! [`crate::control::update_from_join_orchestrator::expand_staged_update_from_join`].
 
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
@@ -36,86 +45,82 @@ use crate::types::{TxnId, VShardId};
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-/// Expand every staged `DocumentOp::InsertSelect` in `buffered` into concrete,
-/// fresh-surrogate `PointInsert` tasks, preserving each `InsertSelect`'s
-/// position and passing every other task through untouched.
+/// Resolve one in-transaction `DocumentOp::InsertSelect` task into the concrete,
+/// fresh-surrogate `PointInsert` tasks its copied source rows expand to.
 ///
-/// Runs in the Control-Plane COMMIT path just after the buffered plans are
-/// obtained and before dispatch classification, so the transaction commits
-/// concrete writes rather than a re-scanned `InsertSelect`.
-pub(crate) async fn expand_staged_insert_selects(
+/// `task` must be an `InsertSelect` plan with `task.txn_id` set to the active
+/// transaction, so the source scan folds rows staged by earlier statements in the
+/// same transaction. Each copied row is assigned its OWN fresh, catalog-registered
+/// surrogate. The emitted point ops carry the same `txn_id` and target the TARGET
+/// collection's vShard (recomputed here so dispatch classification stays honest,
+/// exactly as the MERGE / `UPDATE ... FROM` expanders do). The caller stages +
+/// buffers each returned op.
+///
+/// Signature mirrors
+/// [`resolve_and_emit_merge_ops`](crate::control::merge_orchestrator::
+/// resolve_and_emit_merge_ops) /
+/// [`resolve_and_emit_update_from_join_ops`](crate::control::
+/// update_from_join_orchestrator::resolve_and_emit_update_from_join_ops).
+pub(crate) async fn resolve_and_emit_insert_select_ops(
     state: &SharedState,
     tenant_id: TenantId,
-    buffered: Vec<PhysicalTask>,
+    task: &PhysicalTask,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    // Fast path: no staged INSERT ... SELECT to expand — return the buffer as-is.
-    if !buffered.iter().any(|t| {
-        matches!(
-            &t.plan,
-            PhysicalPlan::Document(DocumentOp::InsertSelect { .. })
-        )
-    }) {
-        return Ok(buffered);
-    }
+    let PhysicalPlan::Document(DocumentOp::InsertSelect {
+        target_collection,
+        source_collection,
+        source_filters,
+        source_limit,
+    }) = &task.plan
+    else {
+        // Callers only pass an `InsertSelect` task; a mismatch is a bug.
+        return Err(crate::Error::PlanError {
+            detail: "resolve_and_emit_insert_select_ops: non-INSERT-SELECT task".into(),
+        });
+    };
 
-    let mut out: Vec<PhysicalTask> = Vec::with_capacity(buffered.len());
-    for task in buffered {
-        let PhysicalPlan::Document(DocumentOp::InsertSelect {
+    // Scan the source (base ∪ overlay via the threaded `task.txn_id`) and assign
+    // each copied row its OWN fresh, catalog-registered surrogate.
+    let rows = materialize_copy(
+        state,
+        MaterializeCopy {
+            tenant_id,
+            database_id: task.database_id,
             target_collection,
             source_collection,
             source_filters,
-            source_limit,
-        }) = &task.plan
-        else {
-            out.push(task);
-            continue;
-        };
+            source_limit: *source_limit,
+            txn_id: task.txn_id,
+        },
+    )
+    .await?;
 
-        let rows = materialize_copy(
-            state,
-            MaterializeCopy {
-                tenant_id,
-                database_id: task.database_id,
-                target_collection,
-                source_collection,
-                source_filters,
-                source_limit: *source_limit,
-                txn_id: task.txn_id,
-            },
-        )
-        .await?;
+    // Concrete writes land on the TARGET collection's vShard — that is where the
+    // copied rows live. Recomputing it (rather than reusing the staged task's
+    // vShard) keeps dispatch classification honest, exactly as the MERGE /
+    // `UPDATE ... FROM` expanders do.
+    let vshard_id = VShardId::from_collection_in_database(task.database_id, target_collection);
 
-        // Concrete writes land on the TARGET collection's vShard — that is where
-        // the copied rows live. Recomputing it (rather than reusing the staged
-        // task's vShard) keeps dispatch classification honest: `classify_dispatch`
-        // runs AFTER expansion, so a copy whose target differs from a sibling op's
-        // shard is correctly classified single- vs multi-shard by the real vShards.
-        let vshard_id = VShardId::from_collection_in_database(task.database_id, target_collection);
-        for (document_id, value, surrogate) in rows {
-            out.push(PhysicalTask {
-                tenant_id: task.tenant_id,
-                vshard_id,
-                database_id: task.database_id,
-                plan: PhysicalPlan::Document(DocumentOp::PointInsert {
-                    collection: target_collection.clone(),
-                    document_id,
-                    value,
-                    if_absent: false,
-                    surrogate,
-                }),
-                post_set_op: PostSetOp::None,
-                txn_id: task.txn_id,
-            });
-        }
+    let mut out: Vec<PhysicalTask> = Vec::with_capacity(rows.len());
+    for (document_id, value, surrogate) in rows {
+        out.push(PhysicalTask {
+            tenant_id: task.tenant_id,
+            vshard_id,
+            database_id: task.database_id,
+            plan: PhysicalPlan::Document(DocumentOp::PointInsert {
+                collection: target_collection.clone(),
+                document_id,
+                value,
+                if_absent: false,
+                surrogate,
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: task.txn_id,
+        });
     }
     Ok(out)
 }
 
-/// Scan the source page-by-page and produce the concrete target rows:
-/// `(target_document_id, msgpack_value, fresh_surrogate)`, one per surviving
-/// source row. Reuses the shared [`resolve_copy_spec`] / [`assign_page_rows`]
-/// pipeline (scan → normalize → filter → assign) so the strict-source
-/// normalization and identity derivation stay identical to the autocommit path.
 /// Inputs for [`materialize_copy`], bundled to keep the copy pipeline within
 /// argument limits.
 struct MaterializeCopy<'a> {
@@ -128,6 +133,11 @@ struct MaterializeCopy<'a> {
     txn_id: Option<TxnId>,
 }
 
+/// Scan the source page-by-page and produce the concrete target rows:
+/// `(target_document_id, msgpack_value, fresh_surrogate)`, one per surviving
+/// source row. Reuses the shared [`resolve_copy_spec`] / [`assign_page_rows`]
+/// pipeline (scan → normalize → filter → assign) so the strict-source
+/// normalization and identity derivation stay identical to the autocommit path.
 async fn materialize_copy(
     state: &SharedState,
     args: MaterializeCopy<'_>,

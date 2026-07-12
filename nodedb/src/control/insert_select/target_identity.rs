@@ -3,7 +3,7 @@
 //! Derive a copied row's identity on the TARGET collection: resolve how the
 //! target's primary key maps a row to a surrogate, then assign a fresh,
 //! catalog-registered surrogate for it. Shared by the autocommit
-//! `INSERT ... SELECT` orchestrator and the COMMIT-time expander.
+//! `INSERT ... SELECT` orchestrator and the statement-time staged expander.
 
 use nodedb_types::columnar::DocumentMode;
 use nodedb_types::{CollectionType, DatabaseId, Surrogate, TenantId, Value};

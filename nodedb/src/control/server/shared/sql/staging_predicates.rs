@@ -14,12 +14,19 @@ use nodedb_physical::physical_plan::{
 
 /// Allow-list of the plans the in-transaction path stages at statement time:
 /// point writes, predicate `BulkUpdate` / `BulkDelete` (bulk predicate DML),
-/// `InsertSelect` (`INSERT ... SELECT`), and `Upsert` (`UPSERT INTO`).
-/// Explicit match on the exact staged variants — KV point writes stay on the
-/// buffer path. Named for the point-write case historically; also covers
-/// bulk predicate DML, `InsertSelect`, and `Upsert` now that
-/// `stage_bulk_update` / `stage_bulk_delete` / `stage_insert_select` /
-/// `stage_document_upsert` stage the matched rows the same way.
+/// and `Upsert` (`UPSERT INTO`). Explicit match on the exact staged variants —
+/// KV point writes stay on the buffer path. Named for the point-write case
+/// historically; also covers bulk predicate DML and `Upsert` now that
+/// `stage_bulk_update` / `stage_bulk_delete` / `stage_document_upsert` stage the
+/// matched rows the same way.
+///
+/// `InsertSelect` (`INSERT ... SELECT`) is deliberately NOT here: an
+/// in-transaction `INSERT ... SELECT` is resolved + staged at STATEMENT time by
+/// [`resolve_and_emit_insert_select_ops`](crate::control::insert_select::
+/// resolve_and_emit_insert_select_ops) (driven from
+/// `session::expander_stage`), which emits concrete fresh-surrogate
+/// `PointInsert` ops that flow through this gate on their own — the raw
+/// `InsertSelect` never reaches the staging path.
 ///
 /// A `RETURNING` clause does NOT change stageability. The `stage_*` handlers
 /// stage the matched rows' resolved post-images identically whether or not a
@@ -39,7 +46,6 @@ pub fn is_point_write(plan: &PhysicalPlan) -> bool {
                 | DocumentOp::PointUpdate { .. }
                 | DocumentOp::BulkUpdate { .. }
                 | DocumentOp::BulkDelete { .. }
-                | DocumentOp::InsertSelect { .. }
                 | DocumentOp::Upsert { .. }
         )
     )
@@ -47,7 +53,7 @@ pub fn is_point_write(plan: &PhysicalPlan) -> bool {
 
 /// Allow-list of plans the in-transaction path stages at statement time via
 /// `MetaOp::StageWrite`: everything [`is_point_write`] accepts (Document
-/// point writes, predicate `BulkUpdate` / `BulkDelete`, `InsertSelect`),
+/// point writes, predicate `BulkUpdate` / `BulkDelete`, `Upsert`),
 /// plus the eleven stageable KV point writes -- `KvOp::Put`, `KvOp::Insert`,
 /// `KvOp::InsertIfAbsent`, `KvOp::InsertOnConflictUpdate`, `KvOp::Delete`,
 /// `KvOp::BatchPut`, `KvOp::Incr`, `KvOp::IncrFloat`, `KvOp::Cas`,
@@ -196,7 +202,6 @@ pub fn staged_tag_kind(plan: &PhysicalPlan, payload: &[u8]) -> StagedTagKind {
         PhysicalPlan::Document(DocumentOp::PointDelete { .. } | DocumentOp::BulkDelete { .. }) => {
             StagedTagKind::Delete
         }
-        PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => StagedTagKind::Insert,
         PhysicalPlan::Document(DocumentOp::Upsert { .. }) => StagedTagKind::DocUpsert,
         PhysicalPlan::Kv(op) => staged_kv_tag_kind(op, payload),
         PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => StagedTagKind::Insert,

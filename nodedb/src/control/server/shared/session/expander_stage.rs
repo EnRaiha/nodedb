@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Statement-time expansion + staging of an in-transaction `MERGE` or
-//! `UPDATE ... FROM <source>`.
+//! Statement-time expansion + staging of an in-transaction `MERGE`,
+//! `UPDATE ... FROM <source>`, or `INSERT ... SELECT`.
 //!
-//! Autocommit `MERGE` / `UPDATE ... FROM` is intercepted before this seam and
-//! driven by [`crate::control::merge_orchestrator::run_merge`] /
-//! [`crate::control::update_from_join_orchestrator::run_update_from_join`]; only a
-//! join-expanding DML executed INSIDE an explicit transaction block reaches here.
-//! For those, the raw `DocumentOp::Merge` / `DocumentOp::UpdateFromJoin` plan is
-//! NOT buffered for COMMIT-time replay. Instead it is resolved NOW — against
-//! base ∪ overlay, so it sees rows this transaction staged in earlier statements
-//! — and the concrete `PointInsert` / `PointPut` / `PointDelete` ops it expands to
-//! are staged into the transaction's overlay (and buffered for COMMIT) through the
-//! exact same statement-time staging path a plain in-transaction point write uses
-//! ([`stage_write`]). (`UPDATE ... FROM` only ever emits `PointPut` ops.)
+//! Autocommit `MERGE` / `UPDATE ... FROM` / `INSERT ... SELECT` is intercepted
+//! before this seam and driven by
+//! [`crate::control::merge_orchestrator::run_merge`] /
+//! [`crate::control::update_from_join_orchestrator::run_update_from_join`] /
+//! [`crate::control::insert_select::run_insert_select`]; only such a DML executed
+//! INSIDE an explicit transaction block reaches here. For those, the raw
+//! `DocumentOp::Merge` / `DocumentOp::UpdateFromJoin` / `DocumentOp::InsertSelect`
+//! plan is NOT buffered for COMMIT-time replay. Instead it is resolved NOW —
+//! against base ∪ overlay, so it sees rows this transaction staged in earlier
+//! statements — and the concrete `PointInsert` / `PointPut` / `PointDelete` ops it
+//! expands to are staged into the transaction's overlay (and buffered for COMMIT)
+//! through the exact same statement-time staging path a plain in-transaction point
+//! write uses ([`stage_write`]). (`UPDATE ... FROM` only ever emits `PointPut`
+//! ops; `INSERT ... SELECT` only ever emits fresh-surrogate `PointInsert` ops.)
 //!
 //! Doing this at statement time (rather than at COMMIT) makes base == overlay
 //! universally: a LATER statement in the same transaction (e.g. an `UPDATE` of a
@@ -32,6 +35,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 
 use crate::bridge::envelope::{PhysicalPlan, Response};
+use crate::control::insert_select::resolve_and_emit_insert_select_ops;
 use crate::control::merge_orchestrator::resolve_and_emit_merge_ops;
 use crate::control::state::SharedState;
 use crate::control::update_from_join_orchestrator::resolve_and_emit_update_from_join_ops;
@@ -46,12 +50,12 @@ use super::store::SessionStore;
 
 /// Outcome of [`route_in_tx_expander`].
 pub(crate) enum ExpanderOutcome {
-    /// `task` was a not-yet-resolved in-transaction `MERGE` or
-    /// `UPDATE ... FROM`: resolved, staged, and buffered. Carries the aggregate
-    /// command tag.
+    /// `task` was a not-yet-resolved in-transaction `MERGE`, `UPDATE ... FROM`,
+    /// or `INSERT ... SELECT`: resolved, staged, and buffered. Carries the
+    /// aggregate command tag.
     Handled(InTxnRoute),
-    /// Autocommit, an already-resolved `MERGE` / `UPDATE ... FROM`, or any other
-    /// plan.
+    /// Autocommit, an already-resolved `MERGE` / `UPDATE ... FROM` /
+    /// `INSERT ... SELECT`, or any other plan.
     /// Hands the original task back — unmodified, no clone taken — for the
     /// caller to route through [`route_in_tx_write`](
     /// super::staging_gate::route_in_tx_write). Boxed so the common
@@ -59,11 +63,13 @@ pub(crate) enum ExpanderOutcome {
     Passthrough(Box<PhysicalTask>),
 }
 
-/// Intercept an in-transaction `MERGE` for statement-time resolution + staging.
+/// Intercept an in-transaction `MERGE` / `UPDATE ... FROM` / `INSERT ... SELECT`
+/// for statement-time resolution + staging.
 ///
 /// Takes `task` by value and hands it back via [`ExpanderOutcome::Passthrough`]
-/// for every case that isn't a not-yet-resolved in-transaction `MERGE`, so
-/// callers never need to clone `task` just to probe whether this seam applies.
+/// for every case that isn't a not-yet-resolved in-transaction join-expanding
+/// DML, so callers never need to clone `task` just to probe whether this seam
+/// applies.
 ///
 /// `dispatch` is invoked once per emitted point op (hence `Fn`, not `FnOnce`),
 /// with a `MetaOp::StageWrite` task wrapping that op — the same closure the
@@ -79,9 +85,9 @@ where
     F: Fn(PhysicalTask) -> Fut,
     Fut: Future<Output = crate::Result<Response>>,
 {
-    // Only an in-transaction `MERGE` or `UPDATE ... FROM` is handled here.
-    // Autocommit and every other plan fall through (`Passthrough`) to the
-    // neutral staging gate.
+    // Only an in-transaction `MERGE` / `UPDATE ... FROM` / `INSERT ... SELECT`
+    // is handled here. Autocommit and every other plan fall through
+    // (`Passthrough`) to the neutral staging gate.
     if sessions.transaction_state(addr) != TransactionState::InBlock {
         return Ok(ExpanderOutcome::Passthrough(Box::new(task)));
     }
@@ -123,6 +129,22 @@ where
                 .map_err(StagingGateError::Dispatch)?;
             (ops, StagedTagKind::UpdateFromJoin)
         }
+        PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => {
+            // Stamp the active transaction id so the source scan folds this
+            // transaction's staging overlay: an `INSERT ... SELECT` copies a
+            // row an earlier statement in the same transaction staged.
+            task.txn_id = sessions.tx_id(addr);
+            // Resolve the copy and derive the concrete, fresh-surrogate
+            // `PointInsert` ops. A resolve / surrogate-assignment failure is a
+            // genuine dispatch error; map it into the gate's `Dispatch` variant
+            // so the caller renders it exactly like any other in-transaction
+            // write failure. `INSERT ... SELECT` renders the `INSERT n` tag, so
+            // it reuses `StagedTagKind::Insert`.
+            let ops = resolve_and_emit_insert_select_ops(state, task.tenant_id, &task)
+                .await
+                .map_err(StagingGateError::Dispatch)?;
+            (ops, StagedTagKind::Insert)
+        }
         _ => return Ok(ExpanderOutcome::Passthrough(Box::new(task))),
     };
     Ok(ExpanderOutcome::Handled(
@@ -131,10 +153,11 @@ where
 }
 
 /// Stage + buffer each concrete point op a resolved `MERGE` / `UPDATE ...
-/// FROM` expands to, aggregating the per-arm affected counts into one staged
-/// outcome for the whole statement. Shared tail of [`route_in_tx_expander`]'s
-/// two resolve arms — they differ only in which `resolve_and_emit_*` fn
-/// produced `ops` and which [`StagedTagKind`] the result carries.
+/// FROM` / `INSERT ... SELECT` expands to, aggregating the per-op affected
+/// counts into one staged outcome for the whole statement. Shared tail of
+/// [`route_in_tx_expander`]'s resolve arms — they differ only in which
+/// `resolve_and_emit_*` fn produced `ops` and which [`StagedTagKind`] the result
+/// carries.
 async fn stage_and_aggregate<F, Fut>(
     sessions: &SessionStore,
     addr: &SocketAddr,
@@ -149,7 +172,8 @@ where
     // Stage + buffer each point op through the shared statement-time path. Each
     // `stage_write` dispatches a `MetaOp::StageWrite` into the overlay (real
     // statement-time constraint errors) AND buffers the concrete op for COMMIT's
-    // durable replay — the raw `Merge` / `UpdateFromJoin` is never buffered.
+    // durable replay — the raw `Merge` / `UpdateFromJoin` / `InsertSelect` is
+    // never buffered.
     let mut affected = 0usize;
     for op in ops {
         // `stage_write` only ever returns `Staged` (or propagates an `Err`

@@ -296,7 +296,7 @@ pub(crate) async fn scan_source_page(
 ///
 /// `txn_id` selects the read view: `None` (autocommit `run_merge` /
 /// `run_update_from_join`) scans committed base storage only; `Some(txn)` (the
-/// COMMIT-time expanders) folds the transaction's staging overlay for the
+/// statement-time staged expanders) folds the transaction's staging overlay for the
 /// SOURCE collection, so a source row inserted/updated by an earlier statement
 /// in the same transaction is shipped too — mirroring the target-side overlay
 /// fold the RESOLVE pass performs.

@@ -5,4 +5,5 @@ pub(crate) mod expand_staged;
 pub mod orchestrator;
 pub(crate) mod target_identity;
 
+pub(crate) use expand_staged::resolve_and_emit_insert_select_ops;
 pub use orchestrator::run_insert_select;

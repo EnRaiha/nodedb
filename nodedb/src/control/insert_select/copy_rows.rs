@@ -2,7 +2,7 @@
 
 //! Shared row-copy machinery for `INSERT ... SELECT`, used by BOTH the
 //! autocommit orchestrator ([`crate::control::insert_select::run_insert_select`])
-//! and the COMMIT-time staged expander
+//! and the statement-time staged expander
 //! ([`crate::control::insert_select::expand_staged`]).
 //!
 //! Both drive the same pipeline: scan the source page-by-page, NORMALIZE each
