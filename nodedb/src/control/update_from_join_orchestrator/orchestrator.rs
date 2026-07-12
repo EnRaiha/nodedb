@@ -70,6 +70,7 @@ pub async fn run_update_from_join(
         args.tenant_id,
         args.database_id,
         args.source_collection,
+        None,
     )
     .await?;
 
@@ -95,6 +96,7 @@ pub async fn run_update_from_join(
         args.database_id,
         args.target_collection,
         plan,
+        None,
     )
     .await?;
 

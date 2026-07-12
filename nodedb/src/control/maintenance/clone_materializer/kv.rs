@@ -104,7 +104,8 @@ pub(super) async fn materialize_kv_collection(
                 ttl_ms: 0,
                 surrogate,
             });
-            let resp = dispatch_local(state, tenant_id, db_id, &target_qualified, plan).await?;
+            let resp =
+                dispatch_local(state, tenant_id, db_id, &target_qualified, plan, None).await?;
             if resp.status != Status::Ok {
                 return Err(crate::Error::Storage {
                     engine: "clone_materializer".into(),
@@ -198,7 +199,7 @@ async fn scan_source_page(
         cursor: cursor.to_vec(),
         count: SCAN_PAGE,
     });
-    let resp = dispatch_local(state, tenant_id, source_db_id, source_qualified, plan).await?;
+    let resp = dispatch_local(state, tenant_id, source_db_id, source_qualified, plan, None).await?;
     if resp.status != Status::Ok {
         return Err(crate::Error::Storage {
             engine: "clone_materializer".into(),
@@ -276,6 +277,6 @@ async fn probe_target_key(
         // ceiling, so reads against the target stay unbounded here.
         surrogate_ceiling: None,
     });
-    let resp = dispatch_local(state, tenant_id, db_id, target_qualified, plan).await?;
+    let resp = dispatch_local(state, tenant_id, db_id, target_qualified, plan, None).await?;
     Ok(resp.status == Status::Ok && !resp.payload.is_empty())
 }

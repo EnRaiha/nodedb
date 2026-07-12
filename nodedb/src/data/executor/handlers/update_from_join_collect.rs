@@ -20,7 +20,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::update_from_join_source_map::json_value_to_string;
 use crate::data::executor::task::ExecutionTask;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId, TxnId};
 use nodedb_physical::physical_plan::UpdateValue;
 
 use super::update_from_join::ResolvedUpdateRow;
@@ -38,6 +38,18 @@ pub(in crate::data::executor) struct CollectUpdateRows<'a> {
     pub target_filters: &'a [ScanFilter],
     pub strict_schema: Option<&'a StrictSchema>,
     pub config_key: &'a (TenantId, String),
+}
+
+/// Borrowed inputs for [`CoreLoop::scan_target_rows`], bundled to keep the
+/// overlay-aware target scan within argument limits.
+struct ScanTargetRows<'a> {
+    database_id: u64,
+    tid: u64,
+    target_collection: &'a str,
+    target_filters: &'a [ScanFilter],
+    strict_schema: Option<&'a StrictSchema>,
+    txn_id: Option<TxnId>,
+    target_coll_key: &'a (DatabaseId, TenantId, String),
 }
 
 impl CoreLoop {
@@ -60,26 +72,33 @@ impl CoreLoop {
             config_key,
         } = ctx;
         let database_id = task.request.database_id.as_u64();
+        // Read the TARGET as the transaction's CURRENT view = base ∪ overlay:
+        // `None` (autocommit write path) is base-only; `Some(txn)` (COMMIT-time
+        // RESOLVE) folds rows staged earlier in the same transaction.
+        let txn_id = task.request.txn_id;
+        let target_coll_key: (DatabaseId, TenantId, String) = (
+            task.request.database_id,
+            TenantId::new(tid),
+            target_collection.to_string(),
+        );
 
-        // Scan the target collection for rows passing the target-only filters.
-        let target_doc_ids = self.scan_target_doc_ids(
+        // Scan the target collection for rows passing the target-only filters,
+        // folded with the transaction's staging overlay. The scan already yields
+        // each matched row's CURRENT body (overlay put superseding base, staged
+        // insert appended), so the body is used directly — a base `sparse.get`
+        // would miss a row this transaction only staged.
+        let target_rows = self.scan_target_rows(ScanTargetRows {
             database_id,
             tid,
             target_collection,
             target_filters,
             strict_schema,
-        )?;
+            txn_id,
+            target_coll_key: &target_coll_key,
+        })?;
 
         let mut rows: Vec<ResolvedUpdateRow> = Vec::new();
-        for doc_id in target_doc_ids {
-            let current_bytes = match self
-                .sparse
-                .get(database_id, tid, target_collection, &doc_id)
-            {
-                Ok(Some(b)) => b,
-                Ok(None) | Err(_) => continue,
-            };
-
+        for (doc_id, current_bytes) in target_rows {
             let mut target_doc = if let Some(schema) = strict_schema {
                 match super::super::strict_format::binary_tuple_to_json(&current_bytes, schema) {
                     Some(v) => v,
@@ -183,17 +202,28 @@ impl CoreLoop {
         Ok(rows)
     }
 
-    /// Range-scan the target collection, returning the doc IDs of rows that pass
-    /// every target-only filter (decoding strict Binary Tuples to JSON for
-    /// filter evaluation when the target is strict-mode).
-    fn scan_target_doc_ids(
-        &self,
-        database_id: u64,
-        tid: u64,
-        target_collection: &str,
-        target_filters: &[ScanFilter],
-        strict_schema: Option<&StrictSchema>,
-    ) -> crate::Result<Vec<String>> {
+    /// Range-scan the target collection, returning each row that passes every
+    /// target-only filter as `(doc_id, current_stored_body)` — decoding strict
+    /// Binary Tuples to JSON for filter evaluation when the target is
+    /// strict-mode. The body is the row's CURRENT stored form (strict Binary
+    /// Tuple or MessagePack), returned so the caller need not re-fetch it.
+    ///
+    /// When `txn_id` is `Some`, the transaction's staging overlay is folded over
+    /// the base result: a staged tombstone hides its base row, a staged put
+    /// replaces the base body (re-checked against the SAME target filters via the
+    /// strict-aware matcher), and a staged put absent from base is appended when
+    /// it passes the filters. `None` (autocommit) returns the base-filtered rows
+    /// unchanged — byte-identical to the pre-staging behavior.
+    fn scan_target_rows(&self, args: ScanTargetRows<'_>) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        let ScanTargetRows {
+            database_id,
+            tid,
+            target_collection,
+            target_filters,
+            strict_schema,
+            txn_id,
+            target_coll_key,
+        } = args;
         let prefix = crate::engine::sparse::btree::coll_prefix(database_id, tid, target_collection);
         let end = format!("{prefix}\u{ffff}");
 
@@ -212,7 +242,7 @@ impl CoreLoop {
                 detail: format!("open table: {e}"),
             })?;
 
-        let mut ids = Vec::new();
+        let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
         if let Ok(range) = table.range(prefix.as_str()..end.as_str()) {
             for entry in range.flatten() {
                 let key = entry.0.value();
@@ -229,10 +259,21 @@ impl CoreLoop {
                     target_filters.iter().all(|f| f.matches_binary(value_bytes))
                 };
                 if matches && let Some(doc_id) = key.strip_prefix(&prefix) {
-                    ids.push(doc_id.to_string());
+                    rows.push((doc_id.to_string(), value_bytes.to_vec()));
                 }
             }
         }
-        Ok(ids)
+
+        // Read-your-own-writes: fold the transaction's staging overlay over the
+        // base-filtered rows. The overlay's staged bodies are the same canonical
+        // stored form as base bodies, so the strict-aware matcher re-checks a
+        // staged put against the same target filters — a staged insert/update
+        // that satisfies the predicate is surfaced, one that no longer does is
+        // dropped, exactly as for a base row.
+        if let Some(txn_id) = txn_id {
+            let matches = self.strict_aware_matcher(tid, target_collection, target_filters);
+            self.merge_overlay_into_scan(txn_id, target_coll_key, &mut rows, &matches);
+        }
+        Ok(rows)
     }
 }

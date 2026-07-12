@@ -32,7 +32,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::insert_select::copy_rows::{assign_page_rows, resolve_copy_spec};
 use crate::control::maintenance::clone_materializer::scan_source_page;
 use crate::control::state::SharedState;
-use crate::types::VShardId;
+use crate::types::{TxnId, VShardId};
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -73,12 +73,15 @@ pub(crate) async fn expand_staged_insert_selects(
 
         let rows = materialize_copy(
             state,
-            tenant_id,
-            task.database_id,
-            target_collection,
-            source_collection,
-            source_filters,
-            *source_limit,
+            MaterializeCopy {
+                tenant_id,
+                database_id: task.database_id,
+                target_collection,
+                source_collection,
+                source_filters,
+                source_limit: *source_limit,
+                txn_id: task.txn_id,
+            },
         )
         .await?;
 
@@ -113,15 +116,31 @@ pub(crate) async fn expand_staged_insert_selects(
 /// source row. Reuses the shared [`resolve_copy_spec`] / [`assign_page_rows`]
 /// pipeline (scan → normalize → filter → assign) so the strict-source
 /// normalization and identity derivation stay identical to the autocommit path.
-async fn materialize_copy(
-    state: &SharedState,
+/// Inputs for [`materialize_copy`], bundled to keep the copy pipeline within
+/// argument limits.
+struct MaterializeCopy<'a> {
     tenant_id: TenantId,
     database_id: DatabaseId,
-    target_collection: &str,
-    source_collection: &str,
-    source_filters: &[u8],
+    target_collection: &'a str,
+    source_collection: &'a str,
+    source_filters: &'a [u8],
     source_limit: usize,
+    txn_id: Option<TxnId>,
+}
+
+async fn materialize_copy(
+    state: &SharedState,
+    args: MaterializeCopy<'_>,
 ) -> crate::Result<Vec<(String, Vec<u8>, Surrogate)>> {
+    let MaterializeCopy {
+        tenant_id,
+        database_id,
+        target_collection,
+        source_collection,
+        source_filters,
+        source_limit,
+        txn_id,
+    } = args;
     let spec = resolve_copy_spec(
         state,
         tenant_id,
@@ -143,6 +162,7 @@ async fn materialize_copy(
             source_collection,
             &cursor,
             None,
+            txn_id,
         )
         .await?;
 

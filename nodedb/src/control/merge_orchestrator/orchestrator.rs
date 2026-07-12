@@ -101,6 +101,7 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
             args.tenant_id,
             args.database_id,
             args.source_collection,
+            None,
         )
         .await?;
 
@@ -112,6 +113,7 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
             args.database_id,
             args.target_collection,
             resolve_plan,
+            None,
         )
         .await?;
         if resolve_resp.status != Status::Ok {
@@ -143,6 +145,7 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
             args.database_id,
             args.target_collection,
             apply_plan,
+            None,
         )
         .await?;
 

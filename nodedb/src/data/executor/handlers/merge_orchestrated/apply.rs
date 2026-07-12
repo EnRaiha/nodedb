@@ -123,7 +123,7 @@ impl CoreLoop {
         };
         let database_id = task.request.database_id.as_u64();
 
-        let plan = match self.collect_merge_plan(database_id, tid, &params) {
+        let plan = match self.collect_merge_plan(database_id, tid, task.request.txn_id, &params) {
             Ok(p) => p,
             Err(e) => return self.response_error(task, e),
         };

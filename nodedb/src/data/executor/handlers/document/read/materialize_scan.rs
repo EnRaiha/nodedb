@@ -22,6 +22,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::doc_id_to_surrogate;
 use crate::engine::sparse::btree::DOCUMENTS;
+use crate::types::{DatabaseId, TenantId};
 
 impl CoreLoop {
     /// Execute a cursor-paginated raw document scan for the clone materializer.
@@ -93,11 +94,20 @@ impl CoreLoop {
             }
         };
 
+        // When resolving inside a transaction (the COMMIT-time MERGE /
+        // `UPDATE ... FROM` source-ship), the caller needs the transaction's
+        // CURRENT source view = base ∪ overlay. The overlay merge supersedes /
+        // tombstones rows that can span pages, so it must apply to the WHOLE
+        // base set at once: collect every base row (ignoring the page cap) and
+        // return it in a single, un-paginated response. Autocommit callers
+        // (`txn_id == None`) keep the cursor-paginated base-only behavior.
+        let txn_id = task.request.txn_id;
+
         let mut entries: Vec<(String, u32, Vec<u8>)> = Vec::with_capacity(count.min(256));
         let mut last_doc_id = String::new();
 
         for row in range {
-            if entries.len() >= count {
+            if txn_id.is_none() && entries.len() >= count {
                 break;
             }
             let row = match row {
@@ -130,8 +140,34 @@ impl CoreLoop {
             entries.push((doc_id, surrogate, value));
         }
 
-        // Next-cursor is the last doc_id_hex seen; empty = scan complete.
-        let next_cursor: Vec<u8> = if entries.len() < count {
+        // Fold the transaction's staging overlay into the full base set: a
+        // staged tombstone hides its base row, a staged put replaces the base
+        // body, and a staged put absent from base is appended. Staged bodies are
+        // the same canonical stored form as base bodies (Binary Tuple for a
+        // strict source, MessagePack for a schemaless one), so the caller decodes
+        // both identically. The source ships ALL rows unfiltered, so the merge
+        // predicate is collect-all.
+        let next_cursor: Vec<u8> = if let Some(txn_id) = txn_id {
+            let coll_key: (DatabaseId, TenantId, String) = (
+                task.request.database_id,
+                TenantId::new(tid),
+                collection.to_string(),
+            );
+            let mut rows: Vec<(String, Vec<u8>)> = entries
+                .into_iter()
+                .map(|(doc_id, _surrogate, value)| (doc_id, value))
+                .collect();
+            self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &|_| true);
+            entries = rows
+                .into_iter()
+                .filter_map(|(doc_id, value)| {
+                    doc_id_to_surrogate(&doc_id).map(|s| (doc_id, s.as_u32(), value))
+                })
+                .collect();
+            // The whole set is returned in one response; the scan is complete.
+            Vec::new()
+        } else if entries.len() < count {
+            // Next-cursor is the last doc_id_hex seen; empty = scan complete.
             Vec::new()
         } else {
             last_doc_id.into_bytes()

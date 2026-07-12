@@ -22,6 +22,8 @@
 
 use nodedb_types::{CloneStatus, DatabaseId, Lsn, Surrogate, TenantId};
 
+use crate::types::TxnId;
+
 use super::dispatch::dispatch_local;
 use super::reaper::{ReapParams, reap_materialized_collection};
 use crate::bridge::envelope::Status;
@@ -86,6 +88,7 @@ pub(super) async fn materialize_document_collection(
             &source_qualified,
             &cursor,
             system_as_of_ms,
+            None,
         )
         .await?;
 
@@ -155,7 +158,8 @@ pub(super) async fn materialize_document_collection(
                 surrogate: target_surrogate,
             });
 
-            let resp = dispatch_local(state, tenant_id, db_id, &target_qualified, plan).await?;
+            let resp =
+                dispatch_local(state, tenant_id, db_id, &target_qualified, plan, None).await?;
             if resp.status != Status::Ok {
                 return Err(crate::Error::Storage {
                     engine: "clone_materializer".into(),
@@ -237,6 +241,12 @@ fn checkpoint_progress(
 pub(crate) type ScanPage = (Vec<(String, u32, Vec<u8>)>, Vec<u8>);
 
 /// Run one source-side `MaterializeScan` round-trip.
+///
+/// `txn_id` is threaded into the dispatched `MaterializeScan` so that, when the
+/// scan runs inside a transaction (the COMMIT-time MERGE / `UPDATE ... FROM`
+/// expanders), the source handler folds the transaction's staging overlay into
+/// the returned rows — a source row staged by an earlier statement is visible.
+/// Autocommit callers pass `None` (base-only, unchanged).
 pub(crate) async fn scan_source_page(
     state: &SharedState,
     tenant_id: TenantId,
@@ -244,6 +254,7 @@ pub(crate) async fn scan_source_page(
     source_qualified: &str,
     cursor: &[u8],
     system_as_of_ms: Option<i64>,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<ScanPage> {
     let plan = PhysicalPlan::Document(DocumentOp::MaterializeScan {
         collection: source_qualified.to_string(),
@@ -251,7 +262,15 @@ pub(crate) async fn scan_source_page(
         count: SCAN_PAGE,
         system_as_of_ms,
     });
-    let resp = dispatch_local(state, tenant_id, source_db_id, source_qualified, plan).await?;
+    let resp = dispatch_local(
+        state,
+        tenant_id,
+        source_db_id,
+        source_qualified,
+        plan,
+        txn_id,
+    )
+    .await?;
     if resp.status != Status::Ok {
         return Err(crate::Error::Storage {
             engine: "clone_materializer".into(),
@@ -274,11 +293,19 @@ pub(crate) async fn scan_source_page(
 /// stored source rows (a Binary Tuple for a strict source, MessagePack for a
 /// schemaless source) into their plan so the Data Plane builds the join-map from
 /// the shipped bytes instead of a local read of a possibly-non-resident source.
+///
+/// `txn_id` selects the read view: `None` (autocommit `run_merge` /
+/// `run_update_from_join`) scans committed base storage only; `Some(txn)` (the
+/// COMMIT-time expanders) folds the transaction's staging overlay for the
+/// SOURCE collection, so a source row inserted/updated by an earlier statement
+/// in the same transaction is shipped too — mirroring the target-side overlay
+/// fold the RESOLVE pass performs.
 pub(crate) async fn read_all_source_rows(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     source_collection: &str,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<Vec<(String, Vec<u8>)>> {
     let mut cursor: Vec<u8> = Vec::new();
     let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
@@ -290,6 +317,7 @@ pub(crate) async fn read_all_source_rows(
             source_collection,
             &cursor,
             None,
+            txn_id,
         )
         .await?;
         for (doc_id, _source_surrogate, value) in entries {

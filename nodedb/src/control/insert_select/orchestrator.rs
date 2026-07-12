@@ -88,6 +88,7 @@ pub async fn run_insert_select(
             source_collection,
             &cursor,
             None,
+            None,
         )
         .await?;
 
@@ -117,8 +118,8 @@ pub async fn run_insert_select(
                 documents,
                 surrogates,
             });
-            let resp =
-                dispatch_local(state, tenant_id, database_id, target_collection, plan).await?;
+            let resp = dispatch_local(state, tenant_id, database_id, target_collection, plan, None)
+                .await?;
             if resp.status != Status::Ok {
                 // Atomic page failure (e.g. constraint violation): the page's
                 // rows did not land. Surface the DP error verbatim.

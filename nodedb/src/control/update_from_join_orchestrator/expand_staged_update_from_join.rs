@@ -145,8 +145,17 @@ async fn resolve_update_rows(
 
     // Phase 0: read the SOURCE where it lives (its vShard can map to a different
     // Data-Plane core than the target's) and ship the raw rows into the plan.
-    let source_rows =
-        read_all_source_rows(state, tenant_id, task.database_id, source_collection).await?;
+    // Threading the staged transaction's id folds the source's own staging
+    // overlay, so a source row inserted/updated earlier in this transaction is
+    // shipped too.
+    let source_rows = read_all_source_rows(
+        state,
+        tenant_id,
+        task.database_id,
+        source_collection,
+        task.txn_id,
+    )
+    .await?;
 
     // Phase 1: dispatch the read-only RESOLVE pass against the target's core.
     let resolve_plan = PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
@@ -161,12 +170,17 @@ async fn resolve_update_rows(
         resolve_only: true,
         source_rows: Some(source_rows),
     });
+    // The RESOLVE pass reads the TARGET as base ∪ overlay: passing the staged
+    // transaction's id lets the target scan fold rows this transaction staged
+    // earlier, so an `UPDATE ... FROM` affects a row a prior statement in the
+    // same transaction inserted.
     let resolve_resp = dispatch_local(
         state,
         tenant_id,
         task.database_id,
         target_collection,
         resolve_plan,
+        task.txn_id,
     )
     .await?;
     if resolve_resp.status != Status::Ok {

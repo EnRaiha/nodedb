@@ -17,7 +17,7 @@ use nodedb_types::{DatabaseId, TenantId};
 
 use crate::bridge::envelope::{Priority, Request, Response};
 use crate::control::state::SharedState;
-use crate::types::{ReadConsistency, RequestId, TraceId, VShardId};
+use crate::types::{ReadConsistency, RequestId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 
 /// Dispatch a `PhysicalPlan` to the local Data Plane and await the response.
@@ -28,12 +28,22 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 /// scans and target-side writes — both target the local node directly because
 /// every shard the materializer touches is owned locally (vshard-affinity is
 /// preserved by `VShardId::from_collection_in_database`).
+///
+/// `txn_id` stamps the dispatched request with the transaction whose staging
+/// overlay the Data Plane handler must fold into its read. Autocommit callers
+/// (the clone materializer, `run_merge` / `run_update_from_join`, the
+/// `INSERT ... SELECT` orchestrator) pass `None` — no overlay exists, so the
+/// handler reads base storage exactly as before. The COMMIT-time MERGE /
+/// `UPDATE ... FROM` expanders pass the transaction's id so the RESOLVE pass
+/// (and its source scan) observes rows staged by earlier statements in the
+/// same transaction.
 pub(crate) async fn dispatch_local(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     collection_qualified: &str,
     plan: PhysicalPlan,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<Response> {
     let req_id = RequestId::new(state.request_id_counter.fetch_add(1, Ordering::Relaxed));
     let deadline_secs = state.tuning.network.default_deadline_secs;
@@ -54,7 +64,7 @@ pub(crate) async fn dispatch_local(
         user_roles: Vec::new(),
         user_id: None,
         statement_digest: None,
-        txn_id: None,
+        txn_id,
         wal_lsn: None,
         resolved_now_ms: None,
         admission: crate::bridge::envelope::Admission::Exempt(

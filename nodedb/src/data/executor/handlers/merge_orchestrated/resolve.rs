@@ -30,7 +30,12 @@ impl CoreLoop {
         tid: u64,
         params: MergeParams<'_>,
     ) -> Response {
-        let plan = match self.collect_merge_plan(task.request.database_id.as_u64(), tid, &params) {
+        let plan = match self.collect_merge_plan(
+            task.request.database_id.as_u64(),
+            tid,
+            task.request.txn_id,
+            &params,
+        ) {
             Ok(p) => p,
             Err(e) => return self.response_error(task, e),
         };

@@ -88,10 +88,17 @@ impl CoreLoop {
     /// UPDATE/DELETE) and the unmatched source rows (→ INSERT), collecting the
     /// resolved bodies. Shared by [`Self::execute_merge_resolve`] and
     /// [`Self::execute_merge_apply`] so both derive an identical action set.
+    ///
+    /// `txn_id` threads the staged transaction's identity into the target scan
+    /// (`collect_target_docs`) so both the RESOLVE and APPLY passes classify
+    /// against the transaction's CURRENT view = base ∪ overlay, seeing rows
+    /// staged by earlier statements in the same transaction. `None` (autocommit)
+    /// classifies against committed base storage only.
     pub(super) fn collect_merge_plan(
         &self,
         database_id: u64,
         tid: u64,
+        txn_id: Option<crate::types::TxnId>,
         params: &MergeParams<'_>,
     ) -> crate::Result<MergePlanActions> {
         let source_map = self.build_merge_source_map(
@@ -102,7 +109,8 @@ impl CoreLoop {
             params.source_rows,
         )?;
         let strict_schema = self.merge_strict_schema(tid, params.target_collection);
-        let target_docs = self.collect_target_docs(database_id, tid, params.target_collection)?;
+        let target_docs =
+            self.collect_target_docs(database_id, tid, params.target_collection, txn_id)?;
 
         let mut updates: Vec<MergeUpdate> = Vec::new();
         let mut deletes: Vec<MergeDelete> = Vec::new();
