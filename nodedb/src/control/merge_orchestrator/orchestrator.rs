@@ -169,6 +169,20 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
             continue;
         }
 
+        // `dispatch_local` bypasses the pgwire autocommit funnel's post-apply
+        // redo minting, so a MERGE landing on a vector-indexed target carries
+        // its per-row Put/Delete write-set back here unconsumed. Mint it now —
+        // without this durable redo a WAL-only restart rebuilds the HNSW from
+        // the pre-merge Put records (apply_point_put/apply_point_delete
+        // reconciled storage + overlays but minted no WAL redo carrying the new
+        // bodies). No-op on non-vector targets.
+        crate::control::server::wal_dispatch::mint_dispatch_local_redo(
+            &state.wal,
+            args.tenant_id,
+            args.database_id,
+            args.target_collection,
+            &apply_resp,
+        )?;
         return Ok(apply_resp);
     }
 }

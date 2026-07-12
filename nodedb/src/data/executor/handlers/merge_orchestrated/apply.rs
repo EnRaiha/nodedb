@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::handlers::point::apply_put::{PointPutOutcome, PointPutParams};
@@ -16,6 +16,12 @@ use crate::engine::document::store::surrogate_to_doc_id;
 use nodedb_types::Surrogate;
 
 use super::super::merge::MergeParams;
+
+/// One committed Phase-A put captured for post-commit event emission:
+/// `(row_key, new stored body borrowed from the plan, prior stored value)`.
+/// The body borrows from the merge plan (owned for the whole apply) rather than
+/// being cloned.
+type MergePutEvent<'a> = (String, &'a [u8], Option<Vec<u8>>);
 
 /// Record the in-memory index mutations a successful [`CoreLoop::apply_point_put`]
 /// performed as undo entries. The HNSW vector index and the spatial R-tree live
@@ -142,6 +148,12 @@ impl CoreLoop {
         // the per-row UPDATE re-index below.
         let has_vectors = self.collection_has_vectors(database_id, tid, params.target_collection);
 
+        // One post-apply redo entry per indexed row — a `Put` for each
+        // UPDATE/INSERT post-image, a `Delete` for each removed row — carried
+        // back so the Control Plane mints the durable WAL redo the vector index
+        // needs to survive a WAL-only restart. Empty on non-vector targets.
+        let mut write_set: Vec<WriteSetEntry> = Vec::new();
+
         // Phase A: matched UPDATE + NOT-MATCHED INSERT share ONE redb write
         // transaction. Any per-row error (including a UNIQUE violation from
         // `apply_point_put`) aborts, dropping the txn and rolling the whole set
@@ -150,9 +162,10 @@ impl CoreLoop {
             Ok(t) => t,
             Err(e) => return self.response_error(task, e),
         };
-        // (row_key, new_body_msgpack, prior_stored) captured for post-commit
-        // event emission; bodies are re-borrowed from the plan after commit.
-        let mut put_events: Vec<(String, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        // Captured for post-commit event emission. The clone into `write_set`
+        // below is the only owned body copy actually needed, since `plan`
+        // doesn't outlive the function but does outlive this loop.
+        let mut put_events: Vec<MergePutEvent<'_>> = Vec::new();
         let mut affected = 0u64;
         // Every row key written into `txn`, pushed BEFORE the write so a row that
         // fails mid-apply (its cache entry is populated before the UNIQUE check)
@@ -206,7 +219,14 @@ impl CoreLoop {
                     ) {
                         Ok(mut outcome) => {
                             record_put_index_undo(&mut undo_log, &mut outcome);
-                            put_events.push((row_key, upd.body.clone(), outcome.prior_value));
+                            if has_vectors {
+                                write_set.push(WriteSetEntry {
+                                    surrogate: surrogate.as_u32(),
+                                    is_delete: false,
+                                    value: upd.body.clone(),
+                                });
+                            }
+                            put_events.push((row_key, upd.body.as_slice(), outcome.prior_value));
                             affected += 1;
                         }
                         Err(e) => {
@@ -287,7 +307,14 @@ impl CoreLoop {
             ) {
                 Ok(mut outcome) => {
                     record_put_index_undo(&mut undo_log, &mut outcome);
-                    put_events.push((row_key, ins.body.clone(), None));
+                    if has_vectors {
+                        write_set.push(WriteSetEntry {
+                            surrogate: surrogate.as_u32(),
+                            is_delete: false,
+                            value: ins.body.clone(),
+                        });
+                    }
+                    put_events.push((row_key, ins.body.as_slice(), None));
                     affected += 1;
                 }
                 Err(e) => {
@@ -350,6 +377,13 @@ impl CoreLoop {
                         Ok(outcome) => {
                             if outcome.prior_value.is_some() {
                                 affected += 1;
+                                if has_vectors {
+                                    write_set.push(WriteSetEntry {
+                                        surrogate: surrogate.as_u32(),
+                                        is_delete: true,
+                                        value: Vec::new(),
+                                    });
+                                }
                             }
                             let row_key = surrogate_to_doc_id(surrogate);
                             self.emit_write_event(
@@ -377,7 +411,7 @@ impl CoreLoop {
         }
 
         let result = serde_json::json!({ "affected": affected });
-        match encode_json(&result) {
+        let mut response = match encode_json(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,
@@ -385,6 +419,10 @@ impl CoreLoop {
                     detail: e.to_string(),
                 },
             ),
+        };
+        if !write_set.is_empty() {
+            response.write_set = write_set;
         }
+        response
     }
 }
