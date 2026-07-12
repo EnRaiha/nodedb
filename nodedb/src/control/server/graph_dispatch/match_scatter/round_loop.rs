@@ -38,7 +38,7 @@ struct DispatchCtx<'f> {
     tenant_id: TenantId,
     database_id: DatabaseId,
     deadline_ms: u64,
-    shared_arc: &'f Arc<SharedState>,
+    shared_arc: Arc<SharedState>,
     version_set: GatewayVersionSet,
 }
 
@@ -87,12 +87,12 @@ fn push_dispatch_fut<'f>(
                 decision: RouteDecision::Remote { node_id, vshard_id },
                 vshard_id: (vshard_id % VShardId::COUNT as u64) as u32,
             };
-            let shared_arc = ctx.shared_arc;
+            let shared_arc = ctx.shared_arc.clone();
             let version_set = ctx.version_set.clone();
             futs.push(Box::pin(async move {
                 let payloads = dispatch_route(
                     route,
-                    shared_arc,
+                    &shared_arc,
                     tenant_id,
                     database_id,
                     TraceId::ZERO,

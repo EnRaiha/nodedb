@@ -3,9 +3,15 @@
 //! Signal handling: graceful shutdown on Ctrl+C / SIGTERM, force-stop on second signal.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::control::cluster::ClusterHandle;
 use crate::control::shutdown::ShutdownBus;
 use crate::control::state::SharedState;
+
+/// Deadline given to each cluster subsystem (SWIM, reachability,
+/// decommission, rebalancer) to stop cleanly during graceful shutdown.
+const CLUSTER_SUBSYSTEM_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Spawn the graceful shutdown handler and the force-stop handler.
 ///
@@ -19,6 +25,7 @@ pub fn spawn_signal_handlers(
     conn_semaphore: Arc<tokio::sync::Semaphore>,
     max_connections: usize,
     shutdown_bus: ShutdownBus,
+    cluster_handle: Option<Arc<ClusterHandle>>,
 ) {
     let (force_stop_tx, force_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let sem_clone = Arc::clone(&conn_semaphore);
@@ -87,6 +94,31 @@ pub fn spawn_signal_handlers(
                 total = ?report.total,
                 "background loops exceeded shutdown deadline"
             );
+        }
+
+        // Stop cluster subsystem tasks (SWIM, reachability, decommission,
+        // rebalancer) so they release their clone of `Arc<SharedState>`
+        // (transitively, via the shared `MultiRaft` handle) before the
+        // process exits. `RunningCluster::shutdown_all` consumes the
+        // value, so it must be taken out of the handle's slot exactly
+        // once; a `None` here means either single-node mode or that
+        // shutdown already ran.
+        if let Some(handle) = &cluster_handle {
+            let running = handle
+                .running_cluster
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(running) = running {
+                let errors = running
+                    .shutdown_all(CLUSTER_SUBSYSTEM_SHUTDOWN_DEADLINE)
+                    .await;
+                if errors.is_empty() {
+                    tracing::info!("cluster subsystems stopped cleanly");
+                } else {
+                    tracing::error!(?errors, "cluster subsystem shutdown errors");
+                }
+            }
         }
 
         match tokio::time::timeout(std::time::Duration::from_secs(2), sequencer_handle).await {

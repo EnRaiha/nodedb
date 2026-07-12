@@ -18,7 +18,7 @@ use crate::control::state::SharedState;
 
 use super::loop_build::RaftLoopType;
 
-/// Everything the final phase needs beyond `handle`/`shared`/`shutdown_rx`.
+/// Everything the final phase needs beyond `handle`/`shared`.
 pub(super) struct ObservabilityInputs {
     pub(super) sequencer_inbox: nodedb_cluster::calvin::Inbox,
     pub(super) sequencer_metrics: Arc<nodedb_cluster::calvin::SequencerMetrics>,
@@ -37,14 +37,13 @@ pub(super) fn finish_observability(
     transport_tuning: &nodedb_types::config::tuning::ClusterTransportTuning,
     raft_loop: Arc<RaftLoopType>,
     inputs: ObservabilityInputs,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::sync::watch::Receiver<bool> {
     let ObservabilityInputs {
         sequencer_inbox,
         sequencer_metrics,
         calvin_completion_registry,
         ollp_orchestrator,
-        mut sequencer_service,
+        sequencer_service,
     } = inputs;
 
     let _ = shared.sequencer_inbox.set(sequencer_inbox);
@@ -134,17 +133,18 @@ pub(super) fn finish_observability(
     // lifetime/shutdown pattern as the sequencer ticker below.
     let refiller = shared.surrogate_assigner.clone();
     let refiller_shared = Arc::downgrade(shared);
-    let sr_refill = shutdown_rx.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = refiller.run_refill_loop(refiller_shared) => {}
-            _ = async {
-                let mut rx = sr_refill;
-                let _ = rx.changed().await;
-            } => {}
-        }
-        info!("surrogate refill loop stopped");
-    });
+    crate::control::shutdown::spawn_loop(
+        &shared.loop_registry,
+        &shared.shutdown,
+        "surrogate_refill_loop",
+        move |mut shutdown| async move {
+            tokio::select! {
+                _ = refiller.run_refill_loop(refiller_shared) => {}
+                _ = shutdown.wait_cancelled() => {}
+            }
+            info!("surrogate refill loop stopped");
+        },
+    );
 
     // Subscribe to the boot-time readiness watch BEFORE spawning the
     // tick loop so we cannot miss the first transition. The receiver
@@ -158,29 +158,49 @@ pub(super) fn finish_observability(
         .loop_metrics_registry
         .register(raft_loop.loop_metrics());
 
-    // Start the Raft tick loop.
+    // Start the Raft tick loop. `RaftLoop::run` takes a raw
+    // `watch::Receiver<bool>` and drives shutdown internally, so it gets one
+    // from the canonical watch; the `spawn_loop` receiver is unused. Routing
+    // through `spawn_loop` registers the join handle so `shutdown_all` waits
+    // for it (dropping its captured `Arc<RaftLoopType>` deterministically).
     let rl_run = raft_loop.clone();
-    let sr_raft = shutdown_rx.clone();
-    tokio::spawn(async move {
-        rl_run.run(sr_raft).await;
-        info!("raft loop stopped");
-    });
+    let raft_raw_shutdown = shared.shutdown.raw_receiver();
+    crate::control::shutdown::spawn_loop(
+        &shared.loop_registry,
+        &shared.shutdown,
+        "raft_tick_loop",
+        move |_shutdown| async move {
+            rl_run.run(raft_raw_shutdown).await;
+            info!("raft loop stopped");
+        },
+    );
 
-    let sr_sequencer = shutdown_rx.clone();
-    tokio::spawn(async move {
-        sequencer_service.run(sr_sequencer).await;
-        info!("sequencer service stopped");
-    });
+    let seq_raw_shutdown = shared.shutdown.raw_receiver();
+    crate::control::shutdown::spawn_loop(
+        &shared.loop_registry,
+        &shared.shutdown,
+        "raft_sequencer",
+        move |_shutdown| async move {
+            let mut sequencer_service = sequencer_service;
+            sequencer_service.run(seq_raw_shutdown).await;
+            info!("sequencer service stopped");
+        },
+    );
 
     // Start the RPC server (accepts inbound QUIC connections).
     let transport_serve = handle.transport.clone();
     let rl_handler = raft_loop.clone();
-    let sr_serve = shutdown_rx.clone();
-    tokio::spawn(async move {
-        if let Err(e) = transport_serve.serve(rl_handler, sr_serve).await {
-            tracing::error!(error = %e, "raft RPC server failed");
-        }
-    });
+    let serve_raw_shutdown = shared.shutdown.raw_receiver();
+    crate::control::shutdown::spawn_loop(
+        &shared.loop_registry,
+        &shared.shutdown,
+        "raft_rpc_serve",
+        move |_shutdown| async move {
+            if let Err(e) = transport_serve.serve(rl_handler, serve_raw_shutdown).await {
+                tracing::error!(error = %e, "raft RPC server failed");
+            }
+        },
+    );
 
     // Wire version of every node is now carried on the live
     // `NodeInfo` in `cluster_topology`. Log the derived view for observability.
@@ -217,10 +237,15 @@ pub(super) fn finish_observability(
     if shared.health_monitor.set(health_monitor.clone()).is_err() {
         tracing::warn!("health_monitor already set — start_raft appears to have run twice");
     }
-    let sr_health = shutdown_rx;
-    tokio::spawn(async move {
-        health_monitor.run(sr_health).await;
-    });
+    let health_raw_shutdown = shared.shutdown.raw_receiver();
+    crate::control::shutdown::spawn_loop(
+        &shared.loop_registry,
+        &shared.shutdown,
+        "raft_health_monitor",
+        move |_shutdown| async move {
+            health_monitor.run(health_raw_shutdown).await;
+        },
+    );
 
     info!(node_id = handle.node_id, "raft loop and RPC server started");
 

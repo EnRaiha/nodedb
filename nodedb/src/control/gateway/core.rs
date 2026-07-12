@@ -18,8 +18,8 @@
 //! [`PlanCache`] keyed on `(sql_text_hash, placeholder_types_hash,
 //! DescriptorVersionSet)` before calling the planner.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
 use tracing::{Instrument, debug, info_span};
@@ -52,7 +52,16 @@ pub struct QueryContext {
 
 /// The gateway: routes, dispatches, retries, and caches physical plans.
 pub struct Gateway {
-    pub(crate) shared: Arc<SharedState>,
+    /// `Weak` back-reference to the owning [`SharedState`].
+    ///
+    /// `SharedState` owns this `Gateway` via its strong `Option<Arc<Gateway>>`
+    /// field, so a strong `Arc<SharedState>` here would form a reference cycle
+    /// that keeps `SharedState` alive forever (its clone count never reaches
+    /// zero on shutdown). Holding it `Weak` breaks the cycle: while the node
+    /// runs some other owner always keeps `SharedState` alive, so
+    /// [`Gateway::shared`] always upgrades; `None` only occurs during full
+    /// teardown, where a clean typed error (never a panic) is correct.
+    shared: Weak<SharedState>,
     pub plan_cache: Arc<PlanCache>,
     /// Number of times `retry_not_leader` retried due to a `NotLeader` response.
     /// Each retry attempt after the initial attempt increments this counter.
@@ -69,9 +78,20 @@ impl Gateway {
     pub fn new(shared: Arc<SharedState>) -> Self {
         Self {
             plan_cache: Arc::new(PlanCache::default_capacity()),
-            shared,
+            shared: Arc::downgrade(&shared),
             not_leader_retry_count: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Upgrade the `Weak` back-reference to a strong `Arc<SharedState>`.
+    ///
+    /// Always succeeds while the node is running (some other owner keeps
+    /// `SharedState` alive). Returns a typed error — never panics — if called
+    /// while racing full node teardown, after the last strong `Arc` is gone.
+    pub(crate) fn shared(&self) -> Result<Arc<SharedState>, Error> {
+        self.shared.upgrade().ok_or_else(|| Error::Internal {
+            detail: "gateway: SharedState dropped (node shutting down)".into(),
+        })
     }
 
     /// Total number of NotLeader-triggered retries since this gateway was created.
@@ -91,13 +111,15 @@ impl Gateway {
         ctx: &QueryContext,
         plan: PhysicalPlan,
     ) -> Result<Vec<Vec<u8>>, Error> {
+        let shared = self.shared()?;
         let span = info_span!(
             "gateway.execute",
             trace_id = %ctx.trace_id,
             tenant_id = ctx.tenant_id.as_u64()
         );
         let start = SystemTime::now();
-        let version_set = self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id);
+        let version_set =
+            self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)?;
         let result = self
             .execute_with_version_set(ctx, plan, version_set)
             .instrument(span)
@@ -106,7 +128,7 @@ impl Gateway {
         // enabled collector correlates this with the executor spans
         // emitted by every leaseholder we dispatched to — they all
         // share the same `trace_id`.
-        self.shared.trace_exporter.emit(EmitSpanParams {
+        shared.trace_exporter.emit(EmitSpanParams {
             span_name: "gateway.execute",
             trace_id: ctx.trace_id,
             start,
@@ -124,7 +146,7 @@ impl Gateway {
         // backup's watermark always dominates the tenant_wm it
         // itself advanced.
         if result.is_ok() {
-            self.shared.advance_tenant_write_hlc(ctx.tenant_id.as_u64());
+            shared.advance_tenant_write_hlc(ctx.tenant_id.as_u64());
         }
 
         result
@@ -167,7 +189,7 @@ impl Gateway {
             // Verify the stored version set is still current by cross-checking
             // each collection's current descriptor version.
             let current_vs =
-                self.verify_version_set(&stored_vs, ctx.tenant_id.as_u64(), ctx.database_id);
+                self.verify_version_set(&stored_vs, ctx.tenant_id.as_u64(), ctx.database_id)?;
             if current_vs == stored_vs {
                 // Version set is still current — try the full plan cache.
                 let full_key = PlanCacheKey {
@@ -191,7 +213,7 @@ impl Gateway {
 
         // Compute the actual version set from the plan (contains the real
         // collection names and their current descriptor versions).
-        let actual_vs = self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id);
+        let actual_vs = self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)?;
         let actual_key = PlanCacheKey {
             sql_text_hash: sql_hash,
             placeholder_types_hash: ph_hash,
@@ -213,14 +235,15 @@ impl Gateway {
         plan: PhysicalPlan,
         version_set: GatewayVersionSet,
     ) -> Result<Vec<Vec<u8>>, Error> {
+        let shared = self.shared()?;
         let routes = self.compute_routes(plan, ctx)?;
 
-        let deadline_ms = default_deadline_ms(&self.shared);
+        let deadline_ms = default_deadline_ms(&shared);
         // Gateway-level byte ceiling: per-route `dispatch_to_data_plane`
         // already caps each shard's payload; this additionally caps the
         // scatter-gather *sum* so an N-shard fan-out can't accumulate
         // N × cap across routes.
-        let max_total_bytes = self.shared.tuning.network.max_query_result_bytes as usize;
+        let max_total_bytes = shared.tuning.network.max_query_result_bytes as usize;
         let mut all_payloads: Vec<Vec<u8>> = Vec::new();
         let mut accumulated_bytes: usize = 0;
 
@@ -230,16 +253,17 @@ impl Gateway {
             let plan_for_retry = route.plan.clone();
             let vshard_id_u32 = route.vshard_id;
 
-            let routing_ref = self.shared.cluster_routing.as_deref();
+            let routing_ref = shared.cluster_routing.as_deref();
 
             let retry_counter = Arc::clone(&self.not_leader_retry_count);
             let version_set_for_route = version_set.clone();
+            let shared_for_route = Arc::clone(&shared);
             let payloads = retry_not_leader(routing_ref, move |attempt| {
                 if attempt > 0 {
                     retry_counter.fetch_add(1, Ordering::Relaxed);
                 }
                 let plan = plan_for_retry.clone();
-                let shared = Arc::clone(&self.shared);
+                let shared = Arc::clone(&shared_for_route);
                 let tenant_id = ctx.tenant_id;
                 let database_id = ctx.database_id;
                 let trace_id = ctx.trace_id;
@@ -341,19 +365,15 @@ impl Gateway {
         // BOTH single-node and cluster mode — the single-node early-return in
         // `route_plan` bypasses `route_single_collection`, which is exactly the
         // multi-core scenario that triggers the silent-wrong-result bug.
-        super::colocation_guard::guard_cross_collection_write(
-            &self.shared,
-            ctx.database_id,
-            &plan,
-        )?;
+        let shared = self.shared()?;
+        super::colocation_guard::guard_cross_collection_write(&shared, ctx.database_id, &plan)?;
 
-        let routing_guard = self
-            .shared
+        let routing_guard = shared
             .cluster_routing
             .as_ref()
             .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
         let routing = routing_guard.as_deref();
-        let catalog = Some(self.shared.credentials.catalog());
+        let catalog = Some(shared.credentials.catalog());
         let database_id = ctx.database_id;
         let tenant_id = ctx.tenant_id.as_u64();
         let strategy_fn = |name: &str| {
@@ -365,7 +385,7 @@ impl Gateway {
         };
         route_plan(
             plan,
-            self.shared.node_id,
+            shared.node_id,
             routing,
             ctx.database_id,
             strategy_fn,
@@ -389,16 +409,17 @@ impl Gateway {
         plan: &PhysicalPlan,
         tenant_id: u64,
         database_id: DatabaseId,
-    ) -> GatewayVersionSet {
-        let catalog = Some(self.shared.credentials.catalog());
+    ) -> Result<GatewayVersionSet, Error> {
+        let shared = self.shared()?;
+        let catalog = Some(shared.credentials.catalog());
 
-        GatewayVersionSet::from_plan(plan, |name| {
+        Ok(GatewayVersionSet::from_plan(plan, |name| {
             catalog
                 .and_then(|c| c.get_collection(database_id, tenant_id, name).ok())
                 .flatten()
                 .map(|col| col.descriptor_version.max(1))
                 .unwrap_or(0)
-        })
+        }))
     }
 
     /// Re-read the current descriptor versions for the collections listed in
@@ -412,8 +433,9 @@ impl Gateway {
         stored_vs: &GatewayVersionSet,
         tenant_id: u64,
         database_id: DatabaseId,
-    ) -> GatewayVersionSet {
-        let catalog = Some(self.shared.credentials.catalog());
+    ) -> Result<GatewayVersionSet, Error> {
+        let shared = self.shared()?;
+        let catalog = Some(shared.credentials.catalog());
 
         let pairs: Vec<(String, u64)> = stored_vs
             .iter()
@@ -427,7 +449,7 @@ impl Gateway {
             })
             .collect();
 
-        GatewayVersionSet::from_pairs(pairs)
+        Ok(GatewayVersionSet::from_pairs(pairs))
     }
 }
 

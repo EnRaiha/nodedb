@@ -31,7 +31,6 @@ pub fn start_raft(
     handle: &ClusterHandle,
     shared: Arc<SharedState>,
     data_dir: &std::path::Path,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
     transport_tuning: &ClusterTransportTuning,
 ) -> crate::Result<tokio::sync::watch::Receiver<bool>> {
     let (multi_raft, setup) = build_group_setup(handle, &shared, transport_tuning)?;
@@ -44,7 +43,6 @@ pub fn start_raft(
         loop_build.tracker,
         loop_build.apply_rx,
         loop_build.calvin_read_result_senders,
-        &shutdown_rx,
     );
 
     let ready_rx = finish_observability(
@@ -59,7 +57,6 @@ pub fn start_raft(
             ollp_orchestrator: loop_build.ollp_orchestrator,
             sequencer_service: loop_build.sequencer_service,
         },
-        shutdown_rx,
     );
 
     Ok(ready_rx)

@@ -69,6 +69,44 @@ pub fn spawn_loop<F, Fut>(
     }
 }
 
+/// Spawn an async loop that is joined on shutdown but NEVER
+/// force-aborted, even if it outlives the shutdown deadline.
+///
+/// Same registration and signal semantics as [`spawn_loop`],
+/// except the registered handle is [`LoopHandle::AsyncNoAbort`]:
+/// `shutdown_all` still waits for it, but a laggard past the
+/// deadline is reported and LEFT RUNNING rather than
+/// `.abort()`'d.
+///
+/// Use for determinism- or durability-critical loops that MUST
+/// exit only at a safe internal boundary — a Calvin `Scheduler`
+/// (a mid-epoch `.abort()` would diverge this node's replicated
+/// state machine from its peers), or the raft apply loop (an
+/// abort mid-apply would strand committed-but-unapplied
+/// entries). The body MUST observe shutdown promptly via the
+/// [`ShutdownReceiver`] so it reaches that boundary well within
+/// the deadline; the no-abort guarantee is a correctness
+/// backstop, not a licence to shut down slowly.
+pub fn spawn_loop_no_abort<F, Fut>(
+    registry: &LoopRegistry,
+    shutdown: &ShutdownWatch,
+    name: &'static str,
+    body: F,
+) where
+    F: FnOnce(ShutdownReceiver) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let rx = shutdown.subscribe();
+    let handle = tokio::spawn(async move { body(rx).await });
+    if let Err(e) = registry.register(name, LoopHandle::AsyncNoAbort(handle)) {
+        tracing::warn!(
+            error = %e,
+            "spawn_loop_no_abort after registry close — task will run to \
+             completion but shutdown_all will not wait for it"
+        );
+    }
+}
+
 /// Spawn a blocking loop via `tokio::task::spawn_blocking`.
 /// Same semantics as [`spawn_loop`] except the body runs on a
 /// blocking thread and is NOT abort-able by the registry —

@@ -194,10 +194,28 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             lock_manager,
             promotion_rx,
         });
-        let shutdown = shared.shutdown.subscribe();
-        tokio::spawn(async move {
-            scheduler.run(shutdown).await;
-        });
+        // Route through `spawn_loop_no_abort` so `LoopRegistry::shutdown_all`
+        // waits for the scheduler to exit (dropping its captured
+        // `Arc<SharedState>` deterministically) but NEVER force-aborts it: a
+        // Calvin `Scheduler` advances a replicated state machine and a
+        // mid-epoch `.abort()` would diverge this node from its peers.
+        // `Scheduler::run` already breaks at an epoch-safe boundary (its
+        // `biased` shutdown arm sits at the top of the select loop), so on a
+        // signal it exits well within the shutdown deadline.
+        //
+        // Fixed `&'static str` name: N schedulers register under one key.
+        // `LoopRegistry::register` stores handles in a `Vec` with no de-dup,
+        // so duplicate names are tolerated and each handle is joined
+        // independently. Per-vShard identity is carried by the `vshard_id`
+        // field the scheduler logs on start/stop.
+        crate::control::shutdown::spawn_loop_no_abort(
+            &shared.loop_registry,
+            &shared.shutdown,
+            "calvin_scheduler",
+            move |shutdown| async move {
+                scheduler.run(shutdown).await;
+            },
+        );
         spawned += 1;
     }
     Ok(spawned)
@@ -263,30 +281,34 @@ pub(super) fn spawn_vshard_schedulers(
     let sm_task = Arc::clone(sequencer_state_machine);
     let rr_task = Arc::clone(calvin_read_result_senders);
     let cfg_task = scheduler_config.clone();
-    let mut shutdown = shared.shutdown.subscribe();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.wait_cancelled() => break,
-                _ = tick.tick() => {
-                    if let Err(e) = reconcile_vshard_schedulers(ReconcileSchedulersParams {
-                        node_id,
-                        routing: &routing,
-                        shared: &shared_task,
-                        raft_loop_handle: &raft_loop_handle,
-                        sequencer_state_machine: &sm_task,
-                        calvin_read_result_senders: &rr_task,
-                        scheduler_config: &cfg_task,
-                    }) {
-                        tracing::warn!(node_id, error = %e, "calvin scheduler reconcile pass failed");
+    crate::control::shutdown::spawn_loop(
+        &shared.loop_registry,
+        &shared.shutdown,
+        "calvin_vshard_reconcile",
+        move |mut shutdown| async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait_cancelled() => break,
+                    _ = tick.tick() => {
+                        if let Err(e) = reconcile_vshard_schedulers(ReconcileSchedulersParams {
+                            node_id,
+                            routing: &routing,
+                            shared: &shared_task,
+                            raft_loop_handle: &raft_loop_handle,
+                            sequencer_state_machine: &sm_task,
+                            calvin_read_result_senders: &rr_task,
+                            scheduler_config: &cfg_task,
+                        }) {
+                            tracing::warn!(node_id, error = %e, "calvin scheduler reconcile pass failed");
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 
     Ok(())
 }

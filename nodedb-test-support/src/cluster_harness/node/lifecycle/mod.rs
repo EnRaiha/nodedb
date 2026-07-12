@@ -29,6 +29,7 @@
 //! [`spawn_variants`]; the full spawn body in [`spawn_full`]; query
 //! execution + shutdown + `Drop` teardown in [`teardown`].
 
+mod client_slot;
 mod spawn_full;
 mod spawn_variants;
 mod teardown;

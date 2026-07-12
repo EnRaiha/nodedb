@@ -129,14 +129,17 @@ pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_no
 /// The gateway's `Arc<SharedState>` for the remote dispatch path. In cluster
 /// mode the gateway is always wired; failing loudly here beats silently
 /// degrading to a local-only (partial) scatter.
-pub(super) fn gateway_shared(state: &SharedState) -> crate::Result<&Arc<SharedState>> {
-    state
+pub(super) fn gateway_shared(state: &SharedState) -> crate::Result<Arc<SharedState>> {
+    let gateway = state
         .gateway
         .as_ref()
-        .map(|g| &g.shared)
         .ok_or_else(|| crate::Error::Internal {
             detail: "graph scatter: cluster routing present but gateway unavailable for \
-                     remote dispatch"
+                 remote dispatch"
                 .into(),
-        })
+        })?;
+    // Upgrade the gateway's `Weak<SharedState>` back-reference. Always
+    // succeeds while the node runs; a `None` (racing full teardown) surfaces
+    // as the accessor's own typed shutdown error.
+    gateway.shared()
 }

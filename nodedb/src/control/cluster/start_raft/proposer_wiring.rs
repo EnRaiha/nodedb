@@ -24,7 +24,6 @@ pub(super) fn wire_proposers(
     tracker: Arc<ProposeTracker>,
     apply_rx: mpsc::Receiver<ApplyBatch>,
     calvin_read_result_senders: Arc<Mutex<BTreeMap<u32, Sender<ReadResultEvent>>>>,
-    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
 ) {
     // Wire the Raft proposer into SharedState so CP dispatch paths
     // (pgwire, HTTP, array inbound) can route writes through Raft.
@@ -140,23 +139,33 @@ pub(super) fn wire_proposers(
 
     // Spawn the background apply loop. It reads from the mpsc channel
     // pushed by `DistributedApplier::apply_committed`, dispatches to the
-    // Data Plane, and notifies propose waiters.
+    // Data Plane, and notifies propose waiters. Registered via
+    // `spawn_loop_no_abort` so `LoopRegistry::shutdown_all` waits for it to
+    // exit (dropping its captured `Arc<SharedState>` deterministically) but
+    // NEVER force-aborts it — an abort mid-apply would strand
+    // committed-but-unapplied entries.
     let apply_state = shared.clone();
     let apply_tracker = tracker.clone();
     let apply_calvin_read_result_senders = Arc::clone(&calvin_read_result_senders);
-    let sr_apply = shutdown_rx.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = run_apply_loop(
-                apply_rx,
-                apply_state,
-                apply_tracker,
-                apply_calvin_read_result_senders,
-            ) => {}
-            _ = async {
-                let mut rx = sr_apply;
-                let _ = rx.changed().await;
-            } => {}
-        }
-    });
+    crate::control::shutdown::spawn_loop_no_abort(
+        &shared.loop_registry,
+        &shared.shutdown,
+        "raft_apply_loop",
+        move |mut shutdown| async move {
+            // `biased` polls `run_apply_loop` FIRST on every iteration: any
+            // committed batch already queued in `apply_rx` is drained to the
+            // Data Plane before the shutdown arm can win, so shutdown never
+            // cuts the loop off mid-apply.
+            tokio::select! {
+                biased;
+                _ = run_apply_loop(
+                    apply_rx,
+                    apply_state,
+                    apply_tracker,
+                    apply_calvin_read_result_senders,
+                ) => {}
+                _ = shutdown.wait_cancelled() => {}
+            }
+        },
+    );
 }

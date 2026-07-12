@@ -9,6 +9,7 @@ use std::time::Duration;
 use nodedb::ServerConfig;
 use nodedb::bootstrap;
 use nodedb::bootstrap::tls::build_tls_acceptor;
+use nodedb::control::cluster::ClusterHandle;
 use nodedb::control::server::ilp_listener::IlpListener;
 use nodedb::control::server::listener::Listener;
 use nodedb::control::server::pgwire::listener::PgListener;
@@ -40,6 +41,7 @@ pub(crate) async fn setup(
     config: &ServerConfig,
     cluster_mode_str: &str,
     shutdown_bus: &ShutdownBus,
+    cluster_handle: Option<Arc<ClusterHandle>>,
 ) -> anyhow::Result<ListenerSetup> {
     // Create shared connection semaphore — enforced across all listeners.
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(config.server.max_connections));
@@ -65,6 +67,7 @@ pub(crate) async fn setup(
         Arc::clone(&conn_semaphore),
         config.server.max_connections,
         shutdown_bus.clone(),
+        cluster_handle,
     );
 
     // Build shared TLS acceptor if configured. Per-protocol flags control

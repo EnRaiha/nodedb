@@ -73,7 +73,6 @@ pub(crate) fn spawn(
                 handle,
                 Arc::clone(shared),
                 &config.server.data_dir,
-                shutdown_rx.clone(),
                 &config.tuning.cluster_transport,
             )?)
         } else {

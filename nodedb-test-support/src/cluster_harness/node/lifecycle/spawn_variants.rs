@@ -4,6 +4,7 @@
 //! [`super::spawn_full`]'s `spawn_with_full_config`.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use nodedb_types::config::tuning::ClusterTransportTuning;
 
@@ -118,6 +119,29 @@ impl TestClusterNode {
     pub async fn spawn_single_node_calvin(
         num_cores: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_single_node_calvin_at(num_cores, None).await
+    }
+
+    /// Spawn (or reopen) the single-node Calvin stack rooted at
+    /// `data_dir_path` instead of an internally-minted `tempdir()`.
+    ///
+    /// This is the WAL-only-restart entry point: call it once with a fresh
+    /// `tempfile::tempdir()`'s path to bring the node up, `exec` some writes,
+    /// shut down via `graceful_shutdown_wal_only` (which does NOT delete the
+    /// directory — the caller's `TempDir` owns it), then call this again with
+    /// the SAME path to reopen against the persisted WAL / redb stores. The
+    /// caller must keep its `TempDir` alive across both calls.
+    pub async fn spawn_single_node_calvin_on_path(
+        num_cores: usize,
+        data_dir_path: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_single_node_calvin_at(num_cores, Some(data_dir_path)).await
+    }
+
+    async fn spawn_single_node_calvin_at(
+        num_cores: usize,
+        data_dir_path: Option<PathBuf>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Sub-second election so the lone sequencer voter self-elects quickly
         // under the shared CI CPU pool without spurious re-elections.
         let tuning = ClusterTransportTuning {
@@ -135,6 +159,6 @@ impl TestClusterNode {
             replication_factor: 1,
             single_node_calvin: true,
         };
-        Self::spawn_with_full_config(1, vec![], &config).await
+        Self::spawn_with_full_config_at(1, vec![], &config, data_dir_path).await
     }
 }

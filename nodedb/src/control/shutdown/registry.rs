@@ -21,6 +21,17 @@ use super::report::{LaggardReport, ShutdownReport};
 pub enum LoopHandle {
     /// Tokio task. Can be `.abort()`'d on laggard.
     Async(JoinHandle<()>),
+    /// Tokio task that MUST NOT be `.abort()`'d — it advances a
+    /// replicated / durable state machine and a mid-flight
+    /// cancellation would leave it diverged from its peers or
+    /// strand committed-but-unapplied work. Joined on shutdown
+    /// exactly like [`Self::Async`], but a laggard past the
+    /// deadline is reported and LEFT RUNNING rather than
+    /// force-cancelled. The loop is responsible for observing
+    /// shutdown promptly at a safe internal boundary (e.g. a
+    /// Calvin scheduler breaking at an epoch boundary, or the
+    /// raft apply loop finishing its current drain batch).
+    AsyncNoAbort(JoinHandle<()>),
     /// `spawn_blocking` task. The join handle still exists,
     /// but aborting is a no-op — it only cancels scheduling,
     /// not the running thread. Laggards are logged, not
@@ -32,6 +43,7 @@ impl LoopHandle {
     fn take_handle(self) -> (JoinHandle<()>, bool) {
         match self {
             Self::Async(h) => (h, true),
+            Self::AsyncNoAbort(h) => (h, false),
             Self::Blocking(h) => (h, false),
         }
     }

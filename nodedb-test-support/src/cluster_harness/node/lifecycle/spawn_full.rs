@@ -21,9 +21,21 @@ use nodedb::wal::WalManager;
 
 use crate::cluster_harness::cluster::ClusterSpawnConfig;
 
-use super::types::TestClusterNode;
+use super::client_slot::ClusterTestClient;
+use super::types::{DataDir, TestClusterNode};
 
 impl TestClusterNode {
+    /// [`Self::spawn_with_full_config`] entry point used by every spawn
+    /// variant that does not need to reopen an existing data directory: mints
+    /// a fresh `tempdir()` this node owns and deletes on drop.
+    pub(crate) async fn spawn_with_full_config(
+        node_id: u64,
+        seed_nodes: Vec<SocketAddr>,
+        config: &ClusterSpawnConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_with_full_config_at(node_id, seed_nodes, config, None).await
+    }
+
     /// Lowest-level cluster-node spawn. In addition to the tuning knobs of
     /// [`Self::spawn_with_tuning_graph_query_and_cores`], this accepts the
     /// Raft `log_compaction_threshold`: when `Some(n)`, every Raft group on
@@ -43,10 +55,23 @@ impl TestClusterNode {
     ///
     /// Every other spawn entry point delegates here with `None` /
     /// `replication_factor = 3`.
-    pub(crate) async fn spawn_with_full_config(
+    ///
+    /// `data_dir_path_override`: `None` mints a fresh `tempdir()` this node
+    /// owns and deletes on drop (the historical behaviour, via
+    /// [`Self::spawn_with_full_config`]). `Some(path)` roots the node at a
+    /// CALLER-supplied directory instead — used by `..._on_path` spawn
+    /// variants that reopen a previous node's data directory (a WAL-only
+    /// restart). In both cases the WAL at `<dir>/test.wal` is replayed and
+    /// threaded into every Data-Plane core via `CoreLoopSpawn::replay`: on a
+    /// fresh empty WAL this replays zero records (no behaviour change from
+    /// before this parameter existed); on a reopened directory it rebuilds
+    /// in-memory-only structures (e.g. the vector HNSW index) from the
+    /// persisted `TransactionRedo` / `Put` / etc. records.
+    pub(crate) async fn spawn_with_full_config_at(
         node_id: u64,
         seed_nodes: Vec<SocketAddr>,
         config: &ClusterSpawnConfig,
+        data_dir_path_override: Option<PathBuf>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let tuning = &config.tuning;
         let graph_tuning = &config.graph_tuning;
@@ -55,13 +80,23 @@ impl TestClusterNode {
         let log_compaction_threshold = config.log_compaction_threshold;
         let replication_factor = config.replication_factor;
 
-        let data_dir = tempfile::tempdir()?;
-        let data_dir_path: PathBuf = data_dir.path().to_path_buf();
+        let (data_dir_handle, data_dir_path): (DataDir, PathBuf) = match data_dir_path_override {
+            Some(p) => (DataDir::Borrowed, p),
+            None => {
+                let dir = tempfile::tempdir()?;
+                let path = dir.path().to_path_buf();
+                (DataDir::Owned(dir), path)
+            }
+        };
 
-        // Open WAL + dispatcher + event bus.
+        // Open WAL + dispatcher + event bus. Replay whatever is already on
+        // disk (empty for a fresh directory) so every core can rebuild its
+        // in-memory-only structures before it starts ticking.
         let wal = Arc::new(WalManager::open_for_testing(
             &data_dir_path.join("test.wal"),
         )?);
+        let wal_records: Arc<[nodedb_wal::WalRecord]> = Arc::from(wal.replay()?.into_boxed_slice());
+        let replay_tombstones = nodedb_wal::extract_tombstones(&wal_records);
         let (dispatcher, data_sides) = Dispatcher::new(num_cores, 1024);
         let (event_producers, event_consumers) = create_event_bus(num_cores);
 
@@ -166,6 +201,13 @@ impl TestClusterNode {
             data_sides.into_iter().zip(event_producers).enumerate()
         {
             let (core_stop_tx, core_stop_rx) = std::sync::mpsc::channel::<()>();
+            let replay = (!wal_records.is_empty()).then(|| crate::core_loop_runner::WalReplay {
+                records: Arc::clone(&wal_records),
+                tombstones: replay_tombstones.clone(),
+                // Cluster node may host multiple cores; replay must route each
+                // record to `vshard % num_cores` matching the live node.
+                num_cores,
+            });
             let core_handle =
                 crate::core_loop_runner::spawn_core_loop(crate::core_loop_runner::CoreLoopSpawn {
                     idx,
@@ -175,7 +217,7 @@ impl TestClusterNode {
                     event_producer,
                     core_metrics: shared.system_metrics.clone(),
                     governor: shared.governor.clone(),
-                    replay: None,
+                    replay,
                     graph_tuning: graph_tuning.clone(),
                     query_tuning: query_tuning.clone(),
                     stop_rx: core_stop_rx,
@@ -216,13 +258,20 @@ impl TestClusterNode {
 
         // Start Raft + install MetadataCommitApplier.
         let (cluster_shutdown_tx, cluster_shutdown_rx) = tokio::sync::watch::channel(false);
-        nodedb::control::cluster::start_raft(
-            &handle,
-            Arc::clone(&shared),
-            &data_dir_path,
-            cluster_shutdown_rx.clone(),
-            tuning,
-        )?;
+        nodedb::control::cluster::start_raft(&handle, Arc::clone(&shared), &data_dir_path, tuning)?;
+
+        // `start_raft` spawns the cluster subsystems (SWIM, reachability,
+        // decommission, rebalancer) and stashes the resulting
+        // `RunningCluster` on `handle.running_cluster`. Take it out now —
+        // `handle` itself is not otherwise retained past this point — so
+        // `graceful_shutdown_wal_only` can stop and join those tasks
+        // before returning (see `nodedb_cluster::RunningCluster`'s doc:
+        // the host must call `shutdown_all` during orderly shutdown).
+        let running_cluster = handle
+            .running_cluster
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
 
         // CRDT constraint reconcile loop (leader-gated). The production server
         // spawns this from `spawn_background_loops`, which the harness does not
@@ -236,7 +285,7 @@ impl TestClusterNode {
         // cleanly. Returns None on single-node clusters that
         // never wired metadata_raft (the harness always wires it,
         // so this returns Some in practice for cluster tests).
-        let _lease_renewal = nodedb::control::lease::LeaseRenewalLoop::spawn(
+        let lease_renewal_handle = nodedb::control::lease::LeaseRenewalLoop::spawn(
             Arc::clone(&shared),
             tuning,
             cluster_shutdown_rx,
@@ -345,19 +394,21 @@ impl TestClusterNode {
             listen_addr,
             pg_addr,
             native_port,
-            client,
+            client: ClusterTestClient::new(client),
             shared,
-            _data_dir: data_dir,
-            _conn_handle: conn_handle,
+            _data_dir: data_dir_handle,
+            _conn_handle: Some(conn_handle),
             pg_shutdown_bus,
             poller_shutdown_tx,
             cluster_shutdown_tx,
             core_stop_txs,
-            _pg_handle: pg_handle,
-            _native_handle: native_handle,
-            _poller_handle: poller_handle,
+            _pg_handle: Some(pg_handle),
+            _native_handle: Some(native_handle),
+            _poller_handle: Some(poller_handle),
             _core_handles: core_handles,
-            _event_plane: event_plane,
+            _event_plane: Some(event_plane),
+            _lease_renewal_handle: lease_renewal_handle,
+            _running_cluster: running_cluster,
         })
     }
 }

@@ -43,19 +43,22 @@ impl Gateway {
         ctx: &QueryContext,
         plan: PhysicalPlan,
     ) -> Result<ResultStream, Error> {
-        let version_set = self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id);
+        let shared = self.shared()?;
+        let version_set =
+            self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)?;
 
         let routes = self.compute_routes(plan, ctx)?;
 
-        let deadline_ms = default_deadline_ms(&self.shared);
+        let deadline_ms = default_deadline_ms(&shared);
 
         let mut per_route: Vec<ResultStream> = Vec::with_capacity(routes.len());
         for route in routes {
             let vshard_id_u32 = route.vshard_id;
             let plan_for_retry = route.plan.clone();
-            let routing_ref = self.shared.cluster_routing.as_deref();
+            let routing_ref = shared.cluster_routing.as_deref();
             let retry_counter = Arc::clone(&self.not_leader_retry_count);
             let version_set_for_route = version_set.clone();
+            let shared_for_route = Arc::clone(&shared);
 
             // The not-leader retry wraps only the eager pre-stream phase. Each
             // attempt re-resolves the routing decision and re-opens the stream;
@@ -66,7 +69,7 @@ impl Gateway {
                     retry_counter.fetch_add(1, Ordering::Relaxed);
                 }
                 let plan = plan_for_retry.clone();
-                let shared = Arc::clone(&self.shared);
+                let shared = Arc::clone(&shared_for_route);
                 let tenant_id = ctx.tenant_id;
                 let database_id = ctx.database_id;
                 let trace_id = ctx.trace_id;

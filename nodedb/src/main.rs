@@ -137,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
             governor,
             system_metrics: Arc::clone(&system_metrics),
             maintenance_budget,
-            cluster_handle: cluster_handle.as_ref(),
+            cluster_handle: cluster_handle.as_deref(),
             startup_gate: &startup_gate,
             root_span: &root_span,
         },
@@ -156,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         &config,
         shutdown_rx.clone(),
         background::BackgroundLoopsInputs {
-            cluster_handle: cluster_handle.as_ref(),
+            cluster_handle: cluster_handle.as_deref(),
             wal: Arc::clone(&wal),
             event_consumers,
             watermark_store,
@@ -174,7 +174,14 @@ async fn main() -> anyhow::Result<()> {
         resp_listener,
         base_acceptor,
         native_tls_enabled,
-    } = listeners::setup(&shared, &config, cluster_mode_str, &shutdown_bus).await?;
+    } = listeners::setup(
+        &shared,
+        &config,
+        cluster_mode_str,
+        &shutdown_bus,
+        cluster_handle.clone(),
+    )
+    .await?;
 
     // Per-protocol TLS: returns the acceptor only if the protocol flag is true.
     let tls_for = |enabled: bool| -> Option<tokio_rustls::TlsAcceptor> {

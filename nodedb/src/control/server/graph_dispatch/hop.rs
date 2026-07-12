@@ -31,7 +31,6 @@
 //! table, so a stale routing hint cannot misroute a frontier node.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use futures::future::join_all;
 
@@ -288,22 +287,14 @@ async fn expand_remote(
     direction: Direction,
     max_results: u32,
 ) -> crate::Result<Vec<NeighborTriple>> {
-    // The dispatcher's remote path needs an `&Arc<SharedState>`. In cluster
-    // mode the gateway is always wired; its `Arc<SharedState>` is the same
-    // state we were handed. If the gateway (and thus the cluster transport
-    // path) is unavailable, fail loudly rather than silently degrade to a
-    // local-only — that would return a partial reachable set.
-    let gateway = shared
-        .gateway
-        .as_ref()
-        .ok_or_else(|| crate::Error::Internal {
-            detail:
-                "graph hop: cluster routing present but gateway unavailable for remote dispatch"
-                    .into(),
-        })?;
-    let shared_arc: &Arc<SharedState> = &gateway.shared;
+    // The dispatcher's remote path needs an owned `Arc<SharedState>`. In
+    // cluster mode the gateway is always wired; `gateway_shared` fails loudly
+    // if it is absent (rather than silently degrading to a partial local-only
+    // reachable set) and upgrades the gateway's weak back-reference to the
+    // owning `SharedState`.
+    let shared_arc = super::cluster_resolve::gateway_shared(shared)?;
 
-    let deadline_ms = default_deadline_ms(shared);
+    let deadline_ms = default_deadline_ms(&shared_arc);
     // Graph structural ops touch no named collection, so the version set is
     // empty (descriptor-version checks do not apply to node-id-keyed edges).
     let version_set = GatewayVersionSet::from_pairs(Vec::new());
@@ -329,12 +320,13 @@ async fn expand_remote(
             vshard_id: (vshard_id % VShardId::COUNT as u64) as u32,
         };
         let version_set = version_set.clone();
+        let shared_arc = shared_arc.clone();
         // Box::pin keeps the heterogeneous async dispatch futures uniform for
         // `join_all` and guards against any future async-recursion concerns.
         Box::pin(async move {
             dispatch_route(
                 route,
-                shared_arc,
+                &shared_arc,
                 tenant_id,
                 database_id,
                 TraceId::ZERO,

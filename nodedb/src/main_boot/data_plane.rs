@@ -26,7 +26,7 @@ pub(crate) struct DataPlaneBootstrap {
     pub(crate) governor: Arc<nodedb_mem::governor::MemoryGovernor>,
     pub(crate) watermark_store: Arc<nodedb::event::watermark::WatermarkStore>,
     pub(crate) trigger_dlq: Arc<std::sync::Mutex<nodedb::event::trigger::TriggerDlq>>,
-    pub(crate) cluster_handle: Option<nodedb::control::cluster::ClusterHandle>,
+    pub(crate) cluster_handle: Option<Arc<nodedb::control::cluster::ClusterHandle>>,
     // Held only to keep the Data Plane core threads alive; never read.
     pub(crate) _core_handles: Vec<std::thread::JoinHandle<()>>,
 }
@@ -114,7 +114,7 @@ pub(crate) async fn bootstrap_data_plane(
             &config.tuning.cluster_transport,
         )
         .await?;
-        Some(handle)
+        Some(Arc::new(handle))
     } else if config.server.single_node_calvin {
         // Flag-gated single-node Calvin: synthesize a one-node cluster so the
         // sequencer + per-vShard schedulers run and cross-core transactions
@@ -125,7 +125,7 @@ pub(crate) async fn bootstrap_data_plane(
             &config.tuning.cluster_transport,
         )
         .await?;
-        Some(handle)
+        Some(Arc::new(handle))
     } else {
         None
     };

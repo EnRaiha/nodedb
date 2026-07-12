@@ -106,10 +106,11 @@ pub(super) async fn scatter_superstep(
         let node_id = d.node_id;
         let is_local = d.is_local;
         let route_vshard = d.route_vshard;
+        let shared_arc = shared_arc.clone();
 
         Box::pin(async move {
             let payload = dispatch_superstep_to_node(
-                shared_arc,
+                &shared_arc,
                 DispatchSuperstepParams {
                     tenant_id,
                     database_id,

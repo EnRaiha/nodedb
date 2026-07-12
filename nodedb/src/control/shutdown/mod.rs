@@ -26,5 +26,5 @@ pub use phase::ShutdownPhase;
 pub use receiver::ShutdownReceiver;
 pub use registry::{LoopHandle, LoopRegistry, RegistryClosed};
 pub use report::{LaggardReport, ShutdownReport};
-pub use spawn::{spawn_blocking_loop, spawn_loop};
+pub use spawn::{spawn_blocking_loop, spawn_loop, spawn_loop_no_abort};
 pub use watch::ShutdownWatch;

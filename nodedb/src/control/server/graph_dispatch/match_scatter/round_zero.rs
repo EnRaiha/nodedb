@@ -76,10 +76,11 @@ pub(super) async fn scatter_round_zero(
         };
         let version_set = version_set.clone();
         let node_id = owner.node_id;
+        let shared_arc = shared_arc.clone();
         Box::pin(async move {
             let payloads = dispatch_route(
                 route,
-                shared_arc,
+                &shared_arc,
                 tenant_id,
                 database_id,
                 TraceId::ZERO,

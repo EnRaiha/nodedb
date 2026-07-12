@@ -40,7 +40,7 @@ pub async fn spawn_protocol_listeners(
     config: &ServerConfig,
     infra: ListenerInfra,
     base_acceptor: Option<tokio_rustls::TlsAcceptor>,
-    cluster_handle: &Option<ClusterHandle>,
+    cluster_handle: &Option<Arc<ClusterHandle>>,
 ) {
     let ProtocolListeners {
         pg_listener,

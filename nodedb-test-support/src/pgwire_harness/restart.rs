@@ -195,6 +195,8 @@ impl TestServer {
             let replay = (!wal_records.is_empty()).then(|| crate::core_loop_runner::WalReplay {
                 records: Arc::clone(&wal_records),
                 tombstones: replay_tombstones.clone(),
+                // Single-core pgwire harness (`Dispatcher::new(1, ..)`).
+                num_cores: 1,
             });
             let core_handle =
                 crate::core_loop_runner::spawn_core_loop(crate::core_loop_runner::CoreLoopSpawn {

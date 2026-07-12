@@ -49,6 +49,12 @@ const TICK_INTERVAL: Duration = Duration::from_millis(1);
 pub struct WalReplay {
     pub records: Arc<[WalRecord]>,
     pub tombstones: TombstoneSet,
+    /// Total number of Data-Plane cores in this node. WAL replay routes each
+    /// record to `vshard_id % num_cores`, so this MUST equal the live node's
+    /// core count or records replay onto the wrong core (a multi-core node
+    /// with `num_cores = 1` would replay everything onto core 0 while reads
+    /// route to `vshard % real_core_count`).
+    pub num_cores: usize,
 }
 
 /// Configuration for one CoreLoop spawn.
@@ -133,9 +139,10 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
                 if let Some(WalReplay {
                     records,
                     tombstones,
+                    num_cores,
                 }) = replay
                 {
-                    core.replay_all_wal(&records, 1, &tombstones);
+                    core.replay_all_wal(&records, num_cores, &tombstones);
                 }
                 while matches!(
                     stop_rx.try_recv(),
